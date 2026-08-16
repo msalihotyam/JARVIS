@@ -29,7 +29,7 @@ Kullanıcı, ChatGPT ile doğal biçimde fikir alışverişi yapabildiği; aynı
 
 - Platform: Windows 11
 - Proje kökü: `C:\Users\realk\Masaüstü\JARVIS`
-- Proje şu anda Git deposu değildir.
+- Proje bir Git deposudur; ilk başarılı live smoke checkpoint'i `main` dalında `bef77e7` (`fix: preserve approved clarification in Claude payload`) üzerinden alınmıştır.
 - İlk iskelette kullanıcı tarafından oluşturulan ve korunmaya devam eden klasör/dosyalar:
   - `Agent Core/agent_core.py`
   - `Connectors/base_connector.py`
@@ -52,19 +52,23 @@ Bu devam oturumunda aşağıdakiler tamamlandı:
 6. Aylık hedef ve sert üst sınır 20 USD'ye indirildi; preflight tahmini, hard-cap block ve açık override modeli uygulandı.
 7. Claude Code connector allowed roots, derin secret redaction, outbound metadata, `--safe-mode`, strict/empty MCP, açık read-only tool listesi, no-session-persistence ve çağrı başı bütçe korumasıyla güçlendirildi. `--bare` ve permission bypass kullanılmaz.
 8. Eski kullanıcı dosyaları silinmeden compatibility wrapper'a dönüştürüldü; `pyproject.toml`, README, CLI entrypoint ve Windows test betiği eklendi.
-9. Toplam 63 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, loop giriş aşaması koruması, Windows Python sürüm koruması, faturalandırma sınıfı politikası ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
+9. Toplam 81 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, loop giriş aşaması koruması, Windows Python sürüm koruması, faturalandırma sınıfı politikası, approval-payload bütünlüğü, symbolic destination normalizasyonu, clarification egress sınırı ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
 10. Sağlayıcıdan bağımsız faturalandırma sınıfı (`BillingClass`) ve parasal gözlem durumu (`MonetaryState`) sözleşmeye eklendi; usage ledger şeması 3'e additive migration ile yükseltildi. Claude connector, harici model çağrısından önce yerel ve modelsiz `claude auth status --json` yoklamasıyla Claude Max/OAuth yolunu doğrular, metered kimlik bilgisi ortam değişkeni **varsa (boş değerle bile)** veya yol belirlenemezse çağrıyı başlatmadan durur ve model alt sürecine temizlenmiş ortam verir.
 11. Bağımsız inceleme sonrası dört düzeltme uygulandı: (a) kalıcılaştırılmış geç aşama devamı artık faturalandırma ön kontrolünü atlayamaz, (b) ücretli API onayı aylık sert sınır kapısını atlamaz, (c) sınıflandırma bildirmeyen connector `UNKNOWN` kalır (fail closed), (d) yasaklı kimlik bilgisi ortam değişkeni boş değerle de engeller.
+12. Permission scope alanları field-aware normalize edilir: filesystem/URL `target` ile symbolic `action`, `connector` ve symbolic/URL `destination` ayrılmıştır. `anthropic/claude-code` artık çalışma dizinine bağlı yerel path'e dönüşmez; approval scope ile outbound preview aynı destination'a bağlanır.
+13. Claude outbound serialization default-deny hale getirildi. Yalnızca açık external preference allowlist'i serialize edilir; billing/runtime/control marker'ları local kalır. Canonical JSON encoding approval-time ve execute-time payload'ı persistence key-order farklarından bağımsız, byte-stable tutar. Kullanıcı clarification'ı ham preference olarak değil, redacted top-level `visible_assumption` alanıyla approval öncesinde görünür ve execute-time payload'da birebir aynı taşınır.
+14. İlk gerçek, tamamen read-only Claude Code smoke çağrısı 16 Ağustos 2026'da başarıyla tamamlandı. Canonical kayıtlar: session `62f6940b-bdda-4787-a9a9-b8fcd631b1b2`, task `30c1b3fa-b0b5-4d93-abb3-e5bb59ec07b1`, permission request `f707aec1-12dd-5a01-80df-9d7df8ec59be`, grant `69aacf3f-0683-479f-8494-532da9c5ba92`. Task `COMPLETED`, verification `PASSED`; tek model çağrısı fixture'dan `LYRA-11` değerini doğru döndürdü. Grant session'a hatırlanmadı ve retry yapılmadı.
+15. Smoke çağrısında approved/executed canonical payload SHA-256 `4a4f69785ead2a5b16a3447390261afc739881a616b6024a872468e2b85d2d12`, full prompt SHA-256 `8ef0c0046e5bfebeb4e2bedfeff9e0f5a13df6e59090dcdc3e15c2da4d63b74d` olarak eşleşti. Fixture SHA-256 `205847b7a4045a25e6f0883768c81e536d3884e611671098f190381515266a9c` ve tracked repository değişmedi. Billing `SUBSCRIPTION_INCLUDED`; 6 input token, 1464 output token, 1 call ve yaklaşık `0.0998965 USD` non-monetary reference cost kaydedildi. `monetary_cost_usd` null, monetary state `NOT_APPLICABLE` ve aylık parasal harcama `0 USD` kaldı.
+16. Post-call çıktısını yazdıran geçici, repo-dışı smoke harness'i Windows CP1254 konsolunda Unicode `—`/`→` karakterlerini `ensure_ascii=False` ile yazarken hata verdi. Hata task tamamlanıp canonical sonuç kaydedildikten sonra yalnızca geçici reporter'ın console-print adımında oluştu; connector, Agent Core, audit veya ürün CLI davranışı etkilenmedi ve model retry edilmedi. Tracked `jarvis` kodunda bu reporter bulunmadığı için ürün koduna yapay bir düzeltme eklenmedi.
 
-Claude Code CLI sürüm `2.1.232` olarak kurulu bulundu. Resmi, etkileşimsiz JSON çağrısı denendi; hesap Max aboneliğiyle tanınıyor fakat OAuth erişim belirteci süresi dolduğu için sunucu `401` döndürdü. Denemenin raporlanan maliyeti `0 USD` oldu ve hiçbir dosya değiştirilmedi.
+Önceki bir erken denemede görülen süresi dolmuş OAuth/401 durumu, daha sonraki local `claude auth status --json` kontrolü ve başarılı live smoke ile aşılmıştır. Başarılı çağrı Claude Max/OAuth abonelik yolunda çalışmış, ek parasal harcama oluşturmamış ve hiçbir tracked dosyayı değiştirmemiştir.
 
 Sıradaki adımlar:
 
-1. Kullanıcı isterse kendi Claude hesabında `claude auth login` ile yeniden giriş yapar.
-2. Canlı çağrı ancak kullanıcı ayrıca istediğinde, aynı tek dönüşlü güvenli plan modunda tekrar çalıştırılır.
-3. Başarılı olursa Claude connector, Agent Core üzerinden ilk uçtan uca kod planlama görevinde doğrulanır.
-4. Yazma yeteneği ayrı bir açık izin kapsamıyla ve geri alınabilir test projesinde eklenir.
-5. OpenAI API ancak kullanıcı açıkça onayladıktan, güncel model/fiyat bilgisi doğrulandıktan ve harcama korumaları hazırlandıktan sonra bağlanır.
+1. Bu final smoke checkpoint'i ayrı ve dar kapsamlı bir dokümantasyon commit'i olarak kaydet.
+2. Yeni live model çağrısı yapmadan önce yeni task/session/request ve ayrı açık kullanıcı onayı oluştur.
+3. Yazma yeteneğini yalnızca ayrı bir açık izin kapsamıyla, geri alınabilir test projesinde ve yeni güvenlik incelemesiyle değerlendir.
+4. OpenAI API'yi yalnızca kullanıcı açıkça onayladıktan, güncel model/fiyat bilgisi doğrulandıktan ve harcama korumaları hazırlandıktan sonra bağla.
 
 ## İlk kabul ölçütleri
 
