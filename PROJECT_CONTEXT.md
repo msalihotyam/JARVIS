@@ -52,7 +52,7 @@ Bu devam oturumunda aşağıdakiler tamamlandı:
 6. Aylık hedef ve sert üst sınır 20 USD'ye indirildi; preflight tahmini, hard-cap block ve açık override modeli uygulandı.
 7. Claude Code connector allowed roots, derin secret redaction, outbound metadata, `--safe-mode`, strict/empty MCP, açık read-only tool listesi, no-session-persistence ve çağrı başı bütçe korumasıyla güçlendirildi. `--bare` ve permission bypass kullanılmaz.
 8. Eski kullanıcı dosyaları silinmeden compatibility wrapper'a dönüştürüldü; `pyproject.toml`, README, CLI entrypoint ve Windows test betiği eklendi.
-9. Toplam 35 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, Windows Python sürüm koruması ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
+9. Toplam 36 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, loop giriş aşaması koruması, Windows Python sürüm koruması ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
 
 Claude Code CLI sürüm `2.1.232` olarak kurulu bulundu. Resmi, etkileşimsiz JSON çağrısı denendi; hesap Max aboneliğiyle tanınıyor fakat OAuth erişim belirteci süresi dolduğu için sunucu `401` döndürdü. Denemenin raporlanan maliyeti `0 USD` oldu ve hiçbir dosya değiştirilmedi.
 

@@ -84,6 +84,14 @@ class AgentCore:
                 "Task belongs to a different session.",
                 session,
             )
+        if existing_session_id is None and task.stage is not LoopStage.UNDERSTAND:
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                "A new task must start at the understand stage; "
+                "use resume() to continue persisted work.",
+                session,
+            )
         if existing_session_id is not None:
             persisted = self.memory.load_task(task.id)
             if persisted is not None:

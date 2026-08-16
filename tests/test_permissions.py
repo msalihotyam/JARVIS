@@ -8,6 +8,7 @@ from pathlib import Path
 
 from jarvis.contracts import (
     ErrorCode,
+    LoopStage,
     PermissionGrant,
     PermissionMode,
     RiskLevel,
@@ -203,6 +204,40 @@ class PermissionPolicyTests(unittest.TestCase):
         rejected = PermissionGrant.for_request(first.permission_request, approved=False)
         resumed = core.resume(first.session.id, first.task.id, rejected)
         self.assertEqual(RunStatus.REJECTED, resumed.status)
+        self.assertEqual(0, connector.execute_calls)
+
+    def test_new_task_cannot_start_mid_loop_and_skip_approval(self) -> None:
+        worst_case = dict(
+            risk=RiskLevel.CRITICAL,
+            effect=SideEffect.EXTERNAL_EGRESS,
+            reversible=False,
+            always_requires_approval=True,
+        )
+        connector = DummyConnector(
+            risk=RiskLevel.CRITICAL,
+            side_effect=SideEffect.EXTERNAL_EGRESS,
+            reversible=False,
+            always_requires_approval=True,
+            estimate_max=999.0,
+            is_paid=True,
+        )
+        core = self.core(connector, PermissionMode.SESSION)
+
+        pre_staged = make_task(**worst_case)
+        pre_staged.stage = LoopStage.EXECUTE
+        pre_staged.selected_connector = connector.manifest.name
+        run = core.run(pre_staged)
+
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.INVALID_TASK, run.error.code)
+        self.assertEqual(0, connector.execute_calls)
+        self.assertIsNone(self.memory.load_task(pre_staged.id))
+        self.assertEqual(0.0, self.memory.monthly_actual_cost())
+        self.assertEqual([], self.memory.list_decisions(run.session.id))
+
+        # The same worst-case task still reaches the approval gate normally.
+        allowed = core.run(make_task(**worst_case))
+        self.assertEqual(RunStatus.AWAITING_APPROVAL, allowed.status)
         self.assertEqual(0, connector.execute_calls)
 
     def test_pending_approval_survives_core_restart(self) -> None:
