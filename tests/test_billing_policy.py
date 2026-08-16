@@ -275,6 +275,128 @@ class MaxSubscriptionBillingTests(BillingPolicyTestCase):
         self.assertEqual(0.0, estimate.monetary_maximum_usd)
 
 
+class ApprovedPayloadIntegrityTests(BillingPolicyTestCase):
+    """What the user approved is byte-for-byte what the CLI receives."""
+
+    @staticmethod
+    def outbound_json(prompt: str) -> dict:
+        return json.loads(prompt.split("\n", 1)[1])
+
+    @patch.object(
+        ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
+    )
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_executed_prompt_equals_the_approved_prompt(self, popen, auth_status) -> None:
+        popen.return_value = FakeProcess(cli_payload(total_cost_usd=0.0))
+        core = self.core()
+
+        first = core.run(self.claude_task())
+        self.assertEqual(RunStatus.AWAITING_APPROVAL, first.status)
+        approved_prompt, _ = self.connector._build_prompt(first.task)
+        approved_payload, _ = self.connector._sanitized_payload(first.task)
+        self.assertNotIn("billing_preflight_fingerprint", first.task.preferences)
+
+        run = self.approve(core, first)
+        self.assertEqual(RunStatus.COMPLETED, run.status)
+
+        model_calls = self.model_calls(popen)
+        self.assertEqual(1, len(model_calls))
+        command = model_calls[0].args[0]
+        executed_prompt = command[command.index("-p") + 1]
+
+        # The exact bytes the user approved are the exact bytes that were sent.
+        self.assertEqual(approved_prompt, executed_prompt)
+        executed_payload = self.outbound_json(executed_prompt)
+        self.assertEqual(approved_payload, executed_payload)
+
+        for key in (
+            "billing_preflight_fingerprint",
+            "billing_repreflight_attempts",
+            "paid_api_task_approval",
+            "cost_cap_override",
+        ):
+            with self.subTest(preference=key):
+                self.assertNotIn(key, executed_payload["preferences"])
+                self.assertNotIn(key, executed_prompt)
+
+        # The internal marker is still persisted locally for execution safety.
+        persisted = self.memory.load_task(run.task.id)
+        self.assertIn("billing_preflight_fingerprint", persisted.preferences)
+        self.assertEqual(0.0, self.memory.monthly_monetary_cost())
+
+    @patch.object(
+        ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
+    )
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_user_clarification_reaches_the_approved_payload(
+        self, popen, auth_status
+    ) -> None:
+        popen.return_value = FakeProcess(cli_payload(total_cost_usd=0.0))
+        clarification = "Use option B and inspect only the approved fixture."
+        core = self.core()
+
+        task = self.claude_task()
+        task.preferences = {
+            "needs_clarification": True,
+            "clarification_question": "Which option should the plan assume?",
+        }
+        asked = core.run(task)
+        self.assertEqual(RunStatus.AWAITING_CLARIFICATION, asked.status)
+        self.assertEqual(0, len(self.model_calls(popen)))
+
+        answered = core.provide_clarification(
+            asked.session.id, asked.task.id, clarification
+        )
+        self.assertEqual(RunStatus.AWAITING_APPROVAL, answered.status)
+        self.assertEqual(clarification, answered.task.visible_assumption)
+        self.assertEqual(0, len(self.model_calls(popen)))
+
+        approved_payload, _ = self.connector._sanitized_payload(answered.task)
+        approved_prompt, _ = self.connector._build_prompt(answered.task)
+        self.assertEqual(clarification, approved_payload["visible_assumption"])
+        self.assertNotIn("clarification", approved_payload["preferences"])
+        self.assertIn(
+            "visible_assumption",
+            answered.permission_request.outbound_preview.field_names,
+        )
+
+        run = core.resume(
+            answered.session.id,
+            answered.task.id,
+            PermissionGrant.for_request(
+                answered.permission_request, remember_for_session=False
+            ),
+        )
+        self.assertEqual(RunStatus.COMPLETED, run.status)
+
+        model_calls = self.model_calls(popen)
+        self.assertEqual(1, len(model_calls))
+        command = model_calls[0].args[0]
+        executed_prompt = command[command.index("-p") + 1]
+
+        self.assertEqual(approved_prompt, executed_prompt)
+        executed_payload = self.outbound_json(executed_prompt)
+        self.assertEqual(clarification, executed_payload["visible_assumption"])
+        for key in (
+            "billing_preflight_fingerprint",
+            "billing_repreflight_attempts",
+            "paid_api_task_approval",
+            "cost_cap_override",
+            "needs_clarification",
+            "clarification_question",
+            "clarification",
+            "assumption",
+        ):
+            with self.subTest(preference=key):
+                self.assertNotIn(key, executed_payload["preferences"])
+                self.assertNotIn(f'"{key}"', executed_prompt)
+
+        persisted = self.memory.load_task(run.task.id)
+        self.assertIn("billing_preflight_fingerprint", persisted.preferences)
+        self.assertEqual(clarification, persisted.preferences["clarification"])
+        self.assertEqual(0.0, self.memory.monthly_monetary_cost())
+
+
 class ApiKeyRouteTests(BillingPolicyTestCase):
     """Test B - a metered credential in the environment blocks execution."""
 

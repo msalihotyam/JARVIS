@@ -54,6 +54,15 @@ PROHIBITED_BILLING_ENV_VARS = (
     "CLAUDE_CODE_USE_VERTEX",
 )
 
+#: The only task preferences that may leave the machine, in this order.
+#:
+#: Default-deny on purpose: AgentCore writes internal runtime, billing,
+#: approval and control markers into ``Task.preferences`` after the outbound
+#: payload has been approved. Serializing the whole mapping would change the
+#: approved payload behind the user's back, so anything not listed here - now
+#: or in the future - stays local.
+EXTERNAL_PREFERENCE_KEYS = ("preferred_connector",)
+
 #: Non-secret ``claude auth status --json`` values that together prove an
 #: OAuth, subscription-backed route with no incremental monetary charge.
 _OAUTH_AUTH_METHODS = frozenset({"claude.ai"})
@@ -208,7 +217,7 @@ class ClaudeCodeConnector(BaseConnector):
 
     def outbound_preview(self, task: Task) -> OutboundDataPreview:
         payload, redacted_count = self._sanitized_payload(task)
-        encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        encoded = self._encode_payload(payload).encode("utf-8")
         field_names = tuple(sorted(self._field_names(payload)))
         return OutboundDataPreview(
             destination="anthropic/claude-code",
@@ -421,9 +430,18 @@ class ClaudeCodeConnector(BaseConnector):
         payload, redacted_count = self._sanitized_payload(task)
         return (
             "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"
-            + json.dumps(payload, ensure_ascii=False, default=str),
+            + self._encode_payload(payload),
             redacted_count,
         )
+
+    @staticmethod
+    def _encode_payload(payload: dict[str, Any]) -> str:
+        """Canonical outbound encoding.
+
+        Keys are sorted so the approved payload and the executed payload are
+        byte-identical even though persistence round-trips reorder dictionaries.
+        """
+        return json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
 
     def _sanitized_payload(self, task: Task) -> tuple[dict[str, Any], int]:
         if task.scope.data_classification is DataClassification.SECRET:
@@ -436,21 +454,48 @@ class ClaudeCodeConnector(BaseConnector):
                         "details": "[REDACTED_SECRET_SCOPE]",
                     },
                     "context": "[REDACTED_SECRET_CLASSIFICATION]",
+                    "visible_assumption": "[REDACTED_SECRET_CLASSIFICATION]",
                     "preferences": {},
                 },
-                6,
+                7,
             )
         objective, objective_redactions = self._redact(task.objective)
         context, context_redactions = self._redact(task.context)
-        preferences, preferences_redactions = self._redact(task.preferences)
+        # The clarification the user answered with, or the assumption shown to
+        # them, travels as this one explicit field. The raw preference keys it
+        # is derived from stay local with the rest of the mapping.
+        assumption, assumption_redactions = self._redact(task.visible_assumption or "")
+        preferences, preferences_redactions = self._redact(
+            self._external_preferences(task)
+        )
         payload = {
             "objective": objective,
             "capability": task.capability,
             "scope": task.scope.to_dict(),
             "context": context,
+            "visible_assumption": assumption,
             "preferences": preferences,
         }
-        return payload, objective_redactions + context_redactions + preferences_redactions
+        return (
+            payload,
+            objective_redactions
+            + context_redactions
+            + assumption_redactions
+            + preferences_redactions,
+        )
+
+    @staticmethod
+    def _external_preferences(task: Task) -> dict[str, Any]:
+        """The approved, externally shareable slice of ``task.preferences``.
+
+        Built from the allowlist rather than from the task, so the key order is
+        stable and post-approval internal writes cannot alter the payload.
+        """
+        return {
+            key: task.preferences[key]
+            for key in EXTERNAL_PREFERENCE_KEYS
+            if key in task.preferences
+        }
 
     @classmethod
     def _redact(cls, value: Any, key: str = "") -> tuple[Any, int]:

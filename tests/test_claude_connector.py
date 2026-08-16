@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -7,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from jarvis.connectors import claude_code
 from jarvis.connectors.claude_code import (
+    EXTERNAL_PREFERENCE_KEYS,
     PROHIBITED_BILLING_ENV_VARS,
     ClaudeCodeConnector,
 )
@@ -28,6 +31,26 @@ OAUTH_MAX_AUTH_STATUS = {
     "apiProvider": "firstParty",
     "subscriptionType": "max",
 }
+
+
+#: Internal runtime/billing/approval markers AgentCore writes into
+#: ``Task.preferences`` after the outbound payload has already been approved.
+INTERNAL_PREFERENCES = {
+    "billing_preflight_fingerprint": "subscription_included|0.000000000|0|0.100000000",
+    "billing_repreflight_attempts": 2,
+    "paid_api_task_approval": "internal-approval-id",
+    "cost_cap_override": "internal-override-id",
+    "unauthorized_runtime_marker": "must-not-egress",
+}
+
+
+def canonical(payload) -> str:
+    """Deterministic encoding used only for comparing outbound payloads."""
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def patch_oauth_environment():
@@ -131,6 +154,179 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         )
         self.assertEqual("anthropic/claude-code", request.scope.destination)
         self.assertEqual("claude-code-plan", request.scope.connector)
+
+    def test_only_allowlisted_preferences_reach_the_outbound_payload(self) -> None:
+        task = self.task()
+        task.visible_assumption = "Use option B"
+        task.preferences = {
+            "preferred_connector": "claude-code-plan",
+            **INTERNAL_PREFERENCES,
+        }
+        payload, _ = self.connector._sanitized_payload(task)
+        prompt, _ = self.connector._build_prompt(task)
+        preview = self.connector.outbound_preview(task)
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+
+        self.assertEqual({"preferred_connector": "claude-code-plan"}, payload["preferences"])
+        for key in INTERNAL_PREFERENCES:
+            with self.subTest(preference=key):
+                self.assertNotIn(key, payload["preferences"])
+                self.assertNotIn(key, serialized)
+                self.assertNotIn(key, prompt)
+                self.assertNotIn(f"preferences.{key}", preview.field_names)
+        self.assertNotIn("must-not-egress", prompt)
+        self.assertIn("preferences.preferred_connector", preview.field_names)
+
+    def test_visible_assumption_is_an_explicit_external_field(self) -> None:
+        task = self.task()
+        task.visible_assumption = "Use option B"
+        task.preferences = {
+            "preferred_connector": "claude-code-plan",
+            "clarification": "Use option B",
+            "assumption": "internal assumption copy",
+            "needs_clarification": True,
+            "clarification_question": "Which option?",
+            **INTERNAL_PREFERENCES,
+        }
+        payload, _ = self.connector._sanitized_payload(task)
+        prompt, _ = self.connector._build_prompt(task)
+        preview = self.connector.outbound_preview(task)
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+
+        self.assertEqual("Use option B", payload["visible_assumption"])
+        self.assertIn('"visible_assumption": "Use option B"', prompt)
+        self.assertIn("visible_assumption", preview.field_names)
+        self.assertGreater(preview.approximate_bytes, len("Use option B"))
+        # The outbound preference object is unchanged by the new field.
+        self.assertEqual(
+            {"preferred_connector": "claude-code-plan"}, payload["preferences"]
+        )
+        # The raw keys the value is derived from never leave the machine.
+        for key in (
+            "clarification",
+            "assumption",
+            "needs_clarification",
+            "clarification_question",
+            *INTERNAL_PREFERENCES,
+        ):
+            with self.subTest(preference=key):
+                self.assertNotIn(key, payload["preferences"])
+                self.assertNotIn(f'"{key}"', serialized)
+                self.assertNotIn(f'"{key}"', prompt)
+                self.assertNotIn(f"preferences.{key}", preview.field_names)
+        self.assertNotIn("internal assumption copy", prompt)
+        self.assertNotIn("Which option?", prompt)
+
+    def test_visible_assumption_is_redacted(self) -> None:
+        task = self.task()
+        task.visible_assumption = "Reuse token sk-super-secret-123456789 as agreed"
+        baseline, baseline_count = self.connector._sanitized_payload(self.task())
+        payload, count = self.connector._sanitized_payload(task)
+        self.assertNotIn("super-secret", json.dumps(payload, default=str))
+        self.assertIn("[REDACTED]", payload["visible_assumption"])
+        self.assertEqual(baseline_count + 1, count)
+
+    def test_secret_classification_hides_the_visible_assumption(self) -> None:
+        task = self.task()
+        task.scope = ActionScope(
+            action="analyze",
+            target=str(self.root),
+            destination="anthropic/claude-code",
+            data_classification=DataClassification.SECRET,
+        )
+        task.visible_assumption = "classified clarification text"
+        payload, count = self.connector._sanitized_payload(task)
+        self.assertNotIn(
+            "classified clarification text", json.dumps(payload, default=str)
+        )
+        self.assertEqual(
+            "[REDACTED_SECRET_CLASSIFICATION]", payload["visible_assumption"]
+        )
+        self.assertGreaterEqual(count, 7)
+
+    def test_approved_payload_survives_post_approval_internal_writes(self) -> None:
+        task = self.task({"repository": "jarvis"})
+        task.visible_assumption = "Use option B and inspect only the fixture."
+        task.preferences = {"preferred_connector": "claude-code-plan"}
+
+        approved_payload, approved_redactions = self.connector._sanitized_payload(task)
+        approved_prompt, _ = self.connector._build_prompt(task)
+        approved_preview = self.connector.outbound_preview(task)
+
+        # Exactly what AgentCore records after the user approves.
+        task.preferences.update(INTERNAL_PREFERENCES)
+
+        execute_payload, execute_redactions = self.connector._sanitized_payload(task)
+        execute_prompt, _ = self.connector._build_prompt(task)
+        execute_preview = self.connector.outbound_preview(task)
+
+        self.assertEqual(
+            sha256(canonical(approved_payload)), sha256(canonical(execute_payload))
+        )
+        self.assertEqual(sha256(approved_prompt), sha256(execute_prompt))
+        self.assertEqual(approved_redactions, execute_redactions)
+        self.assertEqual(
+            approved_preview.approximate_bytes, execute_preview.approximate_bytes
+        )
+        self.assertEqual(
+            approved_preview.redacted_items, execute_preview.redacted_items
+        )
+        self.assertEqual(approved_preview.field_names, execute_preview.field_names)
+        self.assertEqual(
+            approved_preview.destination, execute_preview.destination
+        )
+        self.assertEqual(approved_payload["scope"], execute_payload["scope"])
+        self.assertEqual(
+            "anthropic/claude-code", execute_payload["scope"]["destination"]
+        )
+        self.assertEqual(
+            "Use option B and inspect only the fixture.",
+            execute_payload["visible_assumption"],
+        )
+
+    def test_canonical_payload_survives_a_persistence_round_trip(self) -> None:
+        task = self.task({"working_directory": str(self.root), "repository": "jarvis"})
+        task.visible_assumption = "Use option B"
+        task.preferences = {"preferred_connector": "claude-code-plan"}
+        before_prompt, _ = self.connector._build_prompt(task)
+
+        # Storage serializes with sorted keys, so a reloaded task has a
+        # different mapping order than the in-memory task that was approved.
+        stored = json.dumps(task.to_dict(), sort_keys=True, default=str)
+        task.context["retrieved_decision_count"] = 0
+        reloaded = Task.from_dict(json.loads(stored))
+        reloaded.preferences.update(INTERNAL_PREFERENCES)
+        after_prompt, _ = self.connector._build_prompt(reloaded)
+
+        self.assertEqual(sha256(before_prompt), sha256(after_prompt))
+        self.assertEqual(before_prompt, after_prompt)
+
+    def test_allowlisted_preferences_are_still_deeply_redacted(self) -> None:
+        task = self.task()
+        task.preferences = {"preferred_connector": "sk-super-secret-123456789"}
+        payload, count = self.connector._sanitized_payload(task)
+        self.assertEqual("[REDACTED]", payload["preferences"]["preferred_connector"])
+        self.assertGreaterEqual(count, 1)
+
+        # Recursion still applies to any structured value that is allowlisted.
+        task.preferences = {
+            "external_profile": {"nested": {"api_key": "sk-super-secret-123456789"}},
+            **INTERNAL_PREFERENCES,
+        }
+        with patch.object(
+            claude_code,
+            "EXTERNAL_PREFERENCE_KEYS",
+            ("preferred_connector", "external_profile"),
+        ):
+            nested_payload, nested_count = self.connector._sanitized_payload(task)
+        serialized = json.dumps(nested_payload, ensure_ascii=False, default=str)
+        self.assertNotIn("super-secret", serialized)
+        self.assertGreaterEqual(nested_count, 1)
+        for key in INTERNAL_PREFERENCES:
+            self.assertNotIn(key, serialized)
+
+    def test_external_preference_allowlist_is_minimal(self) -> None:
+        self.assertEqual(("preferred_connector",), EXTERNAL_PREFERENCE_KEYS)
 
     def test_secret_classification_redacts_entire_scope_details(self) -> None:
         task = Task(
