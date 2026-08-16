@@ -68,6 +68,30 @@ class PermissionMode(str, Enum):
     SMART_AUTO = "smart_auto"
 
 
+class BillingClass(str, Enum):
+    """Provider-neutral billing route of one execution.
+
+    Classification is per execution route/call, never a static connector fact.
+    """
+
+    NO_ADDITIONAL_CHARGE = "no_additional_charge"
+    SUBSCRIPTION_INCLUDED = "subscription_included"
+    METERED_MONETARY = "metered_monetary"
+    UNKNOWN = "unknown"
+
+
+class MonetaryState(str, Enum):
+    """Observation state of a monetary amount; 0.0 is not a substitute."""
+
+    MEASURED = "measured"
+    NOT_APPLICABLE = "not_applicable"
+    UNKNOWN = "unknown"
+
+
+#: Only this class can move real money and therefore the monthly ledger.
+MONETARY_BILLING_CLASSES = frozenset({BillingClass.METERED_MONETARY})
+
+
 class DataClassification(str, Enum):
     PUBLIC = "public"
     INTERNAL = "internal"
@@ -163,6 +187,7 @@ class ErrorCode(str, Enum):
     APPROVAL_REJECTED = "approval_rejected"
     COST_CAP_EXCEEDED = "cost_cap_exceeded"
     PAID_API_DISABLED = "paid_api_disabled"
+    BILLING_ROUTE_UNKNOWN = "billing_route_unknown"
     VERIFICATION_FAILED = "verification_failed"
     CANCELLED = "cancelled"
     INVALID_TASK = "invalid_task"
@@ -277,23 +302,66 @@ class OutboundDataPreview:
 
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
+    """Pre-execution billing route plus expected *monetary* spend.
+
+    ``minimum_usd``/``maximum_usd`` are real money and are only meaningful for
+    ``BillingClass.METERED_MONETARY``. A provider-side resource ceiling (for
+    example a CLI ``--max-budget-usd`` safety bound) belongs in
+    ``resource_ceiling_usd`` and never in the monthly monetary projection.
+    """
+
     provider: str | None = None
     model: str | None = None
     minimum_usd: float = 0.0
     maximum_usd: float = 0.0
     confidence: str = "unknown"
-    is_paid: bool = False
+    billing_class: BillingClass = BillingClass.UNKNOWN
+    billing_evidence: str = ""
+    resource_ceiling_usd: float | None = None
+    #: Whether this route needs the separate ``paid_api_enabled`` user switch.
+    #: This is a policy gate, not a billing classification.
+    requires_paid_api: bool = False
+
+    @property
+    def is_paid(self) -> bool:
+        """Deprecated compatibility view derived from ``billing_class``."""
+        return self.billing_class in MONETARY_BILLING_CLASSES
+
+    @property
+    def monetary_maximum_usd(self) -> float:
+        """Money this estimate may add to the monthly ledger."""
+        return self.maximum_usd if self.is_paid else 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["billing_class"] = self.billing_class.value
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "CostEstimate":
-        return cls(**(data or {}))
+        payload = dict(data or {})
+        legacy_paid = payload.pop("is_paid", None)
+        if legacy_paid:
+            # A legacy ``is_paid`` flag proves a metered, switch-gated route.
+            # A legacy false is ambiguous and must not be read as "free".
+            payload.setdefault("billing_class", BillingClass.METERED_MONETARY.value)
+            payload.setdefault("requires_paid_api", True)
+        payload["billing_class"] = BillingClass(
+            payload.get("billing_class", BillingClass.UNKNOWN.value)
+        )
+        return cls(**{key: value for key, value in payload.items() if key in _COST_FIELDS})
 
 
 @dataclass(slots=True)
 class UsageRecord:
+    """Post-execution telemetry.
+
+    ``monetary_cost_usd`` is incremental money attributable to the call and is
+    the only value the monthly ledger sums. ``reference_cost_usd`` holds a
+    provider-reported USD-equivalent that the user was not incrementally
+    billed for (subscription-included usage), and is never money.
+    """
+
     provider: str | None = None
     model: str | None = None
     connector: str | None = None
@@ -301,18 +369,63 @@ class UsageRecord:
     task_id: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    call_count: int = 0
     estimated_cost_usd: float = 0.0
-    actual_cost_usd: float = 0.0
-    is_paid: bool = False
+    billing_class: BillingClass = BillingClass.UNKNOWN
+    monetary_state: MonetaryState = MonetaryState.UNKNOWN
+    monetary_cost_usd: float | None = None
+    reference_cost_usd: float | None = None
+    billing_evidence: str = ""
     id: str = field(default_factory=lambda: str(uuid4()))
     recorded_at: str = field(default_factory=utc_now)
 
+    @property
+    def counts_toward_monetary_budget(self) -> bool:
+        return (
+            self.billing_class in MONETARY_BILLING_CLASSES
+            and self.monetary_state is MonetaryState.MEASURED
+            and self.monetary_cost_usd is not None
+        )
+
+    @property
+    def budget_amount_usd(self) -> float:
+        return (
+            float(self.monetary_cost_usd)
+            if self.counts_toward_monetary_budget and self.monetary_cost_usd is not None
+            else 0.0
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["billing_class"] = self.billing_class.value
+        data["monetary_state"] = self.monetary_state.value
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UsageRecord":
-        return cls(**(data or {}))
+        payload = dict(data or {})
+        legacy_cost = payload.pop("actual_cost_usd", None)
+        payload.pop("is_paid", None)
+        if legacy_cost is not None and "monetary_cost_usd" not in payload:
+            # Only a positive legacy amount is unambiguous incremental spend.
+            # A legacy 0.0 stays UNKNOWN instead of becoming a measured zero.
+            if float(legacy_cost) > 0:
+                payload.setdefault("monetary_cost_usd", float(legacy_cost))
+                payload.setdefault("billing_class", BillingClass.METERED_MONETARY.value)
+                payload.setdefault("monetary_state", MonetaryState.MEASURED.value)
+        payload["billing_class"] = BillingClass(
+            payload.get("billing_class", BillingClass.UNKNOWN.value)
+        )
+        payload["monetary_state"] = MonetaryState(
+            payload.get("monetary_state", MonetaryState.UNKNOWN.value)
+        )
+        return cls(
+            **{key: value for key, value in payload.items() if key in _USAGE_FIELDS}
+        )
+
+
+_COST_FIELDS = frozenset(CostEstimate.__dataclass_fields__)
+_USAGE_FIELDS = frozenset(UsageRecord.__dataclass_fields__)
 
 
 @dataclass(slots=True)
@@ -677,7 +790,7 @@ class MemoryStore(Protocol):
 
     def append_usage(self, usage: UsageRecord) -> None: ...
 
-    def monthly_actual_cost(self, month: str | None = None) -> float: ...
+    def monthly_monetary_cost(self, month: str | None = None) -> float: ...
 
     def finalize_task(
         self,

@@ -1,19 +1,43 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.connectors.claude_code import (
+    PROHIBITED_BILLING_ENV_VARS,
+    ClaudeCodeConnector,
+)
 from jarvis.contracts import (
     ActionScope,
+    BillingClass,
     DataClassification,
+    MonetaryState,
     OutcomeStatus,
     SessionState,
     Task,
 )
+
+#: Non-secret shape of ``claude auth status --json`` for a Max/OAuth session.
+OAUTH_MAX_AUTH_STATUS = {
+    "loggedIn": True,
+    "authMethod": "claude.ai",
+    "apiProvider": "firstParty",
+    "subscriptionType": "max",
+}
+
+
+def patch_oauth_environment():
+    """Deterministic Claude Max/OAuth environment without metered credentials."""
+    clean = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in PROHIBITED_BILLING_ENV_VARS
+    }
+    return patch.dict(os.environ, clean, clear=True)
 
 
 class FakeProcess:
@@ -46,6 +70,16 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
             default_working_directory=self.root,
             max_budget_usd=0.15,
         )
+        environment = patch_oauth_environment()
+        environment.start()
+        self.addCleanup(environment.stop)
+        # The auth-status probe is local and non-model; it is mocked so the
+        # suite never depends on the developer's live session.
+        auth = patch.object(
+            ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
+        )
+        auth.start()
+        self.addCleanup(auth.stop)
 
     def task(self, context=None) -> Task:
         return Task(
@@ -186,7 +220,10 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         )
         result = self.connector.execute(self.task(), SessionState())
         self.assertEqual(OutcomeStatus.ERROR, result.outcome)
-        self.assertEqual(0, result.usage.actual_cost_usd)
+        self.assertEqual(BillingClass.SUBSCRIPTION_INCLUDED, result.usage.billing_class)
+        self.assertEqual(MonetaryState.NOT_APPLICABLE, result.usage.monetary_state)
+        self.assertIsNone(result.usage.monetary_cost_usd)
+        self.assertEqual(0.0, result.usage.reference_cost_usd)
         self.assertEqual(401, result.error.details["api_error_status"])
 
 

@@ -6,9 +6,11 @@ from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     ActionScope,
     Availability,
+    BillingClass,
     CostEstimate,
     DataClassification,
     ErrorCode,
+    MonetaryState,
     OutcomeStatus,
     RiskLevel,
     SessionState,
@@ -38,9 +40,18 @@ class DummyConnector(BaseConnector):
         estimate_max: float = 0.0,
         is_paid: bool = False,
         actual_cost: float = 0.0,
+        billing_class: BillingClass | None = None,
         verification_passes: bool = True,
         outcome: OutcomeStatus = OutcomeStatus.SUCCESS,
     ) -> None:
+        # A connector that projects or reports real USD is metered by
+        # definition; anything else defaults to a free local route.
+        self._billing_class = billing_class or (
+            BillingClass.METERED_MONETARY
+            if is_paid or estimate_max > 0 or actual_cost > 0
+            else BillingClass.NO_ADDITIONAL_CHARGE
+        )
+        self._requires_paid_api = is_paid
         self.manifest = ConnectorManifest(
             name=name,
             capabilities=("echo",),
@@ -51,12 +62,12 @@ class DummyConnector(BaseConnector):
                 reversible=reversible,
                 always_requires_approval=always_requires_approval,
             ),
-            is_paid=is_paid,
+            default_billing_class=self._billing_class,
+            requires_paid_api=is_paid,
         )
         self._suitability = suitability
         self._available = available
         self._estimate_max = estimate_max
-        self._is_paid = is_paid
         self.actual_cost = actual_cost
         self.verification_passes = verification_passes
         self.outcome = outcome
@@ -76,17 +87,25 @@ class DummyConnector(BaseConnector):
             minimum_usd=0.0,
             maximum_usd=self._estimate_max,
             confidence="test",
-            is_paid=self._is_paid,
+            billing_class=self._billing_class,
+            billing_evidence="dummy_connector_fixed_route",
+            requires_paid_api=self._requires_paid_api,
         )
 
     def execute(self, task: Task, session: SessionState) -> ToolResult:
         self.execute_calls += 1
+        metered = self._billing_class is BillingClass.METERED_MONETARY
         usage = UsageRecord(
             provider="test-provider",
             model="test-model",
             connector=self.manifest.name,
-            actual_cost_usd=self.actual_cost,
-            is_paid=self.actual_cost > 0,
+            billing_class=self._billing_class,
+            monetary_state=(
+                MonetaryState.MEASURED if metered else MonetaryState.NOT_APPLICABLE
+            ),
+            monetary_cost_usd=self.actual_cost if metered else None,
+            reference_cost_usd=None if metered else (self.actual_cost or None),
+            call_count=1,
         )
         if self.outcome is OutcomeStatus.ERROR:
             return ToolResult(

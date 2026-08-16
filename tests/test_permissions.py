@@ -232,7 +232,7 @@ class PermissionPolicyTests(unittest.TestCase):
         self.assertEqual(ErrorCode.INVALID_TASK, run.error.code)
         self.assertEqual(0, connector.execute_calls)
         self.assertIsNone(self.memory.load_task(pre_staged.id))
-        self.assertEqual(0.0, self.memory.monthly_actual_cost())
+        self.assertEqual(0.0, self.memory.monthly_monetary_cost())
         self.assertEqual([], self.memory.list_decisions(run.session.id))
 
         # The same worst-case task still reaches the approval gate normally.

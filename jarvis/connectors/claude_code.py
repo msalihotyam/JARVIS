@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,9 +14,11 @@ from typing import Any
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     Availability,
+    BillingClass,
     CostEstimate,
     DataClassification,
     ErrorCode,
+    MonetaryState,
     OutboundDataPreview,
     OutcomeStatus,
     RiskLevel,
@@ -41,6 +44,22 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 )
 
+#: Environment variables that route the CLI to a metered or unverifiable
+#: billing path. Only their presence is ever inspected, never their value.
+PROHIBITED_BILLING_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+#: Non-secret ``claude auth status --json`` values that together prove an
+#: OAuth, subscription-backed route with no incremental monetary charge.
+_OAUTH_AUTH_METHODS = frozenset({"claude.ai"})
+_FIRST_PARTY_PROVIDERS = frozenset({"firstparty", "first_party"})
+_SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
+
 
 class ClaudeCodeConnector(BaseConnector):
     manifest = ConnectorManifest(
@@ -55,7 +74,10 @@ class ClaudeCodeConnector(BaseConnector):
             always_requires_approval=True,
         ),
         timeout_seconds=120,
-        is_paid=False,
+        # The CLI can run through a subscription, a metered API key or an
+        # unverifiable gateway, so the real route is probed per call in
+        # estimate_cost(). UNKNOWN is the fail-closed manifest default.
+        default_billing_class=BillingClass.UNKNOWN,
     )
 
     def __init__(
@@ -65,6 +87,7 @@ class ClaudeCodeConnector(BaseConnector):
         default_working_directory: str | Path | None = None,
         timeout_seconds: int | None = None,
         max_budget_usd: float = 0.25,
+        auth_probe_timeout_seconds: int = 20,
     ) -> None:
         default_root = Path(default_working_directory or Path.cwd()).resolve()
         roots = allowed_roots or (default_root,)
@@ -74,9 +97,11 @@ class ClaudeCodeConnector(BaseConnector):
         self.default_working_directory = default_root
         self.command = command
         self.timeout_seconds = timeout_seconds or self.manifest.timeout_seconds
+        # Per-call Claude CLI *resource* safety ceiling, not expected spend.
         self.max_budget_usd = max_budget_usd
         if self.max_budget_usd <= 0:
             raise ValueError("max_budget_usd must be positive")
+        self.auth_probe_timeout_seconds = auth_probe_timeout_seconds
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._process_lock = threading.Lock()
         self._last_payload_meta: dict[str, dict[str, Any]] = {}
@@ -88,16 +113,98 @@ class ClaudeCodeConnector(BaseConnector):
         return Availability(True)
 
     def estimate_cost(self, task: Task) -> CostEstimate:
-        if task.estimate.maximum_usd > 0:
-            return task.estimate
+        """Classify the billing route before any monetary preflight decision."""
+        billing_class, evidence = self.billing_route()
+        metered = billing_class is BillingClass.METERED_MONETARY
         return CostEstimate(
             provider="anthropic",
             model=None,
             minimum_usd=0.0,
-            maximum_usd=self.max_budget_usd,
-            confidence="guardrail_limit",
-            is_paid=False,
+            # Only a metered route projects real money. The CLI ceiling is a
+            # containment bound and is reported separately.
+            maximum_usd=self.max_budget_usd if metered else 0.0,
+            confidence="auth_route_probe",
+            billing_class=billing_class,
+            billing_evidence=evidence,
+            resource_ceiling_usd=self.max_budget_usd,
         )
+
+    def billing_route(self) -> tuple[BillingClass, str]:
+        """Positively establish the auth/billing route, or fail closed.
+
+        Returns a provider-neutral class and a safe, non-secret evidence tag.
+        Absence of an API key alone is never sufficient evidence.
+        """
+        if self.prohibited_billing_env_vars():
+            return (
+                BillingClass.UNKNOWN,
+                "claude_env:prohibited_metered_credential_present",
+            )
+        status = self._auth_status()
+        if status is None:
+            return BillingClass.UNKNOWN, "claude_auth_status:unavailable"
+        if status.get("loggedIn") is not True:
+            return BillingClass.UNKNOWN, "claude_auth_status:not_logged_in"
+        auth_method = str(status.get("authMethod") or "").strip().casefold()
+        provider = str(status.get("apiProvider") or "").strip().casefold()
+        subscription = str(status.get("subscriptionType") or "").strip().casefold()
+        if (
+            auth_method not in _OAUTH_AUTH_METHODS
+            or provider not in _FIRST_PARTY_PROVIDERS
+        ):
+            return BillingClass.UNKNOWN, "claude_auth_status:unsupported_auth_route"
+        if subscription not in _SUBSCRIPTION_TYPES:
+            return BillingClass.UNKNOWN, "claude_auth_status:no_subscription_evidence"
+        return BillingClass.SUBSCRIPTION_INCLUDED, "claude_auth_status:oauth_subscription"
+
+    @staticmethod
+    def prohibited_billing_env_vars() -> tuple[str, ...]:
+        """Names of prohibited variables that are *present*, empty or not.
+
+        Presence, never truthiness: the policy requires the variable to be
+        absent. Values are never read, compared, logged or persisted.
+        """
+        present = {key.upper() for key in os.environ}
+        return tuple(
+            name for name in PROHIBITED_BILLING_ENV_VARS if name.upper() in present
+        )
+
+    def _auth_status(self) -> dict[str, Any] | None:
+        """Local, non-model auth probe. Raw output never leaves this method."""
+        try:
+            completed = subprocess.run(
+                [self.command, "auth", "status", "--json"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.auth_probe_timeout_seconds,
+                shell=False,
+                env=self._sanitized_environment(),
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _sanitized_environment() -> dict[str, str]:
+        """Child environment with metered credential routes removed.
+
+        Matching is case-insensitive so Windows environment casing cannot
+        smuggle a prohibited variable through.
+        """
+        prohibited = {name.upper() for name in PROHIBITED_BILLING_ENV_VARS}
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() not in prohibited
+        }
 
     def outbound_preview(self, task: Task) -> OutboundDataPreview:
         payload, redacted_count = self._sanitized_payload(task)
@@ -113,6 +220,21 @@ class ClaudeCodeConnector(BaseConnector):
         )
 
     def execute(self, task: Task, session: SessionState) -> ToolResult:
+        # Re-verify the billing route here: nothing may spawn the external
+        # model command on a metered or unestablished route.
+        billing_class, evidence = self.billing_route()
+        if billing_class is BillingClass.UNKNOWN:
+            return self._error_result(
+                task,
+                ErrorCode.BILLING_ROUTE_UNKNOWN,
+                "Billing route could not be established; the Claude model call "
+                "was not started.",
+                details={"billing_evidence": evidence},
+                retryable=False,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+            )
+
         try:
             working_directory = self._working_directory(task.context)
         except ValueError as exc:
@@ -121,6 +243,8 @@ class ClaudeCodeConnector(BaseConnector):
                 ErrorCode.CONNECTOR_FAILED,
                 str(exc),
                 retryable=False,
+                billing_class=billing_class,
+                billing_evidence=evidence,
             )
 
         prompt, redacted_count = self._build_prompt(task)
@@ -135,6 +259,9 @@ class ClaudeCodeConnector(BaseConnector):
                 encoding="utf-8",
                 errors="replace",
                 shell=False,
+                # Defense in depth: metered credential routes are stripped
+                # from the external model subprocess environment.
+                env=self._sanitized_environment(),
             )
         except FileNotFoundError:
             return self._error_result(
@@ -142,6 +269,8 @@ class ClaudeCodeConnector(BaseConnector):
                 ErrorCode.CONNECTOR_UNAVAILABLE,
                 "Claude Code CLI is not installed or is not on PATH.",
                 retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
             )
 
         with self._process_lock:
@@ -156,6 +285,9 @@ class ClaudeCodeConnector(BaseConnector):
                 ErrorCode.CONNECTOR_FAILED,
                 "Claude Code did not finish before the timeout.",
                 retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+                call_count=1,
             )
         finally:
             with self._process_lock:
@@ -166,7 +298,7 @@ class ClaudeCodeConnector(BaseConnector):
                 outcome=OutcomeStatus.CANCELLED,
                 summary="Claude Code task was cancelled.",
                 error=StructuredError(ErrorCode.CANCELLED, "Task cancelled"),
-                usage=self._usage(task, {}),
+                usage=self._usage(task, {}, billing_class, evidence, call_count=1),
             )
 
         payload = self._parse_payload(stdout)
@@ -179,9 +311,12 @@ class ClaudeCodeConnector(BaseConnector):
                 "Claude Code returned an unreadable response.",
                 details={"cli_detail": str(safe_detail)[:1000]},
                 retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+                call_count=1,
             )
 
-        usage = self._usage(task, payload)
+        usage = self._usage(task, payload, billing_class, evidence, call_count=1)
         result_text = str(payload.get("result") or "").strip()
         failed = process.returncode != 0 or bool(payload.get("is_error"))
         metadata = {
@@ -370,10 +505,38 @@ class ClaudeCodeConnector(BaseConnector):
                 return payload
         return None
 
-    def _usage(self, task: Task, payload: dict[str, Any]) -> UsageRecord:
+    def _usage(
+        self,
+        task: Task,
+        payload: dict[str, Any],
+        billing_class: BillingClass = BillingClass.UNKNOWN,
+        billing_evidence: str = "",
+        call_count: int = 0,
+    ) -> UsageRecord:
         usage_data = payload.get("usage") or {}
         model_usage = payload.get("modelUsage") or {}
         model = str(next(iter(model_usage))) if isinstance(model_usage, dict) and model_usage else None
+        reported_cost = payload.get("total_cost_usd")
+        reported_usd = float(reported_cost) if reported_cost is not None else None
+        if billing_class is BillingClass.METERED_MONETARY:
+            monetary_state = (
+                MonetaryState.MEASURED if reported_usd is not None else MonetaryState.UNKNOWN
+            )
+            monetary_cost = reported_usd
+            reference_cost = None
+        elif billing_class in (
+            BillingClass.SUBSCRIPTION_INCLUDED,
+            BillingClass.NO_ADDITIONAL_CHARGE,
+        ):
+            # The CLI still reports a USD-equivalent for subscription usage.
+            # It is reference telemetry, never incremental user spend.
+            monetary_state = MonetaryState.NOT_APPLICABLE
+            monetary_cost = None
+            reference_cost = reported_usd
+        else:
+            monetary_state = MonetaryState.UNKNOWN
+            monetary_cost = None
+            reference_cost = reported_usd
         return UsageRecord(
             provider="anthropic",
             model=model,
@@ -381,9 +544,14 @@ class ClaudeCodeConnector(BaseConnector):
             task_id=task.id,
             input_tokens=int(usage_data.get("input_tokens") or 0),
             output_tokens=int(usage_data.get("output_tokens") or 0),
-            estimated_cost_usd=task.estimate.maximum_usd,
-            actual_cost_usd=float(payload.get("total_cost_usd") or 0.0),
-            is_paid=float(payload.get("total_cost_usd") or 0.0) > 0,
+            # External model-call attempts. The local auth probe is not one.
+            call_count=call_count,
+            estimated_cost_usd=task.estimate.monetary_maximum_usd,
+            billing_class=billing_class,
+            monetary_state=monetary_state,
+            monetary_cost_usd=monetary_cost,
+            reference_cost_usd=reference_cost,
+            billing_evidence=billing_evidence,
         )
 
     def _error_result(
@@ -394,10 +562,13 @@ class ClaudeCodeConnector(BaseConnector):
         *,
         details: dict[str, Any] | None = None,
         retryable: bool,
+        billing_class: BillingClass = BillingClass.UNKNOWN,
+        billing_evidence: str = "",
+        call_count: int = 0,
     ) -> ToolResult:
         return ToolResult(
             outcome=OutcomeStatus.ERROR,
             summary=message,
             error=StructuredError(code, message, details or {}, retryable),
-            usage=self._usage(task, {}),
+            usage=self._usage(task, {}, billing_class, billing_evidence, call_count),
         )

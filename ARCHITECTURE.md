@@ -84,10 +84,40 @@ Her proje ayrı bağlam ve oturumlara sahip olabilir. Bir çalışma oturumu hed
 
 ## 7. Maliyet yönetimi
 
+### 7.1 Sağlayıcıdan bağımsız faturalandırma sınıfı (kullanıcı kararı)
+
+Kullanıcı kararı: **abonelik kapsamındaki kullanım parasal harcama değildir.** Agent Core, Claude'a özgü faturalandırma kavramlarını öğrenmez; yalnızca sağlayıcıdan bağımsız bir sınıflandırma tüketir.
+
+- `NO_ADDITIONAL_CHARGE`: ek ücret doğurmayan yerel/ücretsiz yol.
+- `SUBSCRIPTION_INCLUDED`: mevcut abonelikle karşılanan, ek parasal ücret doğurmayan yol (Claude Max / OAuth).
+- `METERED_MONETARY`: API anahtarı, kullandıkça öde veya kredi gibi gerçek artımlı harcama doğuran yol.
+- `UNKNOWN`: yol güvenilir biçimde belirlenemedi.
+
+Parasal gözlem durumu ayrıca `MEASURED`, `NOT_APPLICABLE` ve `UNKNOWN` olarak ayrılır; üç durum tek bir `0.0` sayısıyla temsil edilmez ve parasal tutar gerektiğinde `null` kalır.
+
+Kurallar:
+
+- Aylık 20 USD parasal defterine yalnızca `METERED_MONETARY` sınıflı ve `MEASURED` durumundaki gerçek harcama girer.
+- `SUBSCRIPTION_INCLUDED` ve `NO_ADDITIONAL_CHARGE` kullanım 20 USD sert sınırını tüketmez; uydurma sıfır maliyet de üretilmez.
+- Sağlayıcı, faturalandırılmayan kullanım için USD karşılığı bildirirse bu değer yalnızca referans/telemetri (`reference_cost_usd`) olarak saklanır, parasal harcama sayılmaz.
+- Güvenilir biçimde elde edilebiliyorsa token, çağrı sayısı, sağlayıcı, model ve connector telemetrisi kaydedilir.
+- **Uygulanan:** bilinmeyen parasal maliyet ölçülmüş sıfır olarak temsil edilmez; parasal gözlem durumu açıktır; abonelik/referans maliyeti ölçülmüş harcamadan ayrılmıştır.
+- **Ertelendi (kullanıcı kararı):** `input_tokens` ve `output_tokens` şimdilik eski, null olamayan tamsayı alanlar olarak kalır. Telemetri gelmediğinde eski sıfır gösterimi kullanılır; bu sıfır, ölçülmüş sıfır tokenlı bir çağrının kanıtı olarak yorumlanmamalıdır. Null yapılabilir token telemetrisi veya açık token gözlem durumu ayrı ve odaklı bir migration'da ele alınacaktır. Uzun vadeli politika hedefi değişmedi: güvenilir biçimde elde edilemeyen telemetri, ölçülmüş sıfırdan ayırt edilebilir kalmalıdır.
+- Bağlantılı kural: bir connector'ın faturalandırma sınıfını görev (task) değil connector belirler. Kalıcılaştırılmış bir task kendi "ücretsiz" sınıflandırmasını yürütmeye taşıyamaz; sınıf her çağrıda connector'dan yeniden türetilir.
+- `UNKNOWN` sessizce sıfır sayılmaz. Yol belirlenemiyorsa görev harici çağrıdan **önce** kapalı biçimde durur (fail closed). Sınıflandırmasını bildirmeyen bir connector varsayılan olarak `UNKNOWN` kalır; ücretsiz/yerel olduğu bilinen connector bunu açıkça `NO_ADDITIONAL_CHARGE` olarak beyan etmek zorundadır.
+- Kalıcılaştırılmış bir task geç aşamadan (`TOOL_SELECTION`/`EXECUTE`) devam ettirilse bile, `connector.execute()` çağrılmadan önce faturalandırma sınıfı yeniden türetilir ve parasal ön kontrolden geçtiği doğrulanır. Politika girdileri (sınıf, parasal üst sınır, ücretli API gereksinimi, kaynak tavanı) değişmişse görev yürütülmez; `COST_PREFLIGHT` aşamasına geri döner ve gerekli tüm parasal onaylar yeniden alınır.
+- `COST_PREFLIGHT` uygulanabilir tüm parasal kapıları sırayla değerlendirir: ücretli API onayı aylık sert sınır onayının yerine geçmez ve bir grant başka bir isteği karşılamaz.
+- Sınıflandırma her çalıştırma yolu/çağrısı için yapılır; `ConnectorManifest` tek doğruluk kaynağı değildir ve en geç maliyet ön kontrolünde hazır olmalıdır.
+- Abonelik kapsamındaki kullanımda da dışarı veri gönderme onayı ve tüm olağan güvenlik/izin politikası yürürlüktedir.
+- Claude Max / OAuth tespiti connector sınırının içinde kalır: metered kimlik bilgisi ortam değişkenleri yoksa ve yerel, modelsiz `claude auth status --json` yoklaması OAuth + abonelik kanıtını olumlu biçimde verirse yol `SUBSCRIPTION_INCLUDED` olur. Ham çıktı yazdırılmaz veya saklanmaz; yalnızca `billing_evidence` gibi gizli olmayan kanıt etiketi kaydedilir.
+- Claude CLI `--max-budget-usd` değeri **çağrı başına kaynak güvenlik tavanıdır**, beklenen parasal harcama değildir. Aylık parasal projeksiyona eklenmez.
+
+### 7.2 Parasal politika
+
 - Tüm faturalandırılabilir connector/model kullanımı için aylık hedef **20 USD**, kullanıcı onayı olmadan geçilemeyecek sert üst sınır da **20 USD**'dir.
 - Her ücretli görevden önce mümkünse model, tahmini token, tahmini maliyet aralığı ve belirsizlik gösterilir.
 - Çalışma sırasında gerçek token ve yaklaşık dolar karşılığı izlenebilir; görev sonunda gerçek kullanım kaydedilir.
-- Aylık gerçek kullanım SQLite usage ledger'da toplanır. Görev öncesi maksimum tahmin mevcut aylık harcamayla birlikte 20 USD'yi aşarsa görev durur ve yalnızca o göreve bağlı açık cost-override grant'iyle devam eder.
+- Aylık gerçek parasal kullanım SQLite usage ledger'da toplanır; toplama yalnızca `METERED_MONETARY` + `MEASURED` kayıtları dahil eder. Görev öncesi maksimum parasal tahmin mevcut aylık harcamayla birlikte 20 USD'yi aşarsa görev durur ve yalnızca o göreve bağlı açık cost-override grant'iyle devam eder.
 - `paid_api_enabled` varsayılan olarak false kalır; kalıcı olarak açılması kaydedilmiş açık kullanıcı karar kimliği gerektirir. Kapalıyken ücretli bir görev ayrıca göreve özel billing onayı ister.
 - Yerel işlem, ilgili bağlamı seçerek küçültme, özetleme ve gereksiz model çağrılarını önleme temel optimizasyonlardır.
 - Aynı işi iki büyük modele gereksiz yere yaptırmak varsayılan değildir.

@@ -91,8 +91,8 @@ class InMemoryStore:
     def append_usage(self, usage: UsageRecord) -> None:
         self.usage[usage.id] = copy.deepcopy(usage)
 
-    def monthly_actual_cost(self, month: str | None = None) -> float:
-        return sum(item.actual_cost_usd for item in self.usage.values())
+    def monthly_monetary_cost(self, month: str | None = None) -> float:
+        return sum(item.budget_amount_usd for item in self.usage.values())
 
     def finalize_task(
         self,

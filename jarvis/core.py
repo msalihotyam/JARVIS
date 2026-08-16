@@ -9,6 +9,7 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     ActionScope,
     AgentRun,
+    BillingClass,
     CostEstimate,
     DataClassification,
     DecisionRecord,
@@ -40,6 +41,13 @@ from jarvis.registry import (
     ToolRegistry,
 )
 from jarvis.settings import Settings
+
+
+#: Task preference holding the billing fingerprint that cleared cost preflight.
+BILLING_PREFLIGHT_KEY = "billing_preflight_fingerprint"
+BILLING_REPREFLIGHT_COUNT_KEY = "billing_repreflight_attempts"
+#: Bound on preflight <-> execute round trips caused by a changing route.
+BILLING_REPREFLIGHT_LIMIT = 3
 
 
 class AgentCore:
@@ -278,6 +286,12 @@ class AgentCore:
                 return connector
 
             if task.stage is LoopStage.RISK_PERMISSION:
+                # The billing route is established before the user is asked for
+                # anything and before cost preflight, tool selection or
+                # execution can be reached.
+                billing_failure = self._billing_route_failure(session, task, connector)
+                if billing_failure is not None:
+                    return billing_failure
                 request = self.memory.load_pending_approval(task.id, session.id)
                 if request is None or is_expired(request.expires_at):
                     request = connector.permission_request(
@@ -311,13 +325,19 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.COST_PREFLIGHT:
-                estimate = connector.estimate_cost(task)
-                task.estimate = estimate
-                current_spend = self.memory.monthly_actual_cost()
-                projected = current_spend + estimate.maximum_usd
+                # Re-classified here rather than trusting the persisted value:
+                # the route is a property of this call, not of the task.
+                billing_failure = self._billing_route_failure(session, task, connector)
+                if billing_failure is not None:
+                    return billing_failure
+                estimate = task.estimate
+                # Only genuinely metered money is projected against the cap.
+                monetary_maximum = estimate.monetary_maximum_usd
+                current_spend = self.memory.monthly_monetary_cost()
+                projected = current_spend + monetary_maximum
                 request: PermissionRequest | None = None
                 waiting_status = RunStatus.AWAITING_COST_OVERRIDE
-                if estimate.is_paid and not self.settings.paid_api_enabled and not task.preferences.get(
+                if estimate.requires_paid_api and not self.settings.paid_api_enabled and not task.preferences.get(
                     "paid_api_task_approval"
                 ):
                     request = self._cost_permission_request(
@@ -329,7 +349,7 @@ class AgentCore:
                     )
                     waiting_status = RunStatus.AWAITING_APPROVAL
                 elif (
-                    estimate.maximum_usd > 0
+                    monetary_maximum > 0
                     and projected > self.settings.monthly_hard_limit_usd
                     and not task.preferences.get("cost_cap_override")
                 ):
@@ -357,11 +377,28 @@ class AgentCore:
                     if approval_run is not None:
                         return approval_run
                     if request.scope.action.endswith("enable_paid_api_for_task"):
-                        task.preferences["paid_api_task_approval"] = request.id
+                        marker = "paid_api_task_approval"
                     else:
-                        task.preferences["cost_cap_override"] = request.id
+                        marker = "cost_cap_override"
+                    task.preferences[marker] = request.id
                     if consumed:
+                        # One grant satisfies exactly one request.
                         active_grant = None
+                    # Re-enter preflight so every remaining monetary gate is
+                    # evaluated. Each resolved gate records its own marker, so
+                    # this converges instead of looping.
+                    self.memory.persist_checkpoint(
+                        session,
+                        task,
+                        "monetary_gate_approved",
+                        {"gate": marker, "request_id": request.id},
+                    )
+                    continue
+                # No monetary gate remains: record the exact policy inputs that
+                # were cleared so execution can prove it ran on this estimate.
+                task.preferences[BILLING_PREFLIGHT_KEY] = self._billing_fingerprint(
+                    estimate
+                )
                 task.stage = LoopStage.TOOL_SELECTION
                 self.memory.persist_checkpoint(
                     session,
@@ -369,8 +406,11 @@ class AgentCore:
                     "cost_preflight_passed",
                     {
                         "current_month_usd": current_spend,
-                        "estimated_max_usd": estimate.maximum_usd,
+                        "monetary_max_usd": monetary_maximum,
                         "projected_usd": projected,
+                        "billing_class": estimate.billing_class.value,
+                        "billing_evidence": estimate.billing_evidence,
+                        "resource_ceiling_usd": estimate.resource_ceiling_usd,
                     },
                 )
                 continue
@@ -397,6 +437,17 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.EXECUTE:
+                # Last gate before the connector runs. A persisted task can be
+                # resumed straight into this stage, so the billing route is
+                # re-derived here and never taken from the stored estimate.
+                billing_failure = self._billing_route_failure(session, task, connector)
+                if billing_failure is not None:
+                    return billing_failure
+                if not self._billing_preflight_is_current(task):
+                    repreflight = self._require_billing_preflight(session, task)
+                    if repreflight is not None:
+                        return repreflight
+                    continue
                 task.status = TaskStatus.RUNNING
                 try:
                     result = connector.execute(task, session)
@@ -411,14 +462,22 @@ class AgentCore:
                         ),
                         usage=UsageRecord(
                             connector=connector.manifest.name,
-                            estimated_cost_usd=task.estimate.maximum_usd,
+                            estimated_cost_usd=task.estimate.monetary_maximum_usd,
+                            billing_class=task.estimate.billing_class,
+                            billing_evidence=task.estimate.billing_evidence,
                         ),
                     )
                 result.usage.session_id = session.id
                 result.usage.task_id = task.id
                 result.usage.connector = result.usage.connector or connector.manifest.name
+                if result.usage.billing_class is BillingClass.UNKNOWN:
+                    # The route was positively established at cost preflight.
+                    result.usage.billing_class = task.estimate.billing_class
+                    result.usage.billing_evidence = (
+                        result.usage.billing_evidence or task.estimate.billing_evidence
+                    )
                 result.usage.estimated_cost_usd = max(
-                    result.usage.estimated_cost_usd, task.estimate.maximum_usd
+                    result.usage.estimated_cost_usd, task.estimate.monetary_maximum_usd
                 )
                 self.memory.append_usage(result.usage)
                 task.result_snapshot = self._result_to_dict(result)
@@ -547,6 +606,85 @@ class AgentCore:
                     ErrorCode.INVALID_TASK, f"Unsupported loop stage: {task.stage.value}"
                 ),
             )
+
+    @staticmethod
+    def _billing_fingerprint(estimate: CostEstimate) -> str:
+        """The billing-critical policy inputs, without the evidence string.
+
+        Evidence is deliberately excluded so a reworded, policy-equivalent
+        classification cannot bounce a task between stages forever.
+        """
+        ceiling = estimate.resource_ceiling_usd
+        return "|".join(
+            (
+                estimate.billing_class.value,
+                f"{estimate.monetary_maximum_usd:.9f}",
+                str(int(estimate.requires_paid_api)),
+                "none" if ceiling is None else f"{float(ceiling):.9f}",
+            )
+        )
+
+    def _billing_preflight_is_current(self, task: Task) -> bool:
+        """Whether this exact estimate is the one that cleared cost preflight."""
+        recorded = task.preferences.get(BILLING_PREFLIGHT_KEY)
+        return bool(recorded) and recorded == self._billing_fingerprint(task.estimate)
+
+    def _require_billing_preflight(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Send a task back through monetary preflight, with a loop bound."""
+        repeats = int(task.preferences.get(BILLING_REPREFLIGHT_COUNT_KEY, 0)) + 1
+        if repeats > BILLING_REPREFLIGHT_LIMIT:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.BILLING_ROUTE_UNKNOWN,
+                    "The billing route keeps changing between preflight and "
+                    "execution; refusing to run an external call.",
+                    details={"repreflight_attempts": repeats},
+                ),
+            )
+        task.preferences[BILLING_REPREFLIGHT_COUNT_KEY] = repeats
+        # Approvals were granted against the superseded policy inputs, so the
+        # applicable monetary gates must be re-evaluated from scratch.
+        stale = task.preferences.pop(BILLING_PREFLIGHT_KEY, None)
+        task.preferences.pop("paid_api_task_approval", None)
+        task.preferences.pop("cost_cap_override", None)
+        task.stage = LoopStage.COST_PREFLIGHT
+        task.status = TaskStatus.PENDING
+        self.memory.persist_checkpoint(
+            session,
+            task,
+            "billing_preflight_required",
+            {
+                "reason": "stale_or_missing_billing_preflight",
+                "previous_fingerprint": stale,
+                "current_fingerprint": self._billing_fingerprint(task.estimate),
+                "attempt": repeats,
+            },
+        )
+        return None
+
+    def _billing_route_failure(
+        self, session: SessionState, task: Task, connector: BaseConnector
+    ) -> AgentRun | None:
+        """Classify the billing route and fail closed when it is unknown."""
+        estimate = connector.estimate_cost(task)
+        task.estimate = estimate
+        if estimate.billing_class is not BillingClass.UNKNOWN:
+            return None
+        # Never assume a free route and never invent a zero cost.
+        return self._terminal_failure(
+            session,
+            task,
+            StructuredError(
+                ErrorCode.BILLING_ROUTE_UNKNOWN,
+                "The billing route could not be established; "
+                "refusing to run an external call.",
+                details={"billing_evidence": estimate.billing_evidence},
+            ),
+        )
 
     def _connector_for_task(self, task: Task) -> BaseConnector | AgentRun:
         try:
@@ -745,7 +883,9 @@ class AgentCore:
                     session_id=session.id,
                     task_id=task.id,
                     connector=task.selected_connector,
-                    estimated_cost_usd=task.estimate.maximum_usd,
+                    estimated_cost_usd=task.estimate.monetary_maximum_usd,
+                    billing_class=task.estimate.billing_class,
+                    billing_evidence=task.estimate.billing_evidence,
                 ),
             )
         task.result_snapshot = self._result_to_dict(result)

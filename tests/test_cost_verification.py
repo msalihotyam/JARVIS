@@ -5,8 +5,10 @@ import unittest
 from pathlib import Path
 
 from jarvis.contracts import (
+    BillingClass,
     ErrorCode,
     LoopStage,
+    MonetaryState,
     PermissionGrant,
     PermissionMode,
     RunStatus,
@@ -36,7 +38,13 @@ class CostAndVerificationTests(unittest.TestCase):
         )
 
     def test_hard_cap_blocks_until_explicit_override(self) -> None:
-        self.memory.append_usage(UsageRecord(actual_cost_usd=19.90, is_paid=True))
+        self.memory.append_usage(
+            UsageRecord(
+                billing_class=BillingClass.METERED_MONETARY,
+                monetary_state=MonetaryState.MEASURED,
+                monetary_cost_usd=19.90,
+            )
+        )
         connector = DummyConnector(estimate_max=0.20)
         core = self.core(connector)
         first = core.run(make_task())
@@ -81,7 +89,7 @@ class CostAndVerificationTests(unittest.TestCase):
         connector = DummyConnector(actual_cost=0.07)
         run = self.core(connector).run(make_task())
         self.assertEqual(RunStatus.COMPLETED, run.status)
-        self.assertAlmostEqual(0.07, self.memory.monthly_actual_cost())
+        self.assertAlmostEqual(0.07, self.memory.monthly_monetary_cost())
         records = self.memory.usage_records()
         self.assertEqual(1, len(records))
         self.assertEqual(run.task.id, records[0].task_id)
@@ -92,7 +100,7 @@ class CostAndVerificationTests(unittest.TestCase):
         connector = DummyConnector(actual_cost=0.05, outcome=OutcomeStatus.ERROR)
         run = self.core(connector).run(make_task())
         self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertAlmostEqual(0.05, self.memory.monthly_actual_cost())
+        self.assertAlmostEqual(0.05, self.memory.monthly_monetary_cost())
 
     def test_verification_failure_prevents_completion_and_decision(self) -> None:
         connector = DummyConnector(verification_passes=False)

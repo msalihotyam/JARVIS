@@ -52,7 +52,9 @@ Bu devam oturumunda aşağıdakiler tamamlandı:
 6. Aylık hedef ve sert üst sınır 20 USD'ye indirildi; preflight tahmini, hard-cap block ve açık override modeli uygulandı.
 7. Claude Code connector allowed roots, derin secret redaction, outbound metadata, `--safe-mode`, strict/empty MCP, açık read-only tool listesi, no-session-persistence ve çağrı başı bütçe korumasıyla güçlendirildi. `--bare` ve permission bypass kullanılmaz.
 8. Eski kullanıcı dosyaları silinmeden compatibility wrapper'a dönüştürüldü; `pyproject.toml`, README, CLI entrypoint ve Windows test betiği eklendi.
-9. Toplam 36 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, loop giriş aşaması koruması, Windows Python sürüm koruması ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
+9. Toplam 63 yerel/mock test izin, maliyet, iptal, doğrulama, registry, migration, restart/persistence, storage abstraction, loop giriş aşaması koruması, Windows Python sürüm koruması, faturalandırma sınıfı politikası ve Claude güvenlik davranışlarını kapsar. Hem doğrudan unittest komutuyla hem `scripts/test.ps1` üzerinden başarıyla geçmiştir.
+10. Sağlayıcıdan bağımsız faturalandırma sınıfı (`BillingClass`) ve parasal gözlem durumu (`MonetaryState`) sözleşmeye eklendi; usage ledger şeması 3'e additive migration ile yükseltildi. Claude connector, harici model çağrısından önce yerel ve modelsiz `claude auth status --json` yoklamasıyla Claude Max/OAuth yolunu doğrular, metered kimlik bilgisi ortam değişkeni **varsa (boş değerle bile)** veya yol belirlenemezse çağrıyı başlatmadan durur ve model alt sürecine temizlenmiş ortam verir.
+11. Bağımsız inceleme sonrası dört düzeltme uygulandı: (a) kalıcılaştırılmış geç aşama devamı artık faturalandırma ön kontrolünü atlayamaz, (b) ücretli API onayı aylık sert sınır kapısını atlamaz, (c) sınıflandırma bildirmeyen connector `UNKNOWN` kalır (fail closed), (d) yasaklı kimlik bilgisi ortam değişkeni boş değerle de engeller.
 
 Claude Code CLI sürüm `2.1.232` olarak kurulu bulundu. Resmi, etkileşimsiz JSON çağrısı denendi; hesap Max aboneliğiyle tanınıyor fakat OAuth erişim belirteci süresi dolduğu için sunucu `401` döndürdü. Denemenin raporlanan maliyeti `0 USD` oldu ve hiçbir dosya değiştirilmedi.
 
@@ -77,8 +79,12 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
 
 ## Maliyet ve onay sınırları
 
+- **Kullanıcı kararı (yeni):** Claude Code, kullanıcının mevcut Claude Max aboneliği/OAuth oturumu üzerinden çalıştığında ve ek ölçülen parasal ücret doğurmadığında bu kullanım JARVIS'in 20 USD aylık parasal bütçesini tüketmez, ücretli API kullanımı sayılmaz ve uydurma USD harcaması üretilmez. Güvenilir biçimde elde edilebilen token/model/çağrı sayısı/sağlayıcı telemetrisi kaydedilebilir; dışarı veri gönderme onayı ve tüm güvenlik/izin politikası aynen geçerlidir.
+- **Token telemetrisi durumu:** Parasal tarafta bilinmeyen değer ölçülmüş sıfıra dönüştürülmez. Ancak `input_tokens`/`output_tokens` kullanıcı kararıyla şimdilik eski, null olamayan tamsayı alanlar olarak bırakılmıştır; telemetri yoksa eski sıfır gösterimi kullanılır ve bu sıfır ölçülmüş sıfır token kanıtı sayılmamalıdır. Null yapılabilir token telemetrisi ayrı bir migration'da ele alınacaktır.
+- Gerçek artımlı harcama doğuran yollar (Anthropic API anahtarı, kullandıkça öde, kredi vb.) için olağan parasal politika sürer: gerekli yerde maliyet onayı, parasal kullanım defteri ve 20 USD sert sınırı.
+- Faturalandırma yolu güvenilir biçimde belirlenemiyorsa ücretsiz varsayılmaz, sıfır maliyet uydurulmaz; görev harici çağrıdan önce kapalı biçimde durur.
 - Faturalandırılabilir model/connector kullanımı için aylık hedef: 20 USD.
-- Kullanıcı onayı olmadan geçilemeyecek sert üst sınır: 20 USD.
+- Kullanıcı onayı olmadan geçilemeyecek sert üst sınır: 20 USD. Bu sınıra yalnızca gerçek, ölçülmüş `METERED_MONETARY` harcama girer.
 - Henüz hiçbir ücretli API anahtarı eklenmemiştir ve eklenmeyecektir.
 - Claude Max aboneliği şirket tarafından karşılandığı için, resmi biçimde mümkünse Claude Code CLI üzerinden bundan yararlanmak önceliklidir; Anthropic API'ye otomatik geçiş yapılmaz.
 - ChatGPT Plus ve diğer aboneliklerin kapatılması bu geliştirme aşamasının parçası değildir; ancak JARVIS olgunlaştıktan ve gerçek kullanım/maliyet ölçüldükten sonra kullanıcı tarafından değerlendirilir.

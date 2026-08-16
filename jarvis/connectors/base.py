@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from jarvis.contracts import (
     ActionScope,
     Availability,
+    BillingClass,
     CostEstimate,
     OutboundDataPreview,
     PermissionRequest,
@@ -32,7 +33,13 @@ class ConnectorManifest:
     default_risk: RiskLevel = RiskLevel.LOW
     default_side_effect: SideEffectProfile = SideEffectProfile()
     timeout_seconds: int = 120
-    is_paid: bool = False
+    #: Fail-closed by default: a connector that never declares or derives its
+    #: billing route stays UNKNOWN and is refused before execution. A local or
+    #: free connector must say NO_ADDITIONAL_CHARGE explicitly; connectors with
+    #: more than one possible route must override estimate_cost().
+    default_billing_class: BillingClass = BillingClass.UNKNOWN
+    #: Whether this connector needs the separate ``paid_api_enabled`` switch.
+    requires_paid_api: bool = False
 
 
 class BaseConnector(ABC):
@@ -48,10 +55,17 @@ class BaseConnector(ABC):
         return Availability(True)
 
     def estimate_cost(self, task: Task) -> CostEstimate:
-        estimate = task.estimate
-        if self.manifest.is_paid and not estimate.is_paid:
-            return replace(estimate, is_paid=True)
-        return estimate
+        # The connector, never the task, is the source of billing truth: a
+        # persisted task must not be able to carry its own "this is free"
+        # classification into execution.
+        return replace(
+            task.estimate,
+            billing_class=self.manifest.default_billing_class,
+            billing_evidence="connector_manifest_default_route",
+            requires_paid_api=(
+                task.estimate.requires_paid_api or self.manifest.requires_paid_api
+            ),
+        )
 
     def side_effects(self, task: Task) -> SideEffectProfile:
         task_effect = task.side_effect

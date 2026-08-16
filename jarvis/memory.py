@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from jarvis.contracts import (
+    BillingClass,
     DecisionRecord,
     LoopCheckpoint,
+    MonetaryState,
     PermissionGrant,
     PermissionRequest,
     SessionState,
@@ -21,7 +23,17 @@ from jarvis.contracts import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: Columns added by migration 3. Applied additively so existing rows survive.
+_USAGE_BILLING_COLUMNS = (
+    ("billing_class", "TEXT"),
+    ("monetary_state", "TEXT"),
+    ("monetary_cost_usd", "REAL"),
+    ("reference_cost_usd", "REAL"),
+    ("call_count", "INTEGER"),
+    ("billing_evidence", "TEXT"),
+)
 
 
 class SQLiteMemoryStore:
@@ -128,7 +140,46 @@ class SQLiteMemoryStore:
         if target_version == 2:
             self._create_current_schema(connection)
             return
+        if target_version == 3:
+            self._migrate_usage_billing(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
+
+    @staticmethod
+    def _migrate_usage_billing(connection: sqlite3.Connection) -> None:
+        """Add provider-neutral billing columns without touching existing rows."""
+        existing = {
+            row[1] for row in connection.execute("PRAGMA table_info(usage_ledger)")
+        }
+        if not existing:
+            # Table not created yet (fresh database); the current schema below
+            # already declares the columns.
+            return
+        for name, column_type in _USAGE_BILLING_COLUMNS:
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE usage_ledger ADD COLUMN {name} {column_type}"
+                )
+        # A positive legacy amount is unambiguous incremental spend and must
+        # keep counting against the monthly hard limit.
+        connection.execute(
+            """
+            UPDATE usage_ledger
+               SET billing_class = ?, monetary_state = ?, monetary_cost_usd = actual_cost_usd
+             WHERE billing_class IS NULL AND actual_cost_usd > 0
+            """,
+            (BillingClass.METERED_MONETARY.value, MonetaryState.MEASURED.value),
+        )
+        # A legacy zero is ambiguous: it may be an unbilled subscription call
+        # or a missing measurement. It stays unknown, never a measured zero.
+        connection.execute(
+            """
+            UPDATE usage_ledger
+               SET billing_class = ?, monetary_state = ?, monetary_cost_usd = NULL
+             WHERE billing_class IS NULL
+            """,
+            (BillingClass.UNKNOWN.value, MonetaryState.UNKNOWN.value),
+        )
 
     def _create_current_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -227,8 +278,17 @@ class SQLiteMemoryStore:
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 estimated_cost_usd REAL NOT NULL,
+                -- actual_cost_usd and is_paid are deprecated compatibility
+                -- columns kept for older readers. Monetary accounting reads
+                -- billing_class/monetary_state/monetary_cost_usd only.
                 actual_cost_usd REAL NOT NULL,
                 is_paid INTEGER NOT NULL,
+                billing_class TEXT,
+                monetary_state TEXT,
+                monetary_cost_usd REAL,
+                reference_cost_usd REAL,
+                call_count INTEGER,
+                billing_evidence TEXT,
                 recorded_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE SET NULL,
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
@@ -479,8 +539,10 @@ class SQLiteMemoryStore:
             INSERT OR REPLACE INTO usage_ledger
                 (id, session_id, task_id, provider, model, connector,
                  input_tokens, output_tokens, estimated_cost_usd,
-                 actual_cost_usd, is_paid, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 actual_cost_usd, is_paid, billing_class, monetary_state,
+                 monetary_cost_usd, reference_cost_usd, call_count,
+                 billing_evidence, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 usage.id,
@@ -492,21 +554,36 @@ class SQLiteMemoryStore:
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.estimated_cost_usd,
-                usage.actual_cost_usd,
-                int(usage.is_paid),
+                # Deprecated compatibility columns, never read for accounting.
+                usage.budget_amount_usd,
+                int(usage.billing_class is BillingClass.METERED_MONETARY),
+                usage.billing_class.value,
+                usage.monetary_state.value,
+                usage.monetary_cost_usd,
+                usage.reference_cost_usd,
+                usage.call_count,
+                usage.billing_evidence,
                 usage.recorded_at,
             ),
         )
 
-    def monthly_actual_cost(self, month: str | None = None) -> float:
+    def monthly_monetary_cost(self, month: str | None = None) -> float:
+        """Only measured, genuinely metered spend counts against the cap."""
         month_key = month or datetime.now(timezone.utc).strftime("%Y-%m")
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT COALESCE(SUM(actual_cost_usd), 0) FROM usage_ledger
+                SELECT COALESCE(SUM(monetary_cost_usd), 0) FROM usage_ledger
                 WHERE substr(recorded_at, 1, 7) = ?
+                  AND billing_class = ?
+                  AND monetary_state = ?
+                  AND monetary_cost_usd IS NOT NULL
                 """,
-                (month_key,),
+                (
+                    month_key,
+                    BillingClass.METERED_MONETARY.value,
+                    MonetaryState.MEASURED.value,
+                ),
             ).fetchone()
         return float(row[0])
 
@@ -516,7 +593,9 @@ class SQLiteMemoryStore:
                 """
                 SELECT id, session_id, task_id, provider, model, connector,
                        input_tokens, output_tokens, estimated_cost_usd,
-                       actual_cost_usd, is_paid, recorded_at
+                       billing_class, monetary_state, monetary_cost_usd,
+                       reference_cost_usd, call_count, billing_evidence,
+                       recorded_at
                 FROM usage_ledger ORDER BY recorded_at, id
                 """
             ).fetchall()
@@ -531,8 +610,16 @@ class SQLiteMemoryStore:
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
                 estimated_cost_usd=row["estimated_cost_usd"],
-                actual_cost_usd=row["actual_cost_usd"],
-                is_paid=bool(row["is_paid"]),
+                billing_class=BillingClass(
+                    row["billing_class"] or BillingClass.UNKNOWN.value
+                ),
+                monetary_state=MonetaryState(
+                    row["monetary_state"] or MonetaryState.UNKNOWN.value
+                ),
+                monetary_cost_usd=row["monetary_cost_usd"],
+                reference_cost_usd=row["reference_cost_usd"],
+                call_count=row["call_count"] or 0,
+                billing_evidence=row["billing_evidence"] or "",
                 recorded_at=row["recorded_at"],
             )
             for row in rows
