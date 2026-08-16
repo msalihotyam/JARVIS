@@ -29,30 +29,66 @@ def is_expired(timestamp: str | None) -> bool:
     return datetime.fromisoformat(timestamp) <= datetime.now(timezone.utc)
 
 
+def normalize_symbol(value: str | Path | None) -> str:
+    """Normalize a symbolic identifier without touching the filesystem.
+
+    Used for names that merely *look* like paths, such as
+    ``anthropic/claude-code``. The result never depends on the current working
+    directory, so a permission fingerprint stays stable wherever JARVIS runs.
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split()).casefold()
+
+
+def _normalize_url(text: str) -> str | None:
+    parsed = urlsplit(text)
+    if not (parsed.scheme and parsed.netloc):
+        return None
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            parsed.query,
+            "",
+        )
+    )
+
+
 def normalize_locator(value: str | Path | None) -> str:
+    """Normalize a filesystem/URL locator to an absolute, canonical form."""
     if value is None:
         return ""
     text = str(value).strip()
     if not text:
         return ""
-    parsed = urlsplit(text)
-    if parsed.scheme and parsed.netloc:
-        return urlunsplit(
-            (
-                parsed.scheme.lower(),
-                parsed.netloc.lower(),
-                parsed.path or "/",
-                parsed.query,
-                "",
-            )
-        )
+    url = _normalize_url(text)
+    if url is not None:
+        return url
     looks_like_path = bool(re.match(r"^[A-Za-z]:[\\/]", text)) or any(
         separator in text for separator in ("/", "\\")
     )
     if looks_like_path:
         resolved = Path(text).expanduser().resolve(strict=False)
         return os.path.normcase(str(resolved)).replace("\\", "/")
-    return " ".join(text.split()).casefold()
+    return normalize_symbol(text)
+
+
+def normalize_destination(value: str | Path | None) -> str:
+    """Normalize an outbound destination endpoint.
+
+    A destination is a real URL or a symbolic provider/connector endpoint such
+    as ``anthropic/claude-code``. It is never resolved against the working
+    directory; a filesystem location belongs in ``ActionScope.target``.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    url = _normalize_url(text)
+    return url if url is not None else normalize_symbol(text)
 
 
 class RiskLevel(IntEnum):
@@ -229,11 +265,15 @@ class ActionScope:
     data_classification: DataClassification = DataClassification.INTERNAL
 
     def normalized(self) -> "ActionScope":
+        # Field-aware on purpose: only ``target`` is a filesystem/URL locator.
+        # ``action`` and ``connector`` are symbolic names, and ``destination``
+        # is an outbound endpoint (symbolic or URL) - none of them may be
+        # expanded against the current working directory.
         return ActionScope(
-            action=normalize_locator(self.action),
+            action=normalize_symbol(self.action),
             target=normalize_locator(self.target),
-            connector=normalize_locator(self.connector),
-            destination=normalize_locator(self.destination),
+            connector=normalize_symbol(self.connector),
+            destination=normalize_destination(self.destination),
             data_classification=self.data_classification,
         )
 

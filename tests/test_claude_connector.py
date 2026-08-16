@@ -119,6 +119,19 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         self.assertGreater(preview.approximate_bytes, 0)
         self.assertEqual(DataClassification.SENSITIVE, preview.data_classification)
 
+    def test_approval_scope_destination_matches_the_outbound_preview(self) -> None:
+        task = self.task()
+        request = self.connector.permission_request(task, "session-1")
+        self.assertEqual(
+            "anthropic/claude-code", request.outbound_preview.destination
+        )
+        # The user approves exactly the destination they are shown.
+        self.assertEqual(
+            request.outbound_preview.destination, request.scope.destination
+        )
+        self.assertEqual("anthropic/claude-code", request.scope.destination)
+        self.assertEqual("claude-code-plan", request.scope.connector)
+
     def test_secret_classification_redacts_entire_scope_details(self) -> None:
         task = Task(
             objective="classified objective",

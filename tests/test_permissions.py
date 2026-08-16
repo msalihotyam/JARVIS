@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -7,13 +9,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jarvis.contracts import (
+    ActionScope,
     ErrorCode,
     LoopStage,
     PermissionGrant,
     PermissionMode,
+    PermissionRequest,
     RiskLevel,
     RunStatus,
     SideEffect,
+    SideEffectProfile,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
@@ -255,6 +260,107 @@ class PermissionPolicyTests(unittest.TestCase):
             PermissionGrant.for_request(first.permission_request),
         )
         self.assertEqual(RunStatus.COMPLETED, resumed.status)
+
+
+class ScopeNormalizationTests(unittest.TestCase):
+    """A scope field is normalized by what it means, not by its punctuation."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    @staticmethod
+    def request_for(destination: str) -> PermissionRequest:
+        return PermissionRequest(
+            task_id="task-1",
+            session_id="session-1",
+            scope=ActionScope(
+                action="analyze",
+                target="resource-a",
+                connector="claude-code-plan",
+                destination=destination,
+            ),
+            risk_level=RiskLevel.MEDIUM,
+            side_effect=SideEffectProfile(effect=SideEffect.EXTERNAL_EGRESS),
+            reason="normalization test",
+        )
+
+    def test_symbolic_destination_is_not_expanded_to_a_path(self) -> None:
+        scope = ActionScope(action="analyze", destination="anthropic/claude-code")
+        normalized = scope.normalized()
+        self.assertEqual("anthropic/claude-code", normalized.destination)
+        self.assertEqual("anthropic/claude-code", scope.to_dict()["destination"])
+        cwd = os.path.normcase(str(Path.cwd())).replace("\\", "/")
+        self.assertNotIn(cwd, normalized.destination)
+        self.assertIsNone(re.match(r"^[A-Za-z]:", normalized.destination))
+
+    def test_symbolic_action_and_connector_stay_symbolic(self) -> None:
+        normalized = ActionScope(
+            action="  Plan/Analyze  ",
+            connector="Claude-Code-Plan",
+        ).normalized()
+        self.assertEqual("plan/analyze", normalized.action)
+        self.assertEqual("claude-code-plan", normalized.connector)
+
+    def test_symbolic_destination_fingerprint_is_working_directory_independent(
+        self,
+    ) -> None:
+        before = self.request_for("anthropic/claude-code").scope_fingerprint
+        elsewhere = self.root / "çalışma-ü"
+        elsewhere.mkdir()
+        original = Path.cwd()
+        os.chdir(elsewhere)
+        try:
+            inside = self.request_for("anthropic/claude-code")
+            self.assertEqual("anthropic/claude-code", inside.scope.normalized().destination)
+            self.assertEqual(before, inside.scope_fingerprint)
+        finally:
+            os.chdir(original)
+        self.assertEqual(before, self.request_for("anthropic/claude-code").scope_fingerprint)
+
+    def test_changing_a_symbolic_destination_changes_the_fingerprint(self) -> None:
+        self.assertNotEqual(
+            self.request_for("anthropic/claude-code").scope_fingerprint,
+            self.request_for("anthropic/other-endpoint").scope_fingerprint,
+        )
+
+    def test_filesystem_target_keeps_canonical_path_normalization(self) -> None:
+        (self.root / "sub").mkdir()
+        mixed = f"{self.root}\\sub\\..\\sub\\file.txt"
+        forward = f"{str(self.root).replace(chr(92), '/')}/sub/file.txt"
+        normalized = ActionScope(action="read", target=mixed).normalized().target
+        self.assertEqual(
+            normalized, ActionScope(action="read", target=forward).normalized().target
+        )
+        self.assertNotIn("\\", normalized)
+        self.assertTrue(normalized.endswith("/sub/file.txt"))
+        expected_root = os.path.normcase(str(self.root)).replace("\\", "/")
+        self.assertTrue(normalized.startswith(expected_root))
+        if os.name == "nt":
+            self.assertRegex(normalized, r"^[a-z]:/")
+
+    def test_relative_filesystem_target_still_resolves_against_the_cwd(self) -> None:
+        original = Path.cwd()
+        os.chdir(self.root)
+        try:
+            normalized = ActionScope(action="read", target="sub/file.txt").normalized()
+        finally:
+            os.chdir(original)
+        expected = os.path.normcase(str(self.root / "sub" / "file.txt")).replace(
+            "\\", "/"
+        )
+        self.assertEqual(expected, normalized.target)
+
+    def test_url_normalization_is_unchanged(self) -> None:
+        normalized = ActionScope(
+            action="post",
+            target="HTTPS://API.Example.COM/v1/Send?x=1#fragment",
+            destination="HTTPS://API.Example.COM/v1/Send?x=1#fragment",
+        ).normalized()
+        expected = "https://api.example.com/v1/Send?x=1"
+        self.assertEqual(expected, normalized.target)
+        self.assertEqual(expected, normalized.destination)
 
 
 if __name__ == "__main__":

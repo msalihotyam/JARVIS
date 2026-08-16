@@ -235,7 +235,7 @@ class MaxSubscriptionBillingTests(BillingPolicyTestCase):
         first = core.run(self.claude_task())
         # External egress approval is still mandatory for subscription usage.
         self.assertEqual(RunStatus.AWAITING_APPROVAL, first.status)
-        self.assertIn(
+        self.assertEqual(
             "anthropic/claude-code", first.permission_request.scope.destination
         )
         self.assertIsNotNone(first.permission_request.outbound_preview)
