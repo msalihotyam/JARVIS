@@ -220,7 +220,7 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
     def test_visible_assumption_is_redacted(self) -> None:
         task = self.task()
         task.visible_assumption = "Reuse token sk-super-secret-123456789 as agreed"
-        baseline, baseline_count = self.connector._sanitized_payload(self.task())
+        _, baseline_count = self.connector._sanitized_payload(self.task())
         payload, count = self.connector._sanitized_payload(task)
         self.assertNotIn("super-secret", json.dumps(payload, default=str))
         self.assertIn("[REDACTED]", payload["visible_assumption"])

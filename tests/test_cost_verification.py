@@ -10,7 +10,6 @@ from jarvis.contracts import (
     LoopStage,
     MonetaryState,
     PermissionGrant,
-    PermissionMode,
     RunStatus,
     TaskStatus,
     UsageRecord,
