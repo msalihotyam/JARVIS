@@ -70,6 +70,58 @@ Sıradaki adımlar:
 3. Yazma yeteneğini yalnızca ayrı bir açık izin kapsamıyla, geri alınabilir test projesinde ve yeni güvenlik incelemesiyle değerlendir.
 4. OpenAI API'yi yalnızca kullanıcı açıkça onayladıktan, güncel model/fiyat bilgisi doğrulandıktan ve harcama korumaları hazırlandıktan sonra bağla.
 
+## Development Tooling — non-product
+
+Bu bölüm yalnızca geliştirme ortamını ve kalite araçlarını kaydeder. Buradaki
+hiçbir madde ürün mimarisi, çalışma zamanı bağımlılığı veya JARVIS davranışı
+değildir; `ARCHITECTURE.md` kapsamına girmez.
+
+- **Claude HUD:** Kullanıcı kapsamında kurulu ve aktif. JARVIS reposuna dosya eklemez.
+- **CodeBurn 0.9.20:** Bağımsız global CLI; projeye bağımlı değildir. Gösterdiği
+  USD değerleri API fiyat karşılığı **tahminidir**; Claude Max üzerinden oluşan
+  gerçek ek harcama değildir ve JARVIS'in parasal defterine girmez.
+- **Ruff 0.16.0 baseline:** Geniş denetimde 35 bulgu.
+- **Bandit 1.9.4 baseline:** 4 Low, 0 Medium, 0 High.
+- **Bilinçli tasarım olarak korunan bulgular:** `RUF009` (frozen `SideEffectProfile`
+  varsayılanı), `PLW1510` (`returncode` zaten elle kontrol ediliyor) ve iki
+  `BLE001` (`jarvis/core.py` içindeki sistem sınırı hata dönüşümleri; ikincisi
+  connector hatasında kullanım/muhasebe kaydının yazılmasını garanti eder).
+  Bunlar düzeltilmemiş borç değildir; otomatik düzeltme uygulanmamalıdır.
+- **Temizlenen test artıkları:** İki kullanılmayan test bağlaması `13c2a73`
+  commit'inde kaldırıldı.
+- **Blocking kalite kapısı:** `scripts/quality.ps1`. Tam denetim için
+  `scripts/quality.ps1 -Audit`. Araçlar `uvx` ile sabit sürümde çalışır;
+  runtime `dependencies` boş kalır.
+- **Ertelendi:** `pip-audit` ve `uv.lock`. Tetikleyici: ilk gerçek üçüncü taraf
+  runtime bağımlılığı, ikinci bir makine veya CI ihtiyacı. Bunlardan biri
+  oluşana kadar eklenmez.
+
+### Deferred candidates — not installed
+
+Aşağıdakilerin **hiçbiri kurulu değildir, denenmemiştir ve seçilmemiştir.** Bu
+liste yalnızca ileride değerlendirilebilecek adayları ve hangi koşulda
+değerlendirileceklerini kaydeder; bir karar, taahhüt veya yol haritası değildir.
+Hiçbiri ürün mimarisinin parçası değildir ve `ARCHITECTURE.md` kapsamına girmez.
+Her biri, sırası geldiğinde ayrı ve açık kullanıcı onayıyla ele alınır.
+
+- **Anthropic Frontend Design:** Gerçek UI geliştirmesi başladığında değerlendirilecek.
+- **Context7:** Üçüncü taraf framework/API kullanımı arttığında, yalnız ihtiyaç
+  halinde ve proje kapsamında değerlendirilecek.
+- **CodeGraph vs Serena:** Repo büyüyüp yerleşik kod keşfi yetersiz kaldığında
+  kontrollü karşılaştırma yapılacak; ikisi aynı anda kullanılmayacak.
+- **Playwright MCP:** UI testi veya tarayıcı otomasyonu aşamasına gelindiğinde,
+  önce yalnız geliştirme/test ortamında değerlendirilecek.
+- **Crawl4AI:** İleride web içerik çıkarma connector'ı olarak; domain allowlist,
+  prompt-injection savunması ve external-egress onayıyla değerlendirilecek.
+- **OpenViking:** Mevcut sade/deterministik hafıza gerçekten yetersiz kaldığında
+  değerlendirilecek.
+- **Addy Osmani agent-skills:** Tam paket yerine yalnız ihtiyaç duyulan beceriler
+  seçilecek.
+- **Ponytail:** Güvenlik kritik olmayan tek bir görevde kontrollü pilot
+  yapılmadan global kullanılmayacak.
+- **Obsidian Skills:** Obsidian açıkça bilgi sistemi olarak seçilirse
+  değerlendirilecek.
+
 ## İlk kabul ölçütleri
 
 API anahtarı olmadan çalışan ilk çekirdek sürüm:

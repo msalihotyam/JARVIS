@@ -40,6 +40,30 @@ Doğrudan Python ile:
 python -m unittest discover -s tests -v
 ```
 
+## Kalite kontrolü
+
+Bloklayıcı kontrol. Yalnız temel Ruff hata kuralları (`E4`, `E7`, `E9`, `F`) ve
+`MEDIUM`/`HIGH` seviyesindeki Bandit bulguları başarısızlık sayılır:
+
+```powershell
+.\scripts\quality.ps1
+```
+
+Bloklamayan tam denetim. Tüm Ruff bulgularını ve `LOW` dahil tüm Bandit
+bulgularını gösterir:
+
+```powershell
+.\scripts\quality.ps1 -Audit
+```
+
+- Araçlar `uvx` ile sabit sürümde çalıştırılır: Ruff `0.16.0`, Bandit `1.9.4`.
+  Projeye kurulmazlar ve runtime bağımlılığı eklemezler; `dependencies` boş kalır.
+- Ruff format ve otomatik düzeltme kullanılmaz.
+- Bloklayıcı kontrolün kapsamı dışında kalan bulgular gizlenmiş değildir;
+  `-Audit` çıktısında tam olarak görünürler.
+- `-Audit` bulguları bloklamaz, fakat araç çalıştırma hatasını gizlemez:
+  Ruff veya Bandit çalışamazsa betik aynı hata koduyla çıkar.
+
 ## Yerel durum kontrolü
 
 ```powershell
