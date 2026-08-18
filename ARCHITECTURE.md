@@ -53,6 +53,37 @@ Bu döngü kod, araştırma, dosya, tarayıcı ve bilgisayar kontrolü görevler
 
 Connector'lar ortak bir arayüz kullanacaktır. Sağlayıcıya veya belirli bir CLI'a özgü ayrıntılar Agent Core'a sızmayacaktır.
 
+### 4.1 Yürütülebilir CLI yüzeyi ve composition root (B1, uygulandı)
+
+Kesinleşen kararlar:
+
+- Uygulama bileşimi tek bir composition root'ta toplanır (`jarvis/app.py`). Üretim sırası: `Settings` → `SQLiteMemoryStore` → `ToolRegistry` → `ClaudeCodeConnector` → kayıt → `AgentCore` → `JarvisApp`. Bileşim sırasında availability, faturalandırma yoklaması veya model çalıştırması yapılmaz.
+- Üretim Claude connector'ının izinli tek kökü ve çalışma dizini başlangıç CWD'sidir; çağrı başına kaynak tavanı `Settings.claude_call_budget_usd` değerinden gelir.
+- Bağımlılıklar `create_app(...)` ile enjekte edilebilir. Testler kendi ayar, bellek ve sahte connector'larını verir; üretim connector'ı kurulmaz.
+- CLI yedi komut sunar: `status`, `run`, `resume`, `clarify`, `approve`, `reject`, `cancel`. Komutsuz çağrı `status` ile aynıdır ve status çıktısı geriye dönük uyumlu kalır.
+- `Settings.permission_mode` tek çalışma zamanı politika kaynağıdır. Öncelik: açık CLI bayrağı, verilen `Settings`, varsayılan. Mod yalnız o çağrı için geçerlidir; task girdisinden alınmaz ve task girdisine yazılmaz.
+- Status yolu yalnızca `Settings` ve yerel SQLite meta verisini kullanır; connector kurmaz, yoklamaz, seçmez, çalıştırmaz.
+
+Güvenilmeyen task girdisi:
+
+- Task JSON'u **default-deny** bir allowlist ile alan alan okunur. `Task.from_dict()` güvenilmeyen girdi için kullanılmaz.
+- Tanınmayan veya korumalı alan yok sayılmaz, reddedilir. Kimlik, durum, aşama, plan, estimate, risk, yan etki, result snapshot, clarification, onay/grant durumu, fingerprint ve faturalandırma işaretleri girdiden kabul edilmez; içeride üretilir veya connector'a aittir.
+- Girdi UTF-8 olmalı, en çok 256 KiB olmalı, kökü nesne olmalıdır. Yinelenen JSON anahtarı ve finite olmayan sayı reddedilir. Dosya ve stdin okumaları sınırın bir byte fazlasıyla sınırlıdır; büyük girdi belleğe alınmadan reddedilir.
+- `scope.destination` verilmezse `anthropic/claude-code` olur; verilirse normalize edilmiş değeri buna eşit olmak zorundadır. `context.inputs` opak kullanıcı içeriğidir, kontrol alanı değildir.
+
+Onay semantiği:
+
+- `approve` ve `reject` yalnızca `load_pending_approval(task_id, session_id)` ile yüklenen tam kaydı kullanır. Verilen request ID ve fingerprint yalnızca karşılaştırma kanıtıdır; grant'e kopyalanmaz.
+- Eşleşmeyen veya süresi dolmuş istek yeniden hesaplanmaz, değiştirilmez ve iş çalıştırılmaz.
+- Grant yalnızca `PermissionGrant.for_request(...)` ile üretilir. Varsayılan onay tek seferliktir.
+- `--remember-for-session` yalnızca mevcut yeniden kullanım koşullarının tamamı sağlanırsa kabul edilir: etkin mod `session`, yan etki zorunlu değil, risk `HIGH` altında ve işlem geri alınabilir. Aksi halde grant üretilmeden durur. Zorunlu onaylı dışarı veri gönderimi bu nedenle tek seferlik kalır.
+
+Çıktı ve çıkış kodları:
+
+- Status dışındaki her komut tek, sabit anahtarlı, deterministik ve redakte edilmiş bir JSON zarfı yazar (`sort_keys=True`, `allow_nan=False`, ASCII kaçışlı, CP1254 güvenli). Aynı `AgentRun` byte-özdeş serileşir.
+- Zarf yalnızca allowlist'lenmiş alanları taşır. Task objective'i, context'i, preferences'ı, planı, result snapshot'ı, ham outbound payload/prompt, kimlik bilgileri, keyfi `result.data` ve keyfi `StructuredError.details` yazdırılmaz. Dışarı gönderilen veriyi yalnızca connector'ın kalıcılaştırdığı redakte `OutboundDataPreview` temsil eder. Zarfa giren her metin ayrıca secret-key/secret-value redaksiyonundan geçer.
+- Çıkış kodları: `0` tamamlandı, `10` onay/maliyet override bekleniyor, `11` clarification bekleniyor, `20` ret, `21` iptal, `64` geçersiz argüman/JSON/şema/task girdisi veya uygun yetenek yok, `66` session/task/bekleyen istek bulunamadı, `77` politika-güvenlik reddi, `70` connector veya doğrulama hatası ya da beklenmeyen iç hata. Argüman ayrıştırma hataları da aynı zarfla `64` döner; `--help` `0` döner.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:
