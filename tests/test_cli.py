@@ -807,6 +807,40 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(25.0, payload["billing"]["monetary_maximum_usd"])
         self.assertEqual(0, connector.execute_calls)
 
+    def test_retrieved_memory_never_appears_in_the_envelope(self) -> None:
+        marker = "RETRIEVALMARKERALPHA"
+        code, output, _ = self.invoke(
+            ["run", "--task-json", self.task_file(objective="seed objective one")],
+            FakeConnector(summary=f"{marker} decision summary"),
+        )
+        self.assertEqual(0, code)
+        session_id = json.loads(output)["session"]["id"]
+
+        code, output, _ = self.invoke(
+            [
+                "run",
+                "--task-json",
+                self.task_file(objective="retrievalmarkeralpha decision review"),
+                "--session-id",
+                session_id,
+            ],
+            FakeConnector(summary="second run summary"),
+        )
+        self.assertEqual(0, code)
+        payload = json.loads(output)
+        # Retrieval happened and is persisted with the task...
+        task = self.memory.load_task(payload["task"]["id"])
+        self.assertTrue(task.retrieved_context.items)
+        self.assertIn(marker, task.retrieved_context.items[0].summary)
+        # ...but the deterministic envelope reveals none of it.
+        self.assertNotIn(marker, output)
+        self.assertNotIn("retrieved", output)
+        self.assertNotIn("relevance", output)
+        self.assertNotIn("candidate_count", output)
+        self.assertEqual(
+            {"id", "status", "stage", "selected_connector"}, set(payload["task"])
+        )
+
     def test_no_auth_probe_or_model_process_is_ever_reached(self) -> None:
         connector = FakeConnector(side_effect=SideEffect.EXTERNAL_EGRESS, preview=True)
         payload, session_id, task_id = self.start_awaiting_approval(connector)

@@ -10,15 +10,20 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from jarvis.contracts import (
+    RETRIEVAL_CANDIDATE_WINDOW,
     BillingClass,
+    DataClassification,
     DecisionRecord,
     LoopCheckpoint,
+    MemoryRetrievalQuery,
     MonetaryState,
     PermissionGrant,
     PermissionRequest,
+    RetrievedContext,
     SessionState,
     Task,
     UsageRecord,
+    build_retrieved_context,
     utc_now,
 )
 
@@ -671,6 +676,61 @@ class SQLiteMemoryStore:
                 (session_id,),
             ).fetchall()
         return [DecisionRecord.from_dict(json.loads(row[0])) for row in rows]
+
+    def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext:
+        """Bounded, deterministic retrieval over same-session decisions.
+
+        Only the newest ``RETRIEVAL_CANDIDATE_WINDOW`` decisions of the query
+        session are examined, the current task is excluded, and every
+        classification is recovered from the persisted source task, failing
+        closed as SECRET when that recovery is impossible.
+        """
+        sql = (
+            "SELECT d.decision_json, t.state_json FROM decision_log AS d "
+            "LEFT JOIN tasks AS t ON t.id = d.task_id "
+            "WHERE d.session_id = ?"
+        )
+        parameters: list[Any] = [query.session_id]
+        if query.exclude_task_id is not None:
+            sql += " AND d.task_id != ?"
+            parameters.append(query.exclude_task_id)
+        sql += " ORDER BY d.created_at DESC, d.id ASC LIMIT ?"
+        parameters.append(RETRIEVAL_CANDIDATE_WINDOW)
+        with self._connection() as connection:
+            current_classification: DataClassification | None = None
+            if query.exclude_task_id is not None:
+                current_row = connection.execute(
+                    "SELECT state_json FROM tasks WHERE id = ?",
+                    (query.exclude_task_id,),
+                ).fetchone()
+                if current_row is not None:
+                    current_classification = self._classification_from_state(
+                        current_row[0]
+                    )
+            rows = connection.execute(sql, parameters).fetchall()
+        candidates: list[tuple[DecisionRecord, DataClassification]] = []
+        for row in rows:
+            try:
+                record = DecisionRecord.from_dict(json.loads(row[0]))
+            except (TypeError, KeyError, ValueError):
+                # An unreadable decision row cannot be scored or shown.
+                continue
+            candidates.append((record, self._classification_from_state(row[1])))
+        return build_retrieved_context(query, current_classification, candidates)
+
+    @staticmethod
+    def _classification_from_state(state_json: Any) -> DataClassification:
+        """Recover a task's classification from its persisted JSON.
+
+        A missing, unparseable or incomplete source task fails closed as
+        SECRET so its decision can never become externally eligible.
+        """
+        try:
+            return DataClassification(
+                json.loads(state_json)["scope"]["data_classification"]
+            )
+        except (TypeError, KeyError, ValueError):
+            return DataClassification.SECRET
 
     def list_events(self, session_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:

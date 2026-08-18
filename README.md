@@ -13,7 +13,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 
 ## Yapı
 
-- `jarvis/contracts.py`: görev, kapsam, izin, sonuç, doğrulama ve protocol sözleşmeleri.
+- `jarvis/contracts.py`: görev, kapsam, izin, sonuç, doğrulama, bağlam getirme ve protocol sözleşmeleri.
 - `jarvis/core.py`: checkpoint bırakan resumable Agent Loop state machine.
 - `jarvis/app.py`: composition root, güvenilmeyen task JSON sınırı, komut cephesi ve redakte edilmiş çıktı zarfı.
 - `jarvis/cli.py`: yürütülebilir komut yüzeyi ve çıkış kodu eşlemesi.
@@ -169,6 +169,23 @@ etiketli kimlik bilgilerini de (`password=`, `api_key:`, `authorization:`,
 `_`/`-`/boşluk varyantları) `[REDACTED]` ile değiştirir. Sayısal kullanım
 telemetrisi (`input_tokens`, `output_tokens`, `call_count`, parasal alanlar)
 alan adı "token" içerse bile redakte edilmez.
+
+### Bağlam getirme (aynı oturum kararları)
+
+`CONTEXT_RETRIEVAL` aşamasında çekirdek, aynı oturumdaki tamamlanmış kararları
+deterministik bir token kesişimiyle puanlar ve tipli `Task.retrieved_context`
+anlık görüntüsü olarak kalıcılaştırır. Sorgu yalnızca objective, capability,
+scope.action ve scope.target alanlarından kurulur; `context.inputs` ve
+preferences sorguya girmez. En yeni 50 karar incelenir; sınıflandırma
+uygunluğu kaynak task'tan geri kazanılır (okunamayan kayıt SECRET sayılır ve
+dışa uygun olmaz); en çok 5 kayıt, alan başına 480/240/80 karakter tavanıyla
+ve toplam en çok 4.000 karakter içerikle seçilir. Claude connector yalnızca
+`kind`, `summary`, `rationale`, `next_step` ve `classification` alanlarını,
+getirilen hafızanın güvenilmeyen tarihsel referans verisi olduğunu belirten
+sabit bir notla serileştirir; kayıt/task kimlikleri, skorlar ve sayaçlar
+yereldir. Boş görüntü payload şeklini değiştirmez. Task JSON'u
+`retrieved_context` veya getirme metadata'sı veremez ve CLI çıktı zarfı
+getirilen içeriği göstermez.
 
 ### Composition root ve testler
 

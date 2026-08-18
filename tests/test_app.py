@@ -233,6 +233,26 @@ class TaskInputBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(ALLOWED_DESTINATION, task.scope.destination)
 
+    def test_rejects_retrieval_fields_at_the_boundary(self) -> None:
+        # The retrieval snapshot and its metadata are internal state; task
+        # JSON supplying them is rejected, never ignored.
+        cases = (
+            task_document(retrieved_context={"items": []}),
+            task_document(retrieved_memory=[]),
+            task_document(retrieval={"max_items": 50}),
+            task_document(scope={"action": "read", "retrieved_context": {}}),
+            task_document(context={"retrieved_context": {"items": []}}),
+            task_document(context={"retrieved_memory": []}),
+            task_document(preferences={"retrieved_context": {}}),
+            task_document(preferences={"relevance_score": 5}),
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(TaskInputError):
+                    decode_task_json(raw)
+        # A valid document always starts from an empty internal snapshot.
+        self.assertEqual((), decode_task_json(task_document()).retrieved_context.items)
+
     def test_rejects_an_integer_above_the_digit_limit(self) -> None:
         limit = sys.get_int_max_str_digits()
         if limit == 0:  # pragma: no cover - only when the guard is disabled

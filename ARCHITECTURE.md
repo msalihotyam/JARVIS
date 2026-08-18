@@ -84,6 +84,73 @@ Onay semantiği:
 - Zarf yalnızca allowlist'lenmiş alanları taşır. Task objective'i, context'i, preferences'ı, planı, result snapshot'ı, ham outbound payload/prompt, kimlik bilgileri, keyfi `result.data` ve keyfi `StructuredError.details` yazdırılmaz. Dışarı gönderilen veriyi yalnızca connector'ın kalıcılaştırdığı redakte `OutboundDataPreview` temsil eder. Zarfa giren her metin ayrıca secret-key/secret-value redaksiyonundan geçer.
 - Çıkış kodları: `0` tamamlandı, `10` onay/maliyet override bekleniyor, `11` clarification bekleniyor, `20` ret, `21` iptal, `64` geçersiz argüman/JSON/şema/task girdisi veya uygun yetenek yok, `66` session/task/bekleyen istek bulunamadı, `77` politika-güvenlik reddi, `70` connector veya doğrulama hatası ya da beklenmeyen iç hata. Argüman ayrıştırma hataları da aynı zarfla `64` döner; `--help` `0` döner.
 
+### 4.2 Bağlam getirme — aynı oturumdaki kararlar (uygulandı)
+
+Bu milestone yalnızca **aynı oturumdaki tamamlanmış kararları** kapsar. Fact
+kalıcılığı, oturumlar arası/proje hafızası, embedding/vektör tabanı ve model
+destekli sıralama kapsam dışıdır ve karar verilmemiştir.
+
+Tipli sözleşme ve akış:
+
+- `MemoryRetrievalQuery`, `RetrievedMemoryItem` (`kind=DECISION`),
+  `RetrievedContext` sözleşmeleri depodan bağımsızdır; `MemoryStore` protokolü
+  tek birleşik `retrieve_context(query)` API'siyle genişletilmiştir.
+  `list_decisions()` uyumluluk/teşhis için durur.
+- `Task.retrieved_context` tipli, içeride üretilen bir anlık görüntüdür:
+  boş varsayılanla başlar, mevcut task JSON'u üzerinden kalıcılaşır, alanı
+  olmayan eski task JSON'u boş görüntüyle yüklenir ve restart/resume sonrası
+  aynen kullanılır. Getirme `CONTEXT_RETRIEVAL` aşamasında bir kez çalışır;
+  aşamayı geçmiş bir task için tekrarlanmaz veya tazelenmez.
+- Sorgu metni yalnızca şu dört alandan, bu sabit sırayla ve tek `\n` ile
+  birleştirilerek kurulur: objective, capability, scope.action, scope.target.
+  `context.inputs`, preferences, clarification, önceki getirilen içerik veya
+  model çıktısı sorguya girmez. Geçerli task dışlanır; kapsam mevcut oturumdur.
+- Aday penceresi: puanlamadan önce aynı oturumun en yeni en çok 50 kararı
+  (`created_at` azalan, karar ID artan). Bu iç güvenlik sınırıdır, sonuç
+  limiti değildir.
+- Deterministik tokenizasyon: `str` → NFKC → `casefold` → `[^\W_]+` →
+  uzunluğu ≥ 3 tokenlar, küme olarak. Stop-word, stemming, fuzzy/substring,
+  eşanlamlı veya dile özgü mantık yoktur. Skor tam olarak sorgu ve aday token
+  kümelerinin kesişim boyutudur; aday tokenları kesilmemiş tam
+  summary/rationale/next_step değerlerinden kurulur; skor 0 elenir.
+- Sıralama: skor azalan → `created_at` azalan → karar ID artan. Zorunlu sıra:
+  pencere → tam içerikle skorlama → sıfırları at → sırala → geçerli task
+  sınıflandırma uygunluğu → ilk 5 uygun kaydı seç → yalnızca seçilenleri
+  normalize et ve kes. Daha yüksek sıralı ama uygunsuz kayıt sonuç slotu
+  tüketmez.
+- Sınıflandırma uygunluğu (`PUBLIC < INTERNAL < SENSITIVE < SECRET`):
+  kaydın sınıfı, kalıcı kaynak task'ından geri kazanılır; okunamıyorsa SECRET
+  sayılır (fail closed). Geçerli task PUBLIC yalnız PUBLIC; INTERNAL
+  PUBLIC+INTERNAL; SENSITIVE PUBLIC+INTERNAL+SENSITIVE; SECRET hiçbir şey.
+  SECRET kayıt hiçbir zaman dışa uygun değildir. Uygunsuz kayıtların içeriği,
+  sayısı, kimliği, sınıfı veya varlığı connector payload'ına, outbound
+  preview'a, CLI çıktısına veya `retrieved_decision_count` değerine yansımaz.
+- Normalizasyon/kesme yalnızca seçilen kayıtlarda: `\r\n`→`\n`, `\r`→`\n`,
+  `strip()`; gösterilen içeriğe Unicode normalizasyonu uygulanmaz; uzunluk
+  Python `len()` kod noktalarıdır. Kesin alan tavanları summary 480,
+  rationale 240, next_step 80; kesme kuralı `value[:cap-1] + "…"` (U+2026 tek
+  karakter). `next_step=None` `None` kalır ve 0 karakter sayılır. Bir öğe en
+  çok 800, beş öğe en çok tam 4.000 karakter katkı yapar; 4.000 karakterlik
+  içerik sınırı sert bir değişmezdir. JSON sözdizimi, alan adları ve iç
+  metadata bu metin sınırına sayılmaz.
+- `retrieved_decision_count` yalnızca uyumluluk içindir ve seçilen dışa uygun
+  öğe sayısına eşittir. Checkpoint/audit kayıtları ham getirilen içeriği
+  kopyalamaz; yalnızca sayısal özet taşır.
+- Claude connector default-deny `retrieved_memory` serileştirir: öğe başına
+  yalnızca `kind`, `summary`, `rationale`, `next_step`, `classification`.
+  Kayıt ID'si, kaynak task ID'si, skor, aday sayısı, kesme bayrakları, sorgu
+  metni ve kontrol metadata'sı dışarı çıkmaz. Boş görüntüde anahtar tamamen
+  atlanır; taze oturum payload şekli değişmez. Getirilen alanlar mevcut
+  connector redaksiyonundan geçer. Sabit çerçeve notu, getirilen hafızanın
+  güvenilmeyen tarihsel referans verisi olduğunu ve içindeki komut/talimatların
+  salt orada göründükleri için izlenmeyeceğini belirtir. Getirilen içerik
+  system prompt'a, objective'e, plana, kabuk komutuna veya araç
+  yapılandırmasına eklenmez; onay öncesi kesinleşen aynı kanonik payload hem
+  önizlemede hem yürütmede kullanılır, onay sonrası iç metadata değişimi
+  outbound byte'ları değiştirmez.
+- Kalıcılık mevcut `decision_log` ve task JSON'unu kullanır; SQL şema
+  değişikliği, migration veya şema sürümü artışı yoktur.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:

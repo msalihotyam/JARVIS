@@ -6,11 +6,12 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -468,6 +469,255 @@ _COST_FIELDS = frozenset(CostEstimate.__dataclass_fields__)
 _USAGE_FIELDS = frozenset(UsageRecord.__dataclass_fields__)
 
 
+# --------------------------------------------------------------------------
+# Retrieved memory (same-session completed decisions)
+# --------------------------------------------------------------------------
+
+#: At most this many of the newest same-session decisions are examined per
+#: retrieval. An internal safety bound, not the final result limit.
+RETRIEVAL_CANDIDATE_WINDOW = 50
+
+#: Absolute retrieval ceilings. Query values below them may narrow a
+#: retrieval; values above them are clamped and never expand it.
+RETRIEVAL_MAX_ITEMS = 5
+RETRIEVAL_MAX_CHARACTERS = 4_000
+
+#: Exact per-field character caps applied to the finally selected records.
+RETRIEVAL_SUMMARY_CAP = 480
+RETRIEVAL_RATIONALE_CAP = 240
+RETRIEVAL_NEXT_STEP_CAP = 80
+
+
+class RetrievedMemoryKind(str, Enum):
+    DECISION = "decision"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRetrievalQuery:
+    session_id: str
+    query_text: str
+    exclude_task_id: str | None
+    max_items: int = RETRIEVAL_MAX_ITEMS
+    max_characters: int = RETRIEVAL_MAX_CHARACTERS
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievedMemoryItem:
+    kind: RetrievedMemoryKind
+    record_id: str
+    source_task_id: str
+    summary: str
+    rationale: str
+    next_step: str | None
+    classification: DataClassification
+    created_at: str
+    relevance_score: int
+    truncated: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "record_id": self.record_id,
+            "source_task_id": self.source_task_id,
+            "summary": self.summary,
+            "rationale": self.rationale,
+            "next_step": self.next_step,
+            "classification": self.classification.value,
+            "created_at": self.created_at,
+            "relevance_score": self.relevance_score,
+            "truncated": self.truncated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RetrievedMemoryItem":
+        return cls(
+            kind=RetrievedMemoryKind(data.get("kind", RetrievedMemoryKind.DECISION.value)),
+            record_id=data["record_id"],
+            source_task_id=data["source_task_id"],
+            summary=data.get("summary", ""),
+            rationale=data.get("rationale", ""),
+            next_step=data.get("next_step"),
+            # An unreadable classification fails closed.
+            classification=DataClassification(
+                data.get("classification", DataClassification.SECRET.value)
+            ),
+            created_at=data.get("created_at", ""),
+            relevance_score=int(data.get("relevance_score", 0)),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievedContext:
+    items: tuple[RetrievedMemoryItem, ...] = ()
+    candidate_count: int = 0
+    character_count: int = 0
+    truncated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "items": [item.to_dict() for item in self.items],
+            "candidate_count": self.candidate_count,
+            "character_count": self.character_count,
+            "truncated": self.truncated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "RetrievedContext":
+        if not data:
+            return cls()
+        return cls(
+            items=tuple(
+                RetrievedMemoryItem.from_dict(item) for item in data.get("items", [])
+            ),
+            candidate_count=int(data.get("candidate_count", 0)),
+            character_count=int(data.get("character_count", 0)),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+
+def retrieval_tokens(value: Any) -> frozenset[str]:
+    """Exact deterministic retrieval tokenizer.
+
+    ``str`` -> NFKC -> casefold -> ``[^\\W_]+`` -> tokens whose length is at
+    least 3, as a set. No stop words, stemming, fuzzy or substring matching,
+    synonym expansion, model ranking or language-specific handling.
+    """
+    normalized = unicodedata.normalize("NFKC", str(value)).casefold()
+    return frozenset(
+        token
+        for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+        if len(token) >= 3
+    )
+
+
+#: Fixed classification order used only for retrieval eligibility.
+_RETRIEVAL_CLASSIFICATION_RANK = {
+    DataClassification.PUBLIC: 0,
+    DataClassification.INTERNAL: 1,
+    DataClassification.SENSITIVE: 2,
+    DataClassification.SECRET: 3,
+}
+
+
+def retrieval_eligible(
+    current: DataClassification | None, candidate: DataClassification
+) -> bool:
+    """Exact eligibility matrix; an unknown current classification fails closed.
+
+    Shared by the retrieval pipeline and by every egress boundary that must
+    independently re-validate a persisted snapshot.
+    """
+    if current is None:
+        return False
+    if current is DataClassification.SECRET or candidate is DataClassification.SECRET:
+        return False
+    return (
+        _RETRIEVAL_CLASSIFICATION_RANK[candidate]
+        <= _RETRIEVAL_CLASSIFICATION_RANK[current]
+    )
+
+
+def normalize_retrieved_text(value: Any) -> str:
+    return str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def truncate_retrieved_text(value: str, cap: int) -> tuple[str, bool]:
+    if len(value) <= cap:
+        return value, False
+    return value[: cap - 1] + "…", True
+
+
+def build_retrieved_context(
+    query: MemoryRetrievalQuery,
+    current_classification: DataClassification | None,
+    candidates: Sequence[tuple["DecisionRecord", DataClassification]],
+) -> RetrievedContext:
+    """Score, rank, filter, select and truncate one bounded candidate window.
+
+    The order is mandatory: relevance is computed on full untruncated content,
+    zero-score records are dropped, ranking happens before the classification
+    filter so an ineligible record never consumes a result slot, and only the
+    finally selected records are normalized and truncated.
+
+    ``RETRIEVAL_MAX_ITEMS`` and ``RETRIEVAL_MAX_CHARACTERS`` are absolute
+    ceilings: a query may narrow them but can never expand them.
+    """
+    effective_max_items = max(0, min(query.max_items, RETRIEVAL_MAX_ITEMS))
+    effective_max_characters = max(
+        0, min(query.max_characters, RETRIEVAL_MAX_CHARACTERS)
+    )
+    query_tokens = retrieval_tokens(query.query_text)
+    scored: list[tuple[Any, DataClassification, int]] = []
+    for record, classification in candidates:
+        # Candidate tokens come from the full values of summary, rationale
+        # and next_step, in that fixed order; duplicates count once.
+        candidate_tokens = retrieval_tokens(record.summary) | retrieval_tokens(
+            record.rationale
+        )
+        if record.next_step is not None:
+            candidate_tokens |= retrieval_tokens(record.next_step)
+        score = len(query_tokens & candidate_tokens)
+        if score > 0:
+            scored.append((record, classification, score))
+    # Stable triple sort: relevance desc, created_at desc, decision id asc.
+    scored.sort(key=lambda entry: entry[0].id)
+    scored.sort(key=lambda entry: entry[0].created_at, reverse=True)
+    scored.sort(key=lambda entry: entry[2], reverse=True)
+
+    selected: list[RetrievedMemoryItem] = []
+    character_count = 0
+    overflow = False
+    for record, classification, score in scored:
+        if not retrieval_eligible(current_classification, classification):
+            continue
+        if len(selected) >= effective_max_items:
+            overflow = True
+            break
+        summary, summary_truncated = truncate_retrieved_text(
+            normalize_retrieved_text(record.summary), RETRIEVAL_SUMMARY_CAP
+        )
+        rationale, rationale_truncated = truncate_retrieved_text(
+            normalize_retrieved_text(record.rationale), RETRIEVAL_RATIONALE_CAP
+        )
+        if record.next_step is None:
+            next_step: str | None = None
+            next_step_truncated = False
+            next_step_length = 0
+        else:
+            next_step, next_step_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(record.next_step), RETRIEVAL_NEXT_STEP_CAP
+            )
+            next_step_length = len(next_step)
+        contribution = len(summary) + len(rationale) + next_step_length
+        if character_count + contribution > effective_max_characters:
+            overflow = True
+            break
+        selected.append(
+            RetrievedMemoryItem(
+                kind=RetrievedMemoryKind.DECISION,
+                record_id=record.id,
+                source_task_id=record.task_id,
+                summary=summary,
+                rationale=rationale,
+                next_step=next_step,
+                classification=classification,
+                created_at=record.created_at,
+                relevance_score=score,
+                truncated=summary_truncated
+                or rationale_truncated
+                or next_step_truncated,
+            )
+        )
+        character_count += contribution
+    return RetrievedContext(
+        items=tuple(selected),
+        candidate_count=len(candidates),
+        character_count=character_count,
+        truncated=overflow or any(item.truncated for item in selected),
+    )
+
+
 @dataclass(slots=True)
 class Task:
     objective: str
@@ -485,6 +735,9 @@ class Task:
     visible_assumption: str | None = None
     selected_connector: str | None = None
     result_snapshot: dict[str, Any] | None = None
+    #: Internal typed snapshot taken once at CONTEXT_RETRIEVAL. Never accepted
+    #: from untrusted task input and never shown in the CLI output envelope.
+    retrieved_context: RetrievedContext = field(default_factory=RetrievedContext)
     cancellation_requested: bool = False
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -513,6 +766,7 @@ class Task:
             "visible_assumption": self.visible_assumption,
             "selected_connector": self.selected_connector,
             "result_snapshot": self.result_snapshot,
+            "retrieved_context": self.retrieved_context.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -543,6 +797,10 @@ class Task:
             visible_assumption=data.get("visible_assumption"),
             selected_connector=data.get("selected_connector"),
             result_snapshot=data.get("result_snapshot"),
+            # Legacy task JSON without the field loads as an empty snapshot.
+            retrieved_context=RetrievedContext.from_dict(
+                data.get("retrieved_context")
+            ),
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),
             updated_at=data.get("updated_at", utc_now()),
@@ -810,6 +1068,8 @@ class MemoryStore(Protocol):
     ) -> None: ...
 
     def list_decisions(self, session_id: str) -> list[DecisionRecord]: ...
+
+    def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext: ...
 
     def save_pending_approval(self, request: PermissionRequest) -> None: ...
 

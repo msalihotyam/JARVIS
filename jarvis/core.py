@@ -15,6 +15,7 @@ from jarvis.contracts import (
     DecisionRecord,
     ErrorCode,
     LoopStage,
+    MemoryRetrievalQuery,
     MemoryStore,
     OutcomeStatus,
     PermissionGrant,
@@ -219,14 +220,39 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.CONTEXT_RETRIEVAL:
-                decisions = self.memory.list_decisions(session.id)
-                task.context["retrieved_decision_count"] = len(decisions)
+                # The query is built only from the task's own declared intent,
+                # never from arbitrary context inputs, preferences or prior
+                # retrieved content. Retrieval runs once; a task resumed past
+                # this stage keeps the persisted snapshot.
+                query = MemoryRetrievalQuery(
+                    session_id=session.id,
+                    query_text="\n".join(
+                        (
+                            task.objective,
+                            task.capability,
+                            task.scope.action,
+                            task.scope.target,
+                        )
+                    ),
+                    exclude_task_id=task.id,
+                )
+                retrieved = self.memory.retrieve_context(query)
+                task.retrieved_context = retrieved
+                # Compatibility count: selected outbound-eligible items only.
+                task.context["retrieved_decision_count"] = len(retrieved.items)
                 task.stage = LoopStage.CLARIFY_OR_ASSUME
+                # Aggregates only: the checkpoint/audit trail never duplicates
+                # the retrieved contents themselves.
                 self.memory.persist_checkpoint(
                     session,
                     task,
                     "context_retrieved",
-                    {"decision_count": len(decisions)},
+                    {
+                        "decision_count": len(retrieved.items),
+                        "candidate_count": retrieved.candidate_count,
+                        "character_count": retrieved.character_count,
+                        "truncated": retrieved.truncated,
+                    },
                 )
                 continue
 

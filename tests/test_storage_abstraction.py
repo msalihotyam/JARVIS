@@ -4,14 +4,19 @@ import copy
 import unittest
 
 from jarvis.contracts import (
+    RETRIEVAL_CANDIDATE_WINDOW,
+    DataClassification,
     DecisionRecord,
+    MemoryRetrievalQuery,
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
+    RetrievedContext,
     RunStatus,
     SessionState,
     Task,
     UsageRecord,
+    build_retrieved_context,
 )
 from jarvis.core import AgentCore
 from jarvis.registry import ToolRegistry
@@ -64,6 +69,40 @@ class InMemoryStore:
         return copy.deepcopy(
             [item for item in self.decisions if item.session_id == session_id]
         )
+
+    def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext:
+        # Storage-agnostic: the shared pipeline does the scoring, ranking,
+        # eligibility and truncation; this store only supplies the bounded
+        # candidate window and the recovered classifications.
+        current = None
+        if query.exclude_task_id is not None:
+            current_task = self.tasks.get(query.exclude_task_id)
+            current = (
+                current_task.scope.data_classification
+                if current_task is not None
+                else None
+            )
+        window = [
+            record
+            for record in self.decisions
+            if record.session_id == query.session_id
+            and record.task_id != query.exclude_task_id
+        ]
+        window.sort(key=lambda record: record.id)
+        window.sort(key=lambda record: record.created_at, reverse=True)
+        window = window[:RETRIEVAL_CANDIDATE_WINDOW]
+        candidates = []
+        for record in window:
+            source = self.tasks.get(record.task_id)
+            candidates.append(
+                (
+                    record,
+                    source.scope.data_classification
+                    if source is not None
+                    else DataClassification.SECRET,
+                )
+            )
+        return build_retrieved_context(query, current, candidates)
 
     def save_pending_approval(self, request: PermissionRequest) -> None:
         self.pending[(request.task_id, request.session_id)] = copy.deepcopy(request)
@@ -125,6 +164,32 @@ class StorageAbstractionTests(unittest.TestCase):
         self.assertEqual(RunStatus.COMPLETED, run.status)
         self.assertEqual(run.session.id, memory.task_session_id(run.task.id))
         self.assertEqual(1, len(memory.list_decisions(run.session.id)))
+
+    def test_retrieval_flows_through_a_non_sqlite_store(self) -> None:
+        registry = ToolRegistry()
+        registry.register(DummyConnector())
+        memory = InMemoryStore()
+        core = AgentCore(
+            registry,
+            memory,
+            Settings(permission_mode=PermissionMode.SMART_AUTO),
+        )
+        session = core.start_session("retrieval abstraction")
+
+        first = make_task()
+        first.objective = "alpha shared marker"
+        self.assertEqual(RunStatus.COMPLETED, core.run(first, session.id).status)
+
+        second = make_task()
+        second.objective = "alpha shared follow-up"
+        run = core.run(second, session.id)
+
+        self.assertEqual(RunStatus.COMPLETED, run.status)
+        self.assertEqual(1, len(run.task.retrieved_context.items))
+        self.assertEqual(
+            "alpha shared marker", run.task.retrieved_context.items[0].summary
+        )
+        self.assertEqual(1, run.task.context["retrieved_decision_count"])
 
 
 if __name__ == "__main__":
