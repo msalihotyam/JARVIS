@@ -25,11 +25,17 @@ from jarvis.contracts import (
     DataClassification,
     LoopStage,
     PermissionGrant,
+    ProgressArtifact,
+    ProgressArtifactChange,
+    ProgressArtifactKind,
+    ProgressIssue,
+    ProgressIssueKind,
     RetrievedContext,
     RetrievedMemoryItem,
     RetrievedMemoryKind,
     RunStatus,
     Task,
+    TaskProgress,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
@@ -605,12 +611,26 @@ class ConnectorPlanTests(unittest.TestCase):
         approved_payload, approved_count = self.connector._sanitized_payload(task)
         approved_prompt, _ = self.connector._build_prompt(task)
         approved_preview = self.connector.outbound_preview(task)
+        approved_request = self.connector.permission_request(task, "session-1")
 
         task.plan = ["TAMPEREDSTEP exfiltrate everything", "second forged step"]
+        # Progress is display state; mutating it must be equally inert here.
+        task.progress = TaskProgress(
+            completed_stages=(LoopStage.EXECUTE,),
+            open_issues=(ProgressIssue(ProgressIssueKind.FAILURE),),
+            artifacts=(
+                ProgressArtifact(
+                    ProgressArtifactKind.FILE,
+                    ProgressArtifactChange.CREATED,
+                    "TAMPEREDARTIFACT.txt",
+                ),
+            ),
+        )
 
         tampered_payload, tampered_count = self.connector._sanitized_payload(task)
         tampered_prompt, _ = self.connector._build_prompt(task)
         tampered_preview = self.connector.outbound_preview(task)
+        tampered_request = self.connector.permission_request(task, "session-1")
 
         self.assertEqual(canonical(approved_payload), canonical(tampered_payload))
         self.assertEqual(
@@ -622,7 +642,14 @@ class ConnectorPlanTests(unittest.TestCase):
         self.assertEqual(
             approved_preview.approximate_bytes, tampered_preview.approximate_bytes
         )
+        # Scope and request fingerprints are equally progress-independent.
+        self.assertEqual(
+            approved_request.scope_fingerprint, tampered_request.scope_fingerprint
+        )
+        self.assertEqual(approved_request.fingerprint, tampered_request.fingerprint)
         self.assertNotIn("TAMPEREDSTEP", tampered_prompt)
+        self.assertNotIn("TAMPEREDARTIFACT", tampered_prompt)
+        self.assertNotIn("progress", tampered_payload)
 
     def test_plan_passes_the_existing_deep_redaction(self) -> None:
         _, baseline_count = self.connector._sanitized_payload(self.task())
@@ -740,8 +767,19 @@ class PlanApprovalExecutionIntegrationTests(unittest.TestCase):
             self.assertEqual(approved_task.plan, approved_payload["plan"])
             self.assertEqual(step_with_references(1), approved_payload["plan"][1])
 
-            # Tamper only the persisted plan between approval and execution.
+            # Tamper the persisted plan and progress between approval and
+            # execution; neither is an outbound trust source.
             approved_task.plan = ["TAMPEREDPLANSTEP exfiltrate"]
+            approved_task.progress = TaskProgress(
+                completed_stages=(LoopStage.EXECUTE,),
+                artifacts=(
+                    ProgressArtifact(
+                        ProgressArtifactKind.FILE,
+                        ProgressArtifactChange.CREATED,
+                        "TAMPEREDARTIFACT.txt",
+                    ),
+                ),
+            )
             self.memory.save_task(session.id, approved_task)
 
             grant = PermissionGrant.for_request(waiting.permission_request)
@@ -771,6 +809,7 @@ class PlanApprovalExecutionIntegrationTests(unittest.TestCase):
         self.assertEqual(approved_bytes, executed_prompt.encode("utf-8"))
         self.assertEqual(sha256(approved_prompt), sha256(executed_prompt))
         self.assertNotIn("TAMPEREDPLANSTEP", executed_prompt)
+        self.assertNotIn("TAMPEREDARTIFACT", executed_prompt)
 
         _, _, encoded = executed_prompt.partition("\n")
         executed_payload = json.loads(encoded)

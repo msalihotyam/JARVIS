@@ -38,20 +38,25 @@ from jarvis.contracts import (
     ResultVerifier,
     RiskLevel,
     RunStatus,
+    SessionState,
     StructuredError,
     Task,
+    TaskStatus,
     ToolResult,
     is_expired,
+    next_loop_stage,
     normalize_destination,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
+from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 
 
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
-OUTPUT_SCHEMA_VERSION = 1
+#: Version 2 added the deterministic, redacted top-level ``progress`` object.
+OUTPUT_SCHEMA_VERSION = 2
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
@@ -299,8 +304,12 @@ _SECRET_KEY_PATTERN = re.compile(_SECRET_LABEL, re.IGNORECASE)
 #: ``password=hunter2``, ``API_KEY: abc123``, ``authorization: Basic x`` and
 #: the like. The value runs to the end of the field so a space-separated
 #: credential cannot survive; over-redaction is the safe direction here.
+#: The leading boundary is a negative alphanumeric lookbehind rather than
+#: ``\b`` so identifier separators still expose the sensitive term
+#: (``access_token=``, ``client-secret:``) while a term embedded in an
+#: ordinary alphanumeric word (``mytoken=``) stays untouched.
 _LABELLED_SECRET_PATTERN = re.compile(
-    rf"\b({_SECRET_LABEL})(\s*[:=]\s*)([^,;\n]+)", re.IGNORECASE
+    rf"(?<![A-Za-z0-9])({_SECRET_LABEL})(\s*[:=]\s*)([^,;\n]+)", re.IGNORECASE
 )
 
 #: Credential shapes that carry no label of their own.
@@ -369,6 +378,30 @@ def _billing_payload(estimate: CostEstimate) -> dict[str, Any]:
     }
 
 
+def _progress_payload(task: Task, session: SessionState | None) -> dict[str, Any]:
+    """Deterministic, informational progress view of the addressed task.
+
+    ``plan`` is always the safe canonical rebuild — the persisted, possibly
+    tampered ``task.plan`` strings are never printed and its emptiness is the
+    only thing read. ``next_stage`` is the informational linear successor; it
+    never implies the successor may run past an open blocker.
+    """
+    successor = next_loop_stage(task.stage)
+    payload: dict[str, Any] = {
+        "task_id": task.id,
+        "plan": build_task_plan(task) if task.plan else [],
+        "current_stage": task.stage.value,
+        "next_stage": successor.value if successor is not None else None,
+        "post_completion_next_step": (
+            session.next_step
+            if session is not None and task.status is TaskStatus.COMPLETED
+            else None
+        ),
+    }
+    payload.update(task.progress.to_dict())
+    return payload
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -432,6 +465,7 @@ def build_envelope(
         ),
         "approval": None if request is None else _approval_payload(request),
         "billing": None if task is None else _billing_payload(task.estimate),
+        "progress": None if task is None else _progress_payload(task, session),
         "result": None if result is None else _result_payload(result),
         # ``details`` is deliberately dropped: it carries free-form diagnostics.
         "error": (

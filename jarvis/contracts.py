@@ -718,6 +718,316 @@ def build_retrieved_context(
     )
 
 
+# --------------------------------------------------------------------------
+# Task-scoped progress (informational display state, never lifecycle authority)
+# --------------------------------------------------------------------------
+
+#: Hard ceilings for persisted progress collections.
+PROGRESS_MAX_ISSUES = 8
+PROGRESS_MAX_ARTIFACTS = 20
+PROGRESS_TEXT_MAX_CHARS = 240
+
+#: Terminal states; they never appear in ``completed_stages``.
+TERMINAL_LOOP_STAGES = frozenset(
+    {LoopStage.COMPLETED, LoopStage.FAILED, LoopStage.CANCELLED}
+)
+
+#: The deterministic linear work-stage order, for informational progress only.
+LINEAR_LOOP_STAGES: tuple[LoopStage, ...] = (
+    LoopStage.UNDERSTAND,
+    LoopStage.CONTEXT_RETRIEVAL,
+    LoopStage.CLARIFY_OR_ASSUME,
+    LoopStage.PLAN,
+    LoopStage.RISK_PERMISSION,
+    LoopStage.COST_PREFLIGHT,
+    LoopStage.TOOL_SELECTION,
+    LoopStage.EXECUTE,
+    LoopStage.VERIFY,
+    LoopStage.PRESENT,
+    LoopStage.PERSIST,
+)
+
+_NEXT_LOOP_STAGE: dict[LoopStage, LoopStage] = {
+    **dict(zip(LINEAR_LOOP_STAGES, LINEAR_LOOP_STAGES[1:])),
+    LoopStage.PERSIST: LoopStage.COMPLETED,
+}
+
+
+def next_loop_stage(stage: LoopStage) -> "LoopStage | None":
+    """Informational linear successor of a stage, or ``None`` at a terminal.
+
+    Never a transition authority: it does not imply the successor may run
+    now, it bypasses no clarification/approval/cost/cancellation blocker and
+    it feeds no permission, billing, selection, execution, verification or
+    outbound decision.
+    """
+    if type(stage) is not LoopStage:
+        return None
+    return _NEXT_LOOP_STAGE.get(stage)
+
+
+def _legacy_completed_stages(stage: LoopStage) -> tuple[LoopStage, ...]:
+    """Conservative derivation for legacy task JSON without progress.
+
+    A completed task traversed every linear work stage; a nonterminal task
+    traversed the linear predecessors of its current stage; a failed or
+    cancelled task gets nothing invented.
+    """
+    if stage is LoopStage.COMPLETED:
+        return LINEAR_LOOP_STAGES
+    if stage in _NEXT_LOOP_STAGE:
+        return LINEAR_LOOP_STAGES[: LINEAR_LOOP_STAGES.index(stage)]
+    return ()
+
+
+class ProgressIssueKind(str, Enum):
+    CLARIFICATION_REQUIRED = "clarification_required"
+    APPROVAL_REQUIRED = "approval_required"
+    COST_OVERRIDE_REQUIRED = "cost_override_required"
+    INVALID_GRANT = "invalid_grant"
+    CANCELLATION_PENDING = "cancellation_pending"
+    FAILURE = "failure"
+
+
+class ProgressArtifactKind(str, Enum):
+    FILE = "file"
+    DIRECTORY = "directory"
+    ARTIFACT = "artifact"
+
+
+class ProgressArtifactChange(str, Enum):
+    CREATED = "created"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+    GENERATED = "generated"
+
+
+def normalize_progress_text(value: Any) -> str | None:
+    """Bounded display-text normalization for progress metadata.
+
+    Only an actual non-empty string survives; arbitrary objects are never
+    stringified. NFKC, then CRLF/CR to LF, then whitespace-run collapse,
+    then a 240-code-point cap with a final U+2026 on overflow.
+    """
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > PROGRESS_TEXT_MAX_CHARS:
+        return text[: PROGRESS_TEXT_MAX_CHARS - 1] + "…"
+    return text
+
+
+#: Fallback session next step; also replaces credential-bearing values.
+DEFAULT_SESSION_NEXT_STEP = "Review the verified result."
+
+#: Syntax-aware credential screening for persisted progress/session text.
+#: Owned here so runtime creation (``jarvis.progress``) and deserialization
+#: share one canonical, provider-independent policy. A recognized credential
+#: label alone is not enough: credential syntax — a ``:`` or ``=`` delimiter
+#: followed by a non-empty value — is required, so ordinary prose and
+#: filenames such as "Review token telemetry", "tokenizer.py" or
+#: "secret_handling.md" stay valid. The leading boundary is a negative
+#: alphanumeric lookbehind rather than ``\b``: identifier separators such as
+#: ``_`` and ``-`` still expose the sensitive term (``access_token=``,
+#: ``client-secret:``), while a term embedded in an ordinary alphanumeric
+#: word (``mytoken=``) does not match. Independent credential shapes are
+#: always rejected. Presentation redaction in ``jarvis.app`` stays a
+#: separate, deliberately broader second defense.
+_CREDENTIAL_LABEL = (
+    r"api[_\-\s]?key|token|secret|password|passwd|authorization|cookie"
+    r"|private[_\-\s]?key"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9])(?:{_CREDENTIAL_LABEL})\b\s*[:=]\s*\S", re.IGNORECASE
+)
+_CREDENTIAL_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
+    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+)
+
+
+def credential_bearing(text: str) -> bool:
+    """Whether text carries a labelled credential assignment or a raw shape."""
+    if _CREDENTIAL_ASSIGNMENT_PATTERN.search(text):
+        return True
+    return any(pattern.search(text) for pattern in _CREDENTIAL_VALUE_PATTERNS)
+
+
+def normalize_session_next_step(value: Any) -> str:
+    """Bounded, credential-safe session next step.
+
+    Only an actual string is accepted; arbitrary connector data is never
+    stringified. A credential-bearing value is replaced entirely. The raw
+    value is screened before normalization so content beyond the cap and
+    shapes only assembled by NFKC/whitespace folding are both caught. Applied
+    both when a connector result produces the value and when persisted
+    session JSON is loaded, so unsafe text cannot survive a load/resave.
+    """
+    if isinstance(value, str) and credential_bearing(value):
+        return DEFAULT_SESSION_NEXT_STEP
+    text = normalize_progress_text(value)
+    if text is None or credential_bearing(text):
+        return DEFAULT_SESSION_NEXT_STEP
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressIssue:
+    """One typed open issue. No free-form message field exists on purpose."""
+
+    kind: ProgressIssueKind
+    error_code: ErrorCode | None = None
+    retryable: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "error_code": self.error_code.value if self.error_code else None,
+            "retryable": self.retryable,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ProgressIssue | None":
+        """Fail closed: any malformed field drops the whole issue."""
+        if not isinstance(data, dict):
+            return None
+        kind_value = data.get("kind")
+        if not isinstance(kind_value, str):
+            return None
+        try:
+            kind = ProgressIssueKind(kind_value)
+        except ValueError:
+            return None
+        code_value = data.get("error_code")
+        error_code: ErrorCode | None = None
+        if code_value is not None:
+            if not isinstance(code_value, str):
+                return None
+            try:
+                error_code = ErrorCode(code_value)
+            except ValueError:
+                return None
+        retryable = data.get("retryable", False)
+        if not isinstance(retryable, bool):
+            return None
+        return cls(kind=kind, error_code=error_code, retryable=retryable)
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressArtifact:
+    """Informational display metadata only.
+
+    A label is never resolved, opened, executed or treated as a filesystem
+    path.
+    """
+
+    kind: ProgressArtifactKind
+    change: ProgressArtifactChange
+    label: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "change": self.change.value,
+            "label": self.label,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ProgressArtifact | None":
+        """Fail closed: any malformed or credential-bearing field drops the
+        whole artifact, so unsafe persisted labels cannot survive a load."""
+        if not isinstance(data, dict):
+            return None
+        kind_value = data.get("kind")
+        change_value = data.get("change")
+        if not isinstance(kind_value, str) or not isinstance(change_value, str):
+            return None
+        try:
+            kind = ProgressArtifactKind(kind_value)
+            change = ProgressArtifactChange(change_value)
+        except ValueError:
+            return None
+        raw_label = data.get("label")
+        # Screen the raw text first (truncation cannot hide a credential),
+        # then the normalized form (NFKC/whitespace folding cannot assemble
+        # one) — the same double screening the artifact builder applies.
+        if not isinstance(raw_label, str) or credential_bearing(raw_label):
+            return None
+        label = normalize_progress_text(raw_label)
+        if label is None or credential_bearing(label):
+            return None
+        return cls(kind=kind, change=change, label=label)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProgress:
+    """Typed, bounded, task-scoped progress snapshot.
+
+    Purely informational: ``Task.status``/``Task.stage``, approvals, billing
+    state and verification remain the only lifecycle authorities.
+    """
+
+    completed_stages: tuple[LoopStage, ...] = ()
+    open_issues: tuple[ProgressIssue, ...] = ()
+    artifacts: tuple[ProgressArtifact, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "completed_stages": [stage.value for stage in self.completed_stages],
+            "open_issues": [issue.to_dict() for issue in self.open_issues],
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "TaskProgress":
+        """Fail closed per element; ordering and hard ceilings are enforced."""
+        if not isinstance(data, dict):
+            return cls()
+        stages: list[LoopStage] = []
+        raw_stages = data.get("completed_stages", [])
+        if isinstance(raw_stages, (list, tuple)):
+            for value in raw_stages:
+                if not isinstance(value, str):
+                    continue
+                try:
+                    stage = LoopStage(value)
+                except ValueError:
+                    continue
+                if stage in TERMINAL_LOOP_STAGES or stage in stages:
+                    continue
+                stages.append(stage)
+        issues: list[ProgressIssue] = []
+        raw_issues = data.get("open_issues", [])
+        if isinstance(raw_issues, (list, tuple)):
+            for value in raw_issues:
+                issue = ProgressIssue.from_dict(value)
+                if issue is None or issue in issues:
+                    continue
+                issues.append(issue)
+                if len(issues) >= PROGRESS_MAX_ISSUES:
+                    break
+        artifacts: list[ProgressArtifact] = []
+        raw_artifacts = data.get("artifacts", [])
+        if isinstance(raw_artifacts, (list, tuple)):
+            for value in raw_artifacts:
+                artifact = ProgressArtifact.from_dict(value)
+                if artifact is None or artifact in artifacts:
+                    continue
+                artifacts.append(artifact)
+                if len(artifacts) >= PROGRESS_MAX_ARTIFACTS:
+                    break
+        return cls(
+            completed_stages=tuple(stages),
+            open_issues=tuple(issues),
+            artifacts=tuple(artifacts),
+        )
+
+
 @dataclass(slots=True)
 class Task:
     objective: str
@@ -738,6 +1048,9 @@ class Task:
     #: Internal typed snapshot taken once at CONTEXT_RETRIEVAL. Never accepted
     #: from untrusted task input and never shown in the CLI output envelope.
     retrieved_context: RetrievedContext = field(default_factory=RetrievedContext)
+    #: Typed informational progress maintained by AgentCore. Never accepted
+    #: from untrusted task input and never consumed as lifecycle authority.
+    progress: TaskProgress = field(default_factory=TaskProgress)
     cancellation_requested: bool = False
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -767,6 +1080,7 @@ class Task:
             "selected_connector": self.selected_connector,
             "result_snapshot": self.result_snapshot,
             "retrieved_context": self.retrieved_context.to_dict(),
+            "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -775,6 +1089,16 @@ class Task:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Task":
         effect = data.get("side_effect", {})
+        stage = LoopStage(data.get("stage", LoopStage.UNDERSTAND.value))
+        raw_progress = data.get("progress")
+        if isinstance(raw_progress, dict):
+            progress = TaskProgress.from_dict(raw_progress)
+        else:
+            # Legacy or malformed progress: derive only the deterministic
+            # linear predecessors; FAILED/CANCELLED never invent stages.
+            progress = TaskProgress(
+                completed_stages=_legacy_completed_stages(stage)
+            )
         return cls(
             objective=data["objective"],
             capability=data["capability"],
@@ -792,7 +1116,7 @@ class Task:
             ),
             id=data["id"],
             status=TaskStatus(data.get("status", TaskStatus.PENDING.value)),
-            stage=LoopStage(data.get("stage", LoopStage.UNDERSTAND.value)),
+            stage=stage,
             plan=list(data.get("plan", [])),
             visible_assumption=data.get("visible_assumption"),
             selected_connector=data.get("selected_connector"),
@@ -801,6 +1125,7 @@ class Task:
             retrieved_context=RetrievedContext.from_dict(
                 data.get("retrieved_context")
             ),
+            progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),
             updated_at=data.get("updated_at", utc_now()),
@@ -991,6 +1316,9 @@ class SessionState:
     objective: str = ""
     id: str = field(default_factory=lambda: str(uuid4()))
     active_task_id: str | None = None
+    #: Navigation pointer to the most recently touched task. Informational
+    #: only; it survives terminal completion while ``active_task_id`` clears.
+    latest_task_id: str | None = None
     next_step: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -1003,8 +1331,25 @@ class SessionState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionState":
-        allowed = {"objective", "id", "active_task_id", "next_step", "created_at", "updated_at"}
-        return cls(**{key: value for key, value in data.items() if key in allowed})
+        allowed = {
+            "objective",
+            "id",
+            "active_task_id",
+            "latest_task_id",
+            "next_step",
+            "created_at",
+            "updated_at",
+        }
+        payload = {key: value for key, value in data.items() if key in allowed}
+        # Legacy session JSON without the pointer defaults to the active task.
+        if not isinstance(payload.get("latest_task_id"), str):
+            active = payload.get("active_task_id")
+            payload["latest_task_id"] = active if isinstance(active, str) else None
+        # The persisted next step is untrusted display text: the same
+        # canonical policy that bounds newly produced connector results runs
+        # again at load, so unsafe text cannot survive a load/resave cycle.
+        payload["next_step"] = normalize_session_next_step(payload.get("next_step"))
+        return cls(**payload)
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jarvis.contracts import ErrorCode, LoopStage, PermissionMode, RunStatus
+from jarvis.contracts import (
+    LINEAR_LOOP_STAGES,
+    ErrorCode,
+    LoopStage,
+    PermissionMode,
+    RunStatus,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
@@ -70,6 +76,19 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         restored = self.memory.load_task(run.task.id)
         self.assertEqual(LoopStage.COMPLETED, restored.stage)
         self.assertIsNotNone(restored.result_snapshot)
+        # Progress and the navigation pointer survive a real SQLite restart
+        # through the existing JSON columns only.
+        reopened = SQLiteMemoryStore(self.memory.database_path)
+        after_restart = reopened.load_task(run.task.id)
+        self.assertEqual(LINEAR_LOOP_STAGES, after_restart.progress.completed_stages)
+        self.assertEqual((), after_restart.progress.open_issues)
+        self.assertEqual((), after_restart.progress.artifacts)
+        self.assertEqual(
+            run.task.progress.to_dict(), after_restart.progress.to_dict()
+        )
+        session = reopened.load_session(run.session.id)
+        self.assertIsNone(session.active_task_id)
+        self.assertEqual(run.task.id, session.latest_task_id)
         events = {event["event_type"] for event in self.memory.list_events(run.session.id)}
         self.assertTrue(
             {
@@ -91,6 +110,8 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         self.assertEqual(run.task.id, decisions[0].task_id)
 
     def test_schema_has_version_foreign_keys_and_wal(self) -> None:
+        # Progress enrichment added no SQL column, table or migration.
+        self.assertEqual(3, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
         connection = sqlite3.connect(self.memory.database_path)
         try:

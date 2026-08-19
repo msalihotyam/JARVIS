@@ -21,6 +21,7 @@ from jarvis.contracts import (
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
+    ProgressIssueKind,
     ResultVerifier,
     RiskLevel,
     RunStatus,
@@ -36,6 +37,15 @@ from jarvis.contracts import (
     is_expired,
 )
 from jarvis.planning import build_task_plan
+from jarvis.progress import (
+    GATE_ISSUE_KINDS,
+    NON_FAILURE_ISSUE_KINDS,
+    clear_issues,
+    mark_stage_completed,
+    normalize_session_next_step,
+    set_issue,
+    set_waiting_issue,
+)
 from jarvis.registry import (
     AmbiguousConnectorError,
     ConnectorNotFoundError,
@@ -107,6 +117,7 @@ class AgentCore:
             if persisted is not None:
                 task = persisted
         session.active_task_id = task.id
+        session.latest_task_id = task.id
         self.memory.persist_checkpoint(session, task, "task_registered")
         return self._advance(session, task, grant)
 
@@ -138,6 +149,11 @@ class AgentCore:
                 "Task does not belong to this session.",
                 session,
             )
+        # Navigation metadata only. Saved eagerly because a terminal-stage
+        # resume returns without writing another checkpoint.
+        if session.latest_task_id != task.id:
+            session.latest_task_id = task.id
+            self.memory.save_session(session)
         return self._advance(session, task, grant)
 
     def provide_clarification(
@@ -155,6 +171,7 @@ class AgentCore:
         task.preferences["clarification"] = clarification
         task.status = TaskStatus.PENDING
         task.stage = LoopStage.CLARIFY_OR_ASSUME
+        session.latest_task_id = task.id
         self.memory.persist_checkpoint(session, task, "clarification_provided")
         return self._advance(session, task, None)
 
@@ -171,6 +188,7 @@ class AgentCore:
             )
         task.cancellation_requested = True
         task.status = TaskStatus.CANCEL_REQUESTED
+        session.latest_task_id = task.id
         cancelled = False
         if task.selected_connector:
             try:
@@ -181,6 +199,10 @@ class AgentCore:
             task.status = TaskStatus.CANCELLED
             task.stage = LoopStage.CANCELLED
             session.active_task_id = None
+            # Terminal: the status/stage carry the meaning; no issue remains.
+            clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
+        else:
+            set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
         self.memory.persist_checkpoint(
             session,
             task,
@@ -201,6 +223,7 @@ class AgentCore:
                 task.status = TaskStatus.CANCELLED
                 task.stage = LoopStage.CANCELLED
                 session.active_task_id = None
+                clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
                 self.memory.persist_checkpoint(session, task, "task_cancelled")
                 return AgentRun(RunStatus.CANCELLED, session, task)
 
@@ -214,6 +237,7 @@ class AgentCore:
                             "Objective, capability and scope.action are required.",
                         ),
                     )
+                mark_stage_completed(task, LoopStage.UNDERSTAND)
                 task.stage = LoopStage.CONTEXT_RETRIEVAL
                 self.memory.persist_checkpoint(
                     session, task, "intent_understood", {"objective": task.objective}
@@ -241,6 +265,7 @@ class AgentCore:
                 task.retrieved_context = retrieved
                 # Compatibility count: selected outbound-eligible items only.
                 task.context["retrieved_decision_count"] = len(retrieved.items)
+                mark_stage_completed(task, LoopStage.CONTEXT_RETRIEVAL)
                 task.stage = LoopStage.CLARIFY_OR_ASSUME
                 # Aggregates only: the checkpoint/audit trail never duplicates
                 # the retrieved contents themselves.
@@ -262,6 +287,7 @@ class AgentCore:
                 clarification = str(task.preferences.get("clarification") or "").strip()
                 if needs_clarification and not clarification:
                     task.status = TaskStatus.AWAITING_CLARIFICATION
+                    set_waiting_issue(task)
                     self.memory.persist_checkpoint(
                         session,
                         task,
@@ -274,6 +300,8 @@ class AgentCore:
                     or str(task.preferences.get("assumption") or "").strip()
                     or "Proceeding only within the explicit task scope."
                 )
+                clear_issues(task, ProgressIssueKind.CLARIFICATION_REQUIRED)
+                mark_stage_completed(task, LoopStage.CLARIFY_OR_ASSUME)
                 task.stage = LoopStage.PLAN
                 task.status = TaskStatus.PENDING
                 self.memory.persist_checkpoint(
@@ -295,6 +323,7 @@ class AgentCore:
                 except Exception as exc:
                     return self._selection_failure(session, task, exc)
                 task.selected_connector = selection.connector.manifest.name
+                mark_stage_completed(task, LoopStage.PLAN)
                 task.stage = LoopStage.RISK_PERMISSION
                 self.memory.persist_checkpoint(
                     session,
@@ -326,6 +355,8 @@ class AgentCore:
                     if self._remembered_permission_allowed(request) and self.memory.has_remembered_scope_grant(
                         session.id, request.scope_fingerprint
                     ):
+                        clear_issues(task, *GATE_ISSUE_KINDS)
+                        mark_stage_completed(task, LoopStage.RISK_PERMISSION)
                         task.stage = LoopStage.COST_PREFLIGHT
                         self.memory.persist_checkpoint(
                             session, task, "remembered_permission_applied"
@@ -342,6 +373,8 @@ class AgentCore:
                         return approval_run
                     if consumed:
                         active_grant = None
+                clear_issues(task, *GATE_ISSUE_KINDS)
+                mark_stage_completed(task, LoopStage.RISK_PERMISSION)
                 task.stage = LoopStage.COST_PREFLIGHT
                 task.status = TaskStatus.PENDING
                 self.memory.persist_checkpoint(session, task, "permission_policy_passed")
@@ -407,6 +440,7 @@ class AgentCore:
                     if consumed:
                         # One grant satisfies exactly one request.
                         active_grant = None
+                    clear_issues(task, *GATE_ISSUE_KINDS)
                     # Re-enter preflight so every remaining monetary gate is
                     # evaluated. Each resolved gate records its own marker, so
                     # this converges instead of looping.
@@ -422,6 +456,8 @@ class AgentCore:
                 task.preferences[BILLING_PREFLIGHT_KEY] = self._billing_fingerprint(
                     estimate
                 )
+                clear_issues(task, *GATE_ISSUE_KINDS)
+                mark_stage_completed(task, LoopStage.COST_PREFLIGHT)
                 task.stage = LoopStage.TOOL_SELECTION
                 self.memory.persist_checkpoint(
                     session,
@@ -450,6 +486,7 @@ class AgentCore:
                             retryable=True,
                         ),
                     )
+                mark_stage_completed(task, LoopStage.TOOL_SELECTION)
                 task.stage = LoopStage.EXECUTE
                 self.memory.persist_checkpoint(
                     session,
@@ -508,6 +545,7 @@ class AgentCore:
                     task.status = TaskStatus.CANCELLED
                     task.stage = LoopStage.CANCELLED
                     session.active_task_id = None
+                    clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
                     self.memory.persist_checkpoint(session, task, "execution_cancelled")
                     return AgentRun(RunStatus.CANCELLED, session, task, result=result)
                 if not result.ok:
@@ -518,6 +556,7 @@ class AgentCore:
                         or StructuredError(ErrorCode.CONNECTOR_FAILED, result.summary),
                         result,
                     )
+                mark_stage_completed(task, LoopStage.EXECUTE)
                 task.status = TaskStatus.VERIFYING
                 task.stage = LoopStage.VERIFY
                 self.memory.persist_checkpoint(session, task, "execution_completed")
@@ -552,6 +591,7 @@ class AgentCore:
                         ),
                         result,
                     )
+                mark_stage_completed(task, LoopStage.VERIFY)
                 task.stage = LoopStage.PRESENT
                 self.memory.persist_checkpoint(
                     session,
@@ -569,9 +609,13 @@ class AgentCore:
                         task,
                         StructuredError(ErrorCode.CONNECTOR_FAILED, "Missing result"),
                     )
-                session.next_step = str(
-                    result.data.get("next_step") or "Review the verified result."
+                # Only an actual string survives, bounded and credential-safe;
+                # arbitrary connector data is never stringified into session
+                # state.
+                session.next_step = normalize_session_next_step(
+                    result.data.get("next_step")
                 )
+                mark_stage_completed(task, LoopStage.PRESENT)
                 task.stage = LoopStage.PERSIST
                 self.memory.persist_checkpoint(
                     session,
@@ -589,6 +633,10 @@ class AgentCore:
                         task,
                         StructuredError(ErrorCode.CONNECTOR_FAILED, "Missing result"),
                     )
+                # PERSIST succeeded; COMPLETED is the terminal state, not an
+                # executed work stage, and is never recorded as completed.
+                mark_stage_completed(task, LoopStage.PERSIST)
+                clear_issues(task, *ProgressIssueKind)
                 task.status = TaskStatus.COMPLETED
                 task.stage = LoopStage.COMPLETED
                 session.active_task_id = None
@@ -755,6 +803,7 @@ class AgentCore:
             else TaskStatus.AWAITING_APPROVAL
         )
         if grant is None:
+            set_waiting_issue(task)
             self.memory.persist_checkpoint(
                 session,
                 task,
@@ -773,6 +822,15 @@ class AgentCore:
             )
         validation_error = self._validate_grant(request, grant)
         if validation_error is not None:
+            # Still blocked: the applicable blocker stays and the refused
+            # grant is recorded as its own typed issue.
+            set_waiting_issue(task)
+            set_issue(
+                task,
+                ProgressIssueKind.INVALID_GRANT,
+                validation_error.code,
+                validation_error.retryable,
+            )
             self.memory.persist_checkpoint(
                 session,
                 task,
@@ -796,6 +854,9 @@ class AgentCore:
             task.status = TaskStatus.REJECTED
             task.stage = LoopStage.FAILED
             session.active_task_id = None
+            # Terminal user rejection: represented by status/stage only; the
+            # blocked stage is never recorded as completed.
+            clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
             error = StructuredError(
                 ErrorCode.APPROVAL_REJECTED, "The user rejected this action."
             )
@@ -897,6 +958,7 @@ class AgentCore:
         task.status = TaskStatus.FAILED
         task.stage = LoopStage.FAILED
         session.active_task_id = None
+        set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
         if result is None:
             result = ToolResult(
                 outcome=OutcomeStatus.ERROR,

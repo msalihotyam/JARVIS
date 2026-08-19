@@ -37,6 +37,7 @@ from jarvis.contracts import (
     RunStatus,
     SideEffect,
     StructuredError,
+    TaskProgress,
     TaskStatus,
 )
 from jarvis.memory import SQLiteMemoryStore
@@ -116,6 +117,7 @@ class TaskInputBoundaryTests(unittest.TestCase):
         self.assertIs(TaskStatus.PENDING, task.status)
         self.assertIs(LoopStage.UNDERSTAND, task.stage)
         self.assertEqual([], task.plan)
+        self.assertEqual(TaskProgress(), task.progress)
         self.assertIs(RiskLevel.LOW, task.risk_level)
         self.assertIs(SideEffect.NONE, task.side_effect.effect)
         self.assertIs(BillingClass.UNKNOWN, task.estimate.billing_class)
@@ -138,6 +140,11 @@ class TaskInputBoundaryTests(unittest.TestCase):
             "status",
             "stage",
             "plan",
+            "progress",
+            "latest_task_id",
+            "completed_stages",
+            "open_issues",
+            "artifacts",
             "estimate",
             "risk_level",
             "side_effect",
@@ -173,6 +180,11 @@ class TaskInputBoundaryTests(unittest.TestCase):
             ("preferences", {"billing_preflight_fingerprint": "abc"}),
             ("preferences", {"billing_repreflight_attempts": 9}),
             ("preferences", {"anything_else": "value"}),
+            # Progress and session-navigation authority are internal state.
+            ("scope", {"action": "read", "progress": {}}),
+            ("context", {"progress": {"completed_stages": ["execute"]}}),
+            ("preferences", {"progress": {"open_issues": []}}),
+            ("preferences", {"latest_task_id": "task-1"}),
         )
         for section, payload in cases:
             with self.subTest(section=section, payload=payload):
@@ -357,6 +369,41 @@ class PresentationRedactionTests(unittest.TestCase):
                 message = self.envelope_message(f"connector said {text} today")
                 self.assertNotIn(credential, message)
                 self.assertIn(REDACTED, message)
+
+    def test_identifier_separated_credential_labels_are_redacted(self) -> None:
+        # '_' and '-' are identifier separators, not word content: a
+        # sensitive term exposed after them must still be recognized.
+        cases = (
+            "openai_api_key=HUNTER2",
+            "client_secret: HUNTER2",
+            "access_token=HUNTER2",
+            "github_token: HUNTER2",
+            "session_cookie=HUNTER2",
+            "database_password=HUNTER2",
+            "client-secret=HUNTER2",
+            "github-token: HUNTER2",
+            "OpenAI_API_Key=HUNTER2",
+            "CLIENT_SECRET: HUNTER2",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                message = self.envelope_message(f"connector said {text} today")
+                self.assertNotIn("HUNTER2", message)
+                self.assertIn(REDACTED, message)
+
+    def test_sensitive_terms_inside_ordinary_words_are_left_alone(self) -> None:
+        # A sensitive term embedded in an ordinary alphanumeric word is not a
+        # credential, even when assignment syntax follows the word.
+        for text in (
+            "mytoken=value",
+            "passwordless=value",
+            "secretary=value",
+            "tokenizer=value",
+            "open tokenizer.py and secret_handling.md",
+            "Review token telemetry",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(text, self.envelope_message(text))
 
     def test_unlabelled_credential_shapes_stay_redacted(self) -> None:
         cases = (

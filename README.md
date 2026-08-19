@@ -150,18 +150,23 @@ stderr'e ikinci bir tanı yazılmaz. `--help` `0` döner.
 
 Status dışındaki her komut tek bir sabit anahtarlı JSON nesnesi yazar
 (`sort_keys=True`, `allow_nan=False`, ASCII kaçışlı; CP1254 konsolda güvenli).
-Aynı `AgentRun` her seferinde byte-özdeş serileşir.
+Aynı `AgentRun` her seferinde byte-özdeş serileşir. Zarf şema sürümü, üst
+düzey `progress` nesnesinin eklenmesiyle 2'dir; `status` komutu birebir
+geriye uyumlu kalır.
 
 Zarf yalnızca şunları taşır: session kimliği/aktif task/sonraki adım, task
 kimliği/durum/aşama/seçili connector, onay isteği kimliği, fingerprint, scope
 fingerprint, scope, risk, yan etki, gerekçe ve connector'ın kendi redakte
 edilmiş `OutboundDataPreview` kaydı, faturalandırma sınıfı/parasal üst
-sınır/kaynak tavanı, redakte edilmiş sonuç özeti, allowlist'lenmiş kullanım
-telemetrisi, doğrulama durumu/yöntemi/kanıtı ve yapısal hata kodu/mesajı.
+sınır/kaynak tavanı, deterministik `progress` nesnesi, redakte edilmiş sonuç
+özeti, allowlist'lenmiş kullanım telemetrisi, doğrulama durumu/yöntemi/kanıtı
+ve yapısal hata kodu/mesajı.
 
-Task objective'i, context'i, preferences'ı, planı, result snapshot'ı, ham
-outbound payload veya prompt, kimlik bilgileri, keyfi `result.data` ve keyfi
-`StructuredError.details` hiçbir zaman yazdırılmaz. Zarfa girmesine izin verilen
+Task objective'i, context'i, preferences'ı, ham kalıcı planı, result
+snapshot'ı, ham outbound payload veya prompt, kimlik bilgileri, keyfi
+`result.data` ve keyfi `StructuredError.details` hiçbir zaman yazdırılmaz
+(`progress.plan` yalnızca güvenli kanonik yeniden kurulumdur, kalıcı metin
+değildir). Zarfa girmesine izin verilen
 her metin ayrıca redaksiyondan geçirilir: bu politika `jarvis/app.py` içinde
 tanımlıdır, `sk-...`, Bearer ve JWT biçimlerinin yanında serbest metne gömülü
 etiketli kimlik bilgilerini de (`password=`, `api_key:`, `authorization:`,
@@ -203,7 +208,32 @@ alanını her zaman bu güvenli durumdan yeniden kurar: kalıcı veya tahrif
 edilmiş `task.plan` dışarı giden byte'ları değiştiremez, plan mevcut derin
 redaksiyondan geçer ve onay anı ile yürütme anı payload'ı byte-özdeş kalır.
 SECRET task payload'ı plan alanı içermez. Task JSON'u `plan` veremez ve CLI
-çıktı zarfı planı yazdırmaz.
+çıktı zarfı ham kalıcı planı yazdırmaz.
+
+### Task ilerlemesi ve session gezinmesi
+
+İlerleme task kapsamlıdır ve yalnızca bilgilendiricidir: `Task.progress`
+tipli `TaskProgress` anlık görüntüsünü (tamamlanan aşamalar, en çok 8 açık
+issue, en çok 20 artifact) mevcut task JSON'unda taşır; `SessionState`
+yalnızca `latest_task_id` gezinme işaretçisini kazanır. SQL şeması,
+migration ve `MemoryStore` protokolü değişmemiştir.
+
+Status dışı zarf (`schema_version=2`) tek deterministik `progress` nesnesi
+içerir: `task_id`, `plan` (planlama olduysa her zaman kanonik
+`build_task_plan` yeniden kurulumu; kalıcı `task.plan` metnine asla
+güvenilmez), `current_stage` (otoriter `Task.stage`), `next_stage`
+(yalnızca bilgilendirici doğrusal ardıl; hiçbir onay/maliyet/iptal engelini
+atlamaz ve hiçbir geçişi başlatmaz), `completed_stages` (yalnız gerçekten
+başarıyla biten aşamalar, sırayla ve kopyasız; bekleme/hata/ret/iptal aşama
+tamamlamaz, terminal durumlar listeye girmez), `open_issues` (sabit altı
+tipli tür; serbest metin yok), `artifacts` (üretim akışlarında boş) ve
+`post_completion_next_step` (yalnız tamamlanan task için). Session next
+step yalnız gerçek string kabul eder, 240 kod noktasıyla sınırlanır ve
+kimlik bilgisi taşıyan değer bütünüyle `Review the verified result.` ile
+değiştirilir. Task JSON'u `progress` veya `latest_task_id` veremez; eski
+task/session JSON'u güvenle yüklenir ve bozuk ilerleme değerleri kapalı
+biçimde düşer. Onay sonrası progress/plan mutasyonu dışa giden payload,
+prompt, hash, preview veya fingerprint'leri değiştiremez.
 
 ### Composition root ve testler
 

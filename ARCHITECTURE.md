@@ -217,6 +217,116 @@ UI'ı kapsam dışıdır ve karar verilmemiştir.
   eder. Hiçbir plan adımı kendi başına yürütme tetiklemez; AgentCore yine tek
   connector yürütmesi yapar.
 
+### 4.4 SessionState / Progress zenginleştirme (uygulandı)
+
+İlerleme **task kapsamlıdır** ve yalnızca bilgilendirme amaçlıdır; yaşam
+döngüsü otoritesi `Task.status`/`Task.stage`, onaylar, faturalandırma durumu
+ve doğrulamada kalır. `SessionState` yalnızca gezinme işaretçisi kazanır.
+
+- Tipli sözleşme (`jarvis/contracts.py`): `TaskProgress(completed_stages,
+  open_issues≤8, artifacts≤20)`, `ProgressIssue(kind, error_code, retryable)`
+  (sabit altı tür: `clarification_required`, `approval_required`,
+  `cost_override_required`, `invalid_grant`, `cancellation_pending`,
+  `failure`; serbest metin alanı yoktur), `ProgressArtifact(kind∈{file,
+  directory,artifact}, change∈{created,modified,deleted,generated}, label)`.
+  `Task.progress` mevcut task JSON'unda, `SessionState.latest_task_id` mevcut
+  session JSON'unda kalıcılaşır; SQL kolonu, tablo, migration veya yeni
+  `MemoryStore` metodu yoktur ve şema sürümü 3'te kalır.
+- **current/next-stage semantiği (kilitli):** `current_stage` her zaman
+  otoriter `Task.stage`'dir. `next_stage` yalnızca deterministik doğrusal
+  ardıldır (`UNDERSTAND→…→PERSIST→COMPLETED`; `COMPLETED/FAILED/CANCELLED→
+  null`) ve `next_loop_stage()` ile hesaplanır. Salt bilgidir: geçiş
+  başlatmaz veya yetkilendirmez, ardılın şu an çalıştırılabilir olduğunu ima
+  etmez, açık clarification/onay/maliyet/iptal/hata engelini atlamaz ve izin,
+  faturalandırma, connector seçimi, yürütme, doğrulama veya dışa
+  serileştirmeyi etkilemez. Örnek: onay bekleyen task
+  `current_stage=risk_and_permission`, `next_stage=cost_preflight`,
+  `open_issues=[approval_required]` gösterebilir; bu, onay çözülmeden cost
+  preflight'ın çalışabileceği anlamına gelmez.
+- **completed-stage semantiği (kilitli):** Bir aşama yalnızca işi başarıyla
+  bitip AgentCore deterministik ardılına geçerken, kalıcı checkpoint'ten
+  önce, ekleme sırası korunarak ve kopyasız eklenir (`jarvis/progress.py`
+  merkezî yardımcıları; çalışma zamanında SQLite olay tekrarı yoktur).
+  Beklemek aşamayı tamamlamaz; başarısız aşama, reddedilen onayın engellediği
+  aşama, connector iptali/hatası (`EXECUTE`) ve doğrulama hatası (`VERIFY`)
+  tamamlanmış sayılmaz; `COMPLETED/FAILED/CANCELLED` asla listeye girmez.
+  Önceden tamamlanmış aşamalar bekleme, hata, iptal, restart ve resume
+  boyunca korunur; başarılı tamamlanma `UNDERSTAND`→`PERSIST` arası 11
+  aşamayı içerir. `EXECUTE`'tan `COST_PREFLIGHT`'a dönen yeniden-preflight
+  kopya üretmez.
+- **Issue güncellemeleri (deterministik):** `AWAITING_CLARIFICATION→
+  clarification_required`, `AWAITING_APPROVAL→approval_required`,
+  `AWAITING_COST_OVERRIDE→cost_override_required`; geçersiz/bayat grant
+  blocker'ı korur ve mevcut `ErrorCode`/retryable ile `invalid_grant` ekler;
+  çözülmemiş iptal isteği `cancellation_pending`; terminal hata mevcut
+  yapısal `ErrorCode`/retryable ile `failure`; başarılı çözüm ilgili
+  blocker'ı, başarılı tamamlanma tüm issue'ları temizler. Terminal ret/iptal
+  status/stage ile temsil edilir, blocker'ları temizler ve hiçbir aşamayı
+  tamamlanmış diye etiketlemez. Clarification sorusu, onay gerekçesi,
+  connector özeti, doğrulama kanıtı veya hata mesajı `TaskProgress`'e
+  kopyalanmaz.
+- **Artifacts:** yalnız gelecekteki kullanım için tipli/sınırlı sözleşme.
+  Normalizasyon: gerçek `str` zorunlu (`str()` asla çağrılmaz) → NFKC →
+  CRLF→LF, sonra CR→LF → boşluk indirgeme → boş değer düşer → 240 kod
+  noktası (`value[:239]+"…"`, U+2026) → kimlik bilgisi taşıyan etiket
+  kalıcılaşmadan düşer → normalize `(kind, change, label)` üçlüsü ilk geçiş
+  korunarak teklenir → en çok 20 kabul. Etiket asla dosya yolu olarak
+  çözülmez, açılmaz veya çalıştırılmaz. Bu milestone'da hiçbir connector
+  artifact üretmez; connector özeti veya keyfi `ToolResult.data`
+  ayrıştırılmaz ve üretim listesi boş kalır.
+- **Session next step:** `SessionState.next_step` uyumluluk için kalır ama
+  güvenilmeyen bilgi metnidir: kalıcılaşmadan önce yalnız gerçek `str`
+  kabul edilir (aksi halde `Review the verified result.`), NFKC/satır-sonu/
+  boşluk normalize edilir, 240 kod noktasıyla `value[:239]+"…"` kesilir ve
+  kimlik bilgisi taşıyan değer bütünüyle varsayılanla değiştirilir. Keyfi
+  connector verisi session durumuna stringlenmez; app katmanı çıktı
+  redaksiyonu ikinci savunma olarak sürer.
+- **latest_task_id:** gezinme metadata'sıdır, yaşam döngüsü otoritesi
+  değildir. Yeni task kaydı hem `active_task_id` hem `latest_task_id`'yi
+  kurar; resume, clarification, onay/ret ve iptal adreslenen task'ı en son
+  dokunulan yapar; terminal tamamlanma/hata/ret/iptal `active_task_id`'yi
+  bugünkü gibi temizlerken `latest_task_id`'yi korur. `latest_task_id`
+  içermeyen eski session JSON'u mevcut `active_task_id` değerine
+  varsayılanlanır. Proje, görev-listesi veya oturumlar-arası model yoktur.
+- **Geriye uyumluluk:** yalnız mevcut session/task JSON kolonları kullanılır
+  ve `to_dict()/from_dict()` yeni tipli alanları round-trip'ler. Progress'i
+  olmayan eski task JSON'u güvenle yüklenir: terminal olmayan task için
+  yalnız mevcut aşamanın deterministik doğrusal öncülleri türetilir, eski
+  `COMPLETED` task `PERSIST`'e kadar tüm çalışma aşamalarını türetir, eski
+  `FAILED/CANCELLED` task hiçbir aşama uydurmaz. Bilinmeyen/bozuk progress
+  değerleri (ham string enum dahil) kapalı biçimde düşer; tavanlar yüklemede
+  de uygulanır. Şema sürümü artmaz, olay tekrarı yoktur; mevcut checkpoint
+  ve finalization işlemleri kalıcılık sınırı kalır.
+- **Çıktı şeması v2:** status dışı zarf `schema_version=2` olur ve tek
+  deterministik, redakte üst-düzey `progress` nesnesi ekler: `task_id`,
+  `plan` (planlama olmadıysa boş; olduysa her zaman `build_task_plan(task)`
+  ile güvenli kanonik yeniden kurulum — kalıcı `task.plan` metni asla
+  yazdırılmaz veya güvenilmez), `current_stage` (`task.stage.value`),
+  `next_stage` (bilgilendirici ardıl veya `null`), `completed_stages`
+  (kalıcı tamamlanma sırasıyla), `open_issues` (yalnız sabit tipli alanlar),
+  `artifacts` (üretim akışlarında `[]`), `post_completion_next_step`
+  (yalnız tamamlanan adreslenen task için sınırlı session next step, aksi
+  halde `null`). Task yoksa `progress=null`. Mevcut üst-düzey zarf alanları
+  ve session/task/result/approval/billing/error allowlist'leri değişmez;
+  `status` komutu tamamen geriye uyumludur; ASCII-güvenli deterministik JSON
+  ve app-katmanı redaksiyonu sürer. Ham objective, context, preferences,
+  kalıcı task planı, result snapshot, outbound payload/prompt, getirilen
+  hafıza metni veya keyfi result verisi yazdırılmaz. §4.1'deki "plan
+  yazdırılmaz" kuralı ham kalıcı plan için geçerliliğini korur; v2 yalnızca
+  güvenli kanonik yeniden kurulumu taşır. Plan satırı başına tamamlanma
+  işareti yoktur: altı plan satırı bildirimsel planlama rehberidir; geçerli,
+  sonraki ve tamamlanmış ilerleme adımları `LoopStage` değerleridir, plan
+  satırı indeksleri değildir.
+- Onay sonrası progress/plan mutasyonu sanitize connector payload'ını,
+  prompt byte'larını, payload hash'ini, outbound preview'u ve scope/request
+  fingerprint'lerini değiştiremez; hiçbir progress metni talimat olarak
+  yorumlanmaz veya çalıştırılmaz. Yürütme-öncesi süreç kimliği, exactly-once
+  mekanizması, retry davranışı değişikliği, connector artifact keşfi,
+  dosya sistemi/Git taraması ve model-üretimli planlama bu milestone'a
+  eklenmemiştir.
+
+## 5. İzin ve güvenlik modeli
+
 Üç kullanıcı modu kesinleşmiştir:
 
 - **Sıkı onay:** Eyleme dönüşen her önemli adımda onay ister.

@@ -4,6 +4,7 @@ import copy
 import unittest
 
 from jarvis.contracts import (
+    LINEAR_LOOP_STAGES,
     RETRIEVAL_CANDIDATE_WINDOW,
     DataClassification,
     DecisionRecord,
@@ -164,6 +165,14 @@ class StorageAbstractionTests(unittest.TestCase):
         self.assertEqual(RunStatus.COMPLETED, run.status)
         self.assertEqual(run.session.id, memory.task_session_id(run.task.id))
         self.assertEqual(1, len(memory.list_decisions(run.session.id)))
+        # Progress enrichment rides inside the existing session/task objects;
+        # the store above needed no new protocol methods for it.
+        stored_task = memory.load_task(run.task.id)
+        self.assertEqual(LINEAR_LOOP_STAGES, stored_task.progress.completed_stages)
+        self.assertEqual((), stored_task.progress.open_issues)
+        stored_session = memory.load_session(run.session.id)
+        self.assertIsNone(stored_session.active_task_id)
+        self.assertEqual(run.task.id, stored_session.latest_task_id)
 
     def test_retrieval_flows_through_a_non_sqlite_store(self) -> None:
         registry = ToolRegistry()
