@@ -35,6 +35,7 @@ from jarvis.contracts import (
     VerificationRecord,
     is_expired,
 )
+from jarvis.planning import build_task_plan
 from jarvis.registry import (
     AmbiguousConnectorError,
     ConnectorNotFoundError,
@@ -284,15 +285,11 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.PLAN:
-                if not task.plan:
-                    task.plan = [
-                        "Validate intent and retrieved context",
-                        "Apply permission and monthly cost policies",
-                        "Select one deterministic available connector",
-                        "Execute within the normalized scope",
-                        "Verify with explicit method and evidence",
-                        "Present and persist the decision, rationale, and next step",
-                    ]
+                # Always rebuilt from safe structural task state: a persisted
+                # or tampered plan is never preserved while the task is still
+                # at PLAN. A task resumed past this stage keeps its persisted
+                # plan because PLAN is not re-entered.
+                task.plan = build_task_plan(task)
                 try:
                     selection = self.registry.select(task)
                 except Exception as exc:

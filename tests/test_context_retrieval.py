@@ -603,17 +603,23 @@ class CoreFlowTests(unittest.TestCase):
         self.assertIn("eligible-record", serialized)
         self.assertNotIn("classified-record", serialized)
 
-    def test_static_plan_is_unchanged(self) -> None:
+    def test_canonical_plan_reflects_task_state_without_retrieved_prose(self) -> None:
         core = self.core(DummyConnector())
         run = core.run(make_task())
+        # Fixed vector: SHA-256("echo this")[:16] after canonical normalization.
         self.assertEqual(
             [
-                "Validate intent and retrieved context",
-                "Apply permission and monthly cost policies",
-                "Select one deterministic available connector",
-                "Execute within the normalized scope",
-                "Verify with explicit method and evidence",
-                "Present and persist the decision, rationale, and next step",
+                "Validate objective_ref=a6065c2da58054f8 for capability=echo "
+                "and action=read; visible_assumption=present.",
+                "Proceed without retrieved decision references; "
+                "do not infer missing memory.",
+                "Keep execution within the declared scope: target=specified, "
+                "destination=unspecified, classification=internal.",
+                "Apply permission and billing policies before any connector execution.",
+                "Select one deterministic connector and execute only the approved "
+                "action and scope.",
+                "Verify the result against objective_ref=a6065c2da58054f8 and the "
+                "declared scope, then persist the decision, rationale, and next step.",
             ],
             run.task.plan,
         )
@@ -778,6 +784,7 @@ class ConnectorRetrievalTests(unittest.TestCase):
                 "context",
                 "visible_assumption",
                 "preferences",
+                "plan",
             },
             set(payload),
         )

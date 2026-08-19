@@ -187,6 +187,24 @@ yereldir. Boş görüntü payload şeklini değiştirmez. Task JSON'u
 `retrieved_context` veya getirme metadata'sı veremez ve CLI çıktı zarfı
 getirilen içeriği göstermez.
 
+### Görev-farkında deterministik plan
+
+`PLAN` aşaması, yalnızca güvenli yapısal task durumundan kurulan deterministik
+altı adımlı planı üretir ve kalıcılaştırır (`jarvis/planning.py`). Ham
+objective plana girmez; tek temsili, normalize edilmiş metnin SHA-256'sının
+ilk 16 hex karakteri olan `objective_ref=` değeridir. Capability ve action 64,
+her plan adımı 240 kod noktasıyla sınırlandırılır (taşan değer `…` ile biter).
+Target/destination yalnızca `specified|unspecified`, assumption yalnızca
+`present|absent`, sınıflandırma yalnızca kanonik değeri veya `unknown` olarak
+görünür. Getirilen hafıza planı yalnızca uygun karar-referansı **sayısı**
+(en çok 5) üzerinden etkiler; getirilen düz metin hiçbir zaman plan talimatına
+dönüşmez. Claude connector SECRET olmayan payload'daki üst düzey `plan`
+alanını her zaman bu güvenli durumdan yeniden kurar: kalıcı veya tahrif
+edilmiş `task.plan` dışarı giden byte'ları değiştiremez, plan mevcut derin
+redaksiyondan geçer ve onay anı ile yürütme anı payload'ı byte-özdeş kalır.
+SECRET task payload'ı plan alanı içermez. Task JSON'u `plan` veremez ve CLI
+çıktı zarfı planı yazdırmaz.
+
 ### Composition root ve testler
 
 Üretim bileşimi `build_default_app()` içindedir: `Settings` →

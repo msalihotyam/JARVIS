@@ -41,6 +41,7 @@ from jarvis.contracts import (
     retrieval_eligible,
     truncate_retrieved_text,
 )
+from jarvis.planning import build_task_plan
 
 
 SECRET_KEY_PATTERN = re.compile(
@@ -485,6 +486,11 @@ class ClaudeCodeConnector(BaseConnector):
         preferences, preferences_redactions = self._redact(
             self._external_preferences(task)
         )
+        # The outbound plan is independently rebuilt from safe structural task
+        # state at this egress boundary. The persisted ``task.plan`` is
+        # internal state and is never serialized: a restored, corrupted or
+        # tampered plan cannot alter the approved outbound bytes.
+        plan, plan_redactions = self._redact(build_task_plan(task))
         payload = {
             "objective": objective,
             "capability": task.capability,
@@ -492,6 +498,7 @@ class ClaudeCodeConnector(BaseConnector):
             "context": context,
             "visible_assumption": assumption,
             "preferences": preferences,
+            "plan": plan,
         }
         retrieved_memory, retrieved_redactions = self._retrieved_memory(task)
         if retrieved_memory is not None:
@@ -502,6 +509,7 @@ class ClaudeCodeConnector(BaseConnector):
             + context_redactions
             + assumption_redactions
             + preferences_redactions
+            + plan_redactions
             + retrieved_redactions,
         )
 
