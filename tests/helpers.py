@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
@@ -24,6 +25,24 @@ from jarvis.contracts import (
     VerificationRecord,
     VerificationStatus,
 )
+
+
+def safe_cleanup(temp: tempfile.TemporaryDirectory) -> None:
+    """Remove a test temp directory, tolerating Windows delete-pending files.
+
+    SQLite leaves ``-wal``/``-shm`` sidecars that Windows can still hold as
+    delete-pending when the directory is removed. ``ignore_cleanup_errors``
+    does not cover this: CPython's cleanup handler calls ``_resetperms``
+    (``os.chmod``) on the offending path *before* honouring the flag, and
+    ``chmod`` on a delete-pending file raises ``WinError 5``. That escapes as a
+    test error even though nothing is wrong with the test. Test temp
+    directories live under the OS temp dir and are reclaimed there, so
+    swallowing the failure is safe.
+    """
+    try:
+        temp.cleanup()
+    except OSError:
+        pass
 
 
 class DummyConnector(BaseConnector):

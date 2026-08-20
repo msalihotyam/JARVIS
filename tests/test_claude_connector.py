@@ -23,6 +23,7 @@ from jarvis.contracts import (
     SessionState,
     Task,
 )
+from tests.helpers import safe_cleanup
 
 #: Non-secret shape of ``claude auth status --json`` for a Max/OAuth session.
 OAUTH_MAX_AUTH_STATUS = {
@@ -86,7 +87,7 @@ class FakeProcess:
 class ClaudeConnectorSecurityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.connector = ClaudeCodeConnector(
             allowed_roots=(self.root,),

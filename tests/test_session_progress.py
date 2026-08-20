@@ -24,6 +24,7 @@ from jarvis.contracts import (
     PROGRESS_MAX_ISSUES,
     BillingClass,
     ErrorCode,
+    ExecutionAttempt,
     LoopStage,
     MonetaryState,
     OutcomeStatus,
@@ -53,7 +54,7 @@ from jarvis.progress import (
 )
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 from tests.test_app import task_document
 from tests.test_billing_policy import SwitchingRouteConnector
 
@@ -88,7 +89,7 @@ class ProcessBoundaryTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
         self.memory = SQLiteMemoryStore(self.database)
         for target, attribute in (
@@ -353,26 +354,41 @@ class StageAccumulationTests(ProcessBoundaryTestCase):
         self.assertEqual((), cancelled.task.progress.open_issues)
 
     def test_unresolved_cancellation_is_pending_until_terminal(self) -> None:
+        # H2-F: an unresolved cancellation is only "pending" when an execution
+        # attempt is genuinely IN_FLIGHT, and it must never be reported as a
+        # final CANCELLED while the external outcome is unresolved.
         core = self.core(DummyConnector())
         session = core.start_session("pending cancel")
         task = make_task()
         task.stage = LoopStage.EXECUTE
         task.selected_connector = "ghost-connector"
         self.memory.save_task(session.id, task)
+        attempt = self.memory.open_execution_attempt(
+            ExecutionAttempt(
+                session_id=session.id,
+                task_id=task.id,
+                connector="ghost-connector",
+                fingerprint="fp",
+            )
+        )
+        self.assertTrue(
+            self.memory.begin_execution(attempt.id, session.id, task.id, [])
+        )
 
         pending = core.cancel(session.id, task.id)
-        self.assertEqual(RunStatus.CANCELLED, pending.status)
+        # Cancelling, not final CANCELLED: the transition has not occurred.
+        self.assertEqual(RunStatus.CANCELLING, pending.status)
         self.assertIs(TaskStatus.CANCEL_REQUESTED, pending.task.status)
         self.assertIs(LoopStage.EXECUTE, pending.task.stage)
         self.assertEqual(
             [ProgressIssueKind.CANCELLATION_PENDING], issue_kinds(pending.task)
         )
 
-        terminal = core.resume(session.id, task.id)
-        self.assertEqual(RunStatus.CANCELLED, terminal.status)
-        self.assertIs(LoopStage.CANCELLED, terminal.task.stage)
-        self.assertEqual((), terminal.task.progress.open_issues)
-        self.assertNotIn(LoopStage.CANCELLED, terminal.task.progress.completed_stages)
+        # A bare resume with no live owner cannot resolve the in-doubt outcome;
+        # it must not fabricate a successful cancellation or replay execution.
+        blocked = core.resume(session.id, task.id)
+        self.assertEqual(RunStatus.FAILED, blocked.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, blocked.error.code)
 
     def test_cost_preflight_reentry_never_duplicates_completed_stages(self) -> None:
         # Subscription route during selection/permission/preflight, metered

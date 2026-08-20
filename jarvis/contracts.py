@@ -192,6 +192,10 @@ class RunStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     REJECTED = "rejected"
+    #: Cancellation intent is durable but the task was still executing and the
+    #: transition to a final CANCELLED could not be confirmed. Never reported
+    #: as final CANCELLED (H2-F): the executing owner finalizes on return.
+    CANCELLING = "cancelling"
     CANCELLED = "cancelled"
 
 
@@ -244,6 +248,15 @@ class ErrorCode(str, Enum):
     #: The connector refused to attest an external egress for this task
     #: (SECRET classification, a local-resource boundary it cannot honour).
     EGRESS_REFUSED = "egress_refused"
+    #: A prior execution attempt is in doubt (IN_FLIGHT after restart, or an
+    #: outcome the owner could not establish). Non-replayable; needs deferred
+    #: recovery. JARVIS refuses to automatically execute it again.
+    EXECUTION_UNKNOWN_OUTCOME = "execution_unknown_outcome"
+    #: Another local execution owner already holds this task's attempt; a
+    #: concurrent resume observed the live claim and did not execute.
+    EXECUTION_IN_PROGRESS = "execution_in_progress"
+    #: A command targeted a task that is already in a terminal state.
+    TASK_ALREADY_TERMINAL = "task_already_terminal"
 
 
 class AttestationError(Exception):
@@ -1636,6 +1649,64 @@ class LoopCheckpoint:
     created_at: str = field(default_factory=utc_now)
 
 
+class AttemptState(str, Enum):
+    """Durable lifecycle of one local execution attempt (H2).
+
+    PREPARED: bound and gate-validated, the connector boundary has NOT been
+    crossed. Safe to reclaim/retry after restart. IN_FLIGHT: the connector
+    boundary was (about to be) crossed; the external outcome is unknown until
+    the owner concludes it - never replayed after restart. FINISHED: the
+    attempt concluded with a known outcome (success or clean failure); never
+    executed again. UNKNOWN_OUTCOME: the owner could not establish the outcome
+    (an egress call that raised, a timeout); never automatically executed
+    again, needs explicit deferred recovery.
+    """
+
+    PREPARED = "prepared"
+    IN_FLIGHT = "in_flight"
+    FINISHED = "finished"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+
+
+#: Attempt states that must never trigger an automatic re-execution.
+ATTEMPT_NON_REPLAYABLE = frozenset(
+    {AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionAttempt:
+    """One durable local execution attempt bound to an approved opportunity."""
+
+    session_id: str
+    task_id: str
+    connector: str
+    #: The approved permission/attestation identity this attempt runs under.
+    fingerprint: str
+    state: AttemptState = AttemptState.PREPARED
+    id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["state"] = self.state.value
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExecutionAttempt":
+        return cls(
+            session_id=data["session_id"],
+            task_id=data["task_id"],
+            connector=data["connector"],
+            fingerprint=data["fingerprint"],
+            state=AttemptState(data.get("state", AttemptState.PREPARED.value)),
+            id=data["id"],
+            created_at=data.get("created_at", utc_now()),
+            updated_at=data.get("updated_at", utc_now()),
+        )
+
+
 @dataclass(slots=True)
 class AgentRun:
     status: RunStatus
@@ -1685,7 +1756,15 @@ class MemoryStore(Protocol):
         event_type: str,
         payload: dict[str, Any] | None = None,
         pending_request: PermissionRequest | None = None,
-    ) -> None: ...
+    ) -> bool:
+        """Persist one lifecycle checkpoint; True when this writer won.
+
+        The task write and its dependent checkpoint/event/pending-approval
+        writes are one consistent operation. False means a terminal writer
+        already holds authority: nothing was written and the caller must
+        reload authoritative state instead of reporting its own stale view.
+        """
+        ...
 
     def list_decisions(self, session_id: str) -> list[DecisionRecord]: ...
 
@@ -1702,7 +1781,37 @@ class MemoryStore(Protocol):
         request: PermissionRequest,
         grant: PermissionGrant,
         status: str,
-    ) -> None: ...
+    ) -> bool:
+        """Atomically resolve a still-pending request; True only for the single
+        winner. A losing contender creates no grant and must reload state."""
+        ...
+
+    def reject_task(
+        self,
+        request: PermissionRequest,
+        grant: PermissionGrant,
+        session: SessionState,
+        task: Task,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Atomically resolve a pending request REJECTED and finalize the task
+        as terminal rejected in one transaction, so no observable state has a
+        rejected request with a still-resumable task. False if already resolved
+        or terminal (no writes)."""
+        ...
+
+    def cancel_task(
+        self,
+        session: SessionState,
+        task: Task,
+        *,
+        connector_cancelled: bool,
+    ) -> str:
+        """Atomically arbitrate cancellation against the execution attempt in
+        one transaction. Returns ``"terminal"`` (already immutable, no write),
+        ``"cancelled"`` (finalized), or ``"cancelling"`` (IN_FLIGHT: intent
+        recorded, not final)."""
+        ...
 
     def has_remembered_scope_grant(
         self, session_id: str, scope_fingerprint: str
@@ -1718,6 +1827,65 @@ class MemoryStore(Protocol):
         """
         ...
 
+    # -- H2: durable execution-attempt journal and atomic ownership --------
+
+    def latest_execution_attempt(self, task_id: str) -> "ExecutionAttempt | None":
+        """The most recent execution attempt for a task, or None."""
+        ...
+
+    def open_execution_attempt(
+        self, attempt: "ExecutionAttempt"
+    ) -> "ExecutionAttempt":
+        """Atomically create-or-observe the active attempt for the task.
+
+        Inserts ``attempt`` (PREPARED) only when the task has no attempt yet;
+        otherwise returns the existing latest attempt unchanged. The caller
+        proceeds only when the returned attempt is still PREPARED.
+        """
+        ...
+
+    def begin_execution(
+        self,
+        attempt_id: str,
+        session_id: str,
+        task_id: str,
+        one_shot_fingerprints: Sequence[str],
+    ) -> bool:
+        """Atomically claim ownership in ONE transaction: verify authoritative
+        task lifecycle (reject if cancelled/terminal), transition PREPARED ->
+        IN_FLIGHT, and consume every required one-shot grant, all-or-nothing.
+
+        Returns True for exactly one concurrent contender; every loser returns
+        False and must not cross the connector boundary. Durable before
+        ``connector.execute`` is invoked.
+        """
+        ...
+
+    def mark_execution_unknown(self, attempt_id: str) -> None:
+        """Owner-only transition IN_FLIGHT -> UNKNOWN_OUTCOME (outcome in doubt)."""
+        ...
+
+    def conclude_execution(
+        self,
+        session: SessionState,
+        task: Task,
+        attempt_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        finalizing_cancellation: bool = False,
+    ) -> str:
+        """Atomically conclude an IN_FLIGHT attempt as FINISHED together with
+        the task's post-execution lifecycle write and audit checkpoint.
+
+        Returns ``"finished"`` on success, ``"cancelled"`` when an authoritative
+        cancellation was recorded in the conclude window (so a stale
+        success/failure never overwrites it), or ``"lost"`` if the attempt was
+        no longer IN_FLIGHT. ``finalizing_cancellation`` skips the re-check
+        because the write itself is the cancellation.
+        """
+        ...
+
     def append_usage(self, usage: UsageRecord) -> None: ...
 
     def monthly_monetary_cost(self, month: str | None = None) -> float: ...
@@ -1730,7 +1898,15 @@ class MemoryStore(Protocol):
         usage: UsageRecord,
         event_type: str,
         payload: dict[str, Any],
-    ) -> None: ...
+    ) -> bool:
+        """Finalize a task; True only when this writer owned the transition.
+
+        The guarded terminal task write, the session update, the decision
+        record, the final usage bookkeeping and the terminal event are one
+        all-or-nothing operation. False means another terminal writer already
+        won: nothing was written and the caller must report authoritative state.
+        """
+        ...
 
 
 @runtime_checkable

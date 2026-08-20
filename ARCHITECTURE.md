@@ -325,6 +325,120 @@ ve doğrulamada kalır. `SessionState` yalnızca gezinme işaretçisi kazanır.
   dosya sistemi/Git taraması ve model-üretimli planlama bu milestone'a
   eklenmemiştir.
 
+### 4.7 Yerel yürütme günlüğü ve yaşam döngüsü tahkimi (H2, uygulandı)
+
+Yerel yürütme/yeniden başlatma/eşzamanlılık ve yaşam döngüsü riskleri kapatıldı.
+Değişmez emniyet ilkesi: **JARVIS, bir dış yürütmenin zaten başlamadığını
+kanıtlayamıyorsa onu kendiliğinden yeniden çalıştırmaz.** Bu, keyfi uzak
+sağlayıcılar için dağıtık exactly-once değil, **yerel yürütme tahkimidir**.
+
+- **Yürütme-girişimi günlüğü:** Tipli, sağlayıcıdan bağımsız `ExecutionAttempt`
+  (`jarvis/contracts.py`) ve `AttemptState` durumları `PREPARED → IN_FLIGHT →
+  FINISHED`, ayrıca `UNKNOWN_OUTCOME`. Her girişim benzersiz kimlik + session +
+  task + seçili connector + onaylı attestation fingerprint + zaman damgaları
+  taşır ve `execution_attempts` tablosunda kalıcıdır (şema 4, ekleyici
+  migration). Girişim connector sınırından **önce** yazılır; `IN_FLIGHT`,
+  `connector.execute()` çağrılmadan önce dayanıklıdır. Başarı `FINISHED`'e
+  geçer. Yeniden başlatmada bulunan `IN_FLIGHT`/`UNKNOWN_OUTCOME` asla yeniden
+  oynatılmaz; kullanıcıya yapısal, bloklayıcı `EXECUTION_UNKNOWN_OUTCOME`
+  bildirilir. Süreç yeniden bağlanması H2 kapsamında değildir.
+- **Atomik sahiplik (tek kazanan):** `open_execution_attempt` (oluştur-veya-gözle)
+  + `begin_execution` (atomik `PREPARED→IN_FLIGHT` CAS + tek-sefer grant
+  tüketimi) `BEGIN IMMEDIATE` altında serileşir; eşzamanlı ikinci resume mevcut
+  IN_FLIGHT'ı gözler, connector'ı çağırmadan kapalı biçimde durur. Otorite
+  Python nesne kimliği veya süreç-içi kilit değil, **dayanıklı depodur**.
+- **Tek-sefer grant tüketimi:** `permission_grants.consumed_by_attempt` kolonu;
+  bir tek-sefer grant tam olarak bir girişim tarafından tüketilir (atomik
+  rowcount), süre kontrolü korunur, oturum-yeniden-kullanılabilir grant'ler
+  tüketilmez. H1 onay/egress attestation değişmez.
+- **Terminal yaşam döngüsü politikası** (`jarvis/lifecycle.py`): `COMPLETED`,
+  `FAILED`, `CANCELLED`, `REJECTED` normal komutlarla değişmezdir ve connector
+  kayıtlı olmasa bile bağlantısız okunabilir/raporlanabilir. Terminal durum
+  resume/clarify/approve/reject/cancel ile veya bayat yürütme sonucuyla yeniden
+  açılamaz; terminal kontrolü connector aramadan önce yapılır.
+- **İptal tahkimi (H2-F):** İptal niyeti dayanıklıdır. Yürütme sürerken
+  `CANCEL_REQUESTED` kalıcılaşır ve yürüten sahip, `COMPLETED/FAILED` yazmadan
+  önce otoriter iptal durumunu yeniden yükler; bayat başarı, otoriter
+  `CANCELLED` terminalini asla ezmez. Çözülmemiş iptal, gerçek geçiş olmadan
+  final `CANCELLED` diye raporlanmaz; yeni `RunStatus.CANCELLING` bu bekleyen
+  durumu temsil eder.
+- **Sıralama (H2-H):** `connector.execute` → `append_usage` (kullanım önce, asla
+  kaybolmaz) → atomik `conclude_execution` (girişim `FINISHED` + task yaşam
+  döngüsü yazımı + checkpoint tek işlemde). Aradaki bir çökme girişimi
+  `IN_FLIGHT` (yeniden oynatılamaz) bırakır ve yazılmış kullanımı korur.
+  Faturalandırma yeniden tasarlanmadı.
+
+Bağımsız Codex incelemesinin üç bulgusu için son düzeltmeler:
+
+- **Atomik onay/ret tek kazananı:** `resolve_approval` artık `pending` durumu
+  üzerinde tek işlemli CAS'tir (`WHERE status='pending'`); eşzamanlı approve ve
+  reject ikisi birden ilerleyemez. Kaybeden grant üretmez, yürütmez, otoriter
+  durumu yeniden yükler ve kazanan çözümle tutarlı sonuç döner. `_handle_approval`
+  geçersiz-grant yolu, çözülmüş bir isteği taze bir bekleme durumuyla üzerine
+  yazmaz; terminal/çözülmüş durumu yeniden yükleyip raporlar.
+- **Atomik iptal tahkimi (TOCTOU pencereleri):** `begin_execution` aynı işlemde
+  kalıcı task yaşam döngüsünü okur ve task iptal/terminal ise talebi reddeder
+  (Pencere A); `connector.execute` asla başlamaz. `conclude_execution` aynı
+  işlemde otoriter iptali yeniden değerlendirir (Pencere B) ve `"cancelled"`
+  dönerek bayat başarı/başarısızlığın otoriter iptali ezmesini engeller; sahip
+  bunun üzerine CANCELLED'ı sonlandırır.
+- **Tüm tek-sefer kapılarının tüketimi:** `begin_execution` yürütmeyi
+  yetkilendiren HER tek-sefer grant'i (temel izin + geçerli parasal kapılar:
+  ücretli-API, aylık üst-sınır override) tek işlemde ya hep ya hiç tüketir;
+  değişken task tercihlerinden çıkarım yapılmaz, kalıcı grant/istek fingerprint
+  kimlikleri kullanılır. Biri geçersizse hiçbiri tüketilmez ve yürütme başlamaz.
+  Oturum-yeniden-kullanılabilir grant'ler tek-sefer diye tüketilmez.
+
+İkinci Codex incelemesinin iki işlem-sınırı bulgusu için son düzeltmeler:
+
+- **Atomik ret + terminal geçiş (P1-A):** `reject_task` tek işlemde bekleyen
+  isteği `rejected` olarak CAS'ler, task'ı terminal `REJECTED` yapar, grant'i
+  yazar ve checkpoint/olay kaydını atar. Böylece "istek reddedilmiş ama task
+  hâlâ devam ettirilebilir" şeklinde gözlemlenebilir bir ara durum yoktur;
+  eşzamanlı bir resume taze onay isteği üretemez ve bayat approve yürütemez.
+- **Atomik iptal tahkimi (P1-B):** `cancel_task` tek işlemde otoriter task
+  yaşam döngüsünü ve en son execution attempt durumunu birlikte okur, sonra
+  kararı yazar. Terminal task'a dokunmaz (`"terminal"`); yürütme henüz talep
+  edilmemişse iptali sonlandırır (`"cancelled"`, sonraki `begin_execution`
+  kaybeder ve connector hiç çağrılmaz); `IN_FLIGHT` bir girişim varsa yalnız
+  niyeti kaydeder (`"cancelling"`) ve final CANCELLED iddia etmez.
+- **Depo düzeyinde terminal değişmezlik:** `_upsert_task` artık korumalı bir
+  upsert'tür (`WHERE tasks.status NOT IN (...)`); daha eski, terminal olmayan
+  bir task nesnesi taşıyan bayat bir yazıcı terminal satırı asla geri alamaz.
+  Yalnızca açık `save_task` kurulum primitifi (ürün akışında çağrılmaz) bu
+  korumayı bilinçli olarak atlar.
+
+Üçüncü Codex incelemesinin tek bulgusu için son düzeltme:
+
+- **Bayat yazıcı sonucu bildirir (durum/sonuç/denetim tutarlılığı):**
+  `_upsert_task` artık kazanıp kazanmadığını (`rowcount == 1`) döndürür ve
+  `persist_checkpoint` `bool` döner. Korumalı task yazımı ile ona bağlı tüm
+  yazımlar (session, checkpoint, denetim olayı, bekleyen onay) tek tutarlı
+  işlemdir: terminal bir yazıcı çoktan kazandıysa işlem bütünüyle geri alınır
+  ve `False` döner. Böylece bayat bir resume geride ne bayat bir checkpoint,
+  ne `approval_requested` gibi bayat bir yaşam döngüsü olayı, ne de hayalet bir
+  bekleyen onay bırakır. AgentCore onay yolunda bu sonucu inceler; kaybettiyse
+  `_authoritative_run` ile task/session'ı depodan yeniden yükler, otoriter
+  terminal sonucu döner ve **`permission_request` eklemez** — kalıcılıkta
+  gerçekten bulunmayan bir onay fırsatı asla raporlanmaz.
+
+Dördüncü Codex incelemesinin tek bulgusu için son düzeltme:
+
+- **Başarısız korumalı checkpoint bir kontrol-akışı sinyalidir:** Döngüdeki
+  *tüm* yaşam döngüsü yazımları `AgentCore._checkpoint()` üzerinden geçer.
+  Depo "kaybettin" derse `_LifecycleLost` yükselir; `_advance` bunu yakalar ve
+  otoriter sonucu döndürür. Bayat bir sahip artık kendi eski task'ıyla sonraki
+  aşamalara ilerleyemez, dolayısıyla kaybedilen checkpoint'ten sonra `stale
+  verification_passed`, `result_presented`, `task_failed` veya `task_completed`
+  gibi çelişkili olay/karar kaydı yazılmaz.
+- **`finalize_task` ya hep ya hiç:** Korumalı terminal task yazımı, session
+  güncellemesi, karar kaydı, nihai kullanım muhasebesi ve terminal olay tek
+  işlemdedir ve `bool` döner. Bir iptal terminal geçişi çoktan kazandıysa hiçbiri
+  yazılmaz; AgentCore sonucu inceler ve `_authoritative_run` ile otoriter
+  `CANCELLED` durumunu raporlar — hayalet `COMPLETED` üretilmez. Kullanım satırı
+  kendi kimliğiyle anahtarlandığı ve yürütme yolunda zaten yazıldığı için burada
+  yeniden yazılması idempotenttir; mevcut H2 kullanım semantiği korunur.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:

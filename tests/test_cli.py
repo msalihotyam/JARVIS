@@ -38,7 +38,7 @@ from jarvis.contracts import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector
+from tests.helpers import DummyConnector, safe_cleanup
 from tests.test_app import task_document
 
 
@@ -123,7 +123,7 @@ def _must_not_build(settings: Settings):
 class CliTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name)
         self.database = self.root / "jarvis.db"
         self.memory = SQLiteMemoryStore(self.database)
@@ -190,13 +190,13 @@ class CliTestCase(unittest.TestCase):
     def test_status_output_is_backward_compatible(self) -> None:
         expected = {
             "mode": "local",
-            "schema_version": 3,
+            "schema_version": 4,
             "permission_mode": "session",
             "monthly_target_usd": 20.0,
             "monthly_hard_limit_usd": 20.0,
             "paid_api_enabled": False,
         }
-        self.assertEqual(3, self.memory.schema_version())
+        self.assertEqual(4, self.memory.schema_version())
         for argv in ([], ["status"]):
             with self.subTest(argv=argv):
                 code, output, errors = self.invoke(argv, app_factory=_must_not_build)

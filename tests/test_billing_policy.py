@@ -43,7 +43,7 @@ from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 from tests.test_claude_connector import (
     FakeProcess,
     OAUTH_MAX_AUTH_STATUS,
@@ -168,7 +168,7 @@ def cli_payload(total_cost_usd: float | None = None) -> str:
 class BillingPolicyTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
         self.connector = ClaudeCodeConnector(
@@ -846,7 +846,7 @@ class UsageLedgerMigrationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "legacy.db"
         connection = sqlite3.connect(self.database)
         try:

@@ -58,7 +58,7 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 from tests.test_claude_connector import (
     OAUTH_MAX_AUTH_STATUS,
     FakeProcess,
@@ -165,7 +165,7 @@ class ConnectorAttestationMutationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         (self.root / "sub").mkdir()
         self.connector = ClaudeCodeConnector(
@@ -479,7 +479,7 @@ class SecretExternalExecutionTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
         self.connector = ClaudeCodeConnector(
@@ -574,7 +574,7 @@ class ResourceBoundaryTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         (self.root / "inside").mkdir()
         self.outside = self.root.parent
@@ -676,7 +676,7 @@ class ClarificationLifecycleTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector=None, mode=PermissionMode.SESSION) -> AgentCore:
@@ -781,7 +781,7 @@ class OldGrantCannotAuthorizeRefreshedRequestTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
         self.connector = ClaudeCodeConnector(
@@ -894,7 +894,7 @@ class ApprovedEgressEqualsExecutedEgressTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
         self.connector = ClaudeCodeConnector(
@@ -972,7 +972,7 @@ class CostRequestReuseIntegrityTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector) -> AgentCore:
@@ -1066,7 +1066,7 @@ class ToolManifestTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.connector = ClaudeCodeConnector(
             allowed_roots=(self.root,),
@@ -1152,7 +1152,7 @@ class ToolManifestTests(unittest.TestCase):
 class ExpiredGrantTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector) -> AgentCore:
@@ -1303,7 +1303,7 @@ class RequestIdentityTests(unittest.TestCase):
 class ApprovalDisplayBindingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.connector = ClaudeCodeConnector(
             allowed_roots=(self.root,),
@@ -1397,7 +1397,7 @@ class TamperedRequestNotCurrentTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector) -> AgentCore:
@@ -1466,7 +1466,7 @@ class _UnattestedEgressConnector(BaseConnector):
 class UnattestedEgressConnectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector) -> AgentCore:

@@ -8,11 +8,13 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     ActionScope,
     AgentRun,
+    AttemptState,
     AttestationError,
     BillingClass,
     DataClassification,
     DecisionRecord,
     ErrorCode,
+    ExecutionAttempt,
     LoopStage,
     MemoryRetrievalQuery,
     MemoryStore,
@@ -25,6 +27,7 @@ from jarvis.contracts import (
     RiskLevel,
     RunStatus,
     SessionState,
+    SideEffect,
     StructuredError,
     Task,
     TaskStatus,
@@ -33,6 +36,7 @@ from jarvis.contracts import (
     VerificationRecord,
     is_expired,
 )
+from jarvis.lifecycle import is_terminal, terminal_run_status
 from jarvis.planning import build_task_plan
 from jarvis.progress import (
     GATE_ISSUE_KINDS,
@@ -63,6 +67,20 @@ BILLING_REPREFLIGHT_LIMIT = 3
 #: Monetary gate actions; each is its own attested, separately granted request.
 PAID_API_GATE = "enable_paid_api_for_task"
 COST_CAP_GATE = "override_monthly_cost_cap"
+
+
+class _LifecycleLost(Exception):
+    """Internal control flow: another writer won authoritative lifecycle.
+
+    A guarded checkpoint that reports failure is a control-flow signal, not a
+    harmless persistence miss: the local loop must stop immediately rather than
+    keep advancing a stale task through later stages. ``run`` carries the
+    authoritative result reloaded from storage.
+    """
+
+    def __init__(self, run: AgentRun) -> None:
+        super().__init__("lifecycle authority lost to another writer")
+        self.run = run
 
 
 class AgentCore:
@@ -119,9 +137,16 @@ class AgentCore:
             persisted = self.memory.load_task(task.id)
             if persisted is not None:
                 task = persisted
+                # A terminal task is reported, never re-registered or mutated.
+                terminal = self._terminal_run(session, task)
+                if terminal is not None:
+                    return terminal
         session.active_task_id = task.id
         session.latest_task_id = task.id
-        self.memory.persist_checkpoint(session, task, "task_registered")
+        try:
+            self._checkpoint(session, task, "task_registered")
+        except _LifecycleLost as lost:
+            return lost.run
         return self._advance(session, task, grant)
 
     def resume(
@@ -153,10 +178,17 @@ class AgentCore:
                 session,
             )
         # Navigation metadata only. Saved eagerly because a terminal-stage
-        # resume returns without writing another checkpoint.
+        # resume returns without writing another checkpoint. Updating this
+        # session pointer is not a task mutation and needs no connector.
         if session.latest_task_id != task.id:
             session.latest_task_id = task.id
             self.memory.save_session(session)
+        # A terminal task is then reported without touching the connector or
+        # mutating the task, so a completed/failed/cancelled/rejected task
+        # cannot be reopened and stays readable even if its connector is gone.
+        terminal = self._terminal_run(session, task)
+        if terminal is not None:
+            return terminal
         return self._advance(session, task, grant)
 
     def provide_clarification(
@@ -196,7 +228,10 @@ class AgentCore:
         task.status = TaskStatus.PENDING
         task.stage = LoopStage.CLARIFY_OR_ASSUME
         session.latest_task_id = task.id
-        self.memory.persist_checkpoint(session, task, "clarification_provided")
+        try:
+            self._checkpoint(session, task, "clarification_provided")
+        except _LifecycleLost as lost:
+            return lost.run
         return self._advance(session, task, None)
 
     def cancel(self, session_id: str, task_id: str) -> AgentRun:
@@ -210,30 +245,43 @@ class AgentCore:
             return self._input_failure(
                 task, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}", session
             )
-        task.cancellation_requested = True
-        task.status = TaskStatus.CANCEL_REQUESTED
-        session.latest_task_id = task.id
+        # Fast path: a terminal task is reported as-is (the atomic op below
+        # re-checks terminality authoritatively).
+        terminal = self._terminal_run(session, task)
+        if terminal is not None:
+            return terminal
+        # Best-effort connector cancellation signal, taken before the atomic
+        # arbitration; its result only matters when an attempt is IN_FLIGHT.
         cancelled = False
         if task.selected_connector:
             try:
                 cancelled = self.registry.get(task.selected_connector).cancel(task.id)
             except ConnectorNotFoundError:
                 cancelled = False
-        if task.stage is not LoopStage.EXECUTE or cancelled:
-            task.status = TaskStatus.CANCELLED
-            task.stage = LoopStage.CANCELLED
-            session.active_task_id = None
-            # Terminal: the status/stage carry the meaning; no issue remains.
-            clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
-        else:
-            set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
-        self.memory.persist_checkpoint(
-            session,
-            task,
-            "cancellation_requested",
-            {"connector_cancelled": cancelled},
+        # Prepare the pending-cancellation view; the atomic op upgrades it to a
+        # final CANCELLED only if no execution has been claimed (or the
+        # connector confirmed the stop), all within one transaction (P1-B).
+        task.cancellation_requested = True
+        task.status = TaskStatus.CANCEL_REQUESTED
+        session.latest_task_id = task.id
+        clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
+        set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
+        outcome = self.memory.cancel_task(session, task, connector_cancelled=cancelled)
+        if outcome == "terminal":
+            # Execution legitimately reached a terminal state first; never
+            # overwrite it. Report the authoritative persisted state.
+            fresh = self.memory.load_task(task.id)
+            reported = self._terminal_run(session, fresh) if fresh is not None else None
+            return reported if reported is not None else AgentRun(
+                RunStatus.CANCELLED, session, fresh or task
+            )
+        if outcome == "cancelled":
+            return AgentRun(RunStatus.CANCELLED, session, task)
+        if outcome == "cancelling":
+            return AgentRun(RunStatus.CANCELLING, session, task)
+        return self._input_failure(
+            task, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}", session
         )
-        return AgentRun(RunStatus.CANCELLED, session, task)
 
     def _advance(
         self,
@@ -241,14 +289,45 @@ class AgentCore:
         task: Task,
         grant: PermissionGrant | None,
     ) -> AgentRun:
+        """Drive the loop, stopping at once if lifecycle authority is lost."""
+        try:
+            return self._advance_loop(session, task, grant)
+        except _LifecycleLost as lost:
+            return lost.run
+
+    def _advance_loop(
+        self,
+        session: SessionState,
+        task: Task,
+        grant: PermissionGrant | None,
+    ) -> AgentRun:
         active_grant = grant
         while True:
+            # Terminal states are immutable; report and never re-enter the loop.
+            terminal = self._terminal_run(session, task)
+            if terminal is not None:
+                return terminal
+
+            # A durable in-doubt/finished execution attempt is authoritative
+            # over the persisted stage: it is checked before the connector is
+            # even looked up, so an in-doubt task is reportable and never
+            # replayed, and a finished one advances without a second call.
+            if task.stage is LoopStage.EXECUTE:
+                journal = self._execution_journal_precheck(session, task)
+                if isinstance(journal, AgentRun):
+                    return journal
+                if journal == "advanced":
+                    continue
+
+            # Cancellation before any external call started is safe: the
+            # journal precheck above already blocked any IN_FLIGHT/UNKNOWN
+            # attempt, so reaching here means no external call is in progress.
             if task.cancellation_requested:
                 task.status = TaskStatus.CANCELLED
                 task.stage = LoopStage.CANCELLED
                 session.active_task_id = None
                 clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
-                self.memory.persist_checkpoint(session, task, "task_cancelled")
+                self._checkpoint(session, task, "task_cancelled")
                 return AgentRun(RunStatus.CANCELLED, session, task)
 
             if task.stage is LoopStage.UNDERSTAND:
@@ -263,7 +342,7 @@ class AgentCore:
                     )
                 mark_stage_completed(task, LoopStage.UNDERSTAND)
                 task.stage = LoopStage.CONTEXT_RETRIEVAL
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session, task, "intent_understood", {"objective": task.objective}
                 )
                 continue
@@ -293,7 +372,7 @@ class AgentCore:
                 task.stage = LoopStage.CLARIFY_OR_ASSUME
                 # Aggregates only: the checkpoint/audit trail never duplicates
                 # the retrieved contents themselves.
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "context_retrieved",
@@ -312,7 +391,7 @@ class AgentCore:
                 if needs_clarification and not clarification:
                     task.status = TaskStatus.AWAITING_CLARIFICATION
                     set_waiting_issue(task)
-                    self.memory.persist_checkpoint(
+                    self._checkpoint(
                         session,
                         task,
                         "clarification_required",
@@ -328,7 +407,7 @@ class AgentCore:
                 mark_stage_completed(task, LoopStage.CLARIFY_OR_ASSUME)
                 task.stage = LoopStage.PLAN
                 task.status = TaskStatus.PENDING
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "assumption_visible",
@@ -349,7 +428,7 @@ class AgentCore:
                 task.selected_connector = selection.connector.manifest.name
                 mark_stage_completed(task, LoopStage.PLAN)
                 task.stage = LoopStage.RISK_PERMISSION
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "plan_created",
@@ -382,7 +461,7 @@ class AgentCore:
                         clear_issues(task, *GATE_ISSUE_KINDS)
                         mark_stage_completed(task, LoopStage.RISK_PERMISSION)
                         task.stage = LoopStage.COST_PREFLIGHT
-                        self.memory.persist_checkpoint(
+                        self._checkpoint(
                             session, task, "remembered_permission_applied"
                         )
                         continue
@@ -401,7 +480,7 @@ class AgentCore:
                 mark_stage_completed(task, LoopStage.RISK_PERMISSION)
                 task.stage = LoopStage.COST_PREFLIGHT
                 task.status = TaskStatus.PENDING
-                self.memory.persist_checkpoint(session, task, "permission_policy_passed")
+                self._checkpoint(session, task, "permission_policy_passed")
                 continue
 
             if task.stage is LoopStage.COST_PREFLIGHT:
@@ -451,7 +530,7 @@ class AgentCore:
                     # Re-enter preflight so every remaining monetary gate is
                     # evaluated. Each resolved gate now has its own grant, so
                     # this converges instead of looping.
-                    self.memory.persist_checkpoint(
+                    self._checkpoint(
                         session,
                         task,
                         "monetary_gate_approved",
@@ -464,7 +543,7 @@ class AgentCore:
                 clear_issues(task, *GATE_ISSUE_KINDS)
                 mark_stage_completed(task, LoopStage.COST_PREFLIGHT)
                 task.stage = LoopStage.TOOL_SELECTION
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "cost_preflight_passed",
@@ -493,7 +572,7 @@ class AgentCore:
                     )
                 mark_stage_completed(task, LoopStage.TOOL_SELECTION)
                 task.stage = LoopStage.EXECUTE
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "tool_selected",
@@ -518,7 +597,7 @@ class AgentCore:
                 # boundary is recomputed here and must be backed by a consumed
                 # grant (or be policy-exempt); otherwise the task goes back to
                 # the gate it lacks and a fresh approval is required.
-                open_stage = self._unsatisfied_gate(session, task, connector)
+                open_stage, current = self._unsatisfied_gate(session, task, connector)
                 if isinstance(open_stage, AgentRun):
                     return open_stage
                 if open_stage is not None:
@@ -537,10 +616,64 @@ class AgentCore:
                     if regate is not None:
                         return regate
                     continue
+
+                # H2: durably record the attempt (PREPARED) and atomically
+                # claim single ownership (PREPARED -> IN_FLIGHT + one-shot grant
+                # consumption) before crossing the connector boundary.
+                attempt = self.memory.open_execution_attempt(
+                    ExecutionAttempt(
+                        session_id=session.id,
+                        task_id=task.id,
+                        connector=connector.manifest.name,
+                        fingerprint=current.fingerprint,
+                    )
+                )
+                if attempt.state is not AttemptState.PREPARED:
+                    # Another owner raced ahead, or the attempt is in doubt.
+                    return self._execution_in_doubt(session, task, attempt)
+                one_shots = self._execution_one_shot_fingerprints(
+                    session, task, connector, current
+                )
+                if not self.memory.begin_execution(
+                    attempt.id, session.id, task.id, one_shots
+                ):
+                    # The atomic claim failed: another owner won, an
+                    # authoritative cancellation/terminal decision won first, or
+                    # a required one-shot grant is gone. Reload and report the
+                    # authoritative state; never execute here.
+                    fresh = self.memory.load_task(task.id)
+                    if fresh is not None:
+                        terminal = self._terminal_run(session, fresh)
+                        if terminal is not None:
+                            return terminal
+                    return AgentRun(
+                        RunStatus.FAILED,
+                        session,
+                        fresh or task,
+                        error=StructuredError(
+                            ErrorCode.EXECUTION_IN_PROGRESS,
+                            "The execution claim could not be acquired; "
+                            "not executing.",
+                            retryable=True,
+                        ),
+                    )
+
+                # Durable IN_FLIGHT is committed; cross the connector boundary.
                 task.status = TaskStatus.RUNNING
+                external = current.side_effect.effect is SideEffect.EXTERNAL_EGRESS
                 try:
                     result = connector.execute(task, session)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - connector boundary
+                    if external:
+                        # The external outcome is unknowable after a raise:
+                        # mark the attempt non-replayable rather than inventing
+                        # a clean failure that could be safely retried.
+                        self.memory.mark_execution_unknown(attempt.id)
+                        return self._execution_in_doubt(
+                            session,
+                            task,
+                            self.memory.latest_execution_attempt(task.id),
+                        )
                     result = ToolResult(
                         outcome=OutcomeStatus.ERROR,
                         summary=f"Connector failed: {exc}",
@@ -568,27 +701,58 @@ class AgentCore:
                 result.usage.estimated_cost_usd = max(
                     result.usage.estimated_cost_usd, task.estimate.monetary_maximum_usd
                 )
+                # H2-H: usage is recorded first, so a crash before the atomic
+                # conclusion leaves the attempt IN_FLIGHT (non-replayable) with
+                # the successfully written usage preserved.
                 self.memory.append_usage(result.usage)
                 task.result_snapshot = self._result_to_dict(result)
-                if result.outcome is OutcomeStatus.CANCELLED:
-                    task.status = TaskStatus.CANCELLED
-                    task.stage = LoopStage.CANCELLED
-                    session.active_task_id = None
-                    clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
-                    self.memory.persist_checkpoint(session, task, "execution_cancelled")
-                    return AgentRun(RunStatus.CANCELLED, session, task, result=result)
+
+                # H2-F: reload authoritative cancellation before committing a
+                # terminal COMPLETED/FAILED. A stale result never overwrites an
+                # authoritative cancellation.
+                fresh = self.memory.load_task(task.id)
+                cancelled = result.outcome is OutcomeStatus.CANCELLED or (
+                    fresh is not None
+                    and (
+                        fresh.cancellation_requested
+                        or fresh.status
+                        in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED)
+                    )
+                )
+                if cancelled:
+                    return self._finalize_cancelled(session, task, attempt.id, result)
                 if not result.ok:
-                    return self._terminal_failure(
-                        session,
-                        task,
-                        result.error
-                        or StructuredError(ErrorCode.CONNECTOR_FAILED, result.summary),
-                        result,
+                    error = result.error or StructuredError(
+                        ErrorCode.CONNECTOR_FAILED, result.summary
+                    )
+                    task.status = TaskStatus.FAILED
+                    task.stage = LoopStage.FAILED
+                    session.active_task_id = None
+                    set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
+                    outcome = self.memory.conclude_execution(
+                        session, task, attempt.id, "task_failed", error.to_dict()
+                    )
+                    if outcome == "cancelled":
+                        return self._finalize_cancelled(session, task, attempt.id, result)
+                    if outcome == "lost":
+                        return self._execution_in_doubt(
+                            session, task, self.memory.latest_execution_attempt(task.id)
+                        )
+                    return AgentRun(
+                        RunStatus.FAILED, session, task, result=result, error=error
                     )
                 mark_stage_completed(task, LoopStage.EXECUTE)
                 task.status = TaskStatus.VERIFYING
                 task.stage = LoopStage.VERIFY
-                self.memory.persist_checkpoint(session, task, "execution_completed")
+                outcome = self.memory.conclude_execution(
+                    session, task, attempt.id, "execution_completed", {}
+                )
+                if outcome == "cancelled":
+                    return self._finalize_cancelled(session, task, attempt.id, result)
+                if outcome == "lost":
+                    return self._execution_in_doubt(
+                        session, task, self.memory.latest_execution_attempt(task.id)
+                    )
                 continue
 
             if task.stage is LoopStage.VERIFY:
@@ -622,7 +786,7 @@ class AgentCore:
                     )
                 mark_stage_completed(task, LoopStage.VERIFY)
                 task.stage = LoopStage.PRESENT
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "verification_passed",
@@ -646,7 +810,7 @@ class AgentCore:
                 )
                 mark_stage_completed(task, LoopStage.PRESENT)
                 task.stage = LoopStage.PERSIST
-                self.memory.persist_checkpoint(
+                self._checkpoint(
                     session,
                     task,
                     "result_presented",
@@ -680,14 +844,20 @@ class AgentCore:
                     ),
                     next_step=session.next_step,
                 )
-                self.memory.finalize_task(
+                # All-or-nothing with lifecycle authority: if a cancellation
+                # already won the terminal transition, no decision, usage
+                # rewrite, terminal event or session overwrite is persisted and
+                # the authoritative state is reported instead of a phantom
+                # COMPLETED built on this stale task.
+                if not self.memory.finalize_task(
                     session,
                     task,
                     decision,
                     result.usage,
                     "task_completed",
                     {"summary": result.summary, "next_step": session.next_step},
-                )
+                ):
+                    return self._authoritative_run(session, task)
                 return AgentRun(RunStatus.COMPLETED, session, task, result=result)
 
             if task.stage is LoopStage.COMPLETED:
@@ -761,7 +931,7 @@ class AgentCore:
         task.preferences[BILLING_REPREFLIGHT_COUNT_KEY] = repeats
         task.stage = stage
         task.status = TaskStatus.PENDING
-        self.memory.persist_checkpoint(
+        self._checkpoint(
             session, task, event_type, {**payload, "attempt": repeats}
         )
         return None
@@ -880,29 +1050,166 @@ class AgentCore:
 
     def _unsatisfied_gate(
         self, session: SessionState, task: Task, connector: BaseConnector
-    ) -> LoopStage | AgentRun | None:
+    ) -> tuple[LoopStage | AgentRun | None, PermissionRequest | None]:
         """Recompute every gate attestation right before execution.
 
-        Returns the first gate stage lacking a valid consumed grant, ``None``
-        when execution is authorized, or a terminal run on refusal.
+        Returns ``(open_stage, current_request)``: the first gate stage lacking
+        a valid consumed grant (or a terminal run, or ``None`` when execution
+        is authorized), together with the current attested egress request whose
+        fingerprint binds the execution attempt.
         """
         current = self._attested_request(session, task, connector)
         if isinstance(current, AgentRun):
-            return current
+            return current, None
         if not self._permission_satisfied(session, current):
-            return LoopStage.RISK_PERMISSION
+            return LoopStage.RISK_PERMISSION, current
         projected = (
             self.memory.monthly_monetary_cost() + task.estimate.monetary_maximum_usd
         )
         gates = self._monetary_gates(session, task, connector, projected)
         if isinstance(gates, AgentRun):
-            return gates
+            return gates, current
         for _, request in gates:
             if not self.memory.has_approved_grant(
                 session.id, task.id, request.fingerprint
             ):
-                return LoopStage.COST_PREFLIGHT
-        return None
+                return LoopStage.COST_PREFLIGHT, current
+        return None, current
+
+    def _execution_grant_fingerprint(
+        self, session: SessionState, current: PermissionRequest
+    ) -> str | None:
+        """The base-permission one-shot grant fingerprint that must be consumed
+        for this execution, or None when authorization is policy-exempt or
+        backed by a reusable (remembered) session grant."""
+        if not self._requires_approval(current):
+            return None
+        if self._remembered_permission_allowed(
+            current
+        ) and self.memory.has_remembered_scope_grant(
+            session.id, current.scope_fingerprint
+        ):
+            return None
+        return current.fingerprint
+
+    def _execution_one_shot_fingerprints(
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        current: PermissionRequest,
+    ) -> list[str]:
+        """Every non-reusable one-shot grant that authorized this execution
+        opportunity: the base permission plus each applicable monetary gate
+        (paid-API, monthly-cost-cap). They are consumed atomically, all or
+        nothing, so a task cannot execute with any authorizing gate unconsumed.
+        """
+        fingerprints: list[str] = []
+        base = self._execution_grant_fingerprint(session, current)
+        if base is not None:
+            fingerprints.append(base)
+        projected = (
+            self.memory.monthly_monetary_cost() + task.estimate.monetary_maximum_usd
+        )
+        gates = self._monetary_gates(session, task, connector, projected)
+        if not isinstance(gates, AgentRun):
+            fingerprints.extend(request.fingerprint for _, request in gates)
+        return fingerprints
+
+    def _finalize_cancelled(
+        self,
+        session: SessionState,
+        task: Task,
+        attempt_id: str,
+        result: ToolResult,
+    ) -> AgentRun:
+        """Commit an authoritative cancellation over a returned execution: a
+        stale success/failure never becomes COMPLETED/FAILED (H2-F)."""
+        task.status = TaskStatus.CANCELLED
+        task.stage = LoopStage.CANCELLED
+        session.active_task_id = None
+        clear_issues(task, *ProgressIssueKind)
+        outcome = self.memory.conclude_execution(
+            session,
+            task,
+            attempt_id,
+            "execution_cancelled",
+            {},
+            finalizing_cancellation=True,
+        )
+        if outcome != "finished":
+            return self._execution_in_doubt(
+                session, task, self.memory.latest_execution_attempt(task.id)
+            )
+        return AgentRun(RunStatus.CANCELLED, session, task, result=result)
+
+    def _terminal_run(self, session: SessionState, task: Task) -> AgentRun | None:
+        """Report a terminal task as-is, without a connector or any mutation."""
+        if not is_terminal(task):
+            return None
+        result = self._result_from_dict(task.result_snapshot)
+        error = result.error if result is not None else None
+        return AgentRun(
+            terminal_run_status(task), session, task, result=result, error=error
+        )
+
+    def _execution_in_doubt(
+        self,
+        session: SessionState,
+        task: Task,
+        attempt: ExecutionAttempt | None,
+    ) -> AgentRun:
+        """A prior execution attempt cannot be safely replayed. Reports only;
+        the task is left recoverable (never fabricated terminal)."""
+        return AgentRun(
+            RunStatus.FAILED,
+            session,
+            task,
+            error=StructuredError(
+                ErrorCode.EXECUTION_UNKNOWN_OUTCOME,
+                "A prior execution attempt is in doubt and must not be replayed "
+                "automatically; explicit recovery is required.",
+                details=(
+                    {"attempt_state": attempt.state.value} if attempt is not None else {}
+                ),
+            ),
+        )
+
+    def _execution_journal_precheck(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | str | None:
+        """Consult the durable attempt journal before the connector is used.
+
+        Returns an ``AgentRun`` to block (in doubt), the sentinel ``"advanced"``
+        when a FINISHED attempt let the task move past EXECUTE without a second
+        call, or ``None`` (no attempt or a reclaimable PREPARED one) to proceed.
+        """
+        attempt = self.memory.latest_execution_attempt(task.id)
+        if attempt is None or attempt.state is AttemptState.PREPARED:
+            return None
+        if attempt.state in (AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME):
+            # IN_FLIGHT after restart, or an unresolved outcome: never replay.
+            return self._execution_in_doubt(session, task, attempt)
+        # FINISHED: the connector already ran. Advance from the persisted
+        # result instead of executing again.
+        result = self._result_from_dict(task.result_snapshot)
+        if result is None:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.EXECUTION_UNKNOWN_OUTCOME,
+                    "A finished execution attempt has no persisted result to "
+                    "recover; refusing to run it again.",
+                ),
+            )
+        mark_stage_completed(task, LoopStage.EXECUTE)
+        task.status = TaskStatus.VERIFYING
+        task.stage = LoopStage.VERIFY
+        self._checkpoint(
+            session, task, "execution_completed_recovered", {}
+        )
+        return "advanced"
 
     def _billing_route_failure(
         self, session: SessionState, task: Task, connector: BaseConnector
@@ -971,7 +1278,11 @@ class AgentCore:
         )
         if grant is None:
             set_waiting_issue(task)
-            self.memory.persist_checkpoint(
+            # A terminal writer (rejection/cancellation) that already won
+            # aborts here: the waiting state, its checkpoint, its audit event
+            # and its pending request are all rolled back, so no approval
+            # opportunity is reported that does not exist in persistence.
+            self._checkpoint(
                 session,
                 task,
                 "approval_requested",
@@ -989,8 +1300,20 @@ class AgentCore:
             )
         validation_error = self._validate_grant(request, grant)
         if validation_error is not None:
-            # Still blocked: the applicable blocker stays and the refused
-            # grant is recorded as its own typed issue.
+            # A concurrent contender may have resolved the original request
+            # first (the pending is gone) and the winning resolution may
+            # already be authoritative. Never overwrite a terminal or resolved
+            # state with a stale waiting checkpoint: reload and report instead.
+            fresh = self.memory.load_task(task.id)
+            if fresh is not None:
+                terminal = self._terminal_run(session, fresh)
+                if terminal is not None:
+                    return terminal, False
+            if self.memory.load_pending_approval(task.id, session.id) is None:
+                return self._resolution_lost(session, task), False
+            # Still blocked on a genuine invalid grant against a live pending
+            # request: the applicable blocker stays and the refused grant is
+            # recorded as its own typed issue.
             set_waiting_issue(task)
             set_issue(
                 task,
@@ -998,7 +1321,9 @@ class AgentCore:
                 validation_error.code,
                 validation_error.retryable,
             )
-            self.memory.persist_checkpoint(
+            # A terminal writer that won while this grant was refused aborts
+            # here; nothing was written, so nothing stale is reported.
+            self._checkpoint(
                 session,
                 task,
                 "invalid_grant_rejected",
@@ -1015,27 +1340,102 @@ class AgentCore:
                 ),
                 False,
             )
-        status = "approved" if grant.approved else "rejected"
-        self.memory.resolve_approval(request, grant, status)
         if not grant.approved:
+            # P1-A: resolution and terminal rejection are ONE transaction, so
+            # no observable state has a rejected request with a resumable task.
+            # A concurrent contender therefore cannot reissue or reopen it.
             task.status = TaskStatus.REJECTED
             task.stage = LoopStage.FAILED
             session.active_task_id = None
-            # Terminal user rejection: represented by status/stage only; the
-            # blocked stage is never recorded as completed.
             clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
             error = StructuredError(
                 ErrorCode.APPROVAL_REJECTED, "The user rejected this action."
             )
-            self.memory.persist_checkpoint(
-                session, task, "approval_rejected", error.to_dict()
-            )
+            if not self.memory.reject_task(
+                request, grant, session, task, error.to_dict()
+            ):
+                return self._resolution_lost(session, task), False
             return (
                 AgentRun(RunStatus.REJECTED, session, task, error=error),
                 True,
             )
+        # Approve: atomic single-winner resolution. A loser makes no grant,
+        # performs no execution, and reports the authoritative resolution.
+        if not self.memory.resolve_approval(request, grant, "approved"):
+            return self._resolution_lost(session, task), False
         task.status = TaskStatus.PENDING
         return None, True
+
+    def _checkpoint(
+        self,
+        session: SessionState,
+        task: Task,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        pending_request: PermissionRequest | None = None,
+    ) -> None:
+        """Persist one lifecycle checkpoint, or abort the local loop.
+
+        Every lifecycle write in the loop goes through here. If storage reports
+        that a terminal writer already won, nothing was persisted and
+        ``_LifecycleLost`` stops this writer before it can emit any later
+        stage, event, decision or finalization built on its stale task.
+        """
+        if not self.memory.persist_checkpoint(
+            session, task, event_type, payload, pending_request
+        ):
+            raise _LifecycleLost(self._authoritative_run(session, task))
+
+    def _authoritative_run(self, session: SessionState, task: Task) -> AgentRun:
+        """Report the persisted truth after this writer lost lifecycle authority.
+
+        The task and session are reloaded from storage, so the caller never
+        returns its stale local view, and no ``permission_request`` is attached
+        unless one genuinely exists in persistence.
+        """
+        fresh_session = self.memory.load_session(session.id) or session
+        fresh = self.memory.load_task(task.id)
+        if fresh is None:
+            return self._input_failure(
+                task, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task.id}", fresh_session
+            )
+        terminal = self._terminal_run(fresh_session, fresh)
+        if terminal is not None:
+            return terminal
+        # Not terminal (a newer non-terminal writer won): report the persisted
+        # state, with the real pending request when storage actually holds one.
+        pending = self.memory.load_pending_approval(fresh.id, fresh_session.id)
+        return AgentRun(
+            RunStatus.FAILED,
+            fresh_session,
+            fresh,
+            permission_request=pending,
+            error=StructuredError(
+                ErrorCode.STALE_GRANT,
+                "This task was updated by another writer; the local view was "
+                "discarded and no state was persisted.",
+                retryable=True,
+            ),
+        )
+
+    def _resolution_lost(self, session: SessionState, task: Task) -> AgentRun:
+        """A concurrent contender already resolved this approval. Report the
+        authoritative winning state; never execute or create a grant here."""
+        fresh = self.memory.load_task(task.id)
+        if fresh is not None:
+            terminal = self._terminal_run(session, fresh)
+            if terminal is not None:
+                return terminal
+        return AgentRun(
+            RunStatus.FAILED,
+            session,
+            fresh or task,
+            error=StructuredError(
+                ErrorCode.STALE_GRANT,
+                "The approval request was already resolved by another contender.",
+                retryable=True,
+            ),
+        )
 
     @staticmethod
     def _validate_grant(
@@ -1135,7 +1535,7 @@ class AgentCore:
                 ),
             )
         task.result_snapshot = self._result_to_dict(result)
-        self.memory.persist_checkpoint(
+        self._checkpoint(
             session, task, "task_failed", error.to_dict()
         )
         return AgentRun(RunStatus.FAILED, session, task, result=result, error=error)

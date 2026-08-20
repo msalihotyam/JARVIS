@@ -43,7 +43,7 @@ from jarvis.contracts import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector
+from tests.helpers import DummyConnector, safe_cleanup
 
 
 def task_document(**overrides: object) -> str:
@@ -447,7 +447,7 @@ class PresentationRedactionTests(unittest.TestCase):
 class AppCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
         self.memory = SQLiteMemoryStore(self.database)
         self.settings = Settings(memory_database=self.database)
@@ -791,7 +791,7 @@ class AppCommandTests(unittest.TestCase):
 class CompositionRootTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
         self.settings = Settings(memory_database=self.database)
 

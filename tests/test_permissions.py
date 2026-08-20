@@ -24,13 +24,13 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 
 
 class PermissionPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector: DummyConnector, mode: PermissionMode) -> AgentCore:
@@ -267,7 +267,7 @@ class ScopeNormalizationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
 
     @staticmethod

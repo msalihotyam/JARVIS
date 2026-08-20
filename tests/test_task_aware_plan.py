@@ -50,7 +50,7 @@ from jarvis.planning import (
 )
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 from tests.test_claude_connector import (
     OAUTH_MAX_AUTH_STATUS,
     FakeProcess,
@@ -454,7 +454,7 @@ class RetrievedReferenceCountTests(unittest.TestCase):
 class AgentCorePlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, *connectors: DummyConnector) -> AgentCore:
@@ -552,7 +552,7 @@ class AgentCorePlanTests(unittest.TestCase):
 class ConnectorPlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.connector = ClaudeCodeConnector(
             allowed_roots=(self.root,),
@@ -698,7 +698,7 @@ class PlanApprovalExecutionIntegrationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
         self.connector = ClaudeCodeConnector(

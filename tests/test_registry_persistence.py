@@ -16,13 +16,13 @@ from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task
+from tests.helpers import DummyConnector, make_task, safe_cleanup
 
 
 class RegistryAndPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, *connectors: DummyConnector) -> AgentCore:
@@ -110,8 +110,8 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         self.assertEqual(run.task.id, decisions[0].task_id)
 
     def test_schema_has_version_foreign_keys_and_wal(self) -> None:
-        # Progress enrichment added no SQL column, table or migration.
-        self.assertEqual(3, SCHEMA_VERSION)
+        # H2 added the execution-attempt journal at schema 4.
+        self.assertEqual(4, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
         connection = sqlite3.connect(self.memory.database_path)
         try:
