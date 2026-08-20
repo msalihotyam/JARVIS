@@ -34,6 +34,9 @@ class InMemoryStore:
         self.task_sessions: dict[str, str] = {}
         self.pending: dict[tuple[str, str], PermissionRequest] = {}
         self.remembered: set[tuple[str, str]] = set()
+        #: (session, task, fingerprint) -> grant expiry, so an expired grant
+        #: never re-authorizes, mirroring the SQLite store.
+        self.approved: dict[tuple[str, str, str], str] = {}
         self.decisions: list[DecisionRecord] = []
         self.usage: dict[str, UsageRecord] = {}
 
@@ -120,6 +123,10 @@ class InMemoryStore:
         status: str,
     ) -> None:
         self.pending.pop((request.task_id, request.session_id), None)
+        if status == "approved":
+            self.approved[
+                (request.session_id, request.task_id, grant.fingerprint)
+            ] = grant.expires_at
         if status == "approved" and grant.remember_for_session:
             self.remembered.add((request.session_id, request.scope_fingerprint))
 
@@ -127,6 +134,14 @@ class InMemoryStore:
         self, session_id: str, scope_fingerprint: str
     ) -> bool:
         return (session_id, scope_fingerprint) in self.remembered
+
+    def has_approved_grant(
+        self, session_id: str, task_id: str, fingerprint: str
+    ) -> bool:
+        from jarvis.contracts import is_expired
+
+        expiry = self.approved.get((session_id, task_id, fingerprint))
+        return expiry is not None and not is_expired(expiry)
 
     def append_usage(self, usage: UsageRecord) -> None:
         self.usage[usage.id] = copy.deepcopy(usage)

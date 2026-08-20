@@ -18,10 +18,13 @@ from jarvis.contracts import (
     RETRIEVAL_NEXT_STEP_CAP,
     RETRIEVAL_RATIONALE_CAP,
     RETRIEVAL_SUMMARY_CAP,
+    ActionScope,
+    AttestationError,
     Availability,
     BillingClass,
     CostEstimate,
     DataClassification,
+    EgressAttestation,
     ErrorCode,
     MonetaryState,
     OutboundDataPreview,
@@ -37,22 +40,41 @@ from jarvis.contracts import (
     UsageRecord,
     VerificationRecord,
     VerificationStatus,
+    canonical_path,
+    looks_like_path,
     normalize_retrieved_text,
+    normalize_url,
+    redact_credentials,
     retrieval_eligible,
     truncate_retrieved_text,
 )
 from jarvis.planning import build_task_plan
 
 
+#: Structured keys whose whole value is dropped from the outbound payload.
+#: Free-form string *values* go through the shared ``redact_credentials``
+#: policy (raw sk-/Bearer/JWT shapes plus labelled ``api_key: VALUE`` forms).
 SECRET_KEY_PATTERN = re.compile(
     r"(?:api[_-]?key|token|secret|password|passwd|authorization|cookie|private[_-]?key)",
     re.IGNORECASE,
 )
-SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
-    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+
+SECRET_EGRESS_REFUSAL = (
+    "SECRET tasks never reach the external Claude Code process: prompt "
+    "redaction alone cannot bound what the process reads locally."
 )
+
+#: External tool grants for the Claude Code execution path. Deliberately EMPTY.
+#:
+#: The Claude Code CLI's Read/Glob/Grep tools would let the external model
+#: pull file contents the approval never attested. This build cannot verify
+#: that the installed CLI confines those reads to an exact, approved resource
+#: set (doing so would require a live model call), so rather than attest a
+#: boundary it cannot enforce, the file-reading tools are removed: the model
+#: receives only the attested outbound prompt bytes. Re-enable a tool here
+#: only once a bounded, enforceable read manifest exists; the set is bound
+#: into the egress attestation, so any change invalidates prior approvals.
+EGRESS_TOOL_GRANTS: tuple[str, ...] = ()
 
 #: Environment variables that route the CLI to a metered or unverifiable
 #: billing path. Only their presence is ever inspected, never their value.
@@ -246,7 +268,63 @@ class ClaudeCodeConnector(BaseConnector):
             summary="Objective and redacted task context will leave the local machine.",
         )
 
+    def canonical_outbound(self, task: Task) -> bytes:
+        """The exact prompt bytes handed to the CLI; what a grant attests.
+
+        With no external tool grants (see ``EGRESS_TOOL_GRANTS``), these bytes
+        are everything the external model can receive.
+        """
+        prompt, _ = self._build_prompt(task)
+        return prompt.encode("utf-8")
+
+    def external_tool_grants(self, task: Task) -> tuple[str, ...]:
+        """The exact external tools the model process is launched with."""
+        return EGRESS_TOOL_GRANTS
+
+    def egress_attestation(
+        self,
+        task: Task,
+        scope: ActionScope,
+        risk: RiskLevel,
+        effect: SideEffectProfile,
+    ) -> EgressAttestation:
+        # Fail closed before any approval request exists: a SECRET task has
+        # nothing this connector may attest, so no grant can ever cover it.
+        if task.scope.data_classification is DataClassification.SECRET:
+            raise AttestationError(ErrorCode.EGRESS_REFUSED, SECRET_EGRESS_REFUSAL)
+        return super().egress_attestation(task, scope, risk, effect)
+
+    def resource_boundary(self, task: Task) -> tuple[str, tuple[str, ...]]:
+        """The local boundary the subprocess can inspect, canonical and bound.
+
+        The resolved working directory must lie inside the allowed roots and
+        so must a filesystem target; symlinks, junctions and ``..`` routes are
+        resolved before the check, so an escape through them fails closed.
+        """
+        try:
+            working_directory = self._working_directory(task.context)
+        except ValueError as exc:
+            raise AttestationError(ErrorCode.EGRESS_REFUSED, str(exc)) from exc
+        target = str(task.scope.target or "").strip()
+        if target and normalize_url(target) is None and looks_like_path(target):
+            resolved_target = Path(target).expanduser().resolve(strict=False)
+            if not self._within_allowed_roots(resolved_target):
+                raise AttestationError(
+                    ErrorCode.EGRESS_REFUSED,
+                    f"Task target is outside the allowed roots: {resolved_target}",
+                )
+        return (
+            canonical_path(working_directory),
+            tuple(canonical_path(root) for root in self.allowed_roots),
+        )
+
     def execute(self, task: Task, session: SessionState) -> ToolResult:
+        # Independent of AgentCore's gate: a SECRET task is refused before
+        # the route probe, the boundary check and any process creation.
+        if task.scope.data_classification is DataClassification.SECRET:
+            return self._error_result(
+                task, ErrorCode.EGRESS_REFUSED, SECRET_EGRESS_REFUSAL, retryable=False
+            )
         # Re-verify the billing route here: nothing may spawn the external
         # model command on a metered or unestablished route.
         billing_class, evidence = self.billing_route()
@@ -262,12 +340,16 @@ class ClaudeCodeConnector(BaseConnector):
                 billing_evidence=evidence,
             )
 
+        # The same boundary computation the attestation used: the working
+        # directory and target are re-resolved here, right before the process
+        # that can inspect them is created.
         try:
+            self.resource_boundary(task)
             working_directory = self._working_directory(task.context)
-        except ValueError as exc:
+        except (AttestationError, ValueError) as exc:
             return self._error_result(
                 task,
-                ErrorCode.CONNECTOR_FAILED,
+                ErrorCode.EGRESS_REFUSED,
                 str(exc),
                 retryable=False,
                 billing_class=billing_class,
@@ -410,9 +492,14 @@ class ClaudeCodeConnector(BaseConnector):
         path = Path(requested).resolve() if requested else self.default_working_directory
         if not path.is_dir():
             raise ValueError(f"Working directory does not exist: {path}")
-        if not any(path == root or root in path.parents for root in self.allowed_roots):
+        if not self._within_allowed_roots(path):
             raise ValueError(f"Working directory is outside allowed roots: {path}")
         return path
+
+    def _within_allowed_roots(self, path: Path) -> bool:
+        """Containment over resolved paths; ``Path`` equality is case-aware
+        per platform, so a Windows casing variant cannot escape."""
+        return any(path == root or root in path.parents for root in self.allowed_roots)
 
     def _command(self, prompt: str) -> list[str]:
         empty_mcp = json.dumps({"mcpServers": {}}, separators=(",", ":"))
@@ -428,8 +515,11 @@ class ClaudeCodeConnector(BaseConnector):
             "--strict-mcp-config",
             "--mcp-config",
             empty_mcp,
+            # Exactly the attested tool grants - empty by default, so no
+            # tool-mediated file read can leak content outside the attested
+            # prompt bytes. The same source feeds the egress attestation.
             "--tools",
-            "Read,Glob,Grep",
+            ",".join(EGRESS_TOOL_GRANTS),
             "--disable-slash-commands",
             "--no-chrome",
             "--no-session-persistence",
@@ -439,8 +529,9 @@ class ClaudeCodeConnector(BaseConnector):
             f"{self.max_budget_usd:.4f}",
             "--system-prompt",
             (
-                "You are a read-only code planning component. Never modify files, "
-                "run state-changing commands, use external connectors, or disclose secrets."
+                "You are a read-only planning component with no file, tool or "
+                "connector access. Reason only about the provided request. "
+                "Never modify files, run commands, use connectors, or disclose secrets."
             ),
         ]
 
@@ -463,10 +554,12 @@ class ClaudeCodeConnector(BaseConnector):
 
     def _sanitized_payload(self, task: Task) -> tuple[dict[str, Any], int]:
         if task.scope.data_classification is DataClassification.SECRET:
+            # Never executed (see egress_attestation/execute); this fixed
+            # shape carries no task metadata at all, not even the capability.
             return (
                 {
                     "objective": "[REDACTED_SECRET_CLASSIFICATION]",
-                    "capability": task.capability,
+                    "capability": "[REDACTED_SECRET_CLASSIFICATION]",
                     "scope": {
                         "data_classification": DataClassification.SECRET.value,
                         "details": "[REDACTED_SECRET_SCOPE]",
@@ -475,43 +568,31 @@ class ClaudeCodeConnector(BaseConnector):
                     "visible_assumption": "[REDACTED_SECRET_CLASSIFICATION]",
                     "preferences": {},
                 },
-                7,
+                8,
             )
-        objective, objective_redactions = self._redact(task.objective)
-        context, context_redactions = self._redact(task.context)
-        # The clarification the user answered with, or the assumption shown to
-        # them, travels as this one explicit field. The raw preference keys it
-        # is derived from stay local with the rest of the mapping.
-        assumption, assumption_redactions = self._redact(task.visible_assumption or "")
-        preferences, preferences_redactions = self._redact(
-            self._external_preferences(task)
-        )
-        # The outbound plan is independently rebuilt from safe structural task
-        # state at this egress boundary. The persisted ``task.plan`` is
-        # internal state and is never serialized: a restored, corrupted or
+        # Every free-form outbound string field - objective, capability, the
+        # scope strings, context, the visible assumption/clarification, the
+        # allowlisted preferences and the plan - passes through one deep
+        # credential redaction. The clarification travels as the explicit
+        # ``visible_assumption`` field; the raw preference keys stay local.
+        # The plan is rebuilt from safe structural task state here: the
+        # persisted ``task.plan`` is never serialized, so a restored or
         # tampered plan cannot alter the approved outbound bytes.
-        plan, plan_redactions = self._redact(build_task_plan(task))
-        payload = {
-            "objective": objective,
-            "capability": task.capability,
-            "scope": task.scope.to_dict(),
-            "context": context,
-            "visible_assumption": assumption,
-            "preferences": preferences,
-            "plan": plan,
-        }
+        payload, redactions = self._redact(
+            {
+                "objective": task.objective,
+                "capability": task.capability,
+                "scope": task.scope.to_dict(),
+                "context": task.context,
+                "visible_assumption": task.visible_assumption or "",
+                "preferences": self._external_preferences(task),
+                "plan": build_task_plan(task),
+            }
+        )
         retrieved_memory, retrieved_redactions = self._retrieved_memory(task)
         if retrieved_memory is not None:
             payload["retrieved_memory"] = retrieved_memory
-        return (
-            payload,
-            objective_redactions
-            + context_redactions
-            + assumption_redactions
-            + preferences_redactions
-            + plan_redactions
-            + retrieved_redactions,
-        )
+        return payload, redactions + retrieved_redactions
 
     @classmethod
     def _retrieved_memory(cls, task: Task) -> tuple[dict[str, Any] | None, int]:
@@ -648,12 +729,7 @@ class ClaudeCodeConnector(BaseConnector):
                 count += child_count
             return output_list, count
         if isinstance(value, str):
-            text = value
-            count = 0
-            for pattern in SECRET_VALUE_PATTERNS:
-                text, replacements = pattern.subn("[REDACTED]", text)
-                count += replacements
-            return text, count
+            return redact_credentials(value)
         return value, 0
 
     @staticmethod

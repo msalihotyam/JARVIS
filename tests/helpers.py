@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
@@ -73,6 +74,20 @@ class DummyConnector(BaseConnector):
         self.outcome = outcome
         self.execute_calls = 0
         self.cancel_calls = 0
+
+    def canonical_outbound(self, task: Task) -> bytes:
+        # A valid egress connector must implement this; a deterministic view
+        # of the task's outbound-relevant state stands in for real bytes so a
+        # DummyConnector declaring EXTERNAL_EGRESS is a proper attester.
+        return json.dumps(
+            {
+                "objective": task.objective,
+                "scope": task.scope.to_dict(),
+                "assumption": task.visible_assumption,
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
 
     def availability(self) -> Availability:
         return Availability(self._available, "disabled for test" if not self._available else "")

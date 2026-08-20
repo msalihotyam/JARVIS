@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     ActionScope,
     AgentRun,
+    AttestationError,
     BillingClass,
-    CostEstimate,
     DataClassification,
     DecisionRecord,
     ErrorCode,
@@ -26,8 +25,6 @@ from jarvis.contracts import (
     RiskLevel,
     RunStatus,
     SessionState,
-    SideEffect,
-    SideEffectProfile,
     StructuredError,
     Task,
     TaskStatus,
@@ -56,10 +53,16 @@ from jarvis.settings import Settings
 
 
 #: Task preference holding the billing fingerprint that cleared cost preflight.
+#: A routing hint only: the proof that a gate was satisfied is always the
+#: approved grant record bound to the current attestation, never this marker.
 BILLING_PREFLIGHT_KEY = "billing_preflight_fingerprint"
 BILLING_REPREFLIGHT_COUNT_KEY = "billing_repreflight_attempts"
-#: Bound on preflight <-> execute round trips caused by a changing route.
+#: Bound on gate <-> execute round trips caused by changing route/attestation.
 BILLING_REPREFLIGHT_LIMIT = 3
+
+#: Monetary gate actions; each is its own attested, separately granted request.
+PAID_API_GATE = "enable_paid_api_for_task"
+COST_CAP_GATE = "override_monthly_cost_cap"
 
 
 class AgentCore:
@@ -166,6 +169,27 @@ class AgentCore:
                 task,
                 ErrorCode.TASK_NOT_FOUND if task is None else ErrorCode.UNKNOWN_SESSION,
                 "Session or task was not found.",
+                session,
+            )
+        if self.memory.task_session_id(task_id) != session_id:
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                "Task does not belong to this session.",
+                session,
+            )
+        # Legal only while this exact task is actually waiting for the answer.
+        # After an approval was requested or granted, execution began or the
+        # task terminated, a clarification could change the outbound content
+        # behind the user's approval; it is refused without any mutation.
+        if (
+            task.status is not TaskStatus.AWAITING_CLARIFICATION
+            or task.stage is not LoopStage.CLARIFY_OR_ASSUME
+        ):
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                "Task is not awaiting clarification.",
                 session,
             )
         task.preferences["clarification"] = clarification
@@ -344,13 +368,13 @@ class AgentCore:
                 billing_failure = self._billing_route_failure(session, task, connector)
                 if billing_failure is not None:
                     return billing_failure
-                request = self.memory.load_pending_approval(task.id, session.id)
-                if request is None or is_expired(request.expires_at):
-                    request = connector.permission_request(
-                        task,
-                        session.id,
-                        self.settings.approval_ttl_minutes,
-                    )
+                # The request always describes the task as it is *now*; a
+                # persisted pending request is reused only when it attests
+                # exactly this state, otherwise it is superseded.
+                current = self._attested_request(session, task, connector)
+                if isinstance(current, AgentRun):
+                    return current
+                request = self._exact_pending_request(session, task, current)
                 if self._requires_approval(request):
                     if self._remembered_permission_allowed(request) and self.memory.has_remembered_scope_grant(
                         session.id, request.scope_fingerprint
@@ -391,71 +415,52 @@ class AgentCore:
                 monetary_maximum = estimate.monetary_maximum_usd
                 current_spend = self.memory.monthly_monetary_cost()
                 projected = current_spend + monetary_maximum
-                request: PermissionRequest | None = None
-                waiting_status = RunStatus.AWAITING_COST_OVERRIDE
-                if estimate.requires_paid_api and not self.settings.paid_api_enabled and not task.preferences.get(
-                    "paid_api_task_approval"
-                ):
-                    request = self._cost_permission_request(
-                        task,
-                        session,
-                        connector,
-                        action="enable_paid_api_for_task",
-                        reason="This task would use a paid API while paid APIs are disabled.",
+                gates = self._monetary_gates(session, task, connector, projected)
+                if isinstance(gates, AgentRun):
+                    return gates
+                # A gate is satisfied only by an approved grant bound to its
+                # exact current attestation (gate, projection, limit, billing
+                # state, egress digest); persisted markers prove nothing.
+                open_gate = next(
+                    (
+                        (gate, current)
+                        for gate, current in gates
+                        if not self.memory.has_approved_grant(
+                            session.id, task.id, current.fingerprint
+                        )
+                    ),
+                    None,
+                )
+                if open_gate is not None:
+                    gate, current = open_gate
+                    request = self._exact_pending_request(session, task, current)
+                    waiting_status = (
+                        RunStatus.AWAITING_APPROVAL
+                        if gate == PAID_API_GATE
+                        else RunStatus.AWAITING_COST_OVERRIDE
                     )
-                    waiting_status = RunStatus.AWAITING_APPROVAL
-                elif (
-                    monetary_maximum > 0
-                    and projected > self.settings.monthly_hard_limit_usd
-                    and not task.preferences.get("cost_cap_override")
-                ):
-                    request = self._cost_permission_request(
-                        task,
-                        session,
-                        connector,
-                        action="override_monthly_cost_cap",
-                        reason=(
-                            f"Projected monthly cost {projected:.4f} USD exceeds the "
-                            f"{self.settings.monthly_hard_limit_usd:.2f} USD hard cap."
-                        ),
-                    )
-                if request is not None:
-                    pending = self.memory.load_pending_approval(task.id, session.id)
-                    if (
-                        pending is not None
-                        and not is_expired(pending.expires_at)
-                        and pending.scope.action == request.scope.action
-                    ):
-                        request = pending
                     approval_run, consumed = self._handle_approval(
                         session, task, request, active_grant, waiting_status
                     )
                     if approval_run is not None:
                         return approval_run
-                    if request.scope.action.endswith("enable_paid_api_for_task"):
-                        marker = "paid_api_task_approval"
-                    else:
-                        marker = "cost_cap_override"
-                    task.preferences[marker] = request.id
                     if consumed:
                         # One grant satisfies exactly one request.
                         active_grant = None
                     clear_issues(task, *GATE_ISSUE_KINDS)
                     # Re-enter preflight so every remaining monetary gate is
-                    # evaluated. Each resolved gate records its own marker, so
+                    # evaluated. Each resolved gate now has its own grant, so
                     # this converges instead of looping.
                     self.memory.persist_checkpoint(
                         session,
                         task,
                         "monetary_gate_approved",
-                        {"gate": marker, "request_id": request.id},
+                        {"gate": gate, "request_id": request.id},
                     )
                     continue
                 # No monetary gate remains: record the exact policy inputs that
                 # were cleared so execution can prove it ran on this estimate.
-                task.preferences[BILLING_PREFLIGHT_KEY] = self._billing_fingerprint(
-                    estimate
-                )
+                task.preferences[BILLING_PREFLIGHT_KEY] = estimate.gate_state
                 clear_issues(task, *GATE_ISSUE_KINDS)
                 mark_stage_completed(task, LoopStage.COST_PREFLIGHT)
                 task.stage = LoopStage.TOOL_SELECTION
@@ -507,6 +512,30 @@ class AgentCore:
                     repreflight = self._require_billing_preflight(session, task)
                     if repreflight is not None:
                         return repreflight
+                    continue
+                # The persisted stage proves nothing. The attestation of what
+                # will leave, to where, under which gates and from which local
+                # boundary is recomputed here and must be backed by a consumed
+                # grant (or be policy-exempt); otherwise the task goes back to
+                # the gate it lacks and a fresh approval is required.
+                open_stage = self._unsatisfied_gate(session, task, connector)
+                if isinstance(open_stage, AgentRun):
+                    return open_stage
+                if open_stage is not None:
+                    regate = self._require_regate(
+                        session,
+                        task,
+                        stage=open_stage,
+                        event_type="permission_attestation_required",
+                        error_code=ErrorCode.STALE_GRANT,
+                        message=(
+                            "The approved attestation keeps diverging from the "
+                            "execution-time state; refusing to run an external call."
+                        ),
+                        payload={"reason": "missing_or_stale_gate_attestation"},
+                    )
+                    if regate is not None:
+                        return regate
                     continue
                 task.status = TaskStatus.RUNNING
                 try:
@@ -678,63 +707,201 @@ class AgentCore:
                 ),
             )
 
-    @staticmethod
-    def _billing_fingerprint(estimate: CostEstimate) -> str:
-        """The billing-critical policy inputs, without the evidence string.
-
-        Evidence is deliberately excluded so a reworded, policy-equivalent
-        classification cannot bounce a task between stages forever.
-        """
-        ceiling = estimate.resource_ceiling_usd
-        return "|".join(
-            (
-                estimate.billing_class.value,
-                f"{estimate.monetary_maximum_usd:.9f}",
-                str(int(estimate.requires_paid_api)),
-                "none" if ceiling is None else f"{float(ceiling):.9f}",
-            )
-        )
-
     def _billing_preflight_is_current(self, task: Task) -> bool:
         """Whether this exact estimate is the one that cleared cost preflight."""
         recorded = task.preferences.get(BILLING_PREFLIGHT_KEY)
-        return bool(recorded) and recorded == self._billing_fingerprint(task.estimate)
+        return bool(recorded) and recorded == task.estimate.gate_state
 
     def _require_billing_preflight(
         self, session: SessionState, task: Task
     ) -> AgentRun | None:
         """Send a task back through monetary preflight, with a loop bound."""
+        # Approvals were granted against the superseded policy inputs; the
+        # gate attestations no longer match, so every applicable monetary
+        # gate is re-evaluated from scratch.
+        stale = task.preferences.pop(BILLING_PREFLIGHT_KEY, None)
+        return self._require_regate(
+            session,
+            task,
+            stage=LoopStage.COST_PREFLIGHT,
+            event_type="billing_preflight_required",
+            error_code=ErrorCode.BILLING_ROUTE_UNKNOWN,
+            message=(
+                "The billing route keeps changing between preflight and "
+                "execution; refusing to run an external call."
+            ),
+            payload={
+                "reason": "stale_or_missing_billing_preflight",
+                "previous_fingerprint": stale,
+                "current_fingerprint": task.estimate.gate_state,
+            },
+        )
+
+    def _require_regate(
+        self,
+        session: SessionState,
+        task: Task,
+        *,
+        stage: LoopStage,
+        event_type: str,
+        error_code: ErrorCode,
+        message: str,
+        payload: dict[str, Any],
+    ) -> AgentRun | None:
+        """Send a task from EXECUTE back to a gate stage, with a loop bound."""
         repeats = int(task.preferences.get(BILLING_REPREFLIGHT_COUNT_KEY, 0)) + 1
         if repeats > BILLING_REPREFLIGHT_LIMIT:
             return self._terminal_failure(
                 session,
                 task,
                 StructuredError(
-                    ErrorCode.BILLING_ROUTE_UNKNOWN,
-                    "The billing route keeps changing between preflight and "
-                    "execution; refusing to run an external call.",
-                    details={"repreflight_attempts": repeats},
+                    error_code, message, details={"regate_attempts": repeats}
                 ),
             )
         task.preferences[BILLING_REPREFLIGHT_COUNT_KEY] = repeats
-        # Approvals were granted against the superseded policy inputs, so the
-        # applicable monetary gates must be re-evaluated from scratch.
-        stale = task.preferences.pop(BILLING_PREFLIGHT_KEY, None)
-        task.preferences.pop("paid_api_task_approval", None)
-        task.preferences.pop("cost_cap_override", None)
-        task.stage = LoopStage.COST_PREFLIGHT
+        task.stage = stage
         task.status = TaskStatus.PENDING
         self.memory.persist_checkpoint(
-            session,
-            task,
-            "billing_preflight_required",
-            {
-                "reason": "stale_or_missing_billing_preflight",
-                "previous_fingerprint": stale,
-                "current_fingerprint": self._billing_fingerprint(task.estimate),
-                "attempt": repeats,
-            },
+            session, task, event_type, {**payload, "attempt": repeats}
         )
+        return None
+
+    def _attested_request(
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        *,
+        scope_override: ActionScope | None = None,
+        reason: str | None = None,
+    ) -> PermissionRequest | AgentRun:
+        """Build the connector's request/attestation for the task as it is now.
+
+        A connector that cannot attest the egress (SECRET classification, a
+        local boundary it cannot honour, a conflicting side-effect profile)
+        fails the task closed before any approval request can exist.
+        """
+        try:
+            return connector.permission_request(
+                task,
+                session.id,
+                self.settings.approval_ttl_minutes,
+                scope_override=scope_override,
+                reason=reason,
+            )
+        except AttestationError as exc:
+            return self._terminal_failure(
+                session, task, StructuredError(exc.code, str(exc))
+            )
+
+    def _exact_pending_request(
+        self, session: SessionState, task: Task, current: PermissionRequest
+    ) -> PermissionRequest:
+        """The persisted pending request, only if it attests exactly the
+        current state; anything stale, expired or mutated is superseded by a
+        freshly issued ``current`` with a new unique request id.
+
+        Reuse keys on the semantic fingerprint (scope, attestation, gate state
+        and approval display), never on the issuance id: the persisted request
+        keeps its stable id when reused, but an expired or diverged one is
+        replaced by ``current``, which carries a brand-new id so an old grant
+        cannot authorize the re-issued request.
+        """
+        pending = self.memory.load_pending_approval(task.id, session.id)
+        if (
+            pending is not None
+            and not is_expired(pending.expires_at)
+            and pending.fingerprint == current.fingerprint
+        ):
+            return pending
+        return current
+
+    def _monetary_gates(
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        projected: float,
+    ) -> list[tuple[str, PermissionRequest]] | AgentRun:
+        """The monetary gates that apply right now, each as an attested
+        request binding the gate, projection, limit and switch state."""
+        estimate = task.estimate
+        limit = self.settings.monthly_hard_limit_usd
+        applicable: list[tuple[str, str]] = []
+        if estimate.requires_paid_api and not self.settings.paid_api_enabled:
+            applicable.append(
+                (
+                    PAID_API_GATE,
+                    "This task would use a paid API while paid APIs are disabled.",
+                )
+            )
+        if estimate.monetary_maximum_usd > 0 and projected > limit:
+            applicable.append(
+                (
+                    COST_CAP_GATE,
+                    f"Projected monthly cost {projected:.4f} USD exceeds the "
+                    f"{limit:.2f} USD hard cap.",
+                )
+            )
+        gates: list[tuple[str, PermissionRequest]] = []
+        for gate, reason in applicable:
+            cost_gate = "|".join(
+                (
+                    gate,
+                    f"{projected:.9f}",
+                    f"{limit:.9f}",
+                    str(int(self.settings.paid_api_enabled)),
+                )
+            )
+            request = self._cost_permission_request(
+                task, session, connector, action=gate, reason=reason, cost_gate=cost_gate
+            )
+            if isinstance(request, AgentRun):
+                return request
+            gates.append((gate, request))
+        return gates
+
+    def _permission_satisfied(
+        self, session: SessionState, request: PermissionRequest
+    ) -> bool:
+        """Whether the exact current request is policy-exempt, covered by a
+        remembered scope grant, or backed by an approved grant record."""
+        if not self._requires_approval(request):
+            return True
+        if self._remembered_permission_allowed(
+            request
+        ) and self.memory.has_remembered_scope_grant(
+            session.id, request.scope_fingerprint
+        ):
+            return True
+        return self.memory.has_approved_grant(
+            session.id, request.task_id, request.fingerprint
+        )
+
+    def _unsatisfied_gate(
+        self, session: SessionState, task: Task, connector: BaseConnector
+    ) -> LoopStage | AgentRun | None:
+        """Recompute every gate attestation right before execution.
+
+        Returns the first gate stage lacking a valid consumed grant, ``None``
+        when execution is authorized, or a terminal run on refusal.
+        """
+        current = self._attested_request(session, task, connector)
+        if isinstance(current, AgentRun):
+            return current
+        if not self._permission_satisfied(session, current):
+            return LoopStage.RISK_PERMISSION
+        projected = (
+            self.memory.monthly_monetary_cost() + task.estimate.monetary_maximum_usd
+        )
+        gates = self._monetary_gates(session, task, connector, projected)
+        if isinstance(gates, AgentRun):
+            return gates
+        for _, request in gates:
+            if not self.memory.has_approved_grant(
+                session.id, task.id, request.fingerprint
+            ):
+                return LoopStage.COST_PREFLIGHT
         return None
 
     def _billing_route_failure(
@@ -908,7 +1075,8 @@ class AgentCore:
         *,
         action: str,
         reason: str,
-    ) -> PermissionRequest:
+        cost_gate: str,
+    ) -> PermissionRequest | AgentRun:
         scope = ActionScope(
             action=action,
             target=f"monthly-budget:{self.settings.monthly_hard_limit_usd:.2f}-usd",
@@ -916,22 +1084,15 @@ class AgentCore:
             destination=task.scope.destination,
             data_classification=DataClassification.INTERNAL,
         )
-        billing_task = replace(
-            task,
-            risk_level=RiskLevel.HIGH,
-            side_effect=SideEffectProfile(
-                effect=SideEffect.BILLING,
-                reversible=False,
-                always_requires_approval=True,
-            ),
+        # The connector attests the same egress the money would pay for; the
+        # monetary gate view (HIGH, irreversible BILLING, always approved) and
+        # the exact gate state are then bound on top by the loop.
+        request = self._attested_request(
+            session, task, connector, scope_override=scope, reason=reason
         )
-        return connector.permission_request(
-            billing_task,
-            session.id,
-            self.settings.approval_ttl_minutes,
-            scope_override=scope,
-            reason=reason,
-        )
+        if isinstance(request, AgentRun):
+            return request
+        return request.as_monetary_gate(cost_gate)
 
     def _selection_failure(
         self, session: SessionState, task: Task, exc: Exception

@@ -7,13 +7,13 @@ import json
 import os
 import re
 import unicodedata
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import uuid4
 
 
 def utc_now() -> str:
@@ -42,7 +42,7 @@ def normalize_symbol(value: str | Path | None) -> str:
     return " ".join(str(value).split()).casefold()
 
 
-def _normalize_url(text: str) -> str | None:
+def normalize_url(text: str) -> str | None:
     parsed = urlsplit(text)
     if not (parsed.scheme and parsed.netloc):
         return None
@@ -57,6 +57,23 @@ def _normalize_url(text: str) -> str | None:
     )
 
 
+def looks_like_path(text: str) -> bool:
+    """Whether a non-URL locator names a filesystem location."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or any(
+        separator in text for separator in ("/", "\\")
+    )
+
+
+def canonical_path(path: str | Path) -> str:
+    """Windows-safe canonical form of a resolved filesystem path.
+
+    Symlinks, junctions and ``..`` segments are resolved first; the result is
+    case-folded by the platform rules and uses forward slashes only.
+    """
+    resolved = Path(path).expanduser().resolve(strict=False)
+    return os.path.normcase(str(resolved)).replace("\\", "/")
+
+
 def normalize_locator(value: str | Path | None) -> str:
     """Normalize a filesystem/URL locator to an absolute, canonical form."""
     if value is None:
@@ -64,15 +81,11 @@ def normalize_locator(value: str | Path | None) -> str:
     text = str(value).strip()
     if not text:
         return ""
-    url = _normalize_url(text)
+    url = normalize_url(text)
     if url is not None:
         return url
-    looks_like_path = bool(re.match(r"^[A-Za-z]:[\\/]", text)) or any(
-        separator in text for separator in ("/", "\\")
-    )
-    if looks_like_path:
-        resolved = Path(text).expanduser().resolve(strict=False)
-        return os.path.normcase(str(resolved)).replace("\\", "/")
+    if looks_like_path(text):
+        return canonical_path(text)
     return normalize_symbol(text)
 
 
@@ -88,7 +101,7 @@ def normalize_destination(value: str | Path | None) -> str:
     text = str(value).strip()
     if not text:
         return ""
-    url = _normalize_url(text)
+    url = normalize_url(text)
     return url if url is not None else normalize_symbol(text)
 
 
@@ -228,6 +241,21 @@ class ErrorCode(str, Enum):
     VERIFICATION_FAILED = "verification_failed"
     CANCELLED = "cancelled"
     INVALID_TASK = "invalid_task"
+    #: The connector refused to attest an external egress for this task
+    #: (SECRET classification, a local-resource boundary it cannot honour).
+    EGRESS_REFUSED = "egress_refused"
+
+
+class AttestationError(Exception):
+    """A permission/egress attestation cannot be produced; fail closed.
+
+    Raised at the connector boundary before any approval request exists and
+    again before execution. ``code`` is the structured error the loop reports.
+    """
+
+    def __init__(self, code: "ErrorCode", message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +340,49 @@ class SideEffectProfile:
         return self.always_requires_approval or self.effect in MANDATORY_APPROVAL_EFFECTS
 
 
+#: The only explicit safe combination rule between two distinct effects: a
+#: task may raise a connector's *local* effect up this ladder (a read-only
+#: connector asked to do a write is more restricted, never less). Every other
+#: pair of distinct non-NONE effects is a conflict and fails closed.
+_LOCAL_EFFECT_LADDER = (SideEffect.LOCAL_READ, SideEffect.LOCAL_WRITE, SideEffect.DESTRUCTIVE)
+
+
+def merge_side_effects(
+    manifest: SideEffectProfile, requested: SideEffectProfile
+) -> SideEffectProfile:
+    """Fail-closed merge: the connector manifest is the non-weakenable floor.
+
+    Task/persisted state may strengthen (irreversible, always-approve, a
+    higher local effect) but can never remove the connector's external-egress
+    status, mandatory approval, irreversibility or effect. Raises
+    ``AttestationError`` for conflicting non-NONE effects.
+    """
+    if manifest.effect is SideEffect.NONE or manifest.effect is requested.effect:
+        effect = requested.effect
+    elif requested.effect is SideEffect.NONE:
+        effect = manifest.effect
+    elif (
+        manifest.effect in _LOCAL_EFFECT_LADDER
+        and requested.effect in _LOCAL_EFFECT_LADDER
+        and _LOCAL_EFFECT_LADDER.index(requested.effect)
+        > _LOCAL_EFFECT_LADDER.index(manifest.effect)
+    ):
+        effect = requested.effect
+    else:
+        raise AttestationError(
+            ErrorCode.INVALID_TASK,
+            f"Task side effect '{requested.effect.value}' conflicts with the "
+            f"connector side effect '{manifest.effect.value}'.",
+        )
+    return SideEffectProfile(
+        effect=effect,
+        reversible=manifest.reversible and requested.reversible,
+        always_requires_approval=(
+            manifest.always_requires_approval or requested.always_requires_approval
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OutboundDataPreview:
     destination: str
@@ -372,6 +443,24 @@ class CostEstimate:
     def monetary_maximum_usd(self) -> float:
         """Money this estimate may add to the monthly ledger."""
         return self.maximum_usd if self.is_paid else 0.0
+
+    @property
+    def gate_state(self) -> str:
+        """The billing-critical policy inputs, without the evidence string.
+
+        Evidence is deliberately excluded so a reworded, policy-equivalent
+        classification cannot bounce a task between stages forever. Bound
+        into every permission attestation and compared before execution.
+        """
+        ceiling = self.resource_ceiling_usd
+        return "|".join(
+            (
+                self.billing_class.value,
+                f"{self.monetary_maximum_usd:.9f}",
+                str(int(self.requires_paid_api)),
+                "none" if ceiling is None else f"{float(ceiling):.9f}",
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -851,11 +940,36 @@ _CREDENTIAL_VALUE_PATTERNS = (
 )
 
 
+#: Redaction form of the assignment rule: the label and delimiter survive, the
+#: value runs to the end of the field so a space-separated credential cannot
+#: escape; over-redaction is the safe direction at an egress boundary.
+_CREDENTIAL_REDACTION_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9])({_CREDENTIAL_LABEL})(\s*[:=]\s*)([^,;\n]+)", re.IGNORECASE
+)
+
+
 def credential_bearing(text: str) -> bool:
     """Whether text carries a labelled credential assignment or a raw shape."""
     if _CREDENTIAL_ASSIGNMENT_PATTERN.search(text):
         return True
     return any(pattern.search(text) for pattern in _CREDENTIAL_VALUE_PATTERNS)
+
+
+def redact_credentials(text: str, replacement: str = "[REDACTED]") -> tuple[str, int]:
+    """Redact raw credential shapes and labelled credential values in text.
+
+    Shape patterns run first so an ``authorization: Bearer <token>`` header
+    is already reduced before the label rule sees it. Returns the redacted
+    text and the number of replacements. Shared by every egress boundary.
+    """
+    count = 0
+    for pattern in _CREDENTIAL_VALUE_PATTERNS:
+        text, replaced = pattern.subn(replacement, text)
+        count += replaced
+    text, replaced = _CREDENTIAL_REDACTION_PATTERN.subn(
+        lambda match: f"{match.group(1)}{match.group(2)}{replacement}", text
+    )
+    return text, count + replaced
 
 
 def normalize_session_next_step(value: Any) -> str:
@@ -1133,6 +1247,107 @@ class Task:
 
 
 @dataclass(frozen=True, slots=True)
+class EgressAttestation:
+    """The exact external-effect state one permission grant authorizes.
+
+    Provider-independent: a connector fills in what *it* knows (normalized
+    scope incl. connector/destination/classification, effective merged side
+    effect, the digest of the exact canonical bytes it will send, the local
+    resource boundary the external process can inspect) and AgentCore binds
+    the gate state (billing classification/ceiling and, for cost approvals,
+    the monetary gate). Equality of two attestations means the same data
+    leaves to the same place under the same gates from the same boundary.
+    """
+
+    scope: ActionScope
+    risk_level: RiskLevel
+    side_effect: SideEffectProfile
+    #: SHA-256 of the exact sanitized outbound bytes execution will use.
+    outbound_digest: str
+    #: ``CostEstimate.gate_state`` of the connector-derived estimate.
+    billing_gate: str = ""
+    #: Monetary gate being approved (``gate|projected|limit|paid_api``), or
+    #: empty for a plain egress/permission request.
+    cost_gate: str = ""
+    #: Canonical resolved working directory the external process runs in.
+    working_directory: str = ""
+    #: Canonical allowed roots the connector may expose; the approved boundary.
+    allowed_roots: tuple[str, ...] = ()
+    #: The exact external tool grants the process is launched with - the
+    #: local-resource inspection manifest. Empty means the external model can
+    #: receive nothing beyond the attested outbound bytes; any tool-mediated
+    #: file read would be a channel outside those bytes, so an empty grant set
+    #: is the only fully attestable state until a bounded, enforceable read
+    #: manifest exists. Bound into the digest so a changed grant set (or a
+    #: connector that silently re-enables tools) invalidates the approval.
+    tool_grants: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope": self.scope.to_dict(),
+            "risk_level": int(self.risk_level),
+            "side_effect": {
+                "effect": self.side_effect.effect.value,
+                "reversible": self.side_effect.reversible,
+                "always_requires_approval": self.side_effect.always_requires_approval,
+            },
+            "outbound_digest": self.outbound_digest,
+            "billing_gate": self.billing_gate,
+            "cost_gate": self.cost_gate,
+            "working_directory": self.working_directory,
+            "allowed_roots": list(self.allowed_roots),
+            "tool_grants": list(self.tool_grants),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "EgressAttestation | None":
+        if not data:
+            return None
+        effect = data["side_effect"]
+        return cls(
+            scope=ActionScope.from_dict(data["scope"]),
+            risk_level=RiskLevel(data["risk_level"]),
+            side_effect=SideEffectProfile(
+                effect=SideEffect(effect["effect"]),
+                reversible=bool(effect["reversible"]),
+                always_requires_approval=bool(effect["always_requires_approval"]),
+            ),
+            outbound_digest=str(data["outbound_digest"]),
+            billing_gate=str(data.get("billing_gate", "")),
+            cost_gate=str(data.get("cost_gate", "")),
+            working_directory=str(data.get("working_directory", "")),
+            allowed_roots=tuple(str(root) for root in data.get("allowed_roots", [])),
+            tool_grants=tuple(str(tool) for tool in data.get("tool_grants", [])),
+        )
+
+    def display_manifest(self) -> dict[str, Any]:
+        """Safe, user-facing view of the approved boundary and manifest.
+
+        Only digests, canonical bounded paths and tool-grant names; no raw
+        prompt, credentials or retrieved-memory internals.
+        """
+        return {
+            "outbound_digest": self.outbound_digest,
+            "billing_gate": self.billing_gate,
+            "cost_gate": self.cost_gate,
+            "connector": self.scope.connector,
+            "destination": self.scope.destination,
+            "classification": self.scope.data_classification.value,
+            "working_directory": self.working_directory,
+            "allowed_roots": list(self.allowed_roots),
+            "tool_grants": list(self.tool_grants),
+        }
+
+    @property
+    def digest(self) -> str:
+        """Deterministic SHA-256 over the canonical attestation encoding."""
+        encoded = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class PermissionRequest:
     task_id: str
     session_id: str
@@ -1141,12 +1356,41 @@ class PermissionRequest:
     side_effect: SideEffectProfile
     reason: str
     outbound_preview: OutboundDataPreview | None = None
+    #: Absent only for legacy persisted requests, which can then never match
+    #: a current attestation and are superseded by a fresh request.
+    attestation: EgressAttestation | None = None
     expires_at: str = field(default_factory=lambda: future_time(30))
     id: str = ""
 
     def __post_init__(self) -> None:
         if not self.id:
-            object.__setattr__(self, "id", str(uuid5(NAMESPACE_URL, self.fingerprint)))
+            # A fresh, unique issuance identity - never derived from the
+            # semantic fingerprint. Two requests with identical scope and
+            # attestation (for example a re-issue after an expired one) are
+            # distinct issuances, so an old grant can never authorize a newly
+            # issued request even when the semantic fingerprint is identical.
+            object.__setattr__(self, "id", str(uuid4()))
+
+    def as_monetary_gate(self, cost_gate: str) -> "PermissionRequest":
+        """AgentCore's view of this request as a monetary gate approval.
+
+        Money is HIGH risk, irreversible, always approved; the gate state is
+        bound into the attestation and the id is re-derived from it.
+        """
+        profile = SideEffectProfile(
+            effect=SideEffect.BILLING, reversible=False, always_requires_approval=True
+        )
+        risk = max(self.risk_level, RiskLevel.HIGH)
+        attestation = (
+            None
+            if self.attestation is None
+            else replace(
+                self.attestation, risk_level=risk, side_effect=profile, cost_gate=cost_gate
+            )
+        )
+        return replace(
+            self, risk_level=risk, side_effect=profile, attestation=attestation, id=""
+        )
 
     @property
     def scope_fingerprint(self) -> str:
@@ -1163,9 +1407,36 @@ class PermissionRequest:
         ).hexdigest()
 
     @property
+    def display_digest(self) -> str:
+        """Digest of the security-relevant fields shown to the user.
+
+        The reason and the redacted outbound preview are what the user reads
+        when approving; binding them means a stale request whose displayed
+        reason or preview was mutated can never be presented as current.
+        """
+        payload = {
+            "reason": self.reason,
+            "outbound_preview": (
+                self.outbound_preview.to_dict()
+                if self.outbound_preview is not None
+                else None
+            ),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @property
     def fingerprint(self) -> str:
+        """Binds task, scope, the exact egress attestation and the approval
+        display a grant covers. Any change to the outbound digest, gate state,
+        resource boundary, tool grants, reason or preview changes it."""
+        attested = self.attestation.digest if self.attestation is not None else ""
         return hashlib.sha256(
-            f"{self.task_id}|{self.scope_fingerprint}".encode("utf-8")
+            f"{self.task_id}|{self.scope_fingerprint}|{attested}|{self.display_digest}".encode(
+                "utf-8"
+            )
         ).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
@@ -1182,6 +1453,9 @@ class PermissionRequest:
             "reason": self.reason,
             "outbound_preview": (
                 self.outbound_preview.to_dict() if self.outbound_preview else None
+            ),
+            "attestation": (
+                self.attestation.to_dict() if self.attestation is not None else None
             ),
             "expires_at": self.expires_at,
             "id": self.id,
@@ -1204,6 +1478,7 @@ class PermissionRequest:
             outbound_preview=OutboundDataPreview.from_dict(
                 data.get("outbound_preview")
             ),
+            attestation=EgressAttestation.from_dict(data.get("attestation")),
             expires_at=data["expires_at"],
             id=data["id"],
         )
@@ -1432,6 +1707,16 @@ class MemoryStore(Protocol):
     def has_remembered_scope_grant(
         self, session_id: str, scope_fingerprint: str
     ) -> bool: ...
+
+    def has_approved_grant(
+        self, session_id: str, task_id: str, fingerprint: str
+    ) -> bool:
+        """Whether an approved grant was recorded for this exact fingerprint.
+
+        The grant record, never persisted task state, is the proof that a
+        permission/cost gate was satisfied for the attested request.
+        """
+        ...
 
     def append_usage(self, usage: UsageRecord) -> None: ...
 

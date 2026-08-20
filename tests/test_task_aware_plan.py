@@ -661,7 +661,7 @@ class ConnectorPlanTests(unittest.TestCase):
         self.assertIn("[REDACTED]", serialized_plan)
         self.assertGreater(count, baseline_count)
 
-    def test_secret_task_branch_is_unchanged_and_exposes_no_plan(self) -> None:
+    def test_secret_task_branch_exposes_no_plan_or_capability(self) -> None:
         task = self.task(DataClassification.SECRET)
         task.plan = ["SECRETPLANMARKER"]
         task.visible_assumption = "classified assumption"
@@ -681,7 +681,10 @@ class ConnectorPlanTests(unittest.TestCase):
         self.assertNotIn("plan", set(payload))
         self.assertNotIn("SECRETPLANMARKER", serialized)
         self.assertNotIn("objective_ref=", serialized)
-        self.assertEqual(7, count)
+        # H1: the SECRET shape carries no free-form task metadata at all.
+        self.assertNotIn("code_planning", serialized)
+        self.assertEqual("[REDACTED_SECRET_CLASSIFICATION]", payload["capability"])
+        self.assertEqual(8, count)
 
 
 class PlanApprovalExecutionIntegrationTests(unittest.TestCase):

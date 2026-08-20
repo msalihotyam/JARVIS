@@ -99,6 +99,7 @@ _ERROR_EXIT = {
     ErrorCode.PAID_API_DISABLED: EXIT_POLICY,
     ErrorCode.BILLING_ROUTE_UNKNOWN: EXIT_POLICY,
     ErrorCode.CONNECTOR_AMBIGUOUS: EXIT_POLICY,
+    ErrorCode.EGRESS_REFUSED: EXIT_POLICY,
     ErrorCode.APPROVAL_REJECTED: EXIT_REJECTED,
     ErrorCode.CANCELLED: EXIT_CANCELLED,
     ErrorCode.CONNECTOR_UNAVAILABLE: EXIT_INTERNAL,
@@ -366,6 +367,17 @@ def _approval_payload(request: PermissionRequest) -> dict[str, Any]:
         # outbound data; the payload and prompt themselves never appear.
         "outbound_preview": (
             request.outbound_preview.to_dict() if request.outbound_preview else None
+        ),
+        # The safe egress/resource manifest bound into the fingerprint: the
+        # outbound digest, gate state, connector/destination/classification,
+        # the resolved working directory, the approved allowed roots and the
+        # exact external tool grants. Digests and bounded paths only - no raw
+        # prompt, credentials or retrieved-memory internals. What is shown
+        # here corresponds exactly to the execution-time attestation state.
+        "attestation": (
+            request.attestation.display_manifest()
+            if request.attestation is not None
+            else None
         ),
     }
 

@@ -377,7 +377,6 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
             "--safe-mode",
             "--strict-mcp-config",
             "--tools",
-            "Read,Glob,Grep",
             "--no-session-persistence",
             "--permission-mode",
             "plan",
@@ -388,6 +387,17 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
             self.assertIn(required, command)
         self.assertNotIn("--bare", command)
         self.assertNotIn("--dangerously-skip-permissions", command)
+
+    def test_broad_file_reading_tools_are_not_granted(self) -> None:
+        # P1-A: the Read/Glob/Grep tools would let the external model pull
+        # file contents outside the attested prompt, so this path grants none.
+        command = self.connector._command("safe prompt")
+        tools_value = command[command.index("--tools") + 1]
+        self.assertEqual("", tools_value)
+        for tool in ("Read", "Glob", "Grep"):
+            self.assertNotIn(tool, tools_value)
+        serialized = json.dumps(command)
+        self.assertNotIn("Read,Glob,Grep", serialized)
 
     @patch("jarvis.connectors.claude_code.subprocess.Popen")
     def test_mocked_cli_result_has_connector_specific_verification(self, popen) -> None:

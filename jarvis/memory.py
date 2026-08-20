@@ -428,46 +428,50 @@ class SQLiteMemoryStore:
                 (session.id, task.id, event_type, self._json(payload or {}), utc_now()),
             )
             if pending_request is not None:
-                connection.execute(
-                    """
-                    INSERT INTO pending_approvals
-                        (id, task_id, session_id, request_json, status, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        request_json = excluded.request_json,
-                        status = 'pending',
-                        expires_at = excluded.expires_at,
-                        resolved_at = NULL
-                    """,
-                    (
-                        pending_request.id,
-                        pending_request.task_id,
-                        pending_request.session_id,
-                        self._json(pending_request.to_dict()),
-                        utc_now(),
-                        pending_request.expires_at,
-                    ),
-                )
+                self._upsert_pending_approval(connection, pending_request)
+
+    @staticmethod
+    def _upsert_pending_approval(
+        connection: sqlite3.Connection, request: PermissionRequest
+    ) -> None:
+        """Exactly one pending request per task/session.
+
+        A request whose attestation changed gets a new id; the superseded
+        pending row is closed in the same transaction so stale evidence can
+        never be loaded as the current request again.
+        """
+        connection.execute(
+            """
+            INSERT INTO pending_approvals
+                (id, task_id, session_id, request_json, status, created_at, expires_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                request_json = excluded.request_json,
+                status = 'pending',
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                resolved_at = NULL
+            """,
+            (
+                request.id,
+                request.task_id,
+                request.session_id,
+                SQLiteMemoryStore._json(request.to_dict()),
+                utc_now(),
+                request.expires_at,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE pending_approvals SET status = 'superseded', resolved_at = ?
+             WHERE task_id = ? AND session_id = ? AND status = 'pending' AND id != ?
+            """,
+            (utc_now(), request.task_id, request.session_id, request.id),
+        )
 
     def save_pending_approval(self, request: PermissionRequest) -> None:
         with self._connection(write=True) as connection:
-            connection.execute(
-                """
-                INSERT INTO pending_approvals
-                    (id, task_id, session_id, request_json, status, created_at, expires_at)
-                VALUES (?, ?, ?, ?, 'pending', ?, ?)
-                ON CONFLICT(id) DO UPDATE SET request_json = excluded.request_json,
-                    status = 'pending', expires_at = excluded.expires_at, resolved_at = NULL
-                """,
-                (
-                    request.id,
-                    request.task_id,
-                    request.session_id,
-                    self._json(request.to_dict()),
-                    utc_now(),
-                    request.expires_at,
-                ),
-            )
+            self._upsert_pending_approval(connection, request)
 
     def load_pending_approval(
         self, task_id: str, session_id: str
@@ -530,6 +534,27 @@ class SQLiteMemoryStore:
                 LIMIT 1
                 """,
                 (session_id, scope_fingerprint, utc_now()),
+            ).fetchone()
+        return row is not None
+
+    def has_approved_grant(
+        self, session_id: str, task_id: str, fingerprint: str
+    ) -> bool:
+        """The grant record is the only proof a gate was satisfied.
+
+        Expiry is enforced here: a recorded grant whose window has closed can
+        never re-authorize execution, so an expired grant returns the task to
+        a fresh gate rather than silently clearing it.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM permission_grants
+                WHERE session_id = ? AND task_id = ? AND fingerprint = ?
+                  AND approved = 1 AND expires_at > ?
+                LIMIT 1
+                """,
+                (session_id, task_id, fingerprint, utc_now()),
             ).fetchone()
         return row is not None
 
