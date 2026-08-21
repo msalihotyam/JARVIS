@@ -493,12 +493,15 @@ class CrashWindowTests(ExecutionJournalTestCase):
         original_verify = connector.verify
 
         def crashing_verify(*args, **kwargs):
-            raise _CrashInStore()
+            # Process death, not a verifier fault: H4 normalizes an ordinary
+            # verifier exception into a terminal failure, so the crash window
+            # is simulated with the BaseException that escapes that boundary.
+            raise _SimulatedCrash()
 
         connector.verify = crashing_verify
         try:
             core.resume(session.id, task.id)
-        except _CrashInStore:
+        except _SimulatedCrash:
             pass
         finally:
             connector.verify = original_verify

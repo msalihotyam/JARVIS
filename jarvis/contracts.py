@@ -485,10 +485,24 @@ def ledger_month(moment: datetime | None = None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class StructuredError:
+    """The one structured diagnostic the product persists.
+
+    H4: construction is the sanitization boundary. ``message`` is bounded and
+    credential/path-scrubbed and ``details`` is reduced to bounded allowlisted
+    scalars *here*, so no code path - a stage boundary, a connector exception,
+    a legacy row reloaded from SQLite - can put raw text into task JSON, a
+    result snapshot, a checkpoint or an audit event. A diagnostic is
+    informational only and is never execution, billing or lifecycle authority.
+    """
+
     code: ErrorCode
     message: str
     details: dict[str, Any] = field(default_factory=dict)
     retryable: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message", sanitize_diagnostic_text(self.message))
+        object.__setattr__(self, "details", sanitize_diagnostic_details(self.details))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -500,14 +514,220 @@ class StructuredError:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "StructuredError | None":
-        if data is None:
+        """Load a persisted diagnostic conservatively.
+
+        A malformed or adversarial row never becomes active state again: an
+        unknown code falls back to ``INVALID_TASK``, a non-boolean retryable
+        flag falls back to ``False``, and the message/details are re-sanitized
+        so unsafe legacy text cannot be written back on the next checkpoint.
+        """
+        if not isinstance(data, dict):
             return None
+        raw_code = data.get("code")
+        try:
+            code = ErrorCode(raw_code) if isinstance(raw_code, str) else None
+        except ValueError:
+            code = None
+        retryable = data.get("retryable", False)
         return cls(
-            code=ErrorCode(data["code"]),
-            message=data["message"],
+            code=code if code is not None else ErrorCode.INVALID_TASK,
+            message=data.get("message", ""),
             details=data.get("details", {}),
-            retryable=bool(data.get("retryable", False)),
+            retryable=retryable if isinstance(retryable, bool) else False,
         )
+
+
+def diagnostic_from_exception(
+    code: ErrorCode,
+    exc: BaseException,
+    *,
+    retryable: bool = False,
+    stage: Any = None,
+) -> StructuredError:
+    """Normalize an exception into the safe persisted diagnostic contract.
+
+    The exception *object* never reaches storage. Its message is sanitized like
+    any other free-form diagnostic, and the only structural metadata kept is the
+    exception class name and the stage tag - both bounded, non-secret
+    identifiers. Tracebacks, environment values, command lines, raw payloads and
+    connector objects are never carried.
+    """
+    try:
+        message = str(exc)
+    except Exception:  # noqa: BLE001 - a pathological __str__ is not a message
+        message = ""
+    details: dict[str, Any] = {"exception_type": type(exc).__name__}
+    if stage is not None:
+        details["stage"] = stage.value if isinstance(stage, Enum) else str(stage)
+    return StructuredError(code, message, details=details, retryable=retryable)
+
+
+#: The only keys a persisted result snapshot may carry, and the only free-form
+#: ``data`` key the loop itself consumes.
+_RESULT_SNAPSHOT_KEYS = frozenset(
+    {"outcome", "summary", "data", "error", "usage", "verification"}
+)
+_RESULT_DATA_KEYS = frozenset({"next_step"})
+#: Hard ceiling on persisted verification evidence items.
+VERIFICATION_MAX_EVIDENCE = 8
+def _canonical_enum_value(value: Any, allowed: frozenset[str]) -> str | None:
+    """An exact canonical enum value, or ``None``.
+
+    A key being allowlisted is never enough: an enum-like field must carry one
+    of the exact values its enum declares. A raw arbitrary string - including a
+    credential-bearing or oversized one - is not a value, it is tampered data,
+    and it is dropped so restoration keeps failing closed.
+    """
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _snapshot_count(value: Any) -> int:
+    """A persisted count field: real int, not bool, non-negative, bounded.
+
+    Reuses the established H3 zero-normalization policy, so ``True``, ``"7"``,
+    a float, a negative or an oversized integer all become the legacy-safe
+    zero rather than becoming active ``UsageRecord`` state.
+    """
+    return persistable_count(value)
+
+
+def _snapshot_amount(value: Any, *, nullable: bool) -> Any:
+    """A persisted monetary field under the canonical H3 numeric semantics."""
+    if value is None:
+        return None if nullable else 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None if nullable else 0.0
+    try:
+        return float(canonical_usd(value))
+    except BillingIntegrityError:
+        return None if nullable else 0.0
+
+
+def _snapshot_text(value: Any) -> str | None:
+    """A persisted free-form usage string: bounded, scrubbed, or dropped."""
+    if not isinstance(value, str):
+        return None
+    return sanitize_diagnostic_text(value, DIAGNOSTIC_DETAIL_MAX_CHARS)
+
+
+def _sanitize_snapshot_usage(usage: Any) -> dict[str, Any]:
+    """Exactly the canonical typed usage fields, each validated by its own type.
+
+    Default-deny at the nested boundary *and* field-aware inside it: a field is
+    never kept merely because its key is allowlisted. Enum fields must carry an
+    exact canonical value, count fields must be real non-negative bounded ints
+    (``True`` and ``"7"`` are not ints), monetary fields must satisfy the
+    canonical H3 numeric semantics, and free-form strings are bounded and
+    scrubbed. Anything else is dropped and the field falls back to its typed
+    default, so a tampered snapshot can never become active state.
+
+    The class/state/amount triple is additionally reconciled: a *measured*
+    metered row with no amount is impossible, so its state degrades to the
+    fail-closed ``UNKNOWN`` rather than persisting a combination that would
+    raise out of a later ledger write.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in sorted(_USAGE_SNAPSHOT_KEYS & set(usage)):
+        value = usage[key]
+        if key in _USAGE_ENUM_VALUES:
+            resolved = _canonical_enum_value(value, _USAGE_ENUM_VALUES[key])
+        elif key in _USAGE_COUNT_FIELDS:
+            resolved = _snapshot_count(value)
+        elif key in _USAGE_NULLABLE_AMOUNT_FIELDS:
+            resolved = _snapshot_amount(value, nullable=True)
+        elif key in _USAGE_AMOUNT_FIELDS:
+            resolved = _snapshot_amount(value, nullable=False)
+        else:
+            # Free-form and storage-owned identifier strings alike. These are
+            # echoes of the authoritative ledger row, never connector authority:
+            # H3 owns the usage id, the recorded time and the ledger month.
+            resolved = _snapshot_text(value)
+        if resolved is None and key not in _USAGE_NULLABLE_AMOUNT_FIELDS:
+            continue
+        safe[key] = resolved
+    if (
+        safe.get("billing_class") == BillingClass.METERED_MONETARY.value
+        and safe.get("monetary_state") == MonetaryState.MEASURED.value
+        and safe.get("monetary_cost_usd") is None
+    ):
+        # A measured metered row with no amount is not a valid ledger shape and
+        # would raise on a later write; degrade to the fail-closed state.
+        safe["monetary_state"] = MonetaryState.UNKNOWN.value
+    return safe
+
+
+def _sanitize_snapshot_verification(verification: Any) -> dict[str, Any]:
+    """Exactly the canonical typed verification fields, bounded and scrubbed.
+
+    Default-deny: ``status``, ``method`` and ``evidence`` are built explicitly,
+    so ``payload``, ``raw``, ``metadata`` and every other connector-authored
+    field is dropped rather than carried through. ``status`` must be an exact
+    ``VerificationStatus`` value - a raw arbitrary string, however
+    credential-bearing or oversized, is never accepted as a status and is
+    dropped so restoration fails closed.
+    """
+    if not isinstance(verification, dict):
+        return {}
+    evidence = verification.get("evidence")
+    return {
+        "status": _canonical_enum_value(
+            verification.get("status"), _VERIFICATION_STATUS_VALUES
+        ),
+        "method": sanitize_diagnostic_text(
+            verification.get("method", ""), DIAGNOSTIC_DETAIL_MAX_CHARS
+        ),
+        "evidence": [
+            sanitize_diagnostic_text(item, DIAGNOSTIC_DETAIL_MAX_CHARS)
+            for item in (evidence if isinstance(evidence, (list, tuple)) else [])
+        ][:VERIFICATION_MAX_EVIDENCE],
+    }
+
+
+def sanitize_result_snapshot(snapshot: Any) -> dict[str, Any] | None:
+    """Bound and scrub a persisted result snapshot, on write and on load.
+
+    Applied by ``Task.to_dict``/``Task.from_dict`` so the same policy governs
+    freshly produced results, legacy rows and tampered rows alike, and so a
+    load/resave cycle can never write unsafe text back. Idempotent: sanitizing
+    an already-sanitized snapshot is byte-identical.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    safe: dict[str, Any] = {
+        key: value for key, value in snapshot.items() if key in _RESULT_SNAPSHOT_KEYS
+    }
+    if "outcome" in safe:
+        # Enum-like in the result contract: an exact canonical value or nothing.
+        # A credential-bearing or oversized "outcome" is tampered data, and
+        # dropping it makes restoration fail closed deterministically.
+        safe["outcome"] = _canonical_enum_value(safe["outcome"], _OUTCOME_VALUES)
+    if "summary" in safe:
+        safe["summary"] = sanitize_diagnostic_text(safe["summary"])
+    raw_data = safe.get("data")
+    if isinstance(raw_data, dict):
+        # Arbitrary connector ``data`` is never persisted; only the one key the
+        # loop actually consumes survives, bounded and credential-safe.
+        safe["data"] = {
+            key: sanitize_diagnostic_text(raw_data[key])
+            for key in sorted(_RESULT_DATA_KEYS & set(raw_data))
+            # Only an actual string survives; arbitrary connector data is never
+            # stringified into persisted state.
+            if isinstance(raw_data[key], str)
+        }
+    elif "data" in safe:
+        safe["data"] = {}
+    error = StructuredError.from_dict(safe.get("error"))
+    if error is not None:
+        safe["error"] = error.to_dict()
+    elif "error" in safe:
+        safe["error"] = None
+    if "usage" in safe:
+        safe["usage"] = _sanitize_snapshot_usage(safe["usage"])
+    if "verification" in safe:
+        safe["verification"] = _sanitize_snapshot_verification(safe["verification"])
+    return safe
 
 
 @dataclass(frozen=True, slots=True)
@@ -781,6 +1001,22 @@ class UsageRecord:
 
 _COST_FIELDS = frozenset(CostEstimate.__dataclass_fields__)
 _USAGE_FIELDS = frozenset(UsageRecord.__dataclass_fields__)
+#: Exact persisted usage fields: the canonical typed contract, nothing else.
+_USAGE_SNAPSHOT_KEYS = _USAGE_FIELDS
+#: Per-field semantic types inside that contract. A key alone never qualifies a
+#: value; each field is validated against the exact type it declares.
+_USAGE_ENUM_VALUES = {
+    "billing_class": frozenset(item.value for item in BillingClass),
+    "monetary_state": frozenset(item.value for item in MonetaryState),
+}
+_USAGE_COUNT_FIELDS = frozenset({"input_tokens", "output_tokens", "call_count"})
+_USAGE_NULLABLE_AMOUNT_FIELDS = frozenset(
+    {"monetary_cost_usd", "reference_cost_usd"}
+)
+_USAGE_AMOUNT_FIELDS = frozenset({"estimated_cost_usd"})
+#: Exact canonical values for the enum-like result-snapshot fields.
+_OUTCOME_VALUES = frozenset(item.value for item in OutcomeStatus)
+_VERIFICATION_STATUS_VALUES = frozenset(item.value for item in VerificationStatus)
 
 
 def validate_cost_estimate(estimate: CostEstimate) -> None:
@@ -1392,6 +1628,86 @@ _CREDENTIAL_LABEL = (
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     rf"(?<![A-Za-z0-9])(?:{_CREDENTIAL_LABEL})\b\s*[:=]\s*\S", re.IGNORECASE
 )
+#: Command-line credential syntax: ``--api-key VALUE``, ``--token=VALUE`` and
+#: friends. The flag prefix is required, so ordinary prose mentioning a token or
+#: a secret - and file names such as ``tokenizer.py`` - never matches.
+_CLI_CREDENTIAL_FLAG = (
+    r"api[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|token"
+    r"|password|passwd|client[_\-]?secret|secret|authorization|bearer"
+    r"|private[_\-]?key|session[_\-]?cookie|cookie|credential"
+)
+#: The flag and its ``=``/whitespace joiner. The value is NOT matched here: a
+#: character class such as ``[^"]*`` treats an escaped quote as the closing one
+#: and hands back the rest of the secret (``--password "HUNTER2 foo\"bar TAIL"``
+#: leaking ``bar TAIL``). The lookahead only asserts that a value exists, so
+#: ``--token`` with nothing after it is still not a credential assignment.
+_CLI_CREDENTIAL_PATTERN = re.compile(
+    rf"(--?(?:{_CLI_CREDENTIAL_FLAG}))(=|\s+)(?=\S)", re.IGNORECASE
+)
+
+
+def _credential_value_end(text: str, start: int) -> int:
+    """End index of the one credential value beginning at ``start``.
+
+    A deterministic single-pass scanner, because quoting has state a regex
+    cannot carry:
+
+    * unquoted - one whitespace-delimited token, so an ordinary sentence is
+      never swallowed;
+    * quoted - everything up to the first **unescaped** matching quote. A
+      backslash escapes the next character, so an escaped quote stays *inside*
+      the secret instead of ending it;
+    * quoted but never closed - the rest of the bounded diagnostic field. Once
+      a credential flag opens a quote, everything after it is secret; falling
+      back to one token would publish the tail.
+
+    Escapes are honoured in single quotes too. A POSIX shell would not, but
+    this reads diagnostics from any source, and treating ``\\'`` as an escape
+    only ever consumes *more*, which is the safe direction.
+    """
+    length = len(text)
+    if start >= length:
+        return start
+    quote = text[start]
+    if quote not in "\"'":
+        index = start
+        while index < length and not text[index].isspace():
+            index += 1
+        return index
+    index = start + 1
+    while index < length:
+        char = text[index]
+        if char == "\\":
+            # The escaped character belongs to the secret, whatever it is.
+            index += 2
+            continue
+        if char == quote:
+            return index + 1
+        index += 1
+    return length
+
+
+def _redact_cli_credentials(text: str, replacement: str) -> tuple[str, int]:
+    """Replace every command-line credential value, keeping its flag.
+
+    Scans left to right and resumes *after* each consumed value, so a flag
+    mentioned inside a quoted secret is never treated as a fresh assignment.
+    """
+    parts: list[str] = []
+    count = 0
+    index = 0
+    while True:
+        match = _CLI_CREDENTIAL_PATTERN.search(text, index)
+        if match is None:
+            break
+        end = _credential_value_end(text, match.end())
+        parts.append(text[index : match.start()])
+        parts.append(f"{match.group(1)}{match.group(2)}{replacement}")
+        count += 1
+        index = end
+    parts.append(text[index:])
+    return "".join(parts), count
+
 _CREDENTIAL_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
@@ -1408,8 +1724,10 @@ _CREDENTIAL_REDACTION_PATTERN = re.compile(
 
 
 def credential_bearing(text: str) -> bool:
-    """Whether text carries a labelled credential assignment or a raw shape."""
+    """Whether text carries a labelled, command-line or raw-shape credential."""
     if _CREDENTIAL_ASSIGNMENT_PATTERN.search(text):
+        return True
+    if _CLI_CREDENTIAL_PATTERN.search(text):
         return True
     return any(pattern.search(text) for pattern in _CREDENTIAL_VALUE_PATTERNS)
 
@@ -1425,10 +1743,301 @@ def redact_credentials(text: str, replacement: str = "[REDACTED]") -> tuple[str,
     for pattern in _CREDENTIAL_VALUE_PATTERNS:
         text, replaced = pattern.subn(replacement, text)
         count += replaced
+    # Command-line syntax runs before the label rule so ``--token VALUE`` (no
+    # ``:``/``=`` delimiter) is caught, and so the flag itself survives.
+    text, replaced = _redact_cli_credentials(text, replacement)
+    count += replaced
     text, replaced = _CREDENTIAL_REDACTION_PATTERN.subn(
         lambda match: f"{match.group(1)}{match.group(2)}{replacement}", text
     )
     return text, count + replaced
+
+
+# --------------------------------------------------------------------------
+# H4 - persisted diagnostic hygiene
+# --------------------------------------------------------------------------
+#
+# Presentation redaction is not enough: sensitive or unbounded diagnostic text
+# must never become authoritative persisted state in the first place. Every
+# free-form string that can reach task JSON, a result snapshot, a checkpoint or
+# an audit event passes through ``sanitize_diagnostic_text`` first. The policy
+# is provider-independent, deterministic and byte-stable across restarts.
+
+#: The single explicit bound for any persisted free-form diagnostic string.
+#: Matches the existing progress-text ceiling so one number governs every
+#: bounded human-readable field the product persists.
+DIAGNOSTIC_MESSAGE_MAX_CHARS = 240
+#: Tighter bound for the scalar values carried in structured error details.
+DIAGNOSTIC_DETAIL_MAX_CHARS = 120
+#: Hard ceilings on structured error details, so a diagnostic can never grow
+#: into an arbitrary nested blob.
+DIAGNOSTIC_MAX_DETAILS = 8
+DIAGNOSTIC_DETAIL_KEY_MAX_CHARS = 48
+
+#: How much text the redaction passes examine, as a multiple of the final
+#: bound. Anything beyond is discarded before it could be persisted.
+DIAGNOSTIC_WORKING_WINDOW_FACTOR = 8
+
+#: Widest integer a diagnostic detail may carry. Signed 64-bit keeps every
+#: persisted value inside SQLite's INTEGER range and well inside Python's JSON
+#: integer-digit limit, so an arbitrary huge int can never reach persistence.
+DIAGNOSTIC_INT_MIN = -(2**63)
+DIAGNOSTIC_INT_MAX = 2**63 - 1
+
+#: Detail keys that are unsafe to persist whatever their value: a traceback, a
+#: command line, an environment dump, a raw prompt/payload or a captured
+#: stream is a blob by construction, and no value-level scrub makes it a tag.
+#: Matched case-insensitively, including suffixed forms such as
+#: ``connector_traceback``.
+FORBIDDEN_DETAIL_KEYS = frozenset(
+    {
+        "argv",
+        "body",
+        "cmd",
+        "command",
+        "commandline",
+        "cookies",
+        "env",
+        "environ",
+        "environment",
+        "headers",
+        "payload",
+        "prompt",
+        "request",
+        "response",
+        "stack",
+        "stacktrace",
+        "stderr",
+        "stdout",
+        "traceback",
+    }
+)
+
+#: Replacement for a redacted local filesystem location.
+REDACTED_PATH = "[PATH]"
+#: Replacement for a diagnostic value that is not usable text at all.
+UNAVAILABLE_DIAGNOSTIC = "[UNAVAILABLE]"
+
+#: Filesystem shapes that carry machine-local detail (user names, temp
+#: directories, interpreter locations, repository roots). URLs are deliberately
+#: NOT matched: an outbound endpoint is an attested, typed value elsewhere, and
+#: destroying it would hide the very thing a diagnostic is for.
+#:
+#: This is a deterministic single-pass scanner rather than a regex, because a
+#: regex needs bounded repetition to stay safe and those bounds silently became
+#: the *visible* end of a path: a per-segment word ceiling left the tenth word
+#: of a directory name next to the marker, and a segment-count ceiling left the
+#: tail of a deep path (``[PATH]seg17/seg18/TAIL``). A safety bound must bound
+#: the work, never define where a recognized path stops. The scanner has no
+#: such ceiling: once a root is recognized, it consumes to a character a path
+#: cannot cross, or to the end of the bounded diagnostic field.
+#:
+#: Characters no local path can contain, so reaching one PROVES the path ended.
+#: A plain space is deliberately absent: real directories contain spaces
+#: ("Program Files", "My Documents"), so a space is ambiguous and the scanner
+#: keeps consuming - over-redacting the rest of the field rather than exposing
+#: a suffix. Other whitespace ends it, since the field itself has ended.
+_PATH_STOP_CHARS = frozenset("\"'<>|")
+
+
+def _ascii_alnum(char: str) -> bool:
+    """Exactly ``[A-Za-z0-9]``; the empty string (start of text) is not."""
+    return char.isascii() and char.isalnum()
+
+
+def _path_root(text: str, index: int) -> int:
+    """Length of the absolute-path root starting at ``index``, else ``0``.
+
+    Recognizes UNC (``\\\\server``), Windows drive (``C:\\``, ``C:/``) and
+    POSIX (``/``) roots. The preceding character matters: a separator glued to
+    a word or to a URL scheme is not a root, which is what keeps
+    ``read/write``, ``and/or`` and ``https://host/path`` intact.
+    """
+    char = text[index]
+    previous = text[index - 1] if index else ""
+    if char == "\\":
+        return 2 if text.startswith("\\\\", index) else 0
+    if char == "/":
+        return 0 if (_ascii_alnum(previous) or previous in (":", "/")) else 1
+    if (
+        char.isascii()
+        and char.isalpha()
+        and text[index + 1 : index + 2] == ":"
+        and text[index + 2 : index + 3] in ("\\", "/")
+        and not _ascii_alnum(previous)
+    ):
+        return 3
+    return 0
+
+
+def _path_end(text: str, index: int) -> int:
+    """First index at or after ``index`` that a local path cannot cross."""
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in _PATH_STOP_CHARS or (char.isspace() and char != " "):
+            break
+        index += 1
+    return index
+
+
+def redact_local_paths(text: str) -> str:
+    """Replace absolute filesystem locations with a bounded safe marker.
+
+    Applies to *accidental diagnostic leakage* only. A typed resource contract
+    - ``ActionScope.target``, an attestation's working directory or allowed
+    roots - is authoritative state under H1 and never routed through here.
+
+    No basename or terminal segment is ever preserved: free diagnostic text
+    cannot prove that ``/home/john.doe`` names a file rather than a user, so
+    every recognized absolute path collapses to the fixed marker.
+
+    Linear in the length of the text. Each character is examined a constant
+    number of times: a recognized path advances the cursor past its whole
+    extent, and a rejected single-separator candidate advances past the extent
+    too - which is sound precisely because that extent was rejected for
+    containing no further separator, so no root can begin inside it either.
+    """
+    parts: list[str] = []
+    index = 0
+    emitted = 0
+    length = len(text)
+    while index < length:
+        root = _path_root(text, index)
+        if root:
+            body = index + root
+            start = index
+            # A path written as an argument keeps its quotes; consuming through
+            # the matching quote leaves no dangling fragment behind.
+            quote = (
+                text[index - 1]
+                if index > emitted and text[index - 1] in "\"'"
+                else ""
+            )
+            if quote:
+                closing = text.find(quote, body)
+                end = length if closing < 0 else closing + 1
+                start = index - 1
+            else:
+                end = _path_end(text, body)
+            # A lone separator is not an absolute path in free prose, so a
+            # POSIX root must show a second one ("/tmp" is a word, "/tmp/x"
+            # is a location). A drive or UNC root is already unambiguous.
+            if root != 1 or any(char in "\\/" for char in text[body:end]):
+                parts.append(text[emitted:start])
+                parts.append(REDACTED_PATH)
+                index = emitted = end
+                continue
+            index = end
+            continue
+        index += 1
+    parts.append(text[emitted:])
+    return "".join(parts)
+
+
+def sanitize_diagnostic_text(
+    value: Any, cap: int = DIAGNOSTIC_MESSAGE_MAX_CHARS
+) -> str:
+    """The one canonical pipeline for persisted free-form diagnostic text.
+
+    Deterministic and ordered on purpose:
+
+    1. only an actual ``str`` survives; arbitrary objects are never stringified
+       into persisted state, they become ``UNAVAILABLE_DIAGNOSTIC``;
+    2. NFKC, then CRLF/CR to LF, then whitespace-run collapse, so a pathological
+       or multi-line message cannot smuggle structure into a stored field;
+    3. credential redaction (the same canonical policy every egress boundary
+       uses), before truncation, so a secret beyond the cap is still removed;
+    4. local filesystem redaction;
+    5. a hard character bound with a final U+2026 on overflow.
+
+    Running it twice is a no-op, so a value that survived an earlier load is
+    byte-identical after a resave.
+    """
+    if not isinstance(value, str):
+        return UNAVAILABLE_DIAGNOSTIC
+    bound = max(1, int(cap))
+    text = unicodedata.normalize("NFKC", value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    # Work on a bounded window: everything past it is discarded rather than
+    # persisted anyway, and a fixed window keeps the redaction passes linear
+    # on adversarially large input.
+    text = text[: bound * DIAGNOSTIC_WORKING_WINDOW_FACTOR]
+    text, _ = redact_credentials(text)
+    text = redact_local_paths(text)
+    if len(text) > bound:
+        text = text[: bound - 1] + "…"
+    return text
+
+
+def _detail_key_parts(key: str) -> set[str]:
+    """The identifier words in a detail key, for forbidden-key matching."""
+    lowered = key.casefold()
+    return {lowered, *re.split(r"[^a-z0-9]+", lowered)}
+
+
+#: Sentinel meaning "this detail value cannot be persisted safely".
+_DROP_DETAIL = object()
+
+
+def _safe_detail_value(value: Any) -> Any:
+    """One allowlisted, persistence-safe scalar, or ``_DROP_DETAIL``.
+
+    Deliberately narrow: a diagnostic detail is a tag, never a blob. Nested
+    collections and objects are dropped rather than stringified, an integer
+    outside the signed 64-bit range is dropped rather than persisted (an
+    arbitrary huge Python int would otherwise hit the JSON integer-digit limit
+    or overflow the SQLite column), and a non-finite float is dropped rather
+    than turned into a fabricated value.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if DIAGNOSTIC_INT_MIN <= value <= DIAGNOSTIC_INT_MAX else _DROP_DETAIL
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _DROP_DETAIL
+    if isinstance(value, str):
+        return sanitize_diagnostic_text(value, DIAGNOSTIC_DETAIL_MAX_CHARS)
+    return _DROP_DETAIL
+
+
+def sanitize_diagnostic_details(details: Any) -> dict[str, Any]:
+    """Bounded, allowlisted scalar metadata for a structured error.
+
+    Total by construction: no input raises. Only a flat mapping of *actual
+    string* keys to allowlisted, persistence-safe scalars survives. A non-string
+    key is dropped fail-closed rather than coerced - the mapping is iterated by
+    item, so nothing ever assumes a key is a string or looks one up again.
+    Nested dicts and sequences, tracebacks, environment values, raw payloads and
+    connector objects are dropped rather than stringified. Keys are sorted and
+    the count is capped, so the persisted form is deterministic and bounded.
+    """
+    if not isinstance(details, dict) or not details:
+        return {}
+    try:
+        items = sorted(
+            (key, value) for key, value in details.items() if isinstance(key, str)
+        )
+    except TypeError:  # pragma: no cover - unorderable values keep insertion order
+        items = [(key, value) for key, value in details.items() if isinstance(key, str)]
+    safe: dict[str, Any] = {}
+    for raw_key, raw_value in items:
+        if len(safe) >= DIAGNOSTIC_MAX_DETAILS:
+            break
+        key = sanitize_diagnostic_text(raw_key, DIAGNOSTIC_DETAIL_KEY_MAX_CHARS)
+        if not key or key == UNAVAILABLE_DIAGNOSTIC:
+            continue
+        if any(part in FORBIDDEN_DETAIL_KEYS for part in _detail_key_parts(key)):
+            # Structurally unsafe regardless of value; never persisted.
+            continue
+        value = _safe_detail_value(raw_value)
+        if value is _DROP_DETAIL:
+            continue
+        safe[key] = value
+    return safe
 
 
 def normalize_session_next_step(value: Any) -> str:
@@ -1651,7 +2260,7 @@ class Task:
             "plan": self.plan,
             "visible_assumption": self.visible_assumption,
             "selected_connector": self.selected_connector,
-            "result_snapshot": self.result_snapshot,
+            "result_snapshot": sanitize_result_snapshot(self.result_snapshot),
             "retrieved_context": self.retrieved_context.to_dict(),
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
@@ -1693,7 +2302,9 @@ class Task:
             plan=list(data.get("plan", [])),
             visible_assumption=data.get("visible_assumption"),
             selected_connector=data.get("selected_connector"),
-            result_snapshot=data.get("result_snapshot"),
+            # H4: unsafe legacy diagnostic text is scrubbed on load, so it can
+            # never be written back on the next checkpoint.
+            result_snapshot=sanitize_result_snapshot(data.get("result_snapshot")),
             # Legacy task JSON without the field loads as an empty snapshot.
             retrieved_context=RetrievedContext.from_dict(
                 data.get("retrieved_context")

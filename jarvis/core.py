@@ -8,11 +8,20 @@ from typing import Any
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     COST_CAP_GATE,
+    DIAGNOSTIC_DETAIL_MAX_CHARS,
+    MAX_SQLITE_INTEGER,
     PAID_API_GATE,
+    RETRIEVAL_MAX_CHARACTERS,
+    RETRIEVAL_MAX_ITEMS,
+    RETRIEVAL_NEXT_STEP_CAP,
+    RETRIEVAL_RATIONALE_CAP,
+    RETRIEVAL_SUMMARY_CAP,
+    VERIFICATION_MAX_EVIDENCE,
     ActionScope,
     AgentRun,
     AttemptState,
     AttestationError,
+    Availability,
     BillingClaim,
     BillingClass,
     BillingIntegrityError,
@@ -20,6 +29,7 @@ from jarvis.contracts import (
     CostEstimate,
     DataClassification,
     DecisionRecord,
+    EgressAttestation,
     ErrorCode,
     ExecutionAttempt,
     ExecutionClaimOutcome,
@@ -28,28 +38,38 @@ from jarvis.contracts import (
     MemoryRetrievalQuery,
     MemoryStore,
     MonetaryState,
+    OutboundDataPreview,
     OutcomeStatus,
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
     ProgressIssueKind,
     ResultVerifier,
+    RetrievedContext,
+    RetrievedMemoryItem,
+    RetrievedMemoryKind,
     RiskLevel,
     RunStatus,
     SessionState,
     SideEffect,
+    SideEffectProfile,
     StructuredError,
     Task,
     TaskStatus,
     ToolResult,
     UsageRecord,
     VerificationRecord,
+    VerificationStatus,
     canonical_usd,
+    diagnostic_from_exception,
     format_usd,
     is_expired,
+    merge_side_effects,
     nano_usd,
+    normalize_destination,
     require_billing_class,
     require_monetary_state,
+    sanitize_diagnostic_text,
     usd_from_nano,
     validate_cost_estimate,
     validated_measured_cost,
@@ -89,6 +109,163 @@ BILLING_REPREFLIGHT_LIMIT = 3
 
 #: Bound on the non-secret reason tag carried by a billing-integrity failure.
 BILLING_REASON_MAX_CHARS = 120
+
+
+# --------------------------------------------------------------------------
+# H4 - exact nested return validation
+# --------------------------------------------------------------------------
+#
+# A stage boundary that only checks the outer object type is not a boundary:
+# an exact ``RetrievedMemoryItem`` carrying ``kind="decision"`` instead of the
+# ``RetrievedMemoryKind`` member, or an exact ``OutboundDataPreview`` carrying
+# ``data_classification="internal"``, passes an outer check and then raises
+# ``AttributeError`` on ``.value`` later - during checkpoint serialization,
+# fingerprint construction or approval display, all *outside* the protected
+# boundary. These helpers validate the authority-bearing nested fields against
+# the exact types the contract declares, and raise so the caller's stage
+# boundary turns it into deterministic terminal state.
+#
+# Nothing here coerces. ``str()``, ``int()``, ``bool()`` and ``Enum(value)``
+# would turn tampered data into plausible active state, which is the failure
+# these checks exist to prevent: a malformed value is refused, never repaired.
+
+
+def _exact_type(value: Any, expected: type, name: str) -> Any:
+    """Exactly ``expected``; a subclass or an equal-comparing value is not it.
+
+    ``type() is`` rather than ``isinstance``: every classification and kind
+    enum here derives from ``str``, so a raw ``"internal"`` compares equal to
+    ``DataClassification.INTERNAL`` and satisfies ``isinstance(x, str)`` while
+    having no ``.value`` at all.
+    """
+    if type(value) is not expected:
+        raise TypeError(f"{name} is not an exact {expected.__name__}")
+    return value
+
+
+def _exact_text(value: Any, name: str, *, cap: int | None = None) -> str:
+    """An actual string, within an existing hard ceiling when one applies."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} is not a string")
+    if cap is not None and len(value) > cap:
+        raise TypeError(f"{name} exceeds its ceiling")
+    return value
+
+
+def _exact_text_tuple(value: Any, name: str) -> tuple[str, ...]:
+    """An exact tuple of actual strings; a list or a str is not a tuple."""
+    _exact_type(value, tuple, name)
+    for item in value:
+        _exact_text(item, f"{name} entry")
+    return value
+
+
+def _exact_count(value: Any, name: str, *, cap: int = MAX_SQLITE_INTEGER) -> int:
+    """A real non-negative integer inside the persistable range.
+
+    ``True`` is not a count and neither is ``"7"``; the same signed-64-bit
+    ceiling every persisted integer already obeys applies here, so an
+    oversized value can never reach task JSON.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} is not an integer")
+    if not 0 <= value <= cap:
+        raise TypeError(f"{name} is outside the persistable range")
+    return value
+
+
+def _exact_flag(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} is not a boolean")
+    return value
+
+
+def _validated_scope(scope: Any, name: str) -> ActionScope:
+    """Exactly an ``ActionScope`` whose every typed field is exact."""
+    _exact_type(scope, ActionScope, name)
+    for field_name in ("action", "target", "connector", "destination"):
+        _exact_text(getattr(scope, field_name), f"{name} {field_name}")
+    _exact_type(
+        scope.data_classification, DataClassification, f"{name} classification"
+    )
+    return scope
+
+
+def _validated_side_effect(profile: Any, name: str) -> SideEffectProfile:
+    """Exactly a ``SideEffectProfile`` with an exact effect and real booleans."""
+    _exact_type(profile, SideEffectProfile, name)
+    _exact_type(profile.effect, SideEffect, f"{name} effect")
+    _exact_flag(profile.reversible, f"{name} reversible")
+    _exact_flag(profile.always_requires_approval, f"{name} approval flag")
+    return profile
+
+
+def _validated_attestation(attestation: Any) -> EgressAttestation:
+    """Exactly the attestation contract, every bound field included.
+
+    This is the object whose digest authorizes an external effect, so each
+    field that feeds that digest - scope, risk, effect, outbound/gate digests,
+    the resource boundary and the tool-grant manifest - must be exactly what
+    the contract declares before any fingerprint is computed.
+    """
+    _exact_type(attestation, EgressAttestation, "attestation")
+    _validated_scope(attestation.scope, "attestation scope")
+    _exact_type(attestation.risk_level, RiskLevel, "attestation risk level")
+    _validated_side_effect(attestation.side_effect, "attestation side effect")
+    for field_name in (
+        "outbound_digest",
+        "billing_gate",
+        "cost_gate",
+        "working_directory",
+    ):
+        _exact_text(getattr(attestation, field_name), f"attestation {field_name}")
+    _exact_text_tuple(attestation.allowed_roots, "attestation allowed roots")
+    _exact_text_tuple(attestation.tool_grants, "attestation tool grants")
+    return attestation
+
+
+def _validated_outbound_preview(preview: Any) -> OutboundDataPreview:
+    """Exactly the preview contract; this is what the user reads to approve."""
+    _exact_type(preview, OutboundDataPreview, "outbound preview")
+    _exact_text(preview.destination, "outbound preview destination")
+    _exact_type(
+        preview.data_classification,
+        DataClassification,
+        "outbound preview classification",
+    )
+    _exact_text_tuple(preview.field_names, "outbound preview field names")
+    _exact_count(preview.approximate_bytes, "outbound preview byte count")
+    _exact_count(preview.redacted_items, "outbound preview redacted count")
+    _exact_text(preview.summary, "outbound preview summary")
+    return preview
+
+
+def _validated_retrieved_item(item: Any) -> RetrievedMemoryItem:
+    """Exactly one retrieval item, every field validated by its own type.
+
+    The per-field character ceilings are the same hard retrieval contract
+    ``build_retrieved_context`` enforces, so an oversized item is refused
+    rather than persisted into the task snapshot.
+    """
+    _exact_type(item, RetrievedMemoryItem, "retrieved item")
+    _exact_type(item.kind, RetrievedMemoryKind, "retrieved item kind")
+    _exact_type(
+        item.classification, DataClassification, "retrieved item classification"
+    )
+    _exact_text(item.record_id, "retrieved item record id")
+    _exact_text(item.source_task_id, "retrieved item source task id")
+    _exact_text(item.created_at, "retrieved item created_at")
+    _exact_text(item.summary, "retrieved item summary", cap=RETRIEVAL_SUMMARY_CAP)
+    _exact_text(
+        item.rationale, "retrieved item rationale", cap=RETRIEVAL_RATIONALE_CAP
+    )
+    if item.next_step is not None:
+        _exact_text(
+            item.next_step, "retrieved item next step", cap=RETRIEVAL_NEXT_STEP_CAP
+        )
+    _exact_count(item.relevance_score, "retrieved item relevance score")
+    _exact_flag(item.truncated, "retrieved item truncated flag")
+    return item
 
 
 class _LifecycleLost(Exception):
@@ -386,7 +563,24 @@ class AgentCore:
                     ),
                     exclude_task_id=task.id,
                 )
-                retrieved = self.memory.retrieve_context(query)
+                try:
+                    # H4-C: the call AND the validation of what it returned are
+                    # one boundary, so a malformed return value is a boundary
+                    # failure rather than a TypeError escaping into the loop.
+                    retrieved = self._validated_retrieved_context(
+                        self.memory.retrieve_context(query)
+                    )
+                except Exception as exc:  # noqa: BLE001 - stage boundary
+                    # Retrieval is bounded, informational context. A storage or
+                    # decoding fault here must not leave the task in an
+                    # undefined state or leak raw diagnostics.
+                    return self._stage_failure(
+                        session,
+                        task,
+                        LoopStage.CONTEXT_RETRIEVAL,
+                        ErrorCode.INVALID_TASK,
+                        exc,
+                    )
                 task.retrieved_context = retrieved
                 # Compatibility count: selected outbound-eligible items only.
                 task.context["retrieved_decision_count"] = len(retrieved.items)
@@ -417,7 +611,14 @@ class AgentCore:
                         session,
                         task,
                         "clarification_required",
-                        {"question": task.preferences.get("clarification_question", "Clarification required")},
+                        {
+                            "question": sanitize_diagnostic_text(
+                                task.preferences.get(
+                                    "clarification_question",
+                                    "Clarification required",
+                                )
+                            )
+                        },
                     )
                     return AgentRun(RunStatus.AWAITING_CLARIFICATION, session, task)
                 task.visible_assumption = (
@@ -433,7 +634,7 @@ class AgentCore:
                     session,
                     task,
                     "assumption_visible",
-                    {"assumption": task.visible_assumption},
+                    {"assumption": sanitize_diagnostic_text(task.visible_assumption)},
                 )
                 continue
 
@@ -442,10 +643,15 @@ class AgentCore:
                 # or tampered plan is never preserved while the task is still
                 # at PLAN. A task resumed past this stage keeps its persisted
                 # plan because PLAN is not re-entered.
-                task.plan = build_task_plan(task)
+                try:
+                    task.plan = build_task_plan(task)
+                except Exception as exc:  # noqa: BLE001 - stage boundary
+                    return self._stage_failure(
+                        session, task, LoopStage.PLAN, ErrorCode.INVALID_TASK, exc
+                    )
                 try:
                     selection = self.registry.select(task)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - stage boundary
                     return self._selection_failure(session, task, exc)
                 task.selected_connector = selection.connector.manifest.name
                 mark_stage_completed(task, LoopStage.PLAN)
@@ -589,7 +795,21 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.TOOL_SELECTION:
-                availability = connector.availability()
+                try:
+                    availability = self._validated_availability(
+                        connector.availability()
+                    )
+                except Exception as exc:  # noqa: BLE001 - stage boundary
+                    # A probe that raises - or returns something that is not an
+                    # Availability - is an unavailable tool, never an excuse to
+                    # continue toward the connector boundary.
+                    return self._stage_failure(
+                        session,
+                        task,
+                        LoopStage.TOOL_SELECTION,
+                        ErrorCode.CONNECTOR_UNAVAILABLE,
+                        exc,
+                    )
                 if not availability.available:
                     return self._terminal_failure(
                         session,
@@ -762,14 +982,20 @@ class AgentCore:
                             task,
                             self.memory.latest_execution_attempt(task.id),
                         )
+                    # H4-E: the exception object never reaches storage. Its
+                    # message is normalized into the safe diagnostic contract
+                    # once and reused, so the summary and the error carry the
+                    # same bounded, credential- and path-scrubbed text.
+                    failure = diagnostic_from_exception(
+                        ErrorCode.CONNECTOR_FAILED,
+                        exc,
+                        retryable=True,
+                        stage=LoopStage.EXECUTE,
+                    )
                     result = ToolResult(
                         outcome=OutcomeStatus.ERROR,
-                        summary=f"Connector failed: {exc}",
-                        error=StructuredError(
-                            ErrorCode.CONNECTOR_FAILED,
-                            f"Connector failed: {exc}",
-                            retryable=True,
-                        ),
+                        summary=failure.message,
+                        error=failure,
                         usage=UsageRecord(
                             connector=connector.manifest.name,
                             billing_class=task.estimate.billing_class,
@@ -789,6 +1015,11 @@ class AgentCore:
                             billing_evidence=task.estimate.billing_evidence,
                         ),
                     )
+                # H4: connector-authored free-form text is bounded and
+                # scrubbed before it can become persisted task, decision or
+                # audit state. It never touches approval, billing, execution or
+                # progress authority.
+                self._sanitize_result(result)
                 # H2-H/H3: usage is reconciled first, so a crash before the
                 # atomic conclusion leaves the attempt IN_FLIGHT
                 # (non-replayable) with the authoritative usage preserved. The
@@ -856,11 +1087,32 @@ class AgentCore:
                             "Execution result is missing at verification checkpoint.",
                         ),
                     )
-                verification = (
-                    self.verifier.verify(task, result, session)
-                    if self.verifier is not None
-                    else connector.verify(task, result, session)
-                )
+                try:
+                    # H4-C: invoking the verifier and validating what it
+                    # returned are ONE narrow boundary. Validation happens
+                    # before any field-specific access, so a malformed return
+                    # value (None, a dict, a raw-string status, malformed
+                    # evidence) fails deterministically here instead of raising
+                    # an AttributeError that would strand the task at VERIFY
+                    # with a FINISHED attempt and invite a re-verify on restart.
+                    verification = self._validated_verification(
+                        self.verifier.verify(task, result, session)
+                        if self.verifier is not None
+                        else connector.verify(task, result, session)
+                    )
+                except Exception as exc:  # noqa: BLE001 - stage boundary
+                    # H2/H3 already own the execution journal and the ledger by
+                    # this point; a verifier fault only fails verification. The
+                    # attempt stays FINISHED, the connector is never re-run and
+                    # the reconciled usage/reservation is untouched.
+                    return self._stage_failure(
+                        session,
+                        task,
+                        LoopStage.VERIFY,
+                        ErrorCode.VERIFICATION_FAILED,
+                        exc,
+                        result=result,
+                    )
                 result.verification = verification
                 task.result_snapshot = self._result_to_dict(result)
                 if not verification.passed:
@@ -904,7 +1156,10 @@ class AgentCore:
                     session,
                     task,
                     "result_presented",
-                    {"summary": result.summary, "next_step": session.next_step},
+                    {
+                        "summary": sanitize_diagnostic_text(result.summary),
+                        "next_step": session.next_step,
+                    },
                 )
                 continue
 
@@ -927,7 +1182,9 @@ class AgentCore:
                     session_id=session.id,
                     task_id=task.id,
                     summary=result.summary,
-                    rationale=(
+                    # Bounded and scrubbed: a decision record is the record
+                    # future work inherits as trusted history.
+                    rationale=sanitize_diagnostic_text(
                         f"Connector={connector.manifest.name}; "
                         f"verification={result.verification.method}; "
                         f"assumption={task.visible_assumption}"
@@ -939,14 +1196,32 @@ class AgentCore:
                 # rewrite, terminal event or session overwrite is persisted and
                 # the authoritative state is reported instead of a phantom
                 # COMPLETED built on this stale task.
-                if not self.memory.finalize_task(
-                    session,
-                    task,
-                    decision,
-                    result.usage,
-                    "task_completed",
-                    {"summary": result.summary, "next_step": session.next_step},
-                ):
+                try:
+                    finalized = self.memory.finalize_task(
+                        session,
+                        task,
+                        decision,
+                        result.usage,
+                        "task_completed",
+                        {
+                            "summary": sanitize_diagnostic_text(result.summary),
+                            "next_step": session.next_step,
+                        },
+                    )
+                except BillingIntegrityError as exc:
+                    # A tampered/legacy snapshot whose restored usage cannot be
+                    # written must not raise out of resume: it becomes the same
+                    # deterministic terminal failure as any other stage fault,
+                    # with no decision and no completion event.
+                    return self._stage_failure(
+                        session,
+                        task,
+                        LoopStage.PERSIST,
+                        ErrorCode.BILLING_INTEGRITY_FAILED,
+                        exc,
+                        result=result,
+                    )
+                if not finalized:
                     return self._authoritative_run(session, task)
                 return AgentRun(RunStatus.COMPLETED, session, task, result=result)
 
@@ -1232,6 +1507,178 @@ class AgentCore:
         task.result_snapshot = self._result_to_dict(result)
         return self._fail_execution(session, task, attempt_id, result, error)
 
+    # -- H4: persisted diagnostic hygiene ----------------------------------
+
+    def _stage_failure(
+        self,
+        session: SessionState,
+        task: Task,
+        stage: LoopStage,
+        code: ErrorCode,
+        exc: BaseException,
+        *,
+        retryable: bool = False,
+        result: ToolResult | None = None,
+    ) -> AgentRun:
+        """Normalize one stage-boundary exception into deterministic state.
+
+        Narrow by construction: each call site wraps exactly one boundary call,
+        so a lifecycle bug elsewhere still surfaces instead of being swallowed.
+        The task reaches a terminal failure with a safe typed diagnostic, and
+        because that state is terminal a restart reports it rather than
+        retrying the same malformed input forever.
+
+        H2 attempt authority is untouched: this helper is never used where an
+        execution claim is in doubt, so ``UNKNOWN_OUTCOME`` keeps its own
+        meaning and is never reinterpreted as an ordinary diagnostic failure.
+        """
+        return self._terminal_failure(
+            session,
+            task,
+            diagnostic_from_exception(code, exc, retryable=retryable, stage=stage),
+            result,
+        )
+
+    @staticmethod
+    def _validated_retrieved_context(value: Any) -> RetrievedContext:
+        """Require exactly the typed retrieval snapshot the contract declares.
+
+        Validated *recursively* and before any field access, so a ``None``, a
+        dict, a raw string, or an exact ``RetrievedMemoryItem`` whose ``kind``
+        or ``classification`` is a raw string becomes a deterministic boundary
+        failure here instead of an ``AttributeError`` raised later by
+        ``to_dict``, when the task has already accepted the snapshot and the
+        checkpoint is being serialized outside this boundary.
+
+        The result/item/count/character ceilings are the same hard retrieval
+        contract ``build_retrieved_context`` enforces: a snapshot claiming more
+        items or more characters than retrieval can ever produce is tampered
+        data, not a wider window.
+        """
+        if type(value) is not RetrievedContext:
+            raise TypeError("retrieval did not return a RetrievedContext")
+        _exact_type(value.items, tuple, "retrieved context items")
+        if len(value.items) > RETRIEVAL_MAX_ITEMS:
+            raise TypeError("retrieved context exceeds the hard result ceiling")
+        for item in value.items:
+            _validated_retrieved_item(item)
+        _exact_count(value.candidate_count, "retrieved context candidate count")
+        _exact_count(
+            value.character_count,
+            "retrieved context character count",
+            cap=RETRIEVAL_MAX_CHARACTERS,
+        )
+        _exact_flag(value.truncated, "retrieved context truncated flag")
+        return value
+
+    @staticmethod
+    def _validated_availability(value: Any) -> Availability:
+        """Require exactly the typed availability the connector contract declares."""
+        if type(value) is not Availability:
+            raise TypeError("availability probe did not return an Availability")
+        if not isinstance(value.available, bool):
+            raise TypeError("availability flag is not a boolean")
+        if not isinstance(value.reason, str):
+            raise TypeError("availability reason is not a string")
+        return value
+
+    @staticmethod
+    def _validated_permission_request(value: Any) -> PermissionRequest:
+        """Require exactly the typed permission request, recursively.
+
+        Every enum, scope, preview and attestation field is checked before use,
+        so a malformed request can never reach fingerprinting, be persisted as
+        a pending approval row, be displayed for approval, or authorize
+        execution. An outer type check alone is not enough: an exact
+        ``OutboundDataPreview`` carrying ``data_classification="internal"``
+        passes it and then raises ``AttributeError`` on ``.value`` during
+        fingerprint or display serialization - outside this boundary, after a
+        pending approval would already exist.
+        """
+        if type(value) is not PermissionRequest:
+            raise TypeError("connector did not return a PermissionRequest")
+        _exact_text(value.task_id, "permission request task id")
+        _exact_text(value.session_id, "permission request session id")
+        _validated_scope(value.scope, "permission request scope")
+        _exact_type(value.risk_level, RiskLevel, "permission request risk level")
+        _validated_side_effect(value.side_effect, "permission request side effect")
+        _exact_text(value.reason, "permission request reason")
+        if not isinstance(value.id, str) or not value.id:
+            raise TypeError("permission request has no issuance identity")
+        if not isinstance(value.expires_at, str) or not value.expires_at:
+            raise TypeError("permission request has no expiry")
+        if value.attestation is not None:
+            _validated_attestation(value.attestation)
+        if value.outbound_preview is not None:
+            _validated_outbound_preview(value.outbound_preview)
+        return value
+
+    @staticmethod
+    def _validated_verification(record: Any) -> VerificationRecord:
+        """Validate a verifier return value, then bound and scrub it.
+
+        Every structural check happens before any field-specific access, so a
+        malformed value can never reach an attribute lookup: the object must be
+        exactly a ``VerificationRecord``, its status exactly a
+        ``VerificationStatus`` member (a raw string or a foreign enum is not
+        equivalent), its method a string, and its evidence a sequence of
+        strings. Anything else raises, and the caller's stage boundary turns
+        that into a deterministic terminal verification failure.
+        """
+        if type(record) is not VerificationRecord:
+            raise TypeError("verifier did not return a VerificationRecord")
+        if type(record.status) is not VerificationStatus:
+            raise TypeError("verification status is not a VerificationStatus")
+        if not isinstance(record.method, str):
+            raise TypeError("verification method is not a string")
+        evidence = record.evidence
+        if not isinstance(evidence, (tuple, list)):
+            raise TypeError("verification evidence is not a sequence")
+        if not all(isinstance(item, str) for item in evidence):
+            raise TypeError("verification evidence is not a sequence of strings")
+        return VerificationRecord(
+            status=record.status,
+            method=sanitize_diagnostic_text(record.method, DIAGNOSTIC_DETAIL_MAX_CHARS),
+            evidence=tuple(
+                sanitize_diagnostic_text(item, DIAGNOSTIC_DETAIL_MAX_CHARS)
+                for item in evidence[:VERIFICATION_MAX_EVIDENCE]
+            ),
+        )
+
+    @classmethod
+    def _coerced_verification(cls, record: Any) -> VerificationRecord:
+        """Total variant used where raising would strand lifecycle state.
+
+        A connector may attach a verification record to its own ``ToolResult``;
+        that is not the authoritative verification, which happens at VERIFY. A
+        malformed one is discarded rather than raised, because this runs after
+        the connector boundary was crossed and before H3 reconciliation, where
+        an exception would leave the execution in doubt.
+        """
+        try:
+            return cls._validated_verification(record)
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return VerificationRecord()
+
+    @classmethod
+    def _sanitize_result(cls, result: ToolResult) -> None:
+        """Bound and scrub connector-authored free-form result text in place.
+
+        The summary becomes persisted task state, a decision record and audit
+        events; ``data`` is reduced to the single key the loop consumes, so an
+        arbitrary connector blob never becomes trusted history.
+        """
+        result.summary = sanitize_diagnostic_text(result.summary)
+        raw = result.data if isinstance(result.data, dict) else {}
+        result.data = {
+            key: sanitize_diagnostic_text(raw[key])
+            for key in ("next_step",)
+            # Only an actual string survives; arbitrary connector data is never
+            # stringified into persisted or session state.
+            if isinstance(raw.get(key), str)
+        }
+        result.verification = cls._coerced_verification(result.verification)
+
     def _billing_preflight_is_current(self, task: Task) -> bool:
         """Whether this exact estimate is the one that cleared cost preflight."""
         recorded = task.preferences.get(BILLING_PREFLIGHT_KEY)
@@ -1307,17 +1754,136 @@ class AgentCore:
         fails the task closed before any approval request can exist.
         """
         try:
-            return connector.permission_request(
+            return self._authoritative_request(
                 task,
-                session.id,
-                self.settings.approval_ttl_minutes,
-                scope_override=scope_override,
-                reason=reason,
+                session,
+                connector,
+                self._validated_permission_request(
+                    connector.permission_request(
+                        task,
+                        session.id,
+                        self.settings.approval_ttl_minutes,
+                        scope_override=scope_override,
+                        reason=reason,
+                    )
+                ),
+                scope_override,
             )
         except AttestationError as exc:
             return self._terminal_failure(
-                session, task, StructuredError(exc.code, str(exc))
+                session, task, diagnostic_from_exception(exc.code, exc)
             )
+        except Exception as exc:  # noqa: BLE001 - stage boundary
+            # A connector that cannot build its attestation at all is refused
+            # exactly like one that declines to attest.
+            return self._stage_failure(
+                session,
+                task,
+                LoopStage.RISK_PERMISSION,
+                ErrorCode.EGRESS_REFUSED,
+                exc,
+            )
+
+    def _authoritative_request(
+        self,
+        task: Task,
+        session: SessionState,
+        connector: BaseConnector,
+        request: PermissionRequest,
+        scope_override: ActionScope | None,
+    ) -> PermissionRequest:
+        """Require the request to *be* the current authoritative security state.
+
+        Exact field types are not a security property. A connector whose
+        manifest declares HIGH / EXTERNAL_EGRESS can return a perfectly typed
+        request whose top-level ``risk_level`` is LOW and whose
+        ``side_effect`` is a reversible NONE - every field valid, every
+        relationship false - and ``_requires_approval`` would then read those
+        weakened values, auto-approve under SMART_AUTO and execute an
+        unapproved external egress. So the floor is *recomputed here* from the
+        connector manifest and the task, and the returned request is never
+        allowed to establish it.
+
+        Strengthening stays legal (that is what ``merge_side_effects`` and the
+        risk ``max`` already mean); weakening or contradicting is refused, and
+        a malformed request is never silently repaired into a strong one. The
+        refusal is an ``AttestationError``, so it becomes the same
+        deterministic ``EGRESS_REFUSED`` terminal failure as a connector that
+        declines to attest - before any pending approval, ``approval_requested``
+        event, grant or execution attempt can exist.
+        """
+        manifest = connector.manifest
+        # The authoritative floor. Deliberately built from the manifest and the
+        # task, not from ``connector.side_effects()``/``permission_request()``:
+        # a connector must not be able to lower its own floor by overriding the
+        # method that reports it. A conflicting pair raises out of
+        # ``merge_side_effects`` and fails closed exactly like any other
+        # unattestable egress.
+        floor = merge_side_effects(manifest.default_side_effect, task.side_effect)
+        floor_risk = max(task.risk_level, manifest.default_risk)
+        base_scope = scope_override or task.scope
+        expected_scope = ActionScope(
+            action=base_scope.action,
+            target=base_scope.target,
+            connector=manifest.name,
+            destination=base_scope.destination,
+            data_classification=base_scope.data_classification,
+        ).normalized()
+
+        def refuse(detail: str) -> None:
+            raise AttestationError(
+                ErrorCode.EGRESS_REFUSED,
+                f"Permission request does not match the authoritative "
+                f"security state: {detail}.",
+            )
+
+        # -- binding: this request is for this task in this session ----------
+        if request.task_id != task.id or request.session_id != session.id:
+            refuse("task/session binding")
+        # -- scope: exactly the one the current state authorizes -------------
+        # Covers connector, destination and data classification in one
+        # comparison; a narrowed scope is not provably safe from free fields,
+        # so equality is the fail-closed rule.
+        if request.scope != expected_scope:
+            refuse("scope")
+        # -- floor: may be strengthened, never weakened ----------------------
+        if request.risk_level < floor_risk:
+            refuse("risk level below the connector/task floor")
+        try:
+            # Merging the floor into the request changes nothing exactly when
+            # the request is already at or above it, so the canonical
+            # non-weakenable policy is also the comparison. A pair that cannot
+            # merge at all conflicts, which is a refusal too.
+            strengthened = merge_side_effects(floor, request.side_effect)
+        except AttestationError:
+            strengthened = None
+        if strengthened != request.side_effect:
+            refuse("side effect below the connector/task floor")
+        # -- attestation: attests exactly this request -----------------------
+        attestation = request.attestation
+        if attestation is None:
+            refuse("missing egress attestation")
+        if attestation.scope != request.scope:
+            refuse("attestation scope")
+        if attestation.risk_level != request.risk_level:
+            refuse("attestation risk level")
+        if attestation.side_effect != request.side_effect:
+            refuse("attestation side effect")
+        if (
+            floor.effect is SideEffect.EXTERNAL_EGRESS
+            and not attestation.outbound_digest
+        ):
+            # An external egress with nothing attested is not attestable; an
+            # empty digest must never stand in for the bytes that leave.
+            refuse("external egress without an outbound digest")
+        # -- preview: describes the same egress the request authorizes -------
+        preview = request.outbound_preview
+        if preview is not None:
+            if normalize_destination(preview.destination) != request.scope.destination:
+                refuse("preview destination")
+            if preview.data_classification is not task.scope.data_classification:
+                refuse("preview data classification")
+        return request
 
     def _exact_pending_request(
         self, session: SessionState, task: Task, current: PermissionRequest
@@ -1590,7 +2156,19 @@ class AgentCore:
         inverted minimum/maximum or a non-positive resource ceiling fails the
         task before any approval, preflight or external call can happen.
         """
-        estimate = connector.estimate_cost(task)
+        try:
+            estimate = connector.estimate_cost(task)
+        except Exception as exc:  # noqa: BLE001 - stage boundary
+            # The route could not be established at all; fail closed exactly
+            # like an UNKNOWN classification, before any approval or call.
+            task.estimate = CostEstimate(billing_evidence="estimate_probe_failed")
+            return self._stage_failure(
+                session,
+                task,
+                LoopStage.COST_PREFLIGHT,
+                ErrorCode.BILLING_ROUTE_UNKNOWN,
+                exc,
+            )
         try:
             validate_cost_estimate(estimate)
         except BillingIntegrityError as exc:
@@ -1892,7 +2470,12 @@ class AgentCore:
         return self._terminal_failure(
             session,
             task,
-            StructuredError(code, str(exc), retryable=code is ErrorCode.CONNECTOR_UNAVAILABLE),
+            diagnostic_from_exception(
+                code,
+                exc,
+                retryable=code is ErrorCode.CONNECTOR_UNAVAILABLE,
+                stage=LoopStage.PLAN,
+            ),
         )
 
     def _terminal_failure(
@@ -1906,6 +2489,11 @@ class AgentCore:
         task.stage = LoopStage.FAILED
         session.active_task_id = None
         set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
+        if result is not None and result.error is None:
+            # H4: the persisted snapshot must describe its own failure, so a
+            # restart reports the same typed diagnostic instead of a terminal
+            # task with no recorded reason.
+            result.error = error
         if result is None:
             try:
                 estimated = float(canonical_usd(task.estimate.monetary_maximum_usd))
@@ -1964,13 +2552,32 @@ class AgentCore:
 
     @staticmethod
     def _result_from_dict(data: dict[str, Any] | None) -> ToolResult | None:
-        if not data:
+        """Restore a persisted result, or ``None`` when it is not restorable.
+
+        H4-G: a malformed or adversarial snapshot - a missing/unknown outcome,
+        a non-mapping body, malformed usage or verification - never becomes
+        active state again. Returning ``None`` routes into the existing
+        deterministic "result is missing" failure at whichever stage asked, so
+        a reloaded bad row fails the same way every time instead of raising or
+        retrying forever.
+        """
+        if not isinstance(data, dict) or not data:
+            return None
+        try:
+            outcome = OutcomeStatus(data["outcome"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        raw_data = data.get("data")
+        try:
+            usage = UsageRecord.from_dict(data.get("usage"))
+            verification = VerificationRecord.from_dict(data.get("verification"))
+        except (KeyError, TypeError, ValueError):
             return None
         return ToolResult(
-            outcome=OutcomeStatus(data["outcome"]),
-            summary=data["summary"],
-            data=data.get("data", {}),
+            outcome=outcome,
+            summary=sanitize_diagnostic_text(data.get("summary", "")),
+            data=raw_data if isinstance(raw_data, dict) else {},
             error=StructuredError.from_dict(data.get("error")),
-            usage=UsageRecord.from_dict(data.get("usage")),
-            verification=VerificationRecord.from_dict(data.get("verification")),
+            usage=usage,
+            verification=verification,
         )

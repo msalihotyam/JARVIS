@@ -10,6 +10,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Onaylar task, session, normalize hedef, connector, destination, veri sınıfı, fingerprint ve süre ile bağlanır.
 - Aylık hedef ve sert üst sınır 20 USD'dir. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
+- Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 
 ## Yapı
 

@@ -682,6 +682,337 @@ Dördüncü bağımsız incelemenin üç P1 bulgusu için son düzeltmeler:
   `BILLING_INTEGRITY_FAILED`'dir; `AttributeError`/`TypeError` olarak dışarı
   sızmaz, onay/yürütme atlanmaz ve connector `execute` sayısı sıfır kalır.
 
+### 4.9 Kalıcı tanılama hijyeni (H4, uygulandı)
+
+Değişmez emniyet ilkesi: **sunum katmanındaki redaksiyon yeterli değildir.**
+Hassas veya sınırsız tanılama verisi, önce otoriter kalıcı duruma girmemelidir.
+H4'ten sonra her kalıcı hata/tanılama yolu sağlayıcıdan bağımsız, sınırlı,
+sanitize edilmiş, yapısal, yeniden-başlatmaya dayanıklı, deterministik ve
+çalıştırılamaz olmak zorundadır. Tanılama yalnızca bilgilendiricidir; asla
+yürütme, faturalandırma veya yaşam döngüsü otoritesi değildir.
+
+- **Güvenli tanılama sözleşmesi (H4-A):** Ayrı bir hata sistemi kurulmadı;
+  mevcut `StructuredError` sözleşmesi tek boğaz noktası hâline getirildi.
+  `__post_init__` içinde `message` sınırlanır ve sanitize edilir, `details` ise
+  sınırlı, allowlist'lenmiş skalerlere indirgenir. Böylece bir aşama sınırı, bir
+  connector istisnası veya SQLite'tan yeniden yüklenen eski bir satır ham metni
+  task JSON'una, result snapshot'ına, checkpoint'e veya denetim olayına
+  koyamaz. `diagnostic_from_exception()` bir istisnayı bu sözleşmeye çevirir:
+  istisna **nesnesi** asla depoya ulaşmaz, yalnızca sanitize edilmiş mesaj ile
+  sınırlı, gizli olmayan `exception_type` ve `stage` etiketleri saklanır.
+  Traceback, ortam değerleri, komut satırları, ham prompt/payload, keyfi iç içe
+  sözlükler ve keyfi `result.data` hiçbir zaman kalıcılaşmaz.
+- **Merkezî sanitizasyon ve sınırlar (H4-B):** Tek kanonik hat
+  `sanitize_diagnostic_text()`. Sıra bilinçlidir: yalnız gerçek `str` hayatta
+  kalır (aksi hâlde `[UNAVAILABLE]`; keyfi nesneler asla stringe çevrilmez) →
+  NFKC → CRLF/CR'den LF'e → boşluk yığınlarının daraltılması → sınırlı çalışma
+  penceresi → kimlik bilgisi redaksiyonu (her egress sınırının kullandığı aynı
+  kanonik politika, kesmeden **önce**, böylece sınırın ötesindeki bir sır da
+  temizlenir) → yerel yol redaksiyonu → sert karakter sınırı. Tek ve açık
+  maksimum uzunluk **240 karakterdir** (`DIAGNOSTIC_MESSAGE_MAX_CHARS`, mevcut
+  progress metni tavanıyla aynı sayı); yapısal `details` değerleri 120,
+  `details` anahtar sayısı 8'dir. İşlem idempotenttir: bir kez sanitize edilmiş
+  değer yeniden sanitize edilince byte-özdeştir, dolayısıyla yeniden başlatma
+  ve yeniden kaydetme byte-kararlıdır. Yakalanan biçimler: `api_key: VALUE`,
+  `api-key=VALUE`, `*_api_key`, `password`/`*_password`, `access_token`/
+  `*_token`, `client_secret`/`*_secret`, `session_cookie`, karışık büyük/küçük
+  harf varyantları, `sk-` kimlik bilgileri, `Bearer` token'ları ve JWT benzeri
+  token'lar. Güvenli metin güvenli kalır: `tokenizer.py`, `secret_handling.md`,
+  "Review token telemetry" ve token/secret sözcüklerini kimlik bilgisi sözdizimi
+  olmadan kullanan sıradan düzyazı olduğu gibi okunabilir kalır — aşırı
+  redaksiyon da bir kusurdur. Ayrıca `traceback`, `command`, `env`, `prompt`,
+  `payload`, `stdout`/`stderr` gibi **yapısal olarak** güvensiz `details`
+  anahtarları değerine bakılmaksızın tümüyle düşürülür.
+- **Yerel yol / makine detayı hijyeni (H4-C):** Mutlak yerel yollar ham olarak
+  kalıcılaşmaz. Politika kasıtlı olarak asgaridir: güvenle türetilebiliyorsa
+  yalnızca sınırlı bir basename korunur (`[PATH]/core.py`), aksi hâlde sabit
+  `[PATH]` işaretçisi kullanılır. Kullanıcı adı, temp klasörü, yorumlayıcı
+  konumu ve depo kökü kaybolur; ayırıcıyla biten bir yol yalnızca dizin adı
+  taşıdığı için hiçbir şey korumaz. URL'ler yol sayılmaz: giden uç nokta başka
+  yerde tipli ve attest edilmiş bir değerdir. **Bu kural yalnızca kazara
+  tanılama sızıntısına uygulanır**; `ActionScope.target`, attestation'ın çalışma
+  dizini ve izinli kökleri H1 altında otoriter tipli kaynak sözleşmeleridir ve
+  bu hattan hiç geçmez.
+- **Aşama sınırı normalizasyonu (H4-D):** Dev bir catch-all eklenmedi; her
+  çağrı noktası tam olarak tek bir sınır çağrısını sarar, böylece başka bir
+  yaşam döngüsü hatası yine yüzeye çıkar. Kapsanan sınırlar: `CONTEXT_RETRIEVAL`
+  (`retrieve_context`), `PLAN` (`build_task_plan` ve connector seçimi),
+  `COST_PREFLIGHT` (`estimate_cost`), `RISK_PERMISSION` (attestation kurulumu),
+  `TOOL_SELECTION` (`availability`), `EXECUTE` (connector sınırı), `VERIFY`
+  (doğrulayıcı) ve kalıcı sonuç geri yükleme. Her biri güvenli tipli bir
+  tanılamayla deterministik terminal başarısızlığa girer; durum terminal olduğu
+  için yeniden başlatma aynı bozuk girdiyi sonsuza dek yeniden denemez, onu
+  raporlar. H2 girişim otoritesi korunur: `UNKNOWN_OUTCOME` sıradan bir tanılama
+  başarısızlığı olarak yeniden yorumlanmaz.
+- **Connector istisnaları (H4-E):** Çekirdek `str(exc)`'i ham kalıcılaştırmaz.
+  Connector'a özgü ayrıntı yalnızca sağlayıcıdan bağımsız güvenli tanılama
+  sözleşmesine dönüştürülerek hayatta kalabilir. Connector istisna metni onay
+  durumunu, faturalandırma otoritesini, yürütme günlüğü otoritesini veya
+  progress otoritesini değiştiremez. Dış çağrı yürütme sınırını gerçekten
+  geçtiyse H3'ün halihazırda oluşmuş kullanım/rezervasyon muhasebesi korunur.
+- **Olay / checkpoint güvenliği (H4-F):** Hata yolundan üretilen her olay
+  yalnızca tipli olay adı, sınırlı güvenli hata kodu, gerekirse sınırlı
+  sanitize mesaj ve asgari retryable/kategori meta verisi taşır. Başarısız bir
+  task normal bir tamamlanmış karar üretmez. Karar kaydının özeti ve gerekçesi
+  de sınırlanır ve sanitize edilir, çünkü karar kaydı gelecekteki çalışmanın
+  güvenilir tarih olarak devraldığı şeydir.
+- **Kalıcı sonuç geri yükleme (H4-G):** `Task.to_dict`/`Task.from_dict` sonuç
+  snapshot'ını aynı politikadan geçirir (`sanitize_result_snapshot`), bu yüzden
+  taze sonuçlar, eski satırlar ve kurcalanmış satırlar aynı kurallara tabidir ve
+  bir yükle→yeniden kaydet döngüsü güvensiz metni geri yazamaz. Snapshot
+  anahtarları allowlist'lidir; keyfi `result.data` kalıcılaşmaz, yalnızca
+  döngünün gerçekten tükettiği `next_step` anahtarı (ve yalnızca gerçek bir
+  string ise) hayatta kalır. Bozuk bir snapshot — eksik/bilinmeyen outcome,
+  bozuk kullanım veya doğrulama — `None` döner ve mevcut deterministik "sonuç
+  eksik" başarısızlığına yönlenir. Bilinmeyen bir hata kodu `INVALID_TASK`'a,
+  boolean olmayan bir retryable `False`'a düşer. H4 dokunulmamış tarihsel
+  satırları geriye dönük yeniden yazmaz (bu bir migration olurdu ve terminal
+  task değişmezdir); güvensiz baytlar bir yazma olana dek yerinde kalır ve
+  güvensiz hiçbir şey geri yazılamaz.
+
+H4'te şema değişmedi (`SCHEMA_VERSION` 5), yeni bağımlılık eklenmedi ve
+connector'lar değiştirilmedi; kalıcı tanılama hijyeni bilinçli olarak
+çekirdek/sağlayıcı-bağımsız sahipliktedir. H1 onay/egress attestation, SECRET
+dış yürütme reddi, kaynak/araç sınırı, connector-sahipli yan etkiler, H2
+`PREPARED`/`IN_FLIGHT`/`FINISHED`/`UNKNOWN_OUTCOME` ve iptal tahkimi, H3
+rezervasyon/mutabakat ve sabit 20 USD tavanı, deterministik PLAN, sınırlı
+bağlam getirme, tipli Session/Progress ve B1 CLI sözleşmeleri değişmedi.
+
+Bağımsız incelemenin dört P1 bulgusu için son düzeltmeler:
+
+- **P1-A — İç içe `result_snapshot` alanları tam allowlist'tir:** Üst düzey
+  sanitizasyon artık **her** iç içe kontrol/veri sınırında varsayılan-reddet
+  uygular. `usage` yalnızca kanonik tipli `UsageRecord` sözleşmesinin bildirdiği
+  alanları taşır; `verification` yalnızca `status`, `method`, `evidence` taşır.
+  `**verification` geçirgenliği, keyfi iç içe sözlük geçirgenliği ve keyfi
+  connector meta verisi kaldırıldı: `payload`, `raw`, `metadata`, bilinmeyen
+  `usage` alanları ve iç içe blob'lar düşürülür (stringe çevrilmez). Kabul
+  edilen değerler yalnızca güvenli skalerlerdir; string değerler H4 hattından
+  geçirilir (böylece kimlik bilgisi taşıyan `billing_evidence` temizlenir),
+  aralık dışı tam sayılar `0`'a normalize edilir, sonlu olmayan float'lar
+  düşürülür. H3 otorite alanları **yeniden normalize edilmez**, olduğu gibi
+  korunur: defter otoritedir, snapshot bilgilendiricidir, bu yüzden bozuk bir
+  otorite değeri `UsageRecord.from_dict` sınırında kapalı biçimde başarısız
+  olmaya devam eder. `evidence` H4 kurallarına göre sınırlanır ve sanitize
+  edilir; string olmayan `status` düşürülür, böylece geri yükleme kapalı kalır.
+- **P1-B — Yol ve komut satırı kimlik bilgisi boşlukları:** Bir yolun son
+  bileşeni artık yalnızca **kanıtlanabilir** biçimde bir dosya adıysa korunur:
+  sınırlı bir tanımlayıcı artı kısa, harfle başlayan bir dosya uzantısı. Aksi
+  hâlde — sonda ayırıcı, çıplak dizin adı (`C:\Users\realk`, `/home/realk`),
+  sürüm son eki (`python3.13`), nokta ile başlayan dizin (`.cache`), aşırı uzun
+  veya olağandışı segment — yol tümüyle sabit `[PATH]` işaretçisine indirgenir.
+  Böylece kullanıcı/profil/temp/yorumlayıcı/depo mutlak yolları yerel hesap veya
+  makine adını açığa çıkaramaz. Ayrıca kanonik kimlik bilgisi politikasına
+  sözdizimi-farkında **komut satırı** biçimi eklendi: `--api-key VALUE`,
+  `--api_key=VALUE`, `--access-token`, `--token`, `--password`,
+  `--client-secret` ve benzerleri, hem `=` hem boşluk ayırıcıyla ve büyük/küçük
+  harf duyarsız. Bayrağın kendisi korunur (tanılama kullanışlı kalır), değeri
+  redakte edilir. Mevcut tespit (etiketli atama, `sk-`, `Bearer`, JWT) ve
+  yanlış-pozitif güvenliği (`tokenizer.py`, `secret_handling.md`, "Review token
+  telemetry`", `mytoken=value`, `passwordless=value`, sıradan düzyazı) aynen
+  korunur. Bu, ayrı bir politika değil aynı kanonik `redact_credentials`
+  hattının parçasıdır, dolayısıyla egress önizlemeleri de kapsanır.
+- **P1-C — Bozuk doğrulayıcı sonuçları doğrulama sınırının içinde başarısız
+  olur:** Doğrulayıcı çağrısı **ve** döndürdüğü değerin doğrulanması/normalize
+  edilmesi tek dar deterministik aşama sınırıdır. Alan-özgü hiçbir erişimden
+  önce doğrulanır: nesnenin tam olarak `VerificationRecord` olması, `status`'ün
+  tam olarak bir `VerificationStatus` üyesi olması (ham string veya yabancı enum
+  eşdeğer değildir), `method`'un string olması ve `evidence`'ın string dizisi
+  olması. Aksi hâlde `AttributeError` yerine deterministik terminal doğrulama
+  başarısızlığı üretilir: connector yeniden çalıştırılmaz, H2 girişimi
+  `FINISHED` kalır, H3 kullanım/rezervasyon muhasebesi bozulmaz, yeniden
+  başlatma ne yürütmeyi tekrarlar ne de bozuk doğrulayıcı yolunu sonsuza dek
+  yineler. Connector'ın kendi `ToolResult`'ına iliştirdiği doğrulama kaydı için
+  ayrı, **hiç yükselmeyen** bir varyant kullanılır: bu kod connector sınırı
+  geçildikten sonra ve H3 mutabakatından önce çalışır, orada bir istisna yaşam
+  döngüsünü şüphede bırakırdı; bozuk kayıt sessizce atılır, otoriter doğrulama
+  zaten VERIFY'da yapılır.
+- **P1-D — Tanılama detayları tümüyle sınırlı ve kalıcılık-güvenlidir:**
+  Sanitizer artık **total**'dir: hiçbir girdi istisna yükseltmez. Anahtarlar
+  yalnızca gerçek string olabilir; string olmayan anahtar kapalı biçimde
+  düşürülür ve hiçbir yerde anahtarın string olduğu varsayılarak string işlemi
+  veya yeniden arama yapılmaz (eşleme öğe öğe gezilir, bu da eski `KeyError`
+  yolunu tümüyle ortadan kaldırır). Değerler yalnızca açıkça desteklenen güvenli
+  skalerlerdir: string (H4 hattı + uzunluk sınırı), bool, işaretli 64-bit
+  aralığındaki tam sayı (`DIAGNOSTIC_INT_MIN`..`DIAGNOSTIC_INT_MAX`; `10**5000`
+  gibi keyfi büyük Python tam sayıları JSON basamak sınırına veya SQLite
+  taşmasına ulaşamadan düşürülür), sonlu float ve `None`. Koleksiyonlar,
+  nesneler ve bytes düşürülür. Sonuç deterministik, sınırlı ve her zaman geçerli
+  JSON'dur; yaşam döngüsü bozuk bir tanılama yüzünden yürütme sonrası şüpheli
+  konumda kalamaz.
+
+Üçüncü incelemenin üç P1 bulgusu için son düzeltmeler:
+
+- **P1-A — Tipli `result_snapshot` alanları alan-farkında doğrulanır:** Bir alan
+  artık yalnızca anahtarı allowlist'te olduğu için korunmaz; her alan kendi
+  **kesin anlamsal tipine** göre doğrulanır. `outcome` ve `verification.status`
+  enum benzeridir, bu yüzden yalnızca kendi enum'larının bildirdiği tam kanonik
+  değeri kabul ederler; kimlik bilgisi taşıyan veya aşırı büyük ham bir string
+  değer değil kurcalanmış veridir, düşürülür ve geri yükleme kapalı biçimde
+  başarısız olur. `usage` içinde: `billing_class`/`monetary_state` tam
+  `BillingClass`/`MonetaryState` değeri olmalıdır; `input_tokens`/
+  `output_tokens`/`call_count` gerçek, bool olmayan, negatif olmayan ve
+  SQLite-güvenli tam sayı olmalıdır (`True` ve `"7"` tam sayı değildir, mevcut
+  H3 sıfır-normalizasyonuna düşerler); parasal alanlar kanonik H3 sayısal
+  anlambilimini karşılamalıdır; `provider`/`model`/`connector`/
+  `billing_evidence` sınırlı ve sanitize edilmiş string olmalıdır. Ayrıca
+  sınıf/durum/tutar üçlüsü uzlaştırılır: tutarsız bir *measured* metered satır
+  kapalı-güvenli `UNKNOWN` durumuna iner, böylece daha sonraki bir defter
+  yazımında yükselecek bir kombinasyon hiç kalıcılaşmaz.
+  **Bozuk kalıcı snapshot davranışı:** yükleme sırasında sanitize edilir,
+  güvensiz orijinal baytlar geri yazılmaz, connector yeniden çalıştırılmaz, H2
+  girişim durumu ve H3 defter muhasebesi korunur ve — geri yüklenemiyorsa —
+  mevcut güvenli terminal geri-yükleme başarısızlığına düşülür. Terminal
+  yazımın kendisi de dar bir sınıra alındı: yeniden kurulmuş bir kullanım kaydı
+  yazılamıyorsa `BillingIntegrityError` `resume`'dan dışarı yükselmez, aynı
+  deterministik yapısal başarısızlığa dönüşür.
+- **P1-B — Mutlak yol ve tırnaklı CLI kimlik bilgisi redaksiyonu muhafazakârdır:**
+  Tanılama serbest metnindeki mutlak bir yol artık **tümüyle** `[PATH]` olur.
+  Son bileşen bir nokta/uzantı sezgiseline dayanarak korunmaz: `C:\Users\john.doe`
+  ve `/home/john.doe` gibi kullanıcı dizinleri bir dosya adından ayırt
+  edilemez ve bunları korumak tam da kaldırılmak istenen yerel kimliği sızdırır.
+  Bir segmentin güvenli bir dosya etiketi olduğunu yalnızca hâlihazırda tipli
+  bir bağlam kanıtlayabilir; tanılama regex'i kanıtlayamaz. (H1 tipli
+  kaynak/scope kalıcılığı bu hattan hiç geçmez ve değişmedi.) Komut satırı
+  kimlik bilgisi eşleşmesi tırnaklı değerleri de bütün olarak tüketir:
+  `--key value`, `--key=value`, `--key "boşluklu değer"`, `--key='boşluklu
+  değer'` ve büyük/küçük harf varyantları; değerin tamamı sabit işaretçiyle
+  değiştirilir, geride ne tırnak kuyruğu ne de gizli metin kalır. Güvenli metin
+  (`tokenizer.py`, `secret_handling.md`, "Review token telemetry", sıradan
+  düzyazı, `mytoken=value`, `--verbose`) aynen korunur.
+- **P1-C — Aşama dönüş değeri doğrulaması her dar sınırın içindedir:** Çağrı,
+  dönüş tipi doğrulaması ve normalizasyon aynı dar aşama sınırına aittir; bozuk
+  bir dönüş değeri bir sınır hatasına eşdeğerdir ve deterministik yapısal duruma
+  dönüşür (asla stringe çevrilmez). Kapsanan sınırlar: `retrieve_context()` tam
+  `RetrievedContext` (ve tipli alanları) döndürmelidir; connector'ın
+  `permission_request()`'i tam `PermissionRequest` döndürmeli ve scope, sınıf,
+  risk, yan etki, attestation ile önizleme alanları kullanılmadan önce
+  doğrulanmalıdır — bozuk veriyle hiçbir bekleyen onay satırı açılmaz;
+  `availability()` tam `Availability` döndürmelidir. Her durumda görev mevcut
+  deterministik terminal başarısızlığa ulaşır, `execute_calls` sıfır kalır,
+  hiçbir yürütme girişimi/rezervasyon oluşmaz ve terminal durum değişmez olduğu
+  için yeniden başlatma bozuk sınırı sonsuza dek yinelemez.
+
+Dördüncü incelemenin üç P1 bulgusu için son düzeltmeler:
+
+- **P1-A — Aşama dönüş değerleri **özyinelemeli** doğrulanır:** Dış nesnenin
+  tipini doğrulamak sınır değildir. Tam bir `RetrievedMemoryItem` `kind`
+  alanında enum üyesi yerine ham `"decision"` dizgisini, tam bir
+  `OutboundDataPreview` ise `data_classification` alanında ham `"internal"`
+  dizgisini taşıyabilir: bu sınıfların hepsi `str` türevidir, dolayısıyla ham
+  değer enum üyesine **eşit** karşılaştırır, dış kontrolü geçer ve `.value`
+  erişiminde — checkpoint serileştirme, fingerprint kurulumu veya onay
+  gösterimi sırasında, yani **korunan sınırın dışında** — `AttributeError`
+  yükseltir. Artık her otorite taşıyan iç alan `type(x) is T` ile tam tipine
+  göre doğrulanır: `RetrievedContext` için her öğenin `kind`/`classification`
+  enum'ları, string kimlik/metin alanları, `next_step`'in `None`-veya-string
+  oluşu, gerçek (bool olmayan, negatif olmayan, sınırlı) `relevance_score`, tam
+  `bool` `truncated`, kanonik `created_at` ve mevcut sert getirme sözleşmesinin
+  sonuç/öğe/sayı/karakter tavanları; `PermissionRequest` için tam
+  `ActionScope`, `SideEffectProfile` (tam `SideEffect` + gerçek boolean'lar),
+  `OutboundDataPreview` (tam sınıf, tam tuple/string/sayı alanları) ve tam
+  `EgressAttestation` (scope/risk/etki/sınıf, digest alanları, çalışma dizini,
+  izinli kökler ve tool grant koleksiyonları). Hiçbir değer `str()`, `int()`,
+  `bool()`, `Enum(value)` veya duck typing ile onarılmaz — bozuk değer
+  reddedilir. Çağrı, özyinelemeli doğrulama ve normalizasyon aynı dar aşama
+  sınırının içinde kalır, dolayısıyla bozuk veri görev durumuna, checkpoint'e,
+  fingerprint'e, bekleyen onaya, grant'a veya connector yürütmesine **hiç**
+  ulaşmaz: getirme bozuksa mevcut deterministik `INVALID_TASK`, izin verisi
+  bozuksa mevcut `EGRESS_REFUSED` terminal davranışı oluşur.
+- **P1-B — Boşluk içeren mutlak yollar tümüyle redakte edilir:** Önceki desen
+  boşluğa yalnızca ara segmentlerde izin veriyordu, bu yüzden son dizinin ilk
+  kelimesinde duruyor ve ikincisini işaretçinin yanında bırakıyordu
+  (`C:\Users\john.doe\My Documents` → `[PATH] Documents`). Artık son segment de
+  boşluk taşıyabilir; bitiş noktası kanıtlanamadığında açık bir sınırlayıcıya
+  (tırnak, açı ayracı, dikey çizgi) veya alan sonuna kadar **güvenli tarafta
+  aşırı redaksiyon** seçilir. Windows sürücü, UNC ve POSIX biçimleri kapsanır;
+  tırnaklı bir yol açılış tırnağından kapanış tırnağına kadar tüketilir.
+  Aşırı redaksiyon iki eksende sınırlıdır (segment başına en çok 9 kelime,
+  yineleme sayıları açıkça sınırlı), her alternatif zorunlu bir ayırıcıyla
+  çapalıdır ve hiçbir segment ayırıcı içeremez, dolayısıyla eşleşme tek biçimde
+  ayrışır ve katastrofik geri izleme mümkün değildir. URL'ler, sıradan güvenli
+  düzyazı ve idempotans korunur.
+- **P1-C — Sonlandırılmamış tırnaklı CLI kimlik bilgisi tümüyle redakte
+  edilir:** Tanınan bir kimlik bilgisi bayrağı tırnaklı bir değer açtıysa,
+  değerin tamamı gizlidir. Önceki desen kapanış tırnağı yoksa tek bir
+  boşluksuz jetona düşüyor ve sırrın kuyruğunu yayımlıyordu
+  (`--password "HUNTER2 TAILSECRET_LEAK_9988` → `--password [REDACTED]
+  TAILSECRET_LEAK_9988`). Kapanış tırnağı artık isteğe bağlıdır: dengeli bir
+  değer hâlâ tam olarak kapanış tırnağında biter (dolayısıyla sonrasındaki
+  bağımsız argümanlar korunur), kapanmayan bir tırnak ise sınırlı tanılama
+  alanının geri kalanını tüketir. `--key value`, `--key=value`, `--key "boşluklu
+  değer"`, `--key='boşluklu değer'` ve büyük/küçük harf varyantları,
+  `api-key`/`api_key`, `access-token`/`access_token`, `password`,
+  `client-secret`/`client_secret`, `token`, `session-cookie`/`session_cookie`
+  ve mevcut diğer eşdeğerleri için geçerlidir. Güvenli metin (`--verbose`,
+  `tokenizer.py`, `secret_handling.md`, sıradan düzyazı) aynen korunur.
+
+Beşinci incelemenin üç P1 bulgusu için son düzeltmeler:
+
+- **P1-A — İzin isteği ile attestation/manifest arasındaki anlamsal tutarlılık
+  kapalı-güvenlidir:** Alan tipleri bir güvenlik özelliği değildir. Manifest'i
+  HIGH / EXTERNAL_EGRESS / geri alınamaz / her zaman onay olan bir connector,
+  attestation'ı güçlü kalırken üst düzey `risk_level`'ı LOW ve `side_effect`'i
+  geri alınabilir NONE olan **kusursuz tipli** bir `PermissionRequest`
+  döndürebiliyordu; `_requires_approval()` bu zayıflatılmış değerleri okuyor,
+  SMART_AUTO'da otomatik onaylıyor ve onaysız bir dış egress yürütülüyordu
+  (görev COMPLETED, `execute_calls = 1`, kullanıcıya hiç izin isteği
+  gösterilmeden). Artık taban **burada yeniden hesaplanır**: efektif taban
+  `merge_side_effects(manifest.default_side_effect, task.side_effect)`, risk
+  tabanı ise `max(task.risk_level, manifest.default_risk)`. Kasıtlı olarak
+  `connector.side_effects()`/`permission_request()` üzerinden değil, manifest
+  ve görevden türetilir — bir connector kendi tabanını raporlayan metodu
+  ezerek tabanı düşürememelidir; dönen isteğin kendisi tabanı **asla**
+  belirlemez. Doğrulanan ilişkiler: görev/oturum bağı; `scope`'un yetkili
+  olarak yeniden kurulan scope'a (connector adı, hedef, destination, veri
+  sınıfı dâhil) tam eşitliği; isteğin tabanın altına inmemesi
+  (`merge_side_effects(taban, istek) == istek`, çakışan çift de reddedilir);
+  attestation'ın scope/risk/yan etki bakımından isteğe tam eşitliği;
+  EXTERNAL_EGRESS tabanında attestation'ın var olması ve boş olmayan bir
+  outbound digest taşıması; önizlemenin destination ve veri sınıfı bakımından
+  aynı egress'i anlatması. Güçlendirme yasal kalır (risk yükseltmek, geri
+  alınamaz yapmak, yerel etki merdiveninde yukarı çıkmak); zayıflatma ve
+  çelişki reddedilir ve bozuk bir istek **sessizce güçlendirilerek onarılmaz**.
+  Her uyuşmazlık deterministik `EGRESS_REFUSED`'a düşer: bekleyen onay yok,
+  `approval_requested` olayı yok, grant yok, yürütme girişimi yok,
+  `execute_calls == 0`, defter hareketi yok — STRICT, SESSION ve SMART_AUTO
+  modlarının hepsinde aynı şekilde.
+- **P1-B — Güvenlik/başarım sınırları yolun görünür sonunu tanımlayamaz:**
+  Sınırlı yinelemeli regex, segment başına kelime tavanına veya segment sayısı
+  tavanına ulaştığında eşleşmeyi bitiriyor ve kalanı işaretçinin yanında
+  bırakıyordu (`[PATH] TAILMARK`, `[PATH]seg17/seg18/seg19/TAILMARK`). Bir
+  güvenlik sınırı **işi** sınırlamalıdır, tanınmış bir yolun nerede bittiğini
+  değil. Regex yerini küçük, deterministik, tek geçişli bir tarayıcıya bıraktı:
+  Windows sürücü, UNC ve POSIX kökleri tanınır (bir sözcüğe veya URL şemasına
+  yapışık ayırıcı kök değildir, bu yüzden `read/write`, `and/or` ve
+  `https://host/path` bozulmaz); kök tanındıktan sonra tüketme, bir yolun
+  içeremeyeceği bir karaktere (tırnak, açı ayracı, dikey çizgi, alanı bitiren
+  boşluk) veya alan sonuna kadar sürer — **hiçbir tavan yoktur**. Düz boşluk
+  bilerek durdurucu değildir: gerçek dizinler boşluk içerir, dolayısıyla boşluk
+  belirsizdir ve tarayıcı bir sonek açığa çıkarmak yerine alanın kalanını
+  fazladan redakte eder. Tırnaklı bir yol, eşleşen tırnak varsa onun içinden
+  geçilerek tüketilir. Uzantı sezgisine dayalı basename koruması yoktur; çıktı
+  sabit `[PATH]`'tir. Çalışma süresi doğrusaldır: tanınan yol imleci kendi
+  uzamının sonuna taşır, reddedilen tek-ayırıcı adayı ise ancak uzamında başka
+  ayırıcı bulunmadığı için reddedilir — yani o uzamda hiçbir kök başlayamaz —
+  ve imleç yine uzamın sonuna atlar.
+- **P1-C — Kimlik bilgisi değerindeki kaçışlı tırnak redaksiyonu erken
+  bitiremez:** `[^"]*` gibi bir karakter sınıfı kaçışlı tırnağı kapanış
+  tırnağı sanıyor ve sırrın kalanını geri veriyordu
+  (`--password "HUNTER2 foo\"bar TAILSECRET_LEAK_42"` → `bar TAILSECRET_LEAK_42`
+  sızıyordu). Değer artık regex ile değil, küçük ve deterministik bir
+  tarayıcıyla okunur: tırnaksız değer tek bir boşlukla sınırlı jetondur;
+  tırnaklı değer ilk **kaçışsız** eşleşen tırnağa kadar sürer (ters bölü bir
+  sonraki karakteri kaçırır, dolayısıyla kaçışlı tırnak sırrın *içinde* kalır);
+  kapanmayan tırnak sınırlı tanılama alanının kalanını tüketir. Kaçış tek
+  tırnak içinde de onurlandırılır — POSIX kabuğu öyle yapmaz, ama bu hat her
+  kaynaktan tanılama okur ve `\'`'yi kaçış saymak yalnızca *daha fazla*
+  tüketir, yani güvenli yöndür. Dengeli bir değer hâlâ gerçek kapanış
+  tırnağında biter, bu yüzden `--print` gibi bağımsız argümanlar korunur; sır
+  içinde geçen bir bayrak yeni bir atama sayılmaz. Güvenli negatifler
+  (`--verbose`, `tokenizer.py`, `secret_handling.md`, sıradan token/secret
+  düzyazısı) aynen korunur ve sanitizasyon idempotent kalır.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:
