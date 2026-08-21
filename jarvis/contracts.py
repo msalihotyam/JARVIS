@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
@@ -257,6 +259,10 @@ class ErrorCode(str, Enum):
     EXECUTION_IN_PROGRESS = "execution_in_progress"
     #: A command targeted a task that is already in a terminal state.
     TASK_ALREADY_TERMINAL = "task_already_terminal"
+    #: H3: canonical monetary validation, ledger integrity or authoritative
+    #: usage reconciliation failed. Always fail closed; never a retryable
+    #: "probably fine" state, and never accompanied by a completed decision.
+    BILLING_INTEGRITY_FAILED = "billing_integrity_failed"
 
 
 class AttestationError(Exception):
@@ -269,6 +275,212 @@ class AttestationError(Exception):
     def __init__(self, code: "ErrorCode", message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+# --------------------------------------------------------------------------
+# H3 - canonical, provider-independent monetary validation
+# --------------------------------------------------------------------------
+
+#: Canonical monetary precision: exactly nine decimal places (nano-USD).
+MONETARY_DECIMAL_PLACES = 9
+_NANO_EXPONENT = Decimal(1).scaleb(-MONETARY_DECIMAL_PLACES)
+NANO_USD_SCALE = 10**MONETARY_DECIMAL_PLACES
+#: Widest exactly persistable nano-USD amount (SQLite signed 64-bit INTEGER).
+MAX_NANO_USD = 2**63 - 1
+#: Working precision for exact conversions; 19 integral digits plus 9 decimal
+#: places always fit, so no authoritative amount is silently rounded away.
+_MONETARY_PRECISION = 40
+#: Bounded, non-secret reason text carried by an invalid ledger snapshot.
+LEDGER_REASON_MAX_CHARS = 120
+
+
+class BillingIntegrityError(Exception):
+    """Canonical monetary validation or ledger integrity failed; fail closed.
+
+    The message is a short, non-secret field/rule tag. Raw connector telemetry,
+    payloads, prompts or credentials are never carried here.
+    """
+
+    code = ErrorCode.BILLING_INTEGRITY_FAILED
+
+
+def canonical_usd(value: Any, field: str = "amount") -> Decimal:
+    """Exact, finite, non-negative USD at the canonical nine-decimal precision.
+
+    Booleans and non-numeric objects are refused outright; NaN, positive and
+    negative infinity and negative amounts are refused. Conversion goes through
+    ``Decimal(str(value))`` so no binary float artefact reaches the ledger. The
+    result is quantized with ``ROUND_CEILING`` - the only rounding direction
+    that can never under-count money, and then by at most one nano-USD.
+    Anything outside the exactly persistable fixed-width nano-USD range is
+    refused rather than truncated.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise BillingIntegrityError(f"{field}: not a monetary number")
+    try:
+        candidate = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise BillingIntegrityError(f"{field}: not a monetary number") from exc
+    if not candidate.is_finite():
+        raise BillingIntegrityError(f"{field}: must be finite")
+    if candidate < 0:
+        raise BillingIntegrityError(f"{field}: must not be negative")
+    with localcontext() as context:
+        context.prec = _MONETARY_PRECISION
+        try:
+            amount = candidate.quantize(_NANO_EXPONENT, rounding=ROUND_CEILING)
+            nano = int(amount * NANO_USD_SCALE)
+        except (InvalidOperation, OverflowError, ValueError) as exc:
+            raise BillingIntegrityError(f"{field}: outside the monetary range") from exc
+    if nano > MAX_NANO_USD:
+        raise BillingIntegrityError(f"{field}: outside the monetary range")
+    return amount
+
+
+def nano_usd(value: Any, field: str = "amount") -> int:
+    """Exact integer nano-USD; the only persisted monetary representation."""
+    with localcontext() as context:
+        context.prec = _MONETARY_PRECISION
+        return int(canonical_usd(value, field) * NANO_USD_SCALE)
+
+
+def usd_from_nano(nano: Any) -> Decimal:
+    """Exact canonical USD for a persisted nano-USD integer."""
+    if isinstance(nano, bool) or not isinstance(nano, int):
+        raise BillingIntegrityError("nano_usd: not an exact integer amount")
+    if nano < 0 or nano > MAX_NANO_USD:
+        raise BillingIntegrityError("nano_usd: outside the monetary range")
+    return Decimal(nano).scaleb(-MONETARY_DECIMAL_PLACES)
+
+
+def format_usd(value: Any) -> str:
+    """Canonical nine-decimal text form used inside gate/claim identities."""
+    return format(canonical_usd(value), "f")
+
+
+def gate_amount(value: Any) -> str:
+    """Gate-identity form of an amount; an invalid one becomes ``invalid``.
+
+    Fail-closed by construction: an ``invalid`` component can never equal a
+    valid one, so a malformed amount can never satisfy a gate comparison.
+    """
+    try:
+        return format_usd(value)
+    except BillingIntegrityError:
+        return "invalid"
+
+
+def validated_metered_maximum(value: Any) -> Decimal:
+    """A metered pre-execution maximum: finite and strictly greater than zero."""
+    amount = canonical_usd(value, "maximum_usd")
+    if amount <= 0:
+        raise BillingIntegrityError("maximum_usd: metered maximum must be > 0")
+    return amount
+
+
+def validated_metered_minimum(value: Any, maximum: Decimal) -> Decimal:
+    """A metered minimum: finite, non-negative and no greater than the maximum."""
+    amount = canonical_usd(value, "minimum_usd")
+    if amount > maximum:
+        raise BillingIntegrityError("minimum_usd: must not exceed maximum_usd")
+    return amount
+
+
+def validated_resource_ceiling(value: Any) -> Decimal:
+    """A provider-side resource ceiling: finite and strictly positive.
+
+    A containment bound, never monetary spend; validated here so a malformed
+    ceiling cannot ride into a gate identity or an external invocation.
+    """
+    amount = canonical_usd(value, "resource_ceiling_usd")
+    if amount <= 0:
+        raise BillingIntegrityError("resource_ceiling_usd: must be > 0")
+    return amount
+
+
+def validated_measured_cost(value: Any) -> Decimal:
+    """A measured metered actual cost: finite and non-negative; zero is legal."""
+    return canonical_usd(value, "monetary_cost_usd")
+
+
+#: Widest value SQLite can persist in an INTEGER column. A larger Python int
+#: would raise ``OverflowError`` at the driver instead of failing as policy.
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+#: The fixed monthly monetary hard limit as exact nano-USD. Storage-owned
+#: policy: a caller-supplied larger limit is never trusted (H3 P1-C).
+MONTHLY_HARD_LIMIT_NANO_USD = 20 * NANO_USD_SCALE
+
+#: Monetary gate actions. Provider-neutral policy identifiers, owned here so
+#: the loop that issues the request and the storage boundary that re-verifies
+#: the persisted grant compare exactly the same action name.
+PAID_API_GATE = "enable_paid_api_for_task"
+COST_CAP_GATE = "override_monthly_cost_cap"
+
+
+def _enum_from_raw(enum_type: Any, value: Any, field: str) -> Any:
+    """Fail-closed enum decoding for persisted/raw classification values."""
+    if not isinstance(value, str):
+        raise BillingIntegrityError(f"{field}: not a classification value")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise BillingIntegrityError(f"{field}: unknown classification value") from exc
+
+
+def _require_enum(enum_type: Any, value: Any, field: str) -> Any:
+    """Require an exact enum member at a runtime authority boundary.
+
+    A raw string is deliberately *not* accepted even though these enums inherit
+    from ``str``: an externally constructed record carrying
+    ``billing_class="metered_monetary"`` would otherwise survive validation and
+    then crash on ``.value`` deep inside persistence. Failing here turns that
+    into a structured billing-integrity failure instead.
+    """
+    if type(value) is not enum_type:
+        raise BillingIntegrityError(f"{field}: exact {enum_type.__name__} required")
+    return value
+
+
+def require_billing_class(value: Any, field: str = "billing_class") -> BillingClass:
+    return _require_enum(BillingClass, value, field)
+
+
+def require_monetary_state(
+    value: Any, field: str = "monetary_state"
+) -> MonetaryState:
+    return _require_enum(MonetaryState, value, field)
+
+
+def persistable_count(value: Any) -> int:
+    """Legacy-safe non-negative integer count bounded to SQLite's INTEGER range.
+
+    The deferred nullable-telemetry decision stands: a missing, malformed,
+    negative, non-integral or non-representable count uses the existing zero
+    representation rather than raising or inventing a measurement. No billing
+    is ever inferred from it, and no oversized Python int reaches the driver.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    if value < 0 or value > MAX_SQLITE_INTEGER or int(value) != value:
+        return 0
+    return int(value)
+
+
+def billing_class_from_raw(value: Any) -> BillingClass:
+    return _enum_from_raw(BillingClass, value, "billing_class")
+
+
+def monetary_state_from_raw(value: Any) -> MonetaryState:
+    return _enum_from_raw(MonetaryState, value, "monetary_state")
+
+
+def ledger_month(moment: datetime | None = None) -> str:
+    """The UTC ledger month key. Never derived from connector-supplied time."""
+    stamp = moment or datetime.now(timezone.utc)
+    return stamp.astimezone(timezone.utc).strftime("%Y-%m")
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,9 +681,9 @@ class CostEstimate:
         return "|".join(
             (
                 self.billing_class.value,
-                f"{self.monetary_maximum_usd:.9f}",
+                gate_amount(self.monetary_maximum_usd),
                 str(int(self.requires_paid_api)),
-                "none" if ceiling is None else f"{float(ceiling):.9f}",
+                "none" if ceiling is None else gate_amount(ceiling),
             )
         )
 
@@ -569,6 +781,240 @@ class UsageRecord:
 
 _COST_FIELDS = frozenset(CostEstimate.__dataclass_fields__)
 _USAGE_FIELDS = frozenset(UsageRecord.__dataclass_fields__)
+
+
+def validate_cost_estimate(estimate: CostEstimate) -> None:
+    """Fail closed on a pre-execution estimate that cannot be reasoned about.
+
+    This is the *pre-execution* half of the monetary contract: it validates the
+    projected route and bounds a connector declares before anything runs. Its
+    authoritative counterpart for already-recorded history is
+    ``jarvis.memory.validate_ledger_usage``, which is deliberately stricter
+    because a persisted ledger row has no remaining uncertainty to express.
+
+    The billing class must be an exact ``BillingClass`` member: a raw string, a
+    number, a foreign enum or a duck-typed ``.value`` stand-in is refused here,
+    at the earliest provider-neutral boundary, rather than crashing later on
+    enum-specific access. A metered route must project a finite maximum strictly
+    greater than zero with a finite, non-negative minimum no greater than it, so
+    a NaN, infinite, negative or zero/unknown maximum can never slip past a
+    meaningful preflight. A supplied resource ceiling must be finite and
+    strictly positive; it stays a containment bound and never enters the
+    monetary projection.
+    """
+    if not isinstance(estimate, CostEstimate):
+        raise BillingIntegrityError("cost estimate: not a CostEstimate")
+    require_billing_class(estimate.billing_class)
+    if estimate.resource_ceiling_usd is not None:
+        validated_resource_ceiling(estimate.resource_ceiling_usd)
+    if estimate.billing_class is BillingClass.METERED_MONETARY:
+        maximum = validated_metered_maximum(estimate.maximum_usd)
+        validated_metered_minimum(estimate.minimum_usd, maximum)
+        return
+    # A non-metered route projects no money, but a malformed amount still must
+    # not survive into a gate identity or a persisted estimate.
+    canonical_usd(estimate.maximum_usd, "maximum_usd")
+    canonical_usd(estimate.minimum_usd, "minimum_usd")
+
+
+# --------------------------------------------------------------------------
+# H3 - typed, provider/storage-independent ledger state
+# --------------------------------------------------------------------------
+
+
+class LedgerValidity(str, Enum):
+    """Whether the persisted monetary state could be read as authoritative."""
+
+    VALID = "valid"
+    INVALID = "invalid"
+
+
+class ReservationState(str, Enum):
+    """Durable state of one attempt-bound monetary reservation.
+
+    ACTIVE: money is committed to a claimed execution and not yet reconciled.
+    RECONCILED: authoritative measured usage replaced the reservation.
+    UNRESOLVED: the execution returned something the ledger could not accept;
+    the exposure stays until explicit future recovery work.
+    """
+
+    ACTIVE = "active"
+    RECONCILED = "reconciled"
+    UNRESOLVED = "unresolved"
+
+
+#: Reservation states that still contribute monetary exposure.
+OPEN_RESERVATION_STATES = frozenset(
+    {ReservationState.ACTIVE, ReservationState.UNRESOLVED}
+)
+
+
+def reservation_state_from_raw(value: Any) -> ReservationState:
+    return _enum_from_raw(ReservationState, value, "reservation_state")
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerSnapshot:
+    """The authoritative monetary position of one UTC ledger month.
+
+    Provider- and storage-independent. Every amount is exact integer nano-USD;
+    no binary float arithmetic participates in an enforcement decision. An
+    invalid snapshot carries a bounded, non-secret reason and must never be
+    used to authorize paid execution - a malformed persisted row can neither
+    subtract from spend nor be silently ignored.
+    """
+
+    month: str
+    measured_nano_usd: int = 0
+    reserved_nano_usd: int = 0
+    unresolved_nano_usd: int = 0
+    validity: LedgerValidity = LedgerValidity.VALID
+    reason: str = ""
+
+    @classmethod
+    def invalid(cls, month: str, reason: str) -> LedgerSnapshot:
+        return cls(
+            month=month,
+            validity=LedgerValidity.INVALID,
+            reason=str(reason)[:LEDGER_REASON_MAX_CHARS],
+        )
+
+    @property
+    def valid(self) -> bool:
+        return self.validity is LedgerValidity.VALID
+
+    @property
+    def total_nano_usd(self) -> int:
+        """Measured spend plus every still-open reservation, in nano-USD."""
+        return self.measured_nano_usd + self.reserved_nano_usd
+
+    @property
+    def measured_usd(self) -> Decimal:
+        return usd_from_nano(self.measured_nano_usd)
+
+    @property
+    def reserved_usd(self) -> Decimal:
+        return usd_from_nano(self.reserved_nano_usd)
+
+    @property
+    def total_usd(self) -> Decimal:
+        return usd_from_nano(self.total_nano_usd)
+
+    @property
+    def has_unresolved_liability(self) -> bool:
+        """Whether money is committed but not yet reconciled to measured spend."""
+        return self.reserved_nano_usd > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "month": self.month,
+            "measured_usd": format_usd(self.measured_usd),
+            "reserved_usd": format_usd(self.reserved_usd),
+            "total_usd": format_usd(self.total_usd),
+            "has_unresolved_liability": self.has_unresolved_liability,
+            "validity": self.validity.value,
+            "reason": self.reason,
+        }
+
+
+class ExecutionClaimOutcome(str, Enum):
+    """Typed result of the atomic execution claim (attempt + cap + reservation).
+
+    CLAIMED: this owner holds the attempt, every one-shot grant was consumed
+    and the reservation is durable. LOST: another owner, an authoritative
+    cancellation or a missing grant won; nothing was written.
+    BILLING_RECHECK_REQUIRED: the ledger moved after preflight/approval, so the
+    approved projection no longer describes reality; nothing was written and the
+    task must return to COST_PREFLIGHT. LEDGER_INVALID: persisted monetary state
+    could not be read authoritatively; refuse to execute.
+    """
+
+    CLAIMED = "claimed"
+    LOST = "lost"
+    BILLING_RECHECK_REQUIRED = "billing_recheck_required"
+    LEDGER_INVALID = "ledger_invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class BillingClaim:
+    """The exact monetary state an execution claim is authorized against.
+
+    Immutable and fully explicit: storage re-derives the ledger inside the claim
+    transaction and refuses the claim unless the month and the total exposure
+    match this snapshot exactly, so two concurrent metered tasks can never both
+    clear preflight against the same balance.
+    """
+
+    ledger_month: str
+    expected_exposure_nano_usd: int
+    reservation_nano_usd: int
+    limit_nano_usd: int
+    billing_class: BillingClass
+    gate_state: str
+    #: The exact approved cost-override grant fingerprint, when the projection
+    #: crosses the hard limit. Empty when no override is required.
+    cost_override_fingerprint: str = ""
+
+
+class ReconciliationOutcome(str, Enum):
+    """Result of binding one connector result to its attempt reservation."""
+
+    RECONCILED = "reconciled"
+    #: The same attempt replayed the exact same normalized record.
+    IDEMPOTENT = "idempotent"
+    #: A conflicting duplicate, a route/state mismatch or malformed money.
+    CONFLICT = "conflict"
+    #: No reservation exists for this attempt.
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class BillingReconciliation:
+    """Authoritative post-execution usage bound to one execution attempt.
+
+    Identity (usage id), recorded time, ledger month and call count are
+    storage-owned and deliberately absent or storage-written here: a connector
+    may never supply ledger authority. ``billing_class`` is the execution-time
+    route bound into the claim, ``connector`` is the selected connector
+    manifest name and ``billing_evidence`` is the execution-time estimate's
+    evidence - none of the three is ever the class, name or evidence string the
+    connector reported in its own telemetry.
+    """
+
+    attempt_id: str
+    session_id: str
+    task_id: str
+    connector: str
+    billing_class: BillingClass
+    monetary_state: MonetaryState
+    #: Exact measured nano-USD for a metered route; ``None`` otherwise.
+    actual_nano_usd: int | None = None
+    #: Provider-reported USD for unbilled usage. Telemetry, never money.
+    reference_cost_usd: float | None = None
+    #: ``call_count`` is deliberately absent: one claimed execution is exactly
+    #: one external call, so storage writes 1 rather than trusting telemetry.
+    provider: str | None = None
+    model: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    billing_evidence: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationResult:
+    outcome: ReconciliationOutcome
+    #: The authoritative persisted record, for the first insert and for a
+    #: byte-identical replay. ``None`` for a conflict or a missing reservation.
+    usage: UsageRecord | None = None
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome in (
+            ReconciliationOutcome.RECONCILED,
+            ReconciliationOutcome.IDEMPOTENT,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1850,14 +2296,44 @@ class MemoryStore(Protocol):
         session_id: str,
         task_id: str,
         one_shot_fingerprints: Sequence[str],
-    ) -> bool:
+        billing: BillingClaim,
+    ) -> ExecutionClaimOutcome:
         """Atomically claim ownership in ONE transaction: verify authoritative
-        task lifecycle (reject if cancelled/terminal), transition PREPARED ->
-        IN_FLIGHT, and consume every required one-shot grant, all-or-nothing.
+        task lifecycle (reject if cancelled/terminal), rebuild the authoritative
+        ledger snapshot, verify month/exposure against ``billing``, recompute
+        the projection, require the exact approved cost-override grant when it
+        crosses the hard limit, transition PREPARED -> IN_FLIGHT, consume every
+        required one-shot grant and create the attempt-bound reservation - all
+        or nothing.
 
-        Returns True for exactly one concurrent contender; every loser returns
-        False and must not cross the connector boundary. Durable before
+        Exactly one concurrent contender gets ``CLAIMED``; every other outcome
+        wrote nothing and must not cross the connector boundary. Durable before
         ``connector.execute`` is invoked.
+
+        ``billing`` is mandatory. There is no implicit billing route and no
+        synthetic fallback claim: every execution claim states its route,
+        month, expected exposure and reservation explicitly, including
+        zero-monetary routes. A missing or invalid claim fails closed before
+        the attempt is claimed, before any grant is consumed, before any
+        reservation exists and before the connector boundary is crossed.
+        """
+        ...
+
+    def mark_reservation_unresolved(self, attempt_id: str) -> None:
+        """Move an ACTIVE reservation to UNRESOLVED; exposure is retained."""
+        ...
+
+    def reconcile_usage(
+        self, reconciliation: BillingReconciliation
+    ) -> ReconciliationResult:
+        """Atomically insert the authoritative usage row for one attempt and
+        reconcile its reservation, so measured spend replaces reserved exposure
+        without double counting.
+
+        Storage owns the usage id, the recorded timestamp and the ledger month.
+        A first record is inserted immutably; an identical replay of the same
+        attempt is idempotent; a conflicting duplicate, a route/state mismatch
+        or malformed monetary data fails closed and leaves the reservation open.
         """
         ...
 
@@ -1886,9 +2362,22 @@ class MemoryStore(Protocol):
         """
         ...
 
-    def append_usage(self, usage: UsageRecord) -> None: ...
+    def append_usage(self, usage: UsageRecord) -> None:
+        """Compatibility insertion. Rejects invalid monetary data and refuses to
+        overwrite an existing usage id with a conflicting record."""
+        ...
 
-    def monthly_monetary_cost(self, month: str | None = None) -> float: ...
+    def monthly_monetary_cost(self, month: str | None = None) -> float:
+        """Measured metered spend of the month; the compatibility view.
+
+        Enforcement uses ``ledger_snapshot`` instead: measured spend alone
+        ignores reserved exposure that is already committed to an execution.
+        """
+        ...
+
+    def ledger_snapshot(self, month: str | None = None) -> LedgerSnapshot:
+        """The authoritative monetary position used for every paid decision."""
+        ...
 
     def finalize_task(
         self,

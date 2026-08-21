@@ -85,7 +85,8 @@ class CostAndVerificationTests(unittest.TestCase):
         self.assertEqual("user-decision-123", enabled.paid_api_approval_id)
 
     def test_actual_usage_is_persisted_and_aggregated(self) -> None:
-        connector = DummyConnector(actual_cost=0.07)
+        # A metered route must project a real, strictly positive maximum.
+        connector = DummyConnector(estimate_max=0.10, actual_cost=0.07)
         run = self.core(connector).run(make_task())
         self.assertEqual(RunStatus.COMPLETED, run.status)
         self.assertAlmostEqual(0.07, self.memory.monthly_monetary_cost())
@@ -96,7 +97,9 @@ class CostAndVerificationTests(unittest.TestCase):
     def test_connector_failure_usage_is_not_lost(self) -> None:
         from jarvis.contracts import OutcomeStatus
 
-        connector = DummyConnector(actual_cost=0.05, outcome=OutcomeStatus.ERROR)
+        connector = DummyConnector(
+            estimate_max=0.10, actual_cost=0.05, outcome=OutcomeStatus.ERROR
+        )
         run = self.core(connector).run(make_task())
         self.assertEqual(RunStatus.FAILED, run.status)
         self.assertAlmostEqual(0.05, self.memory.monthly_monetary_cost())

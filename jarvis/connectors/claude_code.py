@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,7 @@ from jarvis.contracts import (
     AttestationError,
     Availability,
     BillingClass,
+    BillingIntegrityError,
     CostEstimate,
     DataClassification,
     EgressAttestation,
@@ -41,6 +43,7 @@ from jarvis.contracts import (
     VerificationRecord,
     VerificationStatus,
     canonical_path,
+    canonical_usd,
     looks_like_path,
     normalize_retrieved_text,
     normalize_url,
@@ -109,6 +112,38 @@ _OAUTH_AUTH_METHODS = frozenset({"claude.ai"})
 _FIRST_PARTY_PROVIDERS = frozenset({"firstparty", "first_party"})
 _SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
 
+
+def _reported_usd(value: Any) -> float | None:
+    """Provider-reported USD, or ``None`` when it is not a usable amount.
+
+    Malformed, negative or non-finite telemetry becomes *no* reported cost
+    instead of raising or propagating an invalid number. On the current
+    subscription route this value is reference telemetry only and never enters
+    the monetary ledger; the billing route itself is unchanged by parsing.
+    """
+    if value is None:
+        return None
+    try:
+        return float(canonical_usd(value, "total_cost_usd"))
+    except BillingIntegrityError:
+        return None
+
+
+def _token_count(value: Any) -> int:
+    """Legacy-safe token count.
+
+    The deferred nullable-token decision stands: a missing, malformed, negative
+    or non-integral field uses the existing zero representation rather than
+    raising. That zero is not evidence of a measured zero-token call, and no
+    billing is ever inferred from it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    if value < 0 or int(value) != value:
+        return 0
+    return int(value)
 
 class ClaudeCodeConnector(BaseConnector):
     manifest = ConnectorManifest(
@@ -764,11 +799,12 @@ class ClaudeCodeConnector(BaseConnector):
         billing_evidence: str = "",
         call_count: int = 0,
     ) -> UsageRecord:
-        usage_data = payload.get("usage") or {}
+        usage_data = payload.get("usage")
+        if not isinstance(usage_data, dict):
+            usage_data = {}
         model_usage = payload.get("modelUsage") or {}
         model = str(next(iter(model_usage))) if isinstance(model_usage, dict) and model_usage else None
-        reported_cost = payload.get("total_cost_usd")
-        reported_usd = float(reported_cost) if reported_cost is not None else None
+        reported_usd = _reported_usd(payload.get("total_cost_usd"))
         if billing_class is BillingClass.METERED_MONETARY:
             monetary_state = (
                 MonetaryState.MEASURED if reported_usd is not None else MonetaryState.UNKNOWN
@@ -793,8 +829,8 @@ class ClaudeCodeConnector(BaseConnector):
             model=model,
             connector=self.manifest.name,
             task_id=task.id,
-            input_tokens=int(usage_data.get("input_tokens") or 0),
-            output_tokens=int(usage_data.get("output_tokens") or 0),
+            input_tokens=_token_count(usage_data.get("input_tokens")),
+            output_tokens=_token_count(usage_data.get("output_tokens")),
             # External model-call attempts. The local auth probe is not one.
             call_count=call_count,
             estimated_cost_usd=task.estimate.monetary_maximum_usd,

@@ -28,7 +28,9 @@ from jarvis.app import (
 )
 from jarvis.connectors import claude_code
 from jarvis.contracts import (
+    AgentRun,
     BillingClass,
+    CostEstimate,
     DataClassification,
     ErrorCode,
     LoopStage,
@@ -832,6 +834,59 @@ class CompositionRootTests(unittest.TestCase):
             self.settings.claude_call_budget_usd, connector.max_budget_usd
         )
         self.assertIs(self.settings, app.settings)
+
+
+class ExitCodeMappingTests(unittest.TestCase):
+    """Structured error codes map to stable, documented CLI exit codes."""
+
+    def test_billing_integrity_failure_maps_to_the_policy_exit_code(self) -> None:
+        self.assertEqual(77, app_module.EXIT_POLICY)
+        self.assertEqual(
+            app_module.EXIT_POLICY, app_module._ERROR_EXIT[ErrorCode.BILLING_INTEGRITY_FAILED]
+        )
+        run = AgentRun(
+            RunStatus.FAILED,
+            None,
+            None,
+            error=StructuredError(
+                ErrorCode.BILLING_INTEGRITY_FAILED, "monetary integrity failed"
+            ),
+        )
+        self.assertEqual(77, app_module.JarvisApp._exit_code(run))
+
+    def test_every_error_code_has_an_exit_code(self) -> None:
+        missing = [
+            code.value for code in ErrorCode if code not in app_module._ERROR_EXIT
+        ]
+        self.assertEqual([], missing)
+
+
+class BillingEnvelopeTests(unittest.TestCase):
+    """A malformed monetary amount degrades to null instead of breaking JSON."""
+
+    def test_non_finite_billing_amounts_render_as_null(self) -> None:
+        estimate = CostEstimate(
+            billing_class=BillingClass.METERED_MONETARY,
+            maximum_usd=float("nan"),
+            resource_ceiling_usd=float("inf"),
+        )
+        payload = app_module._billing_payload(estimate)
+        self.assertIsNone(payload["monetary_maximum_usd"])
+        self.assertIsNone(payload["resource_ceiling_usd"])
+        # ``allow_nan=False`` renders it without raising.
+        self.assertIn(
+            "null", app_module.CommandResult(payload, app_module.EXIT_OK).render()
+        )
+
+    def test_valid_billing_amounts_stay_plain_floats(self) -> None:
+        estimate = CostEstimate(
+            billing_class=BillingClass.METERED_MONETARY,
+            maximum_usd=0.25,
+            resource_ceiling_usd=5.0,
+        )
+        payload = app_module._billing_payload(estimate)
+        self.assertEqual(0.25, payload["monetary_maximum_usd"])
+        self.assertEqual(5.0, payload["resource_ceiling_usd"])
 
 
 if __name__ == "__main__":

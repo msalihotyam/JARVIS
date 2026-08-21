@@ -28,6 +28,8 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     ActionScope,
     AgentRun,
+    BillingClass,
+    BillingIntegrityError,
     CostEstimate,
     DataClassification,
     ErrorCode,
@@ -43,9 +45,11 @@ from jarvis.contracts import (
     Task,
     TaskStatus,
     ToolResult,
+    canonical_usd,
     is_expired,
     next_loop_stage,
     normalize_destination,
+    require_billing_class,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
@@ -99,6 +103,7 @@ _ERROR_EXIT = {
     ErrorCode.COST_CAP_EXCEEDED: EXIT_POLICY,
     ErrorCode.PAID_API_DISABLED: EXIT_POLICY,
     ErrorCode.BILLING_ROUTE_UNKNOWN: EXIT_POLICY,
+    ErrorCode.BILLING_INTEGRITY_FAILED: EXIT_POLICY,
     ErrorCode.CONNECTOR_AMBIGUOUS: EXIT_POLICY,
     ErrorCode.EGRESS_REFUSED: EXIT_POLICY,
     ErrorCode.EXECUTION_UNKNOWN_OUTCOME: EXIT_POLICY,
@@ -386,11 +391,38 @@ def _approval_payload(request: PermissionRequest) -> dict[str, Any]:
     }
 
 
+def _finite_usd(value: Any) -> float | None:
+    """Envelope-safe USD amount; anything invalid is reported as ``None``.
+
+    The envelope is rendered with ``allow_nan=False``, so a malformed estimate
+    that reached presentation must degrade to a null rather than crash the CLI
+    or print a non-JSON number.
+    """
+    if value is None:
+        return None
+    try:
+        return float(canonical_usd(value))
+    except BillingIntegrityError:
+        return None
+
+
+def _billing_class_value(estimate: CostEstimate) -> str:
+    """Envelope-safe billing class; anything unvalidated reads as unknown.
+
+    Presentation never dereferences an enum-specific attribute on a value the
+    monetary boundary has not already validated.
+    """
+    try:
+        return require_billing_class(estimate.billing_class).value
+    except BillingIntegrityError:
+        return BillingClass.UNKNOWN.value
+
+
 def _billing_payload(estimate: CostEstimate) -> dict[str, Any]:
     return {
-        "class": estimate.billing_class.value,
-        "monetary_maximum_usd": estimate.monetary_maximum_usd,
-        "resource_ceiling_usd": estimate.resource_ceiling_usd,
+        "class": _billing_class_value(estimate),
+        "monetary_maximum_usd": _finite_usd(estimate.monetary_maximum_usd),
+        "resource_ceiling_usd": _finite_usd(estimate.resource_ceiling_usd),
     }
 
 
@@ -431,8 +463,8 @@ def _result_payload(result: ToolResult) -> dict[str, Any]:
             "call_count": usage.call_count,
             "billing_class": usage.billing_class.value,
             "monetary_state": usage.monetary_state.value,
-            "monetary_cost_usd": usage.monetary_cost_usd,
-            "reference_cost_usd": usage.reference_cost_usd,
+            "monetary_cost_usd": _finite_usd(usage.monetary_cost_usd),
+            "reference_cost_usd": _finite_usd(usage.reference_cost_usd),
             "billing_evidence": usage.billing_evidence,
         },
         "verification": {

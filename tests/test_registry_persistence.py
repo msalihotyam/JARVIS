@@ -110,16 +110,30 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         self.assertEqual(run.task.id, decisions[0].task_id)
 
     def test_schema_has_version_foreign_keys_and_wal(self) -> None:
-        # H2 added the execution-attempt journal at schema 4.
-        self.assertEqual(4, SCHEMA_VERSION)
+        # H2 added the execution-attempt journal at schema 4; H3 added the
+        # attempt-bound execution-billing/reservation journal at schema 5.
+        self.assertEqual(5, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
         connection = sqlite3.connect(self.memory.database_path)
         try:
             event_fks = connection.execute("PRAGMA foreign_key_list(event_log)").fetchall()
+            billing_fks = connection.execute(
+                "PRAGMA foreign_key_list(attempt_billing)"
+            ).fetchall()
+            billing_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(attempt_billing)")
+            }
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         finally:
             connection.close()
         self.assertGreaterEqual(len(event_fks), 1)
+        # The reservation is bound to its execution attempt and carries the
+        # ledger month that fixes which monthly cap receives the spend.
+        self.assertGreaterEqual(len(billing_fks), 1)
+        self.assertIn("execution_attempts", {row[2] for row in billing_fks})
+        self.assertIn("ledger_month", billing_columns)
+        self.assertIn("reserved_nano_usd", billing_columns)
         self.assertEqual("wal", journal_mode.lower())
 
     def test_legacy_database_is_migrated_additively(self) -> None:
@@ -146,6 +160,8 @@ class RegistryAndPersistenceTests(unittest.TestCase):
             check.close()
         self.assertIn("tasks", tables)
         self.assertIn("schema_migrations", tables)
+        self.assertIn("execution_attempts", tables)
+        self.assertIn("attempt_billing", tables)
 
 
 if __name__ == "__main__":

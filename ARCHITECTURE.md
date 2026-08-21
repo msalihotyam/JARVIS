@@ -439,6 +439,249 @@ Dördüncü Codex incelemesinin tek bulgusu için son düzeltme:
   kendi kimliğiyle anahtarlandığı ve yürütme yolunda zaten yazıldığı için burada
   yeniden yazılması idempotenttir; mevcut H2 kullanım semantiği korunur.
 
+### 4.8 Faturalandırma / defter bütünlüğü (H3, uygulandı)
+
+Parasal doğrulama, aylık üst sınırın otoriter uygulanması ve yürütme sonrası
+kullanım mutabakatı kapatıldı. Değişmez emniyet ilkesi: **JARVIS, harcanacak
+paranın tam olarak ne olduğunu ve mevcut aylık maruziyetin tam olarak ne
+olduğunu kanıtlayamıyorsa ücretli çağrıyı yapmaz ve sonucu deftere yazmaz.**
+Bu yerel işlem sertleştirmesidir; dağıtık exactly-once değildir. H1 onay/egress
+attestation ve H2 yürütme/yaşam döngüsü değişmezleri aynen korunur.
+
+- **Kanonik parasal doğrulama** (`jarvis/contracts.py`): `canonical_usd()`
+  bool'u, sayısal olmayan değeri, NaN'ı, +/- sonsuzu ve negatifi reddeder;
+  dönüşüm `Decimal(str(value))` ile yapılır. Kanonik hassasiyet **tam olarak
+  dokuz ondalık basamaktır**; yuvarlama `ROUND_CEILING`'dir, yani parayı asla
+  eksik saymaz. Kalıcı temsil **tam sayı nano-USD**'dir (`nano_usd()`);
+  seçilen sabit genişlikli temsile (SQLite işaretli 64-bit INTEGER) sığmayan
+  değer kesilmez, reddedilir. Otoriter karşılaştırmalar ve işlem değerleri
+  ikili kayan nokta aritmetiği kullanmaz.
+  - Metered `maximum_usd`: sonlu ve **kesinlikle sıfırdan büyük**.
+  - Metered `minimum_usd`: sonlu, negatif olmayan, maksimumu aşmayan.
+  - Kaynak tavanı (`resource_ceiling_usd`): sonlu ve kesinlikle pozitif.
+  - Ölçülmüş gerçek maliyet: sıfır olabilir, sonlu ve negatif olmamalıdır.
+  - Bozuk ham enum/sınıflandırma/durum değerleri kapalı biçimde başarısız olur.
+  - Tek yeni yapısal hata kodu `BILLING_INTEGRITY_FAILED`; mevcut CLI
+    politika/güvenlik çıkış kodu **77**'ye eşlenir.
+  - `Settings` parasal alanları NaN/sonsuz için de doğrulanır (NaN her sıradan
+    aralık karşılaştırmasını sessizce geçerdi). Sert aylık sınır tam 20 USD.
+- **Tipli defter anlık görüntüsü:** `LedgerSnapshot` (UTC defter ayı, ölçülmüş
+  metered harcama, açık/çözülmemiş rezerve maruziyet, toplam maruziyet,
+  çözülmemiş parasal yükümlülük var mı, geçerlilik durumu ve geçersizken
+  sınırlı gizli-olmayan gerekçe). `monthly_monetary_cost()` ölçülmüş-harcama
+  görünümü olarak uyumlu kalır ama artık anlık görüntüden türetilir;
+  **uygulama çıplak float SUM değil bu otoriter anlık görüntüyü kullanır.**
+  Bozuk kalıcı parasal satır veya rezervasyon anlık görüntüyü geçersiz kılar:
+  harcamadan asla düşemez ve ücretli yürütme için sessizce yok sayılamaz.
+  (Kriptografik veritabanı kurcalama koruması H3 kapsamı dışındadır.)
+- **Ekleyici yürütme-faturalandırma günlüğü (şema 4 → 5):** Tek yeni tablo
+  `attempt_billing`; her yürütme girişiminin **en fazla bir** faturalandırma
+  kaydı olur: birincil kimlik olarak `attempt_id`, **depo sahipli** benzersiz
+  `usage_id`, sabit UTC `ledger_month`, otoriter `billing_class`, tam sayı
+  `reserved_nano_usd`, durum (`active`/`reconciled`/`unresolved`), isteğe bağlı
+  `actual_nano_usd` ve depo sahipli zaman damgaları. Migration ekleyici ve
+  idempotenttir; şema-4 session, task, grant, H2 girişim ve kullanım kayıtları
+  yeniden yazılmaz.
+- **Atomik talep, üst sınır kontrolü ve rezervasyon:** `begin_execution` artık
+  boolean değil tipli sonuç döner: `CLAIMED`, `LOST`,
+  `BILLING_RECHECK_REQUIRED`, `LEDGER_INVALID`. Değişmez `BillingClaim` (defter
+  ayı, tam beklenen mevcut maruziyet, istenen rezervasyon, sabit sert sınır,
+  otoriter faturalandırma sınıfı/kapı durumu ve gerektiğinde tam cost-override
+  grant fingerprint'i) talebe bağlanır. H2'nin **aynı `BEGIN IMMEDIATE`
+  işleminde** — otoriter yaşam döngüsü kontrolü, `PREPARED → IN_FLIGHT` CAS ve
+  tüm tek-sefer grant tüketimiyle birlikte — defter anlık görüntüsü yeniden
+  kurulur, ay ve maruziyet talep anlık görüntüsüyle **tam olarak** eşleştirilir,
+  projeksiyon yeniden hesaplanır, sınır aşılıyorsa tam onaylı cost-override
+  grant'i doğrulanır ve girişime bağlı rezervasyon oluşturulur. Hepsi birlikte
+  commit olur veya birlikte geri alınır.
+  - Maruziyet ön kontrolden veya onaydan sonra değiştiyse:
+    `BILLING_RECHECK_REQUIRED` döner; girişim talep edilmez, hiçbir grant
+    tüketilmez, rezervasyon oluşturulmaz, connector sınırı geçilmez. Mevcut
+    sınırlı regate mekanizmasıyla `COST_PREFLIGHT`'a dönülür ve **yeni tam
+    projeksiyondan taze bir maliyet isteği** üretilir.
+  - Daha düşük/bayat bir projeksiyon için onaylanmış cost-override grant'i
+    daha yüksek bir projeksiyonu asla yetkilendiremez (fingerprint kanonik
+    dokuz basamaklı projeksiyona bağlıdır).
+  - Abonelik/ek-ücretsiz yürütmeler yol ve idempotentlik bağlaması için
+    **sıfır değerli** girişim faturalandırma kaydı oluşturur, parasal
+    maruziyet eklemez.
+- **Çökme ve yeniden başlatma:** `IN_FLIGHT` veya `UNKNOWN_OUTCOME` bir girişim
+  aktif rezervasyonunu korur. Yeniden başlatma onu serbest bırakmaz,
+  connector'ı yeniden oynatmaz ve sıfır maliyet saymaz. Aktif veya çözülmemiş
+  rezervasyon, geçerli mutabakata ya da açık gelecek kurtarma çalışmasına kadar
+  parasal maruziyetin parçası kalır. H3'te kurtarma arayüzü veya otomatik
+  rezervasyon serbest bırakma **yoktur**.
+- **Otoriter kullanım mutabakatı:** AgentCore ürün yolu artık connector'ın
+  sahip olduğu `append_usage()` davranışını kullanmaz; girişime bağlı
+  `reconcile_usage()` kullanır. Depo/çekirdek şunlara sahiptir: kullanım
+  kimliği, kayıt zamanı ve defter ayı, session/task kimliği, connector kimliği,
+  talep edilen yürütmenin çağrı sayısı, yürütme zamanı otoriter faturalandırma
+  sınıfı ve kanıtı. **Connector'ın verdiği kimlik veya zaman asla defter
+  otoritesi değildir.**
+  - **Defter ayı bağlaması (ay dönümü):** Otoriter defter ayı, atomik
+    talep/rezervasyon işlemi sırasında depo tarafından `attempt_billing.
+    ledger_month` alanına sabitlenir ve mutabakat **tam olarak o kalıcı ayı**
+    kullanır. Rezervasyonun yerine geçen kullanım satırının parasal zaman
+    damgası (`recorded_at`) bu aydan türetilir (`ledger_timestamp()`: normalde
+    depo sahipli talep zamanı, o ayın dışında kalırsa ayın ilk anı). Böylece
+    bir UTC ay sınırını aşan metered yürütme, tamamlanma zamanı, mutabakat
+    anındaki duvar saati veya connector telemetrisi ne derse desin, kendi
+    rezervasyonunu **kendi ayında** değiştirir; ne rezervasyon ne de gerçek
+    harcama aylar arasında göç eder ve geç gelen bir mutabakat yeni ayın üst
+    sınırını şişiremez. `attempt_billing.created_at`/`updated_at` yalnızca
+    operasyonel/denetim zaman damgalarıdır ve hangi aylık deftere yazılacağını
+    belirlemez. Bozuk bir ay anahtarı kapalı biçimde başarısız olur:
+    yazılırken reddedilir ve okunurken geçerli görünen boş bir pozisyon
+    üretmez.
+  - Kullanım için `INSERT OR REPLACE` kaldırıldı: ilk otoriter girişim kaydı
+    değişmez olarak eklenir, aynı girişimin tam aynı normalize kaydıyla
+    tekrarı idempotenttir, çelişen kopya kapalı biçimde başarısız olur ve
+    mevcut ilgisiz bir `usage_id` asla üzerine yazılmaz. Uyumluluk ekleme API'si
+    (`append_usage`) yalnızca mevcut depo soyutlaması/testleri için korunur ve
+    geçersiz parasal veriyi ve çelişen kopya kimliği reddeder.
+  - `METERED_MONETARY` mutabakatı `MEASURED` ve sonlu, negatif olmayan gerçek
+    maliyet gerektirir; otoriter kullanım satırı eklenir ve rezervasyon aynı
+    işlemde `reconciled` yapılır, böylece ölçülmüş harcama o girişimin rezerve
+    maruziyetinin **yerine geçer**, çift sayım olmaz.
+  - `SUBSCRIPTION_INCLUDED` / `NO_ADDITIONAL_CHARGE` için parasal durum
+    `NOT_APPLICABLE`, parasal maliyet `None`; sonlu ve negatif olmayan
+    sağlayıcı USD değeri yalnızca `reference_cost_usd` olarak saklanır; sıfır
+    rezervasyon mutabık kılınır ve parasal harcama sıfır kalır.
+  - Connector sonucu yürütme zamanı otoriter faturalandırma yolunu **asla**
+    düşüremez veya değiştiremez. Yol/durum uyuşmazlığı, bozuk parasal sonuç
+    veya bilinmeyen metered gerçek maliyet: `BILLING_INTEGRITY_FAILED` ile
+    başarısız olur, rezervasyon aktif/çözülmemiş kalır, sınırlı ve redakte
+    edilmiş denetim olayı yazılır, VERIFY/PRESENT'e devam edilmez ve ne karar
+    ne de `task_completed` olayı kalıcılaştırılır.
+  - Ölçülmüş gerçek maliyet onaylı tahmin maksimumunu aşarsa: tam geçerli
+    gerçek maliyet kaydedilir (asla kırpılmaz veya gizlenmez), defter o gerçek
+    maliyete mutabık kılınır, görev `BILLING_INTEGRITY_FAILED` ile başarısız
+    olur, tamamlanmış karar/olay üretilmez ve sonraki metered iş oluşan defter
+    maruziyetini görür.
+  - H2 iptal tahkimi korunur: otoriter iptal terminal yarışı kazanmaya devam
+    eder, bu sırada halihazırda oluşmuş geçerli kullanım dayanıklı biçimde
+    muhasebeleşmiş kalır.
+- **Claude telemetri dayanıklılığı:** Faturalandırma yolu değişmedi. Bozuk,
+  negatif veya sonlu olmayan `total_cost_usd` artık istisna yükseltmek yerine
+  **referans maliyeti yok** olur; mevcut abonelik yolunda bu değer zaten
+  yalnızca referanstır. Eksik, bozuk, negatif veya tam sayı olmayan token
+  alanları mevcut eski güvenli sıfır gösterimini kullanır; nullable token
+  telemetrisi ertelenmiş kararı korunur ve token tabanlı faturalandırma/çıkarım
+  eklenmemiştir.
+
+H3'te değişmeyenler: onay isteği/fingerprint kurulumu, kanonik giden yük
+kurulumu, onay-zamanı ile yürütme-zamanı yük eşitliği, connector sahipli yan
+etki attestation'ı, tek-sefer grant'in ya hep ya hiç tüketimi, terminal durum
+değişmezliği, iptal kazananı tahkimi, bayat resume koruması,
+`IN_FLIGHT`/`UNKNOWN_OUTCOME` yeniden-oynatmama semantiği, deterministik
+planlama, sınırlı sınıflandırılmış getirme, tipli progress durumu ve izin modu
+davranışı. `Task` üzerinde tutulan faturalandırma/progress durumu yürütme
+otoritesi değildir; otoriter yol connector'dan yeniden türetilir, attest
+edilir ve atomik yürütme talebine bağlanır. Ham connector telemetrisi, yük,
+kimlik bilgisi veya sır taşıyan tanılama yazdırılmaz.
+
+Bağımsız Codex incelemesinin beş P1 bulgusu için son düzeltmeler:
+
+- **P1-A — Connector faturalandırma verisi otorite değildir:** Yürütme zamanı
+  rotası (`task.estimate.billing_class`) tek otoritedir; connector telemetrisi
+  yalnızca gözlemdir. Connector bir sınıf bildiriyorsa otoriter rotayla **birebir
+  eşleşmelidir** (`UNKNOWN` "bildirmedi" demektir); farklı bir sınıf düşürme veya
+  yükseltme girişimidir ve kapalı biçimde reddedilir. Sınıf/durum/para matrisi
+  tek bir paylaşılan doğrulayıcıda toplanmıştır
+  (`validate_monetary_matrix`): `METERED_MONETARY` → `MEASURED` + zorunlu,
+  sonlu, negatif olmayan tutar (referans figür yerine geçemez);
+  `SUBSCRIPTION_INCLUDED`/`NO_ADDITIONAL_CHARGE` → `NOT_APPLICABLE`, parasal
+  tutar `None`, yalnızca `reference_cost_usd`; `UNKNOWN` → asla temiz bir
+  parasal yürütme olarak mutabık kılınamaz. Ayrıca otoriter connector kimliği
+  seçili connector manifest'inden, otoriter kanıt yürütme zamanı tahmininden ve
+  otoriter `call_count` tek talep edilen yürütme için **tam olarak 1**'den
+  gelir; `UsageRecord.connector`, `billing_evidence` ve `call_count` telemetrisi
+  deftere yazılmaz. Uyuşmazlıkta `BILLING_INTEGRITY_FAILED`, rezervasyon
+  aktif/çözülmemiş kalır, VERIFY/PRESENT'e geçilmez, karar veya
+  `task_completed` üretilmez.
+- **P1-B — Defter geçerliliği tüm ilgili satırlarla belirlenir:** Anlık görüntü
+  artık yalnızca "zaten düzgün görünen" `METERED_MONETARY + MEASURED` satırlarını
+  seçmez; **ayın tüm kullanım satırlarını ve tüm rezervasyon satırlarını**
+  inceler. Enum tamlığı, parasal durum, sabit-nokta tutarlar, negatif olmama,
+  zorunlu/null kombinasyonları, rota/durum/para matrisi, kalıcı tam sayı
+  telemetrisi, kullanım kimliği tekilliği ve rezervasyon ↔ otoriter kullanım
+  ilişkisi doğrulanır. Bozuk/kurcalanmış bir satır artık maruziyetten sessizce
+  düşmez: anlık görüntü `valid=False` olur, sınırlı gizli-olmayan gerekçe
+  taşır ve hiçbir ücretli/metered yürütme talebi ilerleyemez.
+- **P1-C — `BillingClaim` zorunludur ve 20 USD tavanı depoya aittir:** Her
+  yürütme talebi tipli bir `BillingClaim` ve bir rezervasyon taşır; sıfır
+  parasal rotalar dahil. Depo sınırında tam tip aranır (ham dict/str/alt sınıf
+  reddedilir), tüm parasal alanlar otoriter işlemin içinde yeniden doğrulanır
+  (tam sayı, sonlu, negatif olmayan; metered rezervasyon kesinlikle pozitif,
+  metered olmayan tam olarak sıfır; geçerli defter ayı; geçerli beklenen
+  maruziyet; tam enum sınıfı ve boş olmayan kapı durumu). Aylık sert tavan
+  `MONTHLY_HARD_LIMIT_NANO_USD` ile depoya aittir: **çağıranın bildirdiği daha
+  büyük bir tavana asla güvenilmez**, `limit_nano_usd` kanonik değere birebir
+  eşit olmalıdır. Projeksiyon tavanı aşıyorsa, verilen cost-override
+  fingerprint'i kalıcı, onaylı, süresi dolmamış ve **gerçekten
+  `override_monthly_cost_cap` eylemine ait** bir isteğe karşılık gelmeli ve
+  attestation'ındaki `cost_gate` bu işlemde yeniden hesaplanan projeksiyon ile
+  tavanı birebir bağlamalıdır; "herhangi bir geçerli grant fingerprint'i" kabul
+  edilmez. Geçersiz/eksik/bayat override: talep yok, grant tüketimi yok,
+  rezervasyon yok, connector çağrısı yok.
+- **P1-D — Sahipliği kaybeden `LOST` döner, faturalandırma yeniden kontrolü
+  değil:** `begin_execution` sıralaması sözleşmenin parçasıdır. Önce bu
+  çağıranın tam olarak o girişimi hâlâ sahiplenip sahiplenemeyeceği belirlenir
+  (girişim kimliği, session, task ve durum). Girişim artık `PREPARED` değilse
+  ya da başka bir session/task'a aitse **anında `LOST`** döner: defter yeniden
+  kontrolü yapılmaz, grant tüketilmez, rezervasyon oluşturulmaz ve görev
+  `COST_PREFLIGHT`'a geri gönderilmez — yarışı kaybetmek bir faturalandırma
+  değişikliği değildir. Yalnızca hâlâ talep edilebilir bir aday otoriter defter
+  karşılaştırmasına ve rezervasyona ilerler; gerçek maruziyet değişimi hâlâ
+  `BILLING_RECHECK_REQUIRED` üretir.
+- **P1-E — Çalışma zamanı tip tamlığı ve SQLite tam sayı sınırları:** Otoriter
+  faturalandırma sözleşmelerinde ham string bir enum üyesine eşdeğer değildir
+  (`require_billing_class`/`require_monetary_state`); `billing_class=
+  "metered_monetary"` gibi bir değer artık kalıcılık içinde `.value` üzerinde
+  çökmek yerine yapısal faturalandırma bütünlüğü hatasıyla kapanır. Ertelenmiş
+  token politikası korunur (alanlar null olamayan tam sayı, telemetri yoksa
+  eski güvenli sıfır) ve SQLite tam sayı temsil edilebilirliğine genişletilir:
+  connector'ın bildirdiği `input_tokens`/`output_tokens` yalnızca gerçek tam
+  sayı, bool olmayan, negatif olmayan ve `0 .. 2^63-1` aralığında kabul edilir,
+  aksi hâlde `0`'a normalize edilir (`persistable_count`), böylece devasa bir
+  Python tam sayısı sürücüye ulaşıp `OverflowError` fırlatamaz. Uyumluluk
+  ekleme yolu (`append_usage`) aynı değerleri normalize etmek yerine yapısal
+  hatayla reddeder. Token telemetrisi H3'te yeniden tasarlanmamıştır.
+
+Dördüncü bağımsız incelemenin üç P1 bulgusu için son düzeltmeler:
+
+- **P1-A — `BillingClaim` zorunludur:** Depo-bağımsız sözleşmede ve SQLite
+  uygulamasında `billing` artık isteğe bağlı değildir; `None` varsayılanı ve
+  sentetik sıfır-maliyet/`NO_ADDITIONAL_CHARGE` yedek talep üretimi tamamen
+  kaldırıldı. **Faturalandırma yokluktan çıkarsanmaz**: örtük bir
+  faturalandırma yolu yoktur. Geçerli bir talep olmadan `begin_execution()`
+  girişimi talep etmeden, hiçbir grant tüketmeden, hiçbir rezervasyon
+  oluşturmadan ve connector sınırına hiç ulaşmadan `BillingIntegrityError` ile
+  kapanır (eksik argüman ise `TypeError`). Sıfır parasal rotalar da kendi ayını,
+  beklenen maruziyetini, sıfır rezervasyonunu ve kanonik tavanını açıkça
+  bildirir.
+- **P1-B — Metered defter satırı yalnızca `MEASURED` olabilir:** Otoriter
+  *kayıtlı* kullanım geçmişi için ayrı ve daha katı bir doğrulayıcı vardır
+  (`jarvis.memory.validate_ledger_usage`); yürütme-öncesi belirsizlik hâlâ
+  `jarvis.contracts.validate_cost_estimate`'in işidir ve bu ayrım açıkça
+  belgelenmiştir. Bir defter satırı `METERED_MONETARY` ise **yalnızca**
+  `MEASURED` + mevcut, sonlu, negatif olmayan, tam temsil edilebilir tutar
+  geçerlidir. `UNKNOWN`, `NOT_APPLICABLE`, eksik tutar, bozuk tutar veya
+  negatif/sonsuz tutar geçersizdir ve artık "geçerli sıfır maliyetli parasal
+  geçmiş" gibi sayılmaz: anlık görüntü `valid=False` olur, sınırlı gerekçe
+  taşır, maruziyet sessizce sıfır sayılmaz ve yeni metered talep engellenir.
+  Çözülmemiş bir **rezervasyon** bundan farklıdır ve kendi anlamını korur:
+  kullanım satırı olmayan maruziyettir, ayrıca doğrulanır ve geçerlidir.
+- **P1-C — `CostEstimate.billing_class` tam `BillingClass` olmalıdır:**
+  Sağlayıcıdan bağımsız en erken doğrulama sınırında (`validate_cost_estimate`)
+  artık `CostEstimate` tipi ve **tam enum üyesi** aranır; ham string, sayı,
+  yabancı enum ve `.value` taklidi eden duck-typed nesneler geçersizdir. Bozuk
+  tahmin task'a hiç benimsenmez — görev fail-closed bir `UNKNOWN` tahminle
+  devam eder — böylece kalıcılık ve sunum katmanları asla doğrulanmamış bir
+  değer üzerinde enum'a özgü erişim yapmaz. Sonuç deterministik
+  `BILLING_INTEGRITY_FAILED`'dir; `AttributeError`/`TypeError` olarak dışarı
+  sızmaz, onay/yürütme atlanmaz ve connector `execute` sayısı sıfır kalır.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:
@@ -484,6 +727,7 @@ Parasal gözlem durumu ayrıca `MEASURED`, `NOT_APPLICABLE` ve `UNKNOWN` olarak 
 Kurallar:
 
 - Aylık 20 USD parasal defterine yalnızca `METERED_MONETARY` sınıflı ve `MEASURED` durumundaki gerçek harcama girer.
+- **H3 (uygulandı):** parasal tutarlar kanonik olarak doğrulanır (bool/sayısal olmayan/NaN/sonsuz/negatif reddedilir, `Decimal(str(value))`, tam dokuz ondalık basamak, kalıcı temsil tam sayı nano-USD). Metered bir `maximum_usd` sonlu ve sıfırdan büyük olmak zorundadır; aksi hâlde görev anlamlı bir ön kontrolü atlayamadan `BILLING_INTEGRITY_FAILED` ile kapanır. Ayrıntılı sözleşme `ARCHITECTURE.md` §4.8'dedir.
 - `SUBSCRIPTION_INCLUDED` ve `NO_ADDITIONAL_CHARGE` kullanım 20 USD sert sınırını tüketmez; uydurma sıfır maliyet de üretilmez.
 - Sağlayıcı, faturalandırılmayan kullanım için USD karşılığı bildirirse bu değer yalnızca referans/telemetri (`reference_cost_usd`) olarak saklanır, parasal harcama sayılmaz.
 - Güvenilir biçimde elde edilebiliyorsa token, çağrı sayısı, sağlayıcı, model ve connector telemetrisi kaydedilir.
@@ -504,6 +748,7 @@ Kurallar:
 - Her ücretli görevden önce mümkünse model, tahmini token, tahmini maliyet aralığı ve belirsizlik gösterilir.
 - Çalışma sırasında gerçek token ve yaklaşık dolar karşılığı izlenebilir; görev sonunda gerçek kullanım kaydedilir.
 - Aylık gerçek parasal kullanım SQLite usage ledger'da toplanır; toplama yalnızca `METERED_MONETARY` + `MEASURED` kayıtları dahil eder. Görev öncesi maksimum parasal tahmin mevcut aylık harcamayla birlikte 20 USD'yi aşarsa görev durur ve yalnızca o göreve bağlı açık cost-override grant'iyle devam eder.
+- **H3 (uygulandı):** aylık maruziyet artık ölçülmüş harcama **artı** hâlâ açık olan girişim rezervasyonlarıdır ve üst sınır, yürütme talebinin atomik `BEGIN IMMEDIATE` işleminin içinde otoriter biçimde kontrol edilip rezerve edilir. Böylece iki eşzamanlı metered görev aynı bakiyeye karşı ön kontrolü birlikte geçemez; kaybeden hiçbir grant tüketmez, rezervasyon oluşturmaz ve connector sınırını geçmez.
 - `paid_api_enabled` varsayılan olarak false kalır; kalıcı olarak açılması kaydedilmiş açık kullanıcı karar kimliği gerektirir. Kapalıyken ücretli bir görev ayrıca göreve özel billing onayı ister.
 - Yerel işlem, ilgili bağlamı seçerek küçültme, özetleme ve gereksiz model çağrılarını önleme temel optimizasyonlardır.
 - Aynı işi iki büyük modele gereksiz yere yaptırmak varsayılan değildir.

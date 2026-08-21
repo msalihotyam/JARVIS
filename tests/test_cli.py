@@ -35,7 +35,7 @@ from jarvis.contracts import (
     SideEffect,
     StructuredError,
 )
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import DummyConnector, safe_cleanup
@@ -190,13 +190,14 @@ class CliTestCase(unittest.TestCase):
     def test_status_output_is_backward_compatible(self) -> None:
         expected = {
             "mode": "local",
-            "schema_version": 4,
+            "schema_version": 5,
             "permission_mode": "session",
             "monthly_target_usd": 20.0,
             "monthly_hard_limit_usd": 20.0,
             "paid_api_enabled": False,
         }
-        self.assertEqual(4, self.memory.schema_version())
+        self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
+        self.assertEqual(5, SCHEMA_VERSION)
         for argv in ([], ["status"]):
             with self.subTest(argv=argv):
                 code, output, errors = self.invoke(argv, app_factory=_must_not_build)

@@ -3,37 +3,62 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+from uuid import uuid4
 
 from jarvis.contracts import (
+    COST_CAP_GATE,
+    MAX_NANO_USD,
+    MAX_SQLITE_INTEGER,
+    MONTHLY_HARD_LIMIT_NANO_USD,
     RETRIEVAL_CANDIDATE_WINDOW,
     AttemptState,
+    BillingClaim,
     BillingClass,
+    BillingIntegrityError,
+    BillingReconciliation,
     DataClassification,
     DecisionRecord,
     ExecutionAttempt,
+    ExecutionClaimOutcome,
+    LedgerSnapshot,
     LoopCheckpoint,
     LoopStage,
     MemoryRetrievalQuery,
     MonetaryState,
     PermissionGrant,
     PermissionRequest,
+    ReconciliationOutcome,
+    ReconciliationResult,
+    ReservationState,
     RetrievedContext,
     SessionState,
     Task,
     TaskStatus,
     UsageRecord,
+    billing_class_from_raw,
     build_retrieved_context,
+    canonical_usd,
+    format_usd,
+    ledger_month,
+    monetary_state_from_raw,
+    nano_usd,
+    normalize_symbol,
+    persistable_count,
+    require_billing_class,
+    require_monetary_state,
+    reservation_state_from_raw,
+    usd_from_nano,
     utc_now,
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -65,8 +90,174 @@ _TERMINAL_STATUS_VALUES = frozenset(
 )
 
 
+def _exact_nano(value: Any, field: str) -> int:
+    """An exact, non-negative, persistable integer nano-USD amount."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BillingIntegrityError(f"{field}: not an exact integer amount")
+    if value < 0 or value > MAX_NANO_USD:
+        raise BillingIntegrityError(f"{field}: outside the monetary range")
+    return value
+
+
+def validate_ledger_usage(
+    billing_class: BillingClass,
+    monetary_state: MonetaryState,
+    monetary_cost_usd: Any,
+    reference_cost_usd: Any,
+    *,
+    where: str,
+) -> None:
+    """The authoritative class/state/money matrix for *recorded* usage history.
+
+    This validates what a ledger row is allowed to be, not what a connector may
+    be uncertain about before it runs. Pre-execution uncertainty belongs to
+    ``jarvis.contracts.validate_cost_estimate``; by the time a row exists in the
+    monthly ledger there is nothing left to be uncertain about, so the metered
+    route admits exactly one shape:
+
+    * ``METERED_MONETARY`` -> ``MEASURED`` only, with a present, finite,
+      non-negative, exactly representable amount. ``UNKNOWN``,
+      ``NOT_APPLICABLE``, a missing amount or a malformed amount are all
+      invalid; a provider "reference" figure can never be substituted.
+    * ``SUBSCRIPTION_INCLUDED`` / ``NO_ADDITIONAL_CHARGE`` -> ``NOT_APPLICABLE``
+      with no monetary amount at all; only a finite, non-negative
+      ``reference_cost_usd`` may survive, and it is never money.
+    * ``UNKNOWN`` -> never measured and never monetary. This is the legacy
+      "route could not be established" row; it contributes no spend.
+
+    An unresolved *reservation* is a different thing entirely and keeps its own
+    semantics: it is exposure without a usage row, validated separately.
+    """
+    require_billing_class(billing_class, f"{where}.billing_class")
+    require_monetary_state(monetary_state, f"{where}.monetary_state")
+    if reference_cost_usd is not None:
+        canonical_usd(reference_cost_usd, f"{where}.reference_cost_usd")
+    if billing_class is BillingClass.METERED_MONETARY:
+        if monetary_state is not MonetaryState.MEASURED:
+            # A recorded metered row is settled money or it is corruption; it
+            # is never a valid zero-cost monetary history entry.
+            raise BillingIntegrityError(f"{where}: metered row is not measured")
+        if monetary_cost_usd is None:
+            raise BillingIntegrityError(
+                f"{where}: measured metered row carries no amount"
+            )
+        canonical_usd(monetary_cost_usd, f"{where}.monetary_cost_usd")
+        return
+    if billing_class in (
+        BillingClass.SUBSCRIPTION_INCLUDED,
+        BillingClass.NO_ADDITIONAL_CHARGE,
+    ):
+        if monetary_state is not MonetaryState.NOT_APPLICABLE:
+            raise BillingIntegrityError(f"{where}: unbilled route is not not_applicable")
+        if monetary_cost_usd is not None:
+            raise BillingIntegrityError(f"{where}: unbilled route carries an amount")
+        return
+    # UNKNOWN: never a measured monetary row.
+    if monetary_state is MonetaryState.MEASURED or monetary_cost_usd is not None:
+        raise BillingIntegrityError(f"{where}: unknown route carries measured money")
+
+
+def validate_usage_record(usage: UsageRecord) -> None:
+    """Fail closed on data that must never reach the ledger.
+
+    Exact enum members are required at this runtime boundary, the class/state/
+    money matrix is enforced, and every persisted integer must fit SQLite's
+    INTEGER range so an oversized Python int fails as policy rather than as a
+    driver ``OverflowError``.
+    """
+    validate_ledger_usage(
+        usage.billing_class,
+        usage.monetary_state,
+        usage.monetary_cost_usd,
+        usage.reference_cost_usd,
+        where="usage",
+    )
+    canonical_usd(usage.estimated_cost_usd, "estimated_cost_usd")
+    for field in ("input_tokens", "output_tokens", "call_count"):
+        value = getattr(usage, field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > MAX_SQLITE_INTEGER
+        ):
+            raise BillingIntegrityError(f"{field}: not a persistable integer count")
+
+
+#: The ledger-relevant identity of a usage row. ``recorded_at`` is deliberately
+#: excluded: it is storage-owned and legitimately differs between a first write
+#: and an identical replay of the same attempt.
+_USAGE_IDENTITY_FIELDS = (
+    "id",
+    "session_id",
+    "task_id",
+    "provider",
+    "model",
+    "connector",
+    "input_tokens",
+    "output_tokens",
+    "call_count",
+    "estimated_cost_usd",
+    "billing_class",
+    "monetary_state",
+    "monetary_cost_usd",
+    "reference_cost_usd",
+    "billing_evidence",
+)
+
+
+def _same_normalized_usage(left: UsageRecord, right: UsageRecord) -> bool:
+    """Whether two usage rows are the same normalized ledger record."""
+    return all(
+        getattr(left, name) == getattr(right, name)
+        for name in _USAGE_IDENTITY_FIELDS
+    )
+
+
+#: Exact shape of a persisted UTC ledger month key (``YYYY-MM``).
+_LEDGER_MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def validated_ledger_month(value: Any) -> str:
+    """Fail-closed decoding of a persisted ledger month key."""
+    if not isinstance(value, str) or not _LEDGER_MONTH_PATTERN.match(value):
+        raise BillingIntegrityError("ledger_month: not a valid UTC month key")
+    return value
+
+
+def ledger_timestamp(month: str, claimed_at: Any) -> str:
+    """The authoritative monetary timestamp for an attempt's ledger month.
+
+    Monthly accounting keys on ``substr(recorded_at, 1, 7)``, so the usage row
+    that replaces a reservation must carry a timestamp inside the month the
+    reservation was fixed to at claim time. The storage-owned claim time is
+    reused when it already falls in that month - the normal case, and it keeps
+    ledger ordering meaningful - otherwise the first instant of the month is
+    used so the row can never land outside it.
+
+    Reconciliation wall-clock time, completion time and connector-supplied
+    timestamps are never consulted: an execution claimed in month A stays
+    accounted in month A even when it concludes in month B, so its reservation
+    is replaced in place and neither the reservation nor the actual spend can
+    migrate between monthly caps.
+    """
+    key = validated_ledger_month(month)
+    if isinstance(claimed_at, str) and claimed_at[:7] == key:
+        return claimed_at
+    return f"{key}-01T00:00:00+00:00"
+
+
 class _ClaimAborted(Exception):
-    """Internal: roll back an execution claim whose one-shot grant vanished."""
+    """Internal: roll back an execution claim and report a typed outcome.
+
+    Raised for a vanished one-shot grant, a ledger that moved after approval,
+    an unreadable ledger or a failed reservation insert. Every write in the
+    claim transaction rolls back together.
+    """
+
+    def __init__(self, outcome: ExecutionClaimOutcome) -> None:
+        super().__init__(outcome.value)
+        self.outcome = outcome
 
 
 class _StaleWriterLost(Exception):
@@ -193,6 +384,9 @@ class SQLiteMemoryStore:
         if target_version == 4:
             self._migrate_execution_journal(connection)
             return
+        if target_version == 5:
+            self._migrate_execution_billing(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
 
     @staticmethod
@@ -226,6 +420,41 @@ class SQLiteMemoryStore:
             connection.execute(
                 "ALTER TABLE permission_grants ADD COLUMN consumed_by_attempt TEXT"
             )
+
+    @staticmethod
+    def _migrate_execution_billing(connection: sqlite3.Connection) -> None:
+        """Add the attempt-bound execution-billing/reservation journal (H3).
+
+        Strictly additive and idempotent: no task, grant, attempt or usage row
+        is rewritten, so every schema-4 database keeps its full history.
+        """
+        connection.executescript(
+"""
+            CREATE TABLE IF NOT EXISTS attempt_billing (
+                -- H3: at most one billing record per execution attempt.
+                attempt_id TEXT PRIMARY KEY,
+                -- Storage-owned ledger identity; a connector never supplies it.
+                usage_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                -- Fixed at claim time; a later write cannot move the month.
+                ledger_month TEXT NOT NULL,
+                -- The authoritative execution-time route the claim was made on.
+                billing_class TEXT NOT NULL,
+                -- Exact integer nano-USD; never a binary float.
+                reserved_nano_usd INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                actual_nano_usd INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(attempt_id) REFERENCES execution_attempts(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attempt_billing_month
+                ON attempt_billing(ledger_month, state);
+"""
+        )
 
     @staticmethod
     def _migrate_usage_billing(connection: sqlite3.Connection) -> None:
@@ -394,6 +623,30 @@ class SQLiteMemoryStore:
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE SET NULL,
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS attempt_billing (
+                -- H3: at most one billing record per execution attempt.
+                attempt_id TEXT PRIMARY KEY,
+                -- Storage-owned ledger identity; a connector never supplies it.
+                usage_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                -- Fixed at claim time; a later write cannot move the month.
+                ledger_month TEXT NOT NULL,
+                -- The authoritative execution-time route the claim was made on.
+                billing_class TEXT NOT NULL,
+                -- Exact integer nano-USD; never a binary float.
+                reserved_nano_usd INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                actual_nano_usd INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(attempt_id) REFERENCES execution_attempts(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attempt_billing_month
+                ON attempt_billing(ledger_month, state);
             """
         )
 
@@ -919,15 +1172,32 @@ class SQLiteMemoryStore:
         session_id: str,
         task_id: str,
         one_shot_fingerprints: Sequence[str],
-    ) -> bool:
+        billing: BillingClaim,
+    ) -> ExecutionClaimOutcome:
         """Atomic single-winner claim in ONE transaction: check authoritative
-        lifecycle, transition PREPARED -> IN_FLIGHT, and consume every required
-        one-shot grant, all-or-nothing. Durable before the connector boundary.
+        lifecycle and attempt ownership, verify the billing claim against the
+        re-derived ledger, transition PREPARED -> IN_FLIGHT, consume every
+        required one-shot grant and create the attempt-bound reservation - all
+        or nothing. Durable before the connector boundary.
 
-        The whole claim fails closed (rolls back, nobody executes) if the task
-        was cancelled/terminal first (H2-F window A), the attempt CAS is lost,
-        or any required one-shot grant is missing/expired/already consumed.
+        Ordering is part of the contract (H3 P1-D): whether this caller can
+        still own the exact attempt is settled *first*. A contender that lost
+        execution ownership gets ``LOST`` immediately and never triggers a
+        ledger recheck, a grant consumption, a reservation or a bounded regate
+        back to COST_PREFLIGHT - losing a race is not a billing change. Only an
+        otherwise-claimable candidate reaches the authoritative cap check.
+
+        ``billing`` is mandatory and carries a real reservation, including for
+        zero-monetary routes. Billing is never inferred from absence: there is
+        no implicit route and no synthetic fallback claim, so no execution can
+        be claimed without an explicit, validated monetary position.
+
+        Raises ``BillingIntegrityError`` for a missing or structurally invalid
+        claim (wrong type, malformed amounts, or a hard limit that is not the
+        canonical policy value); nothing is written and the connector boundary
+        is never reached.
         """
+        claim = self._validated_claim(billing)
         try:
             with self._connection(write=True) as connection:
                 # Window A: an authoritative cancellation or terminal decision
@@ -936,7 +1206,24 @@ class SQLiteMemoryStore:
                     "SELECT status FROM tasks WHERE id = ?", (task_id,)
                 ).fetchone()
                 if row is None or row[0] in _EXECUTION_BLOCKING_STATUSES:
-                    return False
+                    return ExecutionClaimOutcome.LOST
+                # P1-D: ownership before money. The attempt must exist, belong
+                # to this exact session/task and still be claimable.
+                attempt = connection.execute(
+                    "SELECT session_id, task_id, state FROM execution_attempts "
+                    "WHERE id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if (
+                    attempt is None
+                    or attempt["session_id"] != session_id
+                    or attempt["task_id"] != task_id
+                    or attempt["state"] != AttemptState.PREPARED.value
+                ):
+                    return ExecutionClaimOutcome.LOST
+                self._verify_billing_claim(
+                    connection, session_id, task_id, one_shot_fingerprints, claim
+                )
                 cas = connection.execute(
                     "UPDATE execution_attempts SET state = ?, updated_at = ? "
                     "WHERE id = ? AND state = ?",
@@ -949,7 +1236,7 @@ class SQLiteMemoryStore:
                 )
                 if cas.rowcount != 1:
                     # Lost the race (already IN_FLIGHT/concluded). Nothing changed.
-                    return False
+                    return ExecutionClaimOutcome.LOST
                 for fingerprint in one_shot_fingerprints:
                     consumed = connection.execute(
                         """
@@ -963,10 +1250,351 @@ class SQLiteMemoryStore:
                     if consumed.rowcount < 1:
                         # A required one-shot grant is gone; abort the whole
                         # claim so every write here rolls back atomically.
-                        raise _ClaimAborted()
-        except _ClaimAborted:
+                        raise _ClaimAborted(ExecutionClaimOutcome.LOST)
+                self._create_reservation(
+                    connection, attempt_id, session_id, task_id, claim
+                )
+        except _ClaimAborted as aborted:
+            return aborted.outcome
+        return ExecutionClaimOutcome.CLAIMED
+
+    @staticmethod
+    def _validated_claim(billing: BillingClaim) -> BillingClaim:
+        """Exact-type, exact-value validation of the caller's billing claim.
+
+        ``None``, a raw dict, a string, a subclass or a structurally impossible
+        claim is refused before any transaction opens, so a malformed claim can
+        never be persisted and an absent one is never turned into a synthetic
+        zero-cost route. The hard limit is storage-owned policy: a
+        caller-supplied larger ceiling is never trusted, it must equal the
+        canonical value.
+        """
+        if type(billing) is not BillingClaim:
+            raise BillingIntegrityError("billing claim: exact BillingClaim required")
+        billing_class = require_billing_class(billing.billing_class)
+        if billing_class is BillingClass.UNKNOWN:
+            raise BillingIntegrityError("billing claim: unknown route cannot be claimed")
+        validated_ledger_month(billing.ledger_month)
+        reservation = _exact_nano(billing.reservation_nano_usd, "reservation_nano_usd")
+        _exact_nano(billing.expected_exposure_nano_usd, "expected_exposure_nano_usd")
+        if billing_class is BillingClass.METERED_MONETARY:
+            if reservation <= 0:
+                raise BillingIntegrityError(
+                    "billing claim: a metered reservation must be > 0"
+                )
+        elif reservation != 0:
+            raise BillingIntegrityError(
+                "billing claim: a non-metered reservation must be exactly 0"
+            )
+        if billing.limit_nano_usd != MONTHLY_HARD_LIMIT_NANO_USD:
+            # Storage-owned cap. A caller cannot raise its own ceiling.
+            raise BillingIntegrityError(
+                "billing claim: hard limit is not the canonical policy value"
+            )
+        if not isinstance(billing.gate_state, str) or not billing.gate_state:
+            raise BillingIntegrityError("billing claim: gate state is missing")
+        if not isinstance(billing.cost_override_fingerprint, str):
+            raise BillingIntegrityError("billing claim: malformed override fingerprint")
+        return billing
+
+    @classmethod
+    def _verify_billing_claim(
+        cls,
+        connection: sqlite3.Connection,
+        session_id: str,
+        task_id: str,
+        one_shot_fingerprints: Sequence[str],
+        billing: BillingClaim,
+    ) -> None:
+        """Authoritative cap check inside the claim transaction (H3).
+
+        The ledger is rebuilt here, not trusted from preflight: two concurrent
+        metered tasks cannot both clear the cap against the same balance,
+        because the loser's expected exposure no longer matches.
+        """
+        snapshot = cls._snapshot_from(connection, billing.ledger_month)
+        if not snapshot.valid:
+            raise _ClaimAborted(ExecutionClaimOutcome.LEDGER_INVALID)
+        if billing.ledger_month != ledger_month():
+            # The month rolled over between preflight and the claim; the
+            # approved projection describes a month that is no longer current.
+            raise _ClaimAborted(ExecutionClaimOutcome.BILLING_RECHECK_REQUIRED)
+        if snapshot.total_nano_usd != billing.expected_exposure_nano_usd:
+            raise _ClaimAborted(ExecutionClaimOutcome.BILLING_RECHECK_REQUIRED)
+        # The cap compared against is storage-owned policy, never the claim.
+        limit = MONTHLY_HARD_LIMIT_NANO_USD
+        projected = snapshot.total_nano_usd + billing.reservation_nano_usd
+        if projected <= limit:
+            return
+        # Crossing the hard limit needs the exact approved override for THIS
+        # projection. A grant approved for a lower/stale projection carries a
+        # different fingerprint and can never authorize a higher one.
+        fingerprint = billing.cost_override_fingerprint
+        if not fingerprint or fingerprint not in tuple(one_shot_fingerprints):
+            raise _ClaimAborted(ExecutionClaimOutcome.BILLING_RECHECK_REQUIRED)
+        override = connection.execute(
+            """
+            SELECT p.request_json FROM permission_grants AS g
+              JOIN pending_approvals AS p ON p.id = g.request_id
+             WHERE g.session_id = ? AND g.task_id = ? AND g.fingerprint = ?
+               AND g.approved = 1 AND g.remember_for_session = 0
+               AND g.expires_at > ? AND g.consumed_by_attempt IS NULL
+             LIMIT 1
+            """,
+            (session_id, task_id, fingerprint, utc_now()),
+        ).fetchone()
+        if override is None or not cls._is_exact_cost_override(
+            override["request_json"], projected, limit
+        ):
+            raise _ClaimAborted(ExecutionClaimOutcome.BILLING_RECHECK_REQUIRED)
+
+    @staticmethod
+    def _is_exact_cost_override(
+        request_json: Any, projected: int, limit: int
+    ) -> bool:
+        """Whether the persisted approved request really is *this* cost override.
+
+        Not "some valid grant fingerprint": the persisted request must name the
+        monthly-cost-cap action and its attested cost gate must bind exactly the
+        projection and the limit recomputed inside this transaction. A grant
+        approved for a different action, a stale projection or a different cap
+        can never authorize the claim.
+        """
+        try:
+            request = json.loads(request_json)
+            action = request["scope"]["action"]
+            cost_gate = request["attestation"]["cost_gate"]
+        except (TypeError, ValueError, KeyError):
             return False
-        return True
+        if not isinstance(action, str) or not isinstance(cost_gate, str):
+            return False
+        if normalize_symbol(action) != COST_CAP_GATE:
+            return False
+        expected = "|".join(
+            (
+                COST_CAP_GATE,
+                format_usd(usd_from_nano(projected)),
+                format_usd(usd_from_nano(limit)),
+            )
+        )
+        # The trailing component is the paid-API switch state at approval time;
+        # it must be a legal flag, but the money-bearing components are exact.
+        return cost_gate.startswith(f"{expected}|") and cost_gate[
+            len(expected) + 1 :
+        ] in ("0", "1")
+
+    @staticmethod
+    def _create_reservation(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        session_id: str,
+        task_id: str,
+        billing: BillingClaim,
+    ) -> None:
+        """Bind the reservation to the attempt in the same claim transaction.
+
+        A subscription/no-additional-charge route still gets a zero-valued
+        record, so the route and the ledger identity are bound for idempotent
+        reconciliation without adding monetary exposure. Every field was already
+        validated by ``_validated_claim``.
+        """
+        stamp = utc_now()
+        try:
+            connection.execute(
+                """
+                INSERT INTO attempt_billing
+                    (attempt_id, usage_id, session_id, task_id, ledger_month,
+                     billing_class, reserved_nano_usd, state, actual_nano_usd,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    str(uuid4()),
+                    session_id,
+                    task_id,
+                    billing.ledger_month,
+                    billing.billing_class.value,
+                    int(billing.reservation_nano_usd),
+                    ReservationState.ACTIVE.value,
+                    stamp,
+                    stamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise _ClaimAborted(ExecutionClaimOutcome.LOST) from exc
+
+    def mark_reservation_unresolved(self, attempt_id: str) -> None:
+        """Retain the exposure of an attempt whose usage could not be accepted.
+
+        ACTIVE -> UNRESOLVED only. A reconciled reservation is never reopened,
+        and no reservation is ever released here: H3 implements no automatic
+        recovery, so the money stays visible until explicit recovery work.
+        """
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "UPDATE attempt_billing SET state = ?, updated_at = ? "
+                "WHERE attempt_id = ? AND state = ?",
+                (
+                    ReservationState.UNRESOLVED.value,
+                    utc_now(),
+                    attempt_id,
+                    ReservationState.ACTIVE.value,
+                ),
+            )
+
+    def attempt_billing_record(self, attempt_id: str) -> dict[str, Any] | None:
+        """The attempt's billing/reservation row (diagnostics and tests)."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM attempt_billing WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def reconcile_usage(
+        self, reconciliation: BillingReconciliation
+    ) -> ReconciliationResult:
+        """Authoritative attempt-bound usage reconciliation (H3).
+
+        Storage owns the usage id, the recorded timestamp and the ledger month;
+        the connector supplies telemetry only. The usage insert and the
+        reservation transition commit together, so measured spend replaces the
+        reserved exposure exactly once and never double counts.
+        """
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM attempt_billing WHERE attempt_id = ?",
+                (reconciliation.attempt_id,),
+            ).fetchone()
+            if row is None:
+                return ReconciliationResult(
+                    ReconciliationOutcome.MISSING, reason="no_reservation"
+                )
+            try:
+                authoritative = billing_class_from_raw(row["billing_class"])
+                state = reservation_state_from_raw(row["state"])
+                usage = self._authoritative_usage(row, reconciliation)
+            except BillingIntegrityError as exc:
+                return ReconciliationResult(
+                    ReconciliationOutcome.CONFLICT, reason=str(exc)
+                )
+            if reconciliation.billing_class is not authoritative:
+                # The connector may never downgrade or replace the route the
+                # execution claim was authorized against.
+                return ReconciliationResult(
+                    ReconciliationOutcome.CONFLICT, reason="route_mismatch"
+                )
+            existing = connection.execute(
+                "SELECT * FROM usage_ledger WHERE id = ?", (row["usage_id"],)
+            ).fetchone()
+            if existing is not None or state is ReservationState.RECONCILED:
+                if existing is None:
+                    return ReconciliationResult(
+                        ReconciliationOutcome.CONFLICT, reason="missing_usage_row"
+                    )
+                stored = self._usage_from_row(existing)
+                if _same_normalized_usage(stored, usage):
+                    return ReconciliationResult(
+                        ReconciliationOutcome.IDEMPOTENT, usage=stored
+                    )
+                return ReconciliationResult(
+                    ReconciliationOutcome.CONFLICT, reason="conflicting_replay"
+                )
+            try:
+                self._insert_usage(connection, usage)
+            except (BillingIntegrityError, sqlite3.IntegrityError):
+                return ReconciliationResult(
+                    ReconciliationOutcome.CONFLICT, reason="usage_id_collision"
+                )
+            connection.execute(
+                """
+                UPDATE attempt_billing
+                   SET state = ?, actual_nano_usd = ?, updated_at = ?
+                 WHERE attempt_id = ? AND state IN (?, ?)
+                """,
+                (
+                    ReservationState.RECONCILED.value,
+                    int(reconciliation.actual_nano_usd or 0),
+                    utc_now(),
+                    reconciliation.attempt_id,
+                    ReservationState.ACTIVE.value,
+                    ReservationState.UNRESOLVED.value,
+                ),
+            )
+        return ReconciliationResult(ReconciliationOutcome.RECONCILED, usage=usage)
+
+    @staticmethod
+    def _authoritative_usage(
+        row: sqlite3.Row, reconciliation: BillingReconciliation
+    ) -> UsageRecord:
+        """Build the ledger row from storage-owned identity plus telemetry.
+
+        Raises ``BillingIntegrityError`` for a route/state mismatch, a malformed
+        monetary amount or an unknown metered actual - never a silent zero.
+        """
+        billing_class = require_billing_class(reconciliation.billing_class)
+        monetary_state = require_monetary_state(reconciliation.monetary_state)
+        actual = reconciliation.actual_nano_usd
+        reference: float | None = None
+        if billing_class is BillingClass.METERED_MONETARY:
+            if monetary_state is not MonetaryState.MEASURED:
+                raise BillingIntegrityError("metered actual is not measured")
+            monetary_cost: float | None = float(
+                usd_from_nano(_exact_nano(actual, "actual_nano_usd"))
+            )
+        elif billing_class in (
+            BillingClass.SUBSCRIPTION_INCLUDED,
+            BillingClass.NO_ADDITIONAL_CHARGE,
+        ):
+            if monetary_state is not MonetaryState.NOT_APPLICABLE:
+                raise BillingIntegrityError("unbilled route is not not_applicable")
+            if actual not in (None, 0):
+                raise BillingIntegrityError("unbilled route carries a monetary amount")
+            monetary_cost = None
+            if reconciliation.reference_cost_usd is not None:
+                reference = float(
+                    canonical_usd(
+                        reconciliation.reference_cost_usd, "reference_cost_usd"
+                    )
+                )
+        else:
+            raise BillingIntegrityError("unknown route cannot be reconciled")
+        validate_ledger_usage(
+            billing_class, monetary_state, monetary_cost, reference, where="usage"
+        )
+        return UsageRecord(
+            provider=reconciliation.provider,
+            model=reconciliation.model,
+            connector=reconciliation.connector,
+            # Session and task identity come from the claim, not the connector.
+            session_id=row["session_id"],
+            task_id=row["task_id"],
+            # Connector-reported counts are normalized to the legacy-safe zero
+            # when malformed, negative, non-integral or beyond SQLite's INTEGER
+            # range; no billing is ever inferred from them.
+            input_tokens=persistable_count(reconciliation.input_tokens),
+            output_tokens=persistable_count(reconciliation.output_tokens),
+            # One claimed execution is exactly one external call.
+            call_count=1,
+            estimated_cost_usd=float(
+                canonical_usd(reconciliation.estimated_cost_usd, "estimated_cost_usd")
+            ),
+            billing_class=billing_class,
+            monetary_state=monetary_state,
+            monetary_cost_usd=monetary_cost,
+            reference_cost_usd=reference,
+            billing_evidence=reconciliation.billing_evidence,
+            # Storage-owned ledger identity and time. A connector-supplied id
+            # can never overwrite a row, and neither a connector timestamp nor
+            # the wall clock at reconciliation decides the monetary month: the
+            # row inherits the ledger month fixed by the claim transaction, so
+            # a metered execution that spans a UTC month boundary still
+            # replaces its own reservation instead of migrating to the next
+            # month's cap. ``attempt_billing.created_at``/``updated_at`` remain
+            # the operational/audit timestamps and never drive accounting.
+            id=row["usage_id"],
+            recorded_at=ledger_timestamp(row["ledger_month"], row["created_at"]),
+        )
 
     def mark_execution_unknown(self, attempt_id: str) -> None:
         with self._connection(write=True) as connection:
@@ -1042,14 +1670,35 @@ class SQLiteMemoryStore:
         return [self._attempt_from_row(row) for row in rows]
 
     def append_usage(self, usage: UsageRecord) -> None:
+        """Compatibility insertion for direct/legacy writers.
+
+        Kept because the storage abstraction and its contract tests still use
+        it, but no longer a bypass: invalid monetary data is rejected and an
+        existing usage id is never overwritten by a conflicting record. The
+        product execution path uses ``reconcile_usage`` instead, so connector
+        identity and time can never become ledger authority.
+        """
+        validate_usage_record(usage)
         with self._connection(write=True) as connection:
             self._insert_usage(connection, usage)
 
-    @staticmethod
-    def _insert_usage(connection: sqlite3.Connection, usage: UsageRecord) -> None:
+    @classmethod
+    def _insert_usage(
+        cls, connection: sqlite3.Connection, usage: UsageRecord
+    ) -> None:
+        """Immutable insert. A repeat of the byte-identical row is a no-op; a
+        conflicting duplicate id fails closed instead of silently replacing a
+        prior ledger record (the old ``INSERT OR REPLACE`` behaviour)."""
+        existing = connection.execute(
+            "SELECT * FROM usage_ledger WHERE id = ?", (usage.id,)
+        ).fetchone()
+        if existing is not None:
+            if _same_normalized_usage(cls._usage_from_row(existing), usage):
+                return
+            raise BillingIntegrityError("usage id collides with a different record")
         connection.execute(
             """
-            INSERT OR REPLACE INTO usage_ledger
+            INSERT INTO usage_ledger
                 (id, session_id, task_id, provider, model, connector,
                  input_tokens, output_tokens, estimated_cost_usd,
                  actual_cost_usd, is_paid, billing_class, monetary_state,
@@ -1080,63 +1729,207 @@ class SQLiteMemoryStore:
             ),
         )
 
-    def monthly_monetary_cost(self, month: str | None = None) -> float:
-        """Only measured, genuinely metered spend counts against the cap."""
-        month_key = month or datetime.now(timezone.utc).strftime("%Y-%m")
-        with self._connection() as connection:
-            row = connection.execute(
+    @staticmethod
+    def _snapshot_from(
+        connection: sqlite3.Connection, month_key: str
+    ) -> LedgerSnapshot:
+        """Rebuild the authoritative monetary position from persisted rows.
+
+        Validity is decided by validating the *complete* relevant monthly
+        accounting dataset, never by selecting only the rows that already look
+        well formed (H3 P1-B). Every usage row recorded in the month and every
+        reservation bound to the month is inspected: enum exactness, the
+        class/state/money matrix, exact fixed-point non-negative amounts,
+        required/null combinations, and the reservation <-> authoritative usage
+        relationship. Every amount is converted exactly to integer nano-USD, so
+        no binary float arithmetic decides an enforcement question.
+
+        Any integrity violation invalidates the whole snapshot with a bounded,
+        non-secret reason. A malformed or tampered row is never silently
+        excluded from exposure, and no paid execution may proceed on it.
+        """
+        try:
+            # A malformed month key would match no row and return a
+            # valid-looking empty position; refuse it instead.
+            validated_ledger_month(month_key)
+        except BillingIntegrityError:
+            return LedgerSnapshot.invalid(str(month_key)[:32], "malformed_ledger_month")
+        try:
+            usage_rows = connection.execute(
                 """
-                SELECT COALESCE(SUM(monetary_cost_usd), 0) FROM usage_ledger
-                WHERE substr(recorded_at, 1, 7) = ?
-                  AND billing_class = ?
-                  AND monetary_state = ?
-                  AND monetary_cost_usd IS NOT NULL
+                SELECT id, billing_class, monetary_state, monetary_cost_usd,
+                       reference_cost_usd, input_tokens, output_tokens, call_count
+                  FROM usage_ledger
+                 WHERE substr(recorded_at, 1, 7) = ?
                 """,
-                (
-                    month_key,
-                    BillingClass.METERED_MONETARY.value,
-                    MonetaryState.MEASURED.value,
-                ),
-            ).fetchone()
-        return float(row[0])
+                (month_key,),
+            ).fetchall()
+            reservation_rows = connection.execute(
+                """
+                SELECT attempt_id, usage_id, billing_class, reserved_nano_usd,
+                       state, actual_nano_usd
+                  FROM attempt_billing WHERE ledger_month = ?
+                """,
+                (month_key,),
+            ).fetchall()
+        except sqlite3.Error:
+            return LedgerSnapshot.invalid(month_key, "ledger_unreadable")
+
+        measured = 0
+        settled: dict[str, tuple[BillingClass, int | None]] = {}
+        for row in usage_rows:
+            try:
+                # A legacy pre-migration NULL reads as UNKNOWN; anything else
+                # unparseable is tampered data and fails the whole month.
+                billing_class = billing_class_from_raw(
+                    row["billing_class"] or BillingClass.UNKNOWN.value
+                )
+                monetary_state = monetary_state_from_raw(
+                    row["monetary_state"] or MonetaryState.UNKNOWN.value
+                )
+                validate_ledger_usage(
+                    billing_class,
+                    monetary_state,
+                    row["monetary_cost_usd"],
+                    row["reference_cost_usd"],
+                    where="usage",
+                )
+                for field in ("input_tokens", "output_tokens", "call_count"):
+                    value = row[field]
+                    if value is None:
+                        continue
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        or value > MAX_SQLITE_INTEGER
+                    ):
+                        raise BillingIntegrityError("usage: malformed integer telemetry")
+                amount: int | None = None
+                if (
+                    billing_class is BillingClass.METERED_MONETARY
+                    and monetary_state is MonetaryState.MEASURED
+                ):
+                    amount = nano_usd(row["monetary_cost_usd"], "monetary_cost_usd")
+                    measured += amount
+            except BillingIntegrityError:
+                return LedgerSnapshot.invalid(month_key, "malformed_usage_row")
+            # ``usage_ledger.id`` is a TEXT primary key, so a non-text value is
+            # coerced and a duplicate is impossible - but SQLite still permits
+            # NULL in a non-INTEGER primary key, which would detach a row from
+            # its reservation.
+            if not isinstance(row["id"], str) or not row["id"]:
+                return LedgerSnapshot.invalid(month_key, "malformed_usage_identity")
+            settled[row["id"]] = (billing_class, amount)
+
+        reserved = 0
+        unresolved = 0
+        for row in reservation_rows:
+            try:
+                billing_class = billing_class_from_raw(row["billing_class"])
+                state = reservation_state_from_raw(row["state"])
+                amount = _exact_nano(row["reserved_nano_usd"], "reserved_nano_usd")
+            except BillingIntegrityError:
+                return LedgerSnapshot.invalid(month_key, "malformed_reservation_row")
+            if billing_class is BillingClass.METERED_MONETARY:
+                if amount <= 0:
+                    return LedgerSnapshot.invalid(
+                        month_key, "metered_reservation_without_amount"
+                    )
+            elif billing_class is BillingClass.UNKNOWN or amount != 0:
+                return LedgerSnapshot.invalid(
+                    month_key, "impossible_reservation_route"
+                )
+            usage_id = row["usage_id"]
+            if not isinstance(usage_id, str) or not usage_id:
+                return LedgerSnapshot.invalid(month_key, "malformed_reservation_row")
+            if state is ReservationState.RECONCILED:
+                # A reconciled reservation must have its immutable authoritative
+                # usage row, and the two must agree on the money.
+                try:
+                    actual = _exact_nano(row["actual_nano_usd"], "actual_nano_usd")
+                except BillingIntegrityError:
+                    return LedgerSnapshot.invalid(
+                        month_key, "reconciled_without_actual"
+                    )
+                recorded = settled.get(usage_id)
+                if recorded is None:
+                    return LedgerSnapshot.invalid(
+                        month_key, "reconciled_without_usage_row"
+                    )
+                recorded_class, recorded_amount = recorded
+                if recorded_class is not billing_class:
+                    return LedgerSnapshot.invalid(month_key, "reconciled_route_conflict")
+                expected = actual if billing_class is BillingClass.METERED_MONETARY else None
+                if recorded_amount != expected:
+                    return LedgerSnapshot.invalid(month_key, "reconciled_amount_conflict")
+                continue
+            # ACTIVE / UNRESOLVED: nothing may be settled for it yet.
+            if row["actual_nano_usd"] is not None or usage_id in settled:
+                return LedgerSnapshot.invalid(month_key, "unsettled_reservation_conflict")
+            reserved += amount
+            if state is ReservationState.UNRESOLVED:
+                unresolved += amount
+
+        if measured > MAX_NANO_USD or measured + reserved > MAX_NANO_USD:
+            return LedgerSnapshot.invalid(month_key, "ledger_exposure_out_of_range")
+        return LedgerSnapshot(
+            month=month_key,
+            measured_nano_usd=measured,
+            reserved_nano_usd=reserved,
+            unresolved_nano_usd=unresolved,
+        )
+
+    def ledger_snapshot(self, month: str | None = None) -> LedgerSnapshot:
+        """The authoritative monetary position used for every paid decision."""
+        month_key = month or ledger_month()
+        with self._connection() as connection:
+            return self._snapshot_from(connection, month_key)
+
+    def monthly_monetary_cost(self, month: str | None = None) -> float:
+        """Measured, genuinely metered spend of the month (compatibility view).
+
+        Derived from the authoritative snapshot rather than a bare float SUM, so
+        a malformed row fails closed here too instead of quietly reducing the
+        total. Enforcement uses ``ledger_snapshot`` because measured spend alone
+        ignores exposure already reserved by a claimed execution.
+        """
+        snapshot = self.ledger_snapshot(month)
+        if not snapshot.valid:
+            raise BillingIntegrityError(f"ledger invalid: {snapshot.reason}")
+        return float(snapshot.measured_usd)
+
+    @staticmethod
+    def _usage_from_row(row: sqlite3.Row) -> UsageRecord:
+        return UsageRecord(
+            id=row["id"],
+            session_id=row["session_id"],
+            task_id=row["task_id"],
+            provider=row["provider"],
+            model=row["model"],
+            connector=row["connector"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            estimated_cost_usd=row["estimated_cost_usd"],
+            billing_class=BillingClass(
+                row["billing_class"] or BillingClass.UNKNOWN.value
+            ),
+            monetary_state=MonetaryState(
+                row["monetary_state"] or MonetaryState.UNKNOWN.value
+            ),
+            monetary_cost_usd=row["monetary_cost_usd"],
+            reference_cost_usd=row["reference_cost_usd"],
+            call_count=row["call_count"] or 0,
+            billing_evidence=row["billing_evidence"] or "",
+            recorded_at=row["recorded_at"],
+        )
 
     def usage_records(self) -> list[UsageRecord]:
         with self._connection() as connection:
             rows = connection.execute(
-                """
-                SELECT id, session_id, task_id, provider, model, connector,
-                       input_tokens, output_tokens, estimated_cost_usd,
-                       billing_class, monetary_state, monetary_cost_usd,
-                       reference_cost_usd, call_count, billing_evidence,
-                       recorded_at
-                FROM usage_ledger ORDER BY recorded_at, id
-                """
+                "SELECT * FROM usage_ledger ORDER BY recorded_at, id"
             ).fetchall()
-        return [
-            UsageRecord(
-                id=row["id"],
-                session_id=row["session_id"],
-                task_id=row["task_id"],
-                provider=row["provider"],
-                model=row["model"],
-                connector=row["connector"],
-                input_tokens=row["input_tokens"],
-                output_tokens=row["output_tokens"],
-                estimated_cost_usd=row["estimated_cost_usd"],
-                billing_class=BillingClass(
-                    row["billing_class"] or BillingClass.UNKNOWN.value
-                ),
-                monetary_state=MonetaryState(
-                    row["monetary_state"] or MonetaryState.UNKNOWN.value
-                ),
-                monetary_cost_usd=row["monetary_cost_usd"],
-                reference_cost_usd=row["reference_cost_usd"],
-                call_count=row["call_count"] or 0,
-                billing_evidence=row["billing_evidence"] or "",
-                recorded_at=row["recorded_at"],
-            )
-            for row in rows
-        ]
+        return [self._usage_from_row(row) for row in rows]
 
     def finalize_task(
         self,
@@ -1179,6 +1972,7 @@ class SQLiteMemoryStore:
                         decision.created_at,
                     ),
                 )
+                validate_usage_record(usage)
                 self._insert_usage(connection, usage)
                 connection.execute(
                     """

@@ -20,11 +20,14 @@ from jarvis.app import create_app
 from jarvis.connectors import claude_code
 from jarvis.contracts import (
     LINEAR_LOOP_STAGES,
+    MONTHLY_HARD_LIMIT_NANO_USD,
     PROGRESS_MAX_ARTIFACTS,
     PROGRESS_MAX_ISSUES,
+    BillingClaim,
     BillingClass,
     ErrorCode,
     ExecutionAttempt,
+    ExecutionClaimOutcome,
     LoopStage,
     MonetaryState,
     OutcomeStatus,
@@ -41,6 +44,7 @@ from jarvis.contracts import (
     TaskProgress,
     TaskStatus,
     UsageRecord,
+    ledger_month,
     next_loop_stage,
 )
 from jarvis.core import AgentCore
@@ -371,8 +375,24 @@ class StageAccumulationTests(ProcessBoundaryTestCase):
                 fingerprint="fp",
             )
         )
-        self.assertTrue(
-            self.memory.begin_execution(attempt.id, session.id, task.id, [])
+        # H3: every execution claim states its billing route explicitly; a
+        # free route still names its month, exposure, reservation and cap.
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            self.memory.begin_execution(
+                attempt.id,
+                session.id,
+                task.id,
+                [],
+                BillingClaim(
+                    ledger_month=ledger_month(),
+                    expected_exposure_nano_usd=0,
+                    reservation_nano_usd=0,
+                    limit_nano_usd=MONTHLY_HARD_LIMIT_NANO_USD,
+                    billing_class=BillingClass.NO_ADDITIONAL_CHARGE,
+                    gate_state="test_free_route",
+                ),
+            ),
         )
 
         pending = core.cancel(session.id, task.id)

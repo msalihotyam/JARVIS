@@ -17,10 +17,13 @@ from pathlib import Path
 from unittest import mock
 
 from jarvis.contracts import (
+    MONTHLY_HARD_LIMIT_NANO_USD,
     AttemptState,
+    BillingClaim,
     BillingClass,
     ErrorCode,
     ExecutionAttempt,
+    ExecutionClaimOutcome,
     LoopStage,
     MonetaryState,
     OutcomeStatus,
@@ -33,12 +36,29 @@ from jarvis.contracts import (
     TaskStatus,
     ToolResult,
     UsageRecord,
+    ledger_month,
 )
 from jarvis.core import AgentCore
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import DummyConnector, make_task, safe_cleanup
+
+
+def free_claim(memory, *, gate_state: str = "test_free_route") -> BillingClaim:
+    """The explicit zero-monetary claim a NO_ADDITIONAL_CHARGE route must state.
+
+    Billing is never inferred from absence, so even a free route names its
+    route, month, expected exposure, reservation and the canonical hard limit.
+    """
+    return BillingClaim(
+        ledger_month=ledger_month(),
+        expected_exposure_nano_usd=memory.ledger_snapshot().total_nano_usd,
+        reservation_nano_usd=0,
+        limit_nano_usd=MONTHLY_HARD_LIMIT_NANO_USD,
+        billing_class=BillingClass.NO_ADDITIONAL_CHARGE,
+        gate_state=gate_state,
+    )
 
 
 class _SimulatedCrash(BaseException):
@@ -299,7 +319,12 @@ class RestartTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        self.assertTrue(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
 
         fresh = JournalConnector()
         run = self.core(fresh, self.store()).resume(session.id, task.id)
@@ -315,7 +340,9 @@ class RestartTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        memory.begin_execution(attempt.id, session.id, task.id, [])
+        memory.begin_execution(
+            attempt.id, session.id, task.id, [], free_claim(memory)
+        )
         memory.mark_execution_unknown(attempt.id)
         self.assertEqual(
             AttemptState.UNKNOWN_OUTCOME, memory.latest_execution_attempt(task.id).state
@@ -413,14 +440,14 @@ class CrashWindowTests(ExecutionJournalTestCase):
         memory = self.store()
         connector = JournalConnector(store=memory)
 
-        def crashing_append(original):
+        def crashing_reconcile(original):
             def wrapper(*args, **kwargs):
                 raise _CrashInStore()
 
             return wrapper
 
         session, task = self._run_and_crash(
-            connector, memory, ("append_usage", crashing_append)
+            connector, memory, ("reconcile_usage", crashing_reconcile)
         )
         self.assertEqual(1, connector.execute_calls)
         self.assertEqual(
@@ -552,13 +579,27 @@ class GrantConsumptionTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, request.fingerprint)
         )
-        self.assertTrue(
-            memory.begin_execution(attempt.id, session.id, task.id, [request.fingerprint])
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id,
+                session.id,
+                task.id,
+                [request.fingerprint],
+                free_claim(memory),
+            ),
         )
         # The same attempt is no longer PREPARED, so a repeat claim fails and
         # the grant is not consumed a second time.
-        self.assertFalse(
-            memory.begin_execution(attempt.id, session.id, task.id, [request.fingerprint])
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            memory.begin_execution(
+                attempt.id,
+                session.id,
+                task.id,
+                [request.fingerprint],
+                free_claim(memory),
+            ),
         )
         connection = sqlite3.connect(self.database)
         try:
@@ -588,8 +629,15 @@ class GrantConsumptionTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, request.fingerprint)
         )
-        self.assertFalse(
-            memory.begin_execution(attempt.id, session.id, task.id, [request.fingerprint])
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            memory.begin_execution(
+                attempt.id,
+                session.id,
+                task.id,
+                [request.fingerprint],
+                free_claim(memory),
+            ),
         )
         # And the loop refuses to execute on an expired grant.
         run = self.core(connector, self.store()).resume(session.id, task.id)
@@ -604,10 +652,15 @@ class GrantConsumptionTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        self.assertFalse(
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
             memory.begin_execution(
-                attempt.id, session.id, task.id, ["wrong-fingerprint"]
-            )
+                attempt.id,
+                session.id,
+                task.id,
+                ["wrong-fingerprint"],
+                free_claim(memory),
+            ),
         )
 
     def test_session_reusable_grant_is_not_consumed(self) -> None:
@@ -630,7 +683,12 @@ class GrantConsumptionTests(ExecutionJournalTestCase):
             ExecutionAttempt(session.id, task.id, connector.manifest.name, request.fingerprint)
         )
         # The loop passes one_shot=None for reusable grants; nothing is consumed.
-        self.assertTrue(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
         connection = sqlite3.connect(self.database)
         try:
             row = connection.execute(
@@ -1111,7 +1169,12 @@ class BeginConcludeArbitrationTests(ExecutionJournalTestCase):
         stored.stage = LoopStage.CANCELLED
         memory.save_task(session.id, stored)
 
-        self.assertFalse(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
         self.assertEqual(
             AttemptState.PREPARED, memory.latest_execution_attempt(task.id).state
         )
@@ -1127,7 +1190,12 @@ class BeginConcludeArbitrationTests(ExecutionJournalTestCase):
         stored = memory.load_task(task.id)
         stored.status = TaskStatus.CANCEL_REQUESTED
         memory.save_task(session.id, stored)
-        self.assertFalse(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
 
     def test_conclude_refuses_to_overwrite_authoritative_cancellation(self) -> None:
         # Window B: cancellation persisted in the conclude window.
@@ -1138,7 +1206,12 @@ class BeginConcludeArbitrationTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        self.assertTrue(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
         stored = memory.load_task(task.id)
         stored.status = TaskStatus.CANCEL_REQUESTED
         memory.save_task(session.id, stored)
@@ -1206,7 +1279,12 @@ class BeginConcludeArbitrationTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        self.assertFalse(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
         run = self.core(connector, self.store()).resume(session.id, task.id)
         self.assertEqual(RunStatus.CANCELLED, run.status)
         self.assertEqual(0, connector.execute_calls)
@@ -1222,7 +1300,12 @@ class BeginConcludeArbitrationTests(ExecutionJournalTestCase):
         attempt = memory.open_execution_attempt(
             ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
         )
-        self.assertTrue(memory.begin_execution(attempt.id, session.id, task.id, []))
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
 
         run = core.cancel(session.id, task.id)
         self.assertEqual(RunStatus.CANCELLING, run.status)
@@ -1380,10 +1463,15 @@ class AllGrantConsumptionTests(ExecutionJournalTestCase):
             ExecutionAttempt(session.id, task.id, connector.manifest.name, request.fingerprint)
         )
         # One valid base grant, one missing cost grant: all-or-nothing.
-        self.assertFalse(
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
             memory.begin_execution(
-                attempt.id, session.id, task.id, [request.fingerprint, "missing-cost"]
-            )
+                attempt.id,
+                session.id,
+                task.id,
+                [request.fingerprint, "missing-cost"],
+                free_claim(memory),
+            ),
         )
         self.assertEqual(
             AttemptState.PREPARED, memory.latest_execution_attempt(task.id).state
@@ -1568,7 +1656,7 @@ class PostExecutionCancellationRaceTests(ExecutionJournalTestCase):
 
 
 class ExecutionJournalMigrationTests(unittest.TestCase):
-    """A schema-3 database upgrades to 4 additively without data loss."""
+    """A schema-3 database upgrades additively to the current schema."""
 
     V3_SCHEMA = """
     CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -1609,7 +1697,7 @@ class ExecutionJournalMigrationTests(unittest.TestCase):
 
     def test_v3_upgrades_to_v4_additively(self) -> None:
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(4, store.schema_version())
+        self.assertEqual(SCHEMA_VERSION, store.schema_version())
         connection = sqlite3.connect(self.database)
         try:
             tables = {
@@ -1635,7 +1723,7 @@ class ExecutionJournalMigrationTests(unittest.TestCase):
     def test_migration_is_idempotent(self) -> None:
         SQLiteMemoryStore(self.database)
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(4, store.schema_version())
+        self.assertEqual(SCHEMA_VERSION, store.schema_version())
 
 
 if __name__ == "__main__":

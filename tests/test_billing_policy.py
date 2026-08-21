@@ -596,7 +596,9 @@ class MeteredRouteTests(BillingPolicyTestCase):
         self.assertAlmostEqual(20.05, self.memory.monthly_monetary_cost())
 
     def test_metered_usage_is_recorded_as_measured_money(self) -> None:
-        connector = DummyConnector(name="metered", actual_cost=0.02)
+        connector = DummyConnector(
+            name="metered", estimate_max=0.10, actual_cost=0.02
+        )
         run = self.core(connector).run(make_task())
         self.assertEqual(RunStatus.COMPLETED, run.status)
         usage = self.memory.usage_records()[0]

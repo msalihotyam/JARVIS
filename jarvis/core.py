@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
+    COST_CAP_GATE,
+    PAID_API_GATE,
     ActionScope,
     AgentRun,
     AttemptState,
     AttestationError,
+    BillingClaim,
     BillingClass,
+    BillingIntegrityError,
+    BillingReconciliation,
+    CostEstimate,
     DataClassification,
     DecisionRecord,
     ErrorCode,
     ExecutionAttempt,
+    ExecutionClaimOutcome,
+    LedgerSnapshot,
     LoopStage,
     MemoryRetrievalQuery,
     MemoryStore,
+    MonetaryState,
     OutcomeStatus,
     PermissionGrant,
     PermissionMode,
@@ -34,7 +44,16 @@ from jarvis.contracts import (
     ToolResult,
     UsageRecord,
     VerificationRecord,
+    canonical_usd,
+    format_usd,
     is_expired,
+    nano_usd,
+    require_billing_class,
+    require_monetary_state,
+    usd_from_nano,
+    validate_cost_estimate,
+    validated_measured_cost,
+    validated_metered_maximum,
 )
 from jarvis.lifecycle import is_terminal, terminal_run_status
 from jarvis.planning import build_task_plan
@@ -64,9 +83,12 @@ BILLING_REPREFLIGHT_COUNT_KEY = "billing_repreflight_attempts"
 #: Bound on gate <-> execute round trips caused by changing route/attestation.
 BILLING_REPREFLIGHT_LIMIT = 3
 
-#: Monetary gate actions; each is its own attested, separately granted request.
-PAID_API_GATE = "enable_paid_api_for_task"
-COST_CAP_GATE = "override_monthly_cost_cap"
+#: Monetary gate actions come from ``jarvis.contracts`` so the loop that issues
+#: the request and the storage boundary that re-verifies the persisted grant
+#: compare exactly the same action name (imported above).
+
+#: Bound on the non-secret reason tag carried by a billing-integrity failure.
+BILLING_REASON_MAX_CHARS = 120
 
 
 class _LifecycleLost(Exception):
@@ -490,10 +512,15 @@ class AgentCore:
                 if billing_failure is not None:
                     return billing_failure
                 estimate = task.estimate
-                # Only genuinely metered money is projected against the cap.
-                monetary_maximum = estimate.monetary_maximum_usd
-                current_spend = self.memory.monthly_monetary_cost()
-                projected = current_spend + monetary_maximum
+                # Only genuinely metered money is projected against the cap,
+                # and the projection is exact integer nano-USD over the
+                # authoritative snapshot - measured spend plus every still-open
+                # reservation - never a bare float SUM of measured rows.
+                exposure = self._ledger_exposure(session, task)
+                if isinstance(exposure, AgentRun):
+                    return exposure
+                snapshot, monetary_maximum = exposure
+                projected = usd_from_nano(snapshot.total_nano_usd + monetary_maximum)
                 gates = self._monetary_gates(session, task, connector, projected)
                 if isinstance(gates, AgentRun):
                     return gates
@@ -548,9 +575,12 @@ class AgentCore:
                     task,
                     "cost_preflight_passed",
                     {
-                        "current_month_usd": current_spend,
-                        "monetary_max_usd": monetary_maximum,
-                        "projected_usd": projected,
+                        "ledger_month": snapshot.month,
+                        "measured_month_usd": format_usd(snapshot.measured_usd),
+                        "reserved_month_usd": format_usd(snapshot.reserved_usd),
+                        "current_month_usd": format_usd(snapshot.total_usd),
+                        "monetary_max_usd": format_usd(usd_from_nano(monetary_maximum)),
+                        "projected_usd": format_usd(projected),
                         "billing_class": estimate.billing_class.value,
                         "billing_evidence": estimate.billing_evidence,
                         "resource_ceiling_usd": estimate.resource_ceiling_usd,
@@ -592,12 +622,23 @@ class AgentCore:
                     if repreflight is not None:
                         return repreflight
                     continue
+                # H3: the exposure the claim will be arbitrated against. The
+                # authoritative check happens again inside the claim
+                # transaction; this snapshot only builds the exact projection
+                # the gates and the claim are bound to.
+                exposure = self._ledger_exposure(session, task)
+                if isinstance(exposure, AgentRun):
+                    return exposure
+                snapshot, reservation = exposure
+                projected = usd_from_nano(snapshot.total_nano_usd + reservation)
                 # The persisted stage proves nothing. The attestation of what
                 # will leave, to where, under which gates and from which local
                 # boundary is recomputed here and must be backed by a consumed
                 # grant (or be policy-exempt); otherwise the task goes back to
                 # the gate it lacks and a fresh approval is required.
-                open_stage, current = self._unsatisfied_gate(session, task, connector)
+                open_stage, current = self._unsatisfied_gate(
+                    session, task, connector, projected
+                )
                 if isinstance(open_stage, AgentRun):
                     return open_stage
                 if open_stage is not None:
@@ -631,12 +672,56 @@ class AgentCore:
                 if attempt.state is not AttemptState.PREPARED:
                     # Another owner raced ahead, or the attempt is in doubt.
                     return self._execution_in_doubt(session, task, attempt)
-                one_shots = self._execution_one_shot_fingerprints(
-                    session, task, connector, current
+                one_shots, override = self._execution_one_shot_fingerprints(
+                    session, task, connector, current, projected
                 )
-                if not self.memory.begin_execution(
-                    attempt.id, session.id, task.id, one_shots
-                ):
+                # H3: the cap check and the reservation happen inside the same
+                # transaction as the attempt CAS and the grant consumption, so
+                # two concurrent metered tasks can never both clear the cap
+                # against the same balance.
+                claim = BillingClaim(
+                    ledger_month=snapshot.month,
+                    expected_exposure_nano_usd=snapshot.total_nano_usd,
+                    reservation_nano_usd=reservation,
+                    limit_nano_usd=self._limit_nano_usd(),
+                    billing_class=task.estimate.billing_class,
+                    gate_state=task.estimate.gate_state,
+                    cost_override_fingerprint=override,
+                )
+                try:
+                    outcome = self.memory.begin_execution(
+                        attempt.id, session.id, task.id, one_shots, claim
+                    )
+                except BillingIntegrityError as exc:
+                    # The storage boundary refused the claim structurally; it
+                    # wrote nothing and the connector was never reached.
+                    return self._billing_integrity_failure(session, task, str(exc))
+                if outcome is ExecutionClaimOutcome.LEDGER_INVALID:
+                    return self._billing_integrity_failure(
+                        session, task, "ledger_state_invalid"
+                    )
+                if outcome is ExecutionClaimOutcome.BILLING_RECHECK_REQUIRED:
+                    # The ledger moved after preflight or approval: no attempt
+                    # was claimed, no grant consumed, no reservation created and
+                    # the connector boundary was not crossed. Go back to cost
+                    # preflight, which re-derives the exact current projection
+                    # and issues a fresh cost request for it.
+                    regate = self._require_regate(
+                        session,
+                        task,
+                        stage=LoopStage.COST_PREFLIGHT,
+                        event_type="billing_recheck_required",
+                        error_code=ErrorCode.BILLING_INTEGRITY_FAILED,
+                        message=(
+                            "The monthly monetary exposure keeps changing between "
+                            "approval and execution; refusing to run a paid call."
+                        ),
+                        payload={"reason": "ledger_exposure_changed"},
+                    )
+                    if regate is not None:
+                        return regate
+                    continue
+                if outcome is not ExecutionClaimOutcome.CLAIMED:
                     # The atomic claim failed: another owner won, an
                     # authoritative cancellation/terminal decision won first, or
                     # a required one-shot grant is gone. Reload and report the
@@ -658,7 +743,8 @@ class AgentCore:
                         ),
                     )
 
-                # Durable IN_FLIGHT is committed; cross the connector boundary.
+                # Durable IN_FLIGHT plus a durable reservation are committed;
+                # cross the connector boundary.
                 task.status = TaskStatus.RUNNING
                 external = current.side_effect.effect is SideEffect.EXTERNAL_EGRESS
                 try:
@@ -667,7 +753,9 @@ class AgentCore:
                     if external:
                         # The external outcome is unknowable after a raise:
                         # mark the attempt non-replayable rather than inventing
-                        # a clean failure that could be safely retried.
+                        # a clean failure that could be safely retried. The
+                        # reservation stays active, so the money the call may
+                        # already have spent keeps counting as exposure.
                         self.memory.mark_execution_unknown(attempt.id)
                         return self._execution_in_doubt(
                             session,
@@ -684,32 +772,39 @@ class AgentCore:
                         ),
                         usage=UsageRecord(
                             connector=connector.manifest.name,
-                            estimated_cost_usd=task.estimate.monetary_maximum_usd,
                             billing_class=task.estimate.billing_class,
+                            # An unbilled route cannot have spent money, so the
+                            # monetary state is known even though the call
+                            # failed. A metered route stays UNKNOWN and fails
+                            # closed with its reservation retained.
+                            monetary_state=(
+                                MonetaryState.NOT_APPLICABLE
+                                if task.estimate.billing_class
+                                in (
+                                    BillingClass.SUBSCRIPTION_INCLUDED,
+                                    BillingClass.NO_ADDITIONAL_CHARGE,
+                                )
+                                else MonetaryState.UNKNOWN
+                            ),
                             billing_evidence=task.estimate.billing_evidence,
                         ),
                     )
-                result.usage.session_id = session.id
-                result.usage.task_id = task.id
-                result.usage.connector = result.usage.connector or connector.manifest.name
-                if result.usage.billing_class is BillingClass.UNKNOWN:
-                    # The route was positively established at cost preflight.
-                    result.usage.billing_class = task.estimate.billing_class
-                    result.usage.billing_evidence = (
-                        result.usage.billing_evidence or task.estimate.billing_evidence
-                    )
-                result.usage.estimated_cost_usd = max(
-                    result.usage.estimated_cost_usd, task.estimate.monetary_maximum_usd
+                # H2-H/H3: usage is reconciled first, so a crash before the
+                # atomic conclusion leaves the attempt IN_FLIGHT
+                # (non-replayable) with the authoritative usage preserved. The
+                # connector's own billing class, id and timestamp are never
+                # ledger authority: the route bound into the claim is.
+                reconciled = self._reconcile_usage(
+                    session, task, connector, attempt.id, result
                 )
-                # H2-H: usage is recorded first, so a crash before the atomic
-                # conclusion leaves the attempt IN_FLIGHT (non-replayable) with
-                # the successfully written usage preserved.
-                self.memory.append_usage(result.usage)
+                if isinstance(reconciled, AgentRun):
+                    return reconciled
                 task.result_snapshot = self._result_to_dict(result)
 
                 # H2-F: reload authoritative cancellation before committing a
                 # terminal COMPLETED/FAILED. A stale result never overwrites an
-                # authoritative cancellation.
+                # authoritative cancellation, while the usage recorded above
+                # stays durably accounted.
                 fresh = self.memory.load_task(task.id)
                 cancelled = result.outcome is OutcomeStatus.CANCELLED or (
                     fresh is not None
@@ -721,25 +816,20 @@ class AgentCore:
                 )
                 if cancelled:
                     return self._finalize_cancelled(session, task, attempt.id, result)
+                overspend = self._overspend_failure(task, result)
+                if overspend is not None:
+                    # The full actual cost is already recorded and reconciled;
+                    # only the task fails. Later metered work therefore observes
+                    # the real exposure this call created.
+                    return self._fail_execution(
+                        session, task, attempt.id, result, overspend
+                    )
                 if not result.ok:
                     error = result.error or StructuredError(
                         ErrorCode.CONNECTOR_FAILED, result.summary
                     )
-                    task.status = TaskStatus.FAILED
-                    task.stage = LoopStage.FAILED
-                    session.active_task_id = None
-                    set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
-                    outcome = self.memory.conclude_execution(
-                        session, task, attempt.id, "task_failed", error.to_dict()
-                    )
-                    if outcome == "cancelled":
-                        return self._finalize_cancelled(session, task, attempt.id, result)
-                    if outcome == "lost":
-                        return self._execution_in_doubt(
-                            session, task, self.memory.latest_execution_attempt(task.id)
-                        )
-                    return AgentRun(
-                        RunStatus.FAILED, session, task, result=result, error=error
+                    return self._fail_execution(
+                        session, task, attempt.id, result, error
                     )
                 mark_stage_completed(task, LoopStage.EXECUTE)
                 task.status = TaskStatus.VERIFYING
@@ -877,6 +967,271 @@ class AgentCore:
                 ),
             )
 
+    # -- H3: monetary exposure, reservation and usage reconciliation --------
+
+    def _limit_nano_usd(self) -> int:
+        """The fixed monthly hard limit as exact integer nano-USD."""
+        return nano_usd(self.settings.monthly_hard_limit_usd, "monthly_hard_limit_usd")
+
+    def _reservation_nano_usd(self, task: Task) -> int:
+        """Money this execution may add to the monthly ledger, in nano-USD.
+
+        Only a genuinely metered route reserves anything; a subscription or
+        no-additional-charge route reserves exactly zero and still gets its
+        zero-valued attempt billing record for route/idempotency binding.
+        """
+        if task.estimate.billing_class is not BillingClass.METERED_MONETARY:
+            return 0
+        return nano_usd(validated_metered_maximum(task.estimate.maximum_usd))
+
+    def _ledger_exposure(
+        self, session: SessionState, task: Task
+    ) -> tuple[LedgerSnapshot, int] | AgentRun:
+        """The authoritative snapshot plus this task's reservation, or a
+        terminal failure when either cannot be established."""
+        try:
+            reservation = self._reservation_nano_usd(task)
+        except BillingIntegrityError as exc:
+            return self._billing_integrity_failure(session, task, str(exc))
+        snapshot = self.memory.ledger_snapshot()
+        if not snapshot.valid:
+            return self._billing_integrity_failure(
+                session, task, f"ledger_invalid:{snapshot.reason}"
+            )
+        return snapshot, reservation
+
+    def _billing_integrity_failure(
+        self, session: SessionState, task: Task, reason: str
+    ) -> AgentRun:
+        """Fail a task closed on a monetary/ledger integrity violation.
+
+        ``reason`` is a short non-secret rule tag; no connector telemetry,
+        payload or credential material is ever carried into the audit trail.
+        """
+        return self._terminal_failure(
+            session,
+            task,
+            StructuredError(
+                ErrorCode.BILLING_INTEGRITY_FAILED,
+                "Monetary integrity could not be established; refusing to "
+                "record or continue this execution.",
+                details={"reason": reason[:BILLING_REASON_MAX_CHARS]},
+            ),
+        )
+
+    def _fail_execution(
+        self,
+        session: SessionState,
+        task: Task,
+        attempt_id: str,
+        result: ToolResult,
+        error: StructuredError,
+    ) -> AgentRun:
+        """Conclude a claimed attempt as a terminal task failure.
+
+        Never reaches VERIFY/PRESENT, so no decision record and no
+        ``task_completed`` event can be persisted for it.
+        """
+        task.status = TaskStatus.FAILED
+        task.stage = LoopStage.FAILED
+        session.active_task_id = None
+        set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
+        outcome = self.memory.conclude_execution(
+            session, task, attempt_id, "task_failed", error.to_dict()
+        )
+        if outcome == "cancelled":
+            return self._finalize_cancelled(session, task, attempt_id, result)
+        if outcome == "lost":
+            return self._execution_in_doubt(
+                session, task, self.memory.latest_execution_attempt(task.id)
+            )
+        return AgentRun(RunStatus.FAILED, session, task, result=result, error=error)
+
+    def _overspend_failure(
+        self, task: Task, result: ToolResult
+    ) -> StructuredError | None:
+        """Whether a valid measured actual exceeded the approved maximum.
+
+        The full amount is already recorded and reconciled; the task still
+        fails, so an execution that outran its approval can never present a
+        completed decision.
+        """
+        if task.estimate.billing_class is not BillingClass.METERED_MONETARY:
+            return None
+        actual = result.usage.monetary_cost_usd
+        if actual is None:
+            return None
+        try:
+            measured = validated_measured_cost(actual)
+            approved = validated_metered_maximum(task.estimate.maximum_usd)
+        except BillingIntegrityError as exc:
+            return StructuredError(
+                ErrorCode.BILLING_INTEGRITY_FAILED,
+                "The measured cost of this execution could not be validated.",
+                details={"reason": str(exc)[:BILLING_REASON_MAX_CHARS]},
+            )
+        if measured <= approved:
+            return None
+        return StructuredError(
+            ErrorCode.BILLING_INTEGRITY_FAILED,
+            "The measured cost of this execution exceeded the approved "
+            "maximum; the full amount was recorded and the task failed.",
+            details={
+                "reason": "actual_above_approved_maximum",
+                "approved_maximum_usd": format_usd(approved),
+                "measured_usd": format_usd(measured),
+            },
+        )
+
+    def _reconcile_usage(
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        attempt_id: str,
+        result: ToolResult,
+    ) -> AgentRun | None:
+        """Bind the connector result to the attempt's authoritative reservation.
+
+        The execution-time route bound into the claim is the authority; the
+        connector's reported classification, monetary state, usage id and
+        timestamp are telemetry only and can never downgrade, replace or
+        backdate it. On any mismatch the reservation is retained as unresolved
+        exposure and the task fails closed.
+        """
+        route = task.estimate.billing_class
+        try:
+            reconciliation = self._build_reconciliation(
+                session, task, connector, attempt_id, result, route
+            )
+        except BillingIntegrityError as exc:
+            return self._unresolved_billing_failure(
+                session, task, attempt_id, result, str(exc)
+            )
+        outcome = self.memory.reconcile_usage(reconciliation)
+        if not outcome.ok or outcome.usage is None:
+            return self._unresolved_billing_failure(
+                session,
+                task,
+                attempt_id,
+                result,
+                outcome.reason or outcome.outcome.value,
+            )
+        # The persisted authoritative record replaces whatever the connector
+        # reported, so presentation, the result snapshot and the terminal
+        # finalization all describe the row that actually entered the ledger.
+        result.usage = outcome.usage
+        return None
+
+    @staticmethod
+    def _build_reconciliation(
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        attempt_id: str,
+        result: ToolResult,
+        route: BillingClass,
+    ) -> BillingReconciliation:
+        """Bind connector telemetry to the authoritative execution-time route.
+
+        The connector is an *observer* here, never an authority. Its reported
+        billing class may confirm the route but can never downgrade, upgrade or
+        replace it; its class/state/money combination must satisfy the exact
+        matrix for the authoritative route; and its connector name, call count
+        and evidence string are discarded in favour of the selected connector
+        manifest, the single claimed execution and the execution-time estimate.
+        Anything else fails closed before a single ledger row is written.
+        """
+        usage = result.usage
+        # Exact runtime enums: an externally constructed record carrying raw
+        # strings fails as billing integrity, not as an attribute error.
+        reported_class = require_billing_class(usage.billing_class)
+        reported_state = require_monetary_state(usage.monetary_state)
+        if reported_class is not BillingClass.UNKNOWN and reported_class is not route:
+            # UNKNOWN means "the connector reported no route"; any other value
+            # that disagrees with the attested execution route is a downgrade
+            # or upgrade attempt and is refused.
+            raise BillingIntegrityError("connector route contradicts the claim")
+        if route is BillingClass.METERED_MONETARY:
+            if reported_state is not MonetaryState.MEASURED:
+                raise BillingIntegrityError("metered actual is not measured")
+            if usage.monetary_cost_usd is None:
+                # A provider "reference" figure can never stand in for a
+                # measured metered cost.
+                raise BillingIntegrityError("metered actual is missing an amount")
+            actual_nano: int | None = nano_usd(
+                validated_measured_cost(usage.monetary_cost_usd)
+            )
+            monetary_state = MonetaryState.MEASURED
+            reference: float | None = None
+        elif route in (
+            BillingClass.SUBSCRIPTION_INCLUDED,
+            BillingClass.NO_ADDITIONAL_CHARGE,
+        ):
+            if reported_state is not MonetaryState.NOT_APPLICABLE:
+                raise BillingIntegrityError("unbilled route is not not_applicable")
+            if usage.monetary_cost_usd is not None:
+                raise BillingIntegrityError("unbilled route reported a monetary amount")
+            actual_nano = 0
+            monetary_state = MonetaryState.NOT_APPLICABLE
+            # A provider-reported USD equivalent for unbilled usage is kept as
+            # reference telemetry only; a malformed one is simply dropped.
+            reference = None
+            if usage.reference_cost_usd is not None:
+                try:
+                    reference = float(
+                        canonical_usd(usage.reference_cost_usd, "reference_cost_usd")
+                    )
+                except BillingIntegrityError:
+                    reference = None
+        else:
+            raise BillingIntegrityError("unknown route cannot be reconciled")
+        return BillingReconciliation(
+            attempt_id=attempt_id,
+            session_id=session.id,
+            task_id=task.id,
+            # Authoritative identity and evidence: the selected connector
+            # manifest and the execution-time estimate, never the strings the
+            # connector put in its own telemetry.
+            connector=connector.manifest.name,
+            billing_class=route,
+            monetary_state=monetary_state,
+            actual_nano_usd=actual_nano,
+            reference_cost_usd=reference,
+            provider=usage.provider,
+            model=usage.model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            estimated_cost_usd=float(
+                canonical_usd(task.estimate.monetary_maximum_usd, "estimated_cost_usd")
+            ),
+            billing_evidence=task.estimate.billing_evidence,
+        )
+
+    def _unresolved_billing_failure(
+        self,
+        session: SessionState,
+        task: Task,
+        attempt_id: str,
+        result: ToolResult,
+        reason: str,
+    ) -> AgentRun:
+        """Retain the reservation and fail the task closed.
+
+        The exposure stays part of the monthly position until valid
+        reconciliation or explicit future recovery; H3 releases nothing
+        automatically.
+        """
+        self.memory.mark_reservation_unresolved(attempt_id)
+        error = StructuredError(
+            ErrorCode.BILLING_INTEGRITY_FAILED,
+            "The execution result could not be reconciled with its authoritative "
+            "billing route; the reserved exposure was retained.",
+            details={"reason": reason[:BILLING_REASON_MAX_CHARS]},
+        )
+        task.result_snapshot = self._result_to_dict(result)
+        return self._fail_execution(session, task, attempt_id, result, error)
+
     def _billing_preflight_is_current(self, task: Task) -> bool:
         """Whether this exact estimate is the one that cleared cost preflight."""
         recorded = task.preferences.get(BILLING_PREFLIGHT_KEY)
@@ -991,12 +1346,19 @@ class AgentCore:
         session: SessionState,
         task: Task,
         connector: BaseConnector,
-        projected: float,
+        projected: Decimal,
     ) -> list[tuple[str, PermissionRequest]] | AgentRun:
         """The monetary gates that apply right now, each as an attested
-        request binding the gate, projection, limit and switch state."""
+        request binding the gate, projection, limit and switch state.
+
+        ``projected`` is exact canonical USD, so the gate identity a grant is
+        bound to is never a binary float artefact and a grant approved for a
+        lower projection can never match a higher one.
+        """
         estimate = task.estimate
-        limit = self.settings.monthly_hard_limit_usd
+        limit = canonical_usd(
+            self.settings.monthly_hard_limit_usd, "monthly_hard_limit_usd"
+        )
         applicable: list[tuple[str, str]] = []
         if estimate.requires_paid_api and not self.settings.paid_api_enabled:
             applicable.append(
@@ -1005,7 +1367,7 @@ class AgentCore:
                     "This task would use a paid API while paid APIs are disabled.",
                 )
             )
-        if estimate.monetary_maximum_usd > 0 and projected > limit:
+        if estimate.billing_class is BillingClass.METERED_MONETARY and projected > limit:
             applicable.append(
                 (
                     COST_CAP_GATE,
@@ -1018,8 +1380,8 @@ class AgentCore:
             cost_gate = "|".join(
                 (
                     gate,
-                    f"{projected:.9f}",
-                    f"{limit:.9f}",
+                    format_usd(projected),
+                    format_usd(limit),
                     str(int(self.settings.paid_api_enabled)),
                 )
             )
@@ -1049,23 +1411,25 @@ class AgentCore:
         )
 
     def _unsatisfied_gate(
-        self, session: SessionState, task: Task, connector: BaseConnector
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        projected: Decimal,
     ) -> tuple[LoopStage | AgentRun | None, PermissionRequest | None]:
         """Recompute every gate attestation right before execution.
 
         Returns ``(open_stage, current_request)``: the first gate stage lacking
         a valid consumed grant (or a terminal run, or ``None`` when execution
         is authorized), together with the current attested egress request whose
-        fingerprint binds the execution attempt.
+        fingerprint binds the execution attempt. ``projected`` is the exact
+        exposure the same claim will be arbitrated against.
         """
         current = self._attested_request(session, task, connector)
         if isinstance(current, AgentRun):
             return current, None
         if not self._permission_satisfied(session, current):
             return LoopStage.RISK_PERMISSION, current
-        projected = (
-            self.memory.monthly_monetary_cost() + task.estimate.monetary_maximum_usd
-        )
         gates = self._monetary_gates(session, task, connector, projected)
         if isinstance(gates, AgentRun):
             return gates, current
@@ -1098,23 +1462,28 @@ class AgentCore:
         task: Task,
         connector: BaseConnector,
         current: PermissionRequest,
-    ) -> list[str]:
+        projected: Decimal,
+    ) -> tuple[list[str], str]:
         """Every non-reusable one-shot grant that authorized this execution
         opportunity: the base permission plus each applicable monetary gate
         (paid-API, monthly-cost-cap). They are consumed atomically, all or
         nothing, so a task cannot execute with any authorizing gate unconsumed.
+
+        Also returns the exact cost-override fingerprint (or ``""``), which the
+        claim transaction re-verifies against the projection it recomputes.
         """
         fingerprints: list[str] = []
+        override = ""
         base = self._execution_grant_fingerprint(session, current)
         if base is not None:
             fingerprints.append(base)
-        projected = (
-            self.memory.monthly_monetary_cost() + task.estimate.monetary_maximum_usd
-        )
         gates = self._monetary_gates(session, task, connector, projected)
         if not isinstance(gates, AgentRun):
-            fingerprints.extend(request.fingerprint for _, request in gates)
-        return fingerprints
+            for gate, request in gates:
+                fingerprints.append(request.fingerprint)
+                if gate == COST_CAP_GATE:
+                    override = request.fingerprint
+        return fingerprints, override
 
     def _finalize_cancelled(
         self,
@@ -1214,8 +1583,25 @@ class AgentCore:
     def _billing_route_failure(
         self, session: SessionState, task: Task, connector: BaseConnector
     ) -> AgentRun | None:
-        """Classify the billing route and fail closed when it is unknown."""
+        """Classify the billing route and fail closed when it is unknown.
+
+        H3: the connector-derived monetary values are canonically validated in
+        the same step, so a NaN, infinite, negative or zero metered maximum, an
+        inverted minimum/maximum or a non-positive resource ceiling fails the
+        task before any approval, preflight or external call can happen.
+        """
         estimate = connector.estimate_cost(task)
+        try:
+            validate_cost_estimate(estimate)
+        except BillingIntegrityError as exc:
+            # The malformed estimate is never adopted: a raw-string or foreign
+            # billing class would otherwise reach persistence and presentation
+            # and crash on enum-specific access. The task carries a fail-closed
+            # UNKNOWN estimate instead and stops here.
+            task.estimate = CostEstimate(
+                billing_evidence="malformed_connector_estimate"
+            )
+            return self._billing_integrity_failure(session, task, str(exc))
         task.estimate = estimate
         if estimate.billing_class is not BillingClass.UNKNOWN:
             return None
@@ -1521,6 +1907,16 @@ class AgentCore:
         session.active_task_id = None
         set_issue(task, ProgressIssueKind.FAILURE, error.code, error.retryable)
         if result is None:
+            try:
+                estimated = float(canonical_usd(task.estimate.monetary_maximum_usd))
+            except BillingIntegrityError:
+                # The failure may be the malformed estimate itself; a bad
+                # amount must not ride along into telemetry or presentation.
+                estimated = 0.0
+            try:
+                billing_class = require_billing_class(task.estimate.billing_class)
+            except BillingIntegrityError:
+                billing_class = BillingClass.UNKNOWN
             result = ToolResult(
                 outcome=OutcomeStatus.ERROR,
                 summary=error.message,
@@ -1529,8 +1925,8 @@ class AgentCore:
                     session_id=session.id,
                     task_id=task.id,
                     connector=task.selected_connector,
-                    estimated_cost_usd=task.estimate.monetary_maximum_usd,
-                    billing_class=task.estimate.billing_class,
+                    estimated_cost_usd=estimated,
+                    billing_class=billing_class,
                     billing_evidence=task.estimate.billing_evidence,
                 ),
             )
