@@ -45,6 +45,11 @@ JSON'una isteğe bağlı `project_id` alanı eklenmiştir; oturumun ilk
 proje-taşıyan task'ı oturumu bağlar ve zarfın `session.project_id` alanında
 görünür. Getirilen fact/preference öğeleri karar öğeleriyle aynı 5 öğe /
 4.000 karakter kotası içinde yarışır; cross-project izolasyon mutlaktır.
+M2 ile, projeye bağlı bir oturum aynı projenin diğer oturumlarının en yeni
+en çok 25 kararını da aynı kota ve aynı deterministik sıralama içinde aday
+olarak görür; sorgu oturumu hariç tutulur, kararın sınıfı kendi kaynak
+task'ından yeniden kazanılır (eksik/bozuk kaynak SECRET sayılır) ve projesiz
+oturum davranışı birebir değişmeden kalır.
 
 ## Windows'ta test
 

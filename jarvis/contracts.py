@@ -1298,6 +1298,13 @@ PROJECT_MEMORY_TEXT_CAP = 480
 #: internal safety window like ``RETRIEVAL_CANDIDATE_WINDOW``, not a result
 #: limit; the absolute retrieval ceilings above stay unchanged.
 PROJECT_MEMORY_CANDIDATE_WINDOW = 25
+#: Newest decisions of the SAME project's OTHER sessions examined per
+#: retrieval (M2). The querying session is always excluded, so a decision can
+#: never enter through two windows. Like every window above this is an
+#: internal safety bound, never a result quota: the absolute 5-item /
+#: 4,000-character ceilings stay unchanged and no per-source sub-quota
+#: exists - all sources compete in the one deterministic ordering.
+PROJECT_DECISION_CANDIDATE_WINDOW = 25
 
 
 def validate_project_id(value: Any) -> str:

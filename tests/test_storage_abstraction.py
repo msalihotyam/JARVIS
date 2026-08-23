@@ -9,6 +9,7 @@ from jarvis.contracts import (
     LINEAR_LOOP_STAGES,
     MONTHLY_HARD_LIMIT_NANO_USD,
     OPEN_RESERVATION_STATES,
+    PROJECT_DECISION_CANDIDATE_WINDOW,
     PROJECT_MEMORY_CANDIDATE_WINDOW,
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
@@ -278,6 +279,32 @@ class InMemoryStore:
             project_candidates = tuple(
                 copy.deepcopy(active_items[:PROJECT_MEMORY_CANDIDATE_WINDOW])
             )
+            # M2 parity: decisions of the same project's OTHER sessions. A
+            # decision whose session is missing or bound to another project
+            # never enters; the querying session is excluded so the two
+            # decision windows stay disjoint.
+            cross = []
+            for record in self.decisions:
+                if record.session_id == query.session_id:
+                    continue
+                if record.task_id == query.exclude_task_id:
+                    continue
+                session = self.sessions.get(record.session_id)
+                if session is None or session.project_id != query.project_id:
+                    continue
+                cross.append(record)
+            cross.sort(key=lambda record: record.id)
+            cross.sort(key=lambda record: record.created_at, reverse=True)
+            for record in cross[:PROJECT_DECISION_CANDIDATE_WINDOW]:
+                source = self.tasks.get(record.task_id)
+                candidates.append(
+                    (
+                        copy.deepcopy(record),
+                        source.scope.data_classification
+                        if source is not None
+                        else DataClassification.SECRET,
+                    )
+                )
         return build_retrieved_context(
             query, current, candidates, project_candidates=project_candidates
         )
@@ -769,6 +796,51 @@ class StorageAbstractionTests(unittest.TestCase):
         ghost.project_id = "ghost-proj"
         refused = core.run(ghost)
         self.assertEqual(RunStatus.FAILED, refused.status)
+
+    def test_cross_session_decisions_flow_through_a_non_sqlite_store(self) -> None:
+        # M2 is storage-agnostic: a decision recorded by one session of a
+        # project is retrievable from another session of the SAME project
+        # through the protocol alone; a foreign project's session sees none.
+        registry = ToolRegistry()
+        registry.register(DummyConnector())
+        memory = InMemoryStore()
+        memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+        memory.save_project(ProjectRecord(id="proj-b", name="Project B"))
+        core = AgentCore(
+            registry,
+            memory,
+            Settings(permission_mode=PermissionMode.SMART_AUTO),
+        )
+        first = make_task()
+        first.project_id = "proj-a"
+        origin = core.run(first)
+        self.assertEqual(RunStatus.COMPLETED, origin.status)
+        # A second, fresh session of the SAME project sees the decision.
+        second = make_task()
+        second.project_id = "proj-a"
+        run = core.run(second)
+        self.assertEqual(RunStatus.COMPLETED, run.status)
+        self.assertNotEqual(origin.session.id, run.session.id)
+        stored = memory.load_task(run.task.id)
+        cross_ids = {
+            item.record_id
+            for item in stored.retrieved_context.items
+            if item.kind is RetrievedMemoryKind.DECISION
+        }
+        self.assertIn(memory.decisions[0].id, cross_ids)
+        # A session of ANOTHER project never sees it.
+        foreign = make_task()
+        foreign.project_id = "proj-b"
+        foreign_run = core.run(foreign)
+        self.assertEqual(RunStatus.COMPLETED, foreign_run.status)
+        foreign_stored = memory.load_task(foreign_run.task.id)
+        self.assertEqual(
+            set(),
+            {
+                item.record_id
+                for item in foreign_stored.retrieved_context.items
+            },
+        )
 
     def test_retrieval_flows_through_a_non_sqlite_store(self) -> None:
         registry = ToolRegistry()

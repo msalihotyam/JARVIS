@@ -16,6 +16,7 @@ from jarvis.contracts import (
     MAX_NANO_USD,
     MAX_SQLITE_INTEGER,
     MONTHLY_HARD_LIMIT_NANO_USD,
+    PROJECT_DECISION_CANDIDATE_WINDOW,
     PROJECT_MEMORY_CANDIDATE_WINDOW,
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
@@ -2286,6 +2287,17 @@ class SQLiteMemoryStore:
         additionally examined; they compete inside the same absolute item and
         character ceilings and the same eligibility ladder. Without a project
         scope the behaviour is byte-identical to the project-less pipeline.
+
+        With a project scope (M2) the newest
+        ``PROJECT_DECISION_CANDIDATE_WINDOW`` decisions recorded by the SAME
+        project's OTHER sessions are additionally examined. The querying
+        session is excluded, so the two decision windows are disjoint and a
+        decision can never appear twice. Every cross-session decision's
+        classification is recovered from its own persisted source task,
+        failing closed as SECRET; a decision whose session is missing or not
+        bound to exactly this project never enters the window. No source has
+        a sub-quota: all candidates compete in the one deterministic ordering
+        under the unchanged absolute ceilings.
         """
         sql = (
             "SELECT d.decision_json, t.state_json FROM decision_log AS d "
@@ -2311,6 +2323,7 @@ class SQLiteMemoryStore:
                     )
             rows = connection.execute(sql, parameters).fetchall()
             item_rows: list[sqlite3.Row] = []
+            cross_rows: list[sqlite3.Row] = []
             if query.project_id is not None:
                 item_rows = connection.execute(
                     "SELECT id, project_id, kind, text, classification, "
@@ -2320,8 +2333,28 @@ class SQLiteMemoryStore:
                     "ORDER BY created_at DESC, id ASC LIMIT ?",
                     (query.project_id, PROJECT_MEMORY_CANDIDATE_WINDOW),
                 ).fetchall()
+                # M2: decisions of the same project's OTHER sessions. The
+                # inner JOIN both scopes to exactly this project and drops
+                # orphaned decisions whose session row is missing; excluding
+                # the querying session keeps the windows disjoint.
+                cross_sql = (
+                    "SELECT d.decision_json, t.state_json "
+                    "FROM decision_log AS d "
+                    "JOIN sessions AS s ON s.id = d.session_id "
+                    "LEFT JOIN tasks AS t ON t.id = d.task_id "
+                    "WHERE s.project_id = ? AND d.session_id != ?"
+                )
+                cross_parameters: list[Any] = [query.project_id, query.session_id]
+                if query.exclude_task_id is not None:
+                    cross_sql += " AND d.task_id != ?"
+                    cross_parameters.append(query.exclude_task_id)
+                cross_sql += " ORDER BY d.created_at DESC, d.id ASC LIMIT ?"
+                cross_parameters.append(PROJECT_DECISION_CANDIDATE_WINDOW)
+                cross_rows = connection.execute(
+                    cross_sql, cross_parameters
+                ).fetchall()
         candidates: list[tuple[DecisionRecord, DataClassification]] = []
-        for row in rows:
+        for row in list(rows) + list(cross_rows):
             try:
                 record = DecisionRecord.from_dict(json.loads(row[0]))
             except (TypeError, KeyError, ValueError):

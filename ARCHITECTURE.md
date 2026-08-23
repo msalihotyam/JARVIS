@@ -87,10 +87,11 @@ Onay semantiği:
 ### 4.2 Bağlam getirme — aynı oturumdaki kararlar (uygulandı)
 
 Bu bölümün ilk milestone'u yalnızca **aynı oturumdaki tamamlanmış kararları**
-kapsıyordu. Proje kimliği ve açık proje hafızası daha sonra §4.10 (M1) ile
-eklendi ve aynı boru hattının içinde, aynı mutlak sınırlarla çalışır.
-Oturumlar arası karar getirisi, embedding/vektör tabanı ve model destekli
-sıralama hâlâ kapsam dışıdır (M2+ adayı) ve karar verilmemiştir.
+kapsıyordu. Proje kimliği ve açık proje hafızası §4.10 (M1) ile, aynı
+projenin diğer oturumlarındaki kararların getirisi de §4.10 (M2) ile eklendi;
+ikisi de aynı boru hattının içinde, aynı mutlak sınırlarla çalışır.
+Embedding/vektör tabanı ve model destekli sıralama hâlâ kapsam dışıdır ve
+karar verilmemiştir.
 
 Tipli sözleşme ve akış:
 
@@ -1060,9 +1061,22 @@ Kilitli değişmezler:
   kapsayacak biçimde günceldir) ve H1–H5 değişmezleri aynen yürürlüktedir.
   Connector egress sınırında kind allowlist'i tam olarak
   `{decision, fact, preference}`'tır; alan seti değişmemiştir (default-deny).
-- **Ertelenen (M2+):** oturumlar arası karar getirisi, model destekli
-  çıkarım/özetleme, embedding, otomatik proje tespiti, edit/delete/import/
-  export/search-management CLI özellikleri.
+- **Oturumlar arası karar getirisi (M2, uygulandı):** oturum bir projeye
+  bağlıyken, aynı projenin DİĞER oturumlarının en yeni en çok 25 kararı
+  (`PROJECT_DECISION_CANDIDATE_WINDOW`) ek aday penceresi olarak incelenir.
+  Sorgu oturumu her zaman hariçtir; iki karar penceresi ayrıktır ve bir karar
+  asla iki kez giremez. Her kararın sınıfı kendi kalıcı kaynak task'ından
+  yeniden kazanılır; eksik/bozuk kaynak SECRET sayılır (fail closed), oturumu
+  silinmiş veya tam olarak bu projeye bağlı olmayan karar pencereye giremez.
+  Kaynak-başına alt-kota yoktur: aynı-oturum kararları, proje kararları ve
+  fact/preference öğeleri tek deterministik sıralamada yarışır; mutlak 5 öğe
+  / 4.000 karakter tavanları ve connector egress savunma sınırları
+  değişmemiştir. Cross-session karar metni de güvenilmeyen tarihsel
+  referanstır; plan/onay/faturalandırma/scope otoritesi olamaz. Şema
+  değişikliği yoktur (v6 yeterlidir).
+- **Ertelenen (M3+):** model destekli çıkarım/özetleme, embedding, otomatik
+  proje tespiti, edit/delete/import/export/search-management CLI özellikleri,
+  `decision_log` oturum indeksi (olası v7 performans adayı).
 
 ## 5. İzin ve güvenlik modeli
 
