@@ -100,6 +100,9 @@ _ERROR_EXIT = {
     ErrorCode.TASK_NOT_FOUND: EXIT_NOT_FOUND,
     ErrorCode.INVALID_GRANT: EXIT_POLICY,
     ErrorCode.STALE_GRANT: EXIT_POLICY,
+    # Reserved codes (H5): currently produced by no code path, but kept in
+    # the persisted ErrorCode contract and mapped here so every member has a
+    # stable exit code. The live conditions surface as approval gates.
     ErrorCode.COST_CAP_EXCEEDED: EXIT_POLICY,
     ErrorCode.PAID_API_DISABLED: EXIT_POLICY,
     ErrorCode.BILLING_ROUTE_UNKNOWN: EXIT_POLICY,
@@ -108,6 +111,7 @@ _ERROR_EXIT = {
     ErrorCode.EGRESS_REFUSED: EXIT_POLICY,
     ErrorCode.EXECUTION_UNKNOWN_OUTCOME: EXIT_POLICY,
     ErrorCode.EXECUTION_IN_PROGRESS: EXIT_POLICY,
+    # Reserved (H5): currently unproduced; see the contract note.
     ErrorCode.TASK_ALREADY_TERMINAL: EXIT_POLICY,
     ErrorCode.APPROVAL_REJECTED: EXIT_REJECTED,
     ErrorCode.CANCELLED: EXIT_CANCELLED,
@@ -563,7 +567,6 @@ def status_payload(settings: Settings, memory: SQLiteMemoryStore) -> dict[str, A
         "mode": "local",
         "schema_version": memory.schema_version(),
         "permission_mode": settings.permission_mode.value,
-        "monthly_target_usd": settings.monthly_target_usd,
         "monthly_hard_limit_usd": settings.monthly_hard_limit_usd,
         "paid_api_enabled": settings.paid_api_enabled,
     }

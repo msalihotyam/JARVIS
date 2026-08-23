@@ -241,7 +241,13 @@ class ErrorCode(str, Enum):
     INVALID_GRANT = "invalid_grant"
     STALE_GRANT = "stale_grant"
     APPROVAL_REJECTED = "approval_rejected"
+    #: Reserved, currently unproduced (H5): a projected-cost breach surfaces
+    #: as a COST_CAP_GATE approval request, never as this terminal error.
+    #: Kept for persisted-contract compatibility; do not remove or repurpose.
     COST_CAP_EXCEEDED = "cost_cap_exceeded"
+    #: Reserved, currently unproduced (H5): the disabled paid-API switch
+    #: surfaces as a PAID_API_GATE approval request, never as this terminal
+    #: error. Kept for persisted-contract compatibility.
     PAID_API_DISABLED = "paid_api_disabled"
     BILLING_ROUTE_UNKNOWN = "billing_route_unknown"
     VERIFICATION_FAILED = "verification_failed"
@@ -258,6 +264,9 @@ class ErrorCode(str, Enum):
     #: concurrent resume observed the live claim and did not execute.
     EXECUTION_IN_PROGRESS = "execution_in_progress"
     #: A command targeted a task that is already in a terminal state.
+    #: Reserved, currently unproduced (H5): terminal-state refusals surface
+    #: through the lifecycle arbitration codes above today. Kept for
+    #: persisted-contract compatibility.
     TASK_ALREADY_TERMINAL = "task_already_terminal"
     #: H3: canonical monetary validation, ledger integrity or authoritative
     #: usage reconciliation failed. Always fail closed; never a retryable

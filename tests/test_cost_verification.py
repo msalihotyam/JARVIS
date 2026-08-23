@@ -84,6 +84,46 @@ class CostAndVerificationTests(unittest.TestCase):
         self.assertTrue(enabled.paid_api_enabled)
         self.assertEqual("user-decision-123", enabled.paid_api_approval_id)
 
+    def test_both_settings_doors_reject_a_blank_approval_id(self) -> None:
+        # H5: direct construction and enable_paid_api() enforce the same
+        # stripped/non-blank rule; the id stays compatibility metadata and
+        # is never execution authority on its own.
+        settings = Settings(memory_database=self.memory.database_path)
+        with self.assertRaises(ValueError):
+            settings.enable_paid_api("   ")
+        with self.assertRaises(ValueError):
+            Settings(
+                memory_database=self.memory.database_path,
+                paid_api_enabled=True,
+                paid_api_approval_id="   ",
+            )
+        with self.assertRaises(ValueError):
+            Settings(
+                memory_database=self.memory.database_path,
+                paid_api_approval_id="   ",
+            )
+        with self.assertRaises(ValueError):
+            Settings(
+                memory_database=self.memory.database_path,
+                paid_api_approval_id="",
+            )
+
+    def test_valid_approval_ids_are_stored_stripped_by_both_doors(self) -> None:
+        settings = Settings(memory_database=self.memory.database_path)
+        direct = Settings(
+            memory_database=self.memory.database_path,
+            paid_api_approval_id="  user-decision-123  ",
+        )
+        self.assertEqual("user-decision-123", direct.paid_api_approval_id)
+        self.assertEqual(
+            settings.enable_paid_api("  user-decision-123  "),
+            Settings(
+                memory_database=self.memory.database_path,
+                paid_api_enabled=True,
+                paid_api_approval_id="  user-decision-123  ",
+            ),
+        )
+
     def test_actual_usage_is_persisted_and_aggregated(self) -> None:
         # A metered route must project a real, strictly positive maximum.
         connector = DummyConnector(estimate_max=0.10, actual_cost=0.07)

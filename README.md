@@ -8,7 +8,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - `SMART_AUTO` yalnızca düşük riskli ve geri alınabilir işleri otomatik çalıştırır.
 - Dışarı veri gönderimi, ücret/faturalandırma, silme, push/deploy/yayın ve finansal/form gönderimi her modda açık onay ister.
 - Onaylar task, session, normalize hedef, connector, destination, veri sınıfı, fingerprint ve süre ile bağlanır.
-- Aylık hedef ve sert üst sınır 20 USD'dir. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
+- Aylık parasal politika tek yüzeydir: kullanıcı onayı olmadan geçilemeyecek 20 USD sert üst sınır. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 
@@ -253,6 +253,6 @@ başlatmaz. Her iki durumda da `subprocess.run`, `subprocess.Popen` ve
 `shutil.which` sınırları dokunulursa anında hata verecek biçimde patch'lenir.
 Bu nedenle B1 testleri hiçbir canlı model veya auth çağrısı yapmaz.
 
-## Bilinen dış blocker
+## Canlı doğrulama durumu
 
-Canlı Claude Code doğrulaması bu çalışmanın kapsamı dışında tutuldu. Önceki kontrolde yerel Max hesabının OAuth belirteci süresi dolmuştu. Kullanıcı yeniden giriş yaptıktan sonra bile canlı çağrı ancak ayrıca istendiğinde yapılmalıdır.
+İlk gerçek, tamamen read-only canlı Claude Code smoke doğrulaması 16 Ağustos 2026'da başarıyla tamamlandı (checkpoint `bef77e7`; kanonik session/task/grant kayıtları `PROJECT_CONTEXT.md` içindedir). Çağrı Claude Max/OAuth abonelik yolunda `SUBSCRIPTION_INCLUDED` olarak çalıştı ve ek parasal harcama oluşturmadı. Daha önceki bir denemede görülen süresi dolmuş OAuth durumu bu başarılı doğrulamayla aşılmıştır. Canlı model/auth çağrıları yine de yalnızca açıkça istendiğinde yapılır; güvenlik testleri hiçbir canlı çağrı içermez.

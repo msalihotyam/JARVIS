@@ -433,7 +433,6 @@ class CanonicalMonetaryValidationTests(unittest.TestCase):
 class SettingsValidationTests(unittest.TestCase):
     def test_non_finite_settings_are_rejected(self) -> None:
         for field in (
-            "monthly_target_usd",
             "monthly_hard_limit_usd",
             "claude_call_budget_usd",
         ):
@@ -447,7 +446,10 @@ class SettingsValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings(monthly_hard_limit_usd=25.0)
         with self.assertRaises(ValueError):
-            Settings(monthly_target_usd=-1.0)
+            Settings(monthly_hard_limit_usd=-1.0)
+        # H5: the dormant soft-target surface was removed; the hard cap is
+        # the only monthly monetary policy surface.
+        self.assertFalse(hasattr(Settings(), "monthly_target_usd"))
 
 
 class EstimateValidationBeforeExecutionTests(BillingIntegrityTestCase):

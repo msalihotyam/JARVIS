@@ -1075,12 +1075,12 @@ Kurallar:
 
 ### 7.2 Parasal politika
 
-- Tüm faturalandırılabilir connector/model kullanımı için aylık hedef **20 USD**, kullanıcı onayı olmadan geçilemeyecek sert üst sınır da **20 USD**'dir.
+- Tüm faturalandırılabilir connector/model kullanımı için kullanıcı onayı olmadan geçilemeyecek aylık sert üst sınır **20 USD**'dir. Bunun dışında ayrı bir yumuşak aylık hedef yüzeyi yoktur (H5'te kaldırıldı).
 - Her ücretli görevden önce mümkünse model, tahmini token, tahmini maliyet aralığı ve belirsizlik gösterilir.
 - Çalışma sırasında gerçek token ve yaklaşık dolar karşılığı izlenebilir; görev sonunda gerçek kullanım kaydedilir.
 - Aylık gerçek parasal kullanım SQLite usage ledger'da toplanır; toplama yalnızca `METERED_MONETARY` + `MEASURED` kayıtları dahil eder. Görev öncesi maksimum parasal tahmin mevcut aylık harcamayla birlikte 20 USD'yi aşarsa görev durur ve yalnızca o göreve bağlı açık cost-override grant'iyle devam eder.
 - **H3 (uygulandı):** aylık maruziyet artık ölçülmüş harcama **artı** hâlâ açık olan girişim rezervasyonlarıdır ve üst sınır, yürütme talebinin atomik `BEGIN IMMEDIATE` işleminin içinde otoriter biçimde kontrol edilip rezerve edilir. Böylece iki eşzamanlı metered görev aynı bakiyeye karşı ön kontrolü birlikte geçemez; kaybeden hiçbir grant tüketmez, rezervasyon oluşturmaz ve connector sınırını geçmez.
-- `paid_api_enabled` varsayılan olarak false kalır; kalıcı olarak açılması kaydedilmiş açık kullanıcı karar kimliği gerektirir. Kapalıyken ücretli bir görev ayrıca göreve özel billing onayı ister.
+- `paid_api_enabled` varsayılan olarak false kalır ve üretim CLI'sinde onu açan bir yüzey yoktur. Onay kimliği (`paid_api_approval_id`) strip sonrası boş olamaz ve her iki kurulum yolunda da strip edilmiş biçimde saklanır; bu kimlik yalnızca uyumluluk metadata'sıdır, kalıcı bir kullanıcı kararına karşı doğrulanmaz ve tek başına yürütme yetkisi taşımaz. Göreve özel `PAID_API_GATE` onayı yalnızca `requires_paid_api` olan bir görevde anahtar kapalıyken zorunludur; anahtar açıkken bu gate otomatik oluşmaz. `METERED_MONETARY` bir görevde aylık sert sınırı aşan projeksiyon, anahtarın durumundan bağımsız olarak ayrıca göreve özel `COST_CAP_GATE` onayı gerektirir.
 - Yerel işlem, ilgili bağlamı seçerek küçültme, özetleme ve gereksiz model çağrılarını önleme temel optimizasyonlardır.
 - Aynı işi iki büyük modele gereksiz yere yaptırmak varsayılan değildir.
 

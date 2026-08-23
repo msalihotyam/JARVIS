@@ -42,29 +42,40 @@ def _finite(name: str, value: float) -> float:
 class Settings:
     memory_database: Path = PROJECT_ROOT / "data" / "jarvis.db"
     permission_mode: PermissionMode = PermissionMode.SESSION
-    monthly_target_usd: float = MONTHLY_HARD_LIMIT_USD
     monthly_hard_limit_usd: float = MONTHLY_HARD_LIMIT_USD
     paid_api_enabled: bool = False
+    #: Compatibility metadata only. A non-blank approval id is required to
+    #: flip ``paid_api_enabled`` and is stored stripped, but the id itself is
+    #: NOT execution authority: it is never verified against a persisted user
+    #: decision. While the switch is off, a task that requires the paid API
+    #: raises the task-specific PAID_API_GATE approval in ``jarvis.core``;
+    #: with the switch on that gate is not raised, and only a projected
+    #: hard-cap breach raises the separate COST_CAP_GATE.
     paid_api_approval_id: str | None = None
     approval_ttl_minutes: int = 30
     claude_call_budget_usd: float = 0.25
 
     def __post_init__(self) -> None:
         # Finiteness first: NaN passes every ordinary comparison below.
-        target = _finite("monthly_target_usd", self.monthly_target_usd)
         limit = _finite("monthly_hard_limit_usd", self.monthly_hard_limit_usd)
         _finite("claude_call_budget_usd", self.claude_call_budget_usd)
-        if target < 0:
-            raise ValueError("monthly_target_usd cannot be negative")
         try:
             limit_nano = nano_usd(limit, "monthly_hard_limit_usd")
         except BillingIntegrityError as exc:
             raise ValueError(str(exc)) from exc
         if limit_nano != MONTHLY_HARD_LIMIT_NANO_USD:
             raise ValueError("The hard limit is fixed at 20 USD without a new user decision")
-        if target > limit:
-            raise ValueError("monthly_target_usd cannot exceed the hard limit")
-        if self.paid_api_enabled and not self.paid_api_approval_id:
+        # Both construction doors (direct construction here and
+        # ``enable_paid_api`` below) apply the same stripped/non-blank rule
+        # and store the id in its stripped form.
+        approval_id = self.paid_api_approval_id
+        if approval_id is not None:
+            if not isinstance(approval_id, str) or not approval_id.strip():
+                raise ValueError(
+                    "paid_api_approval_id must be a non-blank string when set"
+                )
+            object.__setattr__(self, "paid_api_approval_id", approval_id.strip())
+        if self.paid_api_enabled and approval_id is None:
             raise ValueError("Enabling paid APIs requires an explicit approval id")
         if self.approval_ttl_minutes <= 0:
             raise ValueError("approval_ttl_minutes must be positive")

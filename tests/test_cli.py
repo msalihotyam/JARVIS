@@ -192,7 +192,6 @@ class CliTestCase(unittest.TestCase):
             "mode": "local",
             "schema_version": 5,
             "permission_mode": "session",
-            "monthly_target_usd": 20.0,
             "monthly_hard_limit_usd": 20.0,
             "paid_api_enabled": False,
         }
