@@ -37,6 +37,9 @@ from jarvis.contracts import (
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
+    ProjectMemoryItem,
+    ProjectMemoryKind,
+    ProjectRecord,
     ResultVerifier,
     RiskLevel,
     RunStatus,
@@ -50,6 +53,7 @@ from jarvis.contracts import (
     next_loop_stage,
     normalize_destination,
     require_billing_class,
+    validate_project_id,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
@@ -128,7 +132,9 @@ _ERROR_EXIT = {
 #: Default-deny allowlists. Anything absent here - protected core fields,
 #: billing markers, approval state, fingerprints or future preference keys -
 #: is rejected rather than ignored.
-_TASK_KEYS = frozenset({"objective", "capability", "scope", "context", "preferences"})
+_TASK_KEYS = frozenset(
+    {"objective", "capability", "scope", "context", "preferences", "project_id"}
+)
 _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification"})
 _CONTEXT_KEYS = frozenset({"working_directory", "inputs"})
 _PREFERENCE_KEYS = frozenset(
@@ -284,6 +290,17 @@ def decode_task_json(raw: str | bytes) -> Task:
     if assumption.strip():
         preferences["assumption"] = assumption
 
+    # M1: an optional project reference. Format-validated here; existence and
+    # active state are proven later against storage, where an unknown project
+    # fails the task closed. Never auto-created.
+    project_id: str | None = None
+    project_id_text = _string(document, "project_id", "task")
+    if project_id_text.strip():
+        try:
+            project_id = validate_project_id(project_id_text.strip())
+        except ValueError as exc:
+            raise TaskInputError(str(exc)) from exc
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -297,6 +314,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         ),
         context=context,
         preferences=preferences,
+        project_id=project_id,
     )
 
 
@@ -503,6 +521,7 @@ def build_envelope(
                 "id": session.id,
                 "active_task_id": session.active_task_id,
                 "next_step": session.next_step,
+                "project_id": session.project_id,
             }
         ),
         "task": (
@@ -570,6 +589,113 @@ def status_payload(settings: Settings, memory: SQLiteMemoryStore) -> dict[str, A
         "monthly_hard_limit_usd": settings.monthly_hard_limit_usd,
         "paid_api_enabled": settings.paid_api_enabled,
     }
+
+
+# --------------------------------------------------------------------------
+# Project memory commands (M1) - local-only, deterministic, no connector,
+# no model call. Persisted memory is untrusted reference data and is never
+# approval, billing or lifecycle authority.
+# --------------------------------------------------------------------------
+
+
+def _memory_item_payload(item: ProjectMemoryItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "project_id": item.project_id,
+        "kind": item.kind.value,
+        "classification": item.classification.value,
+        # Exactly what was persisted: already normalized, bounded and passed
+        # through the canonical credential/path hygiene at the write boundary.
+        "text": item.text,
+        "active": item.active,
+        "superseded_by": item.superseded_by,
+        "created_at": item.created_at,
+    }
+
+
+def project_create_result(
+    memory: SQLiteMemoryStore, settings: Settings, project_id: str, name: str
+) -> CommandResult:
+    command = "project-create"
+    try:
+        project = ProjectRecord(id=validate_project_id(project_id), name=name)
+        memory.save_project(project)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        {"command": command, "project": project.to_dict()}, EXIT_OK
+    )
+
+
+def memory_add_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    project_id: str,
+    kind: str,
+    classification: str,
+    text: str,
+    supersedes: str | None,
+) -> CommandResult:
+    command = "memory-add"
+    try:
+        # Kind and classification are explicit user input; an unknown value
+        # fails closed here and is never defaulted or downgraded.
+        item = ProjectMemoryItem(
+            project_id=validate_project_id(project_id),
+            kind=ProjectMemoryKind(kind),
+            text=text,
+            classification=DataClassification(classification),
+        )
+        stored = memory.save_memory_item(item, supersedes=supersedes)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        {
+            "command": command,
+            "item": _memory_item_payload(stored),
+            "superseded": supersedes,
+        },
+        EXIT_OK,
+    )
+
+
+def memory_list_result(
+    memory: SQLiteMemoryStore, settings: Settings, project_id: str
+) -> CommandResult:
+    command = "memory-list"
+    try:
+        valid_id = validate_project_id(project_id)
+        if memory.load_project(valid_id) is None:
+            raise ValueError(f"Unknown project: {valid_id}")
+        items = memory.list_memory_items(valid_id)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        {
+            "command": command,
+            "project_id": valid_id,
+            "items": [_memory_item_payload(item) for item in items],
+        },
+        EXIT_OK,
+    )
 
 
 # --------------------------------------------------------------------------

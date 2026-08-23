@@ -162,6 +162,7 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
 - Gerçek artımlı harcama doğuran yollar (Anthropic API anahtarı, kullandıkça öde, kredi vb.) için olağan parasal politika sürer: gerekli yerde maliyet onayı, parasal kullanım defteri ve 20 USD sert sınırı.
 - Faturalandırma yolu güvenilir biçimde belirlenemiyorsa ücretsiz varsayılmaz, sıfır maliyet uydurulmaz; görev harici çağrıdan önce kapalı biçimde durur.
 - Kullanıcı onayı olmadan geçilemeyecek aylık sert üst sınır: 20 USD. Bu sınıra yalnızca gerçek, ölçülmüş `METERED_MONETARY` harcama girer. Ayrı bir yumuşak aylık hedef yüzeyi yoktur (H5'te kaldırıldı).
+- Proje hafızası M1 uygulandı (şema 6, additive): açık proje kimliği (`jarvis project create`), kullanıcı yazımlı fact/preference deposu (`jarvis memory add/list`, INSERT-only + supersede) ve mevcut getirme kotası içinde proje-kapsamlı getirme. Hafıza güvenilmeyen referans veridir, asla otorite değildir; model/connector hafıza yazamaz; proje otomatik yaratılmaz. Oturumlar arası karar getirisi, embedding ve otomatik çıkarım M2+ adayıdır ve uygulanmamıştır.
 - Henüz hiçbir ücretli API anahtarı eklenmemiştir ve eklenmeyecektir.
 - Claude Max aboneliği şirket tarafından karşılandığı için, resmi biçimde mümkünse Claude Code CLI üzerinden bundan yararlanmak önceliklidir; Anthropic API'ye otomatik geçiş yapılmaz.
 - ChatGPT Plus ve diğer aboneliklerin kapatılması bu geliştirme aşamasının parçası değildir; ancak JARVIS olgunlaştıktan ve gerçek kullanım/maliyet ölçüldükten sonra kullanıcı tarafından değerlendirilir.

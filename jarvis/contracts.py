@@ -1281,8 +1281,156 @@ RETRIEVAL_RATIONALE_CAP = 240
 RETRIEVAL_NEXT_STEP_CAP = 80
 
 
+# --------------------------------------------------------------------------
+# Project identity and project-scoped memory (M1)
+# --------------------------------------------------------------------------
+
+#: Strict project identity: a lowercase slug, never a filesystem path, URL or
+#: free text, so project ids can never collide with the H4 path-redaction
+#: contract or smuggle location details into persisted rows.
+PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+PROJECT_NAME_CAP = 120
+#: Hard ceiling for one stored memory text. Oversized text is REJECTED at the
+#: write boundary, never silently truncated: memory content is semantic user
+#: data, not diagnostics.
+PROJECT_MEMORY_TEXT_CAP = 480
+#: Newest active project items examined per retrieval, before scoring. An
+#: internal safety window like ``RETRIEVAL_CANDIDATE_WINDOW``, not a result
+#: limit; the absolute retrieval ceilings above stay unchanged.
+PROJECT_MEMORY_CANDIDATE_WINDOW = 25
+
+
+def validate_project_id(value: Any) -> str:
+    """Validate one project id; unknown shapes fail closed with ValueError."""
+    if not isinstance(value, str) or not PROJECT_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            "project_id must be a 3-64 character lowercase slug "
+            "([a-z0-9][a-z0-9-]{2,63})"
+        )
+    return value
+
+
+class ProjectMemoryKind(str, Enum):
+    FACT = "fact"
+    PREFERENCE = "preference"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectRecord:
+    """One explicit local project identity. Created only by the user through
+    the CLI; nothing auto-creates a project."""
+
+    id: str
+    name: str
+    active: bool = True
+    created_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.id)
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("project name must be a non-blank string")
+        if len(self.name) > PROJECT_NAME_CAP:
+            raise ValueError(
+                f"project name is longer than {PROJECT_NAME_CAP} characters"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "active": self.active,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectRecord":
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            active=bool(data.get("active", True)),
+            created_at=str(data.get("created_at", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectMemoryItem:
+    """One explicit, user-written project memory entry (fact or preference).
+
+    Untrusted reference data with NO execution authority: it can never
+    satisfy, create or influence approvals, grants, billing or lifecycle
+    state, and its text is data, not instructions. The classification is
+    mandatory at write time and is never downgraded automatically; a
+    malformed persisted classification loads closed as SECRET through
+    ``from_dict``, keeping the item permanently ineligible for egress.
+    """
+
+    project_id: str
+    kind: ProjectMemoryKind
+    text: str
+    classification: DataClassification
+    id: str = field(default_factory=lambda: str(uuid4()))
+    active: bool = True
+    superseded_by: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.project_id)
+        if type(self.kind) is not ProjectMemoryKind:
+            raise ValueError("kind must be a ProjectMemoryKind")
+        if not isinstance(self.classification, DataClassification):
+            raise ValueError("classification must be a DataClassification")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("memory text must be a non-blank string")
+        if len(self.text) > PROJECT_MEMORY_TEXT_CAP:
+            raise ValueError(
+                f"memory text is longer than {PROJECT_MEMORY_TEXT_CAP} characters"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "kind": self.kind.value,
+            "text": self.text,
+            "classification": self.classification.value,
+            "active": self.active,
+            "superseded_by": self.superseded_by,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectMemoryItem":
+        # Kind is strict: an unknown kind raises and the caller skips the row.
+        kind = ProjectMemoryKind(data["kind"])
+        # Classification fails closed: an unreadable value becomes SECRET and
+        # the item stays retrievable-but-never-egressable, not permissive.
+        try:
+            classification = DataClassification(data.get("classification"))
+        except ValueError:
+            classification = DataClassification.SECRET
+        return cls(
+            project_id=data["project_id"],
+            kind=kind,
+            text=data["text"],
+            classification=classification,
+            id=str(data.get("id", "")) or str(uuid4()),
+            active=bool(data.get("active", True)),
+            superseded_by=(
+                data.get("superseded_by")
+                if isinstance(data.get("superseded_by"), str)
+                else None
+            ),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+
 class RetrievedMemoryKind(str, Enum):
     DECISION = "decision"
+    FACT = "fact"
+    PREFERENCE = "preference"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1292,6 +1440,9 @@ class MemoryRetrievalQuery:
     exclude_task_id: str | None
     max_items: int = RETRIEVAL_MAX_ITEMS
     max_characters: int = RETRIEVAL_MAX_CHARACTERS
+    #: Optional project scope (M1). ``None`` keeps retrieval byte-identical
+    #: to the project-less behaviour: same-session decisions only.
+    project_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1425,6 +1576,7 @@ def build_retrieved_context(
     query: MemoryRetrievalQuery,
     current_classification: DataClassification | None,
     candidates: Sequence[tuple["DecisionRecord", DataClassification]],
+    project_candidates: Sequence[ProjectMemoryItem] = (),
 ) -> RetrievedContext:
     """Score, rank, filter, select and truncate one bounded candidate window.
 
@@ -1434,7 +1586,11 @@ def build_retrieved_context(
     finally selected records are normalized and truncated.
 
     ``RETRIEVAL_MAX_ITEMS`` and ``RETRIEVAL_MAX_CHARACTERS`` are absolute
-    ceilings: a query may narrow them but can never expand them.
+    ceilings: a query may narrow them but can never expand them. Project
+    memory items (M1) compete for the SAME slots and characters under the
+    same tokenizer, ordering and eligibility ladder — they never extend the
+    quota, and with ``project_candidates`` empty the result is byte-identical
+    to the project-less behaviour.
     """
     effective_max_items = max(0, min(query.max_items, RETRIEVAL_MAX_ITEMS))
     effective_max_characters = max(
@@ -1453,7 +1609,15 @@ def build_retrieved_context(
         score = len(query_tokens & candidate_tokens)
         if score > 0:
             scored.append((record, classification, score))
-    # Stable triple sort: relevance desc, created_at desc, decision id asc.
+    for item in project_candidates:
+        # A project item scores on its full stored text; its classification is
+        # the item's own explicit stored classification.
+        score = len(query_tokens & retrieval_tokens(item.text))
+        if score > 0:
+            scored.append((item, item.classification, score))
+    # Stable triple sort: relevance desc, created_at desc, record id asc.
+    # One merged ordering across kinds; ids are unique so ties resolve
+    # deterministically.
     scored.sort(key=lambda entry: entry[0].id)
     scored.sort(key=lambda entry: entry[0].created_at, reverse=True)
     scored.sort(key=lambda entry: entry[2], reverse=True)
@@ -1467,30 +1631,45 @@ def build_retrieved_context(
         if len(selected) >= effective_max_items:
             overflow = True
             break
-        summary, summary_truncated = truncate_retrieved_text(
-            normalize_retrieved_text(record.summary), RETRIEVAL_SUMMARY_CAP
-        )
-        rationale, rationale_truncated = truncate_retrieved_text(
-            normalize_retrieved_text(record.rationale), RETRIEVAL_RATIONALE_CAP
-        )
-        if record.next_step is None:
+        if isinstance(record, ProjectMemoryItem):
+            summary, summary_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(record.text), RETRIEVAL_SUMMARY_CAP
+            )
+            rationale = ""
+            rationale_truncated = False
             next_step: str | None = None
             next_step_truncated = False
             next_step_length = 0
+            kind = RetrievedMemoryKind(record.kind.value)
+            source_id = record.project_id
         else:
-            next_step, next_step_truncated = truncate_retrieved_text(
-                normalize_retrieved_text(record.next_step), RETRIEVAL_NEXT_STEP_CAP
+            summary, summary_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(record.summary), RETRIEVAL_SUMMARY_CAP
             )
-            next_step_length = len(next_step)
+            rationale, rationale_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(record.rationale), RETRIEVAL_RATIONALE_CAP
+            )
+            if record.next_step is None:
+                next_step = None
+                next_step_truncated = False
+                next_step_length = 0
+            else:
+                next_step, next_step_truncated = truncate_retrieved_text(
+                    normalize_retrieved_text(record.next_step),
+                    RETRIEVAL_NEXT_STEP_CAP,
+                )
+                next_step_length = len(next_step)
+            kind = RetrievedMemoryKind.DECISION
+            source_id = record.task_id
         contribution = len(summary) + len(rationale) + next_step_length
         if character_count + contribution > effective_max_characters:
             overflow = True
             break
         selected.append(
             RetrievedMemoryItem(
-                kind=RetrievedMemoryKind.DECISION,
+                kind=kind,
                 record_id=record.id,
-                source_task_id=record.task_id,
+                source_task_id=source_id,
                 summary=summary,
                 rationale=rationale,
                 next_step=next_step,
@@ -1505,7 +1684,7 @@ def build_retrieved_context(
         character_count += contribution
     return RetrievedContext(
         items=tuple(selected),
-        candidate_count=len(candidates),
+        candidate_count=len(candidates) + len(project_candidates),
         character_count=character_count,
         truncated=overflow or any(item.truncated for item in selected),
     )
@@ -2227,6 +2406,10 @@ class Task:
     context: dict[str, Any] = field(default_factory=dict)
     estimate: CostEstimate = field(default_factory=CostEstimate)
     preferences: dict[str, Any] = field(default_factory=dict)
+    #: Optional project reference (M1), validated at the input boundary.
+    #: Binding-only: it selects an EXISTING project for the session and is
+    #: never authority; an unknown project fails the task closed.
+    project_id: str | None = None
     risk_level: RiskLevel = RiskLevel.LOW
     side_effect: SideEffectProfile = field(default_factory=SideEffectProfile)
     id: str = field(default_factory=lambda: str(uuid4()))
@@ -2257,6 +2440,7 @@ class Task:
             "context": self.context,
             "estimate": self.estimate.to_dict(),
             "preferences": self.preferences,
+            "project_id": self.project_id,
             "risk_level": int(self.risk_level),
             "side_effect": {
                 "effect": self.side_effect.effect.value,
@@ -2297,6 +2481,14 @@ class Task:
             context=data.get("context", {}),
             estimate=CostEstimate.from_dict(data.get("estimate")),
             preferences=data.get("preferences", {}),
+            # A malformed persisted project reference fails closed to None;
+            # legacy task JSON without the field loads as project-less.
+            project_id=(
+                data.get("project_id")
+                if isinstance(data.get("project_id"), str)
+                and PROJECT_ID_PATTERN.fullmatch(data.get("project_id"))
+                else None
+            ),
             risk_level=RiskLevel(data.get("risk_level", RiskLevel.LOW)),
             side_effect=SideEffectProfile(
                 effect=SideEffect(effect.get("effect", SideEffect.NONE.value)),
@@ -2674,6 +2866,10 @@ class SessionState:
     #: only; it survives terminal completion while ``active_task_id`` clears.
     latest_task_id: str | None = None
     next_step: str | None = None
+    #: Project binding (M1). Set once, at the first project-carrying task of
+    #: the session, only to an existing active project. Scopes retrieval
+    #: only; it is never approval, billing or lifecycle authority.
+    project_id: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -2691,6 +2887,7 @@ class SessionState:
             "active_task_id",
             "latest_task_id",
             "next_step",
+            "project_id",
             "created_at",
             "updated_at",
         }
@@ -2703,6 +2900,15 @@ class SessionState:
         # canonical policy that bounds newly produced connector results runs
         # again at load, so unsafe text cannot survive a load/resave cycle.
         payload["next_step"] = normalize_session_next_step(payload.get("next_step"))
+        # A malformed persisted project binding fails closed to no project:
+        # it must never become a retrieval scope key. Legacy JSON loads None.
+        raw_project = payload.get("project_id")
+        payload["project_id"] = (
+            raw_project
+            if isinstance(raw_project, str)
+            and PROJECT_ID_PATTERN.fullmatch(raw_project)
+            else None
+        )
         return cls(**payload)
 
 
@@ -2835,6 +3041,28 @@ class MemoryStore(Protocol):
     def list_decisions(self, session_id: str) -> list[DecisionRecord]: ...
 
     def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext: ...
+
+    def save_project(self, project: ProjectRecord) -> None: ...
+
+    def load_project(self, project_id: str) -> ProjectRecord | None: ...
+
+    def list_projects(self) -> list[ProjectRecord]: ...
+
+    def save_memory_item(
+        self, item: ProjectMemoryItem, *, supersedes: str | None = None
+    ) -> ProjectMemoryItem:
+        """Persist one explicit memory item (INSERT-only).
+
+        The write boundary applies canonical credential/path hygiene and the
+        text ceiling, verifies the target project exists and is active, and —
+        when ``supersedes`` names an active item of the SAME project — marks
+        that item inactive/superseded in the same transaction. Row content is
+        never rewritten; there is no destructive update or delete."""
+        ...
+
+    def list_memory_items(
+        self, project_id: str, *, include_inactive: bool = False
+    ) -> list[ProjectMemoryItem]: ...
 
     def save_pending_approval(self, request: PermissionRequest) -> None: ...
 

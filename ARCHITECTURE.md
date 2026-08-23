@@ -86,9 +86,11 @@ Onay semantiği:
 
 ### 4.2 Bağlam getirme — aynı oturumdaki kararlar (uygulandı)
 
-Bu milestone yalnızca **aynı oturumdaki tamamlanmış kararları** kapsar. Fact
-kalıcılığı, oturumlar arası/proje hafızası, embedding/vektör tabanı ve model
-destekli sıralama kapsam dışıdır ve karar verilmemiştir.
+Bu bölümün ilk milestone'u yalnızca **aynı oturumdaki tamamlanmış kararları**
+kapsıyordu. Proje kimliği ve açık proje hafızası daha sonra §4.10 (M1) ile
+eklendi ve aynı boru hattının içinde, aynı mutlak sınırlarla çalışır.
+Oturumlar arası karar getirisi, embedding/vektör tabanı ve model destekli
+sıralama hâlâ kapsam dışıdır (M2+ adayı) ve karar verilmemiştir.
 
 Tipli sözleşme ve akış:
 
@@ -148,8 +150,9 @@ Tipli sözleşme ve akış:
   yapılandırmasına eklenmez; onay öncesi kesinleşen aynı kanonik payload hem
   önizlemede hem yürütmede kullanılır, onay sonrası iç metadata değişimi
   outbound byte'ları değiştirmez.
-- Kalıcılık mevcut `decision_log` ve task JSON'unu kullanır; SQL şema
-  değişikliği, migration veya şema sürümü artışı yoktur.
+- Kalıcılık mevcut `decision_log` ve task JSON'unu kullanır; bu milestone'da
+  SQL şema değişikliği yoktu (proje hafızası şemayı sonradan §4.10/M1 ile
+  6'ya taşıdı).
 
 ### 4.3 Görev-farkında deterministik plan (uygulandı)
 
@@ -1013,6 +1016,54 @@ Beşinci incelemenin üç P1 bulgusu için son düzeltmeler:
   (`--verbose`, `tokenizer.py`, `secret_handling.md`, sıradan token/secret
   düzyazısı) aynen korunur ve sanitizasyon idempotent kalır.
 
+### 4.10 Proje kimliği ve açık proje hafızası (M1, uygulandı)
+
+Proje hafızasının ilk güvenli temeli: açık proje kimliği + kullanıcı yazımlı
+fact/preference deposu + mevcut getirme boru hattına kontrollü katılım.
+Şema additive/idempotent olarak 6'ya çıktı (`projects`,
+`project_memory_items`, `sessions.project_id NULL`); hiçbir eski satır
+yeniden yazılmaz ve projesiz session/task davranışı bayt-özdeş kalır.
+
+Kilitli değişmezler:
+
+- **Kimlik:** `project_id` katı bir küçük-harf slug'dır (`[a-z0-9][a-z0-9-]{2,63}`);
+  asla dosya yolu, URL veya serbest metin değildir. Proje yalnızca açık
+  `jarvis project create` komutuyla doğar; hiçbir yol otomatik proje
+  yaratmaz. Task JSON'daki bilinmeyen/pasif proje referansı deterministik
+  biçimde `INVALID_TASK` (çıkış 64) ile kapalı düşer. Oturum, ilk
+  proje-taşıyan task'ında bir kez bağlanır; çelişen referans kapalı düşer.
+  Bozuk kalıcı bağlanma yüklemede None'a düşer (fail closed).
+- **Yazım:** hafıza yalnızca kullanıcı CLI komutlarıyla yazılır
+  (`jarvis memory add`); model veya connector asla hafıza yazamaz.
+  `memory add` açık project, kind (`fact|preference`), classification ve
+  content ister; eksik/deforme classification kapalı düşer ve hiçbir zaman
+  sessizce daha zayıf bir sınıfa indirgenmez. Yazım INSERT-only +
+  supersede'dir: `--supersedes`, aynı projenin aktif bir öğesini aynı
+  transaction'da `active=0/superseded_by` olarak işaretler; içerik sütunları
+  asla yeniden yazılmaz, yıkıcı update/delete yoktur (M1 dışı).
+- **Hijyen:** tanılama sanitizasyonu ile içerik hijyeni aynı şey değildir.
+  Yazım sınırı yalnızca gerçekten gerekli olanı uygular: newline
+  normalizasyonu, 480 karakterlik sert tavan (**aşan metin reddedilir,
+  asla kesilmez**) ve kanonik `redact_credentials` + `redact_local_paths`
+  yardımcıları. Anlamsal içerik başka hiçbir biçimde bozulmaz.
+- **Getirme:** proje öğeleri mevcut boru hattına ikinci bir aday penceresi
+  (en yeni ≤25 aktif öğe) olarak girer; aynı deterministik tokenizer, aynı
+  sıralama (`skor ↓ → created_at ↓ → id ↑`) ve aynı sınıflandırma
+  merdiveni uygulanır. **Toplam tavanlar değişmez:** en çok 5 öğe / 4.000
+  karakter — proje öğeleri kota eklemez, aynı kota içinde yarışır.
+  Cross-project izolasyon mutlaktır; öğenin kendi saklı sınıfı esas alınır,
+  deforme sınıf SECRET sayılır ve SECRET asla dışa uygun değildir. Deforme
+  kind'lı satır çökmeden atlanır.
+- **Yetki:** kalıcı hafıza güvenilmeyen referans veridir. Hiçbir öğe
+  approval/billing/lifecycle otoritesi taşımaz veya etkileyemez; içeriği
+  prompt talimatı olarak yorumlanmaz (connector çerçeve notu fact/preference
+  kapsayacak biçimde günceldir) ve H1–H5 değişmezleri aynen yürürlüktedir.
+  Connector egress sınırında kind allowlist'i tam olarak
+  `{decision, fact, preference}`'tır; alan seti değişmemiştir (default-deny).
+- **Ertelenen (M2+):** oturumlar arası karar getirisi, model destekli
+  çıkarım/özetleme, embedding, otomatik proje tespiti, edit/delete/import/
+  export/search-management CLI özellikleri.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:
@@ -1036,7 +1087,7 @@ Dosya okuma, yerel analiz, özetleme ve normal yerel testler düşük riskli kab
 Hafıza yalnızca sohbet geçmişi değildir. En az iki katman olacaktır:
 
 - **Ham kayıt:** Mesajlar, araç olayları ve değişiklik günlüğü.
-- **Yapılandırılmış kalıcı bilgi:** Proje gerçekleri, kullanıcı tercihleri, kararlar ve karar gerekçeleri.
+- **Yapılandırılmış kalıcı bilgi:** Proje gerçekleri, kullanıcı tercihleri, kararlar ve karar gerekçeleri. (İlk somut adım uygulandı: §4.10/M1 açık proje kimliği ile kullanıcı yazımlı fact/preference deposunu ekledi; kararlar oturum kapsamında kalır.)
 
 Her proje ayrı bağlam ve oturumlara sahip olabilir. Bir çalışma oturumu hedefi, mevcut planı, tamamlanan adımları, açık sorunları, değişen dosyaları ve sonraki adımı saklar. "Baştan yapalım" geçmişi silmez; yeni bir alternatif/karar dalı açar. Eski karar noktalarına geri dönme desteklenecek şekilde veri modeli tasarlanır.
 

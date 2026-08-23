@@ -9,6 +9,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Dışarı veri gönderimi, ücret/faturalandırma, silme, push/deploy/yayın ve finansal/form gönderimi her modda açık onay ister.
 - Onaylar task, session, normalize hedef, connector, destination, veri sınıfı, fingerprint ve süre ile bağlanır.
 - Aylık parasal politika tek yüzeydir: kullanıcı onayı olmadan geçilemeyecek 20 USD sert üst sınır. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
+- Proje hafızası (M1) güvenilmeyen referans veridir: yalnızca açık kullanıcı komutlarıyla yazılır, hiçbir zaman approval/billing/lifecycle otoritesi taşımaz, içeriği talimat olarak yorumlanmaz ve toplam getirme kotasını (5 öğe / 4.000 karakter) büyütmez.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 
@@ -22,6 +23,28 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - `jarvis/registry.py`: priority/suitability/availability/cost tabanlı connector seçimi.
 - `jarvis/connectors/`: ortak connector ve güvenli Claude Code plan connector'ı.
 - Eski `Agent Core`, `Config`, `Connectors`, `Memory`, `Tools` dosyaları uyumluluk sarmalayıcıları olarak korunur.
+
+## Proje hafızası (M1)
+
+Proje kimliği ve açık proje-kapsamlı hafıza tamamen yereldir ve model/ağ
+çağrısı yapmaz. SQLite şeması additive migration ile 6'dadır; eski projesiz
+oturum/task davranışı birebir korunur.
+
+```powershell
+jarvis project create --id jarvis-v1 --name "JARVIS v1"
+jarvis memory add --project jarvis-v1 --kind fact --classification internal --text "..."
+jarvis memory list --project jarvis-v1
+```
+
+Kurallar: proje otomatik yaratılmaz (bilinmeyen proje `64` ile reddedilir);
+`memory add` açık kind (`fact|preference`) ve classification ister, eksikse
+kapalı düşer; metin 480 karakteri aşarsa **reddedilir** (kesilmez) ve yazım
+anında kanonik kimlik-bilgisi/yol redaksiyonundan geçer; yazım INSERT-only +
+`--supersedes`'tir (içerik asla yeniden yazılmaz, edit/delete yoktur). Task
+JSON'una isteğe bağlı `project_id` alanı eklenmiştir; oturumun ilk
+proje-taşıyan task'ı oturumu bağlar ve zarfın `session.project_id` alanında
+görünür. Getirilen fact/preference öğeleri karar öğeleriyle aynı 5 öğe /
+4.000 karakter kotası içinde yarışır; cross-project izolasyon mutlaktır.
 
 ## Windows'ta test
 
@@ -155,7 +178,7 @@ Aynı `AgentRun` her seferinde byte-özdeş serileşir. Zarf şema sürümü, ü
 düzey `progress` nesnesinin eklenmesiyle 2'dir; `status` komutu birebir
 geriye uyumlu kalır.
 
-Zarf yalnızca şunları taşır: session kimliği/aktif task/sonraki adım, task
+Zarf yalnızca şunları taşır: session kimliği/aktif task/sonraki adım/proje bağlanması (`project_id`), task
 kimliği/durum/aşama/seçili connector, onay isteği kimliği, fingerprint, scope
 fingerprint, scope, risk, yan etki, gerekçe ve connector'ın kendi redakte
 edilmiş `OutboundDataPreview` kaydı, faturalandırma sınıfı/parasal üst

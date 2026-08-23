@@ -9,6 +9,8 @@ from jarvis.contracts import (
     LINEAR_LOOP_STAGES,
     MONTHLY_HARD_LIMIT_NANO_USD,
     OPEN_RESERVATION_STATES,
+    PROJECT_MEMORY_CANDIDATE_WINDOW,
+    PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
     AttemptState,
     BillingClaim,
@@ -26,10 +28,14 @@ from jarvis.contracts import (
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
+    ProjectMemoryItem,
+    ProjectMemoryKind,
+    ProjectRecord,
     ReconciliationOutcome,
     ReconciliationResult,
     ReservationState,
     RetrievedContext,
+    RetrievedMemoryKind,
     RunStatus,
     SessionState,
     Task,
@@ -40,6 +46,9 @@ from jarvis.contracts import (
     is_expired,
     ledger_month,
     nano_usd,
+    normalize_retrieved_text,
+    redact_credentials,
+    redact_local_paths,
     usd_from_nano,
     utc_now,
 )
@@ -171,6 +180,9 @@ class InMemoryStore:
         #: H3: attempt-bound billing/reservation records, mirroring the SQLite
         #: ``attempt_billing`` table including storage-owned usage identity.
         self.billing: dict[str, dict] = {}
+        #: M1: project identities and INSERT-only memory items.
+        self.projects: dict[str, ProjectRecord] = {}
+        self.memory_items: list[ProjectMemoryItem] = []
 
     def save_session(self, session: SessionState) -> None:
         self.sessions[session.id] = copy.deepcopy(session)
@@ -254,7 +266,92 @@ class InMemoryStore:
                     else DataClassification.SECRET,
                 )
             )
-        return build_retrieved_context(query, current, candidates)
+        project_candidates: tuple[ProjectMemoryItem, ...] = ()
+        if query.project_id is not None:
+            active_items = [
+                item
+                for item in self.memory_items
+                if item.project_id == query.project_id and item.active
+            ]
+            active_items.sort(key=lambda item: item.id)
+            active_items.sort(key=lambda item: item.created_at, reverse=True)
+            project_candidates = tuple(
+                copy.deepcopy(active_items[:PROJECT_MEMORY_CANDIDATE_WINDOW])
+            )
+        return build_retrieved_context(
+            query, current, candidates, project_candidates=project_candidates
+        )
+
+    def save_project(self, project: ProjectRecord) -> None:
+        if project.id in self.projects:
+            raise ValueError(f"Project already exists: {project.id}")
+        self.projects[project.id] = copy.deepcopy(project)
+
+    def load_project(self, project_id: str) -> ProjectRecord | None:
+        return copy.deepcopy(self.projects.get(project_id))
+
+    def list_projects(self) -> list[ProjectRecord]:
+        return copy.deepcopy(
+            sorted(self.projects.values(), key=lambda p: (p.created_at, p.id))
+        )
+
+    def save_memory_item(
+        self, item: ProjectMemoryItem, *, supersedes: str | None = None
+    ) -> ProjectMemoryItem:
+        # The same write-boundary contract as the SQLite store: normalize,
+        # hard-reject oversize (never truncate), canonical hygiene helpers,
+        # INSERT-only with supersede-only lifecycle flags.
+        text = normalize_retrieved_text(item.text)
+        if not text:
+            raise ValueError("memory text must be a non-blank string")
+        if len(text) > PROJECT_MEMORY_TEXT_CAP:
+            raise ValueError(
+                f"memory text is longer than {PROJECT_MEMORY_TEXT_CAP} characters"
+            )
+        text, _ = redact_credentials(text)
+        text = redact_local_paths(text)
+        stored = replace(item, text=text, active=True, superseded_by=None)
+        project = self.projects.get(stored.project_id)
+        if project is None or not project.active:
+            raise ValueError(f"Unknown or inactive project: {stored.project_id}")
+        if any(existing.id == stored.id for existing in self.memory_items):
+            raise ValueError(f"Memory item already exists: {stored.id}")
+        old_index: int | None = None
+        if supersedes is not None:
+            for index, existing in enumerate(self.memory_items):
+                if existing.id == supersedes:
+                    old_index = index
+                    break
+            if (
+                old_index is None
+                or self.memory_items[old_index].project_id != stored.project_id
+                or not self.memory_items[old_index].active
+            ):
+                raise ValueError(
+                    "supersedes must reference an active memory item "
+                    "of the same project"
+                )
+        self.memory_items.append(copy.deepcopy(stored))
+        if old_index is not None:
+            self.memory_items[old_index] = replace(
+                self.memory_items[old_index],
+                active=False,
+                superseded_by=stored.id,
+                updated_at=utc_now(),
+            )
+        return stored
+
+    def list_memory_items(
+        self, project_id: str, *, include_inactive: bool = False
+    ) -> list[ProjectMemoryItem]:
+        items = [
+            item
+            for item in self.memory_items
+            if item.project_id == project_id
+            and (include_inactive or item.active)
+        ]
+        items.sort(key=lambda item: (item.created_at, item.id))
+        return copy.deepcopy(items)
 
     def save_pending_approval(self, request: PermissionRequest) -> None:
         # Terminal immutability extends to approval issuance: no fresh
@@ -637,6 +734,41 @@ class StorageAbstractionTests(unittest.TestCase):
         stored_session = memory.load_session(run.session.id)
         self.assertIsNone(stored_session.active_task_id)
         self.assertEqual(run.task.id, stored_session.latest_task_id)
+
+    def test_project_memory_flows_through_a_non_sqlite_store(self) -> None:
+        # M1 is storage-agnostic: identity, explicit memory and project-scoped
+        # retrieval work through the protocol alone, with the shared pipeline
+        # doing all scoring/eligibility work.
+        registry = ToolRegistry()
+        registry.register(DummyConnector())
+        memory = InMemoryStore()
+        memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+        memory.save_memory_item(
+            ProjectMemoryItem(
+                project_id="proj-a",
+                kind=ProjectMemoryKind.FACT,
+                text="echo capability uses resource-a for this project",
+                classification=DataClassification.INTERNAL,
+            )
+        )
+        core = AgentCore(
+            registry,
+            memory,
+            Settings(permission_mode=PermissionMode.SMART_AUTO),
+        )
+        task = make_task()
+        task.project_id = "proj-a"
+        run = core.run(task)
+        self.assertEqual(RunStatus.COMPLETED, run.status)
+        self.assertEqual("proj-a", run.session.project_id)
+        stored_task = memory.load_task(run.task.id)
+        kinds = {item.kind for item in stored_task.retrieved_context.items}
+        self.assertIn(RetrievedMemoryKind.FACT, kinds)
+        # An unknown project fails closed through the same protocol.
+        ghost = make_task()
+        ghost.project_id = "ghost-proj"
+        refused = core.run(ghost)
+        self.assertEqual(RunStatus.FAILED, refused.status)
 
     def test_retrieval_flows_through_a_non_sqlite_store(self) -> None:
         registry = ToolRegistry()

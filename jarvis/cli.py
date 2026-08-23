@@ -18,9 +18,17 @@ from jarvis.app import (
     TaskInputError,
     build_default_app,
     failure_result,
+    memory_add_result,
+    memory_list_result,
+    project_create_result,
     status_payload,
 )
-from jarvis.contracts import ErrorCode, PermissionMode
+from jarvis.contracts import (
+    DataClassification,
+    ErrorCode,
+    PermissionMode,
+    ProjectMemoryKind,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
 
@@ -75,6 +83,38 @@ def _build_parser() -> _ArgumentParser:
         if name == "approve":
             command.add_argument("--remember-for-session", action="store_true")
 
+    # Project memory (M1): local-only commands. Like ``status`` they build no
+    # registry, connector or model call; memory is written only through these
+    # explicit user commands, never by a model or a connector.
+    project_command = commands.add_parser(
+        "project", help="Manage local project identities."
+    )
+    project_actions = project_command.add_subparsers(dest="project_action")
+    project_create = project_actions.add_parser(
+        "create", help="Create a project identity (never automatic)."
+    )
+    project_create.add_argument("--id", required=True, dest="project_id")
+    project_create.add_argument("--name", required=True)
+
+    memory_command = commands.add_parser(
+        "memory", help="Explicit project-scoped memory (untrusted reference data)."
+    )
+    memory_actions = memory_command.add_subparsers(dest="memory_action")
+    memory_add = memory_actions.add_parser("add")
+    memory_add.add_argument("--project", required=True)
+    memory_add.add_argument(
+        "--kind", required=True, choices=[kind.value for kind in ProjectMemoryKind]
+    )
+    memory_add.add_argument(
+        "--classification",
+        required=True,
+        choices=[classification.value for classification in DataClassification],
+    )
+    memory_add.add_argument("--text", required=True)
+    memory_add.add_argument("--supersedes")
+    memory_list = memory_actions.add_parser("list")
+    memory_list.add_argument("--project", required=True)
+
     return parser
 
 
@@ -102,6 +142,43 @@ def _read_task_json(source: str) -> bytes:
             f"Task JSON is larger than the {MAX_TASK_JSON_BYTES} byte limit."
         )
     return payload
+
+
+def _dispatch_memory_command(
+    settings: Settings, command: str, args: argparse.Namespace
+) -> CommandResult:
+    memory = SQLiteMemoryStore(settings.memory_database)
+    if command == "project":
+        if getattr(args, "project_action", None) == "create":
+            return project_create_result(
+                memory, settings, args.project_id, args.name
+            )
+        return failure_result(
+            "project",
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            "'project' requires the 'create' sub-command.",
+            EXIT_INVALID_INPUT,
+        )
+    if getattr(args, "memory_action", None) == "add":
+        return memory_add_result(
+            memory,
+            settings,
+            args.project,
+            args.kind,
+            args.classification,
+            args.text,
+            args.supersedes,
+        )
+    if getattr(args, "memory_action", None) == "list":
+        return memory_list_result(memory, settings, args.project)
+    return failure_result(
+        "memory",
+        settings.permission_mode,
+        ErrorCode.INVALID_TASK,
+        "'memory' requires the 'add' or 'list' sub-command.",
+        EXIT_INVALID_INPUT,
+    )
 
 
 def _dispatch(app: JarvisApp, command: str, args: argparse.Namespace) -> CommandResult:
@@ -166,6 +243,13 @@ def main(
         payload: dict[str, Any] = status_payload(effective, memory)
         print(json.dumps(payload, indent=2))
         return 0
+
+    if command in ("project", "memory"):
+        # Local-only project memory commands: no registry, connector, probe
+        # or model call, exactly like ``status``.
+        result = _dispatch_memory_command(effective, command, args)
+        print(result.render())
+        return result.exit_code
 
     result: CommandResult
     try:

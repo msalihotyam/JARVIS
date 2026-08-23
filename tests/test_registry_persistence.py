@@ -111,8 +111,9 @@ class RegistryAndPersistenceTests(unittest.TestCase):
 
     def test_schema_has_version_foreign_keys_and_wal(self) -> None:
         # H2 added the execution-attempt journal at schema 4; H3 added the
-        # attempt-bound execution-billing/reservation journal at schema 5.
-        self.assertEqual(5, SCHEMA_VERSION)
+        # attempt-bound execution-billing/reservation journal at schema 5;
+        # Project Memory M1 added projects/project_memory_items at schema 6.
+        self.assertEqual(6, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
         connection = sqlite3.connect(self.memory.database_path)
         try:

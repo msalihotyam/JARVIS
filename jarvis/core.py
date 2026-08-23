@@ -340,6 +340,9 @@ class AgentCore:
                 terminal = self._terminal_run(session, task)
                 if terminal is not None:
                     return terminal
+        binding_failure = self._bind_project(session, task)
+        if binding_failure is not None:
+            return binding_failure
         session.active_task_id = task.id
         session.latest_task_id = task.id
         try:
@@ -562,6 +565,10 @@ class AgentCore:
                         )
                     ),
                     exclude_task_id=task.id,
+                    # M1: the session's validated binding is the only project
+                    # scope key; a project-less session retrieves exactly as
+                    # before.
+                    project_id=session.project_id,
                 )
                 try:
                     # H4-C: the call AND the validation of what it returned are
@@ -2523,6 +2530,41 @@ class AgentCore:
             session, task, "task_failed", error.to_dict()
         )
         return AgentRun(RunStatus.FAILED, session, task, result=result, error=error)
+
+    def _bind_project(self, session: SessionState, task: Task) -> AgentRun | None:
+        """Deterministic project binding (M1); ``None`` means proceed.
+
+        A task without a project reference never changes the session's
+        binding. A referenced project must already exist and be active -
+        nothing here can auto-create one - and once a session is bound, a
+        conflicting reference fails closed. Binding only scopes retrieval; it
+        grants no authority of any kind.
+        """
+        requested = task.project_id
+        if requested is None:
+            return None
+        if session.project_id is not None:
+            if session.project_id != requested:
+                return self._input_failure(
+                    task,
+                    ErrorCode.INVALID_TASK,
+                    "Task project does not match the session's project.",
+                    session,
+                )
+            return None
+        try:
+            project = self.memory.load_project(requested)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            project = None
+        if project is None or not project.active:
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                f"Unknown or inactive project: {requested}",
+                session,
+            )
+        session.project_id = requested
+        return None
 
     @staticmethod
     def _input_failure(

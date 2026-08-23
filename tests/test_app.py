@@ -108,6 +108,16 @@ class TaskInputBoundaryTests(unittest.TestCase):
             task.preferences,
         )
 
+    def test_project_id_is_validated_at_the_boundary(self) -> None:
+        accepted = decode_task_json(task_document(project_id="proj-a"))
+        self.assertEqual("proj-a", accepted.project_id)
+        absent = decode_task_json(task_document())
+        self.assertIsNone(absent.project_id)
+        for bad in ("Not A Slug", "a/b", "x" * 65, 7, {"id": "proj-a"}):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(TaskInputError):
+                    decode_task_json(task_document(project_id=bad))
+
     def test_documented_defaults_and_internal_state(self) -> None:
         task = decode_task_json(task_document(scope={"action": "read"}))
         self.assertEqual("", task.scope.target)
@@ -501,6 +511,21 @@ class AppCommandTests(unittest.TestCase):
         result = app.run(task_document(), session.id)
         self.assertEqual(0, result.exit_code)
         self.assertEqual(session.id, result.payload["session"]["id"])
+
+    def test_envelope_session_carries_the_project_binding(self) -> None:
+        from jarvis.contracts import ProjectRecord
+
+        app, _ = self.build()
+        unbound = app.run(task_document())
+        self.assertIsNone(unbound.payload["session"]["project_id"])
+        self.memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+        bound = app.run(task_document(project_id="proj-a"))
+        self.assertEqual(0, bound.exit_code)
+        self.assertEqual("proj-a", bound.payload["session"]["project_id"])
+        # An unknown project fails closed with the deterministic input error.
+        refused = app.run(task_document(project_id="ghost-proj"))
+        self.assertEqual(64, refused.exit_code)
+        self.assertEqual("invalid_task", refused.payload["error"]["code"])
 
     def test_run_with_an_unknown_session_is_not_found(self) -> None:
         app, connector = self.build()

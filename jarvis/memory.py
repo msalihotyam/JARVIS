@@ -16,6 +16,8 @@ from jarvis.contracts import (
     MAX_NANO_USD,
     MAX_SQLITE_INTEGER,
     MONTHLY_HARD_LIMIT_NANO_USD,
+    PROJECT_MEMORY_CANDIDATE_WINDOW,
+    PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
     AttemptState,
     BillingClaim,
@@ -33,6 +35,8 @@ from jarvis.contracts import (
     MonetaryState,
     PermissionGrant,
     PermissionRequest,
+    ProjectMemoryItem,
+    ProjectRecord,
     ReconciliationOutcome,
     ReconciliationResult,
     ReservationState,
@@ -48,8 +52,11 @@ from jarvis.contracts import (
     ledger_month,
     monetary_state_from_raw,
     nano_usd,
+    normalize_retrieved_text,
     normalize_symbol,
     persistable_count,
+    redact_credentials,
+    redact_local_paths,
     require_billing_class,
     require_monetary_state,
     reservation_state_from_raw,
@@ -58,7 +65,7 @@ from jarvis.contracts import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -387,7 +394,58 @@ class SQLiteMemoryStore:
         if target_version == 5:
             self._migrate_execution_billing(connection)
             return
+        if target_version == 6:
+            self._migrate_project_memory(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
+
+    @staticmethod
+    def _migrate_project_memory(connection: sqlite3.Connection) -> None:
+        """Add project identity and explicit project-scoped memory (M1).
+
+        Strictly additive and idempotent: two new tables, one nullable column
+        on ``sessions``. No existing row is rewritten, so every schema-5
+        database keeps its full history and every legacy session stays a
+        project-less session (NULL) with byte-identical behaviour.
+        """
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_memory_items (
+                -- M1: INSERT-only rows; content columns are never rewritten.
+                -- Supersede flips only the lifecycle flags below.
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                text TEXT NOT NULL,
+                -- Explicit, user-supplied classification; never defaulted or
+                -- downgraded by code.
+                classification TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                superseded_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pmi_project_active
+                ON project_memory_items(project_id, active);
+            """
+        )
+        existing = {
+            row[1] for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        if existing and "project_id" not in existing:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN project_id TEXT"
+            )
 
     @staticmethod
     def _migrate_execution_journal(connection: sqlite3.Connection) -> None:
@@ -498,8 +556,33 @@ class SQLiteMemoryStore:
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                project_id TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_memory_items (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                text TEXT NOT NULL,
+                classification TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                superseded_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pmi_project_active
+                ON project_memory_items(project_id, active);
 
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -662,12 +745,19 @@ class SQLiteMemoryStore:
         session.touch()
         connection.execute(
             """
-            INSERT INTO sessions (id, state_json, updated_at) VALUES (?, ?, ?)
+            INSERT INTO sessions (id, state_json, updated_at, project_id)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state_json = excluded.state_json,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                project_id = excluded.project_id
             """,
-            (session.id, SQLiteMemoryStore._json(session.to_dict()), session.updated_at),
+            (
+                session.id,
+                SQLiteMemoryStore._json(session.to_dict()),
+                session.updated_at,
+                session.project_id,
+            ),
         )
 
     @staticmethod
@@ -1997,6 +2087,192 @@ class SQLiteMemoryStore:
             ).fetchall()
         return [DecisionRecord.from_dict(json.loads(row[0])) for row in rows]
 
+    def save_project(self, project: ProjectRecord) -> None:
+        """Create one project identity. Explicit and INSERT-only: an existing
+        id is refused loudly, never silently renamed or reactivated."""
+        with self._connection(write=True) as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO projects (id, name, active, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        project.id,
+                        project.name,
+                        int(bool(project.active)),
+                        project.created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Project already exists: {project.id}") from exc
+
+    def load_project(self, project_id: str) -> ProjectRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id, name, active, created_at FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return ProjectRecord(
+                id=row["id"],
+                name=row["name"],
+                active=bool(row["active"]),
+                created_at=str(row["created_at"]),
+            )
+        except (TypeError, ValueError):
+            # A malformed persisted project fails closed as missing: it can
+            # never become a binding or retrieval scope.
+            return None
+
+    def list_projects(self) -> list[ProjectRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, name, active, created_at FROM projects "
+                "ORDER BY created_at, id"
+            ).fetchall()
+        projects: list[ProjectRecord] = []
+        for row in rows:
+            try:
+                projects.append(
+                    ProjectRecord(
+                        id=row["id"],
+                        name=row["name"],
+                        active=bool(row["active"]),
+                        created_at=str(row["created_at"]),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return projects
+
+    def save_memory_item(
+        self, item: ProjectMemoryItem, *, supersedes: str | None = None
+    ) -> ProjectMemoryItem:
+        """Persist one explicit memory item (INSERT-only + supersede).
+
+        The write boundary applies exactly the hygiene the persistence
+        contract needs and nothing more: newline normalization, the hard text
+        ceiling (REJECT, never truncate - memory text is semantic user data,
+        not diagnostics), and the canonical credential/path redaction
+        helpers. Content columns are never rewritten; ``supersedes`` only
+        flips the referenced item's lifecycle flags, in the same transaction.
+        """
+        text = normalize_retrieved_text(item.text)
+        if not text:
+            raise ValueError("memory text must be a non-blank string")
+        if len(text) > PROJECT_MEMORY_TEXT_CAP:
+            raise ValueError(
+                f"memory text is longer than {PROJECT_MEMORY_TEXT_CAP} characters"
+            )
+        text, _ = redact_credentials(text)
+        text = redact_local_paths(text)
+        stored = replace(item, text=text, active=True, superseded_by=None)
+        with self._connection(write=True) as connection:
+            project_row = connection.execute(
+                "SELECT active FROM projects WHERE id = ?",
+                (stored.project_id,),
+            ).fetchone()
+            if project_row is None or not project_row["active"]:
+                raise ValueError(
+                    f"Unknown or inactive project: {stored.project_id}"
+                )
+            if supersedes is not None:
+                old_row = connection.execute(
+                    "SELECT project_id, active FROM project_memory_items "
+                    "WHERE id = ?",
+                    (supersedes,),
+                ).fetchone()
+                if (
+                    old_row is None
+                    or old_row["project_id"] != stored.project_id
+                    or not old_row["active"]
+                ):
+                    raise ValueError(
+                        "supersedes must reference an active memory item "
+                        "of the same project"
+                    )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO project_memory_items
+                        (id, project_id, kind, text, classification, active,
+                         superseded_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                    """,
+                    (
+                        stored.id,
+                        stored.project_id,
+                        stored.kind.value,
+                        stored.text,
+                        stored.classification.value,
+                        stored.created_at,
+                        stored.updated_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"Memory item already exists: {stored.id}"
+                ) from exc
+            if supersedes is not None:
+                connection.execute(
+                    """
+                    UPDATE project_memory_items
+                       SET active = 0, superseded_by = ?, updated_at = ?
+                     WHERE id = ? AND active = 1
+                    """,
+                    (stored.id, utc_now(), supersedes),
+                )
+        return stored
+
+    def list_memory_items(
+        self, project_id: str, *, include_inactive: bool = False
+    ) -> list[ProjectMemoryItem]:
+        sql = (
+            "SELECT id, project_id, kind, text, classification, active, "
+            "superseded_by, created_at, updated_at FROM project_memory_items "
+            "WHERE project_id = ?"
+        )
+        if not include_inactive:
+            sql += " AND active = 1"
+        sql += " ORDER BY created_at, id"
+        with self._connection() as connection:
+            rows = connection.execute(sql, (project_id,)).fetchall()
+        items: list[ProjectMemoryItem] = []
+        for row in rows:
+            item = self._memory_item_from_row(row)
+            if item is not None:
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _memory_item_from_row(row: sqlite3.Row) -> ProjectMemoryItem | None:
+        """Rebuild one persisted item defensively.
+
+        An unknown kind, blank/oversized text or broken identity makes the
+        row unusable and it is skipped (fail closed); an unreadable
+        classification alone degrades to SECRET inside ``from_dict`` so the
+        item stays listable but never egress-eligible.
+        """
+        try:
+            return ProjectMemoryItem.from_dict(
+                {
+                    "id": row["id"],
+                    "project_id": row["project_id"],
+                    "kind": row["kind"],
+                    "text": row["text"],
+                    "classification": row["classification"],
+                    "active": bool(row["active"]),
+                    "superseded_by": row["superseded_by"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        except (TypeError, KeyError, ValueError):
+            return None
+
     def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext:
         """Bounded, deterministic retrieval over same-session decisions.
 
@@ -2004,6 +2280,12 @@ class SQLiteMemoryStore:
         session are examined, the current task is excluded, and every
         classification is recovered from the persisted source task, failing
         closed as SECRET when that recovery is impossible.
+
+        With a project scope (M1) the newest active
+        ``PROJECT_MEMORY_CANDIDATE_WINDOW`` items of exactly that project are
+        additionally examined; they compete inside the same absolute item and
+        character ceilings and the same eligibility ladder. Without a project
+        scope the behaviour is byte-identical to the project-less pipeline.
         """
         sql = (
             "SELECT d.decision_json, t.state_json FROM decision_log AS d "
@@ -2028,6 +2310,16 @@ class SQLiteMemoryStore:
                         current_row[0]
                     )
             rows = connection.execute(sql, parameters).fetchall()
+            item_rows: list[sqlite3.Row] = []
+            if query.project_id is not None:
+                item_rows = connection.execute(
+                    "SELECT id, project_id, kind, text, classification, "
+                    "active, superseded_by, created_at, updated_at "
+                    "FROM project_memory_items "
+                    "WHERE project_id = ? AND active = 1 "
+                    "ORDER BY created_at DESC, id ASC LIMIT ?",
+                    (query.project_id, PROJECT_MEMORY_CANDIDATE_WINDOW),
+                ).fetchall()
         candidates: list[tuple[DecisionRecord, DataClassification]] = []
         for row in rows:
             try:
@@ -2036,7 +2328,17 @@ class SQLiteMemoryStore:
                 # An unreadable decision row cannot be scored or shown.
                 continue
             candidates.append((record, self._classification_from_state(row[1])))
-        return build_retrieved_context(query, current_classification, candidates)
+        project_candidates: list[ProjectMemoryItem] = []
+        for row in item_rows:
+            item = self._memory_item_from_row(row)
+            if item is not None:
+                project_candidates.append(item)
+        return build_retrieved_context(
+            query,
+            current_classification,
+            candidates,
+            project_candidates=tuple(project_candidates),
+        )
 
     @staticmethod
     def _classification_from_state(state_json: Any) -> DataClassification:

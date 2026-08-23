@@ -31,6 +31,8 @@ from jarvis.contracts import (
     DecisionRecord,
     MemoryRetrievalQuery,
     PermissionGrant,
+    ProjectMemoryItem,
+    ProjectMemoryKind,
     RetrievedContext,
     RetrievedMemoryItem,
     RetrievedMemoryKind,
@@ -611,7 +613,7 @@ class CoreFlowTests(unittest.TestCase):
             [
                 "Validate objective_ref=a6065c2da58054f8 for capability=echo "
                 "and action=read; visible_assumption=present.",
-                "Proceed without retrieved decision references; "
+                "Proceed without retrieved memory references; "
                 "do not infer missing memory.",
                 "Keep execution within the declared scope: target=specified, "
                 "destination=unspecified, classification=internal.",
@@ -1306,6 +1308,292 @@ class ApprovalExecutionIntegrationTests(unittest.TestCase):
                 session.id, waiting.permission_request.scope_fingerprint
             )
         )
+
+
+class ProjectMemoryPipelineContractTests(unittest.TestCase):
+    """M1: the shared pipeline mixes project items into the SAME quota under
+    the same deterministic ordering, and stays byte-identical without them."""
+
+    @staticmethod
+    def decision(summary: str, *, created_at: str, record_id: str) -> DecisionRecord:
+        return DecisionRecord(
+            session_id="s",
+            task_id=f"task-{record_id}",
+            summary=summary,
+            rationale="",
+            id=record_id,
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def fact(text: str, *, created_at: str, record_id: str) -> ProjectMemoryItem:
+        return ProjectMemoryItem(
+            project_id="proj-a",
+            kind=ProjectMemoryKind.FACT,
+            text=text,
+            classification=DataClassification.INTERNAL,
+            id=record_id,
+            created_at=created_at,
+        )
+
+    def query(self, text: str = "shared tokens query") -> MemoryRetrievalQuery:
+        return MemoryRetrievalQuery(
+            session_id="s",
+            query_text=text,
+            exclude_task_id=None,
+            project_id="proj-a",
+        )
+
+    def test_empty_project_candidates_are_byte_identical(self) -> None:
+        candidates = [
+            (
+                self.decision(
+                    "shared tokens query summary",
+                    created_at="2026-08-20T00:00:00+00:00",
+                    record_id="d1",
+                ),
+                DataClassification.INTERNAL,
+            )
+        ]
+        legacy = build_retrieved_context(
+            self.query(), DataClassification.INTERNAL, candidates
+        )
+        explicit = build_retrieved_context(
+            self.query(),
+            DataClassification.INTERNAL,
+            candidates,
+            project_candidates=(),
+        )
+        self.assertEqual(legacy.to_dict(), explicit.to_dict())
+
+    def test_merged_ordering_is_score_then_recency_then_id(self) -> None:
+        candidates = [
+            (
+                self.decision(
+                    "shared tokens query decision",
+                    created_at="2026-08-21T00:00:00+00:00",
+                    record_id="d-mid",
+                ),
+                DataClassification.INTERNAL,
+            )
+        ]
+        facts = (
+            self.fact(
+                "shared tokens query fact newest",
+                created_at="2026-08-22T00:00:00+00:00",
+                record_id="f-new",
+            ),
+            self.fact(
+                "shared tokens",
+                created_at="2026-08-23T00:00:00+00:00",
+                record_id="f-low-score",
+            ),
+        )
+        result = build_retrieved_context(
+            self.query(), DataClassification.INTERNAL, candidates, facts
+        )
+        self.assertEqual(
+            ["f-new", "d-mid", "f-low-score"],
+            [item.record_id for item in result.items],
+        )
+        self.assertEqual(
+            [
+                RetrievedMemoryKind.FACT,
+                RetrievedMemoryKind.DECISION,
+                RetrievedMemoryKind.FACT,
+            ],
+            [item.kind for item in result.items],
+        )
+        fact_item = result.items[0]
+        self.assertEqual("", fact_item.rationale)
+        self.assertIsNone(fact_item.next_step)
+        self.assertEqual("proj-a", fact_item.source_task_id)
+
+    def test_project_items_share_the_absolute_item_quota(self) -> None:
+        candidates = [
+            (
+                self.decision(
+                    f"shared tokens query decision {index}",
+                    created_at=f"2026-08-1{index}T00:00:00+00:00",
+                    record_id=f"d{index}",
+                ),
+                DataClassification.INTERNAL,
+            )
+            for index in range(4)
+        ]
+        facts = tuple(
+            self.fact(
+                f"shared tokens query fact {index}",
+                created_at=f"2026-08-2{index}T00:00:00+00:00",
+                record_id=f"f{index}",
+            )
+            for index in range(4)
+        )
+        result = build_retrieved_context(
+            self.query(), DataClassification.INTERNAL, candidates, facts
+        )
+        self.assertEqual(RETRIEVAL_MAX_ITEMS, len(result.items))
+        self.assertEqual(8, result.candidate_count)
+        self.assertTrue(result.truncated)
+
+    def test_zero_score_and_secret_project_items_never_surface(self) -> None:
+        facts = (
+            self.fact(
+                "completely unrelated content",
+                created_at="2026-08-22T00:00:00+00:00",
+                record_id="f-zero",
+            ),
+            ProjectMemoryItem(
+                project_id="proj-a",
+                kind=ProjectMemoryKind.PREFERENCE,
+                text="shared tokens query secret preference",
+                classification=DataClassification.SECRET,
+                id="f-secret",
+                created_at="2026-08-22T00:00:00+00:00",
+            ),
+        )
+        result = build_retrieved_context(
+            self.query(), DataClassification.INTERNAL, [], facts
+        )
+        self.assertEqual((), result.items)
+
+
+class ConnectorEgressKindAllowlistTests(unittest.TestCase):
+    """M1 regression pin for the connector serialization boundary.
+
+    The egress kind allowlist is exactly {decision, fact, preference}: a
+    regression back to decision-only MUST fail here. Unknown or tampered
+    kinds drop fail-closed without consuming an outbound slot, the
+    classification ceiling is re-enforced per item, and the defensive
+    5-item / 4,000-character limits and per-field caps re-apply at egress.
+    """
+
+    @staticmethod
+    def snapshot_item(
+        kind,
+        *,
+        summary: str = "egress allowlist evidence",
+        classification=DataClassification.INTERNAL,
+        record_id: str = "r1",
+    ) -> RetrievedMemoryItem:
+        return RetrievedMemoryItem(
+            kind=kind,
+            record_id=record_id,
+            source_task_id="src",
+            summary=summary,
+            rationale="",
+            next_step=None,
+            classification=classification,
+            created_at="2026-08-23T00:00:00+00:00",
+            relevance_score=1,
+            truncated=False,
+        )
+
+    @staticmethod
+    def payload_for(*items, classification=DataClassification.INTERNAL):
+        task = make_task(classification=classification)
+        task.retrieved_context = RetrievedContext(items=tuple(items))
+        payload, _ = ClaudeCodeConnector._retrieved_memory(task)
+        return payload
+
+    def test_all_three_supported_kinds_egress_in_snapshot_order(self) -> None:
+        payload = self.payload_for(
+            self.snapshot_item(RetrievedMemoryKind.DECISION, record_id="r1"),
+            self.snapshot_item(RetrievedMemoryKind.FACT, record_id="r2"),
+            self.snapshot_item(RetrievedMemoryKind.PREFERENCE, record_id="r3"),
+        )
+        self.assertEqual(RETRIEVED_MEMORY_NOTICE, payload["notice"])
+        kinds = [item["kind"] for item in payload["items"]]
+        self.assertEqual(["decision", "fact", "preference"], kinds)
+        # The pin itself: every supported kind MUST be present. If the
+        # connector allowlist ever narrows back to decision-only, this fails.
+        self.assertEqual({"decision", "fact", "preference"}, set(kinds))
+        for item in payload["items"]:
+            self.assertEqual(
+                {"kind", "summary", "rationale", "next_step", "classification"},
+                set(item),
+            )
+
+    def test_unknown_and_tampered_kinds_drop_without_consuming_slots(self) -> None:
+        class ForeignKind:
+            value = "fact"
+
+        tampered = (
+            self.snapshot_item("fact", record_id="raw-string"),
+            self.snapshot_item(ForeignKind(), record_id="enum-mimic"),
+            self.snapshot_item(None, record_id="none-kind"),
+            self.snapshot_item(12345, record_id="int-kind"),
+        )
+        valid = tuple(
+            self.snapshot_item(
+                RetrievedMemoryKind.FACT,
+                summary=f"egress allowlist evidence {index}",
+                record_id=f"valid-{index}",
+            )
+            for index in range(RETRIEVAL_MAX_ITEMS)
+        )
+        # Tampered items lead the snapshot; every valid item still egresses,
+        # so a dropped kind never consumed an outbound slot.
+        payload = self.payload_for(*(tampered + valid))
+        self.assertEqual(RETRIEVAL_MAX_ITEMS, len(payload["items"]))
+        self.assertEqual(
+            [
+                f"egress allowlist evidence {index}"
+                for index in range(RETRIEVAL_MAX_ITEMS)
+            ],
+            [item["summary"] for item in payload["items"]],
+        )
+        self.assertEqual(
+            {"fact"}, {item["kind"] for item in payload["items"]}
+        )
+        # A fully tampered snapshot contributes no payload key at all.
+        self.assertIsNone(self.payload_for(*tampered))
+
+    def test_classification_ceiling_holds_for_project_kinds(self) -> None:
+        secret = self.snapshot_item(
+            RetrievedMemoryKind.FACT,
+            classification=DataClassification.SECRET,
+            record_id="secret-fact",
+        )
+        sensitive = self.snapshot_item(
+            RetrievedMemoryKind.PREFERENCE,
+            classification=DataClassification.SENSITIVE,
+            record_id="higher-pref",
+        )
+        eligible = self.snapshot_item(
+            RetrievedMemoryKind.FACT, record_id="eligible-fact"
+        )
+        payload = self.payload_for(
+            secret, sensitive, eligible, classification=DataClassification.INTERNAL
+        )
+        self.assertEqual(1, len(payload["items"]))
+        self.assertEqual("internal", payload["items"][0]["classification"])
+        self.assertEqual("fact", payload["items"][0]["kind"])
+        # A SECRET project item never egresses for ANY current classification.
+        for current in DataClassification:
+            with self.subTest(current=current.value):
+                self.assertIsNone(self.payload_for(secret, classification=current))
+
+    def test_defensive_item_and_character_ceilings_reapply_at_egress(self) -> None:
+        oversized = tuple(
+            self.snapshot_item(
+                RetrievedMemoryKind.FACT,
+                summary="x" * 10_000,
+                record_id=f"big-{index}",
+            )
+            for index in range(9)
+        )
+        payload = self.payload_for(*oversized)
+        self.assertLessEqual(len(payload["items"]), RETRIEVAL_MAX_ITEMS)
+        total = sum(
+            len(item["summary"])
+            + len(item["rationale"])
+            + len(item["next_step"] or "")
+            for item in payload["items"]
+        )
+        self.assertLessEqual(total, RETRIEVAL_MAX_CHARACTERS)
+        for item in payload["items"]:
+            self.assertLessEqual(len(item["summary"]), RETRIEVAL_SUMMARY_CAP)
 
 
 if __name__ == "__main__":
