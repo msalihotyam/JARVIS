@@ -2026,7 +2026,7 @@ class SQLiteMemoryStore:
         self,
         session: SessionState,
         task: Task,
-        decision: DecisionRecord,
+        decision: DecisionRecord | None,
         usage: UsageRecord,
         event_type: str,
         payload: dict[str, Any],
@@ -2040,6 +2040,17 @@ class SQLiteMemoryStore:
         transaction rolls back and ``False`` is returned - no decision row, no
         terminal event, no stale session overwrite.
 
+        ``decision`` is optional because not every terminal task HAS a
+        decision to record. A decision is trusted inherited history: later
+        work in the session retrieves it as context. A local file read
+        produces evidence, not a judgement, so it finalizes with no decision
+        at all rather than with an empty or sentinel one - the row is never
+        written, so there is nothing for retrieval to inherit and nothing to
+        clean up afterwards. Everything else about the transaction is
+        unchanged: the terminal task write, the session update, the usage
+        bookkeeping, the terminal event and the guarded arbitration all still
+        happen together or not at all.
+
         The usage row is keyed by its own id and was already appended by the
         execution path, so re-writing it here is idempotent and never
         duplicates legitimately recorded usage.
@@ -2049,20 +2060,21 @@ class SQLiteMemoryStore:
                 self._upsert_session(connection, session)
                 if not self._upsert_task(connection, session.id, task):
                     raise _StaleWriterLost()
-                connection.execute(
-                    """
-                    INSERT OR REPLACE INTO decision_log
-                        (id, session_id, task_id, decision_json, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        decision.id,
-                        decision.session_id,
-                        decision.task_id,
-                        self._json(decision.to_dict()),
-                        decision.created_at,
-                    ),
-                )
+                if decision is not None:
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO decision_log
+                            (id, session_id, task_id, decision_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            decision.id,
+                            decision.session_id,
+                            decision.task_id,
+                            self._json(decision.to_dict()),
+                            decision.created_at,
+                        ),
+                    )
                 validate_usage_record(usage)
                 self._insert_usage(connection, usage)
                 connection.execute(

@@ -609,7 +609,10 @@ class CliTestCase(unittest.TestCase):
         code, output, _ = self.invoke(["run", "--task-json", self.task_file()])
         self.assertEqual(0, code)
         payload = json.loads(output)
-        self.assertEqual(2, payload["schema_version"])
+        # M3 bumped the envelope contract to v3: the bounded ``local_read``
+        # block was added (and the M1 ``session.project_id`` field, which was
+        # added without a bump, is now covered by a version too).
+        self.assertEqual(3, payload["schema_version"])
         self.assertEqual(
             {
                 "schema_version",
@@ -621,11 +624,15 @@ class CliTestCase(unittest.TestCase):
                 "approval",
                 "billing",
                 "progress",
+                "local_read",
                 "result",
                 "error",
             },
             set(payload),
         )
+        # A task that read nothing carries the key with a null value: the
+        # envelope shape is fixed, never conditional.
+        self.assertIsNone(payload["local_read"])
         self.assertEqual(
             {
                 "task_id",

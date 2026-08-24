@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -9,6 +10,9 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     COST_CAP_GATE,
     DIAGNOSTIC_DETAIL_MAX_CHARS,
+    LOCAL_READ_CAPABILITY,
+    LOCAL_READ_RESULT_KEY,
+    LOCAL_READ_TASK_REFERENCE_KEY,
     MAX_SQLITE_INTEGER,
     PAID_API_GATE,
     RETRIEVAL_MAX_CHARACTERS,
@@ -34,6 +38,7 @@ from jarvis.contracts import (
     ExecutionAttempt,
     ExecutionClaimOutcome,
     LedgerSnapshot,
+    LocalReadSnapshot,
     LoopStage,
     MemoryRetrievalQuery,
     MemoryStore,
@@ -60,16 +65,20 @@ from jarvis.contracts import (
     UsageRecord,
     VerificationRecord,
     VerificationStatus,
+    canonical_path,
     canonical_usd,
     diagnostic_from_exception,
     format_usd,
     is_expired,
+    local_read_snapshot_refusal,
     merge_side_effects,
     nano_usd,
     normalize_destination,
     require_billing_class,
     require_monetary_state,
+    retrieval_eligible,
     sanitize_diagnostic_text,
+    unusable_filesystem_target,
     usd_from_nano,
     validate_cost_estimate,
     validated_measured_cost,
@@ -503,6 +512,16 @@ class AgentCore:
         task: Task,
         grant: PermissionGrant | None,
     ) -> AgentRun:
+        # P1-2: bind a filesystem target to its canonical identity ONCE, at
+        # the single entry point every path into the loop passes through
+        # (``run`` and ``resume`` both reach the loop only through here), and
+        # before anything reads the scope. Everything downstream - scope
+        # authority, the permission and scope fingerprints, the egress
+        # attestation's resource boundary and the connector's own execution -
+        # then sees the same canonical string.
+        canonical_failure = self._bind_canonical_local_target(session, task)
+        if canonical_failure is not None:
+            return canonical_failure
         active_grant = grant
         while True:
             # Terminal states are immutable; report and never re-enter the loop.
@@ -550,6 +569,15 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.CONTEXT_RETRIEVAL:
+                # M3: an explicit reference to an earlier completed local read
+                # is resolved here, before retrieval, so an unusable reference
+                # fails the task closed rather than half-populating it. It is
+                # a separate typed field: it never enters the retrieval
+                # pipeline and never consumes the 5-item / 4000-character
+                # retrieval quota.
+                local_read_failure = self._bind_referenced_local_read(session, task)
+                if local_read_failure is not None:
+                    return local_read_failure
                 # The query is built only from the task's own declared intent,
                 # never from arbitrary context inputs, preferences or prior
                 # retrieved content. Retrieval runs once; a task resumed past
@@ -1022,6 +1050,15 @@ class AgentCore:
                             billing_evidence=task.estimate.billing_evidence,
                         ),
                     )
+                # M3: the typed local-read snapshot is lifted off the result
+                # HERE, before ``_sanitize_result`` reduces ``data`` to
+                # ``next_step``. Deliberately non-raising, exactly like
+                # ``_coerced_verification``: this runs after the connector
+                # boundary and before H3 reconciliation, so a malformed
+                # snapshot is discarded rather than raised. The connector's
+                # own verifier then fails the task closed at VERIFY, with the
+                # reservation already reconciled.
+                self._bind_local_read(task, connector, result)
                 # H4: connector-authored free-form text is bounded and
                 # scrubbed before it can become persisted task, decision or
                 # audit state. It never touches approval, billing, execution or
@@ -1185,18 +1222,31 @@ class AgentCore:
                 task.status = TaskStatus.COMPLETED
                 task.stage = LoopStage.COMPLETED
                 session.active_task_id = None
-                decision = DecisionRecord(
-                    session_id=session.id,
-                    task_id=task.id,
-                    summary=result.summary,
-                    # Bounded and scrubbed: a decision record is the record
-                    # future work inherits as trusted history.
-                    rationale=sanitize_diagnostic_text(
-                        f"Connector={connector.manifest.name}; "
-                        f"verification={result.verification.method}; "
-                        f"assumption={task.visible_assumption}"
-                    ),
-                    next_step=session.next_step,
+                # M3: a local read records EVIDENCE, not a judgement. A
+                # decision is trusted inherited history - later tasks in the
+                # session retrieve it as context - so a read that merely
+                # observed a file has nothing to contribute and finalizes
+                # with no decision at all. Not a blanked or sentinel record:
+                # the row is never written, so nothing can be retrieved from
+                # it and nothing has to be cleaned up afterwards. Everything
+                # else about finalization is unchanged, and every other
+                # capability still writes its decision exactly as before.
+                decision = (
+                    None
+                    if task.capability == LOCAL_READ_CAPABILITY
+                    else DecisionRecord(
+                        session_id=session.id,
+                        task_id=task.id,
+                        summary=result.summary,
+                        # Bounded and scrubbed: a decision record is the
+                        # record future work inherits as trusted history.
+                        rationale=sanitize_diagnostic_text(
+                            f"Connector={connector.manifest.name}; "
+                            f"verification={result.verification.method}; "
+                            f"assumption={task.visible_assumption}"
+                        ),
+                        next_step=session.next_step,
+                    )
                 )
                 # All-or-nothing with lifecycle authority: if a cancellation
                 # already won the terminal transition, no decision, usage
@@ -1576,6 +1626,32 @@ class AgentCore:
             cap=RETRIEVAL_MAX_CHARACTERS,
         )
         _exact_flag(value.truncated, "retrieved context truncated flag")
+        return value
+
+    @staticmethod
+    def _validated_local_read(value: Any) -> LocalReadSnapshot:
+        """Require exactly the typed local-read snapshot, before any field use.
+
+        The same H4-C boundary as retrieval, for the same reason: this object
+        crosses the connector boundary and is then serialized into task JSON
+        outside the try block, so a malformed field must fail here rather than
+        raise while a checkpoint is being written.
+
+        P1-5: the structural contract itself is NOT restated here. There is
+        exactly one - ``local_read_snapshot_refusal`` in ``jarvis.contracts`` -
+        and the load boundary, this execution boundary, the public envelope
+        and the Claude egress boundary all call that same function, so four
+        subtly different validators cannot drift apart. This method only
+        turns its refusal into the ``TypeError`` this stage boundary expects.
+
+        ``classification`` is validated as an exact enum by that contract and
+        is then *replaced* by the caller from trusted authority (the reading
+        task's scope, or the SOURCE TASK's scope on the cross-task hop), so
+        nothing a connector or a persisted row puts in it carries authority.
+        """
+        reason = local_read_snapshot_refusal(value)
+        if reason is not None:
+            raise TypeError(f"local read snapshot is invalid: {reason}")
         return value
 
     @staticmethod
@@ -2530,6 +2606,198 @@ class AgentCore:
             session, task, "task_failed", error.to_dict()
         )
         return AgentRun(RunStatus.FAILED, session, task, result=result, error=error)
+
+    def _bind_canonical_local_target(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Canonicalize a local-read target through the FILESYSTEM path (P1-2).
+
+        ``ActionScope.normalized`` is field-aware but shape-driven: it routes
+        ``target`` through ``canonical_path`` only when the text already looks
+        like a path. A bare relative name has no separator and no drive, so it
+        fell through to ``normalize_symbol`` and stayed a *symbolic* string -
+        which meant ``README.md`` and ``.\\README.md`` produced two different
+        scope fingerprints for one file, and, worse, that the symbolic form
+        was never re-resolved: a grant issued against ``readme.md`` stayed
+        valid while the name was repointed at a different file, and execution
+        then resolved the name live and read the new one.
+
+        Binding the capability's target to ``canonical_path`` here removes
+        both. Every spelling of one file - bare, ``.\\`` prefixed, dot/parent
+        segments, a symlink - converges on the same absolute canonical
+        identity, so the approval fingerprint, the attested resource boundary
+        and the bytes the connector opens are the same resource. Repointing
+        after approval then changes the canonical target, which changes the
+        fingerprint, which invalidates the grant.
+
+        Keyed on the capability, not on the connector: the canonical identity
+        must exist before connector selection, since selection itself and the
+        approval that follows are already reading the scope.
+
+        The root-relative display name stays a completely separate value -
+        ``LocalReadSnapshot.relative_path``, derived from the allowed root -
+        so no absolute path travels to the user, the envelope or the model.
+
+        ``None`` means proceed. A target no filesystem can ever name is
+        refused HERE, as ordinary terminal state, because this is the first
+        thing in the loop that touches it. That matters for more than
+        tidiness: this method runs after ``run()`` has already registered the
+        task and pointed the session at it, so a raise here escapes the loop
+        entirely and leaves a registered task with no terminal state and a
+        session still naming it active. An embedded NUL is exactly that case
+        - POSIX rejects it inside ``resolve()`` while Windows accepts it
+        there and rejects it later in ``lstat``/``open``, so the *platform*
+        decided whether the product failed cleanly. It is refused explicitly
+        instead, identically everywhere.
+        """
+        if task.capability != LOCAL_READ_CAPABILITY:
+            return None
+        target = task.scope.target
+        if type(target) is not str or not target.strip():
+            # An empty or malformed target is refused downstream, with the
+            # policy message that names the rule; it is not repaired here.
+            return None
+        unusable = unusable_filesystem_target(target)
+        if unusable is not None:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Read target is not a usable filesystem path: {unusable}.",
+                ),
+            )
+        task.scope = replace(task.scope, target=canonical_path(target))
+        return None
+
+    def _bind_local_read(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """Bind the connector's typed snapshot to the task, or bind nothing.
+
+        Two independent gates before anything is accepted:
+
+        * the *selected connector* must declare the local-read capability, so
+          an unrelated connector cannot smuggle a snapshot onto a task through
+          its result data; and
+        * the object must pass ``_validated_local_read`` exactly.
+
+        ``classification`` is then **replaced**, unconditionally, with the
+        reading task's own scope classification.
+
+        The exact guarantee, stated narrowly: *the classification the connector
+        RETURNS is never read*. Whatever it puts in the snapshot it hands back -
+        a lowered value, a raised one, a raw string, a foreign enum - is
+        discarded here, so a task whose scope says SECRET produces a SECRET
+        snapshot regardless.
+
+        What this does NOT claim: a connector is handed the live ``Task`` in
+        ``execute`` and ``verify`` and can mutate it directly afterwards. That
+        exposure is pre-existing and completely general - the same connector can
+        equally rewrite ``task.objective`` or ``task.scope`` - so it is a
+        property of the connector boundary itself, not of local read, and it is
+        not narrowed by this method. Downstream boundaries do not trust the
+        persisted value either: the cross-task hop and the Claude egress
+        boundary each re-validate the classification independently.
+        """
+        if LOCAL_READ_CAPABILITY not in connector.manifest.capabilities:
+            return
+        raw = result.data if isinstance(result.data, dict) else {}
+        if LOCAL_READ_RESULT_KEY not in raw:
+            return
+        try:
+            snapshot = self._validated_local_read(raw[LOCAL_READ_RESULT_KEY])
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return
+        task.local_read = replace(
+            snapshot, classification=task.scope.data_classification
+        )
+
+    def _bind_referenced_local_read(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Carry a completed task's local-read snapshot onto this task.
+
+        The only cross-task data hop in the product, and it is deliberately
+        narrow. ``context.local_read_task_id`` is a *reference*, never
+        content: every field is re-derived from the referenced task's own
+        persisted state and re-validated here, so editing the reference can
+        never widen what this task may see.
+
+        Every one of these must hold, or the task fails closed:
+
+        * the referenced task exists and belongs to **this** session;
+        * it is not this task itself;
+        * it COMPLETED (an in-flight, failed or cancelled read is not
+          evidence);
+        * it actually carries a structurally valid snapshot; and
+        * the classification ladder allows this task's classification to see
+          the SOURCE TASK's classification - both sides read from exact-typed
+          ``scope.data_classification``, never from the persisted snapshot,
+          and compared with the same ``retrieval_eligible`` matrix the
+          retrieval pipeline and every egress boundary use, so SECRET is
+          never eligible in either role.
+
+        ``None`` means proceed; a task with no reference is untouched.
+        """
+        requested = task.context.get(LOCAL_READ_TASK_REFERENCE_KEY)
+        if requested is None:
+            return None
+
+        def refuse(detail: str) -> AgentRun:
+            # Terminal, like every other CONTEXT_RETRIEVAL boundary failure:
+            # the task is persisted FAILED rather than left parked at a stage
+            # it can never clear.
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Referenced local read is not usable: {detail}.",
+                ),
+            )
+
+        if not isinstance(requested, str) or not requested:
+            return refuse("the reference is not a task id")
+        if requested == task.id:
+            return refuse("a task cannot reference its own local read")
+        if self.memory.task_session_id(requested) != session.id:
+            return refuse("the referenced task belongs to another session")
+        try:
+            source = self.memory.load_task(requested)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            source = None
+        if source is None:
+            return refuse("the referenced task could not be loaded")
+        if source.status is not TaskStatus.COMPLETED:
+            return refuse("the referenced task did not complete")
+        snapshot = source.local_read
+        if not snapshot.present:
+            return refuse("the referenced task carries no local read")
+        # P1-3, and this is the whole point of the hop: the SOURCE TASK's own
+        # authoritative scope classification decides what this snapshot is.
+        # The persisted ``snapshot.classification`` is NEVER read - a row
+        # edited outside the product could say PUBLIC on a SECRET task's read,
+        # and a raw string or a foreign ``str`` enum would satisfy both the
+        # rank lookup and ``retrieval_eligible`` silently. Both sides of the
+        # ladder are therefore taken from exact-typed task scope, and the
+        # snapshot is REBUILT with the source authority before it is
+        # validated or compared.
+        source_authority = source.scope.data_classification
+        if type(source_authority) is not DataClassification:
+            return refuse("the referenced task classification is malformed")
+        destination = task.scope.data_classification
+        if type(destination) is not DataClassification:
+            return refuse("this task classification is malformed")
+        snapshot = replace(snapshot, classification=source_authority)
+        try:
+            snapshot = self._validated_local_read(snapshot)
+        except Exception:  # noqa: BLE001 - boundary; fail closed
+            return refuse("the referenced snapshot is malformed")
+        if not retrieval_eligible(destination, source_authority):
+            return refuse("the classification ladder does not allow it")
+        task.local_read = snapshot
+        return None
 
     def _bind_project(self, session: SessionState, task: Task) -> AgentRun | None:
         """Deterministic project binding (M1); ``None`` means proceed.

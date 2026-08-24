@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from enum import Enum
+
 from jarvis.connectors import claude_code
 from jarvis.connectors.claude_code import (
     EXTERNAL_PREFERENCE_KEYS,
@@ -18,10 +20,12 @@ from jarvis.contracts import (
     ActionScope,
     BillingClass,
     DataClassification,
+    LocalReadSnapshot,
     MonetaryState,
     OutcomeStatus,
     SessionState,
     Task,
+    retrieval_eligible,
 )
 from tests.helpers import safe_cleanup
 
@@ -445,6 +449,171 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         self.assertIsNone(result.usage.monetary_cost_usd)
         self.assertEqual(0.0, result.usage.reference_cost_usd)
         self.assertEqual(401, result.error.details["api_error_status"])
+
+
+class LocalReadPayloadTests(unittest.TestCase):
+    """M3 - the file excerpt travels as attested outbound bytes, and the
+    model is still granted no filesystem access of its own."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.root = Path(self.temp.name).resolve()
+        self.connector = ClaudeCodeConnector(
+            allowed_roots=(self.root,), default_working_directory=self.root
+        )
+
+    def task(
+        self,
+        snapshot: LocalReadSnapshot | None = None,
+        classification: DataClassification = DataClassification.INTERNAL,
+    ) -> Task:
+        task = Task(
+            objective="Analyze the file",
+            capability="code_planning",
+            scope=ActionScope(
+                action="analyze",
+                target=str(self.root),
+                destination="anthropic/claude-code",
+                data_classification=classification,
+            ),
+        )
+        if snapshot is not None:
+            task.local_read = snapshot
+        return task
+
+    @staticmethod
+    def snapshot(
+        excerpt: str = "alpha beta\n",
+        classification: DataClassification = DataClassification.INTERNAL,
+    ) -> LocalReadSnapshot:
+        return LocalReadSnapshot(
+            relative_path="docs/notes.txt",
+            byte_size=len(excerpt.encode("utf-8")),
+            sha256="c" * 64,
+            excerpt=excerpt,
+            truncated=False,
+            classification=classification,
+            read_at="2026-01-01T00:00:00+00:00",
+        )
+
+    def test_the_block_carries_exactly_the_allowed_fields(self) -> None:
+        payload, _ = self.connector._sanitized_payload(self.task(self.snapshot()))
+        self.assertEqual(
+            {"notice", "path", "byte_size", "truncated", "content"},
+            set(payload["local_read"]),
+        )
+        self.assertEqual("docs/notes.txt", payload["local_read"]["path"])
+        self.assertEqual("alpha beta\n", payload["local_read"]["content"])
+
+    def test_the_digest_and_read_time_stay_local(self) -> None:
+        snapshot = self.snapshot()
+        payload, _ = self.connector._sanitized_payload(self.task(snapshot))
+        serialized = json.dumps(payload["local_read"])
+        self.assertNotIn(snapshot.sha256, serialized)
+        self.assertNotIn(snapshot.read_at, serialized)
+
+    def test_a_task_with_no_read_keeps_the_previous_payload_shape(self) -> None:
+        payload, _ = self.connector._sanitized_payload(self.task())
+        self.assertNotIn("local_read", payload)
+
+    def test_the_content_is_part_of_the_attested_outbound_bytes(self) -> None:
+        first = self.connector.canonical_outbound(self.task(self.snapshot("one\n")))
+        second = self.connector.canonical_outbound(self.task(self.snapshot("two\n")))
+        self.assertNotEqual(
+            hashlib.sha256(first).hexdigest(), hashlib.sha256(second).hexdigest()
+        )
+        self.assertIn("one", first.decode("utf-8"))
+
+    def test_the_excerpt_is_never_concatenated_into_the_command_line(self) -> None:
+        # The content may only exist inside the labelled JSON payload; it must
+        # never reach the system prompt or a separate CLI argument.
+        prompt, _ = self.connector._build_prompt(self.task(self.snapshot("MARKER\n")))
+        command = self.connector._command(prompt)
+        occurrences = [part for part in command if "MARKER" in part]
+        self.assertEqual([prompt], occurrences)
+        self.assertEqual("", ",".join(claude_code.EGRESS_TOOL_GRANTS))
+
+    def test_a_secret_task_never_serializes_the_excerpt(self) -> None:
+        task = self.task(self.snapshot("SECRET-MARKER\n"), DataClassification.SECRET)
+        payload, _ = self.connector._sanitized_payload(task)
+        self.assertNotIn("local_read", payload)
+        self.assertNotIn("SECRET-MARKER", json.dumps(payload, default=str))
+
+    def test_an_ineligible_snapshot_drops_the_whole_block(self) -> None:
+        task = self.task(
+            self.snapshot("HIGHER-MARKER\n", DataClassification.SENSITIVE),
+            DataClassification.PUBLIC,
+        )
+        payload, _ = self.connector._sanitized_payload(task)
+        self.assertNotIn("local_read", payload)
+        self.assertNotIn("HIGHER-MARKER", json.dumps(payload, default=str))
+
+    def test_a_raw_string_classification_drops_the_block(self) -> None:
+        """The exact-enum guard is load-bearing, not decorative.
+
+        ``DataClassification`` is a ``str, Enum``, so the raw string
+        ``"public"`` compares equal to ``DataClassification.PUBLIC`` AND hashes
+        identically. It therefore satisfies the rank lookup and
+        ``retrieval_eligible`` silently. Only the exact-type check at the
+        egress boundary stops a SECRET-origin snapshot whose classification
+        field was overwritten with that string from egressing.
+        """
+        snapshot = self.snapshot(
+            "SECRET-ORIGIN-MARKER\n", DataClassification.SECRET
+        )
+        # Prove the premise rather than assuming it.
+        self.assertTrue(retrieval_eligible(DataClassification.INTERNAL, "public"))
+        self.assertFalse(isinstance("public", DataClassification))
+
+        object.__setattr__(snapshot, "classification", "public")
+        payload, _ = self.connector._sanitized_payload(self.task(snapshot))
+        self.assertNotIn("local_read", payload)
+        self.assertNotIn("SECRET-ORIGIN-MARKER", json.dumps(payload, default=str))
+
+    def test_a_foreign_enum_classification_drops_the_block(self) -> None:
+        """Same hazard through a different door: a foreign ``str`` enum with
+        the same value is equally eligible under the ladder."""
+
+        class ForeignClassification(str, Enum):
+            PUBLIC = "public"
+
+        self.assertTrue(
+            retrieval_eligible(
+                DataClassification.INTERNAL, ForeignClassification.PUBLIC
+            )
+        )
+        self.assertFalse(
+            isinstance(ForeignClassification.PUBLIC, DataClassification)
+        )
+
+        snapshot = self.snapshot(
+            "FOREIGN-ENUM-MARKER\n", DataClassification.SECRET
+        )
+        object.__setattr__(snapshot, "classification", ForeignClassification.PUBLIC)
+        payload, _ = self.connector._sanitized_payload(self.task(snapshot))
+        self.assertNotIn("local_read", payload)
+        self.assertNotIn("FOREIGN-ENUM-MARKER", json.dumps(payload, default=str))
+
+    def test_a_malformed_current_classification_drops_the_block(self) -> None:
+        """The same exact-type rule on the other side of the ladder.
+
+        Exercised against ``_local_read`` directly: a raw-string scope
+        classification makes ``ActionScope.to_dict()`` raise before
+        ``_sanitized_payload`` ever reaches the local-read block, so the whole
+        payload is refused anyway. This asserts the local-read guard itself
+        rather than relying on that unrelated failure.
+        """
+        task = self.task(self.snapshot("CURRENT-SIDE-MARKER\n"))
+        object.__setattr__(task.scope, "data_classification", "internal")
+        block, redactions = self.connector._local_read(task)
+        self.assertIsNone(block)
+        self.assertEqual(0, redactions)
+
+    def test_the_outbound_preview_counts_the_local_read_fields(self) -> None:
+        preview = self.connector.outbound_preview(self.task(self.snapshot()))
+        self.assertIn("local_read.content", preview.field_names)
+        self.assertIn("local_read.notice", preview.field_names)
 
 
 if __name__ == "__main__":

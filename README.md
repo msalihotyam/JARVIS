@@ -130,7 +130,7 @@ girdisine yazılmaz. Zorunlu onay gerektiren yan etkiler her modda onay ister.
 Girdi default-deny bir allowlist ile alan alan okunur; `Task.from_dict()`
 güvenilmeyen girdi için hiç kullanılmaz. Kabul edilen alanlar yalnızca
 `objective`, `capability`, `scope.{action,target,destination,data_classification}`,
-`context.{working_directory,inputs}` ve
+`context.{working_directory,inputs,local_read_task_id}` ve
 `preferences.{preferred_connector,needs_clarification,clarification_question,assumption}`
 alanlarıdır. Tanınmayan veya korumalı alanlar (`id`, `status`, `stage`, `plan`,
 `estimate`, `risk_level`, `side_effect`, `result_snapshot`, `clarification`,
@@ -221,6 +221,108 @@ yereldir. Boş görüntü payload şeklini değiştirmez. Task JSON'u
 `retrieved_context` veya getirme metadata'sı veremez ve CLI çıktı zarfı
 getirilen içeriği göstermez.
 
+### Yerel dosya okuma (görev kapsamlı)
+
+`capability: "file_read"` ve `scope.target` ile bir task, izin verilen kökler
+içindeki **tek** bir UTF-8 metin dosyasını okutur. Byte'ları JARVIS okur;
+Claude alt sürecine `Read`/`Glob`/`Grep` veya doğrudan filesystem erişimi
+verilmez (`--tools ""` boş kalır). Böylece modele ulaşan her şey, onayın
+attest ettiği kanonik payload byte'larının içindedir.
+
+Sıra zorunludur: kanonik `resolve` → kök içi containment → secret-file deny
+→ temsil edilebilir root-göreceli ad → normal dosya → onaylanan dizin zinciri
+üzerinden açma ve açılan **nesnenin** hâlâ kök içinde olduğunun kanıtı →
+açılan tanıtıcının aynı dosya olduğunun `st_dev`/`st_ino` kanıtı → 64 KiB
+fiziksel tavan → NUL/UTF-8 kontrolü → newline normalizasyonu →
+`redact_credentials` + `redact_local_paths` → 4.000 karakter kesme.
+**64 KiB'ı aşan dosya reddedilir, sessizce kesilmez.** 4.000 karakterlik
+temsil tavanı ayrı bir kavramdır ve kesme redaksiyondan *sonra* uygulanır,
+böylece redaksiyonun metni büyütmesi tavanı aşamaz.
+
+Zincir, başladığı kök kadar güvenilirdir: her izinli kökün
+`(st_dev, st_ino)` kimliği otorite kümesi kurulurken kaydedilir ve açma
+anında yeniden kanıtlanır, böylece kökün kendisinin yeniden
+yönlendirilmesi de sıfır byte verir.
+
+Açma öncesi `resolve()` bir yol adını kanıtlar, bir nesneyi değil: doğrulama
+ile `open` arasında bir **üst dizin** symlink/junction ile değiştirilirse
+açılan dosya onaylanan zinciri hiç kat etmemiş olur. POSIX'te zincir dizin
+tanıtıcılarıyla `O_NOFOLLOW` yürünür (kök dışına geçici olarak bile hiçbir şey
+açılmaz); Windows'ta zincir önce no-follow taranır ve açılan tanıtıcıya kendi
+authoritative son yolu (`GetFinalPathNameByHandleW`) sorulur. Kök dışına düşen
+her sonuç reddedilir ve sıfır byte verir.
+
+Hedef, yazımı ne olursa olsun (`README.md`, `.\README.md`, `./docs/../docs/x`,
+symlink) yürütmeden önce tek bir yerde `canonical_path`'ten geçirilir; scope
+otoritesi, izin fingerprint'i, attestation ve yürütme aynı kanonik kimliği
+görür. Onaydan sonra ad başka bir dosyaya yönlendirilirse fingerprint değişir
+ve eski grant hiçbir şeyi yetkilendirmez. Bir **hard link** bir link değil, aynı dosyanın ikinci adıdır: çözülecek
+bir şey yoktur ve authoritative son yol handle'ın açıldığı kök-içi addır,
+yani kök dışındaki bir dosyanın kök-içi adı tüm kontrolleri geçerdi. M3
+bu yüzden açılan normal dosyanın `st_nlink > 1` olmasını reddeder;
+kontrol tek `read` çağrısından önce yapılır, dizin ele alışı değişmez ve
+meşru hardlink'li dosyaların okunamaması şimdilik kabul edilmiş bir
+uyumluluk maliyetidir.
+
+Gömülü NUL taşıyan bir hedef - hiçbir platformun
+adlandıramayacağı tek yapısal durum - döngü içinde `INVALID_TASK` ile
+reddedilir; `canonical_path` totaldir, yani çözülemeyen bir hedef asla
+döngünün dışına istisna fırlatıp kayıtlı bir task'ı terminal durumsuz
+bırakamaz. `api_key=...` gibi kimlik-bilgisi
+taşıyan bir dosya **adı**, onay isteği oluşmadan önce reddedilir (redakte
+edilmez): yol bir kaynak tanımlayıcısıdır ve onaylanan kimlik ile görüntülenen
+kimlik ayrışamaz. `apikey.md`, `tokenizer.py`, `secret_handling.md` okunabilir
+kalır.
+
+Secret-file deny politikası bilinçli olarak dardır ve glob kullanmaz: tam
+adlar (`.env` ve `.env.*`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`,
+`.npmrc`, `.pypirc`, `.netrc`, `_netrc`), tam uzantılar (`.pem`, `.key`,
+`.pfx`, `.p12`) ve iki dizin kuralı (`.ssh/**`, `.aws/credentials`).
+`id_generator.py`, `id_map.json`, `id_rsa.pub`, `key.py`, `keys.json`,
+`apikey.md` ve `environment.py` okunabilir kalır. Politika kanonik yol
+üzerinde çalışır, yani sır dosyasına işaret eden symlink de reddedilir;
+deny edilen dosya hiç okunmaz.
+
+Sonuç, tipli ve görev kapsamlı bir alanda (`Task.local_read`) yaşar: kalıcı
+proje hafızası değildir, hiçbir memory/decision satırı üretmez ve getirmenin
+5 öğe / 4.000 karakter kotasını tüketmez. Snapshot'ın yapısal sözleşmesi tek
+bir yerde tanımlıdır (`local_read_snapshot_refusal`) ve yükleme, yürütme,
+doğrulama, zarf ve Claude egress sınırlarının hepsi aynı fonksiyonu çağırır;
+kalıcı satırın `classification` alanı yalnızca tam tanınan bir
+`DataClassification` dizesi olduğunda kabul edilir (geçerli SECRET dahil);
+okunamayan değer SECRET'e düşürülmez, snapshot tamamen atılır.
+Tamamlanan bir `file_read` görevi **decision üretmez**: `finalize_task`
+`decision=None` ile çağrılır ve satır hiç yazılmaz, finalizasyonun geri
+kalanı (terminal task, session temizliği, usage, terminal event,
+atomiklik) aynı kalır - böylece sonraki görevler okumadan hiçbir şey
+miras almaz. Bir NTFS **named stream** (`.env:named`, `secret.pem:s:$DATA`)
+onay öncesinde ve handle'dan türetilen authoritative yolda reddedilir;
+normal sürücü harfi (`C:\...`) etkilenmez.
+Sözleşmeyi ihlal eden kalıcı satır boş snapshot'a düşer, tek onarım aşırı
+büyük excerpt'in yeniden sınırlanmasıdır. Excerpt ayrıca **kanonik olmak
+zorundadır**: `bound_local_text` bir sabit nokta olduğu için
+`bound_local_text(excerpt) == excerpt` değilse satır gerçek bir okumadan
+gelmiş olamaz ve yeniden redakte edilmek yerine reddedilir. Kimlik bilgisi
+politikası `secret_access_key`/`access_key_id` gibi bileşik anahtar
+adlarını ve etiketsiz AWS erişim anahtarı kimliklerini de kapsar. Sınıflandırma connector metadata'sı
+değildir — çekirdek onu okuyan task'ın kendi `scope.data_classification`
+değerinden koşulsuz yeniden bağlar. Yan etki
+profili LOCAL_READ / LOW / reversible'dır, yani STRICT onay ister, SESSION ve
+SMART_AUTO otomatik geçirir; rota `NO_ADDITIONAL_CHARGE` olarak açıkça beyan
+edilir. SQLite şeması değişmez (v6).
+
+Sonraki bir Claude task'ı `context.local_read_task_id` ile bu okumaya
+**referans** verebilir; içerik hiçbir zaman girdiden kabul edilmez. Referans
+yalnız aynı oturumdaki, COMPLETED, yapısal olarak geçerli ve sınıflandırma
+merdiveninin izin verdiği bir kaynağa çözülür, aksi halde `INVALID_TASK`
+(çıkış 64) ile kapalı düşer. Merdivenin kaynak tarafı **kaynak task'ın kendi
+`scope.data_classification` değeridir**; kalıcı snapshot'ın classification'ı
+otorite değildir ve tampered bir satır otoriteyi ne düşürebilir ne
+yükseltebilir. Dışa çıkan blok tam olarak
+`{notice, path, byte_size, truncated, content}` alanlarını taşır; `sha256`,
+sınıflandırma, okuma zamanı ve her türlü mutlak yol yerelde kalır. Zarf,
+okunan dosyanın sınırlanmış görünümünü `local_read` bloğunda gösterir.
+
 ### Görev-farkında deterministik plan
 
 `PLAN` aşaması, yalnızca güvenli yapısal task durumundan kurulan deterministik
@@ -247,7 +349,7 @@ issue, en çok 20 artifact) mevcut task JSON'unda taşır; `SessionState`
 yalnızca `latest_task_id` gezinme işaretçisini kazanır. SQL şeması,
 migration ve `MemoryStore` protokolü değişmemiştir.
 
-Status dışı zarf (`schema_version=2`) tek deterministik `progress` nesnesi
+Status dışı zarf (`schema_version=3`) tek deterministik `progress` nesnesi
 içerir: `task_id`, `plan` (planlama olduysa her zaman kanonik
 `build_task_plan` yeniden kurulumu; kalıcı `task.plan` metnine asla
 güvenilmez), `current_stage` (otoriter `Task.stage`), `next_stage`
@@ -269,8 +371,11 @@ prompt, hash, preview veya fingerprint'leri değiştiremez.
 Üretim bileşimi `build_default_app()` içindedir: `Settings` →
 `SQLiteMemoryStore` → `ToolRegistry` → `ClaudeCodeConnector` (izinli tek kök ve
 çalışma dizini olarak başlangıç CWD'si, çağrı bütçesi `claude_call_budget_usd`)
-→ kayıt → `AgentCore` → `JarvisApp`. Bu kurulum availability, faturalandırma
-yoklaması veya model çalıştırması yapmaz.
++ `LocalFileReadConnector` (aynı tek kök; açıkça boş bir kök kümesi geçersiz
+yapılandırmadır ve çalışma dizinine düşmez) → kayıt → `AgentCore` →
+`JarvisApp`.
+Bu kurulum availability, faturalandırma yoklaması, dosya erişimi veya model
+çalıştırması yapmaz.
 
 Testler kendi `Settings`, bellek ve sahte registry/connector'larını
 `create_app(...)` üzerinden enjekte eder. Yürütülebilir komut akışlarının

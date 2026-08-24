@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -7,10 +8,13 @@ from pathlib import Path
 
 from jarvis.contracts import (
     LINEAR_LOOP_STAGES,
+    DataClassification,
     ErrorCode,
+    LocalReadSnapshot,
     LoopStage,
     PermissionMode,
     RunStatus,
+    SessionState,
 )
 from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
@@ -163,6 +167,103 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         self.assertIn("schema_migrations", tables)
         self.assertIn("execution_attempts", tables)
         self.assertIn("attempt_billing", tables)
+
+    def test_m3_adds_no_schema_migration(self) -> None:
+        # M3 stores the local-read snapshot inside the existing opaque task
+        # JSON blob, so the database contract is unchanged. If this number
+        # moves, a migration was added that M3 explicitly ruled out.
+        self.assertEqual(6, SCHEMA_VERSION)
+        self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
+
+    def test_local_read_snapshot_survives_a_task_round_trip(self) -> None:
+        # The snapshot is persisted task state - not memory, not a decision -
+        # because the approved outbound payload must be reproducible
+        # byte-identically after a restart (H1).
+        session = SessionState(objective="round trip")
+        self.memory.save_session(session)
+        task = make_task()
+        task.local_read = LocalReadSnapshot(
+            relative_path="docs/notes.txt",
+            byte_size=11,
+            sha256="a" * 64,
+            excerpt="alpha beta\n",
+            truncated=False,
+            classification=DataClassification.INTERNAL,
+            read_at="2026-01-01T00:00:00+00:00",
+        )
+        self.memory.save_task(session.id, task)
+        reloaded = self.memory.load_task(task.id)
+        self.assertEqual(task.local_read, reloaded.local_read)
+
+    def _reload_with_local_read(self, **overrides):
+        session = SessionState(objective="tampered")
+        self.memory.save_session(session)
+        task = make_task()
+        self.memory.save_task(session.id, task)
+        snapshot = {
+            "relative_path": "notes.txt",
+            "byte_size": 10,
+            "sha256": "b" * 64,
+            "excerpt": "z" * 9_000,
+            "truncated": False,
+            "classification": "public",
+            "read_at": "2026-01-01T00:00:00+00:00",
+        }
+        snapshot.update(overrides)
+        connection = sqlite3.connect(self.memory.database_path)
+        try:
+            row = connection.execute(
+                "SELECT state_json FROM tasks WHERE id = ?", (task.id,)
+            ).fetchone()
+            document = json.loads(row[0])
+            document["local_read"] = snapshot
+            connection.execute(
+                "UPDATE tasks SET state_json = ? WHERE id = ?",
+                (json.dumps(document), task.id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.memory.load_task(task.id)
+
+    def test_a_tampered_persisted_snapshot_reloads_fail_closed(self) -> None:
+        """An unreadable classification discards the WHOLE snapshot.
+
+        A SECRET fallback would hand back a structurally valid, PRESENT
+        snapshot instead - one that satisfies the contract, renders in the
+        envelope and answers ``present`` to every gate that asks that first.
+        Malformed persisted state must not survive as a usable object
+        wearing a safe label.
+        """
+        reloaded = self._reload_with_local_read(
+            classification="not-a-classification"
+        )
+        self.assertFalse(reloaded.local_read.present)
+        self.assertEqual("", reloaded.local_read.relative_path)
+        self.assertEqual("", reloaded.local_read.excerpt)
+
+    def test_an_unreadable_classification_type_reloads_fail_closed(self) -> None:
+        for value in (None, 7, True, ["public"], {"value": "public"}):
+            with self.subTest(value=value):
+                reloaded = self._reload_with_local_read(classification=value)
+                self.assertFalse(reloaded.local_read.present)
+
+    def test_a_valid_classification_still_rebounds_an_oversized_excerpt(
+        self,
+    ) -> None:
+        """The one legal repair survives, and only for a readable row."""
+        reloaded = self._reload_with_local_read(classification="public")
+        self.assertTrue(reloaded.local_read.present)
+        self.assertIs(DataClassification.PUBLIC, reloaded.local_read.classification)
+        self.assertEqual(4_000, len(reloaded.local_read.excerpt))
+        self.assertTrue(reloaded.local_read.truncated)
+
+    def test_a_valid_secret_classification_is_preserved(self) -> None:
+        reloaded = self._reload_with_local_read(
+            classification="secret", excerpt="bounded\n"
+        )
+        self.assertTrue(reloaded.local_read.present)
+        self.assertIs(DataClassification.SECRET, reloaded.local_read.classification)
 
 
 if __name__ == "__main__":

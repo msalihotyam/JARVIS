@@ -71,9 +71,41 @@ def canonical_path(path: str | Path) -> str:
 
     Symlinks, junctions and ``..`` segments are resolved first; the result is
     case-folded by the platform rules and uses forward slashes only.
+
+    TOTAL by contract: this feeds ``ActionScope.normalized`` and therefore
+    task serialization, permission fingerprints and attestation, all of which
+    run inside lifecycle stages that turn a REFUSAL into deterministic
+    terminal state but have no answer for an EXCEPTION. A target the platform
+    refuses to resolve at all - the practical case is an embedded NUL, which
+    POSIX rejects in ``resolve()`` while Windows tolerates it there and
+    rejects it later in ``lstat``/``open`` - must therefore degrade to a
+    deterministic normalized spelling rather than raise out of the loop and
+    strand a registered task with no terminal state. The value is
+    identity-preserving (nothing is stripped or substituted), so it can never
+    be confused with a real resolved path, and every containment, policy and
+    open check downstream still refuses it.
     """
-    resolved = Path(path).expanduser().resolve(strict=False)
+    try:
+        resolved: str | Path = Path(path).expanduser().resolve(strict=False)
+    except (ValueError, OSError):
+        resolved = str(path)
     return os.path.normcase(str(resolved)).replace("\\", "/")
+
+
+def unusable_filesystem_target(value: Any) -> str | None:
+    """Why no filesystem can ever name this target, or ``None``.
+
+    Deliberately narrow: only what is impossible on EVERY platform, so this
+    stays a structural refusal and never a policy one. A NUL terminates a
+    path at the OS boundary in both the POSIX and the Win32 APIs, so a target
+    carrying one names nothing at all - it is refused as an invalid task, in
+    the loop, instead of being carried to a connector that would raise.
+    """
+    if not isinstance(value, str):
+        return None
+    if chr(0) in value:
+        return "the target contains a NUL character"
+    return None
 
 
 def normalize_locator(value: str | Path | None) -> str:
@@ -1698,6 +1730,368 @@ def build_retrieved_context(
 
 
 # --------------------------------------------------------------------------
+# Task-scoped local file reads (M3)
+# --------------------------------------------------------------------------
+
+#: Physical read ceiling. A larger file is REFUSED; it is never silently
+#: truncated, so a bounded excerpt can never misrepresent a file JARVIS was
+#: not allowed to read whole.
+#: The one capability string that may produce a local-read snapshot. Shared
+#: so the connector manifest, the execution-boundary binding and the
+#: cross-task reference all name the same thing.
+LOCAL_READ_CAPABILITY = "file_read"
+
+#: The single ``ToolResult.data`` key a local-read connector uses to hand its
+#: typed snapshot to ``AgentCore``. It lives here rather than in the connector
+#: module so the execution boundary does not have to import a connector
+#: implementation to know the contract. ``_sanitize_result`` reduces ``data``
+#: to ``next_step``, so this transport is read once and never persisted.
+LOCAL_READ_RESULT_KEY = "local_read"
+
+#: The task ``context`` key that references an earlier completed local read.
+#: A reference only: content is always re-derived from the referenced task's
+#: own persisted state and re-validated.
+LOCAL_READ_TASK_REFERENCE_KEY = "local_read_task_id"
+
+LOCAL_READ_MAX_BYTES = 64 * 1024
+#: Ceiling for the bounded representation that may reach a model or an
+#: output envelope. Independent of the physical ceiling above.
+LOCAL_READ_EXCERPT_MAX_CHARS = 4_000
+#: Hard ceiling on the stored ROOT-RELATIVE path representation. Bounded for
+#: the same reason every other persisted string is: an unbounded scalar in a
+#: task row reaches the envelope, the approval preview and the outbound
+#: payload. A real in-root source path never approaches this.
+LOCAL_READ_PATH_MAX_CHARS = 512
+#: How many canonical passes ``bound_local_text`` may take to reach a fixed
+#: point. Two suffice for every reachable input; the third is the margin that
+#: keeps the bound explicit rather than assumed.
+_LOCAL_TEXT_STABILIZATION_PASSES = 3
+#: Hard ceiling on any canonical timestamp string this module validates.
+CANONICAL_TIMESTAMP_MAX_CHARS = 64
+
+#: Deliberately NARROW secret-file deny policy. Every entry is an exact name,
+#: an exact extension or an exact directory - never a broad glob - so ordinary
+#: project files keep working. ``id_*`` in particular is NOT a pattern here:
+#: only the four OpenSSH private-key defaults are denied, so ``id_generator.py``
+#: and ``id_rsa.pub`` stay readable.
+_DENIED_LOCAL_NAMES = frozenset(
+    {
+        ".env",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "_netrc",
+    }
+)
+#: Private-key / PKCS container extensions.
+_DENIED_LOCAL_SUFFIXES = frozenset({".pem", ".key", ".pfx", ".p12"})
+
+
+def local_read_denial_reason(path: Path) -> str | None:
+    """Why this canonical path may never be read, or ``None``.
+
+    Evaluated on the CANONICAL resolved path, so a benign-looking symlink
+    that points at a denied file is still refused. The reason names the
+    policy rule only - never the file's content and never an absolute path.
+    """
+    # Named streams FIRST, because they defeat every rule below: the deny
+    # policy matches on the exact name and the exact suffix, and ``.env:s``
+    # has neither name ``.env`` nor suffix ``.pem`` - while
+    # ``secret.pem:s:$DATA`` resolves to a stream of a denied file and reads
+    # its bytes. A stream is also a second data channel inside one directory
+    # entry, which is simply outside M3's single-file contract, so it is
+    # refused rather than parsed. The anchor is skipped so ordinary Windows
+    # drive handling (``C:\...``) is untouched; the rule applies to every
+    # component below it and is deliberately uniform across platforms, so a
+    # colon can never mean two different things in one stored identity.
+    components = path.parts[1:] if path.anchor else path.parts
+    if any(":" in component for component in components):
+        return "windows alternate data stream"
+    name = path.name.casefold()
+    parents = {part.casefold() for part in path.parts[:-1]}
+    if ".ssh" in parents:
+        return "ssh key directory"
+    if ".aws" in parents and name == "credentials":
+        return "cloud credential file"
+    if name in _DENIED_LOCAL_NAMES:
+        return "credential-bearing file name"
+    if name.startswith(".env."):
+        # The dotenv family is secret-bearing by definition. ``.env.example``
+        # is refused too: a documented, accepted false positive, because a
+        # template carries no value worth widening the rule for.
+        return "dotenv family file"
+    if path.suffix.casefold() in _DENIED_LOCAL_SUFFIXES:
+        return "private key or certificate container"
+    return None
+
+
+def normalize_local_text(value: str) -> str:
+    """Newline normalization ONLY.
+
+    Deliberately not ``normalize_retrieved_text``: that one strips leading and
+    trailing whitespace, which is right for a display snippet and wrong for
+    file content, where indentation and trailing newlines are part of the
+    data. No Unicode normalization either: the bytes are evidence.
+    """
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def bound_local_text(value: str) -> tuple[str, bool]:
+    """Canonical, deterministic bounded representation of file content.
+
+    The order is mandatory and is the whole contract: newline normalization,
+    then credential redaction, then local-path redaction, and only then the
+    ``LOCAL_READ_EXCERPT_MAX_CHARS`` head truncation. Truncating LAST means a
+    redaction that expands the text can never push the result past the
+    ceiling. No summarization, no chunk selection, no heuristics - the same
+    input always produces the same output.
+
+    The result is also a FIXED POINT: applying this function to its own
+    output returns that output unchanged. That is what lets every downstream
+    boundary state excerpt canonicality as ``bound_local_text(excerpt) ==
+    excerpt`` and refuse anything else. It needs a loop because the last step
+    can, in principle, create work for the first: truncation cuts inside an
+    already-redacted marker, and re-redacting that fragment rewrites it. The
+    loop is bounded and each pass is a full canonical pass, so a value that
+    has not converged is still fully redacted - it is simply refused as
+    non-canonical downstream rather than silently accepted.
+    """
+    text = normalize_local_text(str(value))
+    truncated = False
+    for _ in range(_LOCAL_TEXT_STABILIZATION_PASSES):
+        bounded, _ = redact_credentials(text)
+        bounded = redact_local_paths(bounded)
+        bounded, over = truncate_retrieved_text(
+            bounded, LOCAL_READ_EXCERPT_MAX_CHARS
+        )
+        truncated = truncated or over
+        if bounded == text:
+            return text, truncated
+        text = bounded
+    return text, truncated
+
+
+def canonical_utc_timestamp(value: Any) -> str | None:
+    """The value itself if it is the canonical UTC timestamp grammar, else ``None``.
+
+    The grammar is exactly what ``utc_now`` writes: a bounded, timezone-aware
+    ISO-8601 string whose offset is UTC. Nothing is coerced and nothing is
+    repaired - ``str(value)`` on an arbitrary object would turn a tampered row
+    into a plausible timestamp, which is the failure this exists to prevent.
+    """
+    if type(value) is not str or not value:
+        return None
+    if len(value) > CANONICAL_TIMESTAMP_MAX_CHARS:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    return value
+
+
+def local_read_path_refusal(value: Any) -> str | None:
+    """Why this ROOT-RELATIVE local-read path may never be represented, or ``None``.
+
+    The single grammar for the stored path representation, reused verbatim by
+    the connector (before any byte is read), by the ``AgentCore`` execution
+    boundary, by the public envelope and by the Claude egress boundary - so
+    there is one contract rather than four that drift.
+
+    The last rule is P1-4 and it is deliberately FAIL CLOSED rather than a
+    redaction: a path is a resource identifier, and rewriting
+    ``api_key=HUNTER2.txt`` into a redacted pseudo-path would make the
+    approved identity and the displayed identity diverge while still
+    asserting that a bounded, trustworthy read happened. A credential-bearing
+    file name is refused instead, so approval identity and display identity
+    stay the same string. Ordinary names such as ``apikey.md``,
+    ``tokenizer.py`` and ``secret_handling.md`` carry no credential VALUE and
+    stay readable - the shared ``credential_bearing`` policy, not a
+    name-shaped guess, is what decides.
+    """
+    if type(value) is not str:
+        return "path is not a string"
+    if not value:
+        return "path is empty"
+    if len(value) > LOCAL_READ_PATH_MAX_CHARS:
+        return "path exceeds its character ceiling"
+    if "\\" in value or chr(0) in value:
+        # Also the UNC rejection: a ``\\server\share`` spelling cannot
+        # survive the backslash rule, so no UNC form is ever stored.
+        return "path is not a root-relative POSIX path"
+    if value.startswith("/") or (len(value) > 1 and value[1] == ":"):
+        return "path is absolute"
+    if ":" in value:
+        # Anything left carrying a colon is NTFS named-stream syntax; the
+        # drive-letter form was already handled above.
+        return "path carries an alternate-data-stream separator"
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        return "path has an empty or traversal component"
+    if credential_bearing(value):
+        return "path is credential-bearing"
+    return None
+
+
+def local_read_snapshot_refusal(value: Any) -> str | None:
+    """Why this object is not a usable local-read snapshot, or ``None``.
+
+    THE canonical structural contract for ``LocalReadSnapshot`` (P1-5). Every
+    authority boundary calls this exact function: the load boundary
+    (``from_dict``), the execution boundary (``AgentCore``), the public
+    envelope and the Claude egress payload. Nothing here coerces, and every
+    field is checked against its exact type, so a tampered task row can never
+    widen a ceiling, smuggle a raw string past an enum check or carry an
+    unbounded scalar into anything a user or a model reads.
+
+    An absent snapshot is refused too ("path is empty"); presence is the
+    caller's own question, asked with ``present`` before this one.
+    """
+    if type(value) is not LocalReadSnapshot:
+        return "not a LocalReadSnapshot"
+    reason = local_read_path_refusal(value.relative_path)
+    if reason is not None:
+        return reason
+    # ``type() is int`` and not ``isinstance``: ``True`` is an ``int``.
+    if type(value.byte_size) is not int:
+        return "byte size is not an integer"
+    if not 0 <= value.byte_size <= LOCAL_READ_MAX_BYTES:
+        return "byte size is outside the physical read ceiling"
+    digest = value.sha256
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return "digest is not a lowercase sha256 hex digest"
+    if type(value.excerpt) is not str:
+        return "excerpt is not a string"
+    if len(value.excerpt) > LOCAL_READ_EXCERPT_MAX_CHARS:
+        return "excerpt exceeds its character ceiling"
+    # Length and type are not hygiene. A row edited outside the product can
+    # sit comfortably under the ceiling while carrying raw CRLF, an absolute
+    # local path or a live credential - none of which any real read could
+    # ever have produced, because ``bound_local_text`` removed them. Since
+    # that function is a fixed point, "is this excerpt what a real read would
+    # have stored?" is decidable exactly, with no heuristic: canonical form
+    # is accepted, anything else is refused rather than re-derived. Refusing
+    # is the point - repairing it here would let a tampered excerpt become
+    # active state wearing a clean face.
+    if bound_local_text(value.excerpt)[0] != value.excerpt:
+        return "excerpt is not the canonical bounded representation"
+    if type(value.truncated) is not bool:
+        return "truncated flag is not a boolean"
+    if type(value.classification) is not DataClassification:
+        return "classification is not an exact DataClassification"
+    if canonical_utc_timestamp(value.read_at) is None:
+        return "read timestamp is not a canonical UTC timestamp"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalReadSnapshot:
+    """One bounded, redacted, task-scoped view of a local file.
+
+    Untrusted reference data with NO authority: it never becomes an
+    instruction, a scope change, an approval, a billing input or memory. It
+    is task-scoped by construction - it lives on the task that produced it,
+    never in project memory and never in the decision log.
+
+    ``classification`` is NOT connector metadata: ``AgentCore`` binds it from
+    the reading task's own trusted scope classification, so a connector can
+    neither lower it nor establish authority with a malformed value. A
+    malformed persisted value loads closed as SECRET.
+
+    ``relative_path`` is always relative to an allowed root, so no absolute
+    path or user directory layout can travel with the snapshot.
+    """
+
+    relative_path: str = ""
+    byte_size: int = 0
+    sha256: str = ""
+    excerpt: str = ""
+    truncated: bool = False
+    classification: DataClassification = DataClassification.SECRET
+    read_at: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.relative_path)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "byte_size": self.byte_size,
+            "sha256": self.sha256,
+            "excerpt": self.excerpt,
+            "truncated": self.truncated,
+            "classification": self.classification.value,
+            "read_at": self.read_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LocalReadSnapshot":
+        """Rebuild defensively; malformed persisted state fails closed.
+
+        The ONLY repair applied is re-bounding an oversized excerpt, because
+        a ceiling that a tampered row widened must not survive a load. Every
+        other field is taken verbatim and then judged by the single canonical
+        contract, ``local_read_snapshot_refusal``. A classification that is
+        not an exact recognized value is not repaired either - not even to
+        SECRET - and discards the whole snapshot. Nothing is coerced:
+        ``persistable_count`` on a byte size, ``bool()`` on a truncation flag
+        and ``str()`` on a timestamp would each turn tampered persisted state
+        into plausible ACTIVE state, which is exactly the P1-5 failure. A row
+        that does not satisfy the contract degrades to the empty snapshot -
+        no path, no excerpt, no authority - rather than raising.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        # An exact recognized classification string, or NOTHING. A SECRET
+        # fallback looked fail-closed and was not: it turned a row whose
+        # classification could not be read into a STRUCTURALLY VALID,
+        # PRESENT snapshot - one that passes the whole contract, renders a
+        # block in the envelope, and is a real snapshot for every gate that
+        # asks ``present`` before it asks anything else. Malformed persisted
+        # state must not survive as a usable object wearing a safe label; the
+        # snapshot is discarded instead. ``type() is str`` rather than
+        # ``isinstance``: a foreign ``str`` enum carrying the same value is
+        # not this contract's classification.
+        raw_classification = data.get("classification")
+        if type(raw_classification) is not str:
+            return cls()
+        try:
+            classification = DataClassification(raw_classification)
+        except ValueError:
+            return cls()
+        excerpt = data.get("excerpt")
+        excerpt, over = truncate_retrieved_text(
+            excerpt if isinstance(excerpt, str) else "",
+            LOCAL_READ_EXCERPT_MAX_CHARS,
+        )
+        truncated = data.get("truncated", False)
+        if over and type(truncated) is bool:
+            # Re-bounding is the one repair, so its flag must follow it. A
+            # non-boolean is left alone and refused below.
+            truncated = True
+        candidate = cls(
+            relative_path=data.get("relative_path", ""),
+            byte_size=data.get("byte_size", 0),
+            sha256=data.get("sha256", ""),
+            excerpt=excerpt,
+            truncated=truncated,
+            classification=classification,
+            read_at=data.get("read_at", ""),
+        )
+        return candidate if local_read_snapshot_refusal(candidate) is None else cls()
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -1816,8 +2210,26 @@ DEFAULT_SESSION_NEXT_STEP = "Review the verified result."
 #: word (``mytoken=``) does not match. Independent credential shapes are
 #: always rejected. Presentation redaction in ``jarvis.app`` stays a
 #: separate, deliberately broader second defense.
+#: COMPOUND credential key names, matched whole and tried FIRST.
+#: The bare terms below are anchored with a trailing ``\b``, and ``_`` is a
+#: word character, so ``secret_access_key=`` never matched ``secret`` (no
+#: boundary between ``t`` and ``_``) and ``access_key_id=`` matched nothing at
+#: all - ``key`` alone is deliberately not a label, because ``key.py`` and
+#: ``keys.json`` must stay readable. That left the two most common cloud
+#: credentials in the world, ``AWS_ACCESS_KEY_ID`` and
+#: ``AWS_SECRET_ACCESS_KEY``, completely outside the policy. Alternation is
+#: ordered, so listing the compound forms first also makes the redaction keep
+#: the whole key name visible instead of stopping at ``secret``.
+_COMPOUND_CREDENTIAL_LABEL = (
+    r"secret[_\-\s]?access[_\-\s]?key(?:[_\-\s]?id)?"
+    r"|access[_\-\s]?key[_\-\s]?id"
+    r"|access[_\-\s]?key"
+    r"|secret[_\-\s]?key"
+    r"|api[_\-\s]?secret"
+)
 _CREDENTIAL_LABEL = (
-    r"api[_\-\s]?key|token|secret|password|passwd|authorization|cookie"
+    _COMPOUND_CREDENTIAL_LABEL
+    + r"|api[_\-\s]?key|token|secret|password|passwd|authorization|cookie"
     r"|private[_\-\s]?key"
 )
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
@@ -1827,7 +2239,10 @@ _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
 #: friends. The flag prefix is required, so ordinary prose mentioning a token or
 #: a secret - and file names such as ``tokenizer.py`` - never matches.
 _CLI_CREDENTIAL_FLAG = (
-    r"api[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|token"
+    # Compound forms first, for the same ordering reason as the label above.
+    r"secret[_\-]?access[_\-]?key(?:[_\-]?id)?|access[_\-]?key[_\-]?id"
+    r"|access[_\-]?key|secret[_\-]?key|api[_\-]?secret"
+    r"|api[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|token"
     r"|password|passwd|client[_\-]?secret|secret|authorization|bearer"
     r"|private[_\-]?key|session[_\-]?cookie|cookie|credential"
 )
@@ -1907,6 +2322,12 @@ _CREDENTIAL_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
     re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    # AWS access key ids carry their own documented unique-id prefix, so they
+    # are recognizable with no label at all - which matters because a bare
+    # ``AKIA...`` in file content has no ``key=`` next to it to catch.
+    re.compile(
+        r"\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b"
+    ),
 )
 
 
@@ -2429,6 +2850,11 @@ class Task:
     #: Internal typed snapshot taken once at CONTEXT_RETRIEVAL. Never accepted
     #: from untrusted task input and never shown in the CLI output envelope.
     retrieved_context: RetrievedContext = field(default_factory=RetrievedContext)
+    #: Typed bounded view of one local file read by THIS task (M3). Written
+    #: only by AgentCore from a validated connector result; never accepted
+    #: from untrusted task input, never persisted into project memory and
+    #: never authority of any kind.
+    local_read: LocalReadSnapshot = field(default_factory=LocalReadSnapshot)
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -2462,6 +2888,7 @@ class Task:
             "selected_connector": self.selected_connector,
             "result_snapshot": sanitize_result_snapshot(self.result_snapshot),
             "retrieved_context": self.retrieved_context.to_dict(),
+            "local_read": self.local_read.to_dict(),
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -2517,6 +2944,9 @@ class Task:
             retrieved_context=RetrievedContext.from_dict(
                 data.get("retrieved_context")
             ),
+            # Legacy task JSON without the field loads as an empty snapshot;
+            # a malformed one loads closed (SECRET, re-bounded excerpt).
+            local_read=LocalReadSnapshot.from_dict(data.get("local_read")),
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),
@@ -3238,7 +3668,7 @@ class MemoryStore(Protocol):
         self,
         session: SessionState,
         task: Task,
-        decision: DecisionRecord,
+        decision: DecisionRecord | None,
         usage: UsageRecord,
         event_type: str,
         payload: dict[str, Any],
@@ -3249,6 +3679,10 @@ class MemoryStore(Protocol):
         record, the final usage bookkeeping and the terminal event are one
         all-or-nothing operation. False means another terminal writer already
         won: nothing was written and the caller must report authoritative state.
+
+        ``decision`` is ``None`` for a terminal task that records no
+        judgement for later work to inherit; no decision row is written and
+        every other part of the transaction is unchanged.
         """
         ...
 

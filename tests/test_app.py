@@ -852,13 +852,40 @@ class CompositionRootTests(unittest.TestCase):
 
         connector = app.core.registry.get("claude-code-plan")
         startup_directory = Path.cwd().resolve()
-        self.assertEqual(("claude-code-plan",), app.core.registry.list_names())
+        self.assertEqual(
+            ("claude-code-plan", "local-file-read"),
+            app.core.registry.list_names(),
+        )
         self.assertEqual((startup_directory,), connector.allowed_roots)
         self.assertEqual(startup_directory, connector.default_working_directory)
         self.assertEqual(
             self.settings.claude_call_budget_usd, connector.max_budget_usd
         )
         self.assertIs(self.settings, app.settings)
+
+    def test_default_app_binds_the_local_reader_to_the_same_startup_root(self) -> None:
+        # M3: the local reader and the Claude connector share exactly one
+        # boundary, and constructing it touches no filesystem and no process.
+        with mock.patch.object(
+            claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
+        ), mock.patch.object(
+            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+        ):
+            app = build_default_app(self.settings)
+
+        reader = app.core.registry.get("local-file-read")
+        startup_directory = Path.cwd().resolve()
+        self.assertEqual((startup_directory,), reader.allowed_roots)
+        self.assertEqual(startup_directory, reader.default_working_directory)
+        # The billing route is declared, not inherited: the manifest default
+        # is UNKNOWN and would be refused before execution.
+        self.assertEqual(
+            BillingClass.NO_ADDITIONAL_CHARGE, reader.manifest.default_billing_class
+        )
+        self.assertFalse(reader.manifest.requires_paid_api)
+        # No external tool grant and no canonical outbound override: a local
+        # read is not an egress path at all.
+        self.assertEqual((), reader.external_tool_grants(mock.Mock()))
 
 
 class ExitCodeMappingTests(unittest.TestCase):

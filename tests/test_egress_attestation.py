@@ -25,6 +25,7 @@ from unittest import mock
 from jarvis.connectors import claude_code
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.connectors.local_files import LocalFileReadConnector
 from jarvis.contracts import (
     ActionScope,
     AttestationError,
@@ -1498,6 +1499,79 @@ class UnattestedEgressConnectorTests(unittest.TestCase):
         run = self.core(connector).run(make_task(effect=SideEffect.EXTERNAL_EGRESS))
         self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status)
         self.assertEqual(0, connector.execute_calls)
+
+
+class LocalReadAttestationTests(unittest.TestCase):
+    """M3 - the local reader is the first real consumer of H1's local
+    resource boundary, and it must not become an egress path."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.root = Path(self.temp.name).resolve()
+        self.target = self.root / "notes.txt"
+        self.target.write_text("alpha\n", encoding="utf-8")
+        self.connector = LocalFileReadConnector(
+            allowed_roots=(self.root,), default_working_directory=self.root
+        )
+
+    def task(self, target: Path | str | None = None) -> Task:
+        return Task(
+            objective="read",
+            capability="file_read",
+            scope=ActionScope(
+                action="read",
+                target=str(self.target if target is None else target),
+                data_classification=DataClassification.INTERNAL,
+            ),
+        )
+
+    def test_the_attestation_binds_the_canonical_root_set(self) -> None:
+        request = self.connector.permission_request(self.task(), "session-1")
+        attestation = request.attestation
+        self.assertIsNotNone(attestation)
+        self.assertTrue(attestation.working_directory)
+        self.assertEqual((attestation.working_directory,), attestation.allowed_roots)
+        self.assertEqual((), attestation.tool_grants)
+        self.assertIs(SideEffect.LOCAL_READ, attestation.side_effect.effect)
+
+    def test_a_local_read_grants_no_external_tools_and_sends_no_bytes(self) -> None:
+        # ``canonical_outbound`` is deliberately NOT overridden: the base
+        # empty-bytes default is legitimate precisely because this connector
+        # declares no external egress.
+        self.assertEqual(b"", self.connector.canonical_outbound(self.task()))
+        self.assertEqual((), self.connector.external_tool_grants(self.task()))
+
+    def test_a_target_outside_the_roots_cannot_be_attested(self) -> None:
+        outside = self.root.parent / "outside.txt"
+        with self.assertRaises(AttestationError) as caught:
+            self.connector.permission_request(self.task(outside), "session-1")
+        self.assertEqual(ErrorCode.EGRESS_REFUSED, caught.exception.code)
+
+    def test_a_denied_secret_file_can_never_be_attested(self) -> None:
+        denied = self.root / ".env"
+        denied.write_text("SECRET=1\n", encoding="utf-8")
+        with self.assertRaises(AttestationError) as caught:
+            self.connector.permission_request(self.task(denied), "session-1")
+        self.assertEqual(ErrorCode.EGRESS_REFUSED, caught.exception.code)
+        # The refusal names the policy rule, never the file content.
+        self.assertNotIn("SECRET=1", str(caught.exception))
+
+    def test_the_fingerprint_follows_the_symlink_resolved_target(self) -> None:
+        # This is what makes a post-approval symlink repoint invalidate the
+        # grant instead of silently reading a different file.
+        other = self.root / "other.txt"
+        other.write_text("other\n", encoding="utf-8")
+        link = self.root / "link.txt"
+        try:
+            os.symlink(self.target, link)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("symlink creation not permitted")
+        before = self.connector.permission_request(self.task(link), "s").fingerprint
+        link.unlink()
+        os.symlink(other, link)
+        after = self.connector.permission_request(self.task(link), "s").fingerprint
+        self.assertNotEqual(before, after)
 
 
 if __name__ == "__main__":

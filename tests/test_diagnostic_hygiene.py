@@ -68,6 +68,7 @@ from jarvis.contracts import (
     sanitize_diagnostic_text,
     sanitize_result_snapshot,
 )
+from jarvis.connectors.local_files import LocalFileReadConnector
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
@@ -3275,6 +3276,109 @@ class EscapedQuoteCredentialPersistenceTests(DiagnosticHygieneTestCase):
                 self.assertNotIn(marker, encoded)
                 restored = StructuredError.from_dict(error.to_dict())
                 self.assertEqual(error.to_dict(), restored.to_dict())
+
+
+# --------------------------------------------------------------------------
+# H4 x M3: a local read adds a new content path, and it must stay out of
+# every diagnostic surface.
+# --------------------------------------------------------------------------
+
+
+class LocalReadDiagnosticHygieneTests(unittest.TestCase):
+    MARKER = "FILE-CONTENT-MARKER-4c81"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.root = Path(self.temp.name).resolve()
+        self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
+        self.connector = LocalFileReadConnector(
+            allowed_roots=(self.root,), default_working_directory=self.root
+        )
+        self.core = AgentCore(
+            self._registry(),
+            self.memory,
+            Settings(
+                memory_database=self.memory.database_path,
+                permission_mode=PermissionMode.SESSION,
+            ),
+        )
+
+    def _registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register(self.connector)
+        return registry
+
+    def _task(self, target: Path) -> Task:
+        from jarvis.contracts import ActionScope
+
+        return Task(
+            objective="read the file",
+            capability="file_read",
+            scope=ActionScope(
+                action="read",
+                target=str(target),
+                data_classification=DataClassification.INTERNAL,
+            ),
+        )
+
+    def test_a_denied_file_is_never_read_so_nothing_can_leak(self) -> None:
+        denied = self.root / ".env"
+        denied.write_text(f"TOKEN={self.MARKER}\n", encoding="utf-8")
+        run = self.core.run(self._task(denied))
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.EGRESS_REFUSED, run.error.code)
+        stored = self.memory.load_task(run.task.id)
+        everything = json.dumps(
+            {
+                "task": stored.to_dict(),
+                "events": self.memory.list_events(run.session.id),
+                "error": run.error.to_dict(),
+            },
+            default=str,
+        )
+        self.assertNotIn(self.MARKER, everything)
+
+    def test_a_refusal_message_carries_no_absolute_path(self) -> None:
+        missing = self.root / "definitely-absent.txt"
+        run = self.core.run(self._task(missing))
+        self.assertEqual(RunStatus.FAILED, run.status)
+        # ``StructuredError`` construction is the sanitization boundary: any
+        # absolute path in connector text collapses to the fixed marker.
+        self.assertNotIn(str(self.root), json.dumps(run.error.to_dict()))
+
+    def test_read_content_reaches_the_typed_field_and_nowhere_else(self) -> None:
+        target = self.root / "notes.txt"
+        target.write_text(f"{self.MARKER}\n", encoding="utf-8")
+        run = self.core.run(self._task(target))
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+        stored = self.memory.load_task(run.task.id)
+        self.assertIn(self.MARKER, stored.local_read.excerpt)
+        # Exactly one occurrence in the whole persisted task document.
+        self.assertEqual(1, json.dumps(stored.to_dict()).count(self.MARKER))
+        # And none at all in the diagnostic/audit surfaces.
+        self.assertNotIn(
+            self.MARKER,
+            json.dumps(self.memory.list_events(run.session.id), default=str),
+        )
+        self.assertNotIn(
+            self.MARKER, json.dumps(sanitize_result_snapshot(stored.result_snapshot))
+        )
+        self.assertNotIn(
+            self.MARKER,
+            json.dumps(
+                [d.to_dict() for d in self.memory.list_decisions(run.session.id)]
+            ),
+        )
+
+    def test_verification_evidence_is_metadata_only(self) -> None:
+        target = self.root / "notes.txt"
+        target.write_text(f"{self.MARKER}\n", encoding="utf-8")
+        run = self.core.run(self._task(target))
+        stored = self.memory.load_task(run.task.id)
+        evidence = json.dumps(stored.result_snapshot["verification"])
+        self.assertNotIn(self.MARKER, evidence)
+        self.assertIn(stored.local_read.sha256, evidence)
 
 
 if __name__ == "__main__":

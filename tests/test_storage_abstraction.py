@@ -718,7 +718,7 @@ class InMemoryStore:
         self,
         session: SessionState,
         task: Task,
-        decision: DecisionRecord,
+        decision: DecisionRecord | None,
         usage: UsageRecord,
         event_type: str,
         payload: dict,
@@ -730,7 +730,9 @@ class InMemoryStore:
             return False
         self.save_session(session)
         self.save_task(session.id, task)
-        self.decisions.append(copy.deepcopy(decision))
+        # ``None`` means this terminal task records no judgement to inherit.
+        if decision is not None:
+            self.decisions.append(copy.deepcopy(decision))
         # Idempotent: the authoritative row was already reconciled, so this
         # rewrite is a no-op rather than a second ledger entry.
         self.append_usage(usage)

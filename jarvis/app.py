@@ -25,7 +25,9 @@ from typing import Any, Iterable
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.base import BaseConnector
+from jarvis.connectors.local_files import LocalFileReadConnector
 from jarvis.contracts import (
+    LOCAL_READ_TASK_REFERENCE_KEY,
     ActionScope,
     AgentRun,
     BillingClass,
@@ -33,6 +35,7 @@ from jarvis.contracts import (
     CostEstimate,
     DataClassification,
     ErrorCode,
+    LocalReadSnapshot,
     MemoryStore,
     PermissionGrant,
     PermissionMode,
@@ -50,6 +53,7 @@ from jarvis.contracts import (
     ToolResult,
     canonical_usd,
     is_expired,
+    local_read_snapshot_refusal,
     next_loop_stage,
     normalize_destination,
     require_billing_class,
@@ -64,7 +68,10 @@ from jarvis.settings import Settings
 
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
 #: Version 2 added the deterministic, redacted top-level ``progress`` object.
-OUTPUT_SCHEMA_VERSION = 2
+#: Version 3 (M3) added the bounded top-level ``local_read`` object and the
+#: ``session.project_id`` field that M1 added without a bump. The SQLite
+#: schema is a separate contract and stays at its own version.
+OUTPUT_SCHEMA_VERSION = 3
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
@@ -136,7 +143,13 @@ _TASK_KEYS = frozenset(
     {"objective", "capability", "scope", "context", "preferences", "project_id"}
 )
 _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification"})
-_CONTEXT_KEYS = frozenset({"working_directory", "inputs"})
+#: ``local_read_task_id`` (M3) is a *reference* to an earlier completed local
+#: read in the same session. Content is never accepted from input: the
+#: snapshot is always re-derived from the referenced task's persisted state
+#: and re-validated in ``AgentCore``.
+_CONTEXT_KEYS = frozenset(
+    {"working_directory", "inputs", LOCAL_READ_TASK_REFERENCE_KEY}
+)
 _PREFERENCE_KEYS = frozenset(
     {"preferred_connector", "needs_clarification", "clarification_question", "assumption"}
 )
@@ -228,6 +241,12 @@ def _string(
         raise TaskInputError(f"'{where}.{key}' must be a string.")
     if required and not value.strip():
         raise TaskInputError(f"'{where}.{key}' must not be empty.")
+    if chr(0) in value:
+        # A NUL terminates a string at the OS boundary and names nothing on
+        # any platform. Refused at the input boundary so it can never become
+        # a persisted target, fingerprint input or connector argument; the
+        # loop refuses it independently for programmatically built tasks.
+        raise TaskInputError(f"'{where}.{key}' must not contain a NUL character.")
     return value
 
 
@@ -272,6 +291,14 @@ def decode_task_json(raw: str | bytes) -> Task:
         # Opaque user content. It is never read as a control namespace here;
         # the connector redacts it before anything can leave the machine.
         context["inputs"] = context_input["inputs"]
+    # M3: shape-validated here only. Same-session membership, COMPLETED
+    # source status, snapshot validity and the classification ladder are all
+    # proven later against storage, where any failure fails the task closed.
+    local_read_reference = _string(
+        context_input, LOCAL_READ_TASK_REFERENCE_KEY, "context"
+    )
+    if local_read_reference.strip():
+        context[LOCAL_READ_TASK_REFERENCE_KEY] = local_read_reference.strip()
 
     preference_input = _section(document, "preferences", _PREFERENCE_KEYS)
     preferences: dict[str, Any] = {}
@@ -326,8 +353,15 @@ def decode_task_json(raw: str | bytes) -> Task:
 #: Secret-key vocabulary, used both for field names and for labels embedded in
 #: free-form text. Owned by this module: presentation redaction is a CLI
 #: concern and must not depend on any connector's internal helpers.
+#: Compound key names first: ``_`` is a word character, so the trailing
+#: ``\b`` on the bare terms means ``secret_access_key:`` never matched
+#: ``secret``. Kept byte-for-byte in step with the contracts policy so the
+#: presentation defence is never the weaker of the two.
 _SECRET_LABEL = (
-    r"api[_\-\s]?key|token|secret|password|passwd|authorization|cookie"
+    r"secret[_\-\s]?access[_\-\s]?key(?:[_\-\s]?id)?"
+    r"|access[_\-\s]?key[_\-\s]?id|access[_\-\s]?key|secret[_\-\s]?key"
+    r"|api[_\-\s]?secret"
+    r"|api[_\-\s]?key|token|secret|password|passwd|authorization|cookie"
     r"|private[_\-\s]?key"
 )
 
@@ -349,6 +383,9 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
     re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(
+        r"\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b"
+    ),
 )
 
 
@@ -472,6 +509,49 @@ def _progress_payload(task: Task, session: SessionState | None) -> dict[str, Any
     return payload
 
 
+def _safe_local_read_shape(snapshot: Any) -> bool:
+    """Whether this snapshot is safe to render into the public envelope.
+
+    P1-5: this asks the ONE canonical structural contract,
+    ``local_read_snapshot_refusal``, rather than restating it. A task row
+    edited outside the product can carry an absolute path, a traversal path,
+    an unbounded scalar, a malformed digest or a raw-string classification
+    into memory; the load boundary, the execution boundary, this envelope and
+    the Claude egress boundary now all judge that row by the same function,
+    so the boundary the *user* reads can never be the weaker one.
+
+    Masking would not be enough: printing ``[PATH]`` in place of a tampered
+    absolute path would still assert that a bounded, trustworthy read
+    happened. A snapshot that fails the contract produces NO block at all.
+    """
+    return local_read_snapshot_refusal(snapshot) is None
+
+
+def _local_read_payload(snapshot: LocalReadSnapshot) -> dict[str, Any] | None:
+    """The bounded local-read view of the addressed task, or ``None``.
+
+    Exactly the fields a user needs to see what was read and how far it was
+    bounded. The excerpt is already newline-normalized, credential- and
+    absolute-path-redacted and capped by ``bound_local_text``; the envelope's
+    own ``_redact`` pass then runs over it like every other string.
+
+    ``None`` means the snapshot did not survive ``_safe_local_read_shape``, so
+    the envelope shows no local-read block rather than a tampered one.
+    """
+    if not _safe_local_read_shape(snapshot):
+        return None
+    return {
+        "relative_path": snapshot.relative_path,
+        "byte_size": snapshot.byte_size,
+        "sha256": snapshot.sha256,
+        "classification": snapshot.classification.value,
+        "truncated": snapshot.truncated,
+        "excerpt_characters": len(snapshot.excerpt),
+        "excerpt": snapshot.excerpt,
+        "read_at": snapshot.read_at,
+    }
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -537,6 +617,9 @@ def build_envelope(
         "approval": None if request is None else _approval_payload(request),
         "billing": None if task is None else _billing_payload(task.estimate),
         "progress": None if task is None else _progress_payload(task, session),
+        # ``_local_read_payload`` re-validates the snapshot and returns None
+        # for anything it cannot vouch for, so the presence check lives there.
+        "local_read": (None if task is None else _local_read_payload(task.local_read)),
         "result": None if result is None else _result_payload(result),
         # ``details`` is deliberately dropped: it carries free-form diagnostics.
         "error": (
@@ -919,4 +1002,10 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         default_working_directory=startup_directory,
         max_budget_usd=settings.claude_call_budget_usd,
     )
-    return create_app(settings=settings, connectors=(connector,))
+    # M3: the same startup root, so a local read and a Claude plan are bound
+    # to exactly one boundary. Constructing it touches no filesystem.
+    local_reader = LocalFileReadConnector(
+        allowed_roots=(startup_directory,),
+        default_working_directory=startup_directory,
+    )
+    return create_app(settings=settings, connectors=(connector, local_reader))

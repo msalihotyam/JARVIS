@@ -1078,6 +1078,290 @@ Kilitli değişmezler:
   proje tespiti, edit/delete/import/export/search-management CLI özellikleri,
   `decision_log` oturum indeksi (olası v7 performans adayı).
 
+### 4.11 Görev kapsamlı yerel dosya okuma (M3, uygulandı)
+
+JARVIS'in **kendi** okuduğu, sınırlanmış, redakte edilmiş tek dosyalık yerel
+okuma yeteneği. Claude alt sürecine `Read`/`Glob`/`Grep` veya doğrudan
+filesystem erişimi **verilmez**; `EGRESS_TOOL_GRANTS` boş kalır. Sebep
+mimaridir: bir tool grant, modelin hiçbir onayın attest etmediği byte'ları
+çekmesine izin verirdi ve bu tam olarak H1'in var olma nedenini geçersiz
+kılardı. Byte'ları JARVIS okur, sınırlar, redakte eder ve kanonik payload'a
+koyar; onay **onay ekranında gösterilen o byte'lara** bağlanır.
+
+Şema değişikliği **yoktur** (v6 yeterlidir): snapshot mevcut opak task JSON
+blob'unun içinde yaşar. Zarf sözleşmesi `OUTPUT_SCHEMA_VERSION` 2 → 3'e
+çıkmıştır (yeni `local_read` bloğu; M1'de sürüm artırmadan eklenen
+`session.project_id` de böylece bir sürümle kapsanır). Bu, SQLite şema
+sürümüyle karıştırılmamalıdır — iki ayrı sözleşmedir.
+
+Kilitli değişmezler:
+
+- **Tipli, görev kapsamlı alan:** `Task.local_read: LocalReadSnapshot`
+  (`relative_path`, `byte_size`, `sha256`, `excerpt`, `truncated`,
+  `classification`, `read_at`). Kalıcı **proje hafızası değildir**: hiçbir
+  memory satırı, fact, preference veya decision üretmez - decision
+  **yazılmaz**, boşaltılmaz veya sonradan silinmez: `finalize_task`
+  artık `decision=None` kabul eder ve satırı hiç INSERT etmez, işlemin
+  geri kalanı (guarded terminal task yazımı, session güncellemesi, usage
+  defteri, terminal event, hep-ya-hiç atomikliği) değişmez. Sebep: bir
+  decision, oturumdaki sonraki işlerin **güvenilir miras** olarak
+  getirdiği bir yargıdır; yerel okuma ise kanıt üretir, yargı değil.
+  Diğer her capability decision'ını eskisi gibi yazar; M2 getirme boru
+  hattına girmez ve 5 öğe / 4.000 karakter kotasını tüketmez. Alanı olmayan
+  eski task JSON'u boş snapshot'la yüklenir; sözleşmeyi ihlal eden
+  bozuk/tampered satır **tamamen boş snapshot'a** düşer (fail closed). Tek
+  onarım aşırı büyük excerpt'in yeniden sınırlanmasıdır. Okunamayan bir
+  `classification` de onarılmaz - **SECRET'e bile değil**: SECRET geri
+  düşüşü kapalı görünüyordu ama değildi, çünkü satırı yapısal olarak
+  GEÇERLİ ve MEVCUT bir snapshot'a çeviriyordu (sözleşmeyi geçen, zarfta
+  blok üreten, `present` sorulan her kapıya "evet" diyen bir nesne).
+  Yalnızca tam tanınan bir `DataClassification` **dizesi** kabul edilir;
+  geçerli SECRET dahil geçerli değerler korunur. `persistable_count`,
+  `bool()` ve `str()` gibi zorlamalar kaldırılmıştır çünkü her biri tampered
+  kalıcı durumu makul görünen **aktif** duruma çevirirdi.
+- **Zorunlu okuma sırası:** kanonik `resolve` (symlink/junction/`..` çözülür)
+  → allowed-root containment → secret-file deny → **temsil edilebilir
+  root-göreceli ad** (P1-4/P1-5 dilbilgisi) → tam olarak var olan normal dosya
+  → **onaylanan dizin zinciri üzerinden açma ve açılan nesnenin hâlâ kök
+  içinde olduğunun kanıtı** (aşağıya bakınız) → `fstat` ile açılan tanıtıcının
+  **aynı** dosya olduğunun kanıtı (`st_dev`/`st_ino`) → 64 KiB fiziksel tavan
+  → NUL/UTF-8 katı kontrol → normalize → redakte → kesme. Deny edilen dosya
+  **hiç okunmaz**, bu yüzden içeriğinin tanılama/checkpoint/event yoluna
+  sızması yapısal olarak imkânsızdır.
+- **Ara dizin yarışının kapatılması (P1-1):** açma öncesi `resolve()` bir
+  **yol adını** kanıtlar, bir **nesneyi** değil. Doğrulama ile `open` arasında
+  herhangi bir üst bileşen symlink veya NTFS junction ile değiştirilirse
+  açılan dosya onaylanan zinciri hiç kat etmemiş olur; ne `O_NOFOLLOW` (yalnız
+  son bileşen, Windows'ta hiç yok) ne de `st_dev`/`st_ino` bağı bunu görür,
+  çünkü değişim `lstat`'tan önce inerse ikisi de aynı takas sonrası dosyayı
+  görüp birbirini doğrular. İki platform-uygun rota, tek garanti:
+  (a) dizin tanıtıcısına göreli açma destekleniyorsa (POSIX `dir_fd`) kök
+  altındaki zincir `O_NOFOLLOW` ile tanıtıcıdan tanıtıcıya yürünür; her adım
+  bir önceki adımın açtığı dizin nesnesine sabitlenir, dolayısıyla kök dışına
+  **geçici olarak bile** hiçbir şey açılmaz. (b) Windows'ta `dir_fd` yoktur:
+  önce zincir no-follow `lstat` ile taranıp kök altındaki **herhangi** bir
+  bileşen reparse point ise reddedilir (junction ayrıcalık istemez, bu yüzden
+  soru `S_ISLNK` değildir), sonra açılan tanıtıcıya kendi authoritative son
+  yolu `GetFinalPathNameByHandleW` ile sorulur. Bu cevap yol adından değil
+  **nesneden** gelir; taramadan sonra takas edilen bir zincir de kök dışına
+  düşer, reddedilir ve **sıfır byte** verir. Kalıcılaşan `relative_path` de
+  tanıtıcının kanıtladığı yoldan türetilir.
+  Zincir, başladığı **kök kadar** güvenilirdir. Kökün kendisi bir pathname
+  ile açılsaydı tüm zincir o pathname'in zayıflığını devralırdı: kök
+  kurulumdan sonra başka bir yere yönlendirilirse her kontrolü geçen bir
+  okuma yanlış dizinin içinde "contained" olurdu. Bu yüzden her izinli kökün
+  `(st_dev, st_ino)` kimliği **otorite kümesi oluşturulurken** kaydedilir ve
+  açma anında yeniden kanıtlanır: dizin tanıtıcılarıyla yürüyen platformda
+  açılan kök tanıtıcısının `fstat`'ı ile (`O_NOFOLLOW` ile birlikte),
+  yürüyemeyen platformda no-follow taramanın ilk adımındaki `lstat` ile.
+  Kimliği kayıtlı olmayan bir kök (henüz var olmayan kök dahil) kapalı
+  düşer.
+- **İki ayrı tavan:** fiziksel tavan `LOCAL_READ_MAX_BYTES = 64 KiB`
+  **reddeder** (sessiz kesme yoktur); temsil tavanı
+  `LOCAL_READ_EXCERPT_MAX_CHARS = 4.000` belgelenmiş biçimde kısaltır
+  (`value[:3999] + "…"`, tipli `truncated`). Kesme **redaksiyondan sonra**
+  uygulanır: redaksiyon metni büyütse bile (`/a/b` → `[PATH]`) sonuç tavanı
+  asla aşamaz. Model destekli özetleme, chunk seçimi veya heuristik yoktur;
+  aynı girdi her zaman bayt-özdeş çıktı verir.
+- **Dar secret-file deny politikası:** yalnız tam adlar (`.env`, `.env.*`,
+  `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `.npmrc`, `.pypirc`,
+  `.netrc`, `_netrc`), tam uzantılar (`.pem`, `.key`, `.pfx`, `.p12`) ve iki
+  dizin kuralı (`.ssh/**`, `.aws/credentials`). **`id_*` globu kullanılmaz**
+  → `id_generator.py`, `id_map.json`, `id_rsa.pub`, `key.py`, `keys.json`,
+  `apikey.md`, `environment.py` okunabilir kalır. Politika **kanonik yol**
+  üzerinde çalışır, yani sır dosyasına işaret eden masum görünümlü bir
+  symlink de reddedilir. `.env.example` bilinçli, belgelenmiş bir
+  yanlış-pozitiftir.
+- **Sınıflandırma otoritesi:** `LocalReadSnapshot.classification` connector
+  metadata'sı **değildir**. `AgentCore` onu okuyan task'ın kendi güvenilir
+  `scope.data_classification` değerinden **koşulsuz yeniden bağlar**.
+  Garantinin tam ve dar ifadesi: **connector'ın DÖNDÜRDÜĞÜ classification hiç
+  okunmaz.** Geri verdiği snapshot'a ne koyarsa koysun — düşürülmüş değer,
+  yükseltilmiş değer, ham string, yabancı enum — burada atılır. Bağlama ayrıca
+  seçili connector'ın `file_read` yeteneğini beyan etmesine bağlıdır, böylece
+  ilgisiz bir connector sonucuna snapshot iliştiremez.
+  **Bu ifadenin kapsamadığı şey:** connector'a `execute` ve `verify`
+  aşamalarında canlı `Task` nesnesi verilir ve bağlamadan sonra onu doğrudan
+  mutasyona uğratabilir. Bu maruziyet **önceden var olan ve tamamen geneldir**
+  — aynı connector `task.objective` veya `task.scope` alanlarını da yeniden
+  yazabilir — dolayısıyla local read'e özgü değildir, connector sınırının kendi
+  özelliğidir ve M3 bunu daraltmaz. Aşağı akıştaki sınırlar kalıcı değere de
+  güvenmez: cross-task hop ve Claude egress sınırı classification'ı **bağımsız
+  olarak yeniden doğrular**. Egress sınırındaki exact enum-type kontrolü
+  güvenlik açısından zorunludur: `DataClassification` bir `str, Enum` olduğu
+  için ham `"public"` string'i enum üyesiyle eşit karşılaştırır ve aynı hash'e
+  sahiptir, dolayısıyla tip kontrolü olmadan merdiveni sessizce geçerdi.
+- **Tam kaynak bağlama (H1) ve kanonik hedef kimliği (P1-2):**
+  authoritative hedef `ActionScope.target`'tır. `normalize_locator` biçime
+  göre yönlendirir: ayırıcısı ve sürücü harfi olmayan **çıplak göreceli ad**
+  (`README.md`) `normalize_symbol`'e düşüp *sembolik* kalıyordu, oysa
+  `.\README.md` kanonikleşiyordu — tek dosya için iki farklı fingerprint, ve
+  daha kötüsü sembolik biçim hiç yeniden çözülmediği için ad başka bir dosyaya
+  yönlendirilirken verilen grant geçerli kalıyor, yürütme ise adı canlı çözüp
+  yeni dosyayı okuyordu. Artık `AgentCore._bind_canonical_local_target`,
+  `file_read` yeteneğindeki her hedefi scope okunmadan **önce** tek bir yerde
+  `canonical_path`'ten geçirir: bir dosyanın her yazımı (çıplak, `.\` önekli,
+  nokta/üst segmentli, symlink) aynı mutlak kanonik kimliğe yakınsar, bu kimlik
+  scope otoritesine, izin ve scope fingerprint'ine, `EgressAttestation` kaynak
+  sınırına ve yürütmeye aynı biçimde girer. Onaydan sonra hedef yeniden
+  yönlendirilirse kanonik hedef değişir → fingerprint değişir → grant
+  geçersizleşir ve **sıfır kez** çalışır. Güvenli görüntü adı ayrı bir
+  değerdir (`LocalReadSnapshot.relative_path`, izinli köke göreceli), yani
+  kullanıcıya, zarfa veya modele hiçbir mutlak yol gitmez.
+  `resource_boundary()` H1'in yerel sınır kancasının ilk gerçek tüketicisidir
+  ve hem onay üretilirken hem yürütmeden hemen önce yeniden doğrulanır.
+- **Onay/faturalandırma:** özel durum **eklenmemiştir**. Profil
+  LOCAL_READ / LOW / reversible / `always_requires_approval=False`'tır;
+  LOCAL_READ `MANDATORY_APPROVAL_EFFECTS` içinde değildir, dolayısıyla
+  STRICT onay ister, SESSION ve SMART_AUTO otomatik geçirir. `_LOCAL_EFFECT_LADDER`
+  ile task profili güçlendirebilir, asla zayıflatamaz. Rota
+  `NO_ADDITIONAL_CHARGE` olarak **açıkça** beyan edilir (manifest varsayılanı
+  UNKNOWN'dır ve yürütmeden önce reddedilirdi); rezervasyon/defter yolu
+  açılmaz.
+- **Görevler arası referans ve kaynak-task otoritesi (P1-3):** ürünün tek
+  cross-task veri sıçraması ve bilinçli olarak dardır.
+  `context.local_read_task_id` bir **referanstır**, içerik değil: kaynak task
+  aynı oturumda olmalı, kendisi olmamalı, COMPLETED olmalı, yapısal olarak
+  geçerli bir snapshot taşımalı ve `retrieval_eligible` merdiveni izin
+  vermelidir (SECRET her iki rolde de asla uygun değildir). Herhangi biri
+  sağlanmazsa görev `INVALID_TASK` ile kapalı düşer.
+  Merdivenin **kaynak tarafı kalıcı snapshot'tan asla okunmaz**: kilitli M3
+  değişmezi "snapshot classification otorite değildir" tam olarak burada
+  uygulanır. Hop, kaynak task'ın kendi exact-tipli
+  `scope.data_classification` değerini otorite alır, snapshot'ı bu değerle
+  **yeniden kurar** ve merdiveni ancak ondan sonra uygular; hedef task'ın
+  sınıfı da aynı biçimde exact-tip kontrolünden geçer. Ürün dışında
+  düzenlenmiş bir satır SENSITIVE/SECRET bir okumaya PUBLIC diyemez, ham
+  string veya yabancı `str` enum otoriteyi düşüremez (ikisi de enum üyesiyle
+  eşit karşılaştırıp aynı hash'e sahiptir), ve snapshot kaynağından yüksek
+  bir değer iddia ederek otoriteyi **yükseltemez** de. Reddedildiğinde hiçbir
+  connector seçilmez ve hiçbir yürütme denemesi açılmaz — refüzasyon
+  CONTEXT_RETRIEVAL'de, TOOL_SELECTION'dan önce olur.
+- **Egress:** `_sanitized_payload` içindeki `local_read` bloğu default-deny
+  ve bağımsız yeniden doğrulamalıdır. Dışa çıkan alan kümesi **tam olarak**
+  `{notice, path, byte_size, truncated, content}`'tir; `sha256`,
+  `classification`, `read_at` ve her türlü mutlak yol yerelde kalır. Snapshot
+  kalıcı durum olduğu için bu sınırda **aynı tek yapısal sözleşme** ve sınıf
+  merdiveni yeniden uygulanır; sözleşmeyi ihlal eden bir satır blok üretmez
+  (degrade değil, default-deny), redaksiyonla büyüyen içerik ise kanonik
+  boru hattıyla yeniden sınırlanır. `LOCAL_READ_NOTICE` içeriği
+  açıkça güvenilmeyen referans veri olarak çerçeveler. Excerpt'in task
+  JSON'unda kalıcılaşması **zorunludur**: approve → resume yolunda payload
+  bayt-özdeş yeniden üretilemezse H1 digest bağı kopar.
+- **Tek yapısal sözleşme (P1-5):** `LocalReadSnapshot`'ın yapısal
+  sözleşmesi tek bir yerde, `contracts.local_read_snapshot_refusal`
+  içinde tanımlıdır ve **her otorite sınırı aynı fonksiyonu çağırır**:
+  yükleme sınırı (`from_dict`), yürütme sınırı
+  (`AgentCore._validated_local_read`), connector'ın kendi `verify`'ı, public
+  envelope (`app._safe_local_read_shape`) ve Claude egress sınırı
+  (`_local_read`). Böylece birbirinden sessizce ayrışan dört benzer
+  doğrulayıcı yoktur. Zorunlu tipler ve tavanlar: `relative_path` exact `str`,
+  yalnız root-göreceli (mutlak/sürücü/UNC/ters bölü yok, boş/`.`/`..` bileşeni
+  yok), `LOCAL_READ_PATH_MAX_CHARS = 512` sınırında ve kimlik-bilgisi taşıyan
+  ad reddedilir; `byte_size` exact `int` (bool değil), `0 ≤ n ≤ 64 KiB`;
+  `sha256` exact `str`, tam 64 küçük-harf hex; `excerpt` exact `str`, ≤ 4.000;
+  `truncated` exact `bool`; `classification` exact `DataClassification`;
+  `read_at` exact `str` ve bu deponun kanonik UTC ISO-8601 dilbilgisi
+  (`canonical_utc_timestamp`, ≤ 64 karakter, tz-aware, offset sıfır). Hiçbir
+  alan zorlanmaz.
+  Uzunluk ve tip **hijyen değildir**: tavanın altındaki bir excerpt hâlâ ham
+  CRLF, mutlak yerel yol veya canlı bir kimlik bilgisi taşıyabilir - hiçbiri
+  gerçek bir okumanın üretebileceği şey değildir, çünkü `bound_local_text`
+  onları zaten kaldırmıştı. `bound_local_text` bir **sabit noktadır** (kendi
+  çıktısına uygulandığında onu değiştirmez; son adım olan kesme ilk adım için
+  iş yaratabildiğinden sınırlı bir yakınsama döngüsüyle garanti edilir), bu
+  yüzden "bu excerpt gerçek bir okumanın saklayacağı şey mi?" sorusu sezgisel
+  olmadan tam olarak yanıtlanır: `bound_local_text(excerpt) == excerpt` ise
+  kabul, değilse **ret**. Yeniden redakte etmek olmaz - tampered bir excerpt'in
+  temiz bir yüzle aktif duruma geçmesi demek olurdu.
+  ne aktif snapshot olarak task'a, ne zarfa, ne onay önizlemesine, ne kanonik
+  outbound'a, ne de Claude payload'ına ulaşabilir; yükle → yeniden kaydet →
+  yükle döngüsü sınırlı ve kapalı kalır.
+- **Kimlik-bilgisi taşıyan yol adı fail closed'dır (P1-4):** `api_key=X.txt`
+  gibi bir dosya adı metadata olsa da kullanıcı kontrolündeki
+  kimlik-bilgisi taşıyan metindir. Karar **redaksiyon değil reddir**: yol bir
+  **kaynak tanımlayıcısıdır**, ve `api_key=[REDACTED].txt` gibi bir sözde-yol
+  onaylanan kimlik ile görüntülenen kimliği birbirinden ayırırken hâlâ
+  sınırlanmış ve güvenilir bir okuma yapıldığını iddia ederdi. Kural, ürünün
+  zaten paylaştığı sağlayıcı-bağımsız `credential_bearing` politikasıdır (ad
+  biçimine dair tahmin değil; bu politika `secret_access_key`,
+  `access_key_id`, `secret_key`, `api_secret` gibi **bileşik** anahtar
+  adlarını ve etiketsiz AWS erişim anahtarı kimliklerini de kapsar -
+  `secret` ve `token` sondaki `\b` ile bağlı olduğu ve `_` bir kelime
+  karakteri olduğu için bunlar daha önce hiçbir kurala takılmıyordu),
+  root-göreceli temsile uygulanır ve
+  `resource_boundary()` içinde **herhangi bir onay isteği, önizleme veya
+  attestation var olmadan önce** çalışır. `apikey.md`, `tokenizer.py`,
+  `secret_handling.md`, `id_rsa.pub` gibi gerçek bir kimlik-bilgisi **değeri**
+  taşımayan adlar okunabilir kalır.
+- **İzinli kök otoritesi (P2-6):** `allowed_roots`'un hiç verilmemesi
+  (`None`) belgelenmiş varsayılandır ve yapılandırılmış başlangıç/proje
+  kökünü seçer. **Açıkça boş** bir iterable ise eşanlamlı değildir: "hiç kök
+  yok" der, ve onu sessizce çalışma dizinine çevirmek boş bir otorite kümesini
+  gerçek bir otoriteye genişletirdi — üstelik herhangi bir onay veya yürütme
+  bunu reddedemeden, kurulum anında. Bu yüzden açıkça boş küme geçersiz
+  yapılandırmadır ve constructor'da hata verir; boş üreten bir generator de
+  aynıdır. Kök değerleri gerçek `str`/`Path` olmalıdır (aksi hâlde
+  `TypeError`) ve boş/boşluk bir kök reddedilir, çünkü `Path("")` çalışma
+  dizinine çözülür — aynı genişleme, başka yazımla.
+- **Public envelope sınırı:** CLI zarfındaki `local_read` bloğu, kullanıcının
+  okuduğu sınırdır ve egress sınırıyla **simetriktir**: ikisi de yukarıdaki
+  tek yapısal sözleşmeyi çağırır, dolayısıyla kullanıcının okuduğu sınır asla
+  daha zayıf olamaz. Sözleşme sağlanmazsa **blok hiç üretilmez** (fail
+  closed). Yalnızca yolu `[PATH]` ile maskelemek yeterli olmazdı: maskelenmiş
+  bir yol, tampered bir satır için sınırlanmış ve güvenilir bir okuma
+  yapıldığını yine de iddia ederdi. `OUTPUT_SCHEMA_VERSION = 3` ve geçerli
+  snapshot'ın alan kümesi değişmez.
+- **Kabul edilmiş tradeoff:** redaksiyon, kod içeriğindeki gerçek bir mutlak
+  yolu veya kimlik bilgisi biçimli metni `[PATH]`/`[REDACTED]` ile
+  değiştirir; bu, sadakat yerine hijyen lehine bilinçli bir tercihtir.
+- **NTFS named stream (ADS):** bir named stream tek dizin girdisinin
+  içindeki ikinci veri kanalıdır ve deny politikasının her kuralını
+  boşa çıkarır: politika **tam ad** ve **tam uzantı** eşler, `.env:s`
+  ise ne `.env` adına ne `.pem` uzantısına sahiptir - buna karşılık
+  `secret.pem:s:$DATA` açıkça reddedilen bir dosyanın stream'ini
+  adlandırır ve byte'larını okur. Stream'ler M3'ün tek-dosya
+  sözleşmesinin dışındadır, bu yüzden ayrıştırılmaz, **reddedilir**:
+  kural `local_read_denial_reason` içinde ilk sıradadır, anchor atlanır
+  (normal `C:\...` sürücü ele alışı değişmez) ve altındaki her bileşene
+  uygulanır; ayrıca saklanan root-göreceli temsile de uygulanır. Onay
+  otoritesi oluşmadan **önce** ve handle'dan türetilen authoritative son
+  yola karşı **yeniden** çalışır - her iki platform rotasında da.
+- **Hard link ve kabul edilmiş uyumluluk maliyeti:** hard link bir link
+  değildir; aynı dosyanın ikinci **ADIdır**. Bu yüzden çözülecek bir şey
+  yoktur, reparse point değildir ve `GetFinalPathNameByHandleW` handle'ın
+  açıldığı kök-içi adı döndürür - yani kök dışındaki bir dosyanın kök-içi
+  bir adı containment'ı, secret-file politikasını, no-follow zincir
+  taramasını ve `st_dev`/`st_ino` bağını geçiyor, byte'lar yine de
+  dışarıdan geliyordu. Containment **adlar** hakkında bir iddiadır ve iki
+  adı olan bir dosya köklerin içinde yalnızca birine göre bulunur.
+  M3'ün bilinçli kararı: açılan **normal dosyanın** `st_nlink > 1` olması
+  reddedilir - kontrol açılan handle'ın `fstat`'ında, tek `read`
+  çağrısından **önce** yapılır, dolayısıyla dış içerik geçici olarak bile
+  bellekte tutulmaz. Dizin ele alışı değişmez: dizin zaten `S_ISREG`
+  kontrolünde reddedilir ve bu kurala hiç ulaşmaz. Kabul edilmiş maliyet:
+  meşru hardlink'li dosyalar (git worktree, dedup/paket önbellekleri)
+  şimdilik okunamaz; bu kalıcı bir karar değil, katı allowed-root
+  izolasyonunu istisnasız korumak için ödenen geçici bedeldir.
+- **Hiçbir platformun adlandıramayacağı hedef (NUL):** `canonical_path`
+  sözleşme gereği **totaldir**. `ActionScope.normalized` üzerinden task
+  serileştirmesini, izin fingerprint'ini ve attestation'ı besler; bunların
+  hepsi bir **reddi** deterministik terminal duruma çeviren ama bir
+  **istisnaya** cevabı olmayan aşamaların içinde çalışır. Gömülü NUL tam
+  olarak bu vakadır: POSIX onu `resolve()` içinde reddeder, Windows orada
+  kabul edip sonra `lstat`/`open` içinde reddeder - yani ürünün temiz
+  başarısız olup olmadığına *platform* karar veriyordu, ve POSIX'te
+  kanonikleştirme adımı doğrudan döngünün dışına fırlayıp `run()`
+  tarafından zaten kaydedilmiş ve oturumun aktif gösterdiği bir task'ı
+  terminal durumsuz bırakıyordu. Artık `unusable_filesystem_target` bunu
+  döngü içinde `INVALID_TASK` olarak reddeder, `canonical_path`
+  çözülemeyen hedefi kimliği bozmadan deterministik bir yazıma düşürür ve
+  girdi sınırı NUL taşıyan alanı en baştan geri çevirir.
+- **Non-goals (kilitli):** LOCAL_WRITE yok · terminal/process yok ·
+  glob/recursive traversal yok (tek dosya) · Claude tool grant yok · şema
+  migration yok (v6) · model destekli çıkarım/özet yok · otomatik hafıza
+  yazımı yok · M1/M2 hafıza otoritesi ve H1–H5 değişmez.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:

@@ -1124,7 +1124,9 @@ class EnvelopeProgressTests(ProcessBoundaryTestCase):
         app, _ = self.build_app()
         result = app.run(task_document())
         self.assertEqual(0, result.exit_code)
-        self.assertEqual(2, result.payload["schema_version"])
+        # M3 bumped the public envelope contract 2 -> 3 (bounded ``local_read``
+        # block). The progress object below is unchanged by that bump.
+        self.assertEqual(3, result.payload["schema_version"])
         progress = result.payload["progress"]
         task = self.memory.load_task(result.payload["task"]["id"])
         self.assertEqual(
