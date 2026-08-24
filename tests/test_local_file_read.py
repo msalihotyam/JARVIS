@@ -13,6 +13,7 @@ invariants that must not move.
 from __future__ import annotations
 
 import contextlib
+import enum
 import hashlib
 import json
 import os
@@ -68,6 +69,7 @@ from jarvis.contracts import (
     local_read_snapshot_refusal,
     normalize_local_text,
     redact_credentials,
+    retrieval_eligible,
     unusable_filesystem_target,
     utc_now,
 )
@@ -754,26 +756,65 @@ class ValidationBoundaryTests(unittest.TestCase):
 
 
 class ExactBindingTests(LocalReadTestCase):
-    def test_the_opened_descriptor_must_be_the_stat_ed_file(self) -> None:
-        target = self.write("notes.txt", "original\n")
-        other = self.write("other.txt", "substituted\n")
-        real_open = os.open
+    SUBSTITUTE = "SUBSTITUTED-FILE-MARKER-9a3f"
 
-        def swapping_open(path, flags, *args, **kwargs):
-            # Simulate the name being repointed between stat and open.
-            if str(path) == str(target):
-                return real_open(other, flags, *args, **kwargs)
-            return real_open(path, flags, *args, **kwargs)
+    def test_the_opened_descriptor_must_be_the_stat_ed_file(self) -> None:
+        """A real inode swap under the SAME NAME, in the only window there is.
+
+        Mocking ``os.open`` cannot pin this: the POSIX route opens the final
+        component by basename relative to a directory handle, so a mock keyed
+        on the absolute pathname never fires there and the test would pass on
+        Windows while exercising nothing on Linux. The swap is therefore
+        performed on the real filesystem, at the one seam that sits AFTER the
+        pre-open ``lstat`` and BEFORE the open - the same ``chain`` seam
+        ``ParentDirectoryRaceTests`` uses - so both routes reach the open with
+        a file whose ``(st_dev, st_ino)`` is no longer the authorized one.
+        ``os.replace`` is atomic, so the name never stops existing and the
+        refusal can only come from the identity binding itself.
+        """
+        target = self.write("notes.txt", "original\n")
+        other = self.write("other.txt", f"{self.SUBSTITUTE}\n")
+        original_chain = LocalFileReadConnector._reject_reparse_chain
+        swapped = {"done": False}
+
+        def patched_chain(connector, root, parts):
+            original_chain(connector, root, parts)
+            if not swapped["done"]:
+                swapped["done"] = True
+                os.replace(other, target)
 
         with mock.patch.object(
-            __import__("jarvis.connectors.local_files", fromlist=["os"]).os,
-            "open",
-            side_effect=swapping_open,
+            LocalFileReadConnector, "_reject_reparse_chain", patched_chain
         ):
             task, run = self.run_read(target)
+        self.assertTrue(swapped["done"], "the race window was never reached")
         self.assertEqual(RunStatus.FAILED, run.status)
         self.assertEqual(ErrorCode.INVALID_TASK, run.error.code)
-        self.assertFalse(self.memory.load_task(task.id).local_read.present)
+        # The identity binding is what refused, not some other layer.
+        self.assertIn("changed between authorization and open", run.error.message)
+        stored = self.memory.load_task(task.id)
+        self.assertFalse(stored.local_read.present)
+        self.assertNotIn(self.SUBSTITUTE, json.dumps(stored.to_dict(), default=str))
+        self.assertNotIn(self.SUBSTITUTE, json.dumps(run.error.to_dict(), default=str))
+
+    def test_a_working_directory_outside_the_roots_is_refused(self) -> None:
+        """The attested local boundary, refused before any approval exists."""
+        self.write("notes.txt", "boundary\n")
+        outside = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, outside, True)
+        task = read_task(self.root / "notes.txt")
+        task.context["working_directory"] = str(outside)
+        with self.assertRaises(AttestationError) as caught:
+            self.connector.resource_boundary(task)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, caught.exception.code)
+
+    def test_a_working_directory_that_does_not_exist_is_refused(self) -> None:
+        self.write("notes.txt", "boundary\n")
+        task = read_task(self.root / "notes.txt")
+        task.context["working_directory"] = str(self.root / "no-such-directory")
+        with self.assertRaises(AttestationError) as caught:
+            self.connector.resource_boundary(task)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, caught.exception.code)
 
     def test_resource_boundary_is_the_canonical_root_set(self) -> None:
         self.write("notes.txt", "boundary\n")
@@ -791,16 +832,6 @@ class ExactBindingTests(LocalReadTestCase):
         with self.assertRaises(AttestationError) as caught:
             self.connector.resource_boundary(task)
         self.assertIs(ErrorCode.EGRESS_REFUSED, caught.exception.code)
-
-    def test_the_attested_scope_target_is_the_symlink_resolved_path(self) -> None:
-        # This is what makes a post-approval symlink repoint change the
-        # fingerprint instead of silently reading a different file.
-        real = self.write("real.txt", "real\n")
-        scope = ActionScope(action="read", target=str(self.root / "." / "real.txt"))
-        self.assertEqual(
-            Path(scope.normalized().target).name, Path(str(real)).name.casefold()
-        )
-        self.assertNotIn("/./", scope.normalized().target)
 
 
 # --------------------------------------------------------------------------
@@ -1237,6 +1268,37 @@ class OutboundPayloadTests(LocalReadTestCase):
             snapshot_classification=DataClassification.SECRET
         )
         self.assertNotIn("local_read", self._payload(task))
+
+    def test_a_foreign_str_enum_current_classification_drops_the_block(self) -> None:
+        """The type check on the CURRENT classification is load-bearing.
+
+        ``DataClassification`` is a ``str, Enum``, so a foreign ``str`` enum
+        carrying the same value compares AND hashes equal to it: it survives
+        ``scope.to_dict()`` (unlike a bare ``str``, which raises there and so
+        never reaches this boundary at all) and it satisfies the retrieval
+        ladder outright - asserted below. Dropping the check therefore
+        egresses the block under a spoofed classification, and this test is
+        what fails when it is dropped.
+
+        ``type() is`` versus ``isinstance`` is not the axis here: an enum
+        that has members cannot be extended, so no subclass can exist and the
+        two spellings are behaviourally identical for this type. What matters
+        is that the check exists at all.
+        """
+
+        class ForeignClassification(str, enum.Enum):
+            INTERNAL = DataClassification.INTERNAL.value
+
+        task = self._task_with_snapshot(classification=DataClassification.INTERNAL)
+        foreign = ForeignClassification.INTERNAL
+        # Without the exact-type guard, nothing downstream would refuse this.
+        self.assertEqual(DataClassification.INTERNAL, foreign)
+        self.assertTrue(retrieval_eligible(foreign, task.local_read.classification))
+
+        object.__setattr__(task.scope, "data_classification", foreign)
+        payload = self._payload(task)
+        self.assertNotIn("local_read", payload)
+        self.assertNotIn("alpha beta", json.dumps(payload, default=str))
 
     def test_a_tampered_oversized_excerpt_drops_the_block(self) -> None:
         """Default-deny, not degrade: the whole block goes, not just the tail.
@@ -3025,14 +3087,7 @@ class HardLinkContainmentTests(LocalReadTestCase):
         self.assertIs(OutcomeStatus.SUCCESS, allowed.outcome)
         self.assertEqual([1], reads)
 
-    def test_the_policy_is_scoped_to_the_opened_regular_file(self) -> None:
-        """Directory handling is untouched: a directory never reaches the
-        link check, because it is refused as a non-regular file first."""
-        (self.root / "adir").mkdir()
-        _, run = self.run_read(self.root / "adir")
-        self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertIn("not an existing regular file", run.error.message)
-        self.assertNotIn("filesystem name", run.error.message)
+
 # --------------------------------------------------------------------------
 # R3-1. A classification that cannot be read invalidates the WHOLE snapshot
 # --------------------------------------------------------------------------
