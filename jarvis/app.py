@@ -25,9 +25,13 @@ from typing import Any, Iterable
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.base import BaseConnector
-from jarvis.connectors.local_files import LocalFileReadConnector
+from jarvis.connectors.local_files import (
+    LocalFileReadConnector,
+    LocalFileWriteConnector,
+)
 from jarvis.contracts import (
     LOCAL_READ_TASK_REFERENCE_KEY,
+    LOCAL_WRITE_MODES,
     ActionScope,
     AgentRun,
     BillingClass,
@@ -36,6 +40,7 @@ from jarvis.contracts import (
     DataClassification,
     ErrorCode,
     LocalReadSnapshot,
+    LocalWriteRecord,
     MemoryStore,
     PermissionGrant,
     PermissionMode,
@@ -54,6 +59,9 @@ from jarvis.contracts import (
     canonical_usd,
     is_expired,
     local_read_snapshot_refusal,
+    local_write_content_refusal,
+    local_write_mode_unsupported,
+    local_write_record_refusal,
     next_loop_stage,
     normalize_destination,
     require_billing_class,
@@ -71,7 +79,7 @@ from jarvis.settings import Settings
 #: Version 3 (M3) added the bounded top-level ``local_read`` object and the
 #: ``session.project_id`` field that M1 added without a bump. The SQLite
 #: schema is a separate contract and stays at its own version.
-OUTPUT_SCHEMA_VERSION = 3
+OUTPUT_SCHEMA_VERSION = 4
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
@@ -140,8 +148,21 @@ _ERROR_EXIT = {
 #: billing markers, approval state, fingerprints or future preference keys -
 #: is rejected rather than ignored.
 _TASK_KEYS = frozenset(
-    {"objective", "capability", "scope", "context", "preferences", "project_id"}
+    {
+        "objective",
+        "capability",
+        "scope",
+        "context",
+        "preferences",
+        "project_id",
+        # M5. The intended write bytes and mode. A TOP-LEVEL section, not
+        # a ``context`` key: the Claude connector serializes ``context``
+        # verbatim into its payload, so a context key would have been an
+        # egress channel for up to 64 KiB of file content.
+        "write",
+    }
 )
+_WRITE_KEYS = frozenset({"content", "mode"})
 _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification"})
 #: ``local_read_task_id`` (M3) is a *reference* to an earlier completed local
 #: read in the same session. Content is never accepted from input: the
@@ -328,6 +349,39 @@ def decode_task_json(raw: str | bytes) -> Task:
         except ValueError as exc:
             raise TaskInputError(str(exc)) from exc
 
+    # M5: the intended write bytes and the declared mode. Both are validated
+    # here against the SAME canonical grammars the persistence load boundary
+    # applies, so a row edited outside the product can never carry a payload
+    # this boundary would have refused. The content is NOT transformed - no
+    # newline normalization, no redaction, no truncation: it is the
+    # deliverable, and quietly altering it would corrupt the file while the
+    # product still claimed an attested write.
+    write_input = _section(document, "write", _WRITE_KEYS)
+    write_content = ""
+    write_mode = ""
+    if write_input:
+        if "content" not in write_input or "mode" not in write_input:
+            raise TaskInputError("'write' requires both 'content' and 'mode'.")
+        write_content = write_input["content"]
+        reason = local_write_content_refusal(write_content)
+        if reason is not None:
+            raise TaskInputError(f"'write.content' is refused: {reason}.")
+        write_mode = write_input["mode"]
+        if type(write_mode) is not str or write_mode not in LOCAL_WRITE_MODES:
+            raise TaskInputError(
+                "'write.mode' must be exactly one of: "
+                + ", ".join(LOCAL_WRITE_MODES)
+                + "."
+            )
+        # A recognized mode is not necessarily a supported one. Overwrite is
+        # refused here rather than deep in execution, because no primitive
+        # available to this product can make a replacement conditional on the
+        # destination still being the approved file - see
+        # ``LOCAL_WRITE_ENABLED_MODES``.
+        reason = local_write_mode_unsupported(write_mode)
+        if reason is not None:
+            raise TaskInputError(f"'write.mode' is refused: {reason}.")
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -342,6 +396,8 @@ def decode_task_json(raw: str | bytes) -> Task:
         context=context,
         preferences=preferences,
         project_id=project_id,
+        write_content=write_content,
+        write_mode=write_mode,
     )
 
 
@@ -552,6 +608,34 @@ def _local_read_payload(snapshot: LocalReadSnapshot) -> dict[str, Any] | None:
     }
 
 
+def _local_write_payload(record: LocalWriteRecord) -> dict[str, Any] | None:
+    """The bounded local-write view of the addressed task, or ``None``.
+
+    Metadata only, by construction: the record itself carries no bytes, so
+    there is nothing here to redact and nothing that could leak the file's
+    content or a pre-image. What the user gets is what was authorized and
+    what happened - the root-relative name, the mode, both digests and both
+    sizes.
+
+    ``None`` means the record did not survive the one canonical structural
+    contract, so the envelope shows no local-write block rather than a
+    tampered one.
+    """
+    if local_write_record_refusal(record) is not None:
+        return None
+    return {
+        "relative_path": record.relative_path,
+        "mode": record.mode,
+        "pre_present": record.pre_present,
+        "pre_sha256": record.pre_sha256,
+        "pre_byte_size": record.pre_byte_size,
+        "intended_sha256": record.intended_sha256,
+        "intended_byte_size": record.intended_byte_size,
+        "status": record.status,
+        "written_at": record.written_at,
+    }
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -620,6 +704,12 @@ def build_envelope(
         # ``_local_read_payload`` re-validates the snapshot and returns None
         # for anything it cannot vouch for, so the presence check lives there.
         "local_read": (None if task is None else _local_read_payload(task.local_read)),
+        # M5. Metadata only and re-validated the same way, so a tampered row
+        # renders no block instead of a plausible one. The intended bytes are
+        # deliberately absent: this is the changed-file record, not the file.
+        "local_write": (
+            None if task is None else _local_write_payload(task.local_write)
+        ),
         "result": None if result is None else _result_payload(result),
         # ``details`` is deliberately dropped: it carries free-form diagnostics.
         "error": (
@@ -1008,4 +1098,13 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
     )
-    return create_app(settings=settings, connectors=(connector, local_reader))
+    # M5: the same startup root again, so read, write and the Claude plan are
+    # all bound to exactly one boundary. Constructing it touches no
+    # filesystem and grants the model nothing.
+    local_writer = LocalFileWriteConnector(
+        allowed_roots=(startup_directory,),
+        default_working_directory=startup_directory,
+    )
+    return create_app(
+        settings=settings, connectors=(connector, local_reader, local_writer)
+    )

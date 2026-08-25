@@ -29,6 +29,20 @@ from jarvis.contracts import (
 )
 
 
+#: Effects whose approval must bind the EXACT bytes involved, so a connector
+#: that performs one may not fall back to the empty default outbound. M5 adds
+#: the two local effects that also produce an exact, irreversible byte
+#: outcome, because an approval for "write these bytes there" that attested
+#: ``sha256(b"")`` would bind nothing at all.
+_EXACT_OUTBOUND_EFFECTS = frozenset(
+    {
+        SideEffect.EXTERNAL_EGRESS,
+        SideEffect.LOCAL_WRITE,
+        SideEffect.DESTRUCTIVE,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectorManifest:
     name: str
@@ -85,13 +99,19 @@ class BaseConnector(ABC):
         return None
 
     def canonical_outbound(self, task: Task) -> bytes:
-        """The exact bytes this connector sends externally; none by default.
+        """The exact bytes this connector's effect is bound to; none by default.
 
-        The default is only valid for a connector that performs no external
-        egress. A connector whose effective side effect is EXTERNAL_EGRESS
-        must override this (and ``external_tool_grants`` if it grants tools);
-        otherwise ``egress_attestation`` fails closed rather than letting an
-        empty-bytes digest masquerade as a real attestation.
+        For an egress connector these are the bytes that leave the machine.
+        For a local write they are the canonical frame describing the write -
+        the target, the mode, the pre-state it was authorized against and the
+        exact content - so one digest binds the whole irreversible effect.
+
+        The default is only valid for a connector whose effect produces no
+        exact byte outcome. A connector declaring any effect in
+        ``_EXACT_OUTBOUND_EFFECTS`` must override this (and
+        ``external_tool_grants`` if it grants tools); otherwise
+        ``egress_attestation`` fails closed rather than letting an empty-bytes
+        digest masquerade as a real attestation.
         """
         return b""
 
@@ -124,14 +144,35 @@ class BaseConnector(ABC):
         contract fails closed here - an empty default digest is not a valid
         attestation for something that sends data out.
         """
-        if (
+        # Which side of the merge decides differs by effect, and deliberately.
+        #
+        # EXTERNAL_EGRESS is asked of the MERGED effect exactly as before, so
+        # the escalation path a task has always had - strengthening a
+        # NONE-effect connector into egress - still fails closed here. Bit for
+        # bit unchanged.
+        #
+        # The two local effects are asked of the MANIFEST, because on the
+        # local ladder a task may strengthen LOCAL_READ upward. That
+        # strengthening is a HARDENING mechanism: it makes approval mandatory
+        # for a connector that still only reads. Refusing to attest it would
+        # turn "be stricter about this read" into "this task cannot run",
+        # which is a behaviour change to M3 with no security gain - nothing
+        # writes and nothing is destroyed. A connector whose own manifest
+        # commits it to writing or destroying really will do it, and that is
+        # the case this guard exists for.
+        binds_exact_bytes = (
             effect.effect is SideEffect.EXTERNAL_EGRESS
+            or self.manifest.default_side_effect.effect in _EXACT_OUTBOUND_EFFECTS
+        )
+        if (
+            binds_exact_bytes
             and type(self).canonical_outbound is BaseConnector.canonical_outbound
         ):
             raise AttestationError(
                 ErrorCode.EGRESS_REFUSED,
-                f"Connector '{self.manifest.name}' declares external egress but "
-                "does not implement a canonical outbound attestation.",
+                f"Connector '{self.manifest.name}' declares the exact-byte "
+                f"effect '{effect.effect.value}' but does not implement a "
+                "canonical outbound attestation.",
             )
         working_directory, allowed_roots = self.resource_boundary(task)
         return EgressAttestation(

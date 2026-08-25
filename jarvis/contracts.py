@@ -197,6 +197,15 @@ class SideEffect(str, Enum):
 MANDATORY_APPROVAL_EFFECTS = frozenset(
     {
         SideEffect.DESTRUCTIVE,
+        # M5. A local write is the first side-effecting capability, and it is
+        # not reversible: JARVIS keeps no pre-image bytes, so nothing can put
+        # the previous file back. ARCHITECTURE §5 requires explicit approval
+        # for hard-to-reverse data change in EVERY mode, and no policy here
+        # can tell a harmless create from an overwrite of something that
+        # matters. Membership here also closes the remembered-SESSION path,
+        # because ``_remembered_permission_allowed`` excludes mandatory
+        # effects - one rule, both surfaces.
+        SideEffect.LOCAL_WRITE,
         SideEffect.EXTERNAL_EGRESS,
         SideEffect.BILLING,
         SideEffect.PUSH_DEPLOY_PUBLISH,
@@ -2092,6 +2101,279 @@ class LocalReadSnapshot:
 
 
 # --------------------------------------------------------------------------
+# M5. Bounded, task-scoped local WRITE
+# --------------------------------------------------------------------------
+
+#: Capability name of the bounded single-file local write, so the connector
+#: manifest, the canonical-target binding and the decision gate all name the
+#: same thing.
+LOCAL_WRITE_CAPABILITY = "file_write"
+
+#: The single ``ToolResult.data`` key a local-write connector uses to hand its
+#: typed record to ``AgentCore``. ``_sanitize_result`` reduces ``data`` to
+#: ``next_step``, so this transport is read once and never persisted.
+LOCAL_WRITE_RESULT_KEY = "local_write"
+
+#: Physical ceiling on the bytes one local write may produce. Deliberately a
+#: SEPARATE policy surface from ``LOCAL_READ_MAX_BYTES``: the two are equal
+#: today and must stay free to diverge, so neither may alias the other.
+LOCAL_WRITE_MAX_BYTES = 64 * 1024
+
+#: The write modes this contract can DESCRIBE. They are not a hint:
+#: ``create`` requires the target to be ABSENT and ``overwrite`` requires it
+#: to be PRESENT with the attested digest and size, so "I meant to make a new
+#: file" can never silently become "I replaced an existing one".
+LOCAL_WRITE_MODES = ("create", "overwrite")
+
+#: The write modes M5 will actually PERFORM, which is a strictly narrower
+#: question than what the grammar can express.
+#:
+#: ``create`` is enabled because both platforms can enforce it at the
+#: mutation itself: the object is installed from an open handle, and the
+#: kernel refuses to install it over an existing name. Nothing is checked and
+#: then hoped for.
+#:
+#: ``overwrite`` is NOT enabled. It needs a mutation that means "replace this
+#: destination if and only if it is still the approved object", and no
+#: primitive reachable from here expresses that. Windows'
+#: ``FILE_RENAME_INFO`` carries a bare ``ReplaceIfExists`` boolean with no
+#: destination precondition; Linux' ``renameat2`` offers ``RENAME_NOREPLACE``
+#: (absence only), ``RENAME_EXCHANGE`` and ``RENAME_WHITEOUT``, none of which
+#: is a compare-and-swap. A check followed by an unconditional replace is not
+#: an enforcement - it is a check with a window after it - so overwrite fails
+#: closed rather than shipping a race. Safe overwrite is deferred to its own
+#: milestone, alongside the restore capability that would make it recoverable.
+LOCAL_WRITE_ENABLED_MODES = ("create",)
+
+#: The exact lifecycle labels a persisted write record may carry.
+LOCAL_WRITE_STATUSES = ("prepared", "written", "refused", "unknown")
+
+#: Version tag of the canonical outbound frame the write authority is bound
+#: through (H1). Bumping it invalidates every outstanding write approval,
+#: which is the point: a changed frame is a changed authority.
+LOCAL_WRITE_FRAME_HEADER = b"jarvis.local_write.v1"
+
+#: Same-directory temporary file prefix. Orphans are reported, never deleted:
+#: deletion is a DESTRUCTIVE authority this capability does not hold.
+LOCAL_WRITE_TEMP_PREFIX = ".jarvis-write-"
+
+#: The three outcomes of an in-doubt write diagnosis. Local writes are, unlike
+#: an external egress, DECIDABLE after the fact: the destination is compared
+#: against the two attested states and answers for itself.
+LOCAL_WRITE_DID_NOT_LAND = "write_did_not_land"
+LOCAL_WRITE_LANDED = "write_landed"
+LOCAL_WRITE_AMBIGUOUS = "ambiguous_third_party_change"
+
+
+def _sha256_hex_refusal(value: Any, label: str) -> str | None:
+    """One digest grammar for every write-record digest field."""
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return f"{label} is not a lowercase sha256 hex digest"
+    return None
+
+
+def local_write_content_refusal(value: Any) -> str | None:
+    """Why this text may never be written verbatim to a local file, or ``None``.
+
+    THE single grammar for the intended bytes, applied identically at the
+    untrusted input boundary and at the persistence load boundary, so a task
+    row edited outside the product cannot carry a payload the input boundary
+    would have refused.
+
+    Nothing here transforms the text. The bytes a user asked to write are
+    written exactly: newline normalization, credential redaction or path
+    redaction would silently corrupt the file while the product still claimed
+    a trustworthy, attested write. Bounding and refusing is the only safe
+    handling of content that is itself the deliverable.
+    """
+    if type(value) is not str:
+        return "write content is not a string"
+    if chr(0) in value:
+        # A NUL is the binary tell this capability's UTF-8 text contract
+        # excludes, and it terminates a string at several OS boundaries.
+        return "write content contains a NUL character"
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate survives JSON decoding and cannot be encoded; it
+        # is refused rather than replaced, because a replacement character
+        # would be bytes the user never asked for.
+        return "write content is not encodable as UTF-8"
+    if len(encoded) > LOCAL_WRITE_MAX_BYTES:
+        return "write content exceeds the local write ceiling"
+    return None
+
+
+def local_write_mode_refusal(value: Any) -> str | None:
+    """Why this is not an exact local write mode, or ``None``.
+
+    Grammar only - this is what a persisted record may DESCRIBE. Whether the
+    mode may be performed is a separate, narrower question that
+    ``local_write_mode_unsupported`` answers.
+    """
+    if type(value) is not str or value not in LOCAL_WRITE_MODES:
+        return "write mode is not an exact local write mode"
+    return None
+
+
+def local_write_mode_unsupported(value: Any) -> str | None:
+    """Why this mode may not be PERFORMED in M5, or ``None``.
+
+    Deliberately separate from the grammar. The record contract still has to
+    describe an overwrite - a row written by a future milestone must load and
+    validate - while the execution path refuses to perform one today.
+    """
+    reason = local_write_mode_refusal(value)
+    if reason is not None:
+        return reason
+    if value not in LOCAL_WRITE_ENABLED_MODES:
+        return (
+            f"write mode '{value}' is not supported: no primitive available "
+            "here can make the replacement conditional on the destination "
+            "still being the approved file, so it fails closed rather than "
+            "racing"
+        )
+    return None
+
+
+def local_write_record_refusal(value: Any) -> str | None:
+    """Why this object is not a usable local-write record, or ``None``.
+
+    THE canonical structural contract for ``LocalWriteRecord``. Every
+    boundary calls this exact function: the load boundary (``from_dict``),
+    the execution boundary (``AgentCore``) and the public envelope. Nothing
+    coerces and every field is checked against its exact type, so a tampered
+    task row can never widen a ceiling, smuggle a raw string past a bounded
+    vocabulary or carry an unbounded scalar into anything a user reads.
+
+    An absent record is refused too ("path is empty"); presence is the
+    caller's own question, asked with ``present`` before this one.
+
+    Note what is deliberately NOT here: the bytes. A write record is
+    metadata, so no pre-image and no intended content can ever reach it.
+    """
+    if type(value) is not LocalWriteRecord:
+        return "not a LocalWriteRecord"
+    # The same root-relative grammar the read snapshot stores, reused verbatim
+    # rather than restated: one path contract for both local capabilities, so
+    # a credential-bearing, absolute, traversal or ADS name is refused here
+    # for exactly the reasons it is refused there.
+    reason = local_read_path_refusal(value.relative_path)
+    if reason is not None:
+        return reason
+    reason = local_write_mode_refusal(value.mode)
+    if reason is not None:
+        return reason
+    # ``type() is bool`` and not ``isinstance``: an ``int`` is not this flag.
+    if type(value.pre_present) is not bool:
+        return "pre-state presence flag is not a boolean"
+    if type(value.pre_byte_size) is not int:
+        return "pre-state byte size is not an integer"
+    if type(value.intended_byte_size) is not int:
+        return "intended byte size is not an integer"
+    if not 0 <= value.intended_byte_size <= LOCAL_WRITE_MAX_BYTES:
+        return "intended byte size is outside the local write ceiling"
+    reason = _sha256_hex_refusal(value.intended_sha256, "intended digest")
+    if reason is not None:
+        return reason
+    if value.pre_present:
+        if not 0 <= value.pre_byte_size <= LOCAL_WRITE_MAX_BYTES:
+            return "pre-state byte size is outside the local write ceiling"
+        reason = _sha256_hex_refusal(value.pre_sha256, "pre-state digest")
+        if reason is not None:
+            return reason
+    elif value.pre_sha256 != "" or value.pre_byte_size != 0:
+        # An absent pre-state has NOTHING to describe. A record claiming
+        # absence while carrying a digest or a size is not one this product
+        # ever wrote, and is refused rather than partially believed.
+        return "absent pre-state carries a digest or a size"
+    # Mode and pre-state are ONE authority, not two independent fields: a
+    # record saying "create" about a file that was present, or "overwrite"
+    # about one that was not, describes an operation that could not have been
+    # approved. ``is`` compares the two booleans exactly.
+    if (value.mode == "create") is value.pre_present:
+        return "write mode contradicts the recorded pre-state"
+    if type(value.status) is not str or value.status not in LOCAL_WRITE_STATUSES:
+        return "status is not an exact local write status"
+    if canonical_utc_timestamp(value.written_at) is None:
+        return "write timestamp is not a canonical UTC timestamp"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalWriteRecord:
+    """Metadata of ONE bounded local write, scoped to the task that did it.
+
+    Carries no bytes at all - not the intended content and not a pre-image.
+    That is the whole design: M5 keeps no backup, so it promises no rollback,
+    and a record that cannot restore anything must not look like one that
+    can. What it does carry is exactly enough to answer the two questions
+    that matter after the fact: what was authorized, and what is on disk now.
+
+    Untrusted reference data with NO authority: it never becomes an
+    instruction, a scope change, an approval or a billing input, it is never
+    written to project memory, and a local write produces no decision record.
+    """
+
+    relative_path: str = ""
+    mode: str = ""
+    pre_present: bool = False
+    pre_sha256: str = ""
+    pre_byte_size: int = 0
+    intended_sha256: str = ""
+    intended_byte_size: int = 0
+    status: str = ""
+    written_at: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.relative_path)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "mode": self.mode,
+            "pre_present": self.pre_present,
+            "pre_sha256": self.pre_sha256,
+            "pre_byte_size": self.pre_byte_size,
+            "intended_sha256": self.intended_sha256,
+            "intended_byte_size": self.intended_byte_size,
+            "status": self.status,
+            "written_at": self.written_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LocalWriteRecord":
+        """Rebuild defensively; malformed persisted state fails closed.
+
+        NOTHING is repaired here - there is no analogue of the read
+        snapshot's excerpt re-bounding, because every field is either exact
+        or meaningless. Each value is taken verbatim and then judged by the
+        single canonical contract; a row that does not satisfy it degrades to
+        the empty record rather than raising or becoming a plausible-looking
+        valid one.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        candidate = cls(
+            relative_path=data.get("relative_path", ""),
+            mode=data.get("mode", ""),
+            pre_present=data.get("pre_present", False),
+            pre_sha256=data.get("pre_sha256", ""),
+            pre_byte_size=data.get("pre_byte_size", 0),
+            intended_sha256=data.get("intended_sha256", ""),
+            intended_byte_size=data.get("intended_byte_size", 0),
+            status=data.get("status", ""),
+            written_at=data.get("written_at", ""),
+        )
+        return candidate if local_write_record_refusal(candidate) is None else cls()
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -2855,6 +3137,30 @@ class Task:
     #: from untrusted task input, never persisted into project memory and
     #: never authority of any kind.
     local_read: LocalReadSnapshot = field(default_factory=LocalReadSnapshot)
+    #: M5. The EXACT bytes a local write will produce, as text. Unlike every
+    #: other content field in this contract this one IS accepted from
+    #: untrusted task input - it is the deliverable, and authority over it
+    #: comes from approval, not from provenance. It lives here, typed and at
+    #: the top level, rather than in ``context``: the Claude connector
+    #: serializes ``context`` verbatim into its payload, so a context key
+    #: would have been an egress channel for up to 64 KiB. Nothing adds this
+    #: field to an outbound key set, so it cannot leave the machine.
+    #:
+    #: It persists only for the task's EXECUTABLE lifetime: ``resume``
+    #: rebuilds a task solely from storage, so bytes that are not stored
+    #: cannot be re-attested. At authoritative terminal state the storage
+    #: layer blanks it in the same guarded transaction.
+    write_content: str = ""
+    #: M5. The declared write mode, part of the authority rather than a hint.
+    #: Separate from ``local_write`` because the record is the post-execution
+    #: metadata and must satisfy its full structural contract, while the mode
+    #: has to survive a reload from the moment the task is created.
+    write_mode: str = ""
+    #: M5. Typed metadata of the write THIS task performed. Written only by
+    #: AgentCore from a validated connector result; never accepted from
+    #: untrusted task input, never persisted into project memory, never a
+    #: decision, and it carries no bytes of any kind.
+    local_write: LocalWriteRecord = field(default_factory=LocalWriteRecord)
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -2889,6 +3195,9 @@ class Task:
             "result_snapshot": sanitize_result_snapshot(self.result_snapshot),
             "retrieved_context": self.retrieved_context.to_dict(),
             "local_read": self.local_read.to_dict(),
+            "write_content": self.write_content,
+            "write_mode": self.write_mode,
+            "local_write": self.local_write.to_dict(),
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -2947,6 +3256,24 @@ class Task:
             # Legacy task JSON without the field loads as an empty snapshot;
             # a malformed one loads closed (SECRET, re-bounded excerpt).
             local_read=LocalReadSnapshot.from_dict(data.get("local_read")),
+            # M5. The same grammar the input boundary applies, so a row edited
+            # outside the product cannot carry a payload the boundary would
+            # have refused. An empty value is legitimate twice over: a task
+            # that writes nothing, and a terminal task whose bytes the storage
+            # layer already blanked.
+            write_content=(
+                data.get("write_content", "")
+                if local_write_content_refusal(data.get("write_content", "")) is None
+                else ""
+            ),
+            write_mode=(
+                data.get("write_mode", "")
+                if local_write_mode_refusal(data.get("write_mode")) is None
+                else ""
+            ),
+            # Legacy task JSON without the field loads as an empty record; a
+            # malformed one loads closed as empty rather than partly believed.
+            local_write=LocalWriteRecord.from_dict(data.get("local_write")),
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),

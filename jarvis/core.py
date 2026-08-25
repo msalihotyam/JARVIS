@@ -13,6 +13,8 @@ from jarvis.contracts import (
     LOCAL_READ_CAPABILITY,
     LOCAL_READ_RESULT_KEY,
     LOCAL_READ_TASK_REFERENCE_KEY,
+    LOCAL_WRITE_CAPABILITY,
+    LOCAL_WRITE_RESULT_KEY,
     MAX_SQLITE_INTEGER,
     PAID_API_GATE,
     RETRIEVAL_MAX_CHARACTERS,
@@ -39,6 +41,7 @@ from jarvis.contracts import (
     ExecutionClaimOutcome,
     LedgerSnapshot,
     LocalReadSnapshot,
+    LocalWriteRecord,
     LoopStage,
     MemoryRetrievalQuery,
     MemoryStore,
@@ -71,6 +74,7 @@ from jarvis.contracts import (
     format_usd,
     is_expired,
     local_read_snapshot_refusal,
+    local_write_record_refusal,
     merge_side_effects,
     nano_usd,
     normalize_destination,
@@ -289,6 +293,26 @@ class _LifecycleLost(Exception):
     def __init__(self, run: AgentRun) -> None:
         super().__init__("lifecycle authority lost to another writer")
         self.run = run
+
+
+#: Effects whose outcome cannot be known once the connector raised, so the
+#: attempt is marked non-replayable instead of becoming a clean, retryable
+#: failure. EXTERNAL_EGRESS is the original member and its behaviour is
+#: unchanged: the call may already have left the machine.
+#:
+#: M5 adds the two local effects for the same reason in a different medium. A
+#: local write that raised may have completed its atomic replace, so treating
+#: it as a clean failure would invite a retry over a file that already
+#: changed. Deliberately NOT generalized to every irreversible connector:
+#: irreversibility is about undo, while this set is about whether the outcome
+#: is knowable at all.
+_UNKNOWABLE_ON_RAISE_EFFECTS = frozenset(
+    {
+        SideEffect.EXTERNAL_EGRESS,
+        SideEffect.LOCAL_WRITE,
+        SideEffect.DESTRUCTIVE,
+    }
+)
 
 
 class AgentCore:
@@ -913,6 +937,14 @@ class AgentCore:
                         return regate
                     continue
 
+                # M5: make the attested write metadata durable BEFORE the
+                # boundary, so an attempt that ends in doubt has something
+                # authoritative to be diagnosed against. Fail closed: no
+                # write boundary is crossed without it.
+                unprepared = self._prepare_local_write(session, task, connector)
+                if unprepared is not None:
+                    return unprepared
+
                 # H2: durably record the attempt (PREPARED) and atomically
                 # claim single ownership (PREPARED -> IN_FLIGHT + one-shot grant
                 # consumption) before crossing the connector boundary.
@@ -1001,14 +1033,16 @@ class AgentCore:
                 # Durable IN_FLIGHT plus a durable reservation are committed;
                 # cross the connector boundary.
                 task.status = TaskStatus.RUNNING
-                external = current.side_effect.effect is SideEffect.EXTERNAL_EGRESS
+                unknowable_on_raise = (
+                    current.side_effect.effect in _UNKNOWABLE_ON_RAISE_EFFECTS
+                )
                 try:
                     result = connector.execute(task, session)
                 except Exception as exc:  # noqa: BLE001 - connector boundary
-                    if external:
-                        # The external outcome is unknowable after a raise:
-                        # mark the attempt non-replayable rather than inventing
-                        # a clean failure that could be safely retried. The
+                    if unknowable_on_raise:
+                        # The outcome is unknowable after a raise: mark the
+                        # attempt non-replayable rather than inventing a clean
+                        # failure that could be safely retried. The
                         # reservation stays active, so the money the call may
                         # already have spent keeps counting as exposure.
                         self.memory.mark_execution_unknown(attempt.id)
@@ -1059,6 +1093,9 @@ class AgentCore:
                 # own verifier then fails the task closed at VERIFY, with the
                 # reservation already reconciled.
                 self._bind_local_read(task, connector, result)
+                # M5: the same lift, for the same reason and at the same
+                # point - before ``_sanitize_result`` reduces ``data``.
+                self._bind_local_write(task, connector, result)
                 # H4: connector-authored free-form text is bounded and
                 # scrubbed before it can become persisted task, decision or
                 # audit state. It never touches approval, billing, execution or
@@ -1233,7 +1270,13 @@ class AgentCore:
                 # capability still writes its decision exactly as before.
                 decision = (
                     None
-                    if task.capability == LOCAL_READ_CAPABILITY
+                    # M5 joins M3 here for the same reason: a write is an
+                    # ACTION that produced evidence, not a judgement later
+                    # work should inherit as trusted history. The row is
+                    # never written, so retrieval has nothing to filter and
+                    # nothing to clean up.
+                    if task.capability
+                    in (LOCAL_READ_CAPABILITY, LOCAL_WRITE_CAPABILITY)
                     else DecisionRecord(
                         session_id=session.id,
                         task_id=task.id,
@@ -2179,6 +2222,15 @@ class AgentCore:
     ) -> AgentRun:
         """A prior execution attempt cannot be safely replayed. Reports only;
         the task is left recoverable (never fabricated terminal)."""
+        details: dict[str, Any] = (
+            {"attempt_state": attempt.state.value} if attempt is not None else {}
+        )
+        # M5: a local write can say which of the two attested states the
+        # destination is actually in, which turns "unknown" into an
+        # actionable answer without replaying anything.
+        diagnosis = self._local_write_diagnosis(task)
+        if diagnosis is not None:
+            details["local_write_diagnosis"] = diagnosis
         return AgentRun(
             RunStatus.FAILED,
             session,
@@ -2187,9 +2239,7 @@ class AgentCore:
                 ErrorCode.EXECUTION_UNKNOWN_OUTCOME,
                 "A prior execution attempt is in doubt and must not be replayed "
                 "automatically; explicit recovery is required.",
-                details=(
-                    {"attempt_state": attempt.state.value} if attempt is not None else {}
-                ),
+                details=details,
             ),
         )
 
@@ -2650,8 +2700,9 @@ class AgentCore:
         decided whether the product failed cleanly. It is refused explicitly
         instead, identically everywhere.
         """
-        if task.capability != LOCAL_READ_CAPABILITY:
+        if task.capability not in (LOCAL_READ_CAPABILITY, LOCAL_WRITE_CAPABILITY):
             return None
+        noun = "Read" if task.capability == LOCAL_READ_CAPABILITY else "Write"
         target = task.scope.target
         if type(target) is not str or not target.strip():
             # An empty or malformed target is refused downstream, with the
@@ -2664,7 +2715,7 @@ class AgentCore:
                 task,
                 StructuredError(
                     ErrorCode.INVALID_TASK,
-                    f"Read target is not a usable filesystem path: {unusable}.",
+                    f"{noun} target is not a usable filesystem path: {unusable}.",
                 ),
             )
         task.scope = replace(task.scope, target=canonical_path(target))
@@ -2712,6 +2763,144 @@ class AgentCore:
         task.local_read = replace(
             snapshot, classification=task.scope.data_classification
         )
+
+    def _bind_local_write(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """Bind the connector's typed write record to the task, or bind nothing.
+
+        The same two gates as the read binding: the *selected connector* must
+        declare the write capability, so an unrelated connector cannot smuggle
+        a record onto a task through its result data, and the object must
+        satisfy the one canonical structural contract exactly.
+
+        Unlike the read snapshot there is no classification to rebind - the
+        record carries no content of any kind, only digests, sizes and the
+        root-relative name, so there is nothing in it a classification could
+        be authority over.
+        """
+        if LOCAL_WRITE_CAPABILITY not in connector.manifest.capabilities:
+            return
+        raw = result.data if isinstance(result.data, dict) else {}
+        record = raw.get(LOCAL_WRITE_RESULT_KEY)
+        if type(record) is not LocalWriteRecord:
+            return
+        if local_write_record_refusal(record) is not None:
+            return
+        task.local_write = record
+
+    def _prepare_local_write(
+        self, session: SessionState, task: Task, connector: BaseConnector
+    ) -> AgentRun | None:
+        """Persist the attested write metadata before the boundary is crossed.
+
+        The binding that happens after ``execute`` returns covers only the
+        outcomes that HAVE a result. The one that most needs explaining does
+        not: when a write raises, H2 marks the attempt non-replayable and a
+        diagnosis is worth having only if the two attested states - what the
+        destination was, and what it was authorized to become - were already
+        durable at that moment.
+
+        The record is asked of the connector because the connector is what
+        derived and attested the intent in the first place; it is then judged
+        by the one canonical structural contract before it is bound, and it
+        carries no authority of its own - nothing downstream reads it as
+        permission, billing or lifecycle state. Resolved by duck typing so
+        the core keeps knowing the capability contract and not a concrete
+        connector.
+        """
+        if task.capability != LOCAL_WRITE_CAPABILITY:
+            return None
+        prepare = getattr(connector, "pre_execution_record", None)
+        if not callable(prepare):
+            return self._preparation_failure(session, task, "connector_cannot_prepare")
+        try:
+            record = prepare(task)
+        except Exception as exc:  # noqa: BLE001 - connector boundary
+            # Deliberately NOT ``diagnostic_from_exception``. That contract
+            # bounds and scrubs connector-authored text, which is right for a
+            # general failure, but here the connector was asked about bytes
+            # the user is writing - so its message is the one place those
+            # bytes could plausibly turn up. Only the exception's TYPE is
+            # kept: a class name cannot carry content.
+            return self._preparation_failure(
+                session, task, "preparation_failed", type(exc).__name__
+            )
+        if type(record) is not LocalWriteRecord:
+            return self._preparation_failure(session, task, "no_prepared_record")
+        if local_write_record_refusal(record) is not None:
+            return self._preparation_failure(session, task, "malformed_prepared_record")
+        task.local_write = record
+        # A real checkpoint, not an in-memory assignment: a raise inside
+        # ``execute`` must leave this behind for the RELOADED task to carry.
+        # A real checkpoint, not an in-memory assignment: a raise inside
+        # ``execute`` must leave this behind for the RELOADED task to carry.
+        # ``_checkpoint`` raises ``_LifecycleLost`` if storage refused, which
+        # aborts this writer before any boundary is crossed - so a failed
+        # persist cannot become a write either.
+        self._checkpoint(
+            session,
+            task,
+            "local_write_prepared",
+            {"mode": record.mode, "pre_present": record.pre_present},
+        )
+        return None
+
+    def _preparation_failure(
+        self,
+        session: SessionState,
+        task: Task,
+        reason: str,
+        exception_type: str = "",
+    ) -> AgentRun:
+        """Refuse a write whose approved authority could not be made durable.
+
+        Fail closed, not best effort. The prepared record is what makes an
+        in-doubt write explainable, and a write that could still end up in
+        doubt with nothing to explain it is exactly the outcome this
+        capability must not produce. ``reason`` is a fixed, non-secret label
+        and ``exception_type`` a bare class name; no connector-authored text
+        and no part of the intended content can travel in either.
+        """
+        details: dict[str, Any] = {"reason": reason}
+        if exception_type:
+            details["exception_type"] = exception_type
+        return self._terminal_failure(
+            session,
+            task,
+            StructuredError(
+                ErrorCode.EGRESS_REFUSED,
+                "The approved local-write authority could not be established "
+                "and persisted before execution; refusing to write.",
+                details=details,
+            ),
+        )
+
+    def _local_write_diagnosis(self, task: Task) -> str | None:
+        """What a write in doubt actually did, if the connector can say.
+
+        A local write is decidable after the fact, so the in-doubt report can
+        carry more than "unknown". Resolved by duck typing rather than by
+        importing a connector implementation: the core knows the capability
+        contract, never a concrete connector.
+
+        Purely informational. It never replays, never repairs and never
+        advances the task - the attempt stays non-replayable either way.
+        """
+        if task.capability != LOCAL_WRITE_CAPABILITY:
+            return None
+        try:
+            connector = self.registry.get(task.selected_connector or "")
+        except Exception:  # noqa: BLE001 - a missing connector is not a fault here
+            return None
+        diagnose = getattr(connector, "diagnose_write", None)
+        if not callable(diagnose):
+            return None
+        try:
+            verdict = diagnose(task)
+        except Exception:  # noqa: BLE001 - diagnosis must never strand recovery
+            return None
+        return verdict if type(verdict) is str else None
 
     def _bind_referenced_local_read(
         self, session: SessionState, task: Task

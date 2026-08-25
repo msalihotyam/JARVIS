@@ -64,6 +64,7 @@ from jarvis.contracts import (
     usd_from_nano,
     utc_now,
 )
+from jarvis.lifecycle import is_terminal
 
 
 SCHEMA_VERSION = 6
@@ -762,6 +763,23 @@ class SQLiteMemoryStore:
         )
 
     @staticmethod
+    def _attempt_in_doubt(connection: sqlite3.Connection, task_id: str) -> bool:
+        """Whether this task's latest attempt has an unresolved outcome.
+
+        Read inside the caller's transaction, and only once the task is
+        already terminal, so an ordinary write pays nothing for it.
+        """
+        row = connection.execute(
+            "SELECT state FROM execution_attempts WHERE task_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return row is not None and row[0] in (
+            AttemptState.IN_FLIGHT.value,
+            AttemptState.UNKNOWN_OUTCOME.value,
+        )
+
+    @staticmethod
     def _upsert_task(
         connection: sqlite3.Connection,
         session_id: str,
@@ -779,10 +797,32 @@ class SQLiteMemoryStore:
         explicit ``save_task`` setup primitive passes ``force`` to stage state.
         """
         task.touch()
+        document = task.to_dict()
+        # M5 retention. The raw intended write bytes exist in the task row for
+        # exactly one reason: ``resume`` rebuilds a task solely from storage,
+        # so bytes that are not stored cannot be re-attested or written. Once
+        # the task is authoritatively terminal that reason is gone - it can
+        # never execute again - and the field is blanked HERE, in the single
+        # place every task row is written, so no terminal caller has to
+        # remember. Riding inside the guarded write is the point: if a stale
+        # writer loses arbitration the whole transaction rolls back and the
+        # bytes stay, exactly as they must.
+        #
+        # An attempt still IN_FLIGHT or UNKNOWN_OUTCOME is the one exception:
+        # recovery may still need to re-attest the same bytes, so nothing is
+        # dropped while the outcome is in doubt.
+        #
+        # This is LOGICAL erasure from canonical task state, and nothing
+        # more. ``secure_delete`` is off, ``auto_vacuum`` is NONE and no
+        # VACUUM runs, so previous bytes may remain in freed pages, the WAL
+        # or filesystem slack. No forensic or physical deletion is claimed.
+        if document.get("write_content") and is_terminal(task):
+            if not SQLiteMemoryStore._attempt_in_doubt(connection, task.id):
+                document["write_content"] = ""
         parameters = (
             task.id,
             session_id,
-            SQLiteMemoryStore._json(task.to_dict()),
+            SQLiteMemoryStore._json(document),
             task.status.value,
             task.stage.value,
             task.updated_at,

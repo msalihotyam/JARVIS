@@ -853,7 +853,7 @@ class CompositionRootTests(unittest.TestCase):
         connector = app.core.registry.get("claude-code-plan")
         startup_directory = Path.cwd().resolve()
         self.assertEqual(
-            ("claude-code-plan", "local-file-read"),
+            ("claude-code-plan", "local-file-read", "local-file-write"),
             app.core.registry.list_names(),
         )
         self.assertEqual((startup_directory,), connector.allowed_roots)
@@ -886,6 +886,33 @@ class CompositionRootTests(unittest.TestCase):
         # No external tool grant and no canonical outbound override: a local
         # read is not an egress path at all.
         self.assertEqual((), reader.external_tool_grants(mock.Mock()))
+
+    def test_default_app_binds_the_local_writer_to_the_same_startup_root(self) -> None:
+        # M5: read, write and the Claude plan all share exactly one boundary,
+        # and constructing the writer touches no filesystem and no process.
+        with mock.patch.object(
+            claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
+        ), mock.patch.object(
+            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+        ):
+            app = build_default_app(self.settings)
+
+        writer = app.core.registry.get("local-file-write")
+        startup_directory = Path.cwd().resolve()
+        self.assertEqual((startup_directory,), writer.allowed_roots)
+        self.assertEqual(startup_directory, writer.default_working_directory)
+        self.assertEqual(
+            BillingClass.NO_ADDITIONAL_CHARGE, writer.manifest.default_billing_class
+        )
+        self.assertFalse(writer.manifest.requires_paid_api)
+        # A local write is not an egress path either: JARVIS writes the bytes
+        # itself and the model is granted no filesystem tool of any kind.
+        self.assertEqual((), writer.external_tool_grants(mock.Mock()))
+        # The effect profile is the honest one, and it is mandatory-approval.
+        profile = writer.manifest.default_side_effect
+        self.assertIs(SideEffect.LOCAL_WRITE, profile.effect)
+        self.assertFalse(profile.reversible)
+        self.assertTrue(profile.mandatory)
 
 
 class ExitCodeMappingTests(unittest.TestCase):

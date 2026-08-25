@@ -1357,10 +1357,246 @@ Kilitli değişmezler:
   döngü içinde `INVALID_TASK` olarak reddeder, `canonical_path`
   çözülemeyen hedefi kimliği bozmadan deterministik bir yazıma düşürür ve
   girdi sınırı NUL taşıyan alanı en baştan geri çevirir.
-- **Non-goals (kilitli):** LOCAL_WRITE yok · terminal/process yok ·
-  glob/recursive traversal yok (tek dosya) · Claude tool grant yok · şema
-  migration yok (v6) · model destekli çıkarım/özet yok · otomatik hafıza
-  yazımı yok · M1/M2 hafıza otoritesi ve H1–H5 değişmez.
+- **Non-goals (M3 kapsamında kilitliydi):** LOCAL_WRITE yok · terminal/process
+  yok · glob/recursive traversal yok (tek dosya) · Claude tool grant yok ·
+  şema migration yok (v6) · model destekli çıkarım/özet yok · otomatik hafıza
+  yazımı yok · M1/M2 hafıza otoritesi ve H1–H5 değişmez. Bunlardan yalnızca
+  LOCAL_WRITE, M5'te ayrı ve açık bir güvenlik sözleşmesiyle açılmıştır
+  (§4.12); diğerlerinin tamamı yürürlükte kalır.
+
+### 4.12 Sınırlı tek dosyalık yerel yazma (M5, uygulandı)
+
+JARVIS'in **kendi** yaptığı, sınırlı, atomik, tek dosyalık yerel yazma
+yeteneği (`capability: "file_write"`, connector `local-file-write`). Claude
+alt sürecine `Write`/`Edit`/`Read`/`Glob`/`Grep` veya herhangi bir filesystem
+erişimi **verilmez**; `EGRESS_TOOL_GRANTS` boş kalır. Sebep M3'tekiyle
+aynıdır: bir tool grant, modelin hiçbir onayın attest etmediği byte'ları
+**üretmesine** izin verirdi.
+
+SQLite şeması **v6'da kalır** (yeni tablo/kolon yoktur; kayıt mevcut opak task
+JSON blob'unun içinde yaşar). CLI çıktı zarfı sözleşmesi
+`OUTPUT_SCHEMA_VERSION` **3 → 4** olmuştur (yeni, yalnızca metadata taşıyan
+`local_write` bloğu).
+
+Kilitli değişmezler:
+
+- **Her modda zorunlu onay:** `SideEffect.LOCAL_WRITE` artık
+  `MANDATORY_APPROVAL_EFFECTS` içindedir. `STRICT`, `SESSION` ve `SMART_AUTO`
+  istisnasız onay ister; hatırlanan (`remember_for_session`) bir SESSION
+  grant'i bir yazmayı **asla** yetkilendiremez. "Yalnızca oluşturma"ya
+  otomatik onay yoktur. Profil dürüsttür: `reversible=False`,
+  `always_requires_approval=True`, `default_risk=MEDIUM`.
+- **Geri alma yoktur ve iddia da edilmez:** M5 hiçbir pre-image byte'ı
+  saklamaz, bu yüzden hiçbir şey önceki dosyayı geri koyamaz. `file_restore`
+  bilinçli olarak sonraki bir milestone'a ertelenmiştir; yedek saklama,
+  şifreleme, saklama süresi ve H4 etkileri orada açıkça tasarlanacaktır.
+- **H1 tam-byte bağlama:** `canonical_outbound` deterministik bir çerçeve
+  döndürür — `jarvis.local_write.v1` başlığı, `ensure_ascii` ile kanonik JSON
+  başlık (yol, mod, ön-durum varlığı/digest/boyut, hedeflenen digest/boyut) ve
+  ardından **birebir** yazılacak byte'lar. Bu çerçevenin digest'i
+  `outbound_digest` → `EgressAttestation.digest` →
+  `PermissionRequest.fingerprint` zincirine akar. Yol, mod, ön-durum veya tek
+  bir byte değişirse onay geçersizleşir. `EgressAttestation`'ın serileşen
+  sözleşmesine **hiçbir alan eklenmemiştir**; eklenseydi üründeki her kalıcı
+  attestation digest'i değişirdi. `BaseConnector`'ın "kanonik outbound
+  uygulamayan connector fail-closed" kuralı `LOCAL_WRITE` ve `DESTRUCTIVE`
+  için de geçerlidir. Bu kural connector'ın **kendi manifest'ine** bakar:
+  yerel merdivende bir task `LOCAL_READ`'i yukarı **sertleştirebilir**, ve bu
+  sertleştirme yazma yapmayan bir connector'ı attestation hatasına
+  düşürmemelidir (M3 davranışı korunur). `EXTERNAL_EGRESS` eskisi gibi
+  birleştirilmiş etkiye bakar ve davranışı birebir aynıdır.
+- **Ön-durum (pre-state) otoritesi:** onay tek bir önceki duruma bağlanır —
+  `absent` veya `present(sha256, byte_size)`. Mod ile ön-durum **tek bir
+  otoritedir**: hedefi var olan bir `create` sessizce overwrite'a
+  yükseltilmez, olmayan bir `overwrite` create'e indirilmez; ikisi de
+  reddedilir. Ön-durum yazmadan hemen önce authoritative zincir üzerinden
+  **yeniden türetilir**; değişmişse yazma reddedilir. Ön-durumu güvenle
+  okunamayan veya tavanı aşan bir hedef körlemesine üzerine yazılmaz.
+- **Mutasyon anında otorite (P1, ikinci turda yeniden tasarlandı; üçüncü turda
+  hedef tarafı da nesneye bağlandı):** bir rename veya link, kaynak ve hedef
+  ADLARINI syscall anında kernel içinde yeniden çözer. Bu yüzden "syscall'dan
+  hemen önce stat/yol ile kanıtla" YETERLİ DEĞİLDİR: arkasında her zaman bir
+  pencere kalır. Kurulumun **iki ucu da** artık nesnedir — kaynak açık
+  descriptor, hedef ise doğrulanmış **parent dizin nesnesi** ve onun altında
+  yalnızca göreli yaprak ad:
+  - Windows'ta dosya **kendi handle'ı üzerinden** yeniden adlandırılır ve
+    hedef kökü **pinlenmiş parent HANDLE**'dır
+    (`NtSetInformationFile` / `FileRenameInformation`, `RootDirectory =
+    parent handle`, ad yalnızca yaprak, `ReplaceIfExists = FALSE`). Geçici
+    dosya da aynı handle'ın altında `NtCreateFile` + `FILE_CREATE` ile
+    açılır (`DELETE` erişimiyle, çünkü `os.open`'ın handle'ında o hak yoktur
+    ve onsuz dosya kendi handle'ı üzerinden yeniden adlandırılamaz).
+    Geçicinin **paylaşım kipi sıfırdır** (`FILE_SHARE_READ`/`WRITE`/`DELETE`
+    verilmez): erişim bu handle'ın ne yapabileceğini, paylaşım kipi ise nesne
+    açıkken **başkasının ne alabileceğini** söyler. `FILE_SHARE_WRITE`
+    verilseydi, fsync ile kurulum arasında ikinci bir açan `GENERIC_WRITE`
+    alıp onaylanmış byte'ları değiştirebilirdi; nesne kimliği aynı kaldığı
+    için hiçbir sonradan kimlik kontrolü bunu yakalayamaz. Bu yüzden
+    tam-byte garantisi penceresi olmayan **işletim sistemi paylaşım
+    sözleşmesine** dayanır, sonradan yapılan bir digest kontrolüne değil.
+    `FILE_SHARE_DELETE` de gerekmez ve verilmez: rename geçicinin kendi
+    handle'ı üzerinden çalışır ve `NtSetInformationFile` kaynak handle'ın
+    `DELETE` **erişimine** bakar, paylaşım kipine değil. Böylece
+    doğrulamadan sonra bir üst bileşenin junction/reparse ile
+    değiştirilmesi, byte'ların nereye düştüğünü artık **oynatamaz**: nesne
+    yöneticisi yaprağı kanıtlanmış dizin NESNESİNE göre çözer, yola göre
+    değil. Bu göreli biçim Win32 yüzeyinde ifade edilemez
+    (`SetFileInformationByHandle` boş olmayan `RootDirectory`'yi
+    `ERROR_INVALID_PARAMETER` ile reddeder, `CreateFileW` kök almaz), bu
+    yüzden doğrudan NT giriş noktaları kullanılır. Parent handle bir kez
+    adla açılır ve `GetFinalPathNameByHandleW` ile **kanıtlanır**; zincirdeki
+    bir junction burada farklı bir dizin olarak görünür ve hiçbir şey
+    oluşturulmadan reddedilir. Hedefin yokluğu kontrol edilmez, **kernel
+    tarafından zorlanır** (`STATUS_OBJECT_NAME_COLLISION`).
+  - Linux'ta `/proc/self/fd/N` — her zaman descriptor'ın arkasındaki NESNEYE
+    çözülen sihirli symlink — pinlenmiş parent descriptor üzerinden
+    `dst_dir_fd` ile link'lenir; `link` var olan adı `EEXIST` ile reddeder.
+  - Başka bir platformda **fail closed**. Geriye kalan tek seçenek adla
+    yapılan bir rename olurdu, ki bu tam da kaçınılan işlemdir.
+- **Overwrite M5'te DESTEKLENMEZ (P1-C):** güvenli bir overwrite "bu hedefi
+  ancak hâlâ onaylanan nesne ise değiştir" anlamına gelen bir mutasyon
+  gerektirir. Buradan erişilebilen hiçbir primitif bunu ifade etmiyor:
+  Windows'un `FILE_RENAME_INFORMATION` yapısında yalnızca `ReplaceIfExists`
+  boolean'ı
+  vardır, hedef ön-koşulu yoktur; Linux'ta `renameat2` bayrakları
+  `RENAME_NOREPLACE` (yalnızca yokluk), `RENAME_EXCHANGE` ve
+  `RENAME_WHITEOUT`'tur, hiçbiri compare-and-swap değildir. Kontrol + koşulsuz
+  replace bir zorlama değil, arkasında pencere olan bir kontroldür. Bu yüzden
+  `LOCAL_WRITE_ENABLED_MODES = ("create",)` ve `overwrite` girdi sınırında,
+  attestation'da ve yürütmede **kapalı düşer** — dilbilgisi onu hâlâ tanır
+  (`LOCAL_WRITE_MODES`), çünkü sonraki bir milestone'un yazdığı satır
+  yüklenip doğrulanabilmelidir. Güvenli overwrite, kendi milestone'una
+  ertelenmiştir.
+- **Onaylanan kayıt otoritedir, yürütme yalnızca ona katılır (P1-B):**
+  yürütme filesystem'i yeniden türetir ve **kalıcı `prepared` kayıtla
+  karşılaştırır**; yeni gözlenen durumu asla onaylanan ön-durumun yerine
+  yazmaz. `relative_path`, `mode`, `pre_present`, `pre_sha256`,
+  `pre_byte_size`, `intended_sha256`, `intended_byte_size` alanlarından
+  herhangi biri ayrışırsa mutasyondan önce reddedilir. Böylece connector
+  yürütme sırasında kendine yeni bir otorite üretemez ve aynı kayıt zinciri
+  besler: onay fingerprint'i → kalıcı hazırlık → yürütme karşılaştırması →
+  UNKNOWN_OUTCOME teşhisi.
+- **Atomik yazma:** hedef hiçbir zaman yazma için açılmaz. Byte'lar aynı
+  dizindeki benzersiz bir geçici dosyaya (`.jarvis-write-<uuid>.tmp`,
+  `O_EXCL`, POSIX'te 0o600) yazılır, `fsync` edilir ve yukarıdaki
+  handle-kaynaklı kurulumla görünür olur; Linux yolunda kendi geçici adımız
+  ardından `unlink` edilir (yalnızca hâlâ bizim nesnemizse — başkasının
+  dosyası silinmez, orphan olarak raporlanır) ki hedef tek adla kalsın.
+  Böylece hiçbir gözlemci ve hiçbir çökme yarım yazılmış dosya göremez.
+  POSIX'te zincir root→parent boyunca `O_DIRECTORY|O_NOFOLLOW` ile handle'dan
+  handle'a yürünür; ardından dizin dayanıklılığı için `fsync(parent_fd)`
+  çağrılır. **`O_NOFOLLOW` burada okumadakinden farklı olarak taşıyıcıdır:**
+  yeni oluşturulan bir dosyanın önceki inode'u yoktur, yani
+  `(st_dev, st_ino)` bağlaması yedek koruma sağlamaz.
+- **Containment M3/M4 zincirinin aynısıdır**, yalnızca parent'a yeniden
+  çapalanmıştır: kanonik `resolve` → allowed-root → secret-file deny → ADS
+  reddi → temsil edilebilir root-göreceli ad → kimlik-bilgisi taşıyan ad
+  reddi → **var olan** parent (mkdir yok) → reparse zinciri → authoritative
+  parent handle. Var olan hedef normal dosya olmak zorundadır. **Hard link
+  politikası korunur** (`st_nlink > 1` reddedilir) ve artık ikinci bir
+  gerekçesi vardır: atomik replace diğer adın **üzerine yazmaz**, onu
+  koparır. Meşru hardlink'li dosyaların yazılamaması, katı allowed-root
+  izolasyonu için kabul edilmiş bir uyumluluk maliyeti olarak sürer.
+- **H2 gerçeği (tasarım fazında doğrulandı):** mevcut yaşam döngüsünde
+  dayanıklı `IN_FLIGHT`, `connector.execute()` çağrısının **tamamından önce**
+  girilir. Connector kontrollü bir PREPARED→IN_FLIGHT protokolü icat
+  edilmemiştir; `begin_execution` bölünmemiş, memory store connector'a
+  geçirilmemiştir. Bu, geçici dosya oluşturma/yazma/fsync adımlarının da
+  `IN_FLIGHT` içinde gerçekleştiği anlamına gelir ve bu bilinçli olarak kabul
+  edilmiştir. Buna bağlı olarak `_UNKNOWABLE_ON_RAISE_EFFECTS =
+  {EXTERNAL_EGRESS, LOCAL_WRITE, DESTRUCTIVE}`: bu etkilerden birinde
+  connector istisna fırlatırsa girişim `UNKNOWN_OUTCOME` olur ve asla
+  temiz/yeniden denenebilir bir `CONNECTOR_FAILED` sayılmaz.
+  `EXTERNAL_EGRESS` davranışı birebir korunur; kural her `reversible=False`
+  connector'a genellenmez.
+- **Yürütme öncesi dayanıklı teşhis metadata'sı (P2):** en çok açıklamaya
+  ihtiyaç duyan durum hiç sonuç üretmeyendir. `execute` fırlatırsa H2 girişimi
+  yeniden oynatılamaz işaretler, ve teşhisin karşılaştıracağı bir şey ancak
+  iki attest edilmiş durum **sınır geçilmeden önce** dayanıklı hâle
+  getirilmişse vardır. Bu yüzden `AgentCore`, `connector.execute()`
+  çağrılmadan önce connector'dan `pre_execution_record` ister (attestation'ı
+  üreten aynı `_intent`'ten türetilir, yani connector'ın "ne yaptım"
+  raporu değil, **attest edilen otoritenin metadata hâli**), tek kanonik
+  yapısal sözleşmeyle doğrular, `Task.local_write`'a `status="prepared"`
+  olarak bağlar ve gerçek bir checkpoint ile kalıcılaştırır.
+  **Bu adım fail-closed'dır (ikinci tur):** connector hazırlayamıyorsa,
+  hazırlık istisna fırlatıyorsa, kayıt yanlış tipteyse/bozuksa veya
+  checkpoint kalıcılaşamıyorsa `open_execution_attempt`, `begin_execution` ve
+  `connector.execute` **hiç çağrılmaz**; hiçbir girişim IN_FLIGHT olmaz ve
+  hiçbir filesystem mutasyonu gerçekleşmez. Hazırlık istisnasında bilerek
+  `diagnostic_from_exception` KULLANILMAZ: connector'a tam olarak yazılacak
+  byte'lar sorulduğu için mesajı o byte'ların görünebileceği tek yerdir;
+  yalnızca istisna **tipi** (sınıf adı) saklanır. Kayıt, yürütmenin
+  karşılaştırdığı otoritedir (P1-B) fakat approval/billing/lifecycle
+  otoritesi taşımaz.
+- **Bilinmeyen sonuç teşhisi:** yerel yazma, dış egress'ten farklı olarak
+  sonradan **karar verilebilirdir**. Hedef, attest edilmiş iki durumla
+  karşılaştırılır: ön-duruma uyuyorsa `write_did_not_land`, hedeflenen
+  digest/boyuta uyuyorsa `write_landed`, hiçbirine uymuyorsa
+  `ambiguous_third_party_change`. Teşhis yalnızca **raporlar**: otomatik
+  replay yoktur, task otomatik ilerletilmez, hiçbir şey onarılmaz. Yeniden
+  onay taze bir fingerprint üretir. Artık `.jarvis-write-*.tmp` dosyaları
+  raporlanabilir fakat **asla otomatik silinmez** — silme M5'in sahip olmadığı
+  bir DESTRUCTIVE yetkidir.
+- **Bağımsız doğrulama:** VERIFY aşamasında hedef aynı containment zinciri
+  üzerinden yeniden açılır ve digest/boyut yeniden hesaplanır; hedeflenenle
+  birebir eşleşmezse doğrulama dürüstçe başarısız olur (replace sonrası
+  üçüncü taraf değişikliği dahil). Kanıt yalnızca metadata'dır.
+- **Decision yazılmaz:** tamamlanan `file_write` görevi
+  `finalize_task(decision=None)` ile sonlanır. Yazma bir **eylem/kanıt**
+  olayıdır, sonraki işlerin güvenilir miras olarak getireceği bir yargı
+  değildir. Filtreleme, yazıp-silme veya sentinel kayıt kullanılmaz; satır
+  hiç yazılmaz. Diğer capability'ler decision'ını eskisi gibi yazar.
+- **Ham `write_content` saklama sözleşmesi (yeni ve açık):** yazılacak tam,
+  redakte edilmemiş, kullanıcı kaynaklı byte'lar `tasks.state_json` içinde
+  tipli `Task.write_content` alanında **birebir** saklanır. Bu zorunludur:
+  `resume` task'ı yalnızca depodan yeniden kurar, dolayısıyla saklanmayan
+  byte yeniden attest edilemez veya yazılamaz. Bu byte'lar kimlik-bilgisi
+  biçiminde olabilir; secret-file deny politikası **hedefi** yönetir,
+  **içeriği** değil, ve kullanıcının yazmasını istediği içeriği redakte etmek
+  dosyayı sessizce bozardı. Alan `context` içinde **değildir**: Claude
+  connector'ı `context`'i payload'a birebir serileştirir, bu yüzden bir
+  context anahtarı 64 KiB'a kadar dosya içeriği için egress kanalı olurdu.
+- **Terminal anında mantıksal silme:** otoritatif terminal duruma
+  (`COMPLETED`, `FAILED`, `REJECTED`, `CANCELLED`) ulaşıldığında
+  `write_content` **aynı korumalı atomik işlem içinde** kanonik task
+  durumundan silinir. Tek boğaz noktası `SQLiteMemoryStore._upsert_task`'tır,
+  böylece hiçbir terminal çağıranın bunu hatırlaması gerekmez; korumalı yazım
+  kaybederse (stale writer) işlem geri alınır ve byte'lar da geri gelir.
+  Girişimi hâlâ `IN_FLIGHT`/`UNKNOWN_OUTCOME` olan bir task tek istisnadır:
+  kurtarma aynı byte'ları yeniden attest etmeye ihtiyaç duyabilir. Terminal
+  sonrası yeniden yükleme boş içerik verir, load→resave→reload boş kalır ve
+  terminal bir `resume` byte'lara hiç ihtiyaç duymaz.
+- **Fiziksel silme İDDİA EDİLMEZ (kabul edilmiş artık):** yukarıdaki silme
+  yalnızca **mantıksaldır**. Depo gerçeği: `journal_mode = WAL`,
+  `secure_delete` **kapalı**, `auto_vacuum` **NONE**, `VACUUM` invariantı yok
+  ve `wal_checkpoint(TRUNCATE)` best-effort'tur (güvenli silme mekanizması
+  değildir). Bu nedenle önceki byte'ların eski SQLite sayfalarından, freelist
+  sayfalarından, WAL artıklarından, dosya sistemi tahsis edilmemiş alanından,
+  snapshot'lardan veya yedeklerden kaldırıldığı **iddia edilmez**. M5
+  `secure_delete`, `VACUUM`, özel WAL temizliği veya şifreleme/anahtar
+  yönetimi **eklemez**; bunlar kapsam dışıdır. Veritabanı yereldir, tek
+  kullanıcılıdır ve şifrelenmemiştir: dosyaya okuma erişimi olan biri, yazılan
+  dosyaya okuma erişimi olan biriyle aynı bilgiye sahiptir.
+- **Diğer ham-byte hijyeni:** yukarıda açıkça yetkilendirilen task-satırı
+  saklaması dışında ham byte'lar hiçbir yere ulaşmaz — loop checkpoint, event
+  log, result snapshot, `StructuredError` message/details,
+  `diagnostic_from_exception`, decision_log, proje hafızası, getirme, bekleyen
+  onay/önizleme, genel zarf, Claude payload'ı, argv ve usage/billing
+  kayıtlarının tamamı yalnızca metadata/digest taşır.
+- **Girdi sözleşmesi:** üst düzey `write` bölümü (`content`, `mode`); bilinmeyen
+  anahtar reddedilir. `content` tam `str` olmalı, UTF-8'e kodlanabilmeli (lone
+  surrogate reddedilir), NUL içermemeli ve kodlanmış boyutu ayrı bir politika
+  sabiti olan `LOCAL_WRITE_MAX_BYTES = 64 KiB`'ı aşmamalıdır (değer bugün
+  okuma tavanına eşittir fakat anlamı **takma ad değildir**). Sekme, satır
+  sonu ve taşıma dönüşü dahil diğer C0 karakterleri serbesttir. Yazılan
+  byte'lar tam olarak `write_content.encode("utf-8")`'tir: newline
+  normalizasyonu, redaksiyon, dönüşüm veya sessiz kesme yoktur.
+  `MAX_TASK_JSON_BYTES` değiştirilmemiştir.
+- **Non-goals (M5'te kilitli):** çoklu dosya/glob yok · recursive traversal yok ·
+  `mkdir` yok · silme yok · rename yüzeyi yok · terminal/process yürütme yok ·
+  örtük rollback yok · `file_restore` yok · Claude filesystem grant yok · şema
+  migration yok (v6) · otomatik hafıza yazımı yok · H1–H5 ve M1–M4 değişmez.
 
 ## 5. İzin ve güvenlik modeli
 

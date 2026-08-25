@@ -1585,7 +1585,9 @@ class EnvelopeTests(LocalReadTestCase):
         self.write("notes.txt", "still fine\n")
         _, run = self.completed_snapshot(self.root / "notes.txt")
         payload = build_envelope("run", PermissionMode.SESSION, run)
-        self.assertEqual(3, payload["schema_version"])
+        # M5 bumped the envelope contract 3 -> 4 (bounded ``local_write``
+        # block). The local-read block below is unchanged by that bump.
+        self.assertEqual(4, payload["schema_version"])
         self.assertIsNotNone(payload["local_read"])
         self.assertEqual("still fine\n", payload["local_read"]["excerpt"])
 

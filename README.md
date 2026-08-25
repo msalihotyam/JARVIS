@@ -11,6 +11,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Aylık parasal politika tek yüzeydir: kullanıcı onayı olmadan geçilemeyecek 20 USD sert üst sınır. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
 - Proje hafızası (M1) güvenilmeyen referans veridir: yalnızca açık kullanıcı komutlarıyla yazılır, hiçbir zaman approval/billing/lifecycle otoritesi taşımaz, içeriği talimat olarak yorumlanmaz ve toplam getirme kotasını (5 öğe / 4.000 karakter) büyütmez.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
+- Yerel yazma (M5) her izin modunda açık onay ister ve geri alınamaz olarak beyan edilir: `SideEffect.LOCAL_WRITE` zorunlu-onay etkisidir, hatırlanan bir SESSION grant'i bir yazmayı asla yetkilendiremez ve "yalnızca oluşturma"ya otomatik onay yoktur. Onay, yazılacak **tam byte'lara** ve hedefin **önceki durumuna** bağlanır; ikisinden biri değişirse fingerprint geçersizleşir. Yazma atomiktir ve otorite mutasyon anında yeniden kanıtlanır (kaynak nesne kimliği, `create` için kernel tarafından zorlanan hedef yokluğu, `overwrite` için onaylanan ön-durum); hedef hiçbir zaman yazma için açılmaz ve JARVIS hiçbir pre-image saklamadığı için **rollback vaat etmez**.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 
 ## Yapı
@@ -21,7 +22,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - `jarvis/cli.py`: yürütülebilir komut yüzeyi ve çıkış kodu eşlemesi.
 - `jarvis/memory.py`: SQLite oturum, task, onay, checkpoint, karar ve maliyet defteri.
 - `jarvis/registry.py`: priority/suitability/availability/cost tabanlı connector seçimi.
-- `jarvis/connectors/`: ortak connector ve güvenli Claude Code plan connector'ı.
+- `jarvis/connectors/`: ortak connector, güvenli Claude Code plan connector'ı ve tek boğaz noktalı containment üzerine kurulu yerel okuma/yazma connector'ları.
 - Eski `Agent Core`, `Config`, `Connectors`, `Memory`, `Tools` dosyaları uyumluluk sarmalayıcıları olarak korunur.
 
 ## Proje hafızası (M1)
@@ -50,6 +51,59 @@ en çok 25 kararını da aynı kota ve aynı deterministik sıralama içinde ada
 olarak görür; sorgu oturumu hariç tutulur, kararın sınıfı kendi kaynak
 task'ından yeniden kazanılır (eksik/bozuk kaynak SECRET sayılır) ve projesiz
 oturum davranışı birebir değişmeden kalır.
+
+## Yerel dosya yazma (M5)
+
+`capability: "file_write"` ile izinli kökler içindeki **tek** bir UTF-8 metin
+dosyası JARVIS'in kendisi tarafından yazılır. Modele hiçbir filesystem tool
+grant'i verilmez.
+
+```json
+{
+  "objective": "notu güncelle",
+  "capability": "file_write",
+  "scope": {"action": "write", "target": "notes.txt",
+            "data_classification": "internal"},
+  "write": {"content": "yeni içerik\n", "mode": "overwrite"}
+}
+```
+
+Kurallar: M5 **yalnızca `create`** yapar. `overwrite` tanınır fakat
+**desteklenmez ve kapalı düşer**: güvenli bir overwrite "bu hedefi ancak hâlâ
+onaylanan nesne ise değiştir" anlamına gelen bir mutasyon gerektirir ve ne
+Windows'ta ne Linux'ta buradan erişilebilen bir primitif bunu ifade eder;
+kontrol + koşulsuz replace bir zorlama değil, arkasında pencere olan bir
+kontroldür. Var olan bir dosyaya `create` de reddedilir. `content` tam `str`, katı UTF-8
+(lone surrogate reddedilir), NUL'suz ve en çok `LOCAL_WRITE_MAX_BYTES = 64
+KiB` olmalıdır; sessiz kesme yoktur. Yazılan byte'lar birebir
+`content.encode("utf-8")`'tir — newline normalizasyonu, redaksiyon veya
+dönüşüm uygulanmaz.
+
+Yazma her modda onay ister ve onay **tam byte'lara + hedefin önceki
+durumuna** bağlanır. Kurulumun iki ucu da addır değil **nesnedir**: dosya
+kendi açık handle'ı üzerinden yerine konur ve hedef kökü, doğrulanmış parent
+dizinin kendisidir — altına yalnızca göreli yaprak ad verilir (Windows'ta
+`NtSetInformationFile`/`FileRenameInformation` + `RootDirectory` = parent
+handle, geçici dosya da aynı handle altında `NtCreateFile`/`FILE_CREATE`;
+Linux'ta pinlenmiş parent descriptor üzerinden `/proc/self/fd/N` link'i).
+Böylece ne geçici adın değiştirilmesi kurulanı değiştirebilir, ne de
+doğrulamadan sonra bir üst dizinin junction ile yeniden yönlendirilmesi
+byte'ları onaylanan kökün dışına taşıyabilir. Hedefin yokluğu kontrol
+edilmez, **kernel tarafından zorlanır**. Bu primitifi sunamayan bir platformda yazma
+kapalı düşer. Ayrıca yürütme, kalıcı `prepared` otorite kaydıyla
+karşılaştırılır ve ayrışırsa mutasyondan önce reddedilir. `mkdir`, silme,
+rename, glob, çok dosyalı yazma ve `file_restore` yoktur. Var olan hedef normal dosya olmalıdır
+ve `st_nlink > 1` (hard link) reddedilir.
+
+**Geri alma yoktur.** JARVIS pre-image saklamaz, bu yüzden hiçbir şey önceki
+dosyayı geri koyamaz. Yazılacak ham byte'lar, `resume` task'ı yalnızca depodan
+yeniden kurduğu için, task'ın **çalıştırılabilir ömrü boyunca**
+`tasks.state_json` içinde birebir saklanır ve terminal durumda aynı korumalı
+işlem içinde **mantıksal olarak** silinir. Bu fiziksel/adli bir silme
+**değildir**: `secure_delete` kapalı, `auto_vacuum` NONE ve `VACUUM` yoktur,
+bu yüzden eski byte'lar serbest bırakılmış SQLite sayfalarında, WAL'da veya
+dosya sistemi artığında kalabilir. Veritabanı yerel, tek kullanıcılı ve
+şifrelenmemiştir.
 
 ## Windows'ta test
 
