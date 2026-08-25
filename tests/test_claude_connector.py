@@ -17,6 +17,7 @@ from jarvis.connectors.claude_code import (
     ClaudeCodeConnector,
 )
 from jarvis.contracts import (
+    MODEL_ANSWER_RESULT_KEY,
     ActionScope,
     BillingClass,
     DataClassification,
@@ -421,11 +422,102 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         )
         task = self.task()
         result = self.connector.execute(task, SessionState())
-        verification = self.connector.verify(task, result, SessionState())
         self.assertEqual(OutcomeStatus.SUCCESS, result.outcome)
+        # M6: verification reads the DURABLE ``task.model_answer``, which
+        # AgentCore lifts off the result before ``_sanitize_result`` runs.
+        # Without that lift the verifier fails closed - it will not vouch for
+        # an answer that was never bound. This mirrors the M5 write verifier,
+        # which depends on ``_bind_local_write`` in exactly the same way.
+        unbound = self.connector.verify(task, result, SessionState())
+        self.assertFalse(unbound.passed)
+        self.assertEqual("model_answer_integrity", unbound.method)
+        task.model_answer = result.data[MODEL_ANSWER_RESULT_KEY]
+        verification = self.connector.verify(task, result, SessionState())
         self.assertTrue(verification.passed)
+        self.assertEqual("model_answer_integrity", verification.method)
+        self.assertIn("sha256=" + task.model_answer.sha256, verification.evidence)
         invoked = popen.call_args.args[0]
         self.assertIn("--safe-mode", invoked)
+
+    # -- M6 / P2-A: the REAL result path, not a test double -----------------
+
+    def answer_for(self, result_value):
+        """Drive the production execute() and return its typed answer.
+
+        Deliberately the real connector: the defect this pins lived in the
+        connector's own reading of the provider payload, so a DummyConnector
+        that calls ``build_model_answer`` itself would have proved nothing -
+        and did not.
+        """
+        with patch(
+            "jarvis.connectors.claude_code.subprocess.Popen"
+        ) as popen, patch.object(
+            ClaudeCodeConnector,
+            "billing_route",
+            lambda self: (BillingClass.SUBSCRIPTION_INCLUDED, "test_route"),
+        ):
+            popen.return_value = FakeProcess(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": result_value,
+                        "total_cost_usd": 0,
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "modelUsage": {"claude-test": {}},
+                    }
+                )
+            )
+            result = self.connector.execute(self.task(), SessionState())
+        self.assertEqual(OutcomeStatus.SUCCESS, result.outcome)
+        return result, result.data[MODEL_ANSWER_RESULT_KEY]
+
+    def test_the_real_path_preserves_the_provider_bytes_exactly(self) -> None:
+        """Whitespace is DATA in a deliverable, not formatting noise.
+
+        The connector reads the provider result twice on purpose: coerced and
+        stripped for the diagnostic summary, raw for the typed answer. Before
+        that separation existed, the summary's reading was the only one, so
+        every real answer silently lost its leading indentation, its trailing
+        whitespace and its trailing newline.
+        """
+        provider = "  leading\nbody\ntrailing  \n"
+        _, answer = self.answer_for(provider)
+        self.assertEqual(provider, answer.content)
+        self.assertEqual(len(provider), answer.character_count)
+        self.assertTrue(answer.content.startswith("  "))
+        self.assertTrue(answer.content.endswith("trailing  \n"))
+
+    def test_the_real_path_normalizes_only_line_endings(self) -> None:
+        _, answer = self.answer_for("a\r\nb\r\n")
+        self.assertEqual("a\nb\n", answer.content)
+        _, lone_cr = self.answer_for("a\rb\r")
+        self.assertEqual("a\nb\n", lone_cr.content)
+
+    def test_the_real_path_refuses_a_non_string_provider_result(self) -> None:
+        """A protocol violation must not be dressed up as a model answer.
+
+        ``str()`` on the provider value would render ``{'k': 'v'}`` to the
+        user as something the model wrote, with a valid digest and a passing
+        verification. The typed contract always rejected non-strings; the
+        producer path now lets it.
+        """
+        for value in (12345, 3.5, True, ["a", "b"], {"k": "v"}, None, 0, False, []):
+            with self.subTest(value=repr(value)):
+                _, answer = self.answer_for(value)
+                self.assertFalse(answer.present, f"{value!r} became an answer")
+                self.assertEqual("", answer.content)
+
+    def test_the_real_path_leaves_the_diagnostic_summary_untouched(self) -> None:
+        """H4 semantics are unchanged by the P2-A separation."""
+        result, _ = self.answer_for("  leading\nbody\ntrailing  \n")
+        # Still the coerced, stripped, single-line diagnostic reading.
+        self.assertEqual("leading\nbody\ntrailing", result.summary)
+        structured, _ = self.answer_for({"k": "v"})
+        self.assertEqual("{'k': 'v'}", structured.summary)
+        empty, _ = self.answer_for("")
+        self.assertEqual("Claude Code completed the request.", empty.summary)
 
     @patch("jarvis.connectors.claude_code.subprocess.Popen")
     def test_mocked_auth_failure_preserves_usage(self, popen) -> None:

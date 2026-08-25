@@ -398,6 +398,27 @@ class SanitizationPolicyTests(unittest.TestCase):
                     UNAVAILABLE_DIAGNOSTIC, sanitize_diagnostic_text(value)
                 )
 
+    def test_m6_did_not_widen_the_diagnostic_pipeline(self) -> None:
+        """M6 is additive: it created no exception to H4.
+
+        The typed model answer bypasses this pipeline by being a separate
+        typed contract - the same way ``LocalReadSnapshot`` already does -
+        NOT by relaxing anything here. If a later change tries to buy
+        deliverable fidelity by loosening the diagnostic bound instead, this
+        fails first.
+        """
+        from jarvis.contracts import MODEL_ANSWER_MAX_CHARS
+
+        self.assertEqual(240, DIAGNOSTIC_MESSAGE_MAX_CHARS)
+        self.assertNotEqual(MODEL_ANSWER_MAX_CHARS, DIAGNOSTIC_MESSAGE_MAX_CHARS)
+        multiline = sanitize_diagnostic_text(
+            "first line\nsecond line\nC:\\Users\\someone\\project\\core.py tail"
+        )
+        # Still collapsed, still path-redacted: unchanged by M6.
+        self.assertNotIn("\n", multiline)
+        self.assertIn("[PATH]", multiline)
+        self.assertNotIn("someone", multiline)
+
     def test_the_bound_is_explicit_and_deterministic(self) -> None:
         self.assertEqual(240, DIAGNOSTIC_MESSAGE_MAX_CHARS)
         cleaned = sanitize_diagnostic_text("y" * 10_000)

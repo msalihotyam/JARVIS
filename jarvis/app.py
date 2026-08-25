@@ -42,6 +42,7 @@ from jarvis.contracts import (
     LocalReadSnapshot,
     LocalWriteRecord,
     MemoryStore,
+    ModelAnswer,
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
@@ -62,6 +63,7 @@ from jarvis.contracts import (
     local_write_content_refusal,
     local_write_mode_unsupported,
     local_write_record_refusal,
+    model_answer_refusal,
     next_loop_stage,
     normalize_destination,
     require_billing_class,
@@ -77,9 +79,11 @@ from jarvis.settings import Settings
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
 #: Version 2 added the deterministic, redacted top-level ``progress`` object.
 #: Version 3 (M3) added the bounded top-level ``local_read`` object and the
-#: ``session.project_id`` field that M1 added without a bump. The SQLite
-#: schema is a separate contract and stays at its own version.
-OUTPUT_SCHEMA_VERSION = 4
+#: ``session.project_id`` field that M1 added without a bump.
+#: Version 4 (M5) added the bounded top-level ``local_write`` object.
+#: Version 5 (M6) added the bounded top-level ``model_answer`` object. The
+#: SQLite schema is a separate contract and stays at its own version.
+OUTPUT_SCHEMA_VERSION = 5
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
@@ -636,6 +640,38 @@ def _local_write_payload(record: LocalWriteRecord) -> dict[str, Any] | None:
     }
 
 
+def _model_answer_payload(answer: ModelAnswer) -> dict[str, Any] | None:
+    """The bounded model-answer view of the addressed task, or ``None``.
+
+    The deliverable itself plus the metadata that lets a user judge it: how
+    long it is, whether it was cut, when it was produced and the digest of
+    exactly these bytes. No provider internals - no response type, subtype,
+    stop reason, error status or redaction counter - and no raw payload of
+    any kind; those are provider diagnostics, not the answer.
+
+    The content keeps its newlines, its indentation and any absolute paths it
+    mentions, which is the entire reason M6 exists: the H4 diagnostic
+    pipeline is correct for a diagnostic and destroys a deliverable. It has
+    already been credential-redacted and bounded by ``bound_model_text``; the
+    envelope's own ``_redact`` pass then runs over it like every other string,
+    and that pass is credential-only - it neither truncates nor touches paths.
+
+    ``None`` means the record did not survive the one canonical structural
+    contract, so the envelope shows no model-answer block rather than a
+    tampered one. Masking would not be enough: rendering a repaired answer
+    would still assert that a bounded, intact model answer is being shown.
+    """
+    if model_answer_refusal(answer) is not None:
+        return None
+    return {
+        "content": answer.content,
+        "character_count": answer.character_count,
+        "sha256": answer.sha256,
+        "truncated": answer.truncated,
+        "produced_at": answer.produced_at,
+    }
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -709,6 +745,12 @@ def build_envelope(
         # deliberately absent: this is the changed-file record, not the file.
         "local_write": (
             None if task is None else _local_write_payload(task.local_write)
+        ),
+        # M6. The bounded model deliverable, re-validated the same way. This
+        # is untrusted inbound model data shown to the user, never authority:
+        # nothing downstream reads it back, and it never returns to the model.
+        "model_answer": (
+            None if task is None else _model_answer_payload(task.model_answer)
         ),
         "result": None if result is None else _result_payload(result),
         # ``details`` is deliberately dropped: it carries free-form diagnostics.

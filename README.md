@@ -377,6 +377,45 @@ yükseltebilir. Dışa çıkan blok tam olarak
 sınıflandırma, okuma zamanı ve her türlü mutlak yol yerelde kalır. Zarf,
 okunan dosyanın sınırlanmış görünümünü `local_read` bloğunda gösterir.
 
+### Tipli model cevabı (M6)
+
+Harici modelin cevabı artık kullanılabilir biçimde geri gelir. Daha önce
+kullanıcının gördüğü tek temsil, `AgentCore`'un `ToolResult`'ı H4 tanılama
+hattından geçirmesiyle oluşan özetti: satırlar tek satıra daraltılmış,
+mutlak yollar `[PATH]`'e indirilmiş ve metin 240 karakterde kesilmiş
+oluyordu. Bu bir tanılama için doğrudur, bir teslimat için yıkıcıdır.
+
+M6, cevabı tipli ve sınırlı bir `Task.model_answer` kaydında taşır ve zarfa
+sabit bir `model_answer` bloğu ekler:
+`{content, character_count, sha256, truncated, produced_at}`. İçerik
+**yapısını korur** — satır sonları, girinti, boş satırlar, sondaki satır sonu
+ve metinde geçen mutlak dosya yolları olduğu gibi kalır — en çok
+`MODEL_ANSWER_MAX_CHARS = 8.000` karakterdir ve kalıcılaşmadan önce
+paylaşılan kimlik bilgisi politikasıyla redakte edilir (redaksiyon kesmeden
+**önce** çalışır). Kesme olduysa bant içi bir işaret eklenmez; bilgi tipli
+`truncated` bayrağıyla taşınır. `result.summary` ve karar/geçmiş kaydı
+**değişmeden** eski 240 karakterlik tanılama temsili olarak kalır.
+
+Cevap **güvenilmeyen gelen model verisidir**: gösterim içindir, otorite
+değildir. Onayı, attestation'ı, fingerprint'i, faturalandırmayı, planı,
+connector seçimini, yürütmeyi veya doğrulama otoritesini etkilemez; proje
+hafızasına yazılmaz, getirmeye girmez ve Claude'a geri gönderilmez
+(`EGRESS_TOOL_GRANTS` boş kalır, giden payload birebir aynıdır). `sha256`
+yalnızca kalıcılaşan metnin bütünlük kanıtıdır — köken kanıtı veya
+attestation değildir. `truncated`, iki sınırlama aşamasından (64.000
+karakterlik kaynak penceresi veya 8.000 karakterlik çıktı tavanı) herhangi
+birinin içerik attığını söyleyen tek genel bayraktır; üretici tarafından
+atanır ve **kesme tarihi atılan metin gittikten sonra yeniden kurulamaz**, bu
+yüzden kesilmiş bir cevap meşru olarak tavandan çok kısa olabilir. Doğrulama
+yalnızca yapısaldır: kaydın geçerliliği, metnin boş olmaması ve digest/sayaç
+uyumu denetlenir; cevabın **doğruluğu, isabeti veya halüsinasyon içermediği
+doğrulanmaz**.
+Prompt injection çözülmüş değildir: zehirlenmiş yerel bir dosya modelin ne
+söyleyeceğini etkileyebilir, fakat cevap eylemsiz gösterim verisi olarak
+kalır ve ondan türeyen her eylem yeni ve ayrıca incelenen bir yetki
+sınırından geçmek zorundadır. SECRET bir görev modeli hiç çalıştırmadığı
+için başarılı bir model cevabı da üretmez.
+
 ### Görev-farkında deterministik plan
 
 `PLAN` aşaması, yalnızca güvenli yapısal task durumundan kurulan deterministik
@@ -403,7 +442,7 @@ issue, en çok 20 artifact) mevcut task JSON'unda taşır; `SessionState`
 yalnızca `latest_task_id` gezinme işaretçisini kazanır. SQL şeması,
 migration ve `MemoryStore` protokolü değişmemiştir.
 
-Status dışı zarf (`schema_version=3`) tek deterministik `progress` nesnesi
+Status dışı zarf (`schema_version=5`) tek deterministik `progress` nesnesi
 içerir: `task_id`, `plan` (planlama olduysa her zaman kanonik
 `build_task_plan` yeniden kurulumu; kalıcı `task.plan` metnine asla
 güvenilmez), `current_stage` (otoriter `Task.stage`), `next_stage`

@@ -792,6 +792,30 @@ class ConnectorRetrievalTests(unittest.TestCase):
         )
         self.assertNotIn("retrieved_memory", json.dumps(payload))
 
+    def test_a_model_answer_never_re_enters_the_outbound_payload(self) -> None:
+        """M6 egress isolation, pinned where the outbound shape is owned.
+
+        ``_sanitized_payload`` builds an explicit literal from named task
+        attributes, so it is default-deny by construction and ``Task``
+        gaining a field cannot widen it. That property is only worth
+        anything if it is standing, so this is the regression that fails if
+        anyone ever adds ``model_answer`` to the payload: the model must not
+        be fed its own previous output without a fresh, reviewed decision.
+        """
+        from jarvis.contracts import build_model_answer
+
+        task = self.task()
+        before, before_count = self.connector._sanitized_payload(task)
+        marker = "MODEL-ANSWER-EGRESS-MARKER-3a7e"
+        task.model_answer = build_model_answer(f"earlier answer {marker}\n")
+        after, after_count = self.connector._sanitized_payload(task)
+        self.assertEqual(before, after)
+        self.assertEqual(before_count, after_count)
+        self.assertNotIn("model_answer", set(after))
+        self.assertNotIn(marker, json.dumps(after))
+        # The attested bytes are the real boundary, so assert them too.
+        self.assertNotIn(marker.encode("utf-8"), self.connector.canonical_outbound(task))
+
     def test_serialization_uses_only_the_approved_fields(self) -> None:
         task = self.task()
         task.retrieved_context = self.retrieved_context(

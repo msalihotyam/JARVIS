@@ -15,6 +15,7 @@ from typing import Any
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     LOCAL_READ_EXCERPT_MAX_CHARS,
+    MODEL_ANSWER_RESULT_KEY,
     RETRIEVAL_MAX_CHARACTERS,
     RETRIEVAL_MAX_ITEMS,
     RETRIEVAL_NEXT_STEP_CAP,
@@ -44,9 +45,11 @@ from jarvis.contracts import (
     VerificationRecord,
     VerificationStatus,
     bound_local_text,
+    build_model_answer,
     canonical_path,
     canonical_usd,
     local_read_snapshot_refusal,
+    model_answer_refusal,
     looks_like_path,
     normalize_local_text,
     normalize_retrieved_text,
@@ -212,7 +215,6 @@ class ClaudeCodeConnector(BaseConnector):
         self.auth_probe_timeout_seconds = auth_probe_timeout_seconds
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._process_lock = threading.Lock()
-        self._last_payload_meta: dict[str, dict[str, Any]] = {}
 
     def availability(self) -> Availability:
         command_path = shutil.which(self.command)
@@ -485,7 +487,23 @@ class ClaudeCodeConnector(BaseConnector):
             )
 
         usage = self._usage(task, payload, billing_class, evidence, call_count=1)
-        result_text = str(payload.get("result") or "").strip()
+        # M6. Two DIFFERENT readings of the provider's result, deliberately
+        # separated, because the two consumers want opposite things.
+        #
+        # ``raw_result`` is what the provider actually returned, untouched. It
+        # is what the typed deliverable is built from, so ``build_model_answer``
+        # can apply its own exact-``str`` rule: a coercion here would defeat
+        # that gate before it ran and let a provider's int, list or dict be
+        # rendered to the user as something a model wrote. Stripping here would
+        # be just as wrong - leading indentation and a trailing newline are
+        # part of a deliverable that is meant to be read and copied.
+        #
+        # ``result_text`` is the DIAGNOSTIC reading, unchanged from before M6:
+        # coerced and stripped, feeding the summary and the error paths, where
+        # a short one-line label is exactly what is wanted and where the H4
+        # pipeline bounds it anyway.
+        raw_result = payload.get("result")
+        result_text = str(raw_result or "").strip()
         failed = process.returncode != 0 or bool(payload.get("is_error"))
         metadata = {
             "response_type": payload.get("type"),
@@ -494,7 +512,6 @@ class ClaudeCodeConnector(BaseConnector):
             "redacted_items": redacted_count,
             "api_error_status": payload.get("api_error_status"),
         }
-        self._last_payload_meta[task.id] = metadata
         if failed:
             return ToolResult(
                 outcome=OutcomeStatus.ERROR,
@@ -509,32 +526,86 @@ class ClaudeCodeConnector(BaseConnector):
                 usage=usage,
             )
 
+        # M6. The typed deliverable, built here and only here, from the model
+        # text this call actually returned. Two separate representations of
+        # the same answer leave this method, on purpose:
+        #
+        # * ``summary`` keeps its existing behaviour exactly - AgentCore runs
+        #   it through the H4 diagnostic pipeline (240 characters, newline
+        #   collapse, path redaction) and it remains the decision/history
+        #   representation. Nothing about that is weakened here.
+        # * ``data[MODEL_ANSWER_RESULT_KEY]`` carries the bounded, canonical,
+        #   structure-preserving record AgentCore lifts BEFORE that pipeline
+        #   runs, which is the whole point of M6.
+        #
+        # The raw provider payload does not survive this frame: ``stdout``,
+        # ``stderr`` and the parsed JSON go out of scope here, and only
+        # ``metadata`` (fixed, non-free-form tags) is handed onward - where
+        # ``_sanitize_result`` then drops it too.
         return ToolResult(
             outcome=OutcomeStatus.SUCCESS,
             summary=result_text or "Claude Code completed the request.",
-            data=metadata,
+            data={**metadata, MODEL_ANSWER_RESULT_KEY: build_model_answer(raw_result)},
             usage=usage,
         )
 
     def verify(
         self, task: Task, result: ToolResult, session: SessionState
     ) -> VerificationRecord:
-        metadata = self._last_payload_meta.get(task.id, result.data)
-        evidence = []
-        if result.summary.strip():
-            evidence.append("non_empty_result")
-        if metadata.get("response_type") == "result":
-            evidence.append("structured_result_envelope")
+        """Structural integrity of the DURABLE typed answer, and nothing more.
+
+        M6 moved this off ``_last_payload_meta``. That mapping is connector
+        instance state: it is empty after a restart, so a task resumed at
+        VERIFY was being judged on evidence that had silently disappeared.
+        ``task.model_answer`` was persisted with the execution conclusion, so
+        it answers the same question durably.
+
+        What is checked is exactly what can be checked: the record satisfies
+        the ONE canonical structural contract, it carries text at all, its
+        digest matches that text, its count matches it, and the usage was
+        attributed to this connector.
+
+        What is NOT checked, deliberately and permanently:
+
+        * whether the answer is true, correct, complete, relevant or free of
+          hallucination - the semantic quality of an external model's output
+          is not verifiable here and must never become a requirement, because
+          claiming otherwise would make VERIFY assert something it cannot
+          know; and
+        * whether ``truncated`` tells the truth about what was discarded. The
+          flag is REPORTED as evidence, never re-derived: once the dropped
+          text is gone the history is unreconstructible, and a truncated
+          answer may legitimately be far shorter than the ceiling because
+          redaction compressed it.
+        """
+        answer = task.model_answer
+        reason = model_answer_refusal(answer)
+        if reason is not None:
+            return VerificationRecord(
+                status=VerificationStatus.FAILED,
+                method="model_answer_integrity",
+                evidence=("model answer is not structurally valid",),
+            )
+        if not answer.present or not answer.content.strip():
+            return VerificationRecord(
+                status=VerificationStatus.FAILED,
+                method="model_answer_integrity",
+                evidence=("model answer carries no text",),
+            )
+        evidence = [
+            f"characters={answer.character_count}",
+            f"sha256={answer.sha256}",
+            f"truncated={answer.truncated}",
+        ]
         if result.usage.connector == self.manifest.name:
             evidence.append("usage_attributed_to_connector")
-        status = (
-            VerificationStatus.PASSED
-            if len(evidence) >= 2 and result.ok
-            else VerificationStatus.FAILED
-        )
         return VerificationRecord(
-            status=status,
-            method="claude_cli_structured_response",
+            status=(
+                VerificationStatus.PASSED
+                if result.ok and len(evidence) >= 4
+                else VerificationStatus.FAILED
+            ),
+            method="model_answer_integrity",
             evidence=tuple(evidence),
         )
 

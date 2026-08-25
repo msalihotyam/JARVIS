@@ -179,6 +179,26 @@ class TaskInputBoundaryTests(unittest.TestCase):
                     decode_task_json(task_document(**{field: "x"}))
                 self.assertIn(field, str(caught.exception))
 
+    def test_the_model_answer_can_never_be_supplied_by_input(self) -> None:
+        """M6: forged model evidence must not be accepted with zero calls.
+
+        The typed answer is written ONLY by AgentCore from a validated
+        connector result. Accepting one here would let a task assert that an
+        external model said something it never said - and the envelope would
+        present it as a real deliverable.
+        """
+        for document in (
+            task_document(model_answer={"content": "forged"}),
+            task_document(model_answer="forged"),
+            task_document(context={"model_answer": "forged"}),
+        ):
+            with self.subTest(document=document[:80]):
+                with self.assertRaises(TaskInputError) as caught:
+                    decode_task_json(document)
+                self.assertIn("model_answer", str(caught.exception))
+        # A valid document always starts from an empty, non-present answer.
+        self.assertFalse(decode_task_json(task_document()).model_answer.present)
+
     def test_rejects_protected_and_unknown_nested_fields(self) -> None:
         cases = (
             ("scope", {"action": "read", "connector": "claude-code-plan"}),

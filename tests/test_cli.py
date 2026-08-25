@@ -613,7 +613,8 @@ class CliTestCase(unittest.TestCase):
         # block was added (and the M1 ``session.project_id`` field, which was
         # added without a bump, is now covered by a version too).
         # M5 bumped it again, 3 -> 4, for the bounded ``local_write`` block.
-        self.assertEqual(4, payload["schema_version"])
+        # M6 bumped it again, 4 -> 5, for the bounded ``model_answer`` block.
+        self.assertEqual(5, payload["schema_version"])
         self.assertEqual(
             {
                 "schema_version",
@@ -627,15 +628,17 @@ class CliTestCase(unittest.TestCase):
                 "progress",
                 "local_read",
                 "local_write",
+                "model_answer",
                 "result",
                 "error",
             },
             set(payload),
         )
-        # A task that read or wrote nothing carries the key with a null
-        # value: the envelope shape is fixed, never conditional.
+        # A task that read, wrote or asked a model nothing carries the key
+        # with a null value: the envelope shape is fixed, never conditional.
         self.assertIsNone(payload["local_read"])
         self.assertIsNone(payload["local_write"])
+        self.assertIsNone(payload["model_answer"])
         self.assertEqual(
             {
                 "task_id",

@@ -16,6 +16,7 @@ from jarvis.contracts import (
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_RESULT_KEY,
     MAX_SQLITE_INTEGER,
+    MODEL_ANSWER_RESULT_KEY,
     PAID_API_GATE,
     RETRIEVAL_MAX_CHARACTERS,
     RETRIEVAL_MAX_ITEMS,
@@ -45,6 +46,7 @@ from jarvis.contracts import (
     LoopStage,
     MemoryRetrievalQuery,
     MemoryStore,
+    ModelAnswer,
     MonetaryState,
     OutboundDataPreview,
     OutcomeStatus,
@@ -76,6 +78,7 @@ from jarvis.contracts import (
     local_read_snapshot_refusal,
     local_write_record_refusal,
     merge_side_effects,
+    model_answer_refusal,
     nano_usd,
     normalize_destination,
     require_billing_class,
@@ -1096,6 +1099,10 @@ class AgentCore:
                 # M5: the same lift, for the same reason and at the same
                 # point - before ``_sanitize_result`` reduces ``data``.
                 self._bind_local_write(task, connector, result)
+                # M6: the third lift, same point, same reason. This one is
+                # what stops an external model's answer from being reduced to
+                # the H4 diagnostic summary before the user ever sees it.
+                self._bind_model_answer(task, connector, result)
                 # H4: connector-authored free-form text is bounded and
                 # scrubbed before it can become persisted task, decision or
                 # audit state. It never touches approval, billing, execution or
@@ -1695,6 +1702,28 @@ class AgentCore:
         reason = local_read_snapshot_refusal(value)
         if reason is not None:
             raise TypeError(f"local read snapshot is invalid: {reason}")
+        return value
+
+    @staticmethod
+    def _validated_model_answer(value: Any) -> ModelAnswer:
+        """Require exactly the typed model answer, before any field use.
+
+        The structural contract is NOT restated here. There is exactly one -
+        ``model_answer_refusal`` in ``jarvis.contracts`` - and the load
+        boundary, this execution boundary, the connector's verifier and the
+        public envelope all call that same function, so four subtly different
+        validators cannot drift apart. This method only turns its refusal into
+        the ``TypeError`` the binding boundary expects.
+
+        The exact-type check inside that contract is load-bearing rather than
+        decorative: this object crosses the connector boundary and is then
+        serialized into task JSON, so anything that merely resembles a
+        ``ModelAnswer`` must fail here rather than while a checkpoint is
+        being written.
+        """
+        reason = model_answer_refusal(value)
+        if reason is not None:
+            raise TypeError(f"model answer is invalid: {reason}")
         return value
 
     @staticmethod
@@ -2788,6 +2817,54 @@ class AgentCore:
         if local_write_record_refusal(record) is not None:
             return
         task.local_write = record
+
+    def _bind_model_answer(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """Bind the connector's typed model answer to the task, or bind nothing.
+
+        Runs at the same point and for the same reason as the two bindings
+        above: BEFORE ``_sanitize_result`` reduces ``data`` to ``next_step``.
+        That ordering is the whole of M6 - after it, the answer has already
+        been collapsed to a 240-character, path-redacted, single-line
+        diagnostic string, which is right for a diagnostic and destroys a
+        deliverable.
+
+        Three gates, all mandatory:
+
+        * the *selected connector's own MANIFEST* must declare
+          ``EXTERNAL_EGRESS``. Deliberately the manifest and not the merged
+          effect: a task may strengthen its effect upward (the local ladder
+          relies on it), and that escalation must not make a purely local
+          connector eligible to hand back "external model output". It is also
+          deliberately the side effect rather than a capability name, so the
+          provider-neutral core never learns Claude-specific vocabulary;
+        * the object must be EXACTLY a ``ModelAnswer`` - a dict, a subclass or
+          a foreign look-alike is not this contract; and
+        * it must satisfy the one canonical structural contract.
+
+        Non-raising, exactly like the two bindings above: this runs after the
+        connector boundary and before H3 reconciliation, so a malformed
+        candidate is discarded rather than raised, and the connector's own
+        verifier then fails the task closed at VERIFY.
+
+        The answer carries no authority of any kind, so unlike the read
+        snapshot there is nothing here to rebind from trusted state: it is
+        display data, and a task that ends up with none simply shows none.
+        """
+        if (
+            connector.manifest.default_side_effect.effect
+            is not SideEffect.EXTERNAL_EGRESS
+        ):
+            return
+        raw = result.data if isinstance(result.data, dict) else {}
+        if MODEL_ANSWER_RESULT_KEY not in raw:
+            return
+        try:
+            answer = self._validated_model_answer(raw[MODEL_ANSWER_RESULT_KEY])
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return
+        task.model_answer = answer
 
     def _prepare_local_write(
         self, session: SessionState, task: Task, connector: BaseConnector

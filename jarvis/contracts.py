@@ -2374,6 +2374,303 @@ class LocalWriteRecord:
 
 
 # --------------------------------------------------------------------------
+# M6. Bounded, task-scoped MODEL ANSWER
+# --------------------------------------------------------------------------
+
+#: The single ``ToolResult.data`` key an external-model connector uses to hand
+#: its typed answer to ``AgentCore``. ``_sanitize_result`` reduces ``data`` to
+#: ``next_step``, so this transport is read once and never persisted as data.
+MODEL_ANSWER_RESULT_KEY = "model_answer"
+
+#: Ceiling on the user-facing model deliverable. Its OWN policy surface: it
+#: is not, and may never become, an alias of ``LOCAL_READ_EXCERPT_MAX_CHARS``.
+#: A read excerpt is a bounded view of a local file this machine already owns;
+#: this is inbound text from an external model, and the two ceilings answer
+#: different questions and must stay free to diverge.
+MODEL_ANSWER_MAX_CHARS = 8_000
+
+#: Bounded working window applied to the RAW model text before any redaction
+#: pass runs over it. Everything past it is discarded rather than processed,
+#: which keeps the credential pass linear on adversarially large output. The
+#: same technique ``sanitize_diagnostic_text`` uses for the same reason.
+MODEL_ANSWER_SOURCE_MAX_CHARS = 8 * MODEL_ANSWER_MAX_CHARS
+
+#: Convergence budget for ``bound_model_text``; the same bounded-loop shape as
+#: ``bound_local_text`` and for the same reason (see that function).
+_MODEL_TEXT_STABILIZATION_PASSES = 3
+
+
+def normalize_model_text(value: str) -> str:
+    """Newline normalization ONLY, for a model answer.
+
+    Deliberately NOT ``normalize_local_text``'s twin by accident and NOT
+    ``normalize_retrieved_text``: no NFKC, no strip, no whitespace collapse.
+    Indentation, blank lines and a trailing newline are part of the
+    deliverable a user reads and may copy, not formatting noise, and NFKC
+    would rewrite characters the model actually produced.
+    """
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def bound_model_text(value: str) -> tuple[str, bool]:
+    """Canonical, deterministic bounded representation of a model answer.
+
+    The order is mandatory and IS the contract:
+
+    1. exact ``str`` only - no coercion anywhere on this path;
+    2. newline normalization;
+    3. a bounded source window, cut at a REDACTION-SAFE boundary (below), so
+       redaction never runs over unbounded input and never inherits a token
+       that the cut itself sliced in half;
+    4. shared credential redaction - BEFORE truncation, so a credential past
+       the eventual display boundary is still removed rather than surviving
+       in an intermediate persisted form;
+    5. head truncation to ``MODEL_ANSWER_MAX_CHARS``.
+
+    Step 3's boundary is a security control, not tidiness. A raw
+    ``text[:MODEL_ANSWER_SOURCE_MAX_CHARS]`` is the one cut in this function
+    that would precede a redaction pass, so a credential straddling it would
+    be reduced to a prefix too short for its own pattern to recognize - and a
+    prefix is never redacted, because there is nothing left to match. Heavy
+    redaction earlier in the window can then compress the retained text far
+    enough that the fragment lands inside the 8000-character deliverable.
+
+    The boundary is therefore the last NEWLINE inside the window, and the
+    entire boundary-crossing final line is discarded. Newline is not chosen
+    because it terminates every pattern - it does not: ``Bearer\\s+``, the
+    label's ``[_\\-\\s]?``, the assignment's ``\\s*`` delimiter and the CLI
+    flag's ``\\s+`` joiner all admit one. It is chosen because of a strictly
+    weaker property that IS true of every recognizer in the shared policy:
+
+        no recognized credential can carry SECRET MATERIAL on both sides of
+        a newline.
+
+    * ``sk-``, JWT and the AWS key-id patterns contain no newline at all, so
+      no match can span one.
+    * ``Bearer`` admits a newline only in the gap between the keyword and the
+      token, so the part before it is the public keyword and whitespace.
+    * The labelled form's value class is ``[^,;\\n]+``: a newline can only
+      fall inside the label or the delimiter, leaving no value behind - and a
+      cut inside the value still matches, because the class is ``+``.
+    * The CLI form's value scanner runs to whitespace, to the closing quote,
+      or to the END of the text, so a cut inside a value leaves something the
+      scanner still consumes.
+
+    If the window holds no newline at all, there is no boundary this function
+    can prove safe, so it FAILS CLOSED and yields no text rather than risk
+    publishing half a token. An empty answer is refused by the connector's
+    verifier, which is loud; a leaked credential prefix would not be.
+
+    What it deliberately does NOT do, and the reason ``bound_local_text``
+    could not simply be reused: it never calls ``redact_local_paths``. In a
+    diagnostic string an absolute path is accidental leakage; in a model
+    answer about this project's code it is the answer. Redacting it would
+    destroy the deliverable while still claiming to present one.
+
+    It also appends no ellipsis or any other in-band truncation marker. This
+    text is meant to be read and copied, so a character the model never wrote
+    must not appear inside it; the fact of truncation is carried out of band
+    by the typed ``truncated`` flag instead, which is strictly more honest.
+
+    The result is a FIXED POINT: applying this function to its own output
+    returns that output unchanged. That is what lets every downstream
+    boundary state canonicality as ``bound_model_text(content)[0] == content``
+    and refuse anything else instead of re-deriving it. The loop exists
+    because truncation can, in principle, create work for redaction (a cut
+    inside an already-redacted marker); it is bounded, each pass is a full
+    canonical pass, and a value that has not converged is still fully
+    redacted - it is simply refused downstream as non-canonical.
+    """
+    if type(value) is not str:
+        # End to end, not merely at one caller: a coercion here would hand a
+        # provider's list or dict to the redaction passes and then present the
+        # result as something a model wrote.
+        raise TypeError("model answer text must be an exact str")
+    text = normalize_model_text(value)
+    truncated = len(text) > MODEL_ANSWER_SOURCE_MAX_CHARS
+    if truncated:
+        window = text[:MODEL_ANSWER_SOURCE_MAX_CHARS]
+        # Keep through the last complete line; drop the line the window cut.
+        boundary = window.rfind("\n")
+        text = window[: boundary + 1] if boundary >= 0 else ""
+    for _ in range(_MODEL_TEXT_STABILIZATION_PASSES):
+        bounded, _ = redact_credentials(text)
+        if len(bounded) > MODEL_ANSWER_MAX_CHARS:
+            bounded = bounded[:MODEL_ANSWER_MAX_CHARS]
+            truncated = True
+        if bounded == text:
+            return text, truncated
+        text = bounded
+    return text, truncated
+
+
+def model_answer_refusal(value: Any) -> str | None:
+    """Why this object is not a usable model answer, or ``None``.
+
+    THE canonical structural contract for ``ModelAnswer``. Every boundary
+    calls this exact function - the load boundary (``from_dict``), the
+    execution boundary (``AgentCore``), the connector's own verifier and the
+    public envelope - so four subtly different validators cannot drift apart.
+    That drift is the failure M3 had to close once already; it is not going
+    to be reintroduced here.
+
+    Nothing is coerced and every field is checked against its exact type, so
+    a task row edited outside the product can neither widen the ceiling nor
+    present tampered text as a trustworthy answer.
+
+    An absent answer is refused too; presence is the caller's own question,
+    asked with ``present`` before this one.
+    """
+    if type(value) is not ModelAnswer:
+        return "not a ModelAnswer"
+    if type(value.content) is not str:
+        return "content is not a string"
+    if len(value.content) > MODEL_ANSWER_MAX_CHARS:
+        return "content exceeds its character ceiling"
+    # Length and type are not hygiene. A row edited outside the product can
+    # sit under the ceiling while carrying raw CRLF or a live credential -
+    # neither of which any real answer could have stored, because
+    # ``bound_model_text`` removed them. Since that function is a fixed
+    # point, "is this what a real answer would have stored?" is decidable
+    # exactly. Refusing is the point: repairing here would let tampered text
+    # become active state wearing a clean face.
+    if bound_model_text(value.content)[0] != value.content:
+        return "content is not the canonical bounded representation"
+    # ``type() is int`` and not ``isinstance``: ``True`` is an ``int``.
+    if type(value.character_count) is not int:
+        return "character count is not an integer"
+    if value.character_count != len(value.content):
+        return "character count does not match the content"
+    digest = value.sha256
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return "digest is not a lowercase sha256 hex digest"
+    # Unlike the read snapshot's digest - which describes the whole file and
+    # therefore cannot be checked against the excerpt - this one describes
+    # exactly the persisted text, so the check is unconditional and a
+    # tampered content field cannot survive it.
+    if hashlib.sha256(value.content.encode("utf-8")).hexdigest() != digest:
+        return "digest does not match the content"
+    if type(value.truncated) is not bool:
+        return "truncated flag is not a boolean"
+    # Exact type is ALL that is checkable here, and deliberately so. An
+    # earlier version also required ``truncated`` to imply a content length of
+    # exactly the ceiling. That rule was simply false: loss has two
+    # independent sources - the source window and the output cap - and a
+    # window-truncated answer that redaction then compresses legitimately
+    # ends up well under the ceiling. The rule rejected honest records, and
+    # the truth it claimed to check is not reconstructible anyway once the
+    # discarded text is gone. ``truncated`` is producer-set metadata whose
+    # integrity is bound to the record by the digest; it is not, and must not
+    # be presented as, a provenance claim this validator can re-derive.
+    if canonical_utc_timestamp(value.produced_at) is None:
+        return "produced timestamp is not a canonical UTC timestamp"
+    return None
+
+
+def build_model_answer(value: Any) -> "ModelAnswer":
+    """The canonical constructor: raw model text in, typed record out.
+
+    The ONLY place a ``ModelAnswer`` is built from untrusted text. Only an
+    actual ``str`` produces an answer at all - an arbitrary object is never
+    stringified into one - and everything else follows from
+    ``bound_model_text``, so the record is canonical by construction rather
+    than by inspection afterwards.
+    """
+    if type(value) is not str:
+        return ModelAnswer()
+    content, truncated = bound_model_text(value)
+    return ModelAnswer(
+        content=content,
+        character_count=len(content),
+        sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        truncated=truncated,
+        produced_at=utc_now(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelAnswer:
+    """One bounded, structure-preserving answer from an external model.
+
+    UNTRUSTED INBOUND MODEL DATA with NO authority whatsoever. It never
+    becomes an instruction, a scope change, an approval, a billing input, a
+    plan, a connector choice or a verification judgement; it is never written
+    to project memory; it is never a retrieval candidate; and nothing feeds
+    it back to the model. It is task-scoped by construction - it lives on the
+    task that produced it and nowhere else.
+
+    ``sha256`` is INTEGRITY EVIDENCE for the persisted, displayed text: it is
+    the digest of exactly ``content``. It is deliberately NOT provenance and
+    NOT an attestation. H1 attestation binds the OUTBOUND prompt bytes; this
+    record is what came back, and no digest of inbound text can say anything
+    about how it was produced.
+
+    This contract also makes no claim about the answer's truth, correctness,
+    relevance or freedom from hallucination, and prompt injection is not
+    solved by it: a poisoned local file can influence what a model says. What
+    is guaranteed is narrower and real - the text is bounded, canonical,
+    credential-redacted, tamper-evident and inert.
+
+    ``truncated`` says only that SOME source content was discarded, by either
+    bounded stage: the source window or the output cap. It is a single public
+    boolean on purpose, and it is producer-set. Its integrity travels with the
+    record - the digest covers the content it describes - but its historical
+    truth is NOT re-derivable afterwards, because the discarded text is gone.
+    No boundary claims otherwise, and in particular a truncated answer may be
+    far shorter than the ceiling: redaction can compress heavily.
+    """
+
+    content: str = ""
+    character_count: int = 0
+    sha256: str = ""
+    truncated: bool = False
+    produced_at: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.sha256)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "character_count": self.character_count,
+            "sha256": self.sha256,
+            "truncated": self.truncated,
+            "produced_at": self.produced_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ModelAnswer":
+        """Rebuild defensively; malformed persisted state fails closed.
+
+        NOTHING is repaired and nothing is coerced. ``str()`` on content,
+        ``persistable_count`` on the character count, ``bool()`` on the
+        truncation flag or ``str()`` on the timestamp would each turn a
+        tampered row into plausible ACTIVE state - the exact failure the read
+        snapshot had to close. There is no re-bounding either: an oversized
+        content field would produce a digest that no longer matches, so
+        repairing it could only manufacture a record nothing ever wrote.
+
+        A row that does not satisfy the single canonical contract degrades to
+        the empty, non-present answer rather than raising.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        candidate = cls(
+            content=data.get("content", ""),
+            character_count=data.get("character_count", 0),
+            sha256=data.get("sha256", ""),
+            truncated=data.get("truncated", False),
+            produced_at=data.get("produced_at", ""),
+        )
+        return candidate if model_answer_refusal(candidate) is None else cls()
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -3161,6 +3458,16 @@ class Task:
     #: untrusted task input, never persisted into project memory, never a
     #: decision, and it carries no bytes of any kind.
     local_write: LocalWriteRecord = field(default_factory=LocalWriteRecord)
+    #: M6. The bounded, structure-preserving answer an EXTERNAL MODEL returned
+    #: for THIS task. Written only by AgentCore from a validated connector
+    #: result; never accepted from untrusted task input, never written to
+    #: project memory, never a retrieval candidate, never a decision record
+    #: and never authority of any kind. Nothing adds it to an outbound key
+    #: set, so it cannot travel back to the model.
+    #:
+    #: Unlike ``write_content`` it is NOT erased at terminal state: it is the
+    #: completed task's user-facing deliverable and has to stay readable.
+    model_answer: ModelAnswer = field(default_factory=ModelAnswer)
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -3198,6 +3505,7 @@ class Task:
             "write_content": self.write_content,
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
+            "model_answer": self.model_answer.to_dict(),
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -3274,6 +3582,10 @@ class Task:
             # Legacy task JSON without the field loads as an empty record; a
             # malformed one loads closed as empty rather than partly believed.
             local_write=LocalWriteRecord.from_dict(data.get("local_write")),
+            # M6. Legacy task JSON without the field loads as the empty
+            # answer; a malformed one loads closed as empty rather than
+            # partly believed. Nothing is re-bounded or repaired.
+            model_answer=ModelAnswer.from_dict(data.get("model_answer")),
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),

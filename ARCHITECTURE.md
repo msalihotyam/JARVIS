@@ -1598,6 +1598,158 @@ Kilitli değişmezler:
   örtük rollback yok · `file_restore` yok · Claude filesystem grant yok · şema
   migration yok (v6) · otomatik hafıza yazımı yok · H1–H5 ve M1–M4 değişmez.
 
+### 4.13 Tipli model cevabı (M6, uygulandı)
+
+Harici modelin döndürdüğü cevap için tipli, sınırlı, **yapıyı koruyan** bir
+dönüş kanalı (`ModelAnswer`, `Task.model_answer`). Çözdüğü somut sorun şudur:
+`ClaudeCodeConnector` çok satırlı ve kullanışlı bir cevap döndürebiliyordu,
+fakat `AgentCore` sonrasında `ToolResult`'ı H4 tanılama hattından geçiriyordu —
+satır sonu daraltma, mutlak yol redaksiyonu ve 240 karakter sınırı. Bu işlem
+bir **tanılama** için doğrudur ve bir **teslimat** için yıkıcıdır: 840
+karakterlik yol içermeyen bir cevap 240 karaktere iniyor, tek bir Windows
+yolu içeren bir cevapta ise yoldan sonrası tümüyle kayboluyordu. §3'ün 10.
+adımı ("kullanıcıya sonucu sun") harici model yolu için fiilen
+karşılanmıyordu.
+
+**Terminoloji (bilinçli):** cevap *attest edilmiş* değildir. H1 attestation'ı
+**giden prompt byte'larını** bağlar. `ModelAnswer` **güvenilmeyen gelen model
+verisidir**; `sha256` yalnızca kalıcılaşan/gösterilen metnin **bütünlük
+kanıtıdır**, köken (provenance) kanıtı veya kriptografik yetki değildir.
+
+Kilitli değişmezler:
+
+- **H4'e istisna açılmadı.** `sanitize_diagnostic_text`,
+  `DIAGNOSTIC_MESSAGE_MAX_CHARS = 240`, yol redaksiyonu ve `result.summary`
+  davranışı **birebir korunur**. `ModelAnswer` bu hattı, hat gevşetilerek
+  değil, `LocalReadSnapshot`'ın zaten yaptığı gibi **ayrı tipli bir sözleşme**
+  olarak atlar (§4.9'un tipli kaynak sözleşmeleri kuralı). Aynı görev iki
+  temsil taşır: 8.000 karakterlik teslimat ve 240 karakterlik tanılama özeti.
+- **Sıralama zorunludur (`bound_model_text`):** tam `str` tipi (coerce yok,
+  `str()` yok — kural tek bir çağıranda değil, kanonik hattın kendisinde
+  uygulanır; tip dışı değer `TypeError` ile reddedilir) → CRLF/CR → LF →
+  **redaksiyon-güvenli sınırda** kesilen 64.000 karakterlik kaynak penceresi →
+  **paylaşılan kimlik bilgisi redaksiyonu** → 8.000 karaktere baş kesme →
+  sınırlı sabit-nokta döngüsü. Redaksiyon her kesmeden **önce** gelir: sınırın
+  üstünden taşan bir kimlik bilgisi de temizlenir. `redact_local_paths`
+  **çağrılmaz**: bir tanılamada mutlak yol kazara sızıntıdır, bir kod
+  cevabında ise cevabın kendisidir. NFKC yok, strip yok, boşluk daraltma yok;
+  baştaki boşluk, girinti, boş satır ve sondaki satır sonu korunur.
+- **Kaynak penceresi sınırı bir güvenlik kontrolüdür (P2-B'de düzeltildi).**
+  Ham `text[:64000]` bu fonksiyondaki **redaksiyondan önce gelen tek kesme**
+  olurdu; sınırı çaprazlayan bir kimlik bilgisi kendi kalıbının tanıyamayacağı
+  kadar kısa bir **ön eke** indirgenir ve ön ek asla redakte edilmez, çünkü
+  eşleşecek bir şey kalmamıştır. Pencerenin öncesindeki yoğun redaksiyon
+  kalan metni yeterince sıkıştırırsa bu parça 8.000 karakterlik teslimatın
+  **içine** girer; bağlanır, kalıcılaşır, zarfta görünür ve yeniden yüklemeden
+  sağ çıkar. Bu bağımsız incelemede uçtan uca kanıtlandı.
+  Sınır bu yüzden pencere içindeki **son satır sonudur** ve sınırı çaprazlayan
+  **son satırın tamamı atılır**. Satır sonu, her kalıbı sonlandırdığı için
+  seçilmedi — sonlandırmaz: `Bearer\s+`, etiketin `[_\-\s]?`'i, atamanın
+  `\s*` ayırıcısı ve CLI bayrağının `\s+` birleştiricisi satır sonu kabul
+  eder. Seçilme nedeni, paylaşılan politikadaki **her** tanıyıcı için doğru
+  olan daha zayıf ama yeterli özelliktir: *tanınan hiçbir kimlik bilgisi bir
+  satır sonunun iki yanında birden SIR MALZEMESİ taşıyamaz.* `sk-`, JWT ve
+  AWS kalıpları hiç satır sonu içermez; `Bearer` yalnızca anahtar sözcük ile
+  token arasındaki boşlukta satır sonu kabul eder (öncesinde yalnız genel
+  anahtar sözcük kalır); etiketli biçimin değer sınıfı `[^,;\n]+`'tir ve değer
+  içindeki bir kesme yine eşleşip redakte edilir; CLI biçiminin değer
+  tarayıcısı boşluğa, kapanış tırnağına **veya metnin sonuna** kadar gider.
+  Bu özellik 74 gerçekten-çaprazlayan kesme noktasında sıfır sızıntıyla
+  doğrulanmıştır (kontrol: rastgele kesme noktalarının 3.341'inde 244 sızıntı).
+  **Pencere içinde hiç satır sonu yoksa** kanıtlanabilir bir sınır yoktur ve
+  fonksiyon **kapalı düşer**: yarım bir token yayımlamak yerine hiç metin
+  üretmez. Boş cevabı connector doğrulayıcısı reddeder — bu gürültülüdür;
+  sızan bir kimlik bilgisi ön eki olmazdı.
+- **Bant içi kesme işareti yoktur.** Metin okunup kopyalanmak içindir, bu
+  yüzden modelin yazmadığı bir karakter (`…`) içine girmez; kesme bilgisi
+  tipli `truncated` bayrağıyla **bant dışı** taşınır.
+- **`sha256` = `sha256(content)`.** Kalıcılaşan metnin birebir digest'i, bu
+  yüzden **her sınırda yeniden türetilebilir** ve tahrif edilmiş bir satır
+  kontrolü geçemez. Ham veya kesme öncesi metni hash'lemek hiçbir sınırın
+  doğrulayamayacağı bir alan üretirdi. `character_count == len(content)`.
+- **Tek kanonik yapısal sözleşme:** `model_answer_refusal`. Yükleme sınırı,
+  `AgentCore`, connector doğrulayıcısı ve genel zarf **aynı** fonksiyonu
+  çağırır; M3'ün doğrulayıcı sapması tekrarlanmaz. `from_dict` hiçbir şeyi
+  **coerce etmez** (`str()`/`int()`/`bool()` yok) ve hiçbir şeyi onarmaz;
+  bozuk satır boş, `present` olmayan kayda düşer.
+- **`truncated` semantiği (P2-B'de düzeltildi):** tek genel `bool`'dur ve
+  **kaynak penceresi** veya **8.000 çıktı tavanı** aşamalarından herhangi
+  birinin içerik attığı anlamına gelir. Yalnızca **tam tip** doğrulanır.
+  Daha önce ek olarak `truncated=True → len(content) == 8000` kuralı vardı;
+  bu kural **geçersizdi**: kayıp iki bağımsız kaynaktan gelir ve pencerede
+  kesilip ardından yoğun redaksiyonla sıkışan bir cevap meşru biçimde tavanın
+  çok altında kalır. Kural dürüst kayıtları reddediyordu. Bayrak
+  **üretici tarafından atanır**; bütünlüğü digest ile kayda bağlıdır, fakat
+  **tarihsel doğruluğu atılan metin gittikten sonra yeniden kurulamaz** ve
+  hiçbir sınır bunu iddia etmez. Yeni provenance alanı eklenmemiştir
+  (`source_truncated`/`output_truncated` yoktur).
+- **Üretici kapısı connector MANİFESTİdir:** yalnızca manifest'i
+  `EXTERNAL_EGRESS` bildiren bir connector cevap üretebilir. Birleştirilmiş
+  (merged) etki **kullanılmaz**: `merge_side_effects`, manifest'i `NONE` olan
+  bir connector'a task'ın istediği etkiyi olduğu gibi verir, dolayısıyla
+  merged kapı bir task'ın beyanıyla herhangi bir connector'ı "harici model
+  çıktısı" üretmeye yetkili kılardı. Kapı ayrıca yetenek ADI değil yan
+  etkidir, böylece sağlayıcıdan bağımsız çekirdek Claude'a özgü sözcük dağarı
+  öğrenmez.
+- **Yükseltme (lift) `_sanitize_result`'tan ÖNCEDİR**, M3/M5 kaldırmalarıyla
+  aynı noktada. Sonrasında `data` zaten `next_step`'e indirgenmiş olurdu.
+  Yükseltme raise etmez (M3/M5 ile aynı gerekçe: connector sınırından sonra,
+  H3 mutabakatından önce); bozuk aday **bağlanmaz** ve connector'ın kendi
+  doğrulayıcısı görevi kapalı biçimde başarısız kılar.
+- **Otorite değildir.** Onay, `EgressAttestation`, fingerprint, faturalandırma,
+  yaşam döngüsü, connector seçimi, plan, yürütme, filesystem yetkisi ve
+  doğrulama otoritesi cevaptan **etkilenmez**. Proje hafızasına yazılmaz,
+  getirme (retrieval) adayı olmaz ve `DecisionRecord` metni olmaz — karar/geçmiş
+  temsili mevcut 240 karakterlik özet olarak **değişmeden kalır**. M6 getirme
+  kalitesini bilinçli olarak düzeltmez.
+- **Egress izolasyonu.** `_sanitized_payload` adlandırılmış task alanlarından
+  açık bir literal kurar, yani yapısı gereği varsayılan-reddettir ve `Task`'ın
+  alan kazanması onu genişletemez; buna rağmen bu özellik ayakta bir
+  regresyonla sabitlenmiştir. `canonical_outbound` byte'ları, attestation
+  digest'i, fingerprint ve onay önizlemesi cevap varken de **birebir** aynıdır.
+  `EgressAttestation`'ın serileşen sözleşmesine alan **eklenmemiştir** (alan
+  set'i ve somut bir digest sabitlenmiştir). `EGRESS_TOOL_GRANTS` boş kalır.
+- **SECRET.** Mevcut davranış yeniden türetildi ve sabitlendi: SECRET bir task
+  `egress_attestation`'da onay isteği oluşmadan reddedilir ve `execute`'ta
+  süreç başlatılmadan durur. Bu yüzden başarılı bir `ModelAnswer` **hiç
+  oluşmaz**; ulaşılamayacak bir SECRET-çıktı yolu uydurulmamıştır.
+- **Dayanıklılık (H2 değişmedi).** Cevap ancak `conclude_execution` task'ı
+  yazdığında kalıcıdır. Bundan önceki bir çökme cevabı bırakmaz ve **bırakmadığı
+  iddia edilmez**; girişim H2'ye göre `IN_FLIGHT`/yeniden oynatılamaz kalır.
+  `UNKNOWN_OUTCOME` yalnızca H2 günlüğüne bağlıdır; bir cevabın varlığı
+  yürütmenin kesin bittiğinin kanıtı **değildir**. Yeni günlük durumu yoktur,
+  terminal değişmezlik korunur ve cevap terminal durumda **silinmez**
+  (`write_content`'in aksine: bu, tamamlanmış görevin teslimatıdır).
+- **Doğrulama yapısaldır.** `verify` artık efemer connector metadata'sı yerine
+  **kalıcı** `task.model_answer`'ı okur (yeniden başlatmadan sonra o metadata
+  boştu). Kanıt: kayıt yapısal olarak geçerli, metin boş değil, digest metinle
+  uyuşuyor, sayaç metinle uyuşuyor, kullanım bu connector'a atfedilmiş.
+  Cevabın **doğruluğu, isabeti, alaka düzeyi veya halüsinasyon içermediği
+  doğrulanmaz** ve doğrulanabileceği iddia edilmez. `truncated` yalnızca
+  **kanıt olarak raporlanır**, yeniden türetilmez: atılan metin gittikten
+  sonra kesme tarihi kurulamaz ve kısa ama kesilmiş bir cevap meşrudur.
+- **Prompt injection çözülmemiştir.** Zehirlenmiş yerel bir dosya modelin ne
+  söyleyeceğini etkileyebilir. M6'nın çevrelemesi dardır ve gerçektir: cevap
+  **eylemsiz gösterim verisidir**. Ondan türeyen herhangi bir eylem, tam
+  byte'ları bağlayan yeni ve ayrıca incelenen bir yetki sınırından geçmek
+  zorundadır; M6 böyle bir yol açmaz.
+- **Kalıcılık ve şema.** Kayıt mevcut opak `tasks.state_json` içinde yaşar.
+  SQLite şeması **6'da kalır**, migration yoktur, `jarvis/memory.py`
+  değiştirilmemiştir. Ham stdout, ham Claude JSON'u, stderr ve sağlayıcı
+  tanılama iç alanları (`response_type`, `subtype`, `stop_reason`,
+  `api_error_status`, `redacted_items`) **hiç kalıcılaşmaz**. Çıktı zarfı
+  `OUTPUT_SCHEMA_VERSION` 4 → 5 ile sabit `model_answer` bloğunu kazanır
+  (yoksa `null`; sözleşmeyi geçemeyen kayıt için de `null`).
+- **Kabul edilen artık:** paylaşılan kimlik bilgisi politikası meşru kodu da
+  fazladan redakte edebilir (`password: str` → `password: [REDACTED]`). Aşırı
+  redaksiyon güvenli yöndür ve teslimat sadakati için politika
+  **gevşetilmemiştir**.
+- **Non-goals (M6'da kilitli):** `model_answer` → `file_write` çapraz-task
+  aktarımı yok · model çıktısından otomatik dosya oluşturma yok · cevabın
+  otorite olması yok · cevabın Claude'a geri beslenmesi yok · getirme/proje
+  hafızası entegrasyonu yok · ProgressArtifact/değişen-dosya üreticisi yok ·
+  şema migration yok (v6) · H1–H5 ve M1–M5 değişmez.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:
