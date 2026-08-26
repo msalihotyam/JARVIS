@@ -15,6 +15,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Açık model cevabı aktarımı (M7): create-only bir `file_write` görevi, aynı oturumdaki tamamlanmış bir model görevinin cevabını `write.model_answer_task_id` ile tam byte kaynağı olarak **açıkça** referans verebilir. Cevap güvenilmeyen veridir; tek yetki sınırı yine zorunlu `LOCAL_WRITE` onayıdır ve byte'lar onaydan önce görevin içinde dondurulur, kaynak bir daha okunmaz. Bozuk veya tutarsız kalıcı aktarım kimliği asla direct yazmaya dönüşmez: `invalid` yüklenir ve kapalı düşer.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 - Sınırlı çok dosyalı okuma bağlamı (M8): bir `code_analysis` / `code_planning` görevi `context.local_read_task_ids` ile aynı oturumdaki **en fazla 3** tamamlanmış `file_read` görevini açıkça referans verebilir. Kaynaklar CONTEXT_RETRIEVAL'da **hep-ya-hiç** çözümlenir, sıralı tek bir demet olarak dondurulur ve mevcut H1-bağlı egress yolundan gönderilir. Tekil `local_read_task_id` ile birlikte kullanılamaz; referanslar `task.context` içinde **kalmaz**. Bozuk veya eksik demet asla bağlamsız bir model isteğine dönüşmez: `invalid` yüklenir ve kapalı düşer.
+- Sınırlı bölge okuma (M9): `file_read` görevi isteğe bağlı `read` bölümüyle (`start_line`, `max_lines`) bir dosyanın **satır aralığını** okuyabilir. Bölüm yoksa davranış eskisiyle **birebir aynıdır**. Bölge okuma, aynı kanıtlanmış dosya tanıtıcısı üzerinde akış hâlinde çalışır: satır aranırken baytlar sayılıp **atılır**, istenen bölge yakalanır ve bölge 64 KiB yakalama tavanı içinde **kapanmazsa istek reddedilir** — kısmi bir bölge asla başarı olarak dönmez. Böylece 64 KiB üstü olduğu için bugüne kadar hiç okunamayan büyük dosyalar (ör. `jarvis/contracts.py`) satır aralığıyla okunabilir hâle gelir.
 
 ## Yapı
 
@@ -517,6 +518,65 @@ terminal durumda silinmez; yalnız **tüm** M8 alanları eksik olan eski satır
 connector sınırı isteği sessizce bloksuz göndermez, `EGRESS_REFUSED` ile
 kapalı düşer. Zarf şeması 5, SQLite şeması 6 değişmez. Ayrıntılar
 `ARCHITECTURE.md` §4.15'tedir.
+
+### Sınırlı bölge okuma (M9)
+
+Bir `file_read` görevi, dosyanın tamamı yerine bir **satır aralığını** okuyabilir:
+
+```json
+{
+  "objective": "sözleşme bölümünü oku",
+  "capability": "file_read",
+  "scope": {"action": "read", "target": "C:/proje/jarvis/contracts.py"},
+  "read": {"start_line": 1900, "max_lines": 90}
+}
+```
+
+`read` bölümü **yoksa** davranış M3'teki HEAD okumasıyla birebir aynıdır;
+64 KiB üstü bir dosya yine sessizce kırpılmadan reddedilir. Bölüm varsa
+`start_line` (1..1.000.000) ve `max_lines` (1..200) **zorunludur**, ikisi de
+tam `int` olmalıdır (`bool` kabul edilmez), boş `"read": {}` reddedilir ve
+bölüm yalnız `file_read` için geçerlidir.
+
+Fiziksel okuma iki fazlıdır ve mevcut açık tanıtıcının tüm kanıtlarını
+(izinli kök, symlink/reparse reddi, dev/inode yeniden bağlama, hardlink
+reddi, ADS reddi, gizli-dosya politikası) aynen kullanır: **SEEK** fazında
+sabit parçalar okunur, ham `0x0A` sayılır, her parçada NUL reddedilir ve
+baytlar **atılır** (4 MiB tarama tavanı); **CAPTURE** fazında istenen satırlar
+ham olarak biriktirilir. Bölge yalnızca 64 KiB yakalama tavanı içinde
+**kapanırsa** başarılıdır — ya `max_lines` satır tamamlanır ya da EOF'a
+ulaşılır. Kapanmazsa istek reddedilir ve gerekçe daha az satır istenmesini
+söyler. Çözümleme (decode) yalnızca bölge kapandıktan sonra yapılır; bu
+yüzden başarılı bir bölge daima satır sonunda veya EOF'ta biter ve rastgele
+bir tavan baytı hiçbir zaman kod noktası ortasından kesilmiş hâlde
+çözülmez.
+
+Snapshot iki yeni alan kazanır: `start_line` ve `end_line`. Bunlar **sınırlı
+excerpt'in** temsil ettiği kaynak satır aralığını tanımlar — ham yakalamanın
+değil. Karakter tavanı bir satırı ortadan keserse o satır `end_line`'a
+**dâhildir** (okuyucu onun bir kısmını görebiliyor). `byte_size`/`sha256` ise
+**tam ham yakalamayı** tanımlar; bu, HEAD okumasındaki ilişkinin aynısıdır
+(orada yakalama tüm dosyadır). `truncated` tek bir anlam taşır: **görünen
+kısım yakalamanın tamamı değildir** — istenen bölgenin kendisinin kesildiği
+anlamına asla gelmez. Dolayısıyla `truncated == false` iken dönen satır
+sayısı `max_lines`'tan azsa bu **EOF** demektir.
+
+Dayanıklı kimlik `LocalReadKind {head, region, invalid}` (`local_read_kind`,
+`read_start_line`, `read_max_lines`) fail-closed yüklenir: yalnız **tüm** M9
+alanları eksik olan eski satır `head` olur; kind silinip pencere kalırsa,
+`head` bir pencere taşırsa veya değerler kanonik değilse `invalid` olur ve
+connector reddeder — bir bölge okuması asla sessizce HEAD okumasına dönüşüp
+dosyanın başını "1900. satır" etiketiyle geri veremez. M3 tekil hop ve M8
+çoklu bağlam bölge snapshot'larını hiçbir ek üretici/tüketici mantığı
+olmadan tüketir; Claude yüküne `start_line`/`end_line` yalnız bölge
+snapshot'ları için eklenir, HEAD yükü byte-uyumlu kalır. SQLite şeması 6,
+çıktı zarfı 5 değişmez. Ayrıntılar `ARCHITECTURE.md` §4.16'dadır.
+
+**Kabul edilen artık:** 64 KiB'den büyük **tek bir satır** ne HEAD ne de
+REGION okumasıyla okunabilir (HEAD dosya tavanını aşar, REGION satır
+kapanmadığı için reddeder). Küçültülmüş/minified tek satırlık büyük dosyalar
+bu yüzden okunamaz kalır; bu M9 kapsamı dışındadır ve farklı bir ilkel
+gerektirir.
 
 ### Görev-farkında deterministik plan
 

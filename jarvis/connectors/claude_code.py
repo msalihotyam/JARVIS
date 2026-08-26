@@ -34,6 +34,7 @@ from jarvis.contracts import (
     EgressAttestation,
     ErrorCode,
     LocalReadContextKind,
+    LocalReadSnapshot,
     MonetaryState,
     OutboundDataPreview,
     OutcomeStatus,
@@ -876,16 +877,33 @@ class ClaudeCodeConnector(BaseConnector):
         if not retrieval_eligible(current, snapshot.classification):
             return None, 0
         content, over, redactions = cls._bounded_local_content(snapshot.excerpt)
-        return (
-            {
-                "notice": LOCAL_READ_NOTICE,
-                "path": snapshot.relative_path,
-                "byte_size": snapshot.byte_size,
-                "truncated": snapshot.truncated or over,
-                "content": content,
-            },
-            redactions,
-        )
+        block = {
+            "notice": LOCAL_READ_NOTICE,
+            "path": snapshot.relative_path,
+            "byte_size": snapshot.byte_size,
+            "truncated": snapshot.truncated or over,
+            "content": content,
+        }
+        block.update(cls._local_read_span(snapshot))
+        return block, redactions
+
+    @staticmethod
+    def _local_read_span(snapshot: LocalReadSnapshot) -> dict[str, Any]:
+        """M9. The source-line span, emitted ONLY for a region snapshot.
+
+        Without it a bounded region would reach the model labelled by path
+        alone, so lines 1900-1986 of a file would read as its opening lines -
+        the model would be told the wrong thing about content it can see.
+        The span describes the EXCERPT, which is exactly what is serialized
+        here, so the model can read it as "the span of what I am holding".
+
+        Conditional on purpose: a head snapshot carries 0/0 and emits
+        nothing, so the head payload keeps the exact key set, byte size and
+        approval fingerprint it has today.
+        """
+        if not snapshot.start_line:
+            return {}
+        return {"start_line": snapshot.start_line, "end_line": snapshot.end_line}
 
     @staticmethod
     def _bounded_local_content(value: str) -> tuple[str, bool, int]:
@@ -981,14 +999,16 @@ class ClaudeCodeConnector(BaseConnector):
             )
             total += len(content)
             redactions += source_redactions
-            emitted.append(
-                {
-                    "path": snapshot.relative_path,
-                    "byte_size": snapshot.byte_size,
-                    "truncated": snapshot.truncated or over,
-                    "content": content,
-                }
-            )
+            source = {
+                "path": snapshot.relative_path,
+                "byte_size": snapshot.byte_size,
+                "truncated": snapshot.truncated or over,
+                "content": content,
+            }
+            # M9. Same conditional span, for the same reason: a bundled region
+            # must not reach the model mislabelled as a file head.
+            source.update(cls._local_read_span(snapshot))
+            emitted.append(source)
         if total > LOCAL_READ_CONTEXT_MAX_CHARS:  # pragma: no cover - defensive
             raise refusal("the re-derived bundle exceeds its character ceiling")
         return {"notice": LOCAL_READ_NOTICE, "sources": emitted}, redactions

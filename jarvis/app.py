@@ -30,8 +30,12 @@ from jarvis.connectors.local_files import (
     LocalFileWriteConnector,
 )
 from jarvis.contracts import (
+    LOCAL_READ_CAPABILITY,
     LOCAL_READ_CONTEXT_REFERENCE_KEY,
+    LOCAL_READ_MAX_REGION_LINES,
     LOCAL_READ_MAX_SOURCES,
+    LOCAL_READ_MAX_START_LINE,
+    LOCAL_READ_REGION_SECTION,
     LOCAL_READ_TASK_REFERENCE_KEY,
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_MODES,
@@ -44,6 +48,7 @@ from jarvis.contracts import (
     DataClassification,
     ErrorCode,
     LocalReadContextKind,
+    LocalReadKind,
     LocalReadSnapshot,
     LocalWriteRecord,
     MemoryStore,
@@ -66,6 +71,7 @@ from jarvis.contracts import (
     canonical_usd,
     is_expired,
     local_read_reference_refusal,
+    local_read_region_refusal,
     local_read_snapshot_refusal,
     local_write_content_refusal,
     local_write_mode_unsupported,
@@ -172,6 +178,9 @@ _TASK_KEYS = frozenset(
         # verbatim into its payload, so a context key would have been an
         # egress channel for up to 64 KiB of file content.
         "write",
+        # M9. The bounded LINE REGION of the read target. A top-level section
+        # for the same reason ``write`` is: ``context`` egresses verbatim.
+        LOCAL_READ_REGION_SECTION,
     }
 )
 #: M7: ``model_answer_task_id`` is a REFERENCE to a completed same-session
@@ -179,6 +188,9 @@ _TASK_KEYS = frozenset(
 #: ``content`` and the reference is mandatory; the durable source kind is
 #: derived here from that shape and is never accepted from input.
 _WRITE_KEYS = frozenset({"content", "mode", LOCAL_WRITE_SOURCE_KEY})
+#: M9. The only two read-window parameters. Default-deny like every other
+#: section: anything else is rejected, never ignored.
+_READ_KEYS = frozenset({"start_line", "max_lines"})
 _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification"})
 #: ``local_read_task_id`` (M3) is a *reference* to an earlier completed local
 #: read in the same session. Content is never accepted from input: the
@@ -496,6 +508,60 @@ def decode_task_json(raw: str | bytes) -> Task:
             write_source = WriteSource.MODEL_ANSWER
             write_source_task_id = reference
 
+    # M9: the optional bounded read window. Absence of the section is the
+    # existing HEAD read, byte-identical. The durable kind is derived here
+    # from the validated shape and is never read from input.
+    read_input = _section(document, LOCAL_READ_REGION_SECTION, _READ_KEYS)
+    local_read_kind = LocalReadKind.HEAD
+    read_start_line = 0
+    read_max_lines = 0
+    # Presence is asked of the DOCUMENT, not of the decoded section: an empty
+    # ``"read": {}`` is a region request that names no window, and is refused
+    # rather than silently becoming a head read.
+    if LOCAL_READ_REGION_SECTION in document:
+        for field in ("start_line", "max_lines"):
+            if field not in read_input:
+                raise TaskInputError(
+                    f"'{LOCAL_READ_REGION_SECTION}' requires '{field}'."
+                )
+        start_value = read_input["start_line"]
+        max_value = read_input["max_lines"]
+        # ``type() is int`` and not ``isinstance``: ``True`` is an ``int``,
+        # and a boolean must never be accepted as a line number.
+        for name, value in (("start_line", start_value), ("max_lines", max_value)):
+            if type(value) is not int:
+                raise TaskInputError(
+                    f"'{LOCAL_READ_REGION_SECTION}.{name}' must be an integer."
+                )
+        if not 1 <= start_value <= LOCAL_READ_MAX_START_LINE:
+            raise TaskInputError(
+                f"'{LOCAL_READ_REGION_SECTION}.start_line' must be between 1 "
+                f"and {LOCAL_READ_MAX_START_LINE}."
+            )
+        if not 1 <= max_value <= LOCAL_READ_MAX_REGION_LINES:
+            raise TaskInputError(
+                f"'{LOCAL_READ_REGION_SECTION}.max_lines' must be between 1 "
+                f"and {LOCAL_READ_MAX_REGION_LINES}."
+            )
+        if capability != LOCAL_READ_CAPABILITY:
+            raise TaskInputError(
+                f"'{LOCAL_READ_REGION_SECTION}' is only valid for capability "
+                f"'{LOCAL_READ_CAPABILITY}'."
+            )
+        local_read_kind = LocalReadKind.REGION
+        read_start_line = start_value
+        read_max_lines = max_value
+        # The same contract the load boundary and the connector apply, asked
+        # once more here so a shape this boundary would refuse can never be
+        # constructed at all.
+        reason = local_read_region_refusal(
+            local_read_kind, read_start_line, read_max_lines
+        )
+        if reason is not None:  # pragma: no cover - the checks above fired
+            raise TaskInputError(
+                f"'{LOCAL_READ_REGION_SECTION}' is refused: {reason}."
+            )
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -516,6 +582,9 @@ def decode_task_json(raw: str | bytes) -> Task:
         write_source_task_id=write_source_task_id,
         local_read_context_kind=local_read_context_kind,
         local_read_source_task_ids=local_read_source_task_ids,
+        local_read_kind=local_read_kind,
+        read_start_line=read_start_line,
+        read_max_lines=read_max_lines,
     )
 
 
@@ -714,7 +783,7 @@ def _local_read_payload(snapshot: LocalReadSnapshot) -> dict[str, Any] | None:
     """
     if not _safe_local_read_shape(snapshot):
         return None
-    return {
+    payload: dict[str, Any] = {
         "relative_path": snapshot.relative_path,
         "byte_size": snapshot.byte_size,
         "sha256": snapshot.sha256,
@@ -724,6 +793,15 @@ def _local_read_payload(snapshot: LocalReadSnapshot) -> dict[str, Any] | None:
         "excerpt": snapshot.excerpt,
         "read_at": snapshot.read_at,
     }
+    # M9. Which source lines the excerpt actually is, for a REGION read only.
+    # ``0/0`` is the head sentinel the contract validates against the excerpt,
+    # so a head envelope keeps byte-for-byte the shape it has always had - no
+    # new top-level key, no schema bump, and no span asserted about a read
+    # that never requested one.
+    if snapshot.start_line > 0:
+        payload["start_line"] = snapshot.start_line
+        payload["end_line"] = snapshot.end_line
+    return payload
 
 
 def _local_write_payload(record: LocalWriteRecord) -> dict[str, Any] | None:

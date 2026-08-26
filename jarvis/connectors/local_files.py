@@ -29,6 +29,7 @@ from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     LOCAL_READ_CAPABILITY,
     LOCAL_READ_MAX_BYTES,
+    LOCAL_READ_REGION_SCAN_MAX_BYTES,
     LOCAL_READ_RESULT_KEY,
     LOCAL_WRITE_AMBIGUOUS,
     LOCAL_WRITE_CAPABILITY,
@@ -45,6 +46,7 @@ from jarvis.contracts import (
     CostEstimate,
     DataClassification,
     ErrorCode,
+    LocalReadKind,
     LocalReadSnapshot,
     LocalWriteRecord,
     MonetaryState,
@@ -62,8 +64,10 @@ from jarvis.contracts import (
     VerificationStatus,
     bound_local_text,
     canonical_path,
+    excerpt_line_span,
     local_read_denial_reason,
     local_read_path_refusal,
+    local_read_region_refusal,
     local_read_snapshot_refusal,
     local_write_content_refusal,
     local_write_mode_unsupported,
@@ -109,6 +113,41 @@ _TOO_LARGE = (
     "it is refused rather than silently truncated."
 )
 _NOT_TEXT = "Read target is not strict UTF-8 text."
+#: M9. The read window itself is unusable - an INVALID durable identity, or a
+#: head read carrying region parameters. Terminal, like every other input
+#: refusal on this path: no fresh approval can repair it.
+#: M9. Fixed streaming chunk. Bounds peak memory during a region read to one
+#: chunk plus the captured region, independently of how large the file is.
+_REGION_CHUNK_BYTES = 64 * 1024
+_REGION_IDENTITY = "Local read window is not usable:"
+#: M9. The load-bearing refusal of this milestone. A region that has not
+#: closed by the capture ceiling is REFUSED, never returned as a partial
+#: region, because a partial capture would make ``truncated`` ambiguous: it
+#: would then mean either "the view shows less than the capture" or "the
+#: filesystem request itself was cut", and every consumer inference built on
+#: it - including "fewer lines than requested means EOF" - would be unsound.
+#: Redaction can shrink a 64 KiB partial capture below the excerpt cap, so
+#: such a fragment could otherwise arrive with ``truncated`` FALSE.
+_REGION_NOT_CLOSED = (
+    f"The requested region did not close within the {LOCAL_READ_MAX_BYTES}-byte "
+    "capture ceiling; request fewer lines. It is refused rather than returned "
+    "as a partial region."
+)
+_REGION_SCAN_EXCEEDED = (
+    "Locating the first line of the requested region would read past the "
+    f"{LOCAL_READ_REGION_SCAN_MAX_BYTES}-byte scan ceiling."
+)
+_REGION_EMPTY = "The requested region contains no source line."
+
+
+def _region_past_eof(total_lines: int) -> str:
+    """Refusal naming the file's real line count, so a caller paging through
+    a file learns where it ends without the reader ever computing a total on
+    the success path."""
+    return (
+        f"Read target has {total_lines} line(s); the requested region starts "
+        "past the end of the file."
+    )
 #: A hard link is a second NAME for one file, not a link to be resolved, so
 #: nothing in the containment chain can see it: ``resolve`` has nothing to
 #: dereference, it is not a reparse point, and ``GetFinalPathNameByHandleW``
@@ -491,6 +530,26 @@ class _TargetTooLarge(Exception):
 
 class _MultiplyLinked(Exception):
     """The opened file has more than one name, so containment cannot hold."""
+
+
+class _RegionNotClosed(Exception):
+    """The requested region did not close within the capture ceiling."""
+
+
+class _RegionScanExceeded(Exception):
+    """Reaching the region's first line would pass the scan ceiling."""
+
+
+class _NotTextBytes(Exception):
+    """A NUL byte was seen while scanning or capturing; not text."""
+
+
+class _RegionPastEof(Exception):
+    """The file has fewer lines than the requested region's first line."""
+
+    def __init__(self, total_lines: int) -> None:
+        super().__init__(total_lines)
+        self.total_lines = total_lines
 
 
 class _RootBoundLocalConnector(BaseConnector):
@@ -1743,14 +1802,41 @@ class LocalFileReadConnector(_RootBoundLocalConnector):
         if not stat.S_ISREG(expected.st_mode):
             return self._refusal(task, _NOT_REGULAR)
 
+        # M9. THREE-WAY and explicit. Written as an if/elif/else with INVALID
+        # refused FIRST on purpose: a two-way ``if REGION ... else head``
+        # would turn a corrupted region identity into a SUCCESSFUL head read
+        # carrying region metadata - the first lines of the file returned
+        # under a label claiming lines 1900 onward. The shared contract also
+        # refuses a HEAD that carries a window, so neither kind can borrow
+        # the other's parameters.
+        kind = task.local_read_kind
+        reason = local_read_region_refusal(
+            kind, task.read_start_line, task.read_max_lines
+        )
+        if reason is not None:
+            return self._refusal(task, f"{_REGION_IDENTITY} {reason}.")
+
         try:
-            raw, opened = self._read_exact_file(resolved, expected)
+            if kind is LocalReadKind.REGION:
+                raw, opened = self._read_region_file(
+                    resolved, expected, task.read_start_line, task.read_max_lines
+                )
+            else:
+                raw, opened = self._read_exact_file(resolved, expected)
         except _TargetMoved:
             return self._refusal(task, _TARGET_MOVED)
         except _MultiplyLinked:
             return self._refusal(task, _MULTIPLY_LINKED)
         except _TargetTooLarge:
             return self._refusal(task, _TOO_LARGE)
+        except _RegionNotClosed:
+            return self._refusal(task, _REGION_NOT_CLOSED)
+        except _RegionScanExceeded:
+            return self._refusal(task, _REGION_SCAN_EXCEEDED)
+        except _RegionPastEof as exc:
+            return self._refusal(task, _region_past_eof(exc.total_lines))
+        except _NotTextBytes:
+            return self._refusal(task, _NOT_TEXT)
         except OSError as exc:
             # A genuine I/O fault, not a policy refusal: retryable, and the
             # message is the structured-error contract's own bounded text.
@@ -1770,6 +1856,20 @@ class LocalFileReadConnector(_RootBoundLocalConnector):
             return self._refusal(task, _NOT_TEXT)
 
         excerpt, truncated = bound_local_text(text)
+        # M9. The span describes the BOUNDED EXCERPT, not the raw capture, so
+        # it is derived AFTER bounding. That is what makes it honest for
+        # every consumer: whatever reaches M3, M8 or a model payload is
+        # exactly the span these two numbers name. A line the character cap
+        # cut in half still counts, because the reader can see part of it.
+        if kind is LocalReadKind.REGION:
+            span = excerpt_line_span(excerpt, truncated)
+            if span < 1:  # pragma: no cover - an empty region already refused
+                return self._refusal(task, _REGION_EMPTY)
+            start_line = task.read_start_line
+            end_line = start_line + span - 1
+        else:
+            start_line = 0
+            end_line = 0
         # From the path the OPEN HANDLE proved, never from the pathname that
         # was merely validated, so what is persisted names the file that was
         # actually read.
@@ -1789,12 +1889,15 @@ class LocalFileReadConnector(_RootBoundLocalConnector):
             # can establish, raise or lower authority.
             classification=DataClassification.SECRET,
             read_at=utc_now(),
+            start_line=start_line,
+            end_line=end_line,
         )
         return ToolResult(
             outcome=OutcomeStatus.SUCCESS,
             summary=(
                 f"Read {relative_path}: {len(raw)} bytes, "
                 f"{len(excerpt)}-character bounded excerpt"
+                f"{f' (lines {start_line}-{end_line})' if start_line else ''}"
                 f"{' (truncated)' if truncated else ''}."
             ),
             data={LOCAL_READ_RESULT_KEY: snapshot},
@@ -1829,6 +1932,11 @@ class LocalFileReadConnector(_RootBoundLocalConnector):
                 f"byte_size={snapshot.byte_size}",
                 f"sha256={snapshot.sha256}",
                 f"truncated={'true' if snapshot.truncated else 'false'}",
+            )
+            + (
+                (f"lines={snapshot.start_line}-{snapshot.end_line}",)
+                if snapshot.start_line
+                else ()
             ),
         )
 
@@ -1883,6 +1991,173 @@ class LocalFileReadConnector(_RootBoundLocalConnector):
             raw = handle.read(LOCAL_READ_MAX_BYTES + 1)
         if len(raw) > LOCAL_READ_MAX_BYTES:
             raise _TargetTooLarge()
+        return raw, opened
+
+    def _read_region_file(
+        self,
+        resolved: Path,
+        expected: os.stat_result,
+        start_line: int,
+        max_lines: int,
+    ) -> tuple[bytes, Path]:
+        """Read ONE bounded line region, over the same proven descriptor.
+
+        ``_read_exact_file`` is deliberately left untouched: a head read is
+        the same single bounded ``read`` it always was. This is a second,
+        separate path that reuses every proof that one relies on - the
+        descriptor comes from ``_open_in_root``, and the dev/inode rebinding,
+        the regular-file check and the hard-link refusal are re-asked here on
+        the OPENED file before a byte is kept. None of those proofs is tied
+        to how long the handle stays open; they are anchored to the
+        descriptor, which is what makes a streaming read safe.
+
+        Two phases, and the split is the whole design:
+
+        SEEK    read chunks bounded by what is LEFT of the scan ceiling,
+                count raw newline bytes, refuse a NUL anywhere in the prefix
+                actually traversed, and DISCARD every byte. Nothing is
+                decoded here, so locating line 200 000 of a large file costs
+                no memory and no decoding.
+        CAPTURE from the byte after the (start_line - 1)-th newline, RETAIN
+                raw bytes until the region CLOSES - either the max_lines-th
+                newline is consumed, or the file ends. Reading stops there;
+                the rest of the file is never touched.
+
+        The region succeeds ONLY if it closes at or under the capture
+        ceiling. One byte past the ceiling is accepted into the buffer purely
+        to PROVE the region is still open - the same trick, for the same
+        reason, as the head reader's ``read(LOCAL_READ_MAX_BYTES + 1)``. That
+        sentinel byte can never reach content, ``byte_size`` or ``sha256``,
+        because reaching it is a refusal.
+
+        Both phases are bounded at the DESCRIPTOR and not only in the
+        counters: the handle is unbuffered, and every read asks for at most
+        what is left of its phase's ceiling. So the PHYSICAL bytes this
+        function pulls off the file are at most
+        LOCAL_READ_REGION_SCAN_MAX_BYTES while seeking and at most
+        LOCAL_READ_MAX_BYTES + 1 while capturing.
+
+        Nothing is decoded until the region has closed, which is what makes
+        the strict UTF-8 rule sound: a successful region ends at a newline or
+        at EOF, and both are code-point boundaries in a valid UTF-8 file, so
+        an arbitrary ceiling byte is never handed to the decoder.
+        """
+        descriptor, opened = self._open_in_root(resolved)
+        closed: str | None = None
+        captured = bytearray()
+        # Unbuffered ON PURPOSE, and only here (P2-2). A buffered reader
+        # prefetches whole blocks, so a logical one-byte read for the
+        # sentinel pulls kilobytes off the descriptor: the accounting below
+        # would sit inside its ceilings while the FILE DESCRIPTOR had already
+        # read past them. With ``buffering=0`` one ``read(n)`` is one bounded
+        # descriptor read, which is what makes both bounds true of the
+        # descriptor rather than of a counter - SEEK fetches at most
+        # LOCAL_READ_REGION_SCAN_MAX_BYTES, CAPTURE at most
+        # LOCAL_READ_MAX_BYTES + 1. The head reader is untouched: it issues a
+        # single bounded read and has never had a prefetch to bound.
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            actual = os.fstat(handle.fileno())
+            if not stat.S_ISREG(actual.st_mode) or (
+                actual.st_dev,
+                actual.st_ino,
+            ) != (expected.st_dev, expected.st_ino):
+                raise _TargetMoved()
+            if actual.st_nlink > 1:
+                raise _MultiplyLinked()
+
+            scanned = 0
+            newlines = 0
+            last_byte: int | None = None
+            pending = b""
+            while newlines < start_line - 1:
+                # Bounded BEFORE the read, never audited after it (P2-1):
+                # asking for a whole chunk and only then noticing the ceiling
+                # was passed has already pulled those bytes off the
+                # descriptor, so the declared scan bound would describe a
+                # counter rather than the file.
+                remaining = LOCAL_READ_REGION_SCAN_MAX_BYTES - scanned
+                if remaining <= 0:
+                    raise _RegionScanExceeded()
+                chunk = handle.read(min(_REGION_CHUNK_BYTES, remaining))
+                if not chunk:
+                    # The canonical line rule: no lines in an empty file,
+                    # otherwise one per newline plus a final unterminated one.
+                    total = (
+                        newlines
+                        if (scanned == 0 or last_byte == 0x0A)
+                        else newlines + 1
+                    )
+                    raise _RegionPastEof(total)
+                scanned += len(chunk)
+                last_byte = chunk[-1]
+                cursor = 0
+                while newlines < start_line - 1:
+                    index = chunk.find(b"\n", cursor)
+                    if index < 0:
+                        cursor = len(chunk)
+                        break
+                    newlines += 1
+                    cursor = index + 1
+                # The scanned prefix is what was actually TRAVERSED to reach
+                # the boundary (P2-3) - ``cursor``, not the whole chunk.
+                # Bytes past the boundary are the first bytes of the region,
+                # not part of the seek, and CAPTURE judges them; checking
+                # them here would let a NUL OUTSIDE the requested region
+                # refuse a read it has nothing to do with.
+                if b"\x00" in chunk[:cursor]:
+                    raise _NotTextBytes()
+                if newlines == start_line - 1:
+                    pending = chunk[cursor:]
+
+            ceiling = LOCAL_READ_MAX_BYTES + 1
+            region_lines = 0
+            while closed is None:
+                if not pending:
+                    room = ceiling - len(captured)
+                    if room <= 0:
+                        break
+                    chunk = handle.read(min(_REGION_CHUNK_BYTES, room))
+                    if not chunk:
+                        closed = "eof"
+                        break
+                    pending = chunk
+                room = ceiling - len(captured)
+                take = pending[:room]
+                pending = pending[len(take) :]
+                cursor = 0
+                consumed: int | None = None
+                while region_lines < max_lines:
+                    index = take.find(b"\n", cursor)
+                    if index < 0:
+                        break
+                    region_lines += 1
+                    cursor = index + 1
+                    if region_lines == max_lines:
+                        consumed = cursor
+                        closed = "lines"
+                        break
+                # The region's own bytes and nothing past its closing
+                # newline (P2-3). Once the region has CLOSED, the rest of the
+                # fetched chunk is not part of this read at all, so it can
+                # neither be captured nor refuse the capture; while the
+                # region is still open every byte taken IS region content and
+                # is checked.
+                window = take if consumed is None else take[:consumed]
+                if b"\x00" in window:
+                    raise _NotTextBytes()
+                captured.extend(window)
+                if consumed is None and len(captured) >= ceiling:
+                    break
+
+        if closed is None:
+            raise _RegionNotClosed()
+        raw = bytes(captured)
+        if len(raw) > LOCAL_READ_MAX_BYTES:
+            raise _RegionNotClosed()
+        if not raw:
+            # The seek found start_line - 1 newlines and nothing followed, so
+            # the requested first line does not exist.
+            raise _RegionPastEof(start_line - 1)
         return raw, opened
 
     def _open_in_root(self, resolved: Path) -> tuple[int, Path]:

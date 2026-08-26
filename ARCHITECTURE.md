@@ -2136,6 +2136,115 @@ taşımıyor; bu bir eksiltme değil, alanın anlamı). M3 tekil yolu — dilbil
 yük, fingerprint ve zarf — bilerek **hiç** değiştirilmemiş, mevcut borç olarak
 korunmuştur.
 
+### 4.16 Sınırlı bölge okuma (M9, uygulandı)
+
+**Çözülen darboğaz.** M3'ten beri `file_read` tek bir sınırlı okumaydı ve
+`LOCAL_READ_MAX_BYTES` (64 KiB) **dosyanın** tavanıydı: bu tavanı aşan dosya
+kırpılmaz, **tümüyle reddedilirdi**. Bu repodaki `contracts.py` (~200 KiB),
+`core.py` (~176 KiB), `memory.py` (~106 KiB) ve `local_files.py` (~86 KiB)
+dolayısıyla hiç okunamıyordu. M9 tavanın anlamını değiştirmez; **okunan
+pencereyi** getirir.
+
+**Ürün kuralı.** `file_read` isteğe bağlı bir üst düzey `read` bölümü kabul
+eder: `start_line` (1 tabanlı, dâhil, 1..1.000.000) ve `max_lines`
+(1..200), ikisi de tam `int` (`bool` reddedilir). Bölüm yoksa davranış
+HEAD okumasıdır ve **hiç değişmemiştir**. Yeni capability, yeni connector,
+byte-offset veya anchor kipi yoktur. Bölüm `context` altında değil üst
+düzeydedir; `write` için geçerli olan gerekçe aynen geçerlidir: `context`
+Claude yüküne birebir serileşir.
+
+**Dayanıklı kimlik.** `LocalReadKind {HEAD, REGION, INVALID}` ile
+`Task.local_read_kind`, `Task.read_start_line`, `Task.read_max_lines`. Kind
+içseldir ve girdiden asla alınmaz. Tek kanonik sözleşme
+`local_read_region_refusal(kind, start_line, max_lines)`; giriş sınırı,
+`Task.from_dict` ve connector aynı fonksiyonu sorar. HEAD hiç pencere
+taşımaz — bu madde, kind anahtarı silinmiş ama pencere duran bir satırın
+sıradan bir HEAD okumasına dönüşmesini engeller: sonuç `INVALID` olur.
+Connector'daki dallanma bilerek **üç yolludur** ve INVALID önce reddedilir;
+iki yollu bir `if REGION ... else head` yazımı bozuk bir kimliği başarılı bir
+HEAD okumasına çevirir ve dosyanın başını bölge etiketiyle geri verirdi.
+
+**Fiziksel okuma.** `_read_exact_file` (HEAD) **hiç değiştirilmemiştir**.
+Yanına ayrı bir `_read_region_file` eklenmiştir; aynı `_open_in_root`
+tanıtıcısını kullanır ve dev/inode yeniden bağlama, S_ISREG ve hardlink
+reddi açık tanıtıcı üzerinde yeniden sorulur — bu kanıtların hiçbiri
+tanıtıcının kısa ömürlü olmasına bağlı değildir, hepsi tanıtıcıya
+bağlıdır; akış hâlinde okumayı güvenli kılan da budur. İki faz:
+
+- **SEEK**: sabit 64 KiB parçalar okunur, ham `0x0A` sayılır, her parçada NUL
+  reddedilir, toplam `LOCAL_READ_REGION_SCAN_MAX_BYTES` (4 MiB) ile
+  sınırlanır ve **her bayt atılır**. Bu fazda hiçbir çözümleme yapılmaz.
+- **CAPTURE**: `start_line - 1`'inci satır sonundan itibaren ham baytlar
+  biriktirilir; bölge **kapanınca** okuma durur, dosyanın kalanına hiç
+  dokunulmaz.
+
+**Başarı koşulu ve kısmi bölge yasağı.** Bölge yalnızca 64 KiB yakalama
+tavanı içinde kapanırsa başarılıdır: ya `max_lines` satır tamamlanır (A) ya
+da EOF'a ulaşılır (B). Aksi hâlde **reddedilir**. Bu, M9'un en kritik
+kuralıdır: kısmi bir yakalama başarı sayılsaydı iki ayrı kırpılma ilişkisi
+doğardı (istek→yakalama ve yakalama→excerpt) ve `truncated` ikisini birden
+anlatamazdı. Somut kanıt: 200 uzun mutlak-yol satırı 64 KiB'yi aşar, ama
+yol redaksiyonu her satırı kısa bir işarete indirdiği için **kısmi** bir
+yakalama 4000 karakter tavanının altına düşer ve `truncated=False` ile
+gelirdi; tüketici "istenenden az satır + hiçbir şey kesilmedi" durumunu EOF
+sanardı. Ölçülen: 65.403 baytlık kısmi yakalama → 2.709 karakter,
+`truncated=False`. Reddetme bu hatayı kaynağında yok eder.
+
+Tavan tespiti için tam **bir sentinel bayt** okunur (`MAX + 1`), tıpkı HEAD
+okumasının `read(LOCAL_READ_MAX_BYTES + 1)` hilesi gibi; bu bayt asla
+içeriğe, `byte_size`'a veya `sha256`'ya girmez, çünkü ona ulaşmak zaten bir
+rettir.
+
+**UTF-8.** Çözümleme yalnızca bölge kapandıktan **sonra** yapılır. Başarılı
+bir bölge daima satır sonunda veya EOF'ta biter; ikisi de geçerli UTF-8
+kod-noktası sınırlarıdır, dolayısıyla rastgele bir tavan baytı hiçbir zaman
+çözümleyiciye verilmez. Artımlı çözümleyici veya sınır onarımı **yoktur**.
+Tam bir bölge yine de katı UTF-8'i geçemezse dosya zaten geçerli UTF-8
+değildir ve bugünkü gibi reddedilir.
+
+**Snapshot anlamları.** `LocalReadSnapshot` iki alan kazanır: `start_line` ve
+`end_line`, ve bunlar **sınırlı excerpt'in** kaynak satır aralığını tanımlar
+— M3/M8/model yüküne ulaşabilen tek şey odur. Karakter tavanı bir satırı
+ortadan keserse o satır dâhildir. `byte_size`/`sha256` **tam ham yakalamayı**
+tanımlar; bu HEAD ile birebir aynı ilişkidir (orada yakalama tüm dosyadır ve
+excerpt yine kırpılabilir). `truncated` tek anlam taşır: görünen kısım
+yakalamanın tamamı değil. Bunun sonucu, artık sağlam olan çıkarımdır:
+`truncated == false` iken `(end_line - start_line + 1) < max_lines` ise
+**EOF'a ulaşılmıştır**.
+
+**Excerpt satır aralığı.** Tek kanonik yardımcı
+`excerpt_line_span(excerpt, truncated)`. Var oluş nedeni ölçülmüş bir
+hatadır: `truncate_retrieved_text` `value[: cap - 1] + "…"` üretir, kesim tam
+bir satır sonundan hemen sonraya denk gelirse sentetik elips **kendi başına
+bir satırda** kalır ve saf newline sayımı aralığı bir fazla bildirir. Bu
+repodaki gerçek bölgelerde ~572 örnekten 7'sinde (90 satırlık bölgelerin
+~%0,6'sında) gerçekleşir. Elips **yalnız** `truncated=True` iken atılır; bu
+sayede içeriği gerçekten "…" ile biten bir dosya doğru sayılır. Redaksiyon
+satır **uzunluklarını** değiştirir ama satır **sayısını** değiştirmez
+(işaretler newline içermez), bu yüzden aralık sınırlamadan sonra excerpt'ten
+türetilir ve `local_read_snapshot_refusal` içinde
+`end_line - start_line + 1 == excerpt_line_span(...)` olarak **snapshot'tan
+tek başına** doğrulanabilir. Kabul edilen sınır: iki uçun aynı miktarda
+kaydırılması aralığı korur ve snapshot'tan tespit edilemez — bu, excerpt
+metninin kendisinin değiştirilmesiyle aynı güven düzeyidir.
+
+**Kompozisyon ve sağlayıcı bağımsızlığı.** `core.py` **değişmemiştir**: M3
+tekil hop `replace` ile yeni alanları taşır, M8 çoklu bağlam bölge
+kaynaklarını ek üretici/tüketici mantığı olmadan dondurur, sınıflandırma
+yeniden bağlama aynıdır ve donmuş bir bölge sonradan tüketilirken dosya
+**hiç yeniden okunmaz**. Claude yalnızca serileştiricidir: `start_line` ve
+`end_line` tekil `local_read` bloğuna ve her M8 kaynağına **yalnız bölge
+snapshot'ları için** eklenir, böylece HEAD yükü anahtar kümesi, byte boyutu
+ve onay fingerprint'i olarak aynen kalır. Yetki değişmez — bölge okuma hâlâ
+`LOCAL_READ`'dir; yeni onay kipi, H1/H2/H3 kavramı veya EgressAttestation
+alanı yoktur. SQLite şeması 6, çıktı zarfı 5.
+
+**Kabul edilen artık.** 64 KiB'den büyük **tek bir satır** ne HEAD ne de
+REGION ile okunabilir: HEAD dosya tavanını aşar, REGION ise satır
+kapanmadığı için reddeder. Minified tek satırlık büyük dosyalar bu yüzden
+JARVIS için okunamaz kalır. Bu bilinçli bir M9 sınırıdır ve farklı bir ilkel
+(bayt- veya sütun-sınırlı satır penceresi) gerektirir.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:

@@ -1771,6 +1771,19 @@ LOCAL_READ_EXCERPT_MAX_CHARS = 4_000
 #: task row reaches the envelope, the approval preview and the outbound
 #: payload. A real in-root source path never approaches this.
 LOCAL_READ_PATH_MAX_CHARS = 512
+#: M9. Hard ceiling on how many source lines ONE bounded region read may
+#: request. The excerpt character cap almost always binds first; this refuses
+#: an absurd request outright rather than silently narrowing it.
+LOCAL_READ_MAX_REGION_LINES = 200
+#: M9. Hard ceiling on the first line a region read may name.
+LOCAL_READ_MAX_START_LINE = 1_000_000
+#: M9. Hard ceiling on the bytes a region read may SCAN while locating its
+#: first line. Deliberately a SEPARATE policy surface from
+#: ``LOCAL_READ_MAX_BYTES``, which bounds what is CAPTURED: the two answer
+#: different questions and must stay free to diverge, so neither may alias
+#: the other. Scanned bytes are counted, checked for NUL and discarded; they
+#: are never retained, decoded, persisted or egressed.
+LOCAL_READ_REGION_SCAN_MAX_BYTES = 4 * 1024 * 1024
 #: How many canonical passes ``bound_local_text`` may take to reach a fixed
 #: point. Two suffice for every reachable input; the third is the margin that
 #: keeps the bound explicit rather than assumed.
@@ -1882,6 +1895,44 @@ def bound_local_text(value: str) -> tuple[str, bool]:
             return text, truncated
         text = bounded
     return text, truncated
+
+
+def excerpt_line_span(excerpt: str, truncated: bool) -> int:
+    """How many SOURCE lines a bounded excerpt represents, at least partially.
+
+    THE canonical answer, used both by the region reader to derive
+    ``end_line`` and by ``local_read_snapshot_refusal`` to prove a persisted
+    span against the excerpt it claims to describe.
+
+    The subtlety this function exists for: ``truncate_retrieved_text`` builds
+    ``value[: cap - 1] + ELLIPSIS``, so when the cut lands immediately after
+    a newline the excerpt ends with a newline followed by the ellipsis, which
+    then sits ALONE on a trailing line carrying no source content. Counting
+    newlines naively over-reports the span by exactly one. Measured on real
+    regions of this repo that happens on roughly one 90-line region in a
+    hundred - rare enough to survive review, common enough to be wrong in
+    production.
+
+    The synthetic marker is stripped ONLY when ``truncated`` is true, which
+    is what keeps a file whose real content ends in an ellipsis counted
+    correctly: nothing was cut, so nothing is removed. After the strip both
+    cases collapse into one rule - a mid-line cut leaves text not ending in a
+    newline (the partial line counts, because the reader can see part of it),
+    and a post-newline cut leaves text ending in one (the phantom line does
+    not count).
+
+    Line counting is the canonical rule for text this module has already
+    newline-normalized: no lines in empty text, otherwise one per newline
+    plus one more for a final unterminated line.
+    """
+    if not excerpt:
+        return 0
+    text = excerpt
+    if truncated and text.endswith("…"):
+        text = text[:-1]
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
 def canonical_utc_timestamp(value: Any) -> str | None:
@@ -1999,6 +2050,24 @@ def local_read_snapshot_refusal(value: Any) -> str | None:
         return "classification is not an exact DataClassification"
     if canonical_utc_timestamp(value.read_at) is None:
         return "read timestamp is not a canonical UTC timestamp"
+    # M9. The region span, proved against the excerpt it claims to describe.
+    # ``type() is int`` and not ``isinstance``: ``True`` is an ``int``.
+    if type(value.start_line) is not int or type(value.end_line) is not int:
+        return "region line span is not an exact integer pair"
+    if value.start_line == 0 and value.end_line == 0:
+        return None
+    if not 1 <= value.start_line <= LOCAL_READ_MAX_START_LINE:
+        return "region start line is outside its ceiling"
+    if value.end_line < value.start_line:
+        return "region end line precedes its start line"
+    span = value.end_line - value.start_line + 1
+    if span > LOCAL_READ_MAX_REGION_LINES:
+        return "region span exceeds its line ceiling"
+    # The check that makes a tampered span detectable from the snapshot
+    # ALONE, with no filesystem access: the claimed span must be exactly the
+    # span the excerpt actually shows.
+    if span != excerpt_line_span(value.excerpt, value.truncated):
+        return "region span does not match the excerpt it describes"
     return None
 
 
@@ -2027,6 +2096,19 @@ class LocalReadSnapshot:
     truncated: bool = False
     classification: DataClassification = DataClassification.SECRET
     read_at: str = ""
+    #: M9. The SOURCE-LINE SPAN the bounded ``excerpt`` represents - not the
+    #: span of the raw capture. Both 0 for a head read. For a region read
+    #: ``start_line`` is the requested first line and ``end_line`` is the last
+    #: source line shown at least partially, so a line cut in half by the
+    #: character cap still counts: the reader can see part of it.
+    #:
+    #: ``byte_size``/``sha256`` describe the COMPLETE RAW CAPTURE; these two
+    #: and ``excerpt``/``truncated`` describe the VISIBLE VIEW of it. That is
+    #: exactly the relationship a head read already has, where the capture is
+    #: the whole file, and ``truncated`` means only "the view shows less than
+    #: the capture" - never that the requested region itself was cut.
+    start_line: int = 0
+    end_line: int = 0
 
     @property
     def present(self) -> bool:
@@ -2041,6 +2123,8 @@ class LocalReadSnapshot:
             "truncated": self.truncated,
             "classification": self.classification.value,
             "read_at": self.read_at,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
         }
 
     @classmethod
@@ -2096,6 +2180,12 @@ class LocalReadSnapshot:
             truncated=truncated,
             classification=classification,
             read_at=data.get("read_at", ""),
+            # M9. Taken verbatim; a legacy pre-M9 row has neither key and
+            # loads as the head span. Nothing is coerced - a non-integer or an
+            # inconsistent span is judged by the one contract below and
+            # discards the whole snapshot rather than being repaired.
+            start_line=data.get("start_line", 0),
+            end_line=data.get("end_line", 0),
         )
         return candidate if local_read_snapshot_refusal(candidate) is None else cls()
 
@@ -2936,6 +3026,79 @@ def local_read_context_refusal(kind: Any, ids: Any, sources: Any) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# M9. Bounded region read (durable read-window identity)
+# --------------------------------------------------------------------------
+
+#: The task section naming a bounded LINE REGION of the read target. A
+#: TOP-LEVEL section, not a ``context`` key, for the same reason ``write``
+#: is: the Claude connector serializes ``context`` verbatim, so parameters
+#: kept there would egress with every request. The decoded values live in
+#: typed ``Task`` fields instead.
+LOCAL_READ_REGION_SECTION = "read"
+
+
+class LocalReadKind(str, Enum):
+    """Durable identity of WHICH WINDOW of a file a read task asks for.
+
+    Internal persisted state, never user-supplied authority: the input
+    boundary derives it from the validated ``read`` shape and nothing else
+    ever sets it. It exists so that a task created as a bounded REGION read
+    can never silently become a HEAD read merely because its persisted
+    parameters were corrupted - which would not just lose the window, it
+    would MISLABEL the result, handing back the first lines of a file under
+    metadata claiming lines 1900 onward.
+
+    A malformed or inconsistent identity loads as ``INVALID`` - a typed
+    verdict the connector refuses - rather than as either active kind.
+    ``INVALID`` is never produced by the input boundary; it is accepted on
+    load only so that load -> resave -> load stays invalid.
+
+    The identity carries no filesystem authority of its own: a region read is
+    still LOCAL_READ, still bounded by the same allowed roots, and still
+    subject to every existing containment, symlink, hardlink, ADS and
+    secret-file refusal.
+    """
+
+    HEAD = "head"
+    REGION = "region"
+    INVALID = "invalid"
+
+
+_LOCAL_READ_KIND_VALUES = frozenset(item.value for item in LocalReadKind)
+
+
+def local_read_region_refusal(kind: Any, start_line: Any, max_lines: Any) -> str | None:
+    """Why this (kind, start_line, max_lines) triple is not a usable window.
+
+    THE single contract for the read window, asked by the input boundary, by
+    ``Task.from_dict`` and by the connector before a descriptor is opened.
+    Exact types only - ``type() is int`` and not ``isinstance``, because
+    ``True`` is an ``int`` and a boolean must never be read as a line number.
+
+    ``HEAD`` must carry NO parameters at all. That clause is what stops a
+    tampered row whose kind key was deleted from loading as an ordinary head
+    read while still holding a window: the kind defaults to ``HEAD``, the
+    leftover parameters are seen here, and the triple is refused. Only the
+    COMPLETE absence of M9 state is a legacy row.
+    """
+    if type(kind) is not LocalReadKind:
+        return "read kind is not an exact LocalReadKind"
+    if kind is LocalReadKind.INVALID:
+        return "read window identity is invalid"
+    if type(start_line) is not int or type(max_lines) is not int:
+        return "read window bounds are not exact integers"
+    if kind is LocalReadKind.HEAD:
+        if start_line != 0 or max_lines != 0:
+            return "a head read carries a region window"
+        return None
+    if not 1 <= start_line <= LOCAL_READ_MAX_START_LINE:
+        return "region start line is outside its ceiling"
+    if not 1 <= max_lines <= LOCAL_READ_MAX_REGION_LINES:
+        return "region line count is outside its ceiling"
+    return None
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -3763,6 +3926,18 @@ class Task:
     #: retrieval candidate and never authority of any kind. Retained at
     #: terminal state exactly like the M3 singular snapshot.
     local_read_sources: tuple[LocalReadSnapshot, ...] = ()
+    #: M9. Durable identity of the read WINDOW this task asks for, derived by
+    #: the input boundary from the validated ``read`` section and never
+    #: accepted from input as such. A malformed or inconsistent persisted
+    #: window loads as ``INVALID`` and is refused by the connector, so a
+    #: region read can never silently degrade into a head read wearing a
+    #: region label.
+    local_read_kind: LocalReadKind = LocalReadKind.HEAD
+    #: M9. The 1-based inclusive first source line, and how many lines to
+    #: read. Both 0 for a head read. This is the REQUEST; what was actually
+    #: produced is described by the snapshot's own span.
+    read_start_line: int = 0
+    read_max_lines: int = 0
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -3823,6 +3998,17 @@ class Task:
             "local_read_sources": [
                 snapshot.to_dict() for snapshot in self.local_read_sources
             ],
+            # M9. Persisted verbatim and never erased. The kind is defended
+            # here exactly as the M7 and M8 ones are: ``.value`` on a raw
+            # string would raise, and that raw string would then satisfy a
+            # later membership test as if it were a member.
+            "local_read_kind": (
+                self.local_read_kind.value
+                if type(self.local_read_kind) is LocalReadKind
+                else LocalReadKind.INVALID.value
+            ),
+            "read_start_line": self.read_start_line,
+            "read_max_lines": self.read_max_lines,
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -3916,6 +4102,29 @@ class Task:
         if local_read_context_kind is LocalReadContextKind.INVALID:
             local_read_source_task_ids = ()
             local_read_sources = ()
+        # M9. The durable read window loads FAIL CLOSED, and only the
+        # COMPLETE absence of M9 state is a legacy pre-M9 row. A missing kind
+        # key defaults to HEAD, but the contract below then refuses a HEAD
+        # that still carries a window - so deleting the kind key on a real
+        # region read yields INVALID, never a silently mislabelled head read.
+        raw_read_kind = data.get("local_read_kind", LocalReadKind.HEAD.value)
+        if type(raw_read_kind) is str and raw_read_kind in _LOCAL_READ_KIND_VALUES:
+            local_read_kind = LocalReadKind(raw_read_kind)
+        else:
+            local_read_kind = LocalReadKind.INVALID
+        raw_start = data.get("read_start_line", 0)
+        raw_max = data.get("read_max_lines", 0)
+        if type(raw_start) is not int or type(raw_max) is not int:
+            raw_start, raw_max = 0, 0
+            local_read_kind = LocalReadKind.INVALID
+        if (
+            local_read_kind is not LocalReadKind.INVALID
+            and local_read_region_refusal(local_read_kind, raw_start, raw_max)
+            is not None
+        ):
+            local_read_kind = LocalReadKind.INVALID
+        if local_read_kind is LocalReadKind.INVALID:
+            raw_start, raw_max = 0, 0
         return cls(
             objective=data["objective"],
             capability=data["capability"],
@@ -3982,6 +4191,9 @@ class Task:
             local_read_context_kind=local_read_context_kind,
             local_read_source_task_ids=local_read_source_task_ids,
             local_read_sources=local_read_sources,
+            local_read_kind=local_read_kind,
+            read_start_line=raw_start,
+            read_max_lines=raw_max,
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),
