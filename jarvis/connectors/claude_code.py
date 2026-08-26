@@ -15,7 +15,9 @@ from typing import Any
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     DIAGNOSTIC_DETAIL_MAX_CHARS,
+    LOCAL_READ_CONTEXT_MAX_CHARS,
     LOCAL_READ_EXCERPT_MAX_CHARS,
+    LOCAL_READ_MAX_SOURCES,
     MODEL_ANSWER_RESULT_KEY,
     RETRIEVAL_MAX_CHARACTERS,
     RETRIEVAL_MAX_ITEMS,
@@ -31,6 +33,7 @@ from jarvis.contracts import (
     DataClassification,
     EgressAttestation,
     ErrorCode,
+    LocalReadContextKind,
     MonetaryState,
     OutboundDataPreview,
     OutcomeStatus,
@@ -49,6 +52,7 @@ from jarvis.contracts import (
     build_model_answer,
     canonical_path,
     canonical_usd,
+    local_read_context_refusal,
     local_read_snapshot_refusal,
     model_answer_refusal,
     looks_like_path,
@@ -73,6 +77,16 @@ SECRET_KEY_PATTERN = re.compile(
 SECRET_EGRESS_REFUSAL = (
     "SECRET tasks never reach the external Claude Code process: prompt "
     "redaction alone cannot bound what the process reads locally."
+)
+
+#: M8. The single refusal text for an unusable bounded read context, used at
+#: BOTH boundaries exactly the way ``SECRET_EGRESS_REFUSAL`` is: raised as an
+#: ``AttestationError`` while an attestation is being built, and returned as
+#: an ``EGRESS_REFUSED`` result from inside ``execute``.
+LOCAL_READ_CONTEXT_EGRESS_REFUSAL = (
+    "A task that durably declared bounded local-read context never reaches "
+    "the external Claude Code process without it: silently omitting an "
+    "expected bundle would change what the approval bound."
 )
 
 #: External tool grants for the Claude Code execution path. Deliberately EMPTY.
@@ -439,9 +453,20 @@ class ClaudeCodeConnector(BaseConnector):
         # The same boundary computation the attestation used: the working
         # directory and target are re-resolved here, right before the process
         # that can inspect them is created.
+        #
+        # ``_build_prompt`` is INSIDE this block on purpose (M8). It can now
+        # raise ``AttestationError`` for an unusable frozen read context, and
+        # this call site runs AFTER ``open_execution_attempt`` and
+        # ``begin_execution``: an escaping raise would be treated as an
+        # unknowable outcome for an EXTERNAL_EGRESS effect, marking the
+        # attempt UNKNOWN_OUTCOME and stranding its reservation. Converted
+        # here it becomes the same clean, replay-safe EGRESS_REFUSED result
+        # the boundary check already returns, and the attempt concludes
+        # FINISHED. Nothing is spawned either way: this precedes Popen.
         try:
             self.resource_boundary(task)
             working_directory = self._working_directory(task.context)
+            prompt, redacted_count = self._build_prompt(task)
         except (AttestationError, ValueError) as exc:
             return self._error_result(
                 task,
@@ -452,7 +477,6 @@ class ClaudeCodeConnector(BaseConnector):
                 billing_evidence=evidence,
             )
 
-        prompt, redacted_count = self._build_prompt(task)
         command = self._command(prompt)
         try:
             process = subprocess.Popen(
@@ -794,9 +818,17 @@ class ClaudeCodeConnector(BaseConnector):
         local_read, local_read_redactions = self._local_read(task)
         if local_read is not None:
             payload["local_read"] = local_read
+        # M8. Unlike every other optional block this one can REFUSE rather
+        # than be omitted; see ``_local_read_context``.
+        read_context, read_context_redactions = self._local_read_context(task)
+        if read_context is not None:
+            payload["local_read_context"] = read_context
         return (
             payload,
-            redactions + retrieved_redactions + local_read_redactions,
+            redactions
+            + retrieved_redactions
+            + local_read_redactions
+            + read_context_redactions,
         )
 
     @classmethod
@@ -871,6 +903,95 @@ class ClaudeCodeConnector(BaseConnector):
         if len(bounded) > LOCAL_READ_EXCERPT_MAX_CHARS:  # pragma: no cover - defensive
             bounded, over = bounded[: LOCAL_READ_EXCERPT_MAX_CHARS - 1] + "\u2026", True
         return bounded, over, credential_redactions
+
+    @classmethod
+    def _local_read_context(cls, task: Task) -> tuple[dict[str, Any] | None, int]:
+        """Default-deny view of the frozen multi-file bundle - or a REFUSAL.
+
+        This block is the one part of the payload that must never be quietly
+        dropped. Every other optional block is a nicety: if it cannot be
+        vouched for, omitting it costs the model some context and nothing
+        else. This one is different, because the task DURABLY DECLARED that
+        it carries a bundle. Omitting it would send a context-LESS request
+        under an approval whose reason promised N excerpts, so an unusable
+        bundle raises ``AttestationError`` and the whole request fails closed
+        - exactly the way a SECRET task already does here.
+
+        The four outcomes are exhaustive:
+
+        * ``NONE`` with genuinely empty state -> no block, payload unchanged;
+        * ``NONE`` carrying injected references or excerpts -> REFUSED;
+        * ``REFERENCES`` with a complete, valid, eligible bundle -> the full
+          ordered block;
+        * ``REFERENCES`` that is malformed, short, over budget or carries an
+          ineligible source, and ``INVALID`` -> REFUSED.
+
+        Persisted state is untrusted here exactly like the singular snapshot:
+        the one canonical structural contract, the classification ladder and
+        the count are all re-checked at this boundary. Nothing is dropped
+        from the bundle and no subset is ever emitted.
+
+        The exact and complete outbound field set per source is ``path``,
+        ``byte_size``, ``truncated`` and ``content`` - the same fields the
+        singular block sends. Source task ids, digests, read timestamps and
+        classifications stay local. Frozen order is preserved: ``sort_keys``
+        in the encoder orders dict keys and never list elements.
+        """
+        kind = task.local_read_context_kind
+        ids = task.local_read_source_task_ids
+        sources = task.local_read_sources
+
+        def refusal(detail: str) -> AttestationError:
+            return AttestationError(
+                ErrorCode.EGRESS_REFUSED,
+                f"{LOCAL_READ_CONTEXT_EGRESS_REFUSAL} Refused: {detail}.",
+            )
+
+        reason = local_read_context_refusal(kind, ids, sources)
+        if reason is not None:
+            raise refusal(reason)
+        if kind is LocalReadContextKind.NONE:
+            return None, 0
+        # A payload is only ever built at RISK_PERMISSION or later, both
+        # strictly after CONTEXT_RETRIEVAL, so a REFERENCES task must carry
+        # one snapshot per reference by now. The shared contract is
+        # stage-blind and also accepts the pre-resolution shape; here that
+        # shape is never acceptable.
+        if len(sources) != len(ids):
+            raise refusal("the frozen bundle does not match its reference count")
+        if len(sources) > LOCAL_READ_MAX_SOURCES:  # pragma: no cover - defensive
+            raise refusal("the frozen bundle exceeds its source ceiling")
+        current = task.scope.data_classification
+        if type(current) is not DataClassification:
+            # SECURITY-CRITICAL and NOT redundant, exactly as in
+            # ``_local_read``: ``DataClassification`` is a ``str, Enum``, so a
+            # raw ``"public"`` compares AND hashes equal to the member and
+            # would satisfy the ladder silently. Do not simplify it away.
+            raise refusal("the task classification is malformed")
+        emitted: list[dict[str, Any]] = []
+        redactions = 0
+        total = 0
+        for snapshot in sources:
+            if not retrieval_eligible(current, snapshot.classification):
+                raise refusal(
+                    "the classification ladder does not allow a frozen source"
+                )
+            content, over, source_redactions = cls._bounded_local_content(
+                snapshot.excerpt
+            )
+            total += len(content)
+            redactions += source_redactions
+            emitted.append(
+                {
+                    "path": snapshot.relative_path,
+                    "byte_size": snapshot.byte_size,
+                    "truncated": snapshot.truncated or over,
+                    "content": content,
+                }
+            )
+        if total > LOCAL_READ_CONTEXT_MAX_CHARS:  # pragma: no cover - defensive
+            raise refusal("the re-derived bundle exceeds its character ceiling")
+        return {"notice": LOCAL_READ_NOTICE, "sources": emitted}, redactions
 
     @classmethod
     def _retrieved_memory(cls, task: Task) -> tuple[dict[str, Any] | None, int]:

@@ -30,6 +30,8 @@ from jarvis.connectors.local_files import (
     LocalFileWriteConnector,
 )
 from jarvis.contracts import (
+    LOCAL_READ_CONTEXT_REFERENCE_KEY,
+    LOCAL_READ_MAX_SOURCES,
     LOCAL_READ_TASK_REFERENCE_KEY,
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_MODES,
@@ -41,6 +43,7 @@ from jarvis.contracts import (
     CostEstimate,
     DataClassification,
     ErrorCode,
+    LocalReadContextKind,
     LocalReadSnapshot,
     LocalWriteRecord,
     MemoryStore,
@@ -62,6 +65,7 @@ from jarvis.contracts import (
     WriteSource,
     canonical_usd,
     is_expired,
+    local_read_reference_refusal,
     local_read_snapshot_refusal,
     local_write_content_refusal,
     local_write_mode_unsupported,
@@ -180,8 +184,18 @@ _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification
 #: read in the same session. Content is never accepted from input: the
 #: snapshot is always re-derived from the referenced task's persisted state
 #: and re-validated in ``AgentCore``.
+#:
+#: ``local_read_task_ids`` (M8) is the plural form naming 1..3 such reads.
+#: It is decoded into typed ``Task`` fields and deliberately NOT written back
+#: into ``context``, which the Claude connector serializes verbatim. Exactly
+#: one of the two keys may be supplied.
 _CONTEXT_KEYS = frozenset(
-    {"working_directory", "inputs", LOCAL_READ_TASK_REFERENCE_KEY}
+    {
+        "working_directory",
+        "inputs",
+        LOCAL_READ_TASK_REFERENCE_KEY,
+        LOCAL_READ_CONTEXT_REFERENCE_KEY,
+    }
 )
 _PREFERENCE_KEYS = frozenset(
     {"preferred_connector", "needs_clarification", "clarification_question", "assumption"}
@@ -332,6 +346,58 @@ def decode_task_json(raw: str | bytes) -> Task:
     )
     if local_read_reference.strip():
         context[LOCAL_READ_TASK_REFERENCE_KEY] = local_read_reference.strip()
+    # M8: the plural form. Shape-validated here only; same-session
+    # membership, COMPLETED source status, the producer gate, snapshot
+    # validity and the classification ladder are all proven later against
+    # storage, where any failure fails the task closed.
+    #
+    # The decoded references become TYPED fields and are deliberately never
+    # written into ``context``: the Claude connector serializes ``context``
+    # verbatim, so a context key would egress the task ids for no benefit.
+    local_read_context_kind = LocalReadContextKind.NONE
+    local_read_source_task_ids: tuple[str, ...] = ()
+    if LOCAL_READ_CONTEXT_REFERENCE_KEY in context_input:
+        # Exactly one of the two reference forms. Checked on KEY PRESENCE,
+        # not on truthiness, so an empty singular alongside a plural is
+        # still refused rather than silently ignored.
+        if LOCAL_READ_TASK_REFERENCE_KEY in context_input:
+            raise TaskInputError(
+                "'context' accepts exactly one of "
+                f"'{LOCAL_READ_TASK_REFERENCE_KEY}' or "
+                f"'{LOCAL_READ_CONTEXT_REFERENCE_KEY}'."
+            )
+        references = context_input[LOCAL_READ_CONTEXT_REFERENCE_KEY]
+        # ``type() is not list`` and not ``isinstance``: a list subclass is
+        # not this contract, and a bare string must be refused rather than
+        # iterated into one reference per character.
+        if type(references) is not list:
+            raise TaskInputError(
+                f"'context.{LOCAL_READ_CONTEXT_REFERENCE_KEY}' must be a list."
+            )
+        if not 1 <= len(references) <= LOCAL_READ_MAX_SOURCES:
+            raise TaskInputError(
+                f"'context.{LOCAL_READ_CONTEXT_REFERENCE_KEY}' must name "
+                f"between 1 and {LOCAL_READ_MAX_SOURCES} tasks."
+            )
+        for index, reference in enumerate(references):
+            # The same grammar the persistence load boundary and the
+            # resolver apply. Nothing is stripped or coerced, so a padded
+            # reference is refused rather than quietly canonicalized.
+            reason = local_read_reference_refusal(reference)
+            if reason is not None:
+                raise TaskInputError(
+                    f"'context.{LOCAL_READ_CONTEXT_REFERENCE_KEY}[{index}]' "
+                    f"is refused: {reason}."
+                )
+        if len(set(references)) != len(references):
+            raise TaskInputError(
+                f"'context.{LOCAL_READ_CONTEXT_REFERENCE_KEY}' names the "
+                "same task twice."
+            )
+        # Order is the user's and is preserved verbatim: it decides the
+        # frozen bundle order, the outbound order and the approval identity.
+        local_read_source_task_ids = tuple(references)
+        local_read_context_kind = LocalReadContextKind.REFERENCES
 
     preference_input = _section(document, "preferences", _PREFERENCE_KEYS)
     preferences: dict[str, Any] = {}
@@ -448,6 +514,8 @@ def decode_task_json(raw: str | bytes) -> Task:
         write_mode=write_mode,
         write_source=write_source,
         write_source_task_id=write_source_task_id,
+        local_read_context_kind=local_read_context_kind,
+        local_read_source_task_ids=local_read_source_task_ids,
     )
 
 

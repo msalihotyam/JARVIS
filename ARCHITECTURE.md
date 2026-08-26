@@ -1992,6 +1992,150 @@ Kilitli değişmezler:
   byte-byte geri yüklenen koşularla öldürülmüştür. Hiçbir canlı
   model/connector/auth/ağ çağrısı yapılmamıştır.
 
+### 4.15 Sınırlı çok dosyalı okuma bağlamı (M8, uygulandı)
+
+**Ürün kuralı.** Bir harici-model görevi (`code_analysis`, `code_planning`)
+`context.local_read_task_ids` ile aynı oturumdaki 1..3 tamamlanmış `file_read`
+görevini açıkça referans verebilir. JARVIS her kaynağı CONTEXT_RETRIEVAL'da
+**tam bir kez** çözer, hepsini doğrular, sıralı ve sınırlı tek bir demeti
+tüketici görevin üzerine dondurur ve bu demeti mevcut H1-bağlı egress yolundan
+Claude'a gönderir. M8 yeni dosya sistemi yetkisi, model görevi tarafından
+doğrudan dosya okuma, yeni Claude aracı, yeni connector, orkestrasyon motoru,
+SQLite göçü, çıktı şeması artışı veya oturumlar arası referans **getirmez**.
+Kaynak snapshot'lar GÜVENİLMEYEN DOSYA VERİSİ olarak kalır.
+
+**Giriş sözleşmesi.** `_CONTEXT_KEYS` yeni anahtarı tanır; değer tam `list`,
+1..3 öğe, her öğe `local_read_reference_refusal` dilbilgisinden geçen tam
+`str`'dir (boş değil, NUL yok, baş/son boşluk **kırpılmaz — reddedilir**, ≤64
+karakter). Tekrar reddedilir. Tekil/çoğul XOR'u **anahtar varlığına** göre
+uygulanır, dolayısıyla boş bir tekil ile birlikte verilen çoğul da reddedilir.
+Çözülen referanslar tipli alanlara gider; `task.context` içine **yazılmaz**,
+çünkü Claude connector'ı `context`'i birebir serileştirir.
+
+**Dayanıklı kimlik.** `LocalReadContextKind {NONE, REFERENCES, INVALID}` ile
+`Task.local_read_context_kind`, `Task.local_read_source_task_ids: tuple[str, ...]`
+ve `Task.local_read_sources: tuple[LocalReadSnapshot, ...]`. Kind içseldir,
+girdiden asla alınmaz ve terminal durumda silinmez. Tek kanonik sözleşme
+`local_read_context_refusal(kind, ids, sources)`; giriş sınırı, `Task.from_dict`
+ve `AgentCore` aynı fonksiyonu sorar. Aşama-bağımlı yarı (`sources` çözümleme
+öncesi boş, sonrası `len(ids)`) M7'deki gibi çekirdekte durur.
+
+**Yükleme kapalı düşer.** Yalnız **tüm** M8 alanları eksik olan eski satır
+`NONE` yüklenir. Kind anahtarı silinip id/kaynak kalırsa kind varsayılan
+olarak `NONE` olur, ancak sözleşmenin "NONE hiç durum taşımaz" maddesi bunu
+görür ve sonuç `INVALID` olur — bozuk bir demet asla sıradan bağlamsız bir
+göreve dönüşmez. Kanonik olmayan kind, bozuk id listesi, tam `list` olmayan
+kaynak listesi, sayı uyuşmazlığı ve bozuk tek bir snapshot da `INVALID`'dir;
+bozuk snapshot demetten **düşürülmez**, tüm demeti reddeder. `INVALID`
+save/load döngülerinde korunur. Hiçbir yerde `str()`/`bool()`/`Enum()` zorlaması
+yoktur.
+
+**Tüketici kapısı.** **PLAN'da**, plan göreve konduktan sonra ve
+`registry.select(task)` çağrılmadan hemen önce; yalnız genel registry
+API'siyle (`list_names`/`get`/`can_handle`): en az bir kayıtlı connector
+görevi karşılamalı ve görevi karşılayan **her** connector'ın manifest'i
+`EXTERNAL_EGRESS` olmalıdır. Çekirdek burada ne connector adı ne capability
+adı öğrenir.
+
+Aşama seçimi güvenlik açısından belirleyicidir ve bilerek CONTEXT_RETRIEVAL
+**değildir**. `can_handle` tüm görevin fonksiyonudur; demet henüz
+dondurulmamışken `local_read_sources`'a bakan bir connector `False`, dondurma
+sonrasında `True` döndürebilir. Kapı çözümleyicinin içinde sorulsaydı yalnız
+ilk cevabı görür, `registry.select` ise ikincisine göre yol seçerdi — yani
+egress olmayan, yüksek öncelikli bir connector kapıyı atlatıp donmuş demeti
+alabilirdi (bağımsız inceleme bunu P1 olarak üretti ve `execute`'a ulaştığını
+kanıtladı). Kapı bu yüzden seçimin göreceği **tam** görev durumu üzerinde
+çalışır; tercih edilen (`preferred_connector`) bir connector de bu politikayı
+atlatamaz, çünkü politika seçimden önce ve tüm kayıtlı connector'lar üzerinde
+değerlendirilir. Belirsizlik kabul değil rettir: registry sayılamazsa veya bir
+connector alınıp sorulamazsa görev kapalı düşer, okunamayan aday atlanmaz.
+
+**Seçim sonrası savunma.** `registry.select` döndükten sonra, `selected_connector`
+göreve **yazılmadan** önce, seçilen connector bir kez daha yargılanır: mevcut
+görevi gerçekten karşılamalı ve manifest etkisi `EXTERNAL_EGRESS` olmalıdır.
+Sayım ve seçim aynı registry üzerinde iki ayrı kod yoludur; ikisi ayrışırsa
+yürütebilen taraf yargılanmamış olan olmamalıdır. Reddedilen bir connector
+göreve hiç kaydedilmez ve hiçbir attestation, onay veya girişim oluşmaz.
+
+**Kaynak kapıları ve hep-ya-hiç çözümleme.** `_bind_referenced_local_reads`
+her referans için sırayla: dilbilgisi, kendi kendine referans değil, aynı
+oturum, yüklenebilir, COMPLETED, `source.capability == LOCAL_READ_CAPABILITY`,
+tam `str` `selected_connector`, kayıtlı üretici, üretici manifest'inde
+`LOCAL_READ_CAPABILITY`, `local_read.present`, iki taraf da tam
+`DataClassification`, sınıflandırmanın kaynak `scope`'undan yeniden bağlanması,
+`local_read_snapshot_refusal` ve `retrieval_eligible(hedef, kaynak)`.
+Görev capability'si **ve** üretici manifest'i birlikte gerekir: kurcalanmış bir
+satır ikisinden birini tek başına taklit edebilir ve hiçbiri diğerini
+kapsamaz; ikisi birlikte transitif kopyalanmış snapshot'ı (kendisi bir
+`local_read` taşıyan bir model görevi) reddeder. Doğrulananlar **yerel** bir
+listede toplanır; `task.local_read_sources` yalnızca hepsi geçtiyse, en sonda,
+**bir kez** atanır. Aksi hâlde demet `()` kalır ve görev terminal
+`INVALID_TASK` olur — connector seçimi, onay, girişim ve model çağrısı
+oluşmaz.
+
+**Bütçe ve sıra.** `LOCAL_READ_MAX_SOURCES = 3`,
+`LOCAL_READ_CONTEXT_MAX_CHARS = 12000` (`len(str)` = kod noktası, UTF-8 byte
+değil; 3 × 4000 kanonik snapshot bunu zaten sağlar, bu yüzden sınır
+savunmacıdır). 12000 kabul, 12001 ret. İkinci kırpma katmanı ve otomatik kaynak
+düşürme yoktur. Kullanıcı sırası her hopta korunur; `_encode_payload`'daki
+`sort_keys` sözlük anahtarlarını sıralar, liste elemanlarını asla.
+
+**Aşamalar.** CONTEXT_RETRIEVAL sırası: M7 yazma kimliği → **M8 kimliği** →
+M3 tekil hop → **M8 çoğul çözümleyici** → M7 model-cevap çözümleyicisi →
+getirme → `context_retrieved`. PLAN sırası: kanonik plan → **M8 tüketici
+politikası (donmuş görev üzerinde)** → `registry.select` → **seçilen connector
+savunma kontrolü** → `selected_connector` yazımı → `plan_created`. M8 kimlik
+kontrolü ayrıca RISK_PERMISSION'da
+ilk attestation'dan ve EXECUTE'ta `open_execution_attempt`/`begin_execution`
+öncesinde çalışır. Checkpoint öncesi çökme demeti kalıcılaştırmaz ve
+çözümleyici yeniden çalışır; checkpoint sonrası hiçbir kaynak görev bir daha
+yüklenmez. H2 değişmemiştir.
+
+**H1 / onay provenansı.** `EgressAttestation` değişmez. Onay gerekçesi
+kaynak sayısı, toplam excerpt karakteri ve **sıralı** kaynak kimliği demetinin
+sha256'sını taşır (`json.dumps(list(ids), separators=(",", ":"),
+ensure_ascii=True)`); ham task id'leri taşımaz. Gerekçe `display_digest`
+üzerinden fingerprint'e bağlıdır, bu yüzden onay sonrası id veya sıra değişimi
+eski grant'i kullanılamaz kılar — çıkan byte'lar aynı kalsa bile. Dondurulmuş
+içerik zaten `outbound_digest` üzerinden bağlıdır, bu yüzden gerekçede ikinci
+bir içerik digest'i tekrarlanmaz. Gerekçe yalnız gösterim metadatasıdır;
+yürütme yetkisi değildir ve kurulurken hiçbir kaynak görev okunmaz.
+
+**Claude yükü ve connector kapalı-düşmesi.** Yeni isteğe bağlı blok
+`local_read_context`: `notice` (mevcut `LOCAL_READ_NOTICE`) ve sıralı
+`sources`; her kaynak yalnız `path`, `byte_size`, `truncated`, `content`
+taşır — tekil bloğun alan kümesiyle aynı. Kaynak task id'leri, sha256,
+`read_at` ve sınıflandırma yereldedir. Bu blok, diğer isteğe bağlı bloklardan
+farklı olarak **sessizce düşürülemez**: görev demet taşıdığını dayanıklı
+biçimde beyan ettiği için, bloğu atlamak onayın bağladığından farklı bir istek
+göndermek olurdu. `NONE` + gerçekten boş durum → blok yok (normal);
+`REFERENCES` + geçerli demet → tam sıralı blok; `REFERENCES` + bozuk/eksik/
+kısmi/uygunsuz demet, `INVALID` ve `NONE` + enjekte durum →
+`AttestationError(EGRESS_REFUSED)`. Tek yüklem `_local_read_context` içinde
+yaşar; `outbound_preview`, `canonical_outbound` ve `execute` aynı kurucudan
+geçtiği için üç yol da aynı deterministik sonucu verir.
+
+**EXECUTE yaşam döngüsü düzeltmesi.** `_build_prompt` artık
+`AttestationError` yükseltebilir ve `execute` içindeki çağrı yeri attempt
+claim'inden **sonradır**; kaçan bir yükseltme `EXTERNAL_EGRESS` için
+bilinemez sonuç sayılıp attempt'i `UNKNOWN_OUTCOME` bırakır ve rezervasyonu
+askıda tutardı. Bu yüzden çağrı, `resource_boundary` için zaten var olan
+`(AttestationError, ValueError)` try/except bloğunun **içine** alınmıştır;
+sonuç `retryable=False`, `call_count=0` olan temiz bir `EGRESS_REFUSED`
+`ToolResult`'tır, attempt FINISHED olarak kapanır ve `subprocess.Popen`'a hiç
+ulaşılmaz. H2 ve H3 değişmemiştir.
+
+**İzolasyon.** Kaynak excerpt'leri `DecisionRecord`'a, proje hafızasına veya
+getirme adaylarına asla girmez; kaynak `file_read` görevleri hâlâ karar
+yazmaz; getirme bütçesi 5 / 4000, M8 bütçesi ayrı 3 / 12000'dir. Tüketici
+görev sırasında dosya sistemi okunmaz ve `EGRESS_TOOL_GRANTS` boş kalır.
+Çıktı zarfı v5'tir; `local_reads`/`local_read_context` eklenmemiştir ve çoğul
+tüketicide tekil `local_read` anahtarı `null` kalır (görev **tek** bir okuma
+taşımıyor; bu bir eksiltme değil, alanın anlamı). M3 tekil yolu — dilbilgisi,
+`context` davranışı, kaynak-id egress'i, üretici kapısının yokluğu, çözümleyici,
+yük, fingerprint ve zarf — bilerek **hiç** değiştirilmemiş, mevcut borç olarak
+korunmuştur.
+
 ## 5. İzin ve güvenlik modeli
 
 Üç kullanıcı modu kesinleşmiştir:

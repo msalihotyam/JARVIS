@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -12,6 +13,7 @@ from jarvis.contracts import (
     COST_CAP_GATE,
     DIAGNOSTIC_DETAIL_MAX_CHARS,
     LOCAL_READ_CAPABILITY,
+    LOCAL_READ_CONTEXT_REFERENCE_KEY,
     LOCAL_READ_RESULT_KEY,
     LOCAL_READ_TASK_REFERENCE_KEY,
     LOCAL_WRITE_CAPABILITY,
@@ -42,6 +44,7 @@ from jarvis.contracts import (
     ExecutionAttempt,
     ExecutionClaimOutcome,
     LedgerSnapshot,
+    LocalReadContextKind,
     LocalReadSnapshot,
     LocalWriteRecord,
     LoopStage,
@@ -78,6 +81,8 @@ from jarvis.contracts import (
     format_usd,
     handoff_eligible,
     is_expired,
+    local_read_context_refusal,
+    local_read_reference_refusal,
     local_read_snapshot_refusal,
     local_write_content_refusal,
     local_write_identity_refusal,
@@ -609,6 +614,15 @@ class AgentCore:
                 identity_failure = self._write_identity_failure(session, task)
                 if identity_failure is not None:
                     return identity_failure
+                # M8: the durable read-context identity is judged next, before
+                # either read resolver runs. A corrupted bundle is terminal
+                # here, so a multi-file consumer can never fall through to the
+                # no-context path merely because its provenance was damaged.
+                read_context_failure = self._local_read_context_failure(
+                    session, task
+                )
+                if read_context_failure is not None:
+                    return read_context_failure
                 # M3: an explicit reference to an earlier completed local read
                 # is resolved here, before retrieval, so an unusable reference
                 # fails the task closed rather than half-populating it. It is
@@ -618,6 +632,16 @@ class AgentCore:
                 local_read_failure = self._bind_referenced_local_read(session, task)
                 if local_read_failure is not None:
                     return local_read_failure
+                # M8: the plural hop resolves and freezes the ordered bundle
+                # here, before retrieval and three stages before the first
+                # attestation, so no approval can ever bind live source
+                # pointers instead of frozen excerpts. The two hops are
+                # mutually exclusive by the identity check above.
+                read_context_bind_failure = self._bind_referenced_local_reads(
+                    session, task
+                )
+                if read_context_bind_failure is not None:
+                    return read_context_bind_failure
                 # M7: the explicit model answer handoff resolves and freezes
                 # the write bytes here, before retrieval and three stages
                 # before the first write attestation, so no approval can ever
@@ -731,10 +755,25 @@ class AgentCore:
                     return self._stage_failure(
                         session, task, LoopStage.PLAN, ErrorCode.INVALID_TASK, exc
                     )
+                # M8: the consumer-connector policy is evaluated HERE, on
+                # the exact frozen task ``registry.select`` is about to route,
+                # and never on the pre-freeze one.
+                consumer_failure = self._local_read_consumer_failure(session, task)
+                if consumer_failure is not None:
+                    return consumer_failure
                 try:
                     selection = self.registry.select(task)
                 except Exception as exc:  # noqa: BLE001 - stage boundary
                     return self._selection_failure(session, task, exc)
+                # M8: and the connector selection actually returned is judged
+                # again, before it is recorded. Enumeration and selection are
+                # different code paths over the same registry; if they ever
+                # disagree, the one that can execute must not be the weaker.
+                selected_failure = self._local_read_selection_failure(
+                    session, task, selection.connector
+                )
+                if selected_failure is not None:
+                    return selected_failure
                 task.selected_connector = selection.connector.manifest.name
                 mark_stage_completed(task, LoopStage.PLAN)
                 task.stage = LoopStage.RISK_PERMISSION
@@ -756,6 +795,15 @@ class AgentCore:
                 identity_failure = self._write_identity_failure(session, task)
                 if identity_failure is not None:
                     return identity_failure
+                # M8: nor for a task whose frozen read bundle is not usable.
+                # Past CONTEXT_RETRIEVAL this demands one validated snapshot
+                # per reference, so a bundle that was emptied or truncated
+                # after the checkpoint can never be approved as if intact.
+                read_context_failure = self._local_read_context_failure(
+                    session, task
+                )
+                if read_context_failure is not None:
+                    return read_context_failure
                 # The billing route is established before the user is asked for
                 # anything and before cost preflight, tool selection or
                 # execution can be reached.
@@ -925,6 +973,15 @@ class AgentCore:
                 identity_failure = self._write_identity_failure(session, task)
                 if identity_failure is not None:
                     return identity_failure
+                # M8: the same judgement for the frozen read bundle, and for
+                # the same reason - it precedes open_execution_attempt and
+                # begin_execution, so a damaged bundle opens no attempt and
+                # never becomes a context-less external model request.
+                read_context_failure = self._local_read_context_failure(
+                    session, task
+                )
+                if read_context_failure is not None:
+                    return read_context_failure
                 # Last gate before the connector runs. A persisted task can be
                 # resumed straight into this stage, so the billing route is
                 # re-derived here and never taken from the stored estimate.
@@ -1947,7 +2004,9 @@ class AgentCore:
                 # persisted target fields only - never from the source task -
                 # so RISK_PERMISSION and EXECUTE derive byte-identical text,
                 # and bound into the fingerprint through ``display_digest``.
-                reason = self._handoff_reason(task, connector)
+                reason = self._handoff_reason(
+                    task, connector
+                ) or self._local_read_context_reason(task, connector)
             return self._authoritative_request(
                 task,
                 session,
@@ -3175,6 +3234,355 @@ class AgentCore:
             "bytes resolved from the model answer of task "
             f"{task.write_source_task_id} (sha256 "
             f"{hashlib.sha256(encoded).hexdigest()})."
+        )
+
+    def _local_read_context_failure(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Refuse a task whose durable read-context identity is not usable.
+
+        The one central check of the M8 (kind, references, frozen bundle,
+        stage) consistency, evaluated at every stage that builds authority:
+        the start of CONTEXT_RETRIEVAL, RISK_PERMISSION before the first
+        attestation, and EXECUTE before any claim or side effect. It is what
+        stops a persisted multi-file consumer from ever degrading into a
+        context-LESS external model request.
+
+        ``INVALID`` is terminal. So is a ``NONE`` that still carries
+        references or excerpts, which is how a row whose kind key was
+        deleted is caught: the kind defaults to ``NONE``, the leftover state
+        contradicts it, and the task is refused instead of quietly running
+        with no context. So is a plural reference list that reappeared inside
+        ``task.context``, which the Claude connector serializes verbatim, and
+        so is a task carrying the singular and plural references at once.
+
+        The stage-dependent half mirrors M7 exactly: at CONTEXT_RETRIEVAL a
+        REFERENCES task must carry NO frozen sources (injected excerpts are
+        never frozen), and past it must carry exactly one validated snapshot
+        per reference (an emptied or truncated bundle is never sent).
+
+        Terminal ``INVALID_TASK`` rather than a regate on purpose: none of
+        these can be repaired by a fresh approval, and at EXECUTE the check
+        precedes ``open_execution_attempt``/``begin_execution``, so no
+        attempt is opened, claimed or duplicated. ``None`` means proceed.
+        """
+        reason = local_read_context_refusal(
+            task.local_read_context_kind,
+            task.local_read_source_task_ids,
+            task.local_read_sources,
+        )
+        if reason is None and LOCAL_READ_CONTEXT_REFERENCE_KEY in task.context:
+            # The plural references are TYPED fields. A copy inside context
+            # would travel verbatim into the outbound payload.
+            reason = "the plural reference list must not live in task context"
+        if (
+            reason is None
+            and task.local_read_context_kind is LocalReadContextKind.REFERENCES
+        ):
+            if LOCAL_READ_TASK_REFERENCE_KEY in task.context:
+                reason = (
+                    "a task carries both a singular and a plural local-read "
+                    "reference"
+                )
+            elif task.stage is LoopStage.CONTEXT_RETRIEVAL:
+                if task.local_read_sources:
+                    reason = "frozen sources are present before they were resolved"
+            elif len(task.local_read_sources) != len(
+                task.local_read_source_task_ids
+            ):
+                reason = "the frozen bundle does not match its reference count"
+        if reason is None:
+            return None
+        return self._terminal_failure(
+            session,
+            task,
+            StructuredError(
+                ErrorCode.INVALID_TASK,
+                f"Local read context is not usable: {reason}.",
+            ),
+        )
+
+    @staticmethod
+    def _connector_egress_effect(connector: Any) -> Any:
+        """The connector's OWN manifest effect, or ``None`` if unreadable.
+
+        Deliberately the manifest and not the merged effect: a task may
+        strengthen its effect upward, and that escalation must never make a
+        purely local connector eligible to receive file excerpts.
+        """
+        return getattr(
+            getattr(getattr(connector, "manifest", None), "default_side_effect", None),
+            "effect",
+            None,
+        )
+
+    def _local_read_consumer_failure(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Refuse a frozen bundle whose capability any local connector serves.
+
+        Evaluated at PLAN, on the EXACT task ``registry.select`` is about to
+        route. That timing is the whole point. ``can_handle`` is a function of
+        the whole task, so a connector may answer False while the bundle is
+        empty and True once it is frozen; a policy asked at CONTEXT_RETRIEVAL
+        would see only the first answer and selection would act on the second.
+        Asking here means the state the policy judges and the state selection
+        consumes are the same object.
+
+        The rule is manifest-derived and provider-neutral: at least one
+        registered connector must handle the task, and EVERY connector that
+        handles it must declare ``EXTERNAL_EGRESS`` in its own manifest. So a
+        bundle can never be routed to a connector that would ignore or
+        mishandle it, and a preferred or higher-priority local connector
+        cannot win the route, because it is refused before any selection
+        happens at all.
+
+        Uncertainty is a refusal, never an admission: if the registry cannot
+        be enumerated, or a connector cannot be fetched or asked, the task
+        fails closed rather than the unreadable candidate being skipped.
+        ``None`` means proceed.
+        """
+        if task.local_read_context_kind is not LocalReadContextKind.REFERENCES:
+            return None
+
+        def refuse(detail: str) -> AgentRun:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Local read context has no usable consumer: {detail}.",
+                ),
+            )
+
+        try:
+            names = tuple(self.registry.list_names())
+        except Exception:  # noqa: BLE001 - registry boundary; fail closed
+            return refuse("the connector registry could not be enumerated")
+        capable = []
+        for name in names:
+            # A candidate that cannot be fetched or asked is NOT silently
+            # skipped: skipping it would let an unreadable connector stay out
+            # of the policy and still be selectable.
+            try:
+                candidate = self.registry.get(name)
+                handles = bool(candidate.can_handle(task))
+            except Exception:  # noqa: BLE001 - boundary; fail closed
+                return refuse("a registered connector could not be inspected")
+            if handles:
+                capable.append(candidate)
+        if not capable:
+            return refuse("no registered connector can consume the bundle")
+        for candidate in capable:
+            if self._connector_egress_effect(candidate) is not SideEffect.EXTERNAL_EGRESS:
+                return refuse(
+                    "the capability is not served exclusively by external-model "
+                    "connectors"
+                )
+        return None
+
+    def _local_read_selection_failure(
+        self, session: SessionState, task: Task, connector: Any
+    ) -> AgentRun | None:
+        """Judge the connector selection actually returned, before recording it.
+
+        Defence in depth over ``_local_read_consumer_failure``: that method
+        enumerates the registry, this one interrogates the single object that
+        will really execute. The two are different code paths over the same
+        registry - a preferred-connector route, a registry whose listing and
+        lookup disagree, or a manifest read that differs between them - and
+        if they ever diverge the object that can execute must not be the one
+        that escaped judgement.
+
+        Runs BEFORE ``task.selected_connector`` is assigned, so a refused
+        connector is never recorded on the task, and long before any
+        attestation, approval or execution attempt. ``None`` means proceed.
+        """
+        if task.local_read_context_kind is not LocalReadContextKind.REFERENCES:
+            return None
+
+        def refuse(detail: str) -> AgentRun:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Local read context consumer is not usable: {detail}.",
+                ),
+            )
+
+        try:
+            handles = bool(connector.can_handle(task))
+        except Exception:  # noqa: BLE001 - boundary; fail closed
+            handles = False
+        if not handles:
+            return refuse("the selected connector cannot consume the frozen bundle")
+        if self._connector_egress_effect(connector) is not SideEffect.EXTERNAL_EGRESS:
+            return refuse("the selected connector is not an external-model connector")
+        return None
+
+    def _bind_referenced_local_reads(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Resolve every reference and freeze ONE ordered bounded bundle.
+
+        The third cross-task data hop, and the only one that is plural. Every
+        reference is resolved exactly once, here, before retrieval and three
+        stages before the first attestation; after the ``context_retrieved``
+        checkpoint the frozen tuple is the only context input and no source
+        task is ever read again.
+
+        ALL OR NOTHING, and that is the whole point: every source is proven
+        into a LOCAL list first, and ``task.local_read_sources`` is assigned
+        exactly once, at the end, only if every single source passed. A
+        bundle whose third source fails therefore leaves the task with an
+        EMPTY tuple, and the refusal is terminal ``INVALID_TASK`` before any
+        connector is selected, any approval is requested or any attempt is
+        opened. No partial subset can exist, let alone be sent.
+
+        The consumer gate is manifest-derived and provider-neutral: the
+        capability must be served by at least one registered connector and by
+        NOTHING but external-model connectors, so a bundle can never be
+        attached to a task whose connector would silently ignore it. The core
+        never learns a connector name or a capability name for this.
+
+        ``task.local_read_sources`` is the ONLY field this method writes; the
+        M3 singular ``task.local_read`` is deliberately left untouched.
+        """
+        if task.local_read_context_kind is not LocalReadContextKind.REFERENCES:
+            return None
+
+        def refuse(detail: str) -> AgentRun:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Referenced local read context is not usable: {detail}.",
+                ),
+            )
+
+        # NOTE: the consumer-connector policy is deliberately NOT evaluated
+        # here. ``can_handle`` is a function of the WHOLE task, and at this
+        # point the bundle has not been frozen yet, so a connector whose
+        # ``can_handle`` depends on ``local_read_sources`` would answer False
+        # now and True at PLAN - evading a gate asked here and then winning
+        # ``registry.select``. The policy therefore runs at PLAN, against the
+        # exact post-freeze task selection itself will see.
+        destination = task.scope.data_classification
+        if type(destination) is not DataClassification:
+            return refuse("this task classification is malformed")
+
+        validated: list[LocalReadSnapshot] = []
+        for reference in task.local_read_source_task_ids:
+            if local_read_reference_refusal(reference) is not None:
+                return refuse("a source reference is malformed")
+            if reference == task.id:
+                return refuse("a task cannot reference its own local read")
+            if self.memory.task_session_id(reference) != session.id:
+                return refuse("a source task belongs to another session")
+            try:
+                source = self.memory.load_task(reference)
+            except Exception:  # noqa: BLE001 - storage boundary; fail closed
+                source = None
+            if source is None:
+                return refuse("a source task could not be loaded")
+            if source.status is not TaskStatus.COMPLETED:
+                return refuse("a source task did not complete")
+            # The producer gate. The task's own declared capability AND the
+            # connector that actually ran it are both required: a tampered
+            # row can forge either field alone, and neither check subsumes
+            # the other. Together they reject a transitively copied snapshot
+            # - a model task that itself carries a local read is not a
+            # local-read producer.
+            if source.capability != LOCAL_READ_CAPABILITY:
+                return refuse("a source task is not a local read")
+            producer_name = source.selected_connector
+            if type(producer_name) is not str or not producer_name:
+                return refuse("a source task names no producer")
+            try:
+                producer = self.registry.get(producer_name)
+            except Exception:  # noqa: BLE001 - an unknown producer is a refusal
+                producer = None
+            if producer is None:
+                return refuse("a source producer is not a registered connector")
+            capabilities = getattr(
+                getattr(producer, "manifest", None), "capabilities", ()
+            )
+            if LOCAL_READ_CAPABILITY not in capabilities:
+                return refuse("a source producer does not perform local reads")
+            snapshot = source.local_read
+            if not snapshot.present:
+                return refuse("a source task carries no local read")
+            # P1-3, exactly as the singular hop: the SOURCE TASK's own
+            # authoritative scope classification decides what this snapshot
+            # is. The persisted snapshot classification is NEVER read - a row
+            # edited outside the product could say PUBLIC on a SENSITIVE
+            # task's read, and a raw string or a foreign ``str`` enum would
+            # satisfy both the rank lookup and ``retrieval_eligible``
+            # silently. Both sides come from exact-typed task scope, and the
+            # snapshot is REBUILT with the source authority before it is
+            # validated or compared.
+            source_authority = source.scope.data_classification
+            if type(source_authority) is not DataClassification:
+                return refuse("a source task classification is malformed")
+            snapshot = replace(snapshot, classification=source_authority)
+            try:
+                snapshot = self._validated_local_read(snapshot)
+            except Exception:  # noqa: BLE001 - boundary; fail closed
+                return refuse("a source snapshot is malformed")
+            if not retrieval_eligible(destination, source_authority):
+                return refuse("the classification ladder does not allow it")
+            validated.append(snapshot)
+
+        frozen = tuple(validated)
+        # The count and the combined character budget are judged by the one
+        # canonical contract, on the completed tuple, before it is adopted.
+        reason = local_read_context_refusal(
+            task.local_read_context_kind, task.local_read_source_task_ids, frozen
+        )
+        if reason is not None:
+            return refuse(reason)
+        task.local_read_sources = frozen
+        return None
+
+    @staticmethod
+    def _local_read_context_reason(
+        task: Task, connector: BaseConnector
+    ) -> str | None:
+        """The approval reason of a multi-file read task, from frozen fields.
+
+        Provenance and display only. It names how many excerpts will be sent,
+        how many characters they carry, and the digest of the ORDERED source
+        identity - never the raw task ids, which stay local. It is bound into
+        the fingerprint through ``display_digest``, which is what makes a
+        changed reference or a changed ORDER invalidate an existing approval
+        even though the outbound bytes would be identical. The frozen content
+        is separately bound through ``outbound_digest``, so repeating a
+        content digest here would bind the same bytes twice.
+
+        Derived from the persisted target fields only - no source task is
+        consulted - so RISK_PERMISSION and EXECUTE derive byte-identical
+        text. ``None`` for every other task, so existing reasons, display
+        digests and fingerprints are unchanged.
+        """
+        if task.local_read_context_kind is not LocalReadContextKind.REFERENCES:
+            return None
+        sources = task.local_read_sources
+        total = sum(len(snapshot.excerpt) for snapshot in sources)
+        # A JSON array, so ORDER is significant; ``sort_keys`` is deliberately
+        # not passed, and would not reorder a list if it were.
+        identity = hashlib.sha256(
+            json.dumps(
+                list(task.local_read_source_task_ids),
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return (
+            f"Connector '{connector.manifest.name}' will send {len(sources)} "
+            f"bounded local-read excerpt(s) ({total} characters; source-set "
+            f"sha256 {identity})."
         )
 
     def _bind_referenced_model_answer(

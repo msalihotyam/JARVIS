@@ -14,6 +14,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Yerel yazma (M5) her izin modunda açık onay ister ve geri alınamaz olarak beyan edilir: `SideEffect.LOCAL_WRITE` zorunlu-onay etkisidir, hatırlanan bir SESSION grant'i bir yazmayı asla yetkilendiremez ve "yalnızca oluşturma"ya otomatik onay yoktur. Onay, yazılacak **tam byte'lara** ve hedefin **önceki durumuna** bağlanır; ikisinden biri değişirse fingerprint geçersizleşir. Yazma atomiktir ve otorite mutasyon anında yeniden kanıtlanır (kaynak nesne kimliği, `create` için kernel tarafından zorlanan hedef yokluğu, `overwrite` için onaylanan ön-durum); hedef hiçbir zaman yazma için açılmaz ve JARVIS hiçbir pre-image saklamadığı için **rollback vaat etmez**.
 - Açık model cevabı aktarımı (M7): create-only bir `file_write` görevi, aynı oturumdaki tamamlanmış bir model görevinin cevabını `write.model_answer_task_id` ile tam byte kaynağı olarak **açıkça** referans verebilir. Cevap güvenilmeyen veridir; tek yetki sınırı yine zorunlu `LOCAL_WRITE` onayıdır ve byte'lar onaydan önce görevin içinde dondurulur, kaynak bir daha okunmaz. Bozuk veya tutarsız kalıcı aktarım kimliği asla direct yazmaya dönüşmez: `invalid` yüklenir ve kapalı düşer.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
+- Sınırlı çok dosyalı okuma bağlamı (M8): bir `code_analysis` / `code_planning` görevi `context.local_read_task_ids` ile aynı oturumdaki **en fazla 3** tamamlanmış `file_read` görevini açıkça referans verebilir. Kaynaklar CONTEXT_RETRIEVAL'da **hep-ya-hiç** çözümlenir, sıralı tek bir demet olarak dondurulur ve mevcut H1-bağlı egress yolundan gönderilir. Tekil `local_read_task_id` ile birlikte kullanılamaz; referanslar `task.context` içinde **kalmaz**. Bozuk veya eksik demet asla bağlamsız bir model isteğine dönüşmez: `invalid` yüklenir ve kapalı düşer.
 
 ## Yapı
 
@@ -461,6 +462,61 @@ zarfındaki `model_answer.sha256` ve tamamlanan yazmanın
 `local_write.intended_sha256` değerine eşittir (yalnız içerik sürekliliği;
 doğruluk veya provenance kanıtı değildir). Zarf şeması 5, SQLite şeması 6
 değişmez. Ayrıntılar `ARCHITECTURE.md` §4.14'tedir.
+
+### Sınırlı çok dosyalı okuma bağlamı (M8)
+
+Bir harici-model görevi, aynı oturumda tamamlanmış **1..3** `file_read`
+görevini tek bir sınırlı demet olarak referans verebilir:
+
+```json
+{
+  "objective": "iki modülü karşılaştır",
+  "capability": "code_analysis",
+  "scope": {"action": "analyse", "target": "repo"},
+  "context": {
+    "local_read_task_ids": ["<task-a>", "<task-b>", "<task-c>"]
+  }
+}
+```
+
+Kurallar: liste **tam** `list` olmalı, 1..3 öğe taşımalı, her öğe tam
+`str`, boş değil, NUL içermez, baş/son boşluk taşımaz (kırpılmaz, **reddedilir**)
+ve en fazla 64 karakterdir. Tekrar eden id reddedilir (sessiz tekilleştirme
+yoktur). `local_read_task_id` (M3) ile `local_read_task_ids` (M8) **aynı anda
+verilemez**; tekil davranış hiç değişmemiştir. Tek elemanlı liste de çoğuldur
+ve yeni blok üzerinden gider.
+
+Kullanıcının verdiği **sıra korunur**: `[A,B]` ile `[B,A]` farklı görevlerdir
+ve farklı bir onay fingerprint'i üretir. Referanslar tipli `Task` alanlarına
+çözülür ve `task.context` içinde **tutulmaz** — `context` Claude yükünde
+birebir serileşir, dolayısıyla orada tutmak kaynak id'lerini dışarı sızdırırdı.
+
+Çözümleme CONTEXT_RETRIEVAL'da bir kez çalışır ve **hep-ya-hiç**'tir: her
+kaynak için aynı-oturum, COMPLETED, `capability == "file_read"`, kayıtlı
+üretici connector, üreticinin manifest'inde `file_read`, geçerli snapshot ve
+sınıflandırma merdiveni kapıları geçilir; sınıflandırma daima kaynak görevin
+kendi `scope`'undan yeniden bağlanır (kalıcı etikete asla güvenilmez). Üçüncü
+kaynak düşerse demet **boş kalır**, görev terminal `INVALID_TASK` olur ve
+hiçbir connector seçimi, onay, girişim veya model çağrısı oluşmaz. Kısmi bir
+alt küme asla gönderilmez.
+
+Bütçe: en fazla 3 kaynak ve toplam **12000 Python karakteri** (`len(str)`,
+UTF-8 byte değil). İkinci bir kırpma katmanı yoktur; aşım kırpma değil
+**ret**tir. Onay gerekçesi kaynak sayısını, toplam karakteri ve sıralı kaynak
+kümesinin sha256'sını taşır — ham task id'leri **taşımaz** — ve
+`display_digest` üzerinden fingerprint'e bağlanır, böylece id veya sıra
+değişimi eski onayı geçersizleştirir. Dondurulmuş içerik zaten
+`outbound_digest` üzerinden bağlıdır.
+
+Claude yüküne yalnız `local_read_context` bloğu eklenir: `notice` ve sıralı
+`sources` (her biri `path`, `byte_size`, `truncated`, `content`). Kaynak task
+id'leri, mutlak yollar, sha256, `read_at` ve sınıflandırma gönderilmez.
+Dayanıklı kimlik (`local_read_context_kind`: `none` | `references` | `invalid`)
+terminal durumda silinmez; yalnız **tüm** M8 alanları eksik olan eski satır
+`none` yüklenir, kısmi/bozuk durum `invalid` olur. Beklenen demet bozuksa
+connector sınırı isteği sessizce bloksuz göndermez, `EGRESS_REFUSED` ile
+kapalı düşer. Zarf şeması 5, SQLite şeması 6 değişmez. Ayrıntılar
+`ARCHITECTURE.md` §4.15'tedir.
 
 ### Görev-farkında deterministik plan
 

@@ -2792,6 +2792,150 @@ def handoff_eligible(source: Any, target: Any) -> bool:
 
 
 # --------------------------------------------------------------------------
+# M8. Bounded multi-file read context (durable read-context identity)
+# --------------------------------------------------------------------------
+
+#: The task ``context`` key naming 1..3 completed same-session local-read
+#: tasks whose bounded excerpts become ONE ordered frozen bundle on this
+#: task. A reference list only: every excerpt is re-derived from the
+#: referenced tasks' own persisted state and re-validated in ``AgentCore``.
+#:
+#: Unlike the M3 singular key, the decoded value does NOT stay in
+#: ``task.context``. The Claude connector serializes ``context`` verbatim
+#: into its payload, so a context key is an egress channel; the references
+#: live in typed ``Task`` fields instead, exactly as M7's write reference
+#: does.
+LOCAL_READ_CONTEXT_REFERENCE_KEY = "local_read_task_ids"
+
+#: Hard ceiling on how many completed reads one task may reference.
+LOCAL_READ_MAX_SOURCES = 3
+
+#: Hard ceiling on the COMBINED excerpt characters of one frozen bundle,
+#: counted with ``len(str)`` - Unicode code points, not UTF-8 bytes, exactly
+#: like every other character ceiling here. Deliberately a SEPARATE policy
+#: surface from ``LOCAL_READ_EXCERPT_MAX_CHARS``: three canonical snapshots
+#: already satisfy it by construction, so this is the defensive bound that
+#: stops a tampered row from widening the bundle.
+LOCAL_READ_CONTEXT_MAX_CHARS = 12_000
+
+#: Hard ceiling on one persisted source reference. Deliberately a SEPARATE
+#: policy surface from ``LOCAL_WRITE_SOURCE_MAX_CHARS``: the two are equal
+#: today and must stay free to diverge, so neither may alias the other.
+LOCAL_READ_SOURCE_MAX_CHARS = 64
+
+
+class LocalReadContextKind(str, Enum):
+    """Durable semantic identity of THIS task's bounded local-read context.
+
+    Internal persisted state, never user-supplied authority: the input
+    boundary derives it from the validated ``context`` shape and nothing else
+    ever sets it. It exists so that a task created as a multi-file read
+    consumer can never silently become a context-LESS external model request
+    merely because its persisted references or frozen bundle were corrupted.
+    A malformed or inconsistent identity loads as ``INVALID`` - a typed
+    verdict every authority-building stage refuses - rather than as either
+    active kind. ``INVALID`` is never produced by the input boundary; it is
+    accepted on load only so that load -> resave -> load stays invalid.
+
+    The identity carries no filesystem authority of its own: the frozen
+    snapshots stay untrusted reference data, and the existing external-egress
+    approval keeps binding the exact outbound bytes.
+    """
+
+    NONE = "none"
+    REFERENCES = "references"
+    INVALID = "invalid"
+
+
+_LOCAL_READ_CONTEXT_KIND_VALUES = frozenset(
+    item.value for item in LocalReadContextKind
+)
+
+
+def local_read_reference_refusal(value: Any) -> str | None:
+    """Why this is not a usable local-read source reference, or ``None``.
+
+    THE single grammar for one plural reference, applied at the input
+    boundary, at the persistence load boundary and again by the resolver.
+    Nothing is coerced or canonicalized: a padded reference is REFUSED, not
+    stripped, so the identity that was approved is the identity that was
+    typed. Deliberately independent of the M7 write-reference grammar; the
+    two are equal today and must stay free to diverge.
+    """
+    if type(value) is not str:
+        return "source reference is not a string"
+    if not value:
+        return "source reference is empty"
+    if chr(0) in value:
+        return "source reference contains a NUL character"
+    if value != value.strip():
+        return "source reference carries surrounding whitespace"
+    if len(value) > LOCAL_READ_SOURCE_MAX_CHARS:
+        return "source reference exceeds its character ceiling"
+    return None
+
+
+def local_read_context_refusal(kind: Any, ids: Any, sources: Any) -> str | None:
+    """Why this (kind, references, frozen bundle) triple is not usable.
+
+    THE single stage-INDEPENDENT contract for the M8 read context, asked by
+    ``Task.from_dict``, by ``AgentCore`` at every stage that builds authority,
+    and by the Claude egress boundary. Exact types only - a raw
+    ``"references"`` string is not this contract's kind, and a list is not
+    this contract's tuple.
+
+    ``NONE`` must carry NO state at all. That clause is what stops a tampered
+    row whose kind key was deleted from loading as an ordinary no-context
+    task while it still holds references and excerpts: the kind defaults to
+    ``NONE``, the leftover state is seen here, and the triple is refused.
+    Only the COMPLETE absence of M8 state is a legacy row.
+
+    ``REFERENCES`` accepts BOTH the pre-resolution shape (no frozen sources
+    yet) and the post-resolution shape (exactly one snapshot per reference).
+    Which of the two is correct right now depends on the loop stage, which
+    this function deliberately does not know; ``AgentCore`` decides that.
+
+    One malformed frozen snapshot refuses the WHOLE bundle. It is never
+    dropped: a silently shortened bundle would send less than what was
+    approved, which is exactly the partial send M8 forbids.
+    """
+    if type(kind) is not LocalReadContextKind:
+        return "read context kind is not an exact LocalReadContextKind"
+    if kind is LocalReadContextKind.INVALID:
+        return "read context identity is invalid"
+    if type(ids) is not tuple:
+        return "source references are not a tuple"
+    if type(sources) is not tuple:
+        return "frozen sources are not a tuple"
+    if kind is LocalReadContextKind.NONE:
+        if ids:
+            return "a task with no read context carries source references"
+        if sources:
+            return "a task with no read context carries frozen sources"
+        return None
+    if not ids:
+        return "a read context names no source"
+    if len(ids) > LOCAL_READ_MAX_SOURCES:
+        return "read context exceeds its source ceiling"
+    for reference in ids:
+        reason = local_read_reference_refusal(reference)
+        if reason is not None:
+            return f"source reference is malformed: {reason}"
+    if len(set(ids)) != len(ids):
+        return "read context names the same source twice"
+    if len(sources) not in (0, len(ids)):
+        return "frozen sources do not match the source references"
+    for snapshot in sources:
+        reason = local_read_snapshot_refusal(snapshot)
+        if reason is not None:
+            return f"a frozen source is malformed: {reason}"
+    total = sum(len(snapshot.excerpt) for snapshot in sources)
+    if total > LOCAL_READ_CONTEXT_MAX_CHARS:
+        return "frozen sources exceed the bundle character ceiling"
+    return None
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -3601,6 +3745,24 @@ class Task:
     #: be) resolved into ``write_content``. A reference, never content; kept
     #: at terminal state as provenance after the bytes are erased.
     write_source_task_id: str = ""
+    #: M8. Durable identity of THIS task's bounded multi-file read context.
+    #: Derived by the input boundary from the validated ``context`` shape,
+    #: never accepted from input as such, and never erased at terminal state.
+    #: A malformed or inconsistent persisted identity loads as ``INVALID``
+    #: and is refused by every stage that builds authority, so a multi-file
+    #: consumer can never silently become a context-less model request.
+    local_read_context_kind: LocalReadContextKind = LocalReadContextKind.NONE
+    #: M8. The completed same-session local-read tasks whose excerpts were
+    #: (or are to be) frozen onto this task, in the user's declared order.
+    #: References, never content; kept at terminal state as provenance.
+    local_read_source_task_ids: tuple[str, ...] = ()
+    #: M8. The ORDERED frozen bundle, resolved exactly once at
+    #: CONTEXT_RETRIEVAL and never re-derived afterwards. Written only by
+    #: AgentCore from fully validated source state, never accepted from
+    #: untrusted task input, never written to project memory, never a
+    #: retrieval candidate and never authority of any kind. Retained at
+    #: terminal state exactly like the M3 singular snapshot.
+    local_read_sources: tuple[LocalReadSnapshot, ...] = ()
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -3648,6 +3810,19 @@ class Task:
                 else WriteSource.INVALID.value
             ),
             "write_source_task_id": self.write_source_task_id,
+            # M8. Persisted verbatim and never erased. The kind is defended
+            # here for the same reason the M7 one is: ``.value`` on a raw
+            # string would raise, and that raw string would then satisfy a
+            # later membership test as if it were a member.
+            "local_read_context_kind": (
+                self.local_read_context_kind.value
+                if type(self.local_read_context_kind) is LocalReadContextKind
+                else LocalReadContextKind.INVALID.value
+            ),
+            "local_read_source_task_ids": list(self.local_read_source_task_ids),
+            "local_read_sources": [
+                snapshot.to_dict() for snapshot in self.local_read_sources
+            ],
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -3696,6 +3871,51 @@ class Task:
             is not None
         ):
             write_source = WriteSource.INVALID
+        # M8. The durable read-context identity loads FAIL CLOSED, and only
+        # the COMPLETE absence of M8 state is a legacy pre-M8 row. A missing
+        # kind key defaults to NONE, but the pair contract below then refuses
+        # a NONE that still carries references or frozen sources - so
+        # deleting the kind key on a real bundle yields INVALID, never a
+        # silently context-less task. Nothing is coerced: no ``str()``, no
+        # ``bool()``, no ``Enum()`` on a non-string, and one malformed frozen
+        # snapshot refuses the whole bundle rather than being dropped from it.
+        raw_kind = data.get(
+            "local_read_context_kind", LocalReadContextKind.NONE.value
+        )
+        if type(raw_kind) is str and raw_kind in _LOCAL_READ_CONTEXT_KIND_VALUES:
+            local_read_context_kind = LocalReadContextKind(raw_kind)
+        else:
+            local_read_context_kind = LocalReadContextKind.INVALID
+        raw_ids = data.get("local_read_source_task_ids", [])
+        if type(raw_ids) is list and all(type(item) is str for item in raw_ids):
+            local_read_source_task_ids = tuple(raw_ids)
+        else:
+            local_read_source_task_ids = ()
+            local_read_context_kind = LocalReadContextKind.INVALID
+        raw_sources = data.get("local_read_sources", [])
+        if type(raw_sources) is list:
+            local_read_sources = tuple(
+                LocalReadSnapshot.from_dict(item)
+                if type(item) is dict
+                else LocalReadSnapshot()
+                for item in raw_sources
+            )
+        else:
+            local_read_sources = ()
+            local_read_context_kind = LocalReadContextKind.INVALID
+        if (
+            local_read_context_kind is not LocalReadContextKind.INVALID
+            and local_read_context_refusal(
+                local_read_context_kind,
+                local_read_source_task_ids,
+                local_read_sources,
+            )
+            is not None
+        ):
+            local_read_context_kind = LocalReadContextKind.INVALID
+        if local_read_context_kind is LocalReadContextKind.INVALID:
+            local_read_source_task_ids = ()
+            local_read_sources = ()
         return cls(
             objective=data["objective"],
             capability=data["capability"],
@@ -3759,6 +3979,9 @@ class Task:
             model_answer=ModelAnswer.from_dict(data.get("model_answer")),
             write_source=write_source,
             write_source_task_id=write_source_task_id,
+            local_read_context_kind=local_read_context_kind,
+            local_read_source_task_ids=local_read_source_task_ids,
+            local_read_sources=local_read_sources,
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),
