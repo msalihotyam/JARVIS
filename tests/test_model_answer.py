@@ -643,6 +643,47 @@ class RecordContractTests(unittest.TestCase):
             "content is not a string", model_answer_refusal(replace(answer, content=7))
         )
 
+    def test_a_lone_surrogate_row_loads_closed_instead_of_raising(self) -> None:
+        """M7 rider A: the persisted UTF-8 boundary fails closed.
+
+        A lone surrogate survives JSON decoding of a tampered row and cannot
+        be encoded. Before the guard, ``model_answer_refusal`` raised
+        ``UnicodeEncodeError`` out of ``Task.from_dict`` - the one loader
+        every resume goes through - instead of loading the row closed.
+        """
+        row = {
+            "content": "x\ud800y",
+            "character_count": 3,
+            "sha256": "0" * 64,
+            "truncated": False,
+            "produced_at": utc_now(),
+        }
+        answer = ModelAnswer.from_dict(row)
+        self.assertFalse(answer.present)
+        self.assertEqual("", answer.content)
+        candidate = ModelAnswer(**row)
+        self.assertIn("not encodable", model_answer_refusal(candidate))
+        task = Task.from_dict(
+            {
+                "objective": "o",
+                "capability": "c",
+                "scope": {"action": "a"},
+                "id": "t-surrogate",
+                "model_answer": row,
+            }
+        )
+        self.assertFalse(task.model_answer.present)
+
+    def test_valid_unicode_is_untouched_by_the_encodability_guard(self) -> None:
+        text = "astral 😀, accent é, separator line\n"
+        answer = build_model_answer(text)
+        self.assertIsNone(model_answer_refusal(answer))
+        self.assertEqual(text, answer.content)
+        self.assertEqual(answer, ModelAnswer.from_dict(answer.to_dict()))
+        self.assertEqual(
+            hashlib.sha256(text.encode("utf-8")).hexdigest(), answer.sha256
+        )
+
     def test_a_valid_record_round_trips_identically(self) -> None:
         answer = self.valid(STRUCTURED_ANSWER)
         self.assertEqual(answer, ModelAnswer.from_dict(answer.to_dict()))

@@ -1748,7 +1748,249 @@ Kilitli değişmezler:
   aktarımı yok · model çıktısından otomatik dosya oluşturma yok · cevabın
   otorite olması yok · cevabın Claude'a geri beslenmesi yok · getirme/proje
   hafızası entegrasyonu yok · ProgressArtifact/değişen-dosya üreticisi yok ·
-  şema migration yok (v6) · H1–H5 ve M1–M5 değişmez.
+  şema migration yok (v6) · H1–H5 ve M1–M5 değişmez. Bunlardan yalnızca
+  **açık** `model_answer` → `file_write` aktarımı M7'de ayrı ve açık bir yetki
+  sözleşmesiyle açılmıştır (§4.14); model çıktısından **otomatik** dosya
+  oluşturma hâlâ yoktur ve diğerlerinin tamamı yürürlüktedir.
+
+### 4.14 Açık model cevabı aktarımı (M7, uygulandı)
+
+Tamamlanmış bir harici-model görevinin `ModelAnswer`'ı, aynı oturumdaki
+**create-only** bir `file_write` görevinin tam byte kaynağı olarak **açıkça**
+referans verilebilir (`write.model_answer_task_id`). Cevap **güvenilmeyen
+veridir**: güvenilir, otoriter, attest edilmiş, anlamsal olarak doğrulanmış,
+çalıştırılabilir veya otomatik onaylı **değildir**. Tek yetki sınırı mevcut
+zorunlu `LOCAL_WRITE` onayıdır; bu onay tam çözümlenmiş UTF-8 byte'ları,
+kullanıcının verdiği hedefi, `create` modunu, hedefin ön-durumunu ve M5
+kaynak/çalışma-dizini otoritesini bağımsız olarak bağlar. Hiçbir model çıktısı
+hedefi, modu, onayı, yan etkiyi, connector'ı veya filesystem yetkisini
+seçemez. Digest eşitliği yalnızca **içerik sürekliliğini** kanıtlar; model
+provenance'ı (M6 ötesinde), anlamsal doğruluk, gerçeklik veya üretilen kodun
+güvenliği hakkında hiçbir iddia taşımaz.
+
+SQLite şeması **6'da kalır** (migration yok; kayıt opak `tasks.state_json`
+içinde yaşar). Çıktı zarfı `OUTPUT_SCHEMA_VERSION` **5'te kalır**: yeni üst
+düzey anahtar yoktur. `memory.py`, `local_files.py`, `base.py`, `registry.py`,
+`lifecycle.py`, `progress.py`, `settings.py`, `planning.py`, `cli.py`,
+`EgressAttestation`, `LocalWriteRecord`, M5 kanonik çerçevesi, H2 günlüğü ve
+H3 dokunulmamıştır.
+
+Kilitli değişmezler:
+
+- **Girdi sözleşmesi:** `write: {"mode": "create", "model_answer_task_id":
+  "<id>"}`. `content` **XOR** `model_answer_task_id` zorunludur (ikisi birden
+  veya hiçbiri reddedilir); `mode` önce ve değişmeden doğrulanır (create-only
+  politikası aynen). Referans tam yerleşik `str`, boş değil, NUL'suz, çevre
+  boşluksuz (kanonikleştirilmez, **reddedilir**) ve en çok
+  `LOCAL_WRITE_SOURCE_MAX_CHARS = 64` karakterdir; coercion yoktur; yalnız
+  `file_write` capability'sinde geçerlidir; bilinmeyen `write` anahtarı
+  reddedilir. Referans `context` altında **değildir**: `context` Claude
+  payload'ına birebir serileşir, referans ise hiç egress etmeyen `write`
+  bölümünün yerel yazma girdisidir. Kaynak türü (`write_source`) girdiden
+  **asla** alınmaz; doğrulanmış şekilden türetilir.
+- **Dayanıklı yazma-kaynağı kimliği:** `WriteSource {DIRECT, MODEL_ANSWER,
+  INVALID}` tam tipli enum; `Task.write_source` (varsayılan `DIRECT`) ve
+  `Task.write_source_task_id` (varsayılan `""`). İkisi de `to_dict` ile
+  kalıcılaşır ve terminal durumda **silinmez**; `write_content` M5 gereği
+  terminal durumda silinmeye devam eder. `INVALID` girdi sınırından asla
+  üretilmez; yalnız yüklemede kabul edilir ki save→load→save→load boyunca
+  `INVALID` kalsın. Kimlik filesystem otoritesi **değildir**: byte'ları,
+  hedefi, modu ve ön-durumu bağlayan M5 çerçevesidir.
+- **Fail-closed `Task.from_dict`:** eksik `write_source` anahtarı → `DIRECT`
+  (M7 öncesi satırlar yapısal olarak direct yazmadır); kanonik `direct` /
+  `model_answer` / `invalid` → ilgili üye; string olmayan veya bilinmeyen
+  değer → `INVALID`. Referans: `""` → `""`; grameri geçen tam `str` → birebir;
+  bozuk referans → referans `""` **ve** kaynak `INVALID`. Ardından tek
+  kanonik çift doğrulayıcısı (`local_write_identity_refusal`) çalışır:
+  tutarsız aktif çift (`DIRECT` + referans, `MODEL_ANSWER` + geçersiz
+  referans) → `INVALID`. `str()`, `bool()`, string olmayan değerde `Enum()`
+  veya başka bir aktif türe onarım yoktur; sihirli sentinel yoktur. Sonuç:
+  **tek bir alanın bozulması bir aktarım görevini asla direct yazmaya
+  dönüştüremez** ve kaybolan referans yüzünden 0 byte'lık bir M5 create
+  onayı üretilemez.
+- **Tek kanonik doğrulayıcılar:** `local_write_source_refusal(reference)`
+  (gramer), `local_write_identity_refusal(source, reference)` (çift
+  sözleşmesi: tam `WriteSource` tipi, `INVALID` her zaman ret, `DIRECT` boş
+  referans, `MODEL_ANSWER` grameri geçen referans) ve
+  `handoff_eligible(source_cls, target_cls)`. Girdi sınırı, yükleme sınırı ve
+  çözümleyici aynı fonksiyonları çağırır; kural hiçbir sınırda yeniden
+  yazılmaz.
+- **Sınıflandırma matrisi (sağlayıcıdan bağımsız):** kaynak SECRET → her
+  zaman ret; aksi hâlde `rank[kaynak] <= rank[hedef]`. PUBLIC kaynak →
+  PUBLIC/INTERNAL/SENSITIVE/SECRET hedef; INTERNAL kaynak → INTERNAL/
+  SENSITIVE/SECRET; SENSITIVE kaynak → SENSITIVE/SECRET; SECRET kaynak →
+  hiçbiri (ürün SECRET bir cevap üretemez; kalıcı satırdaki SECRET kaynak
+  tampered veridir). **SECRET hedef bilinçli olarak izinlidir**: yerel yazma
+  egress değildir ve içerik daha kısıtlı bir etikete taşınmaktadır. Bu, M3
+  hop'unun `retrieval_eligible` matrisinden yalnız SECRET-hedef hücresinde
+  ayrışır; `retrieval_eligible` ve M3 **değişmemiştir**. Sınıf yalnız kaynak
+  task'ın tam tipli `scope.data_classification` değerinden gelir; model
+  metninden asla çıkarım yapılmaz; ham string veya yabancı `str` enum iki
+  tarafta da reddedilir.
+- **Merkezî yazma-kimliği kontrolü (`AgentCore._write_identity_failure`):**
+  CONTEXT_RETRIEVAL'ın başında, RISK_PERMISSION'da ilk attestation'dan önce ve
+  EXECUTE'ta herhangi bir yeni yetki/claim/yan etki oluşmadan önce çalışır.
+  `DIRECT`: referans boş olmalı (M5 içerik semantiği değişmez).
+  `MODEL_ANSWER`, başarılı CONTEXT_RETRIEVAL'dan **önce**: geçerli referans +
+  **boş** `write_content` (enjekte içerik asla dondurulmaz). `MODEL_ANSWER`,
+  çözümlemeden **sonra**: geçerli referans + **boş olmayan** dondurulmuş
+  `write_content` (boşaltılmış byte'lar asla 0 byte'lık create olmaz).
+  `INVALID` veya `file_write` dışı capability'de `MODEL_ANSWER`: terminal
+  `INVALID_TASK`. Ret terminaldir, regate değildir: bu koşulların hiçbiri
+  taze bir onayla onarılamaz. `MODEL_ANSWER` hiçbir zaman sessizce `DIRECT`
+  diye yeniden etiketlenmez.
+- **H2 / PREPARED girişim:** EXECUTE'taki kimlik kontrolü
+  `open_execution_attempt`/`begin_execution`'dan **önce** çalışır. Önceki bir
+  çökmeden kalan PREPARED girişim varken kimlik bozuksa görev terminal kapanır;
+  girişim PREPARED kalır, claim edilmez, çalıştırılmaz, ikinci girişim
+  açılmaz, IN_FLIGHT sayılmaz, UNKNOWN_OUTCOME uydurulmaz — tam olarak diğer
+  claim-öncesi retlerin (faturalandırma rotası, hazırlık) H2 ile ilişkisi.
+  Değişmiş bir referans aynı durumda regate → taze onay üretir ve girişim yine
+  PREPARED kalır. H2 kodu değişmemiştir; davranış testle sabitlenmiştir.
+- **Çözümleyici (`AgentCore._bind_referenced_model_answer`):** kimlik
+  kontrolünden sonra, M3 hop'undan sonra ve sıradan getirmeden önce çalışır.
+  `DIRECT` hiçbir kaynak yüklemeden döner. `MODEL_ANSWER` için sıralı kapılar
+  — hepsi tek bir byte kopyalanmadan **önce**: capability `file_write`;
+  referans grameri; hedef `scope.target` boş değil; kaynak kendisi değil;
+  aynı oturum (`task_session_id`); kaynak yüklenebiliyor (try/except);
+  `status is COMPLETED`; `selected_connector` boş olmayan `str`; üretici
+  registry'de kayıtlı; üretici manifest'inin **kendi** `default_side_effect`
+  değeri `EXTERNAL_EGRESS` (capability adı **hardcode edilmez** — kapı M6'daki
+  gibi manifest'ten türetilir); tam `ModelAnswer` tipi ve `present`;
+  `model_answer_refusal` None; `truncated is False`; içerik boş/boşluk değil;
+  `local_write_content_refusal` None (NUL vb.); iki tarafta tam
+  `DataClassification`; `handoff_eligible`. Her ret terminal `INVALID_TASK`
+  olup gerekçesi kapıyı adlandırır; `plan_created`, `approval_requested`,
+  connector seçimi, yürütme girişimi ve kopyalanmış `write_content` sıfırdır.
+  Kaynak task'tan kopyalanan **tek** alan `write_content`'tir.
+- **Dondurma semantiği:** `context_retrieved` checkpoint'inden önce
+  `MODEL_ANSWER` + kaynak id + boş `write_content`; sonra `MODEL_ANSWER` +
+  aynı kaynak id + dondurulmuş tam `write_content`. Kaynak task PLAN,
+  RISK_PERMISSION, onay, regate, EXECUTE ve doğrulama boyunca **hiç yeniden
+  okunmaz**; onay dondurulmuş hedef byte'larını bağlar, canlı bir işaretçiyi
+  değil. Checkpoint öncesi çökme → çözümleyici yeniden çalışır, terminal
+  (depo tarafından değişmez) kaynak yeniden yüklenir, aynı byte'lar çözülür.
+  Checkpoint sonrası çökme → kaynak okunmaz, dondurulmuş `write_content` M5'in
+  tek girdisidir. Yeniden başlatma testleri taze depo/registry ile yapılır.
+- **Dondurma sonrası tamper:** (A) kaynak satırı değişir → hedef byte'ları
+  etkilenmez. (B) hedef `write_content` değişir → mevcut M5 re-attestation
+  farklı çerçeve/fingerprint üretir, eski onay geçersizleşir, eski grant
+  tüketilmez, regate/taze onay gerekir. (C) `write_source` bozulur/INVALID
+  olur → kapalı düşer, asla `DIRECT` olmaz. (D) kaynak referansı değişir →
+  dondurulmuş byte'lar aynı kalır, onay gerekçesi → `display_digest` →
+  fingerprint değişir, eski onay çalıştıramaz, taze onay gerekir; yeni
+  referans **yeniden çözümlenmez**. Provenance metadata'sı asla ikinci bir
+  içerik otoritesi olmaz.
+- **H1 / yerel yazma otoritesi:** `local-file-write._intent` dondurulmuş
+  `task.write_content`'i tüketir ve mevcut `jarvis.local_write.v1` + başlık +
+  tam UTF-8 byte çerçevesini **değiştirmeden** kurar. Kanonik çerçeve,
+  `EgressAttestation` alanları, ön-durum semantiği, hedef/mod/çalışma
+  dizini/izinli kök/tool grant otoritesi ve M5 re-attestation değişmemiştir;
+  çözümlenmiş tek bir byte'ın değişmesi mevcut fingerprint'i değiştirir.
+- **Onay gerekçesi / provenance:** yalnız `MODEL_ANSWER` yazmaları için,
+  dondurulmuş hedef alanlarından deterministik ve sınırlı olarak türetilir
+  (`Connector 'local-file-write' will create <n> bytes resolved from the model
+  answer of task <kaynak id> (sha256 <dondurulmuş write_content digest'i>).`).
+  Kaynak task **okunmadan** kurulur; RISK_PERMISSION ve EXECUTE/regate
+  byte-özdeş metni türetir; `display_digest` üzerinden fingerprint'e zaten
+  bağlıdır; yürütme otoritesi değildir (connector onu hiç okumaz). `DIRECT`
+  M5 yazmaları mevcut varsayılan gerekçelerini ve fingerprint'lerini korur.
+- **Digest sürekliliği (kalıcı değişmez):** her kabul edilen aktarımda
+  `source.model_answer.sha256 == sha256(source.model_answer.content.encode("utf-8"))
+  == sha256(target.write_content.encode("utf-8")) == local_write.intended_sha256`.
+  Bu yalnız içerik sürekliliğidir; model attestation'ı, anlamsal doğruluk
+  veya M6 ötesi provenance **değildir**.
+- **Terminal davranışı:** `write_content` silinir (M5); `write_source` ve
+  `write_source_task_id` kalır; yazma hazırlığına/yürütmesine ulaşılmışsa
+  `LocalWriteRecord` hedeflenen digest/boyutu zaten taşır. İkinci bir tam
+  içerik kopyası veya ayrı bir kaynak digest alanı yoktur. "Bu görev açık bir
+  model cevabı aktarımıydı" ifadesi kalıcı task durumundan geri kazanılabilir;
+  genel zarfa yeni blok eklenmez.
+- **Egress / getirme izolasyonu (testle sabit):** hedef yazma yolunda sıfır
+  Claude egress; referans `write` altında; `file_write` için Claude connector
+  seçilemez (`can_handle` False, tercihle zorlanırsa `ConnectorNotFoundError`);
+  çözümleme sırasında model çağrısı yok; `_sanitized_payload`'a `ModelAnswer`
+  veya yazma alanı eklenmez (canonical outbound birebir aynı);
+  `EGRESS_TOOL_GRANTS` `()`; kaynak `load_task` ile çözülür, `retrieve_context`
+  ile değil; yazma task'ının kendi `model_answer`'ı boş kalır; nihai
+  `DecisionRecord` yoktur (`decision=None`); proje hafızası yazılmaz; getirme
+  öğe/karakter kotası değişmez; `OUTPUT_SCHEMA_VERSION` 5.
+- **Rider A — kalıcı surrogate yüklemesi kapalı:** `model_answer_refusal`
+  içerik digest'inden önce `content.encode("utf-8")`'i korur;
+  `UnicodeEncodeError` → sınırlı ret ("content is not encodable as UTF-8"),
+  doğrulanmış byte'lar digest karşılaştırmasında kullanılır. Lone surrogate
+  taşıyan (yalnız kaçışlı-JSON tamperiyle oluşabilen; ürünün kendi yazıcısı
+  SQLite bağlamasında zaten reddedilirdi) kalıcı bir `ModelAnswer` boş/
+  non-present yüklenir; `Task.from_dict`, `load_task` ve `resume` raise etmez;
+  zarf `model_answer` `null` olur; geçerli Unicode davranışı, coercion'suz ve
+  normalizasyonsuz, birebir aynıdır.
+- **Rider B — sağlayıcı surrogate'i kapalı:** `ClaudeCodeConnector.execute`,
+  sağlayıcı payload'ı ayrıştırıldıktan hemen sonra ve herhangi bir
+  `ToolResult` sağlayıcı metni taşımadan önce `payload["result"]` tam `str` ise
+  UTF-8 encodability'yi doğrular; başarısızsa sabit tanılamalı
+  (`Claude Code returned a response that is not valid Unicode text.`),
+  retryable `CONNECTOR_FAILED` sonucu döner; billing class/evidence/`call_count=1`
+  doğru, ham surrogate summary/data/error'a girmez, `execute`'tan istisna
+  kaçmaz. Yalnız `build_model_answer`'ı düzeltmek **yetmezdi**: aynı metin
+  tanılama özetine de giriyor ve SQLite lone surrogate bağlayamadığından
+  `conclude_execution` yazımı `UnicodeEncodeError` ile düşüp girişimi
+  IN_FLIGHT bırakırdı; önceden var olan `is_error` yolu da aynı nedenle
+  kapsanmıştır. Kanonik outbound, prompt ve attestation değişmedi; geçerli
+  sağlayıcı Unicode'u byte-byte aynıdır.
+- **Rider B — P2 düzeltmesi (sağlayıcı metadata'sı):** bağımsız inceleme,
+  `result` dışındaki sağlayıcı dizgelerinin de lone surrogate taşıyabildiğini
+  gösterdi: `is_error` yolunda `subtype`/`stop_reason` →
+  `StructuredError.details` (H4'ün NFKC'si lone surrogate'i olduğu gibi
+  geçirir) ve `modelUsage` ilk anahtarı → `UsageRecord.model` →
+  `usage_ledger.model`; her ikisi de SQLite bağlamasında `UnicodeEncodeError`
+  ile düşüp girişimi IN_FLIGHT bırakıyordu. Tek paylaşılan kural
+  `provider_safe_text` (tam `str`, `DIAGNOSTIC_DETAIL_MAX_CHARS` tavanı,
+  UTF-8'e kodlanabilir; aksi hâlde `None`, yani alan hiç gelmemiş gibi)
+  `type`/`subtype`/`stop_reason` ve model adına uygulanır; `api_error_status`
+  yalnız tam `int` olarak taşınır (`type` → `response_type` zaten H4'ün
+  yasak-anahtar kuralıyla `details`'ten yapısal olarak düşer; kapı
+  tekdüzelik içindir). Coercion, normalizasyon, replacement karakteri veya
+  kesme işareti yoktur; geçerli (ASCII olmayan) Unicode birebir korunur;
+  `result` guard'ı aynı encodability yüklemini paylaşır ve davranışı
+  değişmez. Model adının düşürülmesi ödenen kullanımı eksik sayamaz: tutar
+  `total_cost_usd`'den, token'lar `usage`'dan, `call_count` ve rota H3
+  claim'inden gelir; model adı hiçbirine girdi değildir ve `None` zaten
+  `modelUsage`'sız bir yanıtın mevcut temsilidir. Ham akış metni
+  (`cli_detail`) `errors="replace"` ile çözüldüğünden surrogate taşıyamaz.
+  Tam çekirdek + SQLite regresyonları (subtype, stop_reason, type; başarı ve
+  hata yolunda model adı; geçerli Unicode kontrolü; tüm tablolar + zarf
+  üzerinde işaretli değerin hiç kalıcılaşmadığı kanıtı) ve dört hedefli
+  mutasyon (subtype/stop_reason/model-anahtarı/`result` guard'larının
+  kaldırılması) `tests/test_claude_connector.py` içindedir (+8 test);
+  üretim değişikliği yalnız `claude_code.py`'dedir.
+- **Kabul edilen artıklar:** (1) tutarlı **çok alanlı** yeniden yazım
+  (`write_source` → `direct`, referans → `""`, içerik seçimi) meşru bir direct
+  satırdan ayırt edilemez — `write_content`'i yeniden yazmakla aynı doğadadır
+  ve H4/M5 bozuk-satır tehdit modelinin dışındadır; imza yoktur ve icat etmek
+  ikinci bir otorite kanalı olurdu. (2) Onay sonrası **tek alanlı** referans
+  tamperi taze onayda yanıltıcı bir provenance satırı üretebilir: byte'lar
+  tamdır, taze onay zorunludur, süpersede edilen istek satırı orijinal id'yi
+  taşır; canlı kaynak bağımlılığı bilinçli olarak eklenmemiştir. (3) M6'nın
+  aşırı redaksiyonu (`password: str` → `password: [REDACTED]`) dosyaya birebir
+  yazılır; kullanıcı bu byte'ları onaydan önce kaynak zarfında görür;
+  kimlik bilgisi restorasyonu yoktur. (4) Geçersiz isteğe bağlı sağlayıcı
+  metadata'sı (`subtype`, `stop_reason`, `type`, model adı) sessizce yok
+  sayılır; ayrı bir denetim olayı yazılmaz — tanılama kaybı kabul edilmiş,
+  yaşam döngüsü ve billing kanıtı korunmuştur.
+- **Kapsam ve kanıt:** üretim `jarvis/contracts.py`, `jarvis/app.py`,
+  `jarvis/core.py`, `jarvis/connectors/claude_code.py`; testler
+  `tests/test_model_answer_handoff.py` (yeni, 79 test),
+  `tests/test_model_answer.py` (+2, rider A), `tests/test_claude_connector.py`
+  (+2, rider B; +8, rider B P2 düzeltmesi); dokümanlar bu dosya,
+  `PROJECT_CONTEXT.md`, `README.md`.
+  On altı hedefli mutasyon (dayanıklı ayırıcının kaldırılması, bozuk
+  aktarımın direct'e düşürülmesi, DIRECT+referans çift kuralı, çözümleme
+  öncesi/sonrası içerik kuralları, aynı-oturum/COMPLETED/üretici/truncated/
+  sınıflandırma kapıları, dondurma sonrası yeniden çözümleme, onay gerekçesi
+  türetimi, referans değişiminin fingerprint'e bağlanması, eski grant altında
+  içerik değişimi, iki surrogate guard'ı) bytecode önbelleği kapalı ve kaynak
+  byte-byte geri yüklenen koşularla öldürülmüştür. Hiçbir canlı
+  model/connector/auth/ağ çağrısı yapılmamıştır.
 
 ## 5. İzin ve güvenlik modeli
 

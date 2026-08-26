@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -70,13 +71,18 @@ from jarvis.contracts import (
     UsageRecord,
     VerificationRecord,
     VerificationStatus,
+    WriteSource,
     canonical_path,
     canonical_usd,
     diagnostic_from_exception,
     format_usd,
+    handoff_eligible,
     is_expired,
     local_read_snapshot_refusal,
+    local_write_content_refusal,
+    local_write_identity_refusal,
     local_write_record_refusal,
+    local_write_source_refusal,
     merge_side_effects,
     model_answer_refusal,
     nano_usd,
@@ -596,6 +602,13 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.CONTEXT_RETRIEVAL:
+                # M7: the durable write-source identity is judged first. A
+                # malformed or inconsistent identity is terminal here, so a
+                # handoff task can never fall through to the direct-write
+                # path merely because its persisted provenance was corrupted.
+                identity_failure = self._write_identity_failure(session, task)
+                if identity_failure is not None:
+                    return identity_failure
                 # M3: an explicit reference to an earlier completed local read
                 # is resolved here, before retrieval, so an unusable reference
                 # fails the task closed rather than half-populating it. It is
@@ -605,6 +618,13 @@ class AgentCore:
                 local_read_failure = self._bind_referenced_local_read(session, task)
                 if local_read_failure is not None:
                     return local_read_failure
+                # M7: the explicit model answer handoff resolves and freezes
+                # the write bytes here, before retrieval and three stages
+                # before the first write attestation, so no approval can ever
+                # bind a live source pointer instead of frozen bytes.
+                handoff_failure = self._bind_referenced_model_answer(session, task)
+                if handoff_failure is not None:
+                    return handoff_failure
                 # The query is built only from the task's own declared intent,
                 # never from arbitrary context inputs, preferences or prior
                 # retrieved content. Retrieval runs once; a task resumed past
@@ -731,6 +751,11 @@ class AgentCore:
                 return connector
 
             if task.stage is LoopStage.RISK_PERMISSION:
+                # M7: no attestation, request or approval is ever built for a
+                # write whose durable source identity is not usable.
+                identity_failure = self._write_identity_failure(session, task)
+                if identity_failure is not None:
+                    return identity_failure
                 # The billing route is established before the user is asked for
                 # anything and before cost preflight, tool selection or
                 # execution can be reached.
@@ -893,6 +918,13 @@ class AgentCore:
                 continue
 
             if task.stage is LoopStage.EXECUTE:
+                # M7: the durable source identity is judged again here, before
+                # any new authority, claim, attempt or side effect can be
+                # created. A PREPARED attempt left by an earlier crash is
+                # simply never claimed; H2 is not consulted or changed.
+                identity_failure = self._write_identity_failure(session, task)
+                if identity_failure is not None:
+                    return identity_failure
                 # Last gate before the connector runs. A persisted task can be
                 # resumed straight into this stage, so the billing route is
                 # re-derived here and never taken from the stored estimate.
@@ -1909,6 +1941,13 @@ class AgentCore:
         fails the task closed before any approval request can exist.
         """
         try:
+            if reason is None:
+                # M7: a handoff write names its source and the exact digest of
+                # the frozen bytes in the approval reason. Derived from the
+                # persisted target fields only - never from the source task -
+                # so RISK_PERMISSION and EXECUTE derive byte-identical text,
+                # and bound into the fingerprint through ``display_digest``.
+                reason = self._handoff_reason(task, connector)
             return self._authoritative_request(
                 task,
                 session,
@@ -3063,6 +3102,175 @@ class AgentCore:
         if not retrieval_eligible(destination, source_authority):
             return refuse("the classification ladder does not allow it")
         task.local_read = snapshot
+        return None
+
+    def _write_identity_failure(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Refuse a task whose durable write-source identity is not usable.
+
+        The one central check of the M7 (kind, reference, content, stage)
+        consistency, evaluated at every stage that builds write authority:
+        the start of CONTEXT_RETRIEVAL, RISK_PERMISSION before the first
+        attestation, and EXECUTE before any claim or side effect. It is what
+        stops a persisted handoff from ever degrading into a direct write:
+        ``INVALID`` is terminal, a handoff on a non-write capability is
+        terminal, a handoff carrying content BEFORE its source was resolved
+        is terminal (injected bytes are never frozen), and a handoff carrying
+        no content AFTER resolution is terminal (blanked bytes are never a
+        0-byte create). A direct write only has to carry no reference; its
+        M5 content semantics are untouched.
+
+        Terminal ``INVALID_TASK`` rather than a regate on purpose: none of
+        these conditions can be repaired by a fresh approval, and at EXECUTE
+        the check precedes ``open_execution_attempt``/``begin_execution``, so
+        no attempt is opened, claimed or duplicated - a PREPARED attempt left
+        by an earlier crash simply stays unclaimed, exactly as it does for
+        every other pre-claim refusal. ``None`` means proceed.
+        """
+        reason = local_write_identity_refusal(
+            task.write_source, task.write_source_task_id
+        )
+        if reason is None and task.write_source is WriteSource.MODEL_ANSWER:
+            if task.capability != LOCAL_WRITE_CAPABILITY:
+                reason = "a model answer handoff is only valid for a file_write task"
+            elif task.stage is LoopStage.CONTEXT_RETRIEVAL:
+                if task.write_content != "":
+                    reason = "content is present before the source was resolved"
+            elif task.write_content == "":
+                reason = "the handoff carries no frozen content"
+        if reason is None:
+            return None
+        return self._terminal_failure(
+            session,
+            task,
+            StructuredError(
+                ErrorCode.INVALID_TASK,
+                f"Write source identity is not usable: {reason}.",
+            ),
+        )
+
+    @staticmethod
+    def _handoff_reason(task: Task, connector: BaseConnector) -> str | None:
+        """The approval reason of a handoff write, from frozen target fields.
+
+        Provenance and display only - it names the source task and the exact
+        digest of the bytes the frame binds, so the user approving the write
+        can compare it with the source task's own ``model_answer.sha256``.
+        It is bound into the fingerprint through ``display_digest``, which is
+        why a changed reference after approval forces a fresh approval, but
+        it is never execution authority: the connector never reads it, and
+        the source task is never consulted to build it. ``None`` for every
+        non-handoff task, so M5 direct writes keep their default reason and
+        their existing fingerprints.
+        """
+        if (
+            task.write_source is not WriteSource.MODEL_ANSWER
+            or task.capability != LOCAL_WRITE_CAPABILITY
+        ):
+            return None
+        encoded = task.write_content.encode("utf-8")
+        return (
+            f"Connector '{connector.manifest.name}' will create {len(encoded)} "
+            "bytes resolved from the model answer of task "
+            f"{task.write_source_task_id} (sha256 "
+            f"{hashlib.sha256(encoded).hexdigest()})."
+        )
+
+    def _bind_referenced_model_answer(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Resolve a handoff's source task and freeze its answer as the bytes.
+
+        The second, equally narrow cross-task data hop after M3. The
+        reference is resolved exactly once, here, before retrieval and three
+        stages before the first write attestation; after the
+        ``context_retrieved`` checkpoint the frozen ``write_content`` is the
+        only input M5 ever consumes and the source is never read again.
+
+        Every gate below runs BEFORE a single byte is copied, so a refused
+        source leaves ``write_content`` empty, and the refusal is terminal
+        ``INVALID_TASK`` before any connector is selected, any approval is
+        requested or any attempt is opened. The producer gate is
+        manifest-derived like ``_bind_model_answer``'s - an external-model
+        connector is one whose OWN manifest declares ``EXTERNAL_EGRESS`` -
+        so the provider-neutral core never learns a capability name. The
+        classification ladder is ``handoff_eligible`` on the SOURCE TASK's
+        exact-typed scope classification; the answer text is never consulted
+        for classification or for anything else, and ``write_content`` is
+        the ONLY field this method writes.
+        """
+        if task.write_source is WriteSource.DIRECT:
+            return None
+
+        def refuse(detail: str) -> AgentRun:
+            return self._terminal_failure(
+                session,
+                task,
+                StructuredError(
+                    ErrorCode.INVALID_TASK,
+                    f"Model answer handoff is not usable: {detail}.",
+                ),
+            )
+
+        if task.write_source is not WriteSource.MODEL_ANSWER:
+            return refuse("the write source identity is invalid")
+        if task.capability != LOCAL_WRITE_CAPABILITY:
+            return refuse("a model answer handoff is only valid for a file_write task")
+        reference = task.write_source_task_id
+        if local_write_source_refusal(reference) is not None:
+            return refuse("the source reference is malformed")
+        target = task.scope.target
+        if type(target) is not str or not target.strip():
+            return refuse("the handoff names no destination")
+        if reference == task.id:
+            return refuse("a task cannot hand off its own model answer")
+        if self.memory.task_session_id(reference) != session.id:
+            return refuse("the source task belongs to another session")
+        try:
+            source = self.memory.load_task(reference)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            source = None
+        if source is None:
+            return refuse("the source task could not be loaded")
+        if source.status is not TaskStatus.COMPLETED:
+            return refuse("the source task did not complete")
+        producer_name = source.selected_connector
+        if type(producer_name) is not str or not producer_name:
+            return refuse("the source task names no producer")
+        try:
+            producer = self.registry.get(producer_name)
+        except Exception:  # noqa: BLE001 - an unknown producer is a refusal
+            producer = None
+        if producer is None:
+            return refuse("the source producer is not a registered connector")
+        manifest = getattr(producer, "manifest", None)
+        effect = getattr(getattr(manifest, "default_side_effect", None), "effect", None)
+        if effect is not SideEffect.EXTERNAL_EGRESS:
+            return refuse("the source producer is not an external-model connector")
+        answer = source.model_answer
+        if type(answer) is not ModelAnswer or not answer.present:
+            return refuse("the source task carries no model answer")
+        if model_answer_refusal(answer) is not None:
+            return refuse("the source model answer is malformed")
+        if answer.truncated is not False:
+            return refuse("the source model answer is truncated")
+        content = answer.content
+        if not content.strip():
+            return refuse("the source model answer is blank")
+        reason = local_write_content_refusal(content)
+        if reason is not None:
+            return refuse(f"the source model answer is not writable content: {reason}")
+        source_classification = source.scope.data_classification
+        target_classification = task.scope.data_classification
+        if (
+            type(source_classification) is not DataClassification
+            or type(target_classification) is not DataClassification
+        ):
+            return refuse("classification is malformed")
+        if not handoff_eligible(source_classification, target_classification):
+            return refuse("the classification ladder does not allow the handoff")
+        task.write_content = content
         return None
 
     def _bind_project(self, session: SessionState, task: Task) -> AgentRun | None:

@@ -2525,6 +2525,14 @@ def model_answer_refusal(value: Any) -> str | None:
         return "not a ModelAnswer"
     if type(value.content) is not str:
         return "content is not a string"
+    try:
+        encoded = value.content.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate survives JSON decoding of a tampered row and cannot
+        # be encoded. Refusing here mirrors ``local_write_content_refusal``:
+        # the row loads closed as the empty answer instead of raising out of
+        # ``Task.from_dict`` and every loader above it.
+        return "content is not encodable as UTF-8"
     if len(value.content) > MODEL_ANSWER_MAX_CHARS:
         return "content exceeds its character ceiling"
     # Length and type are not hygiene. A row edited outside the product can
@@ -2552,7 +2560,7 @@ def model_answer_refusal(value: Any) -> str | None:
     # therefore cannot be checked against the excerpt - this one describes
     # exactly the persisted text, so the check is unconditional and a
     # tampered content field cannot survive it.
-    if hashlib.sha256(value.content.encode("utf-8")).hexdigest() != digest:
+    if hashlib.sha256(encoded).hexdigest() != digest:
         return "digest does not match the content"
     if type(value.truncated) is not bool:
         return "truncated flag is not a boolean"
@@ -2668,6 +2676,119 @@ class ModelAnswer:
             produced_at=data.get("produced_at", ""),
         )
         return candidate if model_answer_refusal(candidate) is None else cls()
+
+
+# --------------------------------------------------------------------------
+# M7. Explicit model answer handoff (durable write-source identity)
+# --------------------------------------------------------------------------
+
+#: The ``write`` input key that names ONE completed same-session external-model
+#: task whose answer is the source of a create-only write's bytes. A REFERENCE,
+#: never content: the bytes are always re-derived from the source task's own
+#: persisted state and re-validated in ``AgentCore``. It lives in the ``write``
+#: section - the one input section that never egresses - and never in
+#: ``context``, which the Claude connector serializes verbatim.
+LOCAL_WRITE_SOURCE_KEY = "model_answer_task_id"
+
+#: Hard ceiling on a persisted source reference. A task id is a 36-character
+#: uuid4; the bound keeps the persisted field and the approval reason it
+#: feeds bounded, exactly like every other persisted scalar.
+LOCAL_WRITE_SOURCE_MAX_CHARS = 64
+
+
+class WriteSource(str, Enum):
+    """Durable semantic identity of WHERE a local write's bytes come from.
+
+    Internal persisted state, never user-supplied authority: the input
+    boundary derives it from the validated ``write`` shape and nothing else
+    ever sets it. It exists so that a task created as an explicit model
+    answer handoff can never silently turn into an ordinary direct write
+    merely because persisted provenance was corrupted. A malformed or
+    inconsistent identity loads as ``INVALID`` - a typed verdict that every
+    authority-building stage refuses - rather than as either active kind.
+    ``INVALID`` is never produced by the input boundary; it is accepted on
+    load only so that load -> resave -> load stays invalid.
+
+    The identity carries no filesystem authority of its own. The M5 frame
+    keeps binding the exact bytes, the destination, the mode and the
+    pre-state; this only says how the bytes got onto the task.
+    """
+
+    DIRECT = "direct"
+    MODEL_ANSWER = "model_answer"
+    INVALID = "invalid"
+
+
+_WRITE_SOURCE_VALUES = frozenset(item.value for item in WriteSource)
+
+
+def local_write_source_refusal(value: Any) -> str | None:
+    """Why this is not a usable source-task reference, or ``None``.
+
+    THE single grammar for the reference, applied at the input boundary, at
+    the persistence load boundary and again by the resolver. Nothing is
+    coerced or canonicalized: a padded reference is refused, not stripped,
+    so the identity that was approved is the identity that was typed.
+    """
+    if type(value) is not str:
+        return "source reference is not a string"
+    if not value:
+        return "source reference is empty"
+    if chr(0) in value:
+        return "source reference contains a NUL character"
+    if value != value.strip():
+        return "source reference carries surrounding whitespace"
+    if len(value) > LOCAL_WRITE_SOURCE_MAX_CHARS:
+        return "source reference exceeds its character ceiling"
+    return None
+
+
+def local_write_identity_refusal(source: Any, reference: Any) -> str | None:
+    """Why this (source kind, reference) pair is not a usable write identity.
+
+    THE single pair contract. ``DIRECT`` must carry no reference, so a
+    reference that appears on a direct task through tampering can never be
+    consumed; ``MODEL_ANSWER`` must carry a reference that satisfies the
+    grammar; ``INVALID`` is refused unconditionally. Exact types only - a
+    raw ``"direct"`` string is not this contract's kind.
+    """
+    if type(source) is not WriteSource:
+        return "write source is not an exact WriteSource"
+    if source is WriteSource.INVALID:
+        return "write source identity is invalid"
+    if type(reference) is not str:
+        return "source reference is not a string"
+    if source is WriteSource.DIRECT:
+        if reference != "":
+            return "a direct write carries a source reference"
+        return None
+    reason = local_write_source_refusal(reference)
+    if reason is not None:
+        return f"handoff reference is malformed: {reason}"
+    return None
+
+
+def handoff_eligible(source: Any, target: Any) -> bool:
+    """Whether a source task's classification may flow into a write task's.
+
+    Provider-neutral and deliberately NOT ``retrieval_eligible``: that matrix
+    encodes egress eligibility, where a SECRET current task never egresses.
+    A local write cannot egress, so the only rule is that content may never
+    move into a LESS restrictive classification than its source task's:
+    equal or more restrictive targets - SECRET included - are allowed. A
+    SECRET source is never eligible: the product can never produce one (a
+    SECRET task never reaches an external model), so one on a persisted row
+    is tampered data. Exact types on both sides; a raw string or a foreign
+    ``str`` enum compares equal to a member and is refused precisely because
+    of that.
+    """
+    if type(source) is not DataClassification or type(target) is not DataClassification:
+        return False
+    if source is DataClassification.SECRET:
+        return False
+    return (
+        _RETRIEVAL_CLASSIFICATION_RANK[source] <= _RETRIEVAL_CLASSIFICATION_RANK[target]
+    )
 
 
 # --------------------------------------------------------------------------
@@ -3468,6 +3589,18 @@ class Task:
     #: Unlike ``write_content`` it is NOT erased at terminal state: it is the
     #: completed task's user-facing deliverable and has to stay readable.
     model_answer: ModelAnswer = field(default_factory=ModelAnswer)
+    #: M7. Durable identity of where THIS task's write bytes come from. Derived
+    #: by the input boundary from the validated ``write`` shape, never accepted
+    #: from input as such, never erased at terminal state, and never
+    #: filesystem authority: the M5 frame keeps binding the bytes themselves.
+    #: A malformed or inconsistent persisted identity loads as ``INVALID`` and
+    #: is refused by every stage that builds write authority, so a handoff
+    #: task can never silently degrade into a direct write.
+    write_source: WriteSource = WriteSource.DIRECT
+    #: M7. The completed same-session model task whose answer was (or is to
+    #: be) resolved into ``write_content``. A reference, never content; kept
+    #: at terminal state as provenance after the bytes are erased.
+    write_source_task_id: str = ""
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -3506,6 +3639,15 @@ class Task:
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
             "model_answer": self.model_answer.to_dict(),
+            # M7. Persisted verbatim and never erased. A kind that is not an
+            # exact member is serialized as the typed INVALID verdict rather
+            # than repaired into an active kind.
+            "write_source": (
+                self.write_source.value
+                if type(self.write_source) is WriteSource
+                else WriteSource.INVALID.value
+            ),
+            "write_source_task_id": self.write_source_task_id,
             "progress": self.progress.to_dict(),
             "cancellation_requested": self.cancellation_requested,
             "created_at": self.created_at,
@@ -3525,6 +3667,35 @@ class Task:
             progress = TaskProgress(
                 completed_stages=_legacy_completed_stages(stage)
             )
+        # M7. The durable write-source identity loads FAIL CLOSED. A missing
+        # key is a legacy pre-M7 row and therefore a direct write by
+        # construction; a present value that is not exactly one of the
+        # canonical strings is the typed INVALID verdict, never an active
+        # kind. A malformed reference blanks the reference AND invalidates
+        # the identity, and an inconsistent (kind, reference) pair - a
+        # direct write carrying a reference, a handoff carrying none - is
+        # INVALID too, so no single corrupted field can turn a handoff into a
+        # direct write. Nothing is coerced: no ``str()``, no ``bool()``, no
+        # ``Enum()`` on a non-string, no repair into another active kind.
+        raw_source = data.get("write_source", WriteSource.DIRECT.value)
+        if type(raw_source) is str and raw_source in _WRITE_SOURCE_VALUES:
+            write_source = WriteSource(raw_source)
+        else:
+            write_source = WriteSource.INVALID
+        raw_reference = data.get("write_source_task_id", "")
+        if type(raw_reference) is str and raw_reference == "":
+            write_source_task_id = ""
+        elif local_write_source_refusal(raw_reference) is None:
+            write_source_task_id = raw_reference
+        else:
+            write_source_task_id = ""
+            write_source = WriteSource.INVALID
+        if (
+            write_source is not WriteSource.INVALID
+            and local_write_identity_refusal(write_source, write_source_task_id)
+            is not None
+        ):
+            write_source = WriteSource.INVALID
         return cls(
             objective=data["objective"],
             capability=data["capability"],
@@ -3586,6 +3757,8 @@ class Task:
             # answer; a malformed one loads closed as empty rather than
             # partly believed. Nothing is re-bounded or repaired.
             model_answer=ModelAnswer.from_dict(data.get("model_answer")),
+            write_source=write_source,
+            write_source_task_id=write_source_task_id,
             progress=progress,
             cancellation_requested=bool(data.get("cancellation_requested", False)),
             created_at=data.get("created_at", utc_now()),

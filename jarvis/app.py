@@ -31,7 +31,9 @@ from jarvis.connectors.local_files import (
 )
 from jarvis.contracts import (
     LOCAL_READ_TASK_REFERENCE_KEY,
+    LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_MODES,
+    LOCAL_WRITE_SOURCE_KEY,
     ActionScope,
     AgentRun,
     BillingClass,
@@ -57,12 +59,14 @@ from jarvis.contracts import (
     Task,
     TaskStatus,
     ToolResult,
+    WriteSource,
     canonical_usd,
     is_expired,
     local_read_snapshot_refusal,
     local_write_content_refusal,
     local_write_mode_unsupported,
     local_write_record_refusal,
+    local_write_source_refusal,
     model_answer_refusal,
     next_loop_stage,
     normalize_destination,
@@ -166,7 +170,11 @@ _TASK_KEYS = frozenset(
         "write",
     }
 )
-_WRITE_KEYS = frozenset({"content", "mode"})
+#: M7: ``model_answer_task_id`` is a REFERENCE to a completed same-session
+#: model task whose answer becomes the write's bytes. Exactly one of
+#: ``content`` and the reference is mandatory; the durable source kind is
+#: derived here from that shape and is never accepted from input.
+_WRITE_KEYS = frozenset({"content", "mode", LOCAL_WRITE_SOURCE_KEY})
 _SCOPE_KEYS = frozenset({"action", "target", "destination", "data_classification"})
 #: ``local_read_task_id`` (M3) is a *reference* to an earlier completed local
 #: read in the same session. Content is never accepted from input: the
@@ -363,13 +371,19 @@ def decode_task_json(raw: str | bytes) -> Task:
     write_input = _section(document, "write", _WRITE_KEYS)
     write_content = ""
     write_mode = ""
+    # M7: the durable source kind is derived from the validated shape below
+    # and is never read from input. A task without a ``write`` section is a
+    # direct write of nothing, exactly as before.
+    write_source = WriteSource.DIRECT
+    write_source_task_id = ""
     if write_input:
-        if "content" not in write_input or "mode" not in write_input:
-            raise TaskInputError("'write' requires both 'content' and 'mode'.")
-        write_content = write_input["content"]
-        reason = local_write_content_refusal(write_content)
-        if reason is not None:
-            raise TaskInputError(f"'write.content' is refused: {reason}.")
+        # Mode first, unchanged: a recognized mode is not necessarily a
+        # supported one. Overwrite is refused here rather than deep in
+        # execution, because no primitive available to this product can make
+        # a replacement conditional on the destination still being the
+        # approved file - see ``LOCAL_WRITE_ENABLED_MODES``.
+        if "mode" not in write_input:
+            raise TaskInputError("'write' requires 'mode'.")
         write_mode = write_input["mode"]
         if type(write_mode) is not str or write_mode not in LOCAL_WRITE_MODES:
             raise TaskInputError(
@@ -377,14 +391,44 @@ def decode_task_json(raw: str | bytes) -> Task:
                 + ", ".join(LOCAL_WRITE_MODES)
                 + "."
             )
-        # A recognized mode is not necessarily a supported one. Overwrite is
-        # refused here rather than deep in execution, because no primitive
-        # available to this product can make a replacement conditional on the
-        # destination still being the approved file - see
-        # ``LOCAL_WRITE_ENABLED_MODES``.
         reason = local_write_mode_unsupported(write_mode)
         if reason is not None:
             raise TaskInputError(f"'write.mode' is refused: {reason}.")
+        # Exactly ONE content source: the bytes themselves, or a reference to
+        # a completed model task whose answer will become the bytes. Never
+        # both and never neither.
+        has_content = "content" in write_input
+        has_reference = LOCAL_WRITE_SOURCE_KEY in write_input
+        if has_content == has_reference:
+            raise TaskInputError(
+                "'write' requires exactly one of 'content' or "
+                f"'{LOCAL_WRITE_SOURCE_KEY}'."
+            )
+        if has_content:
+            write_content = write_input["content"]
+            reason = local_write_content_refusal(write_content)
+            if reason is not None:
+                raise TaskInputError(f"'write.content' is refused: {reason}.")
+        else:
+            # M7. The same grammar the persistence load boundary and the
+            # resolver apply; nothing is stripped or coerced, so a padded
+            # reference is refused rather than quietly canonicalized. The
+            # reference is only meaningful for a local write, and refusing it
+            # here keeps a doomed task out of persistence altogether; the
+            # loop refuses it independently for programmatically built tasks.
+            reference = write_input[LOCAL_WRITE_SOURCE_KEY]
+            reason = local_write_source_refusal(reference)
+            if reason is not None:
+                raise TaskInputError(
+                    f"'write.{LOCAL_WRITE_SOURCE_KEY}' is refused: {reason}."
+                )
+            if capability != LOCAL_WRITE_CAPABILITY:
+                raise TaskInputError(
+                    f"'write.{LOCAL_WRITE_SOURCE_KEY}' is only valid for "
+                    f"capability '{LOCAL_WRITE_CAPABILITY}'."
+                )
+            write_source = WriteSource.MODEL_ANSWER
+            write_source_task_id = reference
 
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
@@ -402,6 +446,8 @@ def decode_task_json(raw: str | bytes) -> Task:
         project_id=project_id,
         write_content=write_content,
         write_mode=write_mode,
+        write_source=write_source,
+        write_source_task_id=write_source_task_id,
     )
 
 

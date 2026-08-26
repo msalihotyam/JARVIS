@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,24 +11,35 @@ from unittest.mock import patch
 
 from enum import Enum
 
+from jarvis.app import build_envelope, create_app
 from jarvis.connectors import claude_code
 from jarvis.connectors.claude_code import (
     EXTERNAL_PREFERENCE_KEYS,
     PROHIBITED_BILLING_ENV_VARS,
     ClaudeCodeConnector,
+    provider_safe_text,
 )
 from jarvis.contracts import (
+    DIAGNOSTIC_DETAIL_MAX_CHARS,
     MODEL_ANSWER_RESULT_KEY,
     ActionScope,
+    AttemptState,
+    Availability,
     BillingClass,
     DataClassification,
+    ErrorCode,
     LocalReadSnapshot,
     MonetaryState,
     OutcomeStatus,
+    PermissionGrant,
+    PermissionMode,
+    RunStatus,
     SessionState,
     Task,
+    TaskStatus,
     retrieval_eligible,
 )
+from jarvis.settings import Settings
 from tests.helpers import safe_cleanup
 
 #: Non-secret shape of ``claude auth status --json`` for a Max/OAuth session.
@@ -518,6 +530,384 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
         self.assertEqual("{'k': 'v'}", structured.summary)
         empty, _ = self.answer_for("")
         self.assertEqual("Claude Code completed the request.", empty.summary)
+
+    # -- M7 rider B: a provider result that is not valid Unicode ------------
+
+    def _surrogate_payload(self, *, is_error: bool) -> str:
+        """Provider JSON whose ``result`` carries a lone surrogate.
+
+        ``json.dumps`` escapes it as ``\\ud800``, exactly as a JavaScript
+        runtime serializing a broken string would, and ``json.loads`` on the
+        CLI side hands back a Python ``str`` that cannot be UTF-8 encoded.
+        """
+        return json.dumps(
+            {
+                "type": "result",
+                "subtype": "error" if is_error else "success",
+                "is_error": is_error,
+                "result": "x\ud800y",
+                "api_error_status": 500 if is_error else None,
+                "total_cost_usd": 0,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "modelUsage": {"claude-test": {}},
+            }
+        )
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_provider_result_is_a_clean_connector_failure(
+        self, popen
+    ) -> None:
+        """Both provider shapes: the success path and the pre-existing
+        ``is_error`` path, whose summary used to carry the raw text."""
+        for is_error in (False, True):
+            with self.subTest(is_error=is_error):
+                popen.return_value = FakeProcess(
+                    self._surrogate_payload(is_error=is_error),
+                    returncode=1 if is_error else 0,
+                )
+                result = self.connector.execute(self.task(), SessionState())
+                self.assertEqual(OutcomeStatus.ERROR, result.outcome)
+                self.assertEqual(ErrorCode.CONNECTOR_FAILED, result.error.code)
+                self.assertEqual(
+                    "Claude Code returned a response that is not valid Unicode text.",
+                    result.error.message,
+                )
+                self.assertEqual(result.error.message, result.summary)
+                self.assertTrue(result.error.retryable)
+                self.assertNotIn(MODEL_ANSWER_RESULT_KEY, result.data)
+                for text in (
+                    result.summary,
+                    result.error.message,
+                    json.dumps(result.error.details, ensure_ascii=False),
+                    json.dumps(result.data, ensure_ascii=False, default=str),
+                ):
+                    self.assertNotIn("\ud800", text)
+                self.assertEqual(1, result.usage.call_count)
+                self.assertEqual(BillingClass.SUBSCRIPTION_INCLUDED, result.usage.billing_class)
+                self.assertEqual(MonetaryState.NOT_APPLICABLE, result.usage.monetary_state)
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_provider_result_finalizes_cleanly_through_the_core(
+        self, popen
+    ) -> None:
+        """The task persists and finalizes FAILED; it is not left in doubt.
+
+        Without the guard the success shape raises inside ``execute`` and H2
+        marks the attempt UNKNOWN_OUTCOME; the ``is_error`` shape returns a
+        summary SQLite cannot bind, so the execution conclusion raises and
+        the attempt stays IN_FLIGHT. Neither is a clean failure.
+        """
+        for is_error in (False, True):
+            with self.subTest(is_error=is_error):
+                popen.return_value = FakeProcess(
+                    self._surrogate_payload(is_error=is_error),
+                    returncode=1 if is_error else 0,
+                )
+                app = create_app(
+                    settings=Settings(memory_database=self.root / f"surrogate-{int(is_error)}.db"),
+                    connectors=(self.connector,),
+                )
+                task = self.task()
+                with patch.object(
+                    ClaudeCodeConnector, "availability", return_value=Availability(True)
+                ):
+                    run = app.core.run(task)
+                    self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status, msg=str(run.error))
+                    decided = app.core.resume(
+                        run.session.id,
+                        task.id,
+                        grant=PermissionGrant.for_request(run.permission_request),
+                    )
+                self.assertEqual(RunStatus.FAILED, decided.status)
+                self.assertEqual(ErrorCode.CONNECTOR_FAILED, decided.error.code)
+                attempt = app.memory.latest_execution_attempt(task.id)
+                self.assertIs(AttemptState.FINISHED, attempt.state)
+                stored = app.memory.load_task(task.id)
+                self.assertIs(TaskStatus.FAILED, stored.status)
+                self.assertFalse(stored.model_answer.present)
+                self.assertNotIn("\ud800", json.dumps(stored.to_dict(), ensure_ascii=False))
+
+    # -- M7 P2: provider METADATA that is not valid Unicode -----------------
+    #
+    # Rider B guards ``result``. Independent review showed that the other
+    # provider-controlled strings - ``subtype``/``stop_reason``/``type`` on
+    # the ``is_error`` path (persisted through ``StructuredError.details``)
+    # and the first ``modelUsage`` key (persisted as ``UsageRecord.model``) -
+    # could still carry a lone surrogate into a SQLite write, so the usage or
+    # conclusion write raised and the attempt was stranded IN_FLIGHT.
+
+    #: Wrapped around every malformed provider value so a persisted surface
+    #: can be searched for the WHOLE value: it must be dropped, not repaired
+    #: around the surrogate.
+    META_MARKER = "PROVIDER-META-7e3a"
+
+    def _provider_payload(self, *, is_error: bool, **fields) -> str:
+        payload = {
+            "type": "result",
+            "subtype": "error" if is_error else "success",
+            "is_error": is_error,
+            "result": "Request failed upstream." if is_error else "Plan ready",
+            "api_error_status": 500 if is_error else None,
+            "total_cost_usd": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-test": {}},
+        }
+        payload.update(fields)
+        return json.dumps(payload)
+
+    def _through_the_core(self, popen, payload: str, *, is_error: bool, name: str):
+        """Real AgentCore + SQLiteMemoryStore; returns (app, task, run, db)."""
+        popen.return_value = FakeProcess(payload, returncode=1 if is_error else 0)
+        database = self.root / f"{name}.db"
+        app = create_app(
+            settings=Settings(memory_database=database), connectors=(self.connector,)
+        )
+        task = self.task()
+        with patch.object(
+            ClaudeCodeConnector, "availability", return_value=Availability(True)
+        ):
+            run = app.core.run(task)
+            self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status, msg=str(run.error))
+            decided = app.core.resume(
+                run.session.id,
+                task.id,
+                grant=PermissionGrant.for_request(run.permission_request),
+            )
+        return app, task, decided, database
+
+    @staticmethod
+    def _every_persisted_string(database: Path, run) -> str:
+        """Every text cell of every table, plus the public envelope."""
+        parts = [
+            json.dumps(
+                build_envelope("resume", PermissionMode.SESSION, run), ensure_ascii=False
+            )
+        ]
+        connection = sqlite3.connect(database)
+        try:
+            tables = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            ]
+            for table in tables:
+                for row in connection.execute(f'SELECT * FROM "{table}"'):
+                    parts.extend(cell for cell in row if isinstance(cell, str))
+        finally:
+            connection.close()
+        return "\n".join(parts)
+
+    def _assert_finished_and_hygienic(self, app, task, run, database) -> None:
+        self.assertIs(
+            AttemptState.FINISHED, app.memory.latest_execution_attempt(task.id).state
+        )
+        persisted = self._every_persisted_string(database, run)
+        self.assertNotIn(self.META_MARKER, persisted)
+        self.assertNotIn("\ud800", persisted)
+        # The in-memory run is what the CLI renders from.
+        if run.result is not None:
+            self.assertNotIn(
+                "\ud800", json.dumps(run.result.usage.to_dict(), ensure_ascii=False)
+            )
+        if run.error is not None:
+            self.assertNotIn("\ud800", json.dumps(run.error.to_dict(), ensure_ascii=False))
+
+    def _assert_malformed_metadata_field_is_dropped(self, popen, field: str) -> None:
+        app, task, run, database = self._through_the_core(
+            popen,
+            self._provider_payload(is_error=True, **{field: f"{self.META_MARKER}\ud800"}),
+            is_error=True,
+            name=f"meta-{field}",
+        )
+        # A normal, understood connector failure - never UNKNOWN_OUTCOME and
+        # never a stranded IN_FLIGHT attempt - with the bad field absent and
+        # every other detail intact.
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.CONNECTOR_FAILED, run.error.code)
+        self.assertEqual("Request failed upstream.", run.error.message)
+        details = run.error.details
+        if field == "type":
+            # H4 drops ``response_type`` structurally on every path
+            # (``response`` is a forbidden detail key); the gate is uniformity.
+            self.assertNotIn("response_type", details)
+        else:
+            self.assertIn(field, details)
+            self.assertIsNone(details[field])
+        self.assertEqual(500, details["api_error_status"])
+        self.assertIs(TaskStatus.FAILED, app.memory.load_task(task.id).status)
+        self._assert_finished_and_hygienic(app, task, run, database)
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_subtype_is_a_normal_connector_failure(self, popen) -> None:
+        self._assert_malformed_metadata_field_is_dropped(popen, "subtype")
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_stop_reason_is_a_normal_connector_failure(
+        self, popen
+    ) -> None:
+        self._assert_malformed_metadata_field_is_dropped(popen, "stop_reason")
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_response_type_is_a_normal_connector_failure(
+        self, popen
+    ) -> None:
+        self._assert_malformed_metadata_field_is_dropped(popen, "type")
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_model_name_on_success_completes_unattributed(
+        self, popen
+    ) -> None:
+        """The answer, the ledger row and every billing field survive; only
+        the model NAME is absent - the same row an omitted ``modelUsage``
+        already produces, so nothing paid can be undercounted."""
+        app, task, run, database = self._through_the_core(
+            popen,
+            self._provider_payload(
+                is_error=False, modelUsage={f"{self.META_MARKER}\ud800": {}}
+            ),
+            is_error=False,
+            name="model-success",
+        )
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+        stored = app.memory.load_task(task.id)
+        self.assertIs(TaskStatus.COMPLETED, stored.status)
+        self.assertEqual("Plan ready", stored.model_answer.content)
+        (usage,) = app.memory.usage_records()
+        self.assertIsNone(usage.model)
+        self.assertEqual(
+            (1, 1, 1), (usage.input_tokens, usage.output_tokens, usage.call_count)
+        )
+        self.assertEqual(BillingClass.SUBSCRIPTION_INCLUDED, usage.billing_class)
+        self.assertEqual(MonetaryState.NOT_APPLICABLE, usage.monetary_state)
+        self._assert_finished_and_hygienic(app, task, run, database)
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_a_lone_surrogate_model_name_on_error_is_a_normal_connector_failure(
+        self, popen
+    ) -> None:
+        app, task, run, database = self._through_the_core(
+            popen,
+            self._provider_payload(
+                is_error=True, modelUsage={f"{self.META_MARKER}\ud800": {}}
+            ),
+            is_error=True,
+            name="model-error",
+        )
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.CONNECTOR_FAILED, run.error.code)
+        self.assertIs(TaskStatus.FAILED, app.memory.load_task(task.id).status)
+        (usage,) = app.memory.usage_records()
+        self.assertIsNone(usage.model)
+        self.assertEqual(1, usage.call_count)
+        self._assert_finished_and_hygienic(app, task, run, database)
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_valid_non_ascii_provider_metadata_is_persisted_exactly(self, popen) -> None:
+        """Control: the gate is an encodability rule, not an ASCII rule."""
+        subtype = "yeniden_dene\u2014a\u011f\u2192zaman_a\u015f\u0131m\u0131\u2713"
+        stop_reason = "durduruldu\u2014\u2713"
+        model = "claude-\u00fcn\u00efcode-4\u2192"
+        for is_error in (False, True):
+            with self.subTest(is_error=is_error):
+                app, task, run, database = self._through_the_core(
+                    popen,
+                    self._provider_payload(
+                        is_error=is_error,
+                        subtype=subtype,
+                        stop_reason=stop_reason,
+                        modelUsage={model: {}},
+                    ),
+                    is_error=is_error,
+                    name=f"unicode-{int(is_error)}",
+                )
+                self.assertIs(
+                    AttemptState.FINISHED,
+                    app.memory.latest_execution_attempt(task.id).state,
+                )
+                (usage,) = app.memory.usage_records()
+                self.assertEqual(model, usage.model)
+                persisted = self._every_persisted_string(database, run)
+                self.assertIn(model, persisted)
+                if is_error:
+                    self.assertEqual(RunStatus.FAILED, run.status)
+                    self.assertEqual(subtype, run.error.details["subtype"])
+                    self.assertEqual(stop_reason, run.error.details["stop_reason"])
+                    self.assertIn(subtype, persisted)
+                    self.assertIn(stop_reason, persisted)
+                else:
+                    self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+
+    def test_provider_safe_text_is_the_one_exact_rule(self) -> None:
+        class Subclassed(str):
+            pass
+
+        keep = "erreur\u2014r\u00e9seau\u2192\u2713"
+        self.assertIs(keep, provider_safe_text(keep))
+        self.assertEqual("", provider_safe_text(""))
+        at_cap = "m" * DIAGNOSTIC_DETAIL_MAX_CHARS
+        self.assertIs(at_cap, provider_safe_text(at_cap))
+        for rejected in (
+            "x\ud800y",
+            "\udfff",
+            at_cap + "m",
+            Subclassed("subclass"),
+            None,
+            5,
+            0,
+            True,
+            2.5,
+            ["end_turn"],
+            {"a": "b"},
+            b"bytes",
+        ):
+            with self.subTest(value=repr(rejected)):
+                self.assertIsNone(provider_safe_text(rejected))
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_every_optional_provider_string_is_gated_at_the_connector(
+        self, popen
+    ) -> None:
+        """Connector-level: all five metadata fields malformed at once."""
+        malformed = f"{self.META_MARKER}\ud800"
+        popen.return_value = FakeProcess(
+            self._provider_payload(
+                is_error=True,
+                type=malformed,
+                subtype=malformed,
+                stop_reason=malformed,
+                api_error_status=malformed,
+                modelUsage={malformed: {}},
+            ),
+            returncode=1,
+        )
+        result = self.connector.execute(self.task(), SessionState())
+        self.assertEqual(OutcomeStatus.ERROR, result.outcome)
+        self.assertEqual(ErrorCode.CONNECTOR_FAILED, result.error.code)
+        self.assertFalse(result.error.retryable)
+        self.assertIsNone(result.usage.model)
+        # ``data`` is the ungated connector view of the metadata: every gated
+        # field is already absent-as-None there, including ``response_type``,
+        # which H4 then drops from ``details`` structurally.
+        for key in ("response_type", "subtype", "stop_reason", "api_error_status"):
+            self.assertIn(key, result.data)
+            self.assertIsNone(result.data[key])
+        for key in ("subtype", "stop_reason", "api_error_status"):
+            self.assertIsNone(result.error.details[key])
+        self.assertNotIn("response_type", result.error.details)
+        self.assertEqual(0, result.error.details["redacted_items"])
+        serialized = json.dumps(
+            {
+                "summary": result.summary,
+                "error": result.error.to_dict(),
+                "data": result.data,
+                "usage": result.usage.to_dict(),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        self.assertNotIn(self.META_MARKER, serialized)
+        self.assertNotIn("\ud800", serialized)
 
     @patch("jarvis.connectors.claude_code.subprocess.Popen")
     def test_mocked_auth_failure_preserves_usage(self, popen) -> None:

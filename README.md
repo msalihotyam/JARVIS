@@ -12,6 +12,7 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Proje hafızası (M1) güvenilmeyen referans veridir: yalnızca açık kullanıcı komutlarıyla yazılır, hiçbir zaman approval/billing/lifecycle otoritesi taşımaz, içeriği talimat olarak yorumlanmaz ve toplam getirme kotasını (5 öğe / 4.000 karakter) büyütmez.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
 - Yerel yazma (M5) her izin modunda açık onay ister ve geri alınamaz olarak beyan edilir: `SideEffect.LOCAL_WRITE` zorunlu-onay etkisidir, hatırlanan bir SESSION grant'i bir yazmayı asla yetkilendiremez ve "yalnızca oluşturma"ya otomatik onay yoktur. Onay, yazılacak **tam byte'lara** ve hedefin **önceki durumuna** bağlanır; ikisinden biri değişirse fingerprint geçersizleşir. Yazma atomiktir ve otorite mutasyon anında yeniden kanıtlanır (kaynak nesne kimliği, `create` için kernel tarafından zorlanan hedef yokluğu, `overwrite` için onaylanan ön-durum); hedef hiçbir zaman yazma için açılmaz ve JARVIS hiçbir pre-image saklamadığı için **rollback vaat etmez**.
+- Açık model cevabı aktarımı (M7): create-only bir `file_write` görevi, aynı oturumdaki tamamlanmış bir model görevinin cevabını `write.model_answer_task_id` ile tam byte kaynağı olarak **açıkça** referans verebilir. Cevap güvenilmeyen veridir; tek yetki sınırı yine zorunlu `LOCAL_WRITE` onayıdır ve byte'lar onaydan önce görevin içinde dondurulur, kaynak bir daha okunmaz. Bozuk veya tutarsız kalıcı aktarım kimliği asla direct yazmaya dönüşmez: `invalid` yüklenir ve kapalı düşer.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 
 ## Yapı
@@ -183,10 +184,12 @@ girdisine yazılmaz. Zorunlu onay gerektiren yan etkiler her modda onay ister.
 
 Girdi default-deny bir allowlist ile alan alan okunur; `Task.from_dict()`
 güvenilmeyen girdi için hiç kullanılmaz. Kabul edilen alanlar yalnızca
-`objective`, `capability`, `scope.{action,target,destination,data_classification}`,
-`context.{working_directory,inputs,local_read_task_id}` ve
+`objective`, `capability`, `project_id`,
+`scope.{action,target,destination,data_classification}`,
+`context.{working_directory,inputs,local_read_task_id}`,
 `preferences.{preferred_connector,needs_clarification,clarification_question,assumption}`
-alanlarıdır. Tanınmayan veya korumalı alanlar (`id`, `status`, `stage`, `plan`,
+ve `write.{content,mode,model_answer_task_id}` (`content` XOR
+`model_answer_task_id`; `write_source` girdiden asla alınmaz) alanlarıdır. Tanınmayan veya korumalı alanlar (`id`, `status`, `stage`, `plan`,
 `estimate`, `risk_level`, `side_effect`, `result_snapshot`, `clarification`,
 `paid_api_task_approval`, `cost_cap_override`, `billing_preflight_fingerprint`
 ve benzeri) yok sayılmaz, reddedilir.
@@ -415,6 +418,49 @@ söyleyeceğini etkileyebilir, fakat cevap eylemsiz gösterim verisi olarak
 kalır ve ondan türeyen her eylem yeni ve ayrıca incelenen bir yetki
 sınırından geçmek zorundadır. SECRET bir görev modeli hiç çalıştırmadığı
 için başarılı bir model cevabı da üretmez.
+
+### Açık model cevabı aktarımı (M7)
+
+Tamamlanmış bir model görevinin cevabı, aynı oturumdaki **create-only** bir
+`file_write` görevinin tam byte kaynağı olarak açıkça seçilebilir:
+
+```json
+{
+  "objective": "önerilen testi oluştur",
+  "capability": "file_write",
+  "scope": {"action": "write", "target": "tests/test_new.py",
+            "data_classification": "internal"},
+  "write": {"mode": "create", "model_answer_task_id": "<tamamlanmış model task id>"}
+}
+```
+
+Kurallar: `write.content` **XOR** `write.model_answer_task_id` zorunludur;
+referans tam `str`, boş değil, NUL'suz, çevre boşluksuz (kanonikleştirilmez,
+reddedilir), en çok 64 karakterdir ve yalnız `file_write` görevinde geçerlidir;
+`context` altında verilemez. Cevap **güvenilmeyen veridir**; tek yetki sınırı
+mevcut zorunlu `LOCAL_WRITE` onayıdır ve o onay tam byte'lara, kullanıcının
+verdiği hedefe, `create` moduna ve ön-duruma bağlanır — hiçbir model çıktısı
+hedefi, modu veya onayı seçemez. İçerik **birebir** yazılır
+(`model_answer.content.encode("utf-8")`): strip, code-fence ayrıştırma,
+newline/girinti dönüşümü veya kimlik bilgisi restorasyonu yoktur; M6'nın
+`[REDACTED]` çıktısı dosyaya olduğu gibi girer. Truncated, boş/boşluk, NUL'lu,
+bozuk, tamamlanmamış, başka oturumdaki veya harici-model olmayan bir
+üreticiden gelen cevaplar CONTEXT_RETRIEVAL'da, plan ve onay öncesinde
+reddedilir. Sınıflandırma yalnız yukarı/eşit yönde akar (kaynak SECRET asla;
+SECRET hedef izinli, çünkü yerel yazma egress değildir).
+
+Kaynak CONTEXT_RETRIEVAL'da bir kez çözülür ve `context_retrieved`
+checkpoint'i byte'ları görevin `write_content` alanında dondurur; onay
+dondurulmuş byte'ları bağlar, kaynak sonrasında hiç okunmaz. Görevin dayanıklı
+yazma-kaynağı kimliği (`write_source`: `direct` | `model_answer` | `invalid`,
+`write_source_task_id`) terminal durumda silinmez; bozuk veya tutarsız kalıcı
+kimlik `invalid` yüklenir ve terminal `INVALID_TASK` ile kapanır — bir aktarım
+asla sessizce direct yazmaya dönüşmez. Onay gerekçesi kaynak task id'sini,
+byte sayısını ve dondurulmuş içeriğin sha256'sını gösterir; bu digest kaynak
+zarfındaki `model_answer.sha256` ve tamamlanan yazmanın
+`local_write.intended_sha256` değerine eşittir (yalnız içerik sürekliliği;
+doğruluk veya provenance kanıtı değildir). Zarf şeması 5, SQLite şeması 6
+değişmez. Ayrıntılar `ARCHITECTURE.md` §4.14'tedir.
 
 ### Görev-farkında deterministik plan
 

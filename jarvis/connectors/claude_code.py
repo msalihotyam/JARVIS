@@ -14,6 +14,7 @@ from typing import Any
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
+    DIAGNOSTIC_DETAIL_MAX_CHARS,
     LOCAL_READ_EXCERPT_MAX_CHARS,
     MODEL_ANSWER_RESULT_KEY,
     RETRIEVAL_MAX_CHARACTERS,
@@ -171,6 +172,40 @@ def _token_count(value: Any) -> int:
     if value < 0 or int(value) != value:
         return 0
     return int(value)
+
+
+def _utf8_encodable(text: str) -> bool:
+    """Whether ``text`` encodes as UTF-8, i.e. carries no lone surrogate."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def provider_safe_text(
+    value: Any, cap: int = DIAGNOSTIC_DETAIL_MAX_CHARS
+) -> str | None:
+    """The one rule for an OPTIONAL provider string that may be persisted.
+
+    Every provider-controlled string other than the ``result`` deliverable
+    that leaves ``execute()`` inside a ``ToolResult``, a ``StructuredError``
+    or a ``UsageRecord`` - the response type, subtype and stop reason, and
+    the ``modelUsage`` model name - passes through here. The value comes back
+    unchanged when it is an exact ``str``, within the diagnostic detail
+    ceiling and encodable as UTF-8; anything else becomes ``None``, the same
+    form an omitted field already has, so an invalid value is dropped whole
+    rather than repaired: no ``str()`` coercion, no Unicode normalization, no
+    replacement character, no truncation marker.
+
+    SQLite refuses to bind a lone surrogate and ``sanitize_diagnostic_text``
+    passes one through (NFKC leaves it alone), so without this gate a
+    malformed provider ``subtype`` or model name would raise inside the
+    usage or conclusion write and strand the attempt IN_FLIGHT.
+    """
+    if type(value) is not str or len(value) > cap or not _utf8_encodable(value):
+        return None
+    return value
 
 class ClaudeCodeConnector(BaseConnector):
     manifest = ConnectorManifest(
@@ -473,6 +508,9 @@ class ClaudeCodeConnector(BaseConnector):
 
         payload = self._parse_payload(stdout)
         if payload is None:
+            # Raw stream text, not JSON-decoded: the streams are decoded with
+            # ``errors="replace"``, which can never yield a lone surrogate,
+            # so this diagnostic needs no ``provider_safe_text`` gate.
             detail = stderr.strip() or stdout.strip()
             safe_detail, _ = self._redact(detail)
             return self._error_result(
@@ -480,6 +518,29 @@ class ClaudeCodeConnector(BaseConnector):
                 ErrorCode.CONNECTOR_FAILED,
                 "Claude Code returned an unreadable response.",
                 details={"cli_detail": str(safe_detail)[:1000]},
+                retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+                call_count=1,
+            )
+
+        # M7 rider. A provider result that is not encodable as UTF-8 (a lone
+        # surrogate that survived the CLI's JSON) is refused HERE, before any
+        # ToolResult can carry the text. This is not a build_model_answer
+        # concern alone: the same text would also ride into the diagnostic
+        # summary, and SQLite refuses to bind a lone surrogate, so the task
+        # write at the execution conclusion would raise and leave the attempt
+        # IN_FLIGHT. The refusal is a normal connector failure with a constant
+        # diagnostic; no provider text reaches summary, data or error. The
+        # result is REQUIRED data with its own ceilings downstream, so it
+        # shares only the encodability rule of ``provider_safe_text``; every
+        # optional provider string goes through that function in full.
+        provider_text = payload.get("result")
+        if type(provider_text) is str and not _utf8_encodable(provider_text):
+            return self._error_result(
+                task,
+                ErrorCode.CONNECTOR_FAILED,
+                "Claude Code returned a response that is not valid Unicode text.",
                 retryable=True,
                 billing_class=billing_class,
                 billing_evidence=evidence,
@@ -505,12 +566,20 @@ class ClaudeCodeConnector(BaseConnector):
         raw_result = payload.get("result")
         result_text = str(raw_result or "").strip()
         failed = process.returncode != 0 or bool(payload.get("is_error"))
+        # Provider metadata is untrusted text on the ``is_error`` path it
+        # persists through (``StructuredError.details``): each string field
+        # passes the one shared rule and an invalid value becomes ``None``,
+        # the same form an omitted field already has. The status is an
+        # exact ``int`` or nothing; a provider string is never a status.
+        api_error_status = payload.get("api_error_status")
+        if type(api_error_status) is not int:
+            api_error_status = None
         metadata = {
-            "response_type": payload.get("type"),
-            "subtype": payload.get("subtype"),
-            "stop_reason": payload.get("stop_reason"),
+            "response_type": provider_safe_text(payload.get("type")),
+            "subtype": provider_safe_text(payload.get("subtype")),
+            "stop_reason": provider_safe_text(payload.get("stop_reason")),
             "redacted_items": redacted_count,
-            "api_error_status": payload.get("api_error_status"),
+            "api_error_status": api_error_status,
         }
         if failed:
             return ToolResult(
@@ -521,7 +590,7 @@ class ClaudeCodeConnector(BaseConnector):
                     ErrorCode.CONNECTOR_FAILED,
                     result_text or "Claude Code request failed.",
                     details=metadata,
-                    retryable=payload.get("api_error_status") in {401, 408, 429, 500, 503},
+                    retryable=api_error_status in {401, 408, 429, 500, 503},
                 ),
                 usage=usage,
             )
@@ -976,8 +1045,18 @@ class ClaudeCodeConnector(BaseConnector):
         usage_data = payload.get("usage")
         if not isinstance(usage_data, dict):
             usage_data = {}
-        model_usage = payload.get("modelUsage") or {}
-        model = str(next(iter(model_usage))) if isinstance(model_usage, dict) and model_usage else None
+        # The first ``modelUsage`` key is a provider string and is persisted
+        # (ledger ``model`` column, result snapshot, envelope), so it passes
+        # the shared rule; an invalid key yields ``None``, exactly as an
+        # absent mapping does. This cannot undercount anything: the model
+        # name feeds no amount, token count, call count, route or reservation
+        # - those come from ``total_cost_usd``, ``usage`` and the H3 claim.
+        model_usage = payload.get("modelUsage")
+        model = (
+            provider_safe_text(next(iter(model_usage)))
+            if isinstance(model_usage, dict) and model_usage
+            else None
+        )
         reported_usd = _reported_usd(payload.get("total_cost_usd"))
         if billing_class is BillingClass.METERED_MONETARY:
             monetary_state = (
