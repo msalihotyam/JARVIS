@@ -8,3 +8,23 @@ data/
 dist/
 build/
 *.egg-info/
+
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Logs and coverage
+*.log
+.coverage
+htmlcov/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
