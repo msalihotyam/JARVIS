@@ -238,19 +238,20 @@ class InputBoundaryTests(unittest.TestCase):
                 self.assertEqual("body\n", task.write_content)
                 self.assertEqual(mode, task.write_mode)
 
-    def test_overwrite_is_refused_at_the_input_boundary(self) -> None:
-        """M5 performs create only; overwrite fails closed by policy.
+    def test_overwrite_decodes_but_the_boundary_authorizes_nothing(self) -> None:
+        """M10 enables overwrite as POLICY; everything else is asked later.
 
-        The grammar still RECOGNIZES overwrite - a record written by a later
-        milestone has to load and validate - but no primitive reachable from
-        here can make a replacement conditional on the destination still
-        being the approved file, so it is refused rather than raced.
+        The input boundary owns the grammar and the policy tuple. It does not
+        know whether this host can pin a directory entry, what volume the
+        target sits on, or what is currently on disk - so a decoded overwrite
+        is a well-formed REQUEST and never an authorization. The connector
+        asks all three before any approval can exist.
         """
         self.assertIn("overwrite", LOCAL_WRITE_MODES)
-        self.assertNotIn("overwrite", LOCAL_WRITE_ENABLED_MODES)
-        with self.assertRaises(Exception) as caught:
-            self.decode(content="body\n", mode="overwrite")
-        self.assertIn("not supported", str(caught.exception))
+        self.assertIn("overwrite", LOCAL_WRITE_ENABLED_MODES)
+        task = self.decode(content="body\n", mode="overwrite")
+        self.assertEqual("overwrite", task.write_mode)
+        self.assertEqual("body\n", task.write_content)
 
     def test_a_task_without_a_write_section_carries_nothing(self) -> None:
         task = self.decode()
@@ -515,8 +516,14 @@ class AttestationTests(LocalWriteTestCase):
         two = write_task(self.root / "two.txt", "same\n")
         self.assertNotEqual(self.fingerprint(one), self.fingerprint(two))
 
-    def test_an_unsupported_mode_cannot_be_attested_at_all(self) -> None:
-        """No approval can ever be requested for an operation M5 refuses."""
+    def test_an_unbound_overwrite_cannot_be_attested_at_all(self) -> None:
+        """No approval can ever be requested for an overwrite M10 refuses.
+
+        M5 refused every overwrite at this surface. M10 refuses one carrying
+        no completed whole-file read of the target - the same guarantee in the
+        same place, so nothing downstream has to remember that it would have
+        failed later.
+        """
         self.seed("notes.txt", "prior\n")
         overwrite = write_task(self.root / "notes.txt", "new\n", "overwrite")
         with self.assertRaises(AttestationError) as caught:
@@ -727,26 +734,38 @@ class CreateOverwriteTests(LocalWriteTestCase):
             "already here\n", (self.root / "notes.txt").read_text(encoding="utf-8")
         )
 
-    def test_overwrite_is_refused_before_anything_is_approved(self) -> None:
-        """M5 is create-only, and it refuses at the first surface that asks.
+    def test_an_unbound_overwrite_is_refused_before_anything_is_approved(self) -> None:
+        """M10 binds an overwrite to a completed read of the file it replaces.
 
-        The existing file is left exactly as it was: an unsupported mode
-        never reaches an install, an approval, or even an attestation.
+        A snapshot that merely MATCHES is not provenance, so the durable
+        reference is what the loop demands - and it demands it before an
+        approval, an attestation or an attempt can exist. The existing file is
+        left exactly as it was. The rest of the provenance surface is pinned
+        in ``tests/test_local_file_edit.py``.
         """
         self.seed("notes.txt", "before\n")
         task = write_task(self.root / "notes.txt", "after\n", "overwrite")
         run = self.core.run(task)
         self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertIs(ErrorCode.EGRESS_REFUSED, run.error.code)
-        self.assertIn("not supported", run.error.message)
+        self.assertIs(ErrorCode.INVALID_TASK, run.error.code)
+        self.assertIn("completed local read", run.error.message)
+        self.assertEqual([], self.memory.execution_attempts(task.id))
+        self.assertIsNone(self.memory.load_pending_approval(task.id, run.session.id))
         self.assertEqual(
             "before\n", (self.root / "notes.txt").read_text(encoding="utf-8")
         )
 
     def test_overwrite_of_an_absent_target_is_refused_too(self) -> None:
-        """Not "there is nothing to replace" - the MODE is unsupported."""
+        """Not "the mode is unsupported" any more, and not silently a create.
+
+        An overwrite naming a file that does not exist cannot have a completed
+        read of it either, so it is refused for want of provenance and never
+        downgraded. That mode and prior state are ONE authority is pinned
+        directly against the connector in ``tests/test_local_file_edit.py``.
+        """
         _, run = self.refused(self.root / "missing.txt", "new\n", "overwrite")
-        self.assertIn("not supported", run.error.message)
+        self.assertIs(ErrorCode.INVALID_TASK, run.error.code)
+        self.assertIn("completed local read", run.error.message)
         self.assertFalse((self.root / "missing.txt").exists())
 
     def test_a_directory_target_is_refused(self) -> None:

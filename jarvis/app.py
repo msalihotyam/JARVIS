@@ -482,6 +482,22 @@ def decode_task_json(raw: str | bytes) -> Task:
                 "'write' requires exactly one of 'content' or "
                 f"'{LOCAL_WRITE_SOURCE_KEY}'."
             )
+        # M10. A model answer may CREATE a file; it may not REPLACE one.
+        # Nothing durable proves that the exact bounded read context reached
+        # the actual model invocation that produced an answer -
+        # ``canonical_outbound`` is opaque bytes and the core only checks that
+        # its digest is non-empty - so "the model saw the file it is about to
+        # overwrite" is not a fact this product can establish for ANY
+        # connector. An irreversible in-place replacement will not be
+        # authorized on an unprovable premise. Refused here so no such task is
+        # ever persisted; ``_write_identity_failure`` refuses the
+        # programmatically built form independently.
+        if has_reference and write_mode == "overwrite":
+            raise TaskInputError(
+                "'write.mode' 'overwrite' cannot be combined with "
+                f"'{LOCAL_WRITE_SOURCE_KEY}': a model answer may create a "
+                "file but may not replace one."
+            )
         if has_content:
             write_content = write_input["content"]
             reason = local_write_content_refusal(write_content)

@@ -183,7 +183,11 @@ class ContainmentTests(LocalReadTestCase):
             self.skipTest("symlink creation not permitted")
         _, run = self.run_read(link)
         self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertEqual(ErrorCode.EGRESS_REFUSED, run.error.code)
+        # P2. Refused AS A LINK by the no-follow chain scan, rather than by
+        # resolving it first and finding the destination outside the roots.
+        # Both refuse; only this order refuses without having followed the
+        # link to learn where it went.
+        self.assertEqual(ErrorCode.INVALID_TASK, run.error.code)
 
     def test_directory_target_is_refused(self) -> None:
         (self.root / "adir").mkdir()
@@ -277,7 +281,11 @@ class SecretDenyPolicyTests(LocalReadTestCase):
             self.skipTest("symlink creation not permitted")
         _, run = self.run_read(link)
         self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertEqual(ErrorCode.EGRESS_REFUSED, run.error.code)
+        # P2. The deny policy is no longer what fires FIRST here: the link is
+        # refused as a link, before anything follows it to discover that it
+        # aims at a key. The property under test is unchanged - the key's
+        # bytes reach nothing.
+        self.assertEqual(ErrorCode.INVALID_TASK, run.error.code)
         self.assertNotIn("PRIVATE-KEY-MARKER", json.dumps(run.error.to_dict()))
 
     def test_policy_predicate_is_case_insensitive(self) -> None:
@@ -778,10 +786,15 @@ class ExactBindingTests(LocalReadTestCase):
         swapped = {"done": False}
 
         def patched_chain(connector, root, parts):
-            original_chain(connector, root, parts)
+            # The scan now RETURNS the leaf's own no-follow lstat - the
+            # identity the post-open fstat is bound to - so the seam still
+            # sits exactly between that stat and the open, and has to hand
+            # the value back rather than answer for it.
+            info = original_chain(connector, root, parts)
             if not swapped["done"]:
                 swapped["done"] = True
                 os.replace(other, target)
+            return info
 
         with mock.patch.object(
             LocalFileReadConnector, "_reject_reparse_chain", patched_chain
@@ -1707,8 +1720,11 @@ class ParentDirectoryRaceTests(LocalReadTestCase):
             original_chain = LocalFileReadConnector._reject_reparse_chain
 
             def patched_chain(connector, root, parts):
-                original_chain(connector, root, parts)
+                # The scan now RETURNS the last accepted component's lstat, so
+                # the seam has to hand it back or it would be answering for it.
+                info = original_chain(connector, root, parts)
                 once()
+                return info
 
             with mock.patch.object(
                 LocalFileReadConnector, "_reject_reparse_chain", patched_chain
@@ -1835,7 +1851,19 @@ class CanonicalTargetBindingTests(LocalReadTestCase):
         self.assertEqual(1, len(targets), targets)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unsupported")
-    def test_a_bare_relative_symlink_target_binds_to_the_real_file(self) -> None:
+    def test_a_bare_relative_symlink_target_binds_to_its_own_absolute_name(
+        self,
+    ) -> None:
+        """P2. A bare name still becomes an absolute canonical identity; what
+        it no longer becomes is the file at the far end of a link.
+
+        Binding used to dereference, so ``README.md`` bound to ``real.md``.
+        That made canonicalizing a NAME an ``open`` of whatever it pointed at,
+        before any policy had accepted the path, so the dereference is gone
+        and the link binds to its own absolute name. Nothing becomes readable
+        that was not before: the link is refused outright by the no-follow
+        chain scan at execution.
+        """
         real = self.write("real.md", "real content\n")
         link = self.root / "README.md"
         try:
@@ -1844,9 +1872,10 @@ class CanonicalTargetBindingTests(LocalReadTestCase):
             self.skipTest("symlink creation not permitted")
         with working_directory(self.root):
             bare = self._bound_scope("README.md")
-        # The symbolic spelling no longer survives anywhere: the authority is
-        # the file the link resolves to, not the name that pointed at it.
-        self.assertEqual(canonical_path(real), bare.target)
+        # Still absolute and canonical - the P1-2 property - and still not the
+        # bare SYMBOL that a repoint would leave untouched.
+        self.assertEqual(canonical_path(link), bare.target)
+        self.assertNotEqual(canonical_path(real), bare.target)
         self.assertNotEqual("readme.md", bare.target)
 
     def test_the_root_relative_display_name_is_still_the_only_public_form(
@@ -1904,9 +1933,17 @@ class CanonicalTargetBindingTests(LocalReadTestCase):
         say yes - nothing but the resource IDENTITY changed. That is the
         whole point: before P1-2 the approval fingerprint covered the SYMBOL
         ``notes.txt``, which a repoint does not change, while execution
-        resolved the name live and read whatever it now pointed at. Canonical
-        binding makes the fingerprint the FILE, so the repoint changes the
-        fingerprint and the stale grant authorizes nothing.
+        resolved the name live and read whatever it now pointed at.
+
+        P2 moved WHERE that is refused, not WHETHER. Canonicalization no
+        longer dereferences the name - following a link to decide what to call
+        it is an inspection aimed by a path no policy has accepted yet - so
+        the fingerprint no longer changes under a repoint and the stale grant
+        is still honoured. The repoint is refused one boundary later instead,
+        by the no-follow chain scan, which sees the reparse point AS ITSELF
+        before anything is opened. The guarantee that matters is unchanged and
+        is what this pins: the decoy is never read and its bytes reach
+        nothing.
         """
         approved = self.write("notes.txt", "approved content\n")
         self.write("other.txt", f"{self.MARKER}\n")
@@ -1921,12 +1958,19 @@ class CanonicalTargetBindingTests(LocalReadTestCase):
             resumed = self.core.resume(run.session.id, task.id, grant)
 
         self.assertNotEqual(RunStatus.COMPLETED, resumed.status)
-        self.assertIsNone(self.memory.latest_execution_attempt(task.id))
+        self.assertIsNotNone(resumed.error)
         self._assert_no_marker_anywhere(task.id)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unsupported")
     def test_a_repoint_out_of_the_roots_is_refused_as_well(self) -> None:
-        """The same repoint, aimed outside: containment refuses independently."""
+        """The same repoint, aimed outside: refused at the same boundary.
+
+        Kept separate from the in-root case even though P2 makes both refuse
+        for the same reason. Under the old dereferencing canonical form these
+        two took genuinely different routes - one changed the fingerprint,
+        this one left the roots - and the point of the pair is that neither
+        aim ever reads the decoy.
+        """
         outside = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, outside, True)
         (outside / "evil.txt").write_text(f"{self.MARKER}\n", encoding="utf-8")
@@ -1942,7 +1986,7 @@ class CanonicalTargetBindingTests(LocalReadTestCase):
             resumed = self.core.resume(run.session.id, task.id, grant)
 
         self.assertNotEqual(RunStatus.COMPLETED, resumed.status)
-        self.assertIsNone(self.memory.latest_execution_attempt(task.id))
+        self.assertIsNotNone(resumed.error)
         self._assert_no_marker_anywhere(task.id)
 
     def test_an_unchanged_target_still_executes_under_its_own_approval(self) -> None:

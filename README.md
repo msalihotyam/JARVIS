@@ -11,11 +11,13 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - Aylık parasal politika tek yüzeydir: kullanıcı onayı olmadan geçilemeyecek 20 USD sert üst sınır. Üst sınır yalnızca göreve özel açık override onayıyla aşılabilir.
 - Proje hafızası (M1) güvenilmeyen referans veridir: yalnızca açık kullanıcı komutlarıyla yazılır, hiçbir zaman approval/billing/lifecycle otoritesi taşımaz, içeriği talimat olarak yorumlanmaz ve toplam getirme kotasını (5 öğe / 4.000 karakter) büyütmez.
 - Claude Code connector yalnızca read-only araçlar, safe mode, boş/strict MCP, plan permission mode, no-session-persistence ve çağrı başı bütçe sınırı kullanır.
-- Yerel yazma (M5) her izin modunda açık onay ister ve geri alınamaz olarak beyan edilir: `SideEffect.LOCAL_WRITE` zorunlu-onay etkisidir, hatırlanan bir SESSION grant'i bir yazmayı asla yetkilendiremez ve "yalnızca oluşturma"ya otomatik onay yoktur. Onay, yazılacak **tam byte'lara** ve hedefin **önceki durumuna** bağlanır; ikisinden biri değişirse fingerprint geçersizleşir. Yazma atomiktir ve otorite mutasyon anında yeniden kanıtlanır (kaynak nesne kimliği, `create` için kernel tarafından zorlanan hedef yokluğu, `overwrite` için onaylanan ön-durum); hedef hiçbir zaman yazma için açılmaz ve JARVIS hiçbir pre-image saklamadığı için **rollback vaat etmez**.
+- Yerel yazma (M5) her izin modunda açık onay ister ve geri alınamaz olarak beyan edilir: `SideEffect.LOCAL_WRITE` zorunlu-onay etkisidir, hatırlanan bir SESSION grant'i bir yazmayı asla yetkilendiremez ve "yalnızca oluşturma"ya otomatik onay yoktur. Onay, yazılacak **tam byte'lara** ve hedefin **önceki durumuna** bağlanır; ikisinden biri değişirse fingerprint geçersizleşir. Otorite mutasyon anında yeniden kanıtlanır (kaynak nesne kimliği, `create` için kernel tarafından zorlanan hedef yokluğu, `overwrite` için onaylanan ön-durum). `create` **atomiktir** ve hedefi yazma için hiç açmaz; `overwrite` (M10) hedefi yerinde açar ve **atomik değildir**. JARVIS hiçbir pre-image saklamadığı için ikisi de **rollback vaat etmez**.
 - Açık model cevabı aktarımı (M7): create-only bir `file_write` görevi, aynı oturumdaki tamamlanmış bir model görevinin cevabını `write.model_answer_task_id` ile tam byte kaynağı olarak **açıkça** referans verebilir. Cevap güvenilmeyen veridir; tek yetki sınırı yine zorunlu `LOCAL_WRITE` onayıdır ve byte'lar onaydan önce görevin içinde dondurulur, kaynak bir daha okunmaz. Bozuk veya tutarsız kalıcı aktarım kimliği asla direct yazmaya dönüşmez: `invalid` yüklenir ve kapalı düşer.
 - Kalıcı tanılama hijyeni: istisna/connector hata metni ham olarak saklanmaz. Her kalıcı serbest-metin tanılaması tek kanonik hattan geçer (kimlik bilgisi redaksiyonu, yerel yol redaksiyonu, 240 karakter sert sınır, idempotent); traceback, komut satırı, ortam değerleri, ham prompt/payload ve keyfi `result.data` hiç kalıcılaşmaz.
 - Sınırlı çok dosyalı okuma bağlamı (M8): bir `code_analysis` / `code_planning` görevi `context.local_read_task_ids` ile aynı oturumdaki **en fazla 3** tamamlanmış `file_read` görevini açıkça referans verebilir. Kaynaklar CONTEXT_RETRIEVAL'da **hep-ya-hiç** çözümlenir, sıralı tek bir demet olarak dondurulur ve mevcut H1-bağlı egress yolundan gönderilir. Tekil `local_read_task_id` ile birlikte kullanılamaz; referanslar `task.context` içinde **kalmaz**. Bozuk veya eksik demet asla bağlamsız bir model isteğine dönüşmez: `invalid` yüklenir ve kapalı düşer.
 - Sınırlı bölge okuma (M9): `file_read` görevi isteğe bağlı `read` bölümüyle (`start_line`, `max_lines`) bir dosyanın **satır aralığını** okuyabilir. Bölüm yoksa davranış eskisiyle **birebir aynıdır**. Bölge okuma, aynı kanıtlanmış dosya tanıtıcısı üzerinde akış hâlinde çalışır: satır aranırken baytlar sayılıp **atılır**, istenen bölge yakalanır ve bölge 64 KiB yakalama tavanı içinde **kapanmazsa istek reddedilir** — kısmi bir bölge asla başarı olarak dönmez. Böylece 64 KiB üstü olduğu için bugüne kadar hiç okunamayan büyük dosyalar (ör. `jarvis/contracts.py`) satır aralığıyla okunabilir hâle gelir.
+
+- Doğrudan tam dosya üzerine yazma (M10): `file_write` görevi `write.mode: "overwrite"` ile **var olan** bir dosyanın tamamını değiştirebilir. Zorunlu ön koşul, aynı oturumda tamamlanmış bir **HEAD** `file_read` görevidir (`context.local_read_task_id`): dosyanın şu anki hâli o okumanın `sha256`/`byte_size` değerleriyle **birebir** aynı olmalıdır, aksi hâlde istek reddedilir. Yazma **yerinde** yapılır: yaprak dosya, doğrulanmış parent handle altında yalnız `FILE_SHARE_READ` ile açılır, böylece hem nesne hem de onun **dizin girdisi** çekirdek tarafından pinlenir; ön-durum aynı tanıtıcıdan yeniden özetlenir ve değiştirme aynı tanıtıcıdan yapılır. Bu yol **yalnız Windows + yerel sabit NTFS** üzerinde açıktır ve **atomik değildir** (`reversible=False`, yedek yok, geri alma yok). Model cevabından üretilen bir overwrite bilinçli olarak **ertelenmiştir**; `create` aktarımı değişmedi.
 
 ## Yapı
 
@@ -71,12 +73,13 @@ grant'i verilmez.
 }
 ```
 
-Kurallar: M5 **yalnızca `create`** yapar. `overwrite` tanınır fakat
-**desteklenmez ve kapalı düşer**: güvenli bir overwrite "bu hedefi ancak hâlâ
-onaylanan nesne ise değiştir" anlamına gelen bir mutasyon gerektirir ve ne
-Windows'ta ne Linux'ta buradan erişilebilen bir primitif bunu ifade eder;
-kontrol + koşulsuz replace bir zorlama değil, arkasında pencere olan bir
-kontroldür. Var olan bir dosyaya `create` de reddedilir. `content` tam `str`, katı UTF-8
+Kurallar: bu bölüm M5'in **`create`** yolunu anlatır ve o yol
+değişmemiştir — var olan bir dosyaya `create` reddedilir, kurulum atomiktir
+ve hedef hiç yazma için açılmaz. `overwrite` M5'te kapalı düşerdi; M10 ile
+açıldı ve **ayrı bir yoldur**: yerinde, atomik olmayan, yalnız Windows +
+yerel sabit NTFS'te çalışan ve tamamlanmış bir HEAD `file_read`'e bağlanmak
+zorunda olan bir tam dosya değiştirme. Aşağıdaki "Doğrudan tam dosya üzerine
+yazma (M10)" bölümüne bakınız. `content` tam `str`, katı UTF-8
 (lone surrogate reddedilir), NUL'suz ve en çok `LOCAL_WRITE_MAX_BYTES = 64
 KiB` olmalıdır; sessiz kesme yoktur. Yazılan byte'lar birebir
 `content.encode("utf-8")`'tir — newline normalizasyonu, redaksiyon veya
@@ -288,7 +291,8 @@ Claude alt sürecine `Read`/`Glob`/`Grep` veya doğrudan filesystem erişimi
 verilmez (`--tools ""` boş kalır). Böylece modele ulaşan her şey, onayın
 attest ettiği kanonik payload byte'larının içindedir.
 
-Sıra zorunludur: kanonik `resolve` → kök içi containment → secret-file deny
+Sıra zorunludur: **sözlüksel** kanonikleştirme (link **izlenmez**)
+→ kök içi containment → secret-file deny
 → temsil edilebilir root-göreceli ad → normal dosya → onaylanan dizin zinciri
 üzerinden açma ve açılan **nesnenin** hâlâ kök içinde olduğunun kanıtı →
 açılan tanıtıcının aynı dosya olduğunun `st_dev`/`st_ino` kanıtı → 64 KiB
@@ -303,7 +307,13 @@ Zincir, başladığı kök kadar güvenilirdir: her izinli kökün
 anında yeniden kanıtlanır, böylece kökün kendisinin yeniden
 yönlendirilmesi de sıfır byte verir.
 
-Açma öncesi `resolve()` bir yol adını kanıtlar, bir nesneyi değil: doğrulama
+Kanonikleştirme hiçbir şeyi **izlemez** (P2): `Path.resolve` yerine
+`os.path.abspath` kullanılır, çünkü `resolve` zinciri çözerken Windows'ta
+yolu **açar** — ve bu, hiçbir politikanın henüz kabul etmediği bir yolun
+nişan aldığı bir incelemedir; UNC'ye bakan bir junction'da bir adlandırma,
+kimlik bilgisi taşıyan giden ağ trafiğine dönüşür. Kök içi bir symlink
+böylece hedefine çözülüp okunmak yerine **link olarak reddedilir**.
+Açma öncesi kanonik ad bir yol adını kanıtlar, bir nesneyi değil: doğrulama
 ile `open` arasında bir **üst dizin** symlink/junction ile değiştirilirse
 açılan dosya onaylanan zinciri hiç kat etmemiş olur. POSIX'te zincir dizin
 tanıtıcılarıyla `O_NOFOLLOW` yürünür (kök dışına geçici olarak bile hiçbir şey
@@ -311,11 +321,13 @@ açılmaz); Windows'ta zincir önce no-follow taranır ve açılan tanıtıcıya
 authoritative son yolu (`GetFinalPathNameByHandleW`) sorulur. Kök dışına düşen
 her sonuç reddedilir ve sıfır byte verir.
 
-Hedef, yazımı ne olursa olsun (`README.md`, `.\README.md`, `./docs/../docs/x`,
-symlink) yürütmeden önce tek bir yerde `canonical_path`'ten geçirilir; scope
+Hedef, yazımı ne olursa olsun (`README.md`, `.\README.md`, `./docs/../docs/x`)
+yürütmeden önce tek bir yerde `canonical_path`'ten geçirilir; scope
 otoritesi, izin fingerprint'i, attestation ve yürütme aynı kanonik kimliği
-görür. Onaydan sonra ad başka bir dosyaya yönlendirilirse fingerprint değişir
-ve eski grant hiçbir şeyi yetkilendirmez. Bir **hard link** bir link değil, aynı dosyanın ikinci adıdır: çözülecek
+görür. Onaydan sonra ad bir symlink ile başka bir dosyaya yönlendirilirse
+kanonik kimlik artık değişmez (link çözülmediği için), ama yeniden
+yönlendirme bir sınır sonra no-follow zincir taramasında reddedilir ve sahte
+hedef yine hiç okunmaz. Bir **hard link** bir link değil, aynı dosyanın ikinci adıdır: çözülecek
 bir şey yoktur ve authoritative son yol handle'ın açıldığı kök-içi addır,
 yani kök dışındaki bir dosyanın kök-içi adı tüm kontrolleri geçerdi. M3
 bu yüzden açılan normal dosyanın `st_nlink > 1` olmasını reddeder;
@@ -339,8 +351,9 @@ adlar (`.env` ve `.env.*`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`,
 `.pfx`, `.p12`) ve iki dizin kuralı (`.ssh/**`, `.aws/credentials`).
 `id_generator.py`, `id_map.json`, `id_rsa.pub`, `key.py`, `keys.json`,
 `apikey.md` ve `environment.py` okunabilir kalır. Politika kanonik yol
-üzerinde çalışır, yani sır dosyasına işaret eden symlink de reddedilir;
-deny edilen dosya hiç okunmaz.
+üzerinde ve ayrıca **açık tanıtıcının kanıtladığı** authoritative yol
+üzerinde çalışır; sır dosyasına işaret eden bir symlink zaten link olarak
+reddedilir. Deny edilen dosya hiç okunmaz.
 
 Sonuç, tipli ve görev kapsamlı bir alanda (`Task.local_read`) yaşar: kalıcı
 proje hafızası değildir, hiçbir memory/decision satırı üretmez ve getirmenin
@@ -577,6 +590,115 @@ REGION okumasıyla okunabilir (HEAD dosya tavanını aşar, REGION satır
 kapanmadığı için reddeder). Küçültülmüş/minified tek satırlık büyük dosyalar
 bu yüzden okunamaz kalır; bu M9 kapsamı dışındadır ve farklı bir ilkel
 gerektirir.
+
+### Doğrudan tam dosya üzerine yazma (M10)
+
+Bir `file_write` görevi, var olan bir dosyanın **tamamını** değiştirebilir:
+
+```json
+{
+  "objective": "notları güncelle",
+  "capability": "file_write",
+  "scope": {"action": "write", "target": "C:/proje/notes.txt"},
+  "context": {
+    "working_directory": "C:/proje",
+    "local_read_task_id": "<tamamlanmış HEAD file_read görev kimliği>"
+  },
+  "write": {"mode": "overwrite", "content": "dosyanın yeni tam içeriği\n"}
+}
+```
+
+Yeni girdi anahtarı yoktur: `mode` zaten dilbilgisinde vardı ve
+`local_read_task_id` zaten M3 hop'udur. `expected_sha256` gibi bir alan,
+satır aralığı, yama/diff sözdizimi veya bulanık eşleme **yoktur**.
+
+**Zorunlu ön-görüntü bağlaması.** Overwrite, aynı oturumda **tamamlanmış**
+bir HEAD `file_read` görevine bağlanmak zorundadır. Bağlı snapshot
+`present` olmalı, kanonik sözleşmeyi geçmeli, `start_line == 0` ve
+`end_line == 0` (yani **REGION değil**), `relative_path` hedefle birebir
+eşleşmeli ve `sha256`/`byte_size` diskte **şu anda** gözlenenle birebir
+aynı olmalıdır. Excerpt'in kendisi hiçbir şeyle karşılaştırılmaz: o
+normalize edilmiş, redakte edilmiş ve sınırlanmış bir **gösterim**
+artefaktıdır, dosya değildir — ve doğrudan yolda tam yeni içeriği zaten
+çağıran veriyor, modelden görülmemiş baytları yeniden kurması
+istenmiyor. Bir REGION snapshot'ı asla düzenleme yetkisi olamaz: onun
+digest'i yalnız yakalanan satırları tanımlar.
+
+**Yetki (nesne VE yol).** Bir dosya tanıtıcısı yalnız **nesneyi** pinler.
+JARVIS yazma yetkisi ise hem nesneyi hem de **yolu** bağlar: H1 çerçevesi
+yolu taşır, `_authority_of` onu karşılaştırır, kök-içinde-olma ve
+gizli-dosya reddi de ad hakkında ifadelerdir. Bu yüzden mutasyon anında
+ikisinin de doğru olması gerekir. Yaprak dosya, doğrulanmış parent
+HANDLE'ı altında `NtCreateFile` + `FILE_OPEN` + `FILE_SHARE_READ` ile
+açılır: `FILE_SHARE_WRITE` ve `FILE_SHARE_DELETE` verilmez, dolayısıyla
+tanıtıcı elde tutulduğu sürece kimse nesneyi yazamaz, silemez, yeniden
+adlandıramaz ve aynı ada başka bir dosya koyamaz. Paylaşım denetimi çift
+yönlüdür: çakışan bir tanıtıcı zaten varsa **bizim açmamız** başarısız
+olur, yani "açma başarılı oldu" ifadesi çakışan tanıtıcı bulunmadığının
+kendisi kanıtıdır.
+
+**Neden yerinde.** M5, "bu hedefi ancak hâlâ onaylanan nesne ise değiştir"
+diyen bir **rename** ilkeli aradı ve haklı olarak bulamadı. Bir
+düzenlemenin buna ihtiyacı yoktur: nesne zaten vardır, dolayısıyla
+**tutulabilir**. Doğrulama ile yazma arasında hiçbir ad yeniden
+çözülmediği için yarışacak pencere yoktur. İkinci bağımsız gerekçe:
+yerinde yazma dosyanın inode'unu, izinlerini ve ACL'lerini korur; geçici
+dosya + rename ise izlenen bir kaynak dosyasını sessizce 0600'e ve yeni
+bir inode'a çevirirdi.
+
+**Yalnız Windows + yerel sabit NTFS.** POSIX'te `rename`/`unlink` dizin
+girdileri üzerinde çalışır ve açık bir tanıtıcıyı etkilemez, bu yüzden
+onaylanan inode izinli kökün **dışına** taşınmış olsa bile yazma ona iner
+— bu bir eşzamanlılık artığı değil, yol/kök yetkisinin ihlalidir. POSIX'te
+bunu kapatan bir ilkel yoktur (`fstatat` karşılaştırması arkasında pencere
+bırakır, tavsiye kilitleri yok sayılabilir, zorunlu kilitleme Linux'tan
+kaldırıldı, lease'ler rename'de değil open'da kırılır, `renameat2`'nin
+hedef-inode ön koşulu yoktur). Bu yüzden overwrite yalnız girdiyi
+pinleyebilen platformda açıktır ve başka her yerde **onaydan önce**
+reddedilir. Ayrıca yalnız paylaşım garantisi fiilen doğrulanmış olan
+**yerel sabit NTFS** birimlerinde açıktır; ağ/SMB, WSL DrvFs, çıkarılabilir
+ortam, ReFS ve tanımlanamayan birimler reddedilir. Birim hem onay anında
+yol üzerinden hem de yürütme anında **açık tanıtıcı** üzerinden yeniden
+sorulur. Okuma ve `create` her platformda değişmeden çalışır.
+
+**Atomik değildir, ve bu böyle söylenir.** Hedef yazma için açılır ve
+sıfıra kesilir. Kesme ile `fsync` arasında bir çökme, elektrik kesintisi
+veya sert sonlandırma dosyayı ne ön-görüntü ne de hedeflenen içerik olan
+bir hâlde bırakabilir ve ön-görüntü baytları **kaybolur** — M5'in geri
+alma vaat etmemesiyle aynı sebeple hiçbir yedek tutulmaz. Zarar tek bir
+onaylanmış dosyanın en fazla 64 KiB'iyle sınırlıdır. `reversible=False`
+korunur; yedek, geri alma veya `file_restore` yoktur.
+
+**H2 değişmedi.** Şüpheli bir yazma asla otomatik yeniden oynatılmaz.
+`pre_execution_record` iki onaylanmış durumu sınırın **öncesinde**
+kalıcılaştırır; `diagnose_write` mevcut üç etiketle cevap verir:
+`write_landed`, `write_did_not_land`, `ambiguous_third_party_change`.
+Overwrite için üçüncü etiket, üçüncü tarafın değiştirmesi kadar
+**yarıda kalmış bir yerinde yazma** anlamına da gelebilir; etiket
+bilinçli olarak değiştirilmemiştir, çünkü işlevsel anlamı ikisinde de
+aynıdır: hedef, onaylanan iki durumun hiçbirine uymuyor, insan bakmalı.
+Ön-görüntü bağlaması aynı zamanda yeniden oynatma korumasıdır: baytlar
+indikten sonra dosya artık onaylanan digest'e uymaz, dolayısıyla yeni bir
+deneme kendiliğinden kapalı düşer.
+
+**Model cevabı → overwrite ertelenmiştir.** `write.model_answer_task_id`
+ile `mode: "overwrite"` birlikte kullanılamaz; girdi sınırında reddedilir
+(görev hiç kalıcılaşmaz) ve programatik biçimi `_write_identity_failure`
+içinde bağımsız olarak reddedilir. Sebebi bir connector'a duyulan
+güvensizlik değildir: bugün hiçbir dayanıklı durum, **tam olarak o okuma
+bağlamının gerçek model çağrısına dâhil edildiğini** kanıtlamaz —
+`canonical_outbound` opak baytlardır ve çekirdek yalnız digest'inin boş
+olmadığına bakar. Bu yüzden kural her connector için aynıdır: bağlamı
+dürüstçe serileştiren bir connector da, hiç serileştirmeyen bir connector
+da aynı biçimde reddedilir. `create` aktarımı hiç değişmedi.
+
+**Kabul edilen artıklar.** (1) Overwrite yalnız Windows + yerel sabit
+NTFS'te vardır. (2) Yerinde yazma atomik değildir. (3) Zorunlu ön-görüntü
+bağlaması `retrieval_eligible` üzerinden geçtiği ve SECRET her iki rolde de
+uygun olmadığı için, **SECRET sınıflandırmalı bir görev şu an overwrite
+yapamaz**; bu M10'da çözülmemiş, kayda geçmiş bir sınırdır. (4) Başka bir
+süreç dosyayı yazma erişimiyle açık tutuyorsa overwrite kapalı düşer.
+Ayrıntılar `ARCHITECTURE.md` §4.17'dedir.
 
 ### Görev-farkında deterministik plan
 

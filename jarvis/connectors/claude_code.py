@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -101,6 +102,10 @@ LOCAL_READ_CONTEXT_EGRESS_REFUSAL = (
 #: only once a bounded, enforceable read manifest exists; the set is bound
 #: into the egress attestation, so any change invalidates prior approvals.
 EGRESS_TOOL_GRANTS: tuple[str, ...] = ()
+
+#: Windows marks junctions and symlinks with this file attribute; POSIX has no
+#: equivalent and gets 0, where ``S_ISLNK`` already answers the same question.
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 
 #: Environment variables that route the CLI to a metered or unverifiable
 #: billing path. Only their presence is ever inspected, never their value.
@@ -255,6 +260,18 @@ class ClaudeCodeConnector(BaseConnector):
         self.allowed_roots = tuple(Path(root).resolve() for root in roots)
         if not self.allowed_roots:
             raise ValueError("At least one allowed root is required")
+        # The identity of each root AS AN OBJECT, captured here at
+        # construction, so the no-follow working-directory scan is anchored to
+        # the directory that was authorized rather than to its pathname. A root
+        # that does not exist gets no identity, and a caller-supplied working
+        # directory under it therefore fails closed.
+        self._root_identity: dict[Path, tuple[int, int]] = {}
+        for root in self.allowed_roots:
+            try:
+                info = os.stat(root)
+            except OSError:
+                continue
+            self._root_identity[root] = (info.st_dev, info.st_ino)
         self.default_working_directory = default_root
         self.command = command
         self.timeout_seconds = timeout_seconds or self.manifest.timeout_seconds
@@ -711,13 +728,105 @@ class ClaudeCodeConnector(BaseConnector):
         process.terminate()
         return True
 
+    def _containing_root(self, path: Path) -> Path | None:
+        """The deepest allowed root strictly containing ``path``."""
+        best: Path | None = None
+        for root in self.allowed_roots:
+            if root in path.parents and (
+                best is None or len(root.parts) > len(best.parts)
+            ):
+                best = root
+        return best
+
+    def _reject_reparse_chain(
+        self, root: Path, parts: tuple[str, ...]
+    ) -> os.stat_result:
+        """No-follow walk from ``root`` down ``parts``; the last ``lstat`` wins.
+
+        Same contract as the local connectors' shared scan. The root is checked
+        FIRST and by the identity captured at construction, not merely by
+        shape. Then every component is ``lstat``ed - never ``stat``ed - and
+        cleared before the next one is named, so a junction or symlink is
+        always SEEN AS ITSELF rather than traversed.
+
+        This is the only thing allowed to touch the filesystem before the chain
+        is accepted, so it also RETURNS the ``lstat`` of the last component it
+        accepted. "Is this a directory" is answered from that directory ENTRY
+        instead of from ``is_dir``/``stat``/``resolve`` - every one of which
+        DEREFERENCES, and would therefore follow a caller-planted reparse point
+        before this scan had refused it.
+        """
+        refused = "Working directory does not exist."
+        identity = self._root_identity.get(root)
+        if identity is None:
+            raise ValueError(refused)
+        try:
+            info = os.lstat(root)
+        except OSError as exc:
+            raise ValueError(refused) from exc
+        if (info.st_dev, info.st_ino) != identity:
+            raise ValueError(refused)
+        current = root
+        for name in parts:
+            current = current / name
+            try:
+                info = os.lstat(current)
+            except OSError as exc:
+                raise ValueError(refused) from exc
+            if stat.S_ISLNK(info.st_mode) or (
+                getattr(info, "st_file_attributes", 0) & _REPARSE_POINT
+            ):
+                raise ValueError(refused)
+        return info
+
     def _working_directory(self, context: dict[str, Any]) -> Path:
+        """The effective working directory, proven without following a link.
+
+        P2. ``context["working_directory"]`` is CALLER-CONTROLLED, so it gets
+        the same order every other caller-named path gets: lexical grammar,
+        lexical containment, then the no-follow component scan - and only a
+        path all three accepted becomes the working directory.
+
+        ``Path(requested).resolve()`` used to run first. It DEREFERENCES (on
+        Windows by opening the chain and asking ``GetFinalPathNameByHandleW``),
+        so a junction supplied here was FOLLOWED before any resource policy had
+        looked at it - and the containment check that came after was then asked
+        about the DESTINATION rather than about the name the caller gave,
+        laundering a junction aimed outside the allowed roots into a clean
+        in-root answer. ``os.path.abspath`` collapses ``.``/``..`` as a string
+        and never touches the filesystem, so a ``..`` route out of the roots is
+        still refused lexically.
+
+        ``is_dir()`` is gone from the caller's path for the same reason: it
+        follows. "This is a real directory" now comes from the scan's own
+        no-follow ``lstat`` of the final component, which has already refused a
+        reparse point sitting there - so a working-directory junction is
+        refused AS ITSELF, and where it pointed is never learned.
+
+        The configured default keeps the checks it always had. It is not caller
+        input: it was fixed at construction, and re-deciding it per task would
+        be a redesign of the trusted startup root rather than a fix.
+        """
         requested = context.get("working_directory")
-        path = Path(requested).resolve() if requested else self.default_working_directory
-        if not path.is_dir():
-            raise ValueError(f"Working directory does not exist: {path}")
+        if not requested:
+            path = self.default_working_directory
+            if not path.is_dir():
+                raise ValueError(f"Working directory does not exist: {path}")
+            if not self._within_allowed_roots(path):
+                raise ValueError(f"Working directory is outside allowed roots: {path}")
+            return path
+        try:
+            path = Path(os.path.abspath(Path(requested).expanduser()))
+        except (ValueError, OSError) as exc:
+            raise ValueError("Working directory does not exist.") from exc
         if not self._within_allowed_roots(path):
             raise ValueError(f"Working directory is outside allowed roots: {path}")
+        # ``_containing_root`` answers "strictly below"; a path that IS an
+        # allowed root is its own chain with no components under it.
+        root = self._containing_root(path) or path
+        info = self._reject_reparse_chain(root, path.relative_to(root).parts)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Working directory does not exist.")
         return path
 
     def _within_allowed_roots(self, path: Path) -> bool:

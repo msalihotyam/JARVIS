@@ -69,15 +69,42 @@ def looks_like_path(text: str) -> bool:
 def canonical_path(path: str | Path) -> str:
     """Windows-safe canonical form of a resolved filesystem path.
 
-    Symlinks, junctions and ``..`` segments are resolved first; the result is
-    case-folded by the platform rules and uses forward slashes only.
+    ``..`` segments are collapsed LEXICALLY; the result is case-folded by the
+    platform rules and uses forward slashes only. Links are NOT dereferenced.
+
+    P2. Lexical and only lexical: ``os.path.abspath`` anchors a relative name
+    to the working directory and normalizes it as a string - on Windows
+    through ``GetFullPathNameW``, which never touches the filesystem.
+    ``resolve`` cannot be used here. It DEREFERENCES the chain (on Windows by
+    opening it and asking ``GetFinalPathNameByHandleW``), and this function is
+    the FIRST thing in the loop to touch a local-file target - so a junction
+    planted below an allowed root would be followed here, before any no-follow
+    root-identity/reparse-chain policy has accepted a single component. That
+    is an inspection aimed by a path this product has not yet agreed to look
+    at, and on Windows it is an ``open``: a junction aimed at a UNC share
+    turns canonicalizing a NAME into an outbound network round-trip carrying
+    the user's credentials. Naming a resource must never be an inspection of
+    the filesystem it names.
+
+    Nothing is weakened by refusing to dereference, and one thing is fixed. A
+    reparse point in the chain now reaches the connector's no-follow scan AS
+    ITSELF and is refused there, where dereferencing would have laundered an
+    in-root junction into a clean-looking path the policy never saw.
+    Containment, the secret-file policy and the stored root-relative name are
+    all re-asked afterwards of the path the OPEN HANDLE proves, never of this
+    one, so the authoritative identity is unchanged. What does change is the
+    accepted contract: an in-root symlink is refused rather than read through,
+    and a repoint is refused at the open/policy boundary rather than by
+    changing this fingerprint. Two spellings that only meet by traversing a
+    link no longer share an identity - each keeps the one it was approved
+    under.
 
     TOTAL by contract: this feeds ``ActionScope.normalized`` and therefore
     task serialization, permission fingerprints and attestation, all of which
     run inside lifecycle stages that turn a REFUSAL into deterministic
     terminal state but have no answer for an EXCEPTION. A target the platform
     refuses to resolve at all - the practical case is an embedded NUL, which
-    POSIX rejects in ``resolve()`` while Windows tolerates it there and
+    Windows rejects in ``GetFullPathNameW`` while POSIX tolerates it here and
     rejects it later in ``lstat``/``open`` - must therefore degrade to a
     deterministic normalized spelling rather than raise out of the loop and
     strand a registered task with no terminal state. The value is
@@ -86,7 +113,7 @@ def canonical_path(path: str | Path) -> str:
     open check downstream still refuses it.
     """
     try:
-        resolved: str | Path = Path(path).expanduser().resolve(strict=False)
+        resolved: str | Path = Path(os.path.abspath(Path(path).expanduser()))
     except (ValueError, OSError):
         resolved = str(path)
     return os.path.normcase(str(resolved)).replace("\\", "/")
@@ -1816,9 +1843,14 @@ _DENIED_LOCAL_SUFFIXES = frozenset({".pem", ".key", ".pfx", ".p12"})
 def local_read_denial_reason(path: Path) -> str | None:
     """Why this canonical path may never be read, or ``None``.
 
-    Evaluated on the CANONICAL resolved path, so a benign-looking symlink
-    that points at a denied file is still refused. The reason names the
-    policy rule only - never the file's content and never an absolute path.
+    Evaluated LEXICALLY, on the canonical path exactly as spelled: nothing
+    here dereferences a link to discover where it points. A symlink,
+    junction or other reparse point is refused as itself by the connector's
+    no-follow chain policy, never resolved through to learn its
+    destination; and after a secure open the authoritative opened path is
+    rechecked against this rule where applicable, so a link cannot smuggle
+    a denied file past it. The reason names the policy rule only - never
+    the file's content and never an absolute path.
     """
     # Named streams FIRST, because they defeat every rule below: the deny
     # policy matches on the exact name and the exact suffix, and ``.env:s``
@@ -2215,25 +2247,33 @@ LOCAL_WRITE_MAX_BYTES = 64 * 1024
 #: file" can never silently become "I replaced an existing one".
 LOCAL_WRITE_MODES = ("create", "overwrite")
 
-#: The write modes M5 will actually PERFORM, which is a strictly narrower
-#: question than what the grammar can express.
+#: The write modes POLICY allows to be PERFORMED, which is a strictly
+#: narrower question than what the grammar can express - and a separate one
+#: again from whether the PLATFORM can perform them safely.
 #:
 #: ``create`` is enabled because both platforms can enforce it at the
 #: mutation itself: the object is installed from an open handle, and the
 #: kernel refuses to install it over an existing name. Nothing is checked and
 #: then hoped for.
 #:
-#: ``overwrite`` is NOT enabled. It needs a mutation that means "replace this
-#: destination if and only if it is still the approved object", and no
-#: primitive reachable from here expresses that. Windows'
-#: ``FILE_RENAME_INFO`` carries a bare ``ReplaceIfExists`` boolean with no
-#: destination precondition; Linux' ``renameat2`` offers ``RENAME_NOREPLACE``
-#: (absence only), ``RENAME_EXCHANGE`` and ``RENAME_WHITEOUT``, none of which
-#: is a compare-and-swap. A check followed by an unconditional replace is not
-#: an enforcement - it is a check with a window after it - so overwrite fails
-#: closed rather than shipping a race. Safe overwrite is deferred to its own
-#: milestone, alongside the restore capability that would make it recoverable.
-LOCAL_WRITE_ENABLED_MODES = ("create",)
+#: ``overwrite`` is enabled by M10, and the primitive it needed was never a
+#: rename. M5 looked for "replace this destination if and only if it is still
+#: the approved object" among the rename family and correctly found nothing:
+#: Windows' ``FILE_RENAME_INFO`` carries a bare ``ReplaceIfExists`` boolean
+#: with no destination precondition, and Linux' ``renameat2`` offers
+#: ``RENAME_NOREPLACE`` (absence only), ``RENAME_EXCHANGE`` and
+#: ``RENAME_WHITEOUT``, none of which is a compare-and-swap. An EDIT does not
+#: need one. The object already exists, so it can be HELD: M10 opens the
+#: existing leaf beneath the verified parent, pins both the object AND its
+#: directory entry through the OS sharing contract, digests the pre-state
+#: through that same descriptor and rewrites in place. No name is re-resolved
+#: at the mutation, so there is no window to race.
+#:
+#: This tuple stays PLATFORM-NEUTRAL on purpose. Whether a given host can
+#: actually pin the directory entry is a connector question, asked and
+#: refused there - exactly as the handle-sourced install primitive already
+#: is. Policy does not learn about platforms.
+LOCAL_WRITE_ENABLED_MODES = ("create", "overwrite")
 
 #: The exact lifecycle labels a persisted write record may carry.
 LOCAL_WRITE_STATUSES = ("prepared", "written", "refused", "unknown")
@@ -2311,21 +2351,22 @@ def local_write_mode_refusal(value: Any) -> str | None:
 
 
 def local_write_mode_unsupported(value: Any) -> str | None:
-    """Why this mode may not be PERFORMED in M5, or ``None``.
+    """Why POLICY forbids performing this mode, or ``None``.
 
-    Deliberately separate from the grammar. The record contract still has to
-    describe an overwrite - a row written by a future milestone must load and
-    validate - while the execution path refuses to perform one today.
+    Deliberately separate from the grammar, and equally deliberately separate
+    from the PLATFORM question. A record must still be able to DESCRIBE a
+    mode this host cannot perform - a row written elsewhere has to load and
+    validate - and whether the running platform can offer the primitive a
+    mode needs is asked by the connector, not here. Policy never learns about
+    platforms.
     """
     reason = local_write_mode_refusal(value)
     if reason is not None:
         return reason
     if value not in LOCAL_WRITE_ENABLED_MODES:
         return (
-            f"write mode '{value}' is not supported: no primitive available "
-            "here can make the replacement conditional on the destination "
-            "still being the approved file, so it fails closed rather than "
-            "racing"
+            f"write mode '{value}' is not enabled by policy, so it fails "
+            "closed rather than being performed"
         )
     return None
 

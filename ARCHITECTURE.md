@@ -1119,7 +1119,8 @@ Kilitli değişmezler:
   geçerli SECRET dahil geçerli değerler korunur. `persistable_count`,
   `bool()` ve `str()` gibi zorlamalar kaldırılmıştır çünkü her biri tampered
   kalıcı durumu makul görünen **aktif** duruma çevirirdi.
-- **Zorunlu okuma sırası:** kanonik `resolve` (symlink/junction/`..` çözülür)
+- **Zorunlu okuma sırası:** **sözlüksel** kanonikleştirme (`..` sadeleşir,
+  symlink/junction **çözülmez** — P2, aşağıya bakınız)
   → allowed-root containment → secret-file deny → **temsil edilebilir
   root-göreceli ad** (P1-4/P1-5 dilbilgisi) → tam olarak var olan normal dosya
   → **onaylanan dizin zinciri üzerinden açma ve açılan nesnenin hâlâ kök
@@ -1128,7 +1129,25 @@ Kilitli değişmezler:
   → NUL/UTF-8 katı kontrol → normalize → redakte → kesme. Deny edilen dosya
   **hiç okunmaz**, bu yüzden içeriğinin tanılama/checkpoint/event yoluna
   sızması yapısal olarak imkânsızdır.
-- **Ara dizin yarışının kapatılması (P1-1):** açma öncesi `resolve()` bir
+- **Yol takibi zincir politikasından önce gelemez (P2):** kanonikleştirme
+  artık `Path.resolve(strict=False)` kullanmaz, `os.path.abspath` kullanır
+  (Windows'ta `GetFullPathNameW`, filesystem'e hiç dokunmaz). Gerekçe sıra
+  gerekçesidir: `resolve` zinciri **çözer** — Windows'ta yolu açıp
+  `GetFinalPathNameByHandleW` sorarak — ve `canonical_path` döngüde hedefe
+  dokunan **ilk** şeydir; yani izinli kökün altına yerleştirilmiş bir
+  junction, no-follow kök-kimliği/reparse-zinciri politikası tek bir
+  bileşeni kabul etmeden **izlenirdi**. Bu, ürünün henüz bakmayı kabul
+  etmediği bir yolun aimlediği bir incelemedir ve Windows'ta bir `open`'dır:
+  UNC paylaşımına nişan alan bir junction, bir **adlandırmayı** kullanıcının
+  kimlik bilgilerini taşıyan giden bir ağ gidiş-dönüşüne çevirir. Bir
+  kaynağı **adlandırmak**, adlandırdığı filesystem'i incelemek olamaz.
+  Değişen kabul edilmiş sözleşme: kök içi bir symlink artık hedefine
+  çözülüp okunmak yerine **reddedilir**, ve bir yeniden yönlendirme
+  fingerprint değişimine dayanmak yerine güvenli açma/politika sınırında
+  reddedilir. Otoriter kimlik değişmedi: containment, secret-file deny ve
+  saklanan root-göreceli ad her zaman **açık tanıtıcının kanıtladığı** yola
+  yeniden sorulur.
+- **Ara dizin yarışının kapatılması (P1-1):** açma öncesi kanonik ad bir
   **yol adını** kanıtlar, bir **nesneyi** değil. Doğrulama ile `open` arasında
   herhangi bir üst bileşen symlink veya NTFS junction ile değiştirilirse
   açılan dosya onaylanan zinciri hiç kat etmemiş olur; ne `O_NOFOLLOW` (yalnız
@@ -1201,11 +1220,14 @@ Kilitli değişmezler:
   yeni dosyayı okuyordu. Artık `AgentCore._bind_canonical_local_target`,
   `file_read` yeteneğindeki her hedefi scope okunmadan **önce** tek bir yerde
   `canonical_path`'ten geçirir: bir dosyanın her yazımı (çıplak, `.\` önekli,
-  nokta/üst segmentli, symlink) aynı mutlak kanonik kimliğe yakınsar, bu kimlik
+  nokta/üst segmentli) aynı mutlak kanonik kimliğe yakınsar, bu kimlik
   scope otoritesine, izin ve scope fingerprint'ine, `EgressAttestation` kaynak
   sınırına ve yürütmeye aynı biçimde girer. Onaydan sonra hedef yeniden
-  yönlendirilirse kanonik hedef değişir → fingerprint değişir → grant
-  geçersizleşir ve **sıfır kez** çalışır. Güvenli görüntü adı ayrı bir
+  yönlendirilirse — P2'den sonra symlink artık çözülmediği için kanonik
+  hedef **aynı kalır** ve grant geçerliliğini korur; yeniden yönlendirme bir
+  sınır sonra, reparse noktasını **kendisi olarak** gören no-follow zincir
+  taramasında, hiçbir şey açılmadan reddedilir. Korunan garanti aynıdır:
+  sahte hedef hiç okunmaz. Güvenli görüntü adı ayrı bir
   değerdir (`LocalReadSnapshot.relative_path`, izinli köke göreceli), yani
   kullanıcıya, zarfa veya modele hiçbir mutlak yol gitmez.
   `resource_boundary()` H1'in yerel sınır kancasının ilk gerçek tüketicisidir
@@ -1348,8 +1370,8 @@ Kilitli değişmezler:
   serileştirmesini, izin fingerprint'ini ve attestation'ı besler; bunların
   hepsi bir **reddi** deterministik terminal duruma çeviren ama bir
   **istisnaya** cevabı olmayan aşamaların içinde çalışır. Gömülü NUL tam
-  olarak bu vakadır: POSIX onu `resolve()` içinde reddeder, Windows orada
-  kabul edip sonra `lstat`/`open` içinde reddeder - yani ürünün temiz
+  olarak bu vakadır: Windows onu `GetFullPathNameW` içinde reddeder, POSIX
+  orada kabul edip sonra `lstat`/`open` içinde reddeder - yani ürünün temiz
   başarısız olup olmadığına *platform* karar veriyordu, ve POSIX'te
   kanonikleştirme adımı doğrudan döngünün dışına fırlayıp `run()`
   tarafından zaten kaydedilmiş ve oturumun aktif gösterdiği bir task'ı
@@ -1453,7 +1475,8 @@ Kilitli değişmezler:
     `dst_dir_fd` ile link'lenir; `link` var olan adı `EEXIST` ile reddeder.
   - Başka bir platformda **fail closed**. Geriye kalan tek seçenek adla
     yapılan bir rename olurdu, ki bu tam da kaçınılan işlemdir.
-- **Overwrite M5'te DESTEKLENMEZ (P1-C):** güvenli bir overwrite "bu hedefi
+- **Overwrite M5'te DESTEKLENMEZDİ (P1-C) — M10 ile açıldı, aşağıdaki
+  gerekçe tarihseldir; güncel sözleşme §4.17'dedir.** Güvenli bir overwrite "bu hedefi
   ancak hâlâ onaylanan nesne ise değiştir" anlamına gelen bir mutasyon
   gerektirir. Buradan erişilebilen hiçbir primitif bunu ifade etmiyor:
   Windows'un `FILE_RENAME_INFORMATION` yapısında yalnızca `ReplaceIfExists`
@@ -1462,11 +1485,19 @@ Kilitli değişmezler:
   `RENAME_NOREPLACE` (yalnızca yokluk), `RENAME_EXCHANGE` ve
   `RENAME_WHITEOUT`'tur, hiçbiri compare-and-swap değildir. Kontrol + koşulsuz
   replace bir zorlama değil, arkasında pencere olan bir kontroldür. Bu yüzden
-  `LOCAL_WRITE_ENABLED_MODES = ("create",)` ve `overwrite` girdi sınırında,
-  attestation'da ve yürütmede **kapalı düşer** — dilbilgisi onu hâlâ tanır
-  (`LOCAL_WRITE_MODES`), çünkü sonraki bir milestone'un yazdığı satır
-  yüklenip doğrulanabilmelidir. Güvenli overwrite, kendi milestone'una
-  ertelenmiştir.
+  M5 döneminde `LOCAL_WRITE_ENABLED_MODES = ("create",)` idi ve `overwrite`
+  girdi sınırında, attestation'da ve yürütmede kapalı düşerdi; dilbilgisi onu
+  yine de tanıyordu (`LOCAL_WRITE_MODES`), çünkü sonraki bir milestone'un
+  yazdığı satır yüklenip doğrulanabilmeliydi.
+
+  **M10 güncellemesi.** Aranan compare-and-swap bir **rename** ilkelinde
+  gerçekten yoktur ve yukarıdaki tespit bu yönüyle geçerlidir; bir
+  DÜZENLEMENİN ise rename'e ihtiyacı yoktur, çünkü nesne zaten vardır ve
+  tutulabilir. Bugün `LOCAL_WRITE_ENABLED_MODES = ("create", "overwrite")`,
+  overwrite yerinde ve **atomik olmayan** bir yeniden yazmadır, yalnız Windows
+  + yerel sabit NTFS'te açıktır ve tamamlanmış bir HEAD `file_read`
+  kaynağına bağlanmak zorundadır. Tam sözleşme §4.17'dedir; M5'in **create**
+  yolu ve onun atomik/no-clobber garantisi olduğu gibi durur.
 - **Onaylanan kayıt otoritedir, yürütme yalnızca ona katılır (P1-B):**
   yürütme filesystem'i yeniden türetir ve **kalıcı `prepared` kayıtla
   karşılaştırır**; yeni gözlenen durumu asla onaylanan ön-durumun yerine
@@ -1489,10 +1520,15 @@ Kilitli değişmezler:
   yeni oluşturulan bir dosyanın önceki inode'u yoktur, yani
   `(st_dev, st_ino)` bağlaması yedek koruma sağlamaz.
 - **Containment M3/M4 zincirinin aynısıdır**, yalnızca parent'a yeniden
-  çapalanmıştır: kanonik `resolve` → allowed-root → secret-file deny → ADS
+  çapalanmıştır: **sözlüksel** kanonikleştirme → allowed-root →
+  secret-file deny → ADS
   reddi → temsil edilebilir root-göreceli ad → kimlik-bilgisi taşıyan ad
-  reddi → **var olan** parent (mkdir yok) → reparse zinciri → authoritative
-  parent handle. Var olan hedef normal dosya olmak zorundadır. **Hard link
+  reddi → reparse zinciri → authoritative parent handle. **P2: zincir
+  taraması ilk sıradadır ve `var olan parent` gerçeğini de o üretir** —
+  `is_dir()` dereference ettiği için no-follow tarama kabul etmeden önce
+  çağrılmaz; parent'ın **kendi** no-follow `lstat`'ı hem varlığını hem dizin
+  olduğunu kanıtlar (mkdir yine yok). Var olan hedef normal dosya olmak
+  zorundadır. **Hard link
   politikası korunur** (`st_nlink > 1` reddedilir) ve artık ikinci bir
   gerekçesi vardır: atomik replace diğer adın **üzerine yazmaz**, onu
   koparır. Meşru hardlink'li dosyaların yazılamaması, katı allowed-root
@@ -2244,6 +2280,140 @@ REGION ile okunabilir: HEAD dosya tavanını aşar, REGION ise satır
 kapanmadığı için reddeder. Minified tek satırlık büyük dosyalar bu yüzden
 JARVIS için okunamaz kalır. Bu bilinçli bir M9 sınırıdır ve farklı bir ilkel
 (bayt- veya sütun-sınırlı satır penceresi) gerektirir.
+
+### 4.17 Doğrudan tam dosya üzerine yazma (M10, uygulandı)
+
+M5 güvenli **create**'i getirdi ve güvenli **overwrite**'ı bilinçli olarak
+erteledi: "bu hedefi ancak hâlâ onaylanan nesne ise değiştir" diyen bir
+rename ilkeli yoktu (Windows `FILE_RENAME_INFORMATION` yalnız bir boolean
+taşır; Linux `renameat2` bayrakları compare-and-swap değildir) ve kontrol
+sonrası koşulsuz replace bir uygulama değil, arkasında pencere olan bir
+kontroldür. Bu tespit **geçerlidir ve zayıflatılmamıştır**. Değişen soru
+şudur: bir **düzenlemenin** rename'e ihtiyacı yoktur, çünkü nesne zaten
+vardır ve dolayısıyla **tutulabilir**.
+
+**Ürün.** Yalnız DOĞRUDAN tam dosya üzerine yazma. Bölge düzenleme, yama,
+diff, bulanık eşleme, POSIX overwrite ve model cevabından üretilen
+overwrite M10 kapsamı dışındadır.
+
+**Politika ve platform ayrımı.** `LOCAL_WRITE_ENABLED_MODES` artık
+`("create", "overwrite")`'tir ve **platformdan bağımsızdır**: bu bir
+politika demetidir, `sys.platform`'dan türetilmez ve `contracts.py`
+platform öğrenmez. Belirli bir makinenin dizin girdisini pinleyip
+pinleyemediği connector'ın sorusudur ve connector'da sorulur —
+handle-kaynaklı kurulum ilkelinde olduğu gibi. Connector'daki
+`_ENTRY_PINNED_OVERWRITE` bayrağı import anında bir kez çözülür.
+
+**Zorunlu ön-görüntü.** `_intent` içinde, `_preimage_binding_refusal`
+tek kanonik yüklem olarak sorulur: snapshot `present`, kanonik sözleşmeyi
+geçiyor, `start_line == 0 and end_line == 0` (HEAD sentinel'i — REGION
+reddedilir), `relative_path` birebir eşleşiyor ve `sha256`/`byte_size`
+**gözlenen ön-durumla** birebir aynı. Excerpt hiçbir şeyle
+karşılaştırılmaz. Bu okuma → plan halkasıdır; kalan üç halka mevcut
+makinedir: çerçeve/fingerprint (plan → onay), yedi alanlı
+`_authority_of` karşılaştırması (onay → yürütme) ve pinlenmiş tanıtıcı
+üzerinden yeniden özet (yürütme → mutasyon).
+
+**Mutasyon.** `_open_windows_parent` ile doğrulanmış parent HANDLE'ı
+altında `_windows_open_in_parent` yaprağı açar: `FILE_OPEN` (asla
+`FILE_OPEN_IF`/`FILE_OVERWRITE_IF` — yokluk bir reddir, create değil),
+erişim `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+SYNCHRONIZE`, paylaşım **yalnız `FILE_SHARE_READ`**. Sonra açık nesne
+üzerinde her soru yeniden sorulur (regular file, reparse değil,
+`st_nlink == 1`, `GetFinalPathNameByHandleW` ile otoriter yol hâlâ
+onaylanan yol ve izinli kök içinde, birim hâlâ yerel sabit NTFS), ön-durum
+**aynı tanıtıcıdan** `MAX + 1` sentinel'iyle okunup özetlenir ve onaylanan
+kayıtla karşılaştırılır, ardından `lseek(0)` + `ftruncate(0)` + tam yazma
+döngüsü + `fsync`. Geçici dosya yok, rename yok, `ReplaceIfExists` yok,
+kontrol-sonra-replace yok. Create yolu tamamen ayrıdır ve muhafızı artık
+`intent.mode != "create"` biçiminde **tam eşitliktir**, böylece politika
+demetini genişletmek bir overwrite'ı asla create kurucusuna
+yönlendiremez.
+
+**Neden paylaşım kipi taşıyıcıdır.** Rename ve delete'in ikisi de `DELETE`
+erişimiyle bir açma gerektirir; mevcut bir tanıtıcı `FILE_SHARE_DELETE`
+vermiyorsa böyle bir açma paylaşım ihlaliyle reddedilir. Yazma
+`FILE_WRITE_DATA` gerektirir; mevcut tanıtıcı `FILE_SHARE_WRITE`
+vermiyorsa reddedilir. Ad da kullanılamaz, çünkü onu işgal eden nesne
+kaldırılamaz. Böylece nesne **ve** girdisi, doğrulama → yeniden yazma
+aralığının tamamında çekirdek tarafından pinlenir — arkasında pencere olan
+bir kontrolle değil. Bu, `_TEMPORARY_SHARE` için zaten kurulmuş olan
+argümanın var olan bir nesneye uygulanmış hâlidir.
+
+**Birim uygunluğu.** Paylaşım kipini fiilen doğrulanmış tek birim şekli
+yerel sabit NTFS'tir. `_volume_refusal` onay anında yolun bağlı olduğu
+birimi (`GetDriveTypeW` + `GetVolumeInformationW`) sorar;
+`_windows_handle_filesystem` yürütme anında **açık tanıtıcıyı**
+(`GetVolumeInformationByHandleW`) sorar. Herhangi biri belirsizse
+reddedilir; sessiz geri düşüş yoktur.
+
+**POSIX neden kapalı.** POSIX'te bir tanıtıcı inode'a işaret eder;
+`rename` ve `unlink` dizin girdileri üzerinde çalışır ve açık tanıtıcıyı
+etkilemez. Dolayısıyla tutulan bir tanıtıcı üzerinden yazma, onaylanan
+nesneye — adı o sırada nereye taşınmışsa oraya, aynı dosya sistemindeyse
+izinli kökün dışına bile — iner. JARVIS yazma yetkisi (nesne VE yol)
+olduğundan bu, dayanıklılık artığı değil **yetki ihlalidir**. Kapatan bir
+ilkel yoktur: `fstatat` karşılaştırması arkasında pencere bırakır,
+`flock`/`lockf`/POSIX kayıt kilitleri tavsiye niteliğindedir, zorunlu
+kilitleme Linux 5.15'te kaldırıldı, `F_SETLEASE` open'da kırılır rename'de
+değil, `linkat`/`AT_EMPTY_PATH` yeni bir ad ekler ve mevcut girdiyi
+sabitlemez, `renameat2` bayraklarının hedef-inode ön koşulu yoktur.
+Yürütme sonrası bir kontrol ihlali **tespit** ederdi ama önleyemezdi.
+Okuma bu asimetriden etkilenmez: okuma onaylanan nesneden bayt **alır**,
+adının sonradan nereye gittiği açıklananı değiştirmez; create ise
+yokluğu çekirdeğin zorladığı yeni bir nesne kurar.
+
+**Atomiklik ve geri alınabilirlik.** Yerinde yazma **atomik değildir**.
+Kesme ile `fsync` arasında bir çökme dosyayı ne ön-görüntü ne postimage
+olan bir hâlde bırakabilir; ön-görüntü baytları saklanmadığı için
+kurtarılamaz. Bu açıkça söylenir ve `reversible=False` korunur. Yedek,
+geri alma, `file_restore` veya çoklu dosya işlemi yoktur. Garanti edilen:
+mutasyona uğrayan nesne tam olarak onaylanan nesnedir, adı ve dizin
+girdisi hiç kaybolmaz, başka hiçbir süreç aralık boyunca nesneye
+yazamaz/silemez/yeniden adlandıramaz, baytlar başarı bildirilmeden
+`fsync`'lenir, zarar tek bir onaylanmış dosyanın en fazla 64 KiB'iyle
+sınırlıdır ve sonuç sonradan **karar verilebilirdir**.
+
+**H2/H3 ve şemalar dokunulmadı.** `pre_execution_record` iki onaylanmış
+durumu sınırın öncesinde kalıcılaştırır, `_UNKNOWABLE_ON_RAISE_EFFECTS`
+fırlatan bir yazmayı asla temiz saymaz, `_execution_journal_precheck`
+IN_FLIGHT/UNKNOWN_OUTCOME'u asla yeniden oynatmaz. `diagnose_write` üç
+etiketiyle kalır; overwrite için `ambiguous_third_party_change` yarıda
+kalmış bir yerinde yazma anlamına da gelebilir ve bu belgelenmiştir.
+EgressAttestation'a alan eklenmemiştir; H1 çerçevesi zaten yol, mod,
+ön-durum varlığı/digest/boyut, hedeflenen digest/boyut ve birebir
+baytları taşıyordu — overwrite'ta `pre_present = True`, create'te
+`False`. Onay önizlemesinin **yalnız overwrite dalı** ön-durum digest'ini
+ve boyutunu adlandırır; create dalının metni ve `field_names` demeti
+byte-uyumlu kalır, bu yüzden mevcut create fingerprint'leri yapı gereği
+korunur. SQLite şeması 6, çıktı zarfı 5, `EGRESS_TOOL_GRANTS` boş.
+
+**Model cevabı → overwrite ertelendi.** Dayanıklı hiçbir durum, tam olarak
+o okuma bağlamının **gerçek model çağrısına dâhil edildiğini** kanıtlamaz:
+`canonical_outbound` opak baytlar döndürür, sözleşmesi içeriği hakkında
+hiçbir şey söylemez ve çekirdek yalnız `outbound_digest`'in boş olmadığına
+bakar (`core.py`). Kaynak görevin donmuş bir snapshot **taşıması**
+(iddia A) ve onun egress'e **uygun olması** (iddia B), o snapshot'ın
+gerçek istekte **bulunduğunu** (iddia C) kanıtlamaz — ve gerçek bir
+örnek vardır: Claude yükü, sınıflandırma merdiveni reddederse veya
+snapshot yapısal sözleşmeyi geçmezse bloğu **sessizce düşürür**, görev yine
+tamamlanır. Zayıf bir kanıt (connector'ın kendi beyanı) eklemek yerine
+yetenek ertelenmiştir. Kural connector adına değil, dayanıklı JARVIS
+alanlarına (`write_source`, `write_mode`) bağlıdır; dolayısıyla bağlamı
+dürüstçe serileştiren bir connector da aynı biçimde reddedilir — M10
+kötü bir connector'ı **tespit ettiğini** değil, ayırt **edemediğini**
+söyler. Gelecekteki sözleşme, serileştirmeyi çekirdeğin üretmesini ve
+connector'ın onu birebir gömmesini gerektirir; bu, egress yükünün şeklini
+değiştirir ve kendi milestone'udur.
+
+**Kabul edilen artıklar.** (1) Overwrite yalnız Windows + yerel sabit
+NTFS'tedir. (2) Yerinde yazma atomik değildir. (3) Zorunlu ön-görüntü
+bağlaması `retrieval_eligible` üzerinden geçtiğinden ve SECRET her iki
+rolde de uygun olmadığından, SECRET sınıflandırmalı bir görev şu an
+overwrite yapamaz; bu M10'da çözülmemiştir. (4) Dosyayı yazma erişimiyle
+açık tutan başka bir süreç varsa overwrite kapalı düşer (paylaşım ihlali)
+— doğru davranıştır, ama bir editörün dosyayı açık tutması bunu
+tetikleyebilir.
 
 ## 5. İzin ve güvenlik modeli
 

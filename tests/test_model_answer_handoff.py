@@ -495,11 +495,18 @@ class InputContractTests(unittest.TestCase):
             self.decode({"mode": "create", LOCAL_WRITE_SOURCE_KEY: OTHER_ID, "source": "x"})
         self.assertIn("source", str(caught.exception))
 
-    def test_overwrite_plus_reference_is_refused_on_the_mode(self) -> None:
+    def test_overwrite_plus_reference_is_refused_at_the_input_boundary(self) -> None:
+        """M10 defers ModelAnswer -> overwrite, so the pair never becomes a task.
+
+        Overwrite itself is enabled policy now; what is refused is generating
+        the replacement bytes from a model answer, because nothing durable
+        proves the exact read context reached the actual model invocation.
+        """
         with self.assertRaises(TaskInputError) as caught:
             self.decode({"mode": "overwrite", LOCAL_WRITE_SOURCE_KEY: OTHER_ID})
         self.assertIn("write.mode", str(caught.exception))
-        self.assertEqual(("create",), LOCAL_WRITE_ENABLED_MODES)
+        self.assertIn("may not replace", str(caught.exception))
+        self.assertIn("overwrite", LOCAL_WRITE_ENABLED_MODES)
 
     def test_the_reference_is_only_valid_for_file_write(self) -> None:
         with self.assertRaises(TaskInputError) as caught:
@@ -1012,12 +1019,14 @@ class AuthorityTests(HandoffTestCase):
         self.assertFalse(stored.local_write.pre_present)
 
     def test_create_only_is_enforced_for_a_programmatic_overwrite_handoff(self) -> None:
+        """The input boundary is bypassed; the durable identity gate is not."""
         source, session = self.completed_source()
         task = self.handoff_task(source.id)
         task.write_mode = "overwrite"
         run = self.core.run(task, session_id=session.id)
         self.assertEqual(RunStatus.FAILED, run.status)
-        self.assertIs(ErrorCode.EGRESS_REFUSED, run.error.code)
+        self.assertIs(ErrorCode.INVALID_TASK, run.error.code)
+        self.assertIn("may not overwrite", run.error.message)
         self.assertFalse((self.root / TARGET_NAME).exists())
         self.assertEqual([], self.memory.execution_attempts(task.id))
 

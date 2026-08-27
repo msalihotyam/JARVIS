@@ -851,19 +851,34 @@ class SecurityTests(RegionReadBase):
             link.symlink_to(outside)
         except (OSError, NotImplementedError, AttributeError) as exc:
             self.skipTest(f"symlinks unavailable here: {exc}")
-        self.assert_refused(self.read_region(link, 1, 5), "outside the allowed roots")
+        # P2. The link is refused AS A LINK, by the no-follow chain scan,
+        # rather than by resolving it first and finding the destination
+        # outside the roots. Both refuse; only this order refuses without
+        # having followed the link to learn where it went.
+        self.assert_refused(
+            self.read_region(link, 1, 5), "not an existing regular file"
+        )
 
-    def test_an_in_root_symlink_resolves_to_its_target(self) -> None:
-        """Pinned as EXISTING M3 containment behaviour, unchanged by M9: the
-        target is resolved first, and an in-root target is legitimately
-        readable under its own authoritative name."""
+    def test_an_in_root_symlink_is_refused_rather_than_followed(self) -> None:
+        """P2. The M3 contract this REPLACES: an in-root symlink used to be
+        resolved first and read under its target's authoritative name.
+
+        Canonicalization no longer dereferences anything, because doing so is
+        an inspection of the filesystem aimed by a path no policy has accepted
+        yet. So the link now reaches the no-follow chain scan as itself and is
+        refused there. The real file stays readable under its own name - what
+        is gone is the second, aliased route to it.
+        """
         self.write("real.txt", numbered(10))
         link = self.root / "link.txt"
         try:
             link.symlink_to(self.root / "real.txt")
         except (OSError, NotImplementedError, AttributeError) as exc:
             self.skipTest(f"symlinks unavailable here: {exc}")
-        snapshot = self.snapshot(self.read_region(link, 1, 5))
+        self.assert_refused(
+            self.read_region(link, 1, 5), "not an existing regular file"
+        )
+        snapshot = self.snapshot(self.read_region(self.root / "real.txt", 1, 5))
         self.assertEqual("real.txt", snapshot.relative_path)
         self.assertEqual((1, 5), (snapshot.start_line, snapshot.end_line))
 
