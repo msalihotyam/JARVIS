@@ -1188,7 +1188,7 @@ class CompositionTests(unittest.TestCase):
         payload = self.app.resume(
             session_id=self.session_id, task_id=task_id
         ).payload
-        self.assertEqual(5, payload["schema_version"])
+        self.assertEqual(6, payload["schema_version"])
         self.assertEqual(OUTPUT_SCHEMA_VERSION, payload["schema_version"])
         # The span rides inside the existing local_read block, nowhere else.
         self.assertNotIn("local_region", payload)
@@ -1366,7 +1366,7 @@ class HeadCompatibilityTests(RegionReadBase):
         from jarvis.memory import SCHEMA_VERSION
 
         self.assertEqual(6, SCHEMA_VERSION)
-        self.assertEqual(5, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -22,6 +22,14 @@ from jarvis.contracts import (
     RETRIEVAL_CANDIDATE_WINDOW,
     AttemptState,
     BillingClaim,
+    CHAIN_NO_PREDECESSOR,
+    LOCAL_READ_CAPABILITY,
+    LOCAL_WRITE_CAPABILITY,
+    ChainState,
+    ChainStatus,
+    ChainTaskMode,
+    LocalReadSnapshot,
+    ModelAnswer,
     BillingClass,
     BillingIntegrityError,
     BillingReconciliation,
@@ -49,6 +57,11 @@ from jarvis.contracts import (
     billing_class_from_raw,
     build_retrieved_context,
     canonical_usd,
+    chain_binding_refusal,
+    local_read_snapshot_refusal,
+    chain_id_refusal,
+    chain_state_refusal,
+    chain_task_refusal,
     format_usd,
     ledger_month,
     monetary_state_from_raw,
@@ -742,9 +755,86 @@ class SQLiteMemoryStore:
             ).fetchone()
         return int(row[0])
 
+    # ----------------------------------------------------------------
+    # M11. Chain ownership is STORAGE-OWNED, not session metadata.
+    #
+    # ``SessionState.chain`` is persisted inside ``state_json``, but it is
+    # deliberately NOT ordinary last-writer-wins session state like
+    # ``next_step`` or ``latest_task_id``. A caller holds a SessionState it
+    # loaded at some earlier instant; by the time it saves, another caller may
+    # have declared a chain. Letting that stale object write its own idea of
+    # ``chain`` would silently clear or replace a chain it never saw - a lost
+    # update on the one field where the product promises exactly one owner.
+    #
+    # So the authority is split:
+    #   * creation goes through ``declare_chain_if_absent`` ONLY, which reads
+    #     the incumbent, decides, and writes inside ONE ``BEGIN IMMEDIATE``
+    #     transaction, so exactly one concurrent declarer can win;
+    #   * every OTHER session write preserves whatever chain is persisted at
+    #     that moment, read inside the caller's own write transaction, and
+    #     ignores the stale object's value entirely.
+    #
+    # A caller-held SessionState is therefore never authority over a newer
+    # persisted chain. Future chain PROGRESS mutation (advancing a cursor,
+    # recording a step task id) needs its own storage-owned compare-and-set
+    # operation for the same reason; generic session persistence must never
+    # gain that power. No schema change: this is a rule about who may write a
+    # field that already exists.
+    # ----------------------------------------------------------------
+
     @staticmethod
-    def _upsert_session(connection: sqlite3.Connection, session: SessionState) -> None:
+    def _stored_chain(
+        connection: sqlite3.Connection, session_id: str
+    ) -> ChainState | None:
+        """The chain persisted for this session right now, read in-transaction.
+
+        Fail-closed in the direction that matters: a row that cannot be read
+        as JSON, or whose chain cannot be read as a chain, yields the same
+        typed verdict the loader would produce, never a silent ``None`` that
+        would read as "this session is free to declare one".
+        """
+        row = connection.execute(
+            "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            document = json.loads(row[0])
+        except (TypeError, ValueError):
+            # An unreadable row is not an empty slot. Report the typed INVALID
+            # verdict so the one-chain rule keeps refusing.
+            return ChainState.from_dict("unreadable")
+        if not isinstance(document, dict) or document.get("chain") is None:
+            return None
+        return ChainState.from_dict(document["chain"])
+
+    @staticmethod
+    def _upsert_session(
+        connection: sqlite3.Connection,
+        session: SessionState,
+        *,
+        chain_authority: bool = False,
+    ) -> None:
+        """Write a session, preserving storage-owned chain ownership.
+
+        ``chain_authority`` is set by exactly one caller,
+        ``declare_chain_if_absent``, which has already decided the question
+        inside this same transaction. Every other path - including
+        ``save_session`` and every internal task/approval/billing flow - takes
+        the preserving branch, so no stale snapshot can create, clear or
+        replace a chain by accident.
+
+        The incumbent is read HERE, inside the caller's write transaction, so
+        a declaration cannot land between the preservation read and this
+        write. The caller's object is updated to match what was persisted, so
+        it stops carrying a value storage just refused to honour.
+        """
         session.touch()
+        payload = session.to_dict()
+        if not chain_authority:
+            incumbent = SQLiteMemoryStore._stored_chain(connection, session.id)
+            session.chain = incumbent
+            payload["chain"] = None if incumbent is None else incumbent.to_dict()
         connection.execute(
             """
             INSERT INTO sessions (id, state_json, updated_at, project_id)
@@ -756,7 +846,7 @@ class SQLiteMemoryStore:
             """,
             (
                 session.id,
-                SQLiteMemoryStore._json(session.to_dict()),
+                SQLiteMemoryStore._json(payload),
                 session.updated_at,
                 session.project_id,
             ),
@@ -863,6 +953,582 @@ class SQLiteMemoryStore:
     def save_session(self, session: SessionState) -> None:
         with self._connection(write=True) as connection:
             self._upsert_session(connection, session)
+
+    @staticmethod
+    def _stored_task(
+        connection: sqlite3.Connection, task_id: str
+    ) -> tuple[str, Task] | None:
+        """One task's owning session and rebuilt state, read in-transaction.
+
+        The authoritative row, not a caller's object. Every chain decision
+        that depends on a task's status re-reads it through this, inside the
+        transaction that will act on the answer.
+        """
+        row = connection.execute(
+            "SELECT session_id, state_json FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return str(row[0]), Task.from_dict(json.loads(row[1]))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _task_row_exists(connection: sqlite3.Connection, task_id: str) -> bool:
+        """Whether ANY row already holds this task id. Decoding is irrelevant.
+
+        A3. ``_stored_task`` answers ``None`` for two completely different
+        facts - "no such row" and "a row that cannot be read as a task" - so
+        using it to decide whether an id is FREE handed a hostile or corrupted
+        row's identity to a new task: the insert would then take the id over,
+        re-owning and overwriting a row nobody could read, and the damage
+        would look exactly like a fresh materialization. Existence is a
+        question about the PRIMARY KEY, so it is asked of the primary key.
+        A malformed row is never repaired here and never replaced; it simply
+        blocks its own id, whoever owns it.
+        """
+        return connection.execute(
+            "SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (task_id,)
+        ).fetchone() is not None
+
+    @staticmethod
+    def _attempt_blocks_advance(
+        connection: sqlite3.Connection, task_id: str
+    ) -> bool:
+        """Whether H2 says this step's outcome is not safely settled.
+
+        IN_FLIGHT and UNKNOWN_OUTCOME are the two states the journal refuses
+        to replay. A chain must not advance past either, and must never
+        fabricate a status for one: the step stays where it is.
+        """
+        row = connection.execute(
+            "SELECT state FROM execution_attempts WHERE task_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return str(row[0]) in (
+            AttemptState.IN_FLIGHT.value,
+            AttemptState.UNKNOWN_OUTCOME.value,
+        )
+
+    def _chain_claim_authority(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        task_id: str,
+    ) -> bool:
+        """Whether a chain still authorizes THIS task to claim execution.
+
+        S3B P1-1. Cancellation authority and execution-claim authority are one
+        arbitration, decided in the ONE transaction that grants execution
+        ownership - not two decisions a runner can be paused between.
+
+        The bug this closes: a runner materialized and bound the current step,
+        paused, ``cancel_chain`` committed CANCELLED, and the stale runner
+        resumed into ``begin_execution``, which asked only about the TASK. The
+        task row is untouched by a cancellation - cancelling a chain
+        deliberately does not rewrite the tasks it never started - so the
+        claim succeeded and the connector ran. A reload on the driver side
+        cannot close that: whatever it read, the cancel can still commit
+        between the read and the claim. The question has to be asked where the
+        answer is committed.
+
+        Everything the answer depends on is read here, inside that
+        transaction: the task's owning SESSION, the session's chain, that the
+        chain is ACTIVE, that it is the same chain by id AND by declaration
+        digest the task was bound to, that the bound step is the chain's
+        CURRENT cursor, and that the cursor's slot still holds exactly this
+        task id. A chain cancelled, replaced, redeclared or advanced since the
+        binding fails one of them and the claim is LOST - before ownership,
+        before any grant is consumed, before a reservation exists and before
+        the connector boundary.
+
+        The arbitration is symmetric by construction, because SQLite admits
+        one writer: either the cancel commits first, and every later claim
+        loses - zero attempts, zero connector calls - or the claim commits
+        first, and the cancel finds a chain it may still cancel but an attempt
+        it cannot un-start. Cancellation stops what has not begun; it never
+        pretends an already-owned attempt never happened.
+
+        CHAIN ASSOCIATION IS NOT THE BINDING ALONE. A task is chain-associated
+        when it carries a binding OR when its authoritative owning session's
+        chain NAMES that exact task id in any slot, and either alone is
+        enough. The binding is a claim the task makes about itself; the slot
+        is what the session authoritatively holds. Deciding association from
+        the task's own field only would mean a chain step could be turned into
+        an ordinary task by DELETING state from it - the persistence boundary
+        already degrades a malformed binding to canonical ABSENCE, so
+        corrupting one byte of it was enough to make a cancelled chain's step
+        executable again through an ordinary resume. Removal must never be a
+        grant, so a slot-named task with an absent or malformed binding is
+        LOST here rather than waved through as ordinary.
+
+        A task that is neither bound nor named by any slot is not a chain task
+        and is unaffected: ordinary single-task authority is exactly what it
+        was, including inside a session that separately owns a chain.
+
+        An owning chain that EXISTS but cannot be validated refuses every
+        classification below it. An unusable chain cannot say which tasks
+        belong to it, and INVALID loads with an empty slot tuple, so asking it
+        is worse than not asking: it answers "not mine" about everything.
+
+        OWNERSHIP IS PROVEN FIRST, ahead of every one of those questions. Who
+        owns the row is not a chain question and must not be answered inside
+        one: an ordinary task is the DEFAULT shape, so an ownership check that
+        ran only on the chain path was an ownership check that ran almost
+        never. The authoritative owner in the tasks table must equal the
+        session the claim is made under before this task is classified as
+        ordinary, bound, unbound or chain-associated at all.
+        """
+        found = self._stored_task(connection, task_id)
+        if found is None:
+            return False
+        owner, task = found
+        if owner != session_id:
+            # OWNERSHIP FIRST, before this task is CLASSIFIED as anything.
+            # The attempt row proves only that a caller once wrote this
+            # session id next to this task id; the tasks table is what
+            # actually owns the row. Asking later - after the unbound
+            # "ordinary task" branch had already returned - meant a session
+            # could claim execution of a task belonging to another session
+            # purely by having no chain binding, which is the default state
+            # of every ordinary task. Nothing downstream may run before this.
+            return False
+        binding = task.chain_binding
+        if chain_binding_refusal(binding) is not None:
+            # Tampered chain state on a task is never "no binding".
+            return False
+        # The AUTHORITATIVE side of the association: the OWNING session's
+        # chain, read in this transaction, and what it actually names. Read
+        # for every task, because "is this a chain task at all" is exactly the
+        # question the task's own field cannot be trusted to answer. It is
+        # keyed on ``owner``, never on the caller's session, so a slot in the
+        # CALLER's chain can never manufacture ownership of someone else's
+        # task - by this point the two are already proven identical.
+        chain = self._stored_chain(connection, owner)
+        if chain is not None and chain_state_refusal(chain) is not None:
+            # A1. The owner HAS a chain and it cannot be validated. An
+            # unusable chain does not answer "which tasks do I own" - it
+            # answers nothing at all, and INVALID in particular loads with an
+            # EMPTY slot tuple, so asking it for membership returns a
+            # confident "no". Combined with an erased binding that was enough
+            # to reclassify a cancelled chain's step as an ordinary task and
+            # execute it through a direct resume. Presence of an unusable
+            # chain is therefore refused here, BEFORE any classification: the
+            # store cannot prove this task is unrelated to it, and unprovable
+            # is not the same fact as unrelated.
+            #
+            # Only PRESENCE is refused. A session with no chain at all
+            # (``None``) is genuinely chainless and is untouched, as is every
+            # task under a chain that validates.
+            return False
+        named = chain is not None and task_id in tuple(chain.step_task_ids)
+        if not binding.present:
+            # Ordinary ONLY when nothing authoritative names it. A named task
+            # whose binding is gone has lost its proof, not its membership.
+            return not named
+        if chain is None:
+            return False
+        if chain.status is not ChainStatus.ACTIVE:
+            return False
+        if binding.chain_id != chain.id or binding.chain_digest != chain.digest:
+            return False
+        if binding.step_index != chain.cursor:
+            return False
+        return chain.step_task_ids[chain.cursor] == task_id
+
+    def _chain_for_update(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        chain_id: str,
+        chain_digest: str,
+    ) -> tuple[ChainState | None, str | None]:
+        """The stored chain, or the verdict explaining why it may not be used.
+
+        The CAS precondition every chain-progress primitive shares: the chain
+        must exist, be ACTIVE, and be the SAME chain by id AND by declaration
+        digest. A stale driver holding an older digest - or one whose chain was
+        cancelled, finished or replaced since it read - loses here, before any
+        write.
+        """
+        stored = self._stored_chain(connection, session_id)
+        if stored is None:
+            return None, "unknown"
+        if stored.status is not ChainStatus.ACTIVE:
+            return None, "inactive"
+        if chain_state_refusal(stored) is not None:
+            return None, "inactive"
+        if stored.id != chain_id or stored.digest != chain_digest:
+            return None, "conflict"
+        return stored, None
+
+    def _chain_predecessor_refusal(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        chain: ChainState,
+        step_index: int,
+        task: Task,
+    ) -> str | None:
+        """Why this consumer's PREDECESSOR authority is not current, or None.
+
+        B2. ``AgentCore`` proves the predecessor while DERIVING the consumer,
+        and that proof describes the predecessor as it was at that instant.
+        Between then and the write the predecessor can be tampered - its
+        objective, capability, scope, routing or result rewritten - and the
+        consumer would still be bound, because storage judged only the
+        already-derived consumer. A derivation-time proof is not a
+        materialization-time fact, so the predecessor is re-read and re-proved
+        HERE, on the caller's connection, inside the transaction that binds.
+
+        The result prerequisite each aperture depends on is part of that: a
+        MODEL consumer needs its predecessor's LOCAL READ SNAPSHOT to exist
+        and to be usable, exactly as a CREATE consumer needs a model answer.
+
+        Provider-neutral by construction: every question is asked of the
+        authoritative row and the frozen declaration. WHICH connector is a
+        legitimate external-model producer stays a registry question and stays
+        in ``AgentCore`` - storage never learns it, and the M7 resolver
+        re-proves it independently before a single write byte is used, so this
+        creates no second authority path.
+        """
+        step = chain.steps[step_index]
+        if step.consumes == CHAIN_NO_PREDECESSOR:
+            return None
+        # The chain's own mapping is the only source of the predecessor id.
+        predecessor_id = chain.step_task_ids[step.consumes]
+        if not predecessor_id:
+            return "the predecessor step has produced no task"
+        # ... and the consumer must be routed at exactly that task, through
+        # the one sanctioned aperture for what the consumer is.
+        if step.capability == LOCAL_WRITE_CAPABILITY:
+            declared = task.write_source_task_id
+        else:
+            sources = task.local_read_source_task_ids
+            declared = sources[0] if type(sources) is tuple and sources else ""
+        if declared != predecessor_id:
+            return "the consumer is not routed at this chain's predecessor"
+        found = self._stored_task(connection, predecessor_id)
+        if found is None:
+            return "the predecessor task could not be read"
+        owner, predecessor = found
+        if owner != session_id:
+            return "the predecessor task belongs to another session"
+        if predecessor.status is not TaskStatus.COMPLETED:
+            return "the predecessor task did not complete"
+        if chain_task_refusal(
+            predecessor, chain, step.consumes, mode=ChainTaskMode.STORED
+        ) is not None:
+            return "the predecessor task is not this chain's step task"
+        # The result prerequisites the aperture itself depends on.
+        if step.capability == LOCAL_WRITE_CAPABILITY:
+            answer = predecessor.model_answer
+            if type(answer) is not ModelAnswer or not answer.present:
+                return "the predecessor task carries no model answer"
+            if (
+                type(predecessor.selected_connector) is not str
+                or not predecessor.selected_connector
+            ):
+                return "the predecessor task names no producer"
+        elif predecessor.capability != LOCAL_READ_CAPABILITY:
+            return "the predecessor task is not a local read"
+        else:
+            # F5. Being a COMPLETED file_read is not the prerequisite - HAVING
+            # THE SNAPSHOT is. A read that completed while producing nothing
+            # usable (an absent snapshot, or a row whose snapshot degraded to
+            # absence on load, which is how every malformed one arrives) would
+            # otherwise bind a MODEL consumer that can never run: the M8 hop
+            # refuses it later, after the slot is already spent. The aperture's
+            # own precondition is therefore re-proved HERE, on the
+            # authoritative row, in the transaction that binds.
+            snapshot = predecessor.local_read
+            if type(snapshot) is not LocalReadSnapshot:
+                return "the predecessor read snapshot is not the exact type"
+            if not snapshot.present:
+                return "the predecessor read carries no snapshot"
+            # THE canonical structural contract, not a restatement of it - the
+            # same function the load boundary, the execution boundary, the
+            # envelope and the egress payload all call.
+            if local_read_snapshot_refusal(snapshot) is not None:
+                return "the predecessor read snapshot is not usable"
+            authority = predecessor.scope.data_classification
+            if type(authority) is not DataClassification:
+                return "the predecessor read classification is malformed"
+            # M8 rebinds the classification from the SOURCE TASK's own trusted
+            # scope, so the object the consumer would actually receive is the
+            # one judged, not whatever the stored snapshot says about itself.
+            if local_read_snapshot_refusal(
+                replace(snapshot, classification=authority)
+            ) is not None:
+                return "the predecessor read snapshot is not usable as bound"
+            if snapshot.start_line != 0 or snapshot.end_line != 0:
+                # M8 refuses a bounded region as cross-task context: it
+                # describes only the captured lines.
+                return "the predecessor read is a bounded region"
+        return None
+
+    def materialize_chain_step(
+        self,
+        session_id: str,
+        chain_id: str,
+        chain_digest: str,
+        step_index: int,
+        task: Task,
+    ) -> tuple[str, str]:
+        """Create AND bind exactly one ordinary task for one chain step.
+
+        Returns ``(verdict, task_id)``; verdict is ``"created"``,
+        ``"observed"``, ``"conflict"``, ``"inactive"`` or ``"unknown"``.
+
+        Creation and binding are ONE transaction, and that is the whole point.
+        Creating a task and then saving its id into the chain as two
+        authoritative writes has a window: a crash between them leaves an
+        orphan task nobody can find and a step that will be materialized
+        again. Here there is no window - either both effects are durable or
+        neither is.
+
+        A step that already has a bound task is OBSERVED, never replaced. Two
+        concurrent materializers therefore converge on the same one task id:
+        SQLite admits one writer, the loser re-reads inside its own
+        transaction, sees the winner's binding and returns it.
+
+        The caller's ``task`` is a proposal. Its binding must name this chain,
+        this digest and this index, and the step must be the chain's CURRENT
+        cursor with nothing bound beyond it, or nothing is written.
+        """
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is None:
+                return "unknown", ""
+            stored, verdict = self._chain_for_update(
+                connection, session_id, chain_id, chain_digest
+            )
+            if stored is None:
+                return verdict or "conflict", ""
+            if type(step_index) is not int or step_index != stored.cursor:
+                # Only the cursor may be materialized. An earlier index is
+                # already settled; a later one would pre-create a step the
+                # chain has not reached.
+                return "conflict", ""
+            existing = stored.step_task_ids[step_index]
+            if existing:
+                # OBSERVED is a claim about a row, so the row is read and
+                # re-proved. A bound id alone says nothing: the task may be
+                # missing, owned by another session, or tampered since.
+                found = self._stored_task(connection, existing)
+                if found is None:
+                    return "conflict", ""
+                owner, bound_task = found
+                if owner != session_id:
+                    return "conflict", ""
+                if chain_task_refusal(
+                    bound_task, stored, step_index, mode=ChainTaskMode.STORED
+                ) is not None:
+                    return "conflict", ""
+                return "observed", existing
+            if any(stored.step_task_ids[step_index + 1 :]):
+                return "conflict", ""
+            # A valid binding is necessary but never sufficient. The WHOLE
+            # proposal is judged against the frozen step and the
+            # authoritative predecessor mapping before a row exists.
+            if chain_task_refusal(
+                task, stored, step_index, mode=ChainTaskMode.PROPOSAL
+            ) is not None:
+                return "conflict", ""
+            # A2. The id is judged by the SAME rule the persisted chain
+            # applies to every step task id it already holds - exact ``str``,
+            # non-empty, no NUL, no surrounding whitespace, within the
+            # character ceiling. Reusing ``chain_id_refusal`` rather than
+            # restating it is the point: an id accepted here but refused by
+            # ``chain_state_refusal`` on the next load would write a chain
+            # that can never be read back, which is a self-inflicted INVALID.
+            # ``isinstance`` was not enough - a ``str`` subclass with a
+            # stateful ``__eq__``/``__hash__`` is not the declared type.
+            if chain_id_refusal(task.id) is not None:
+                return "conflict", ""
+            if self._task_row_exists(connection, task.id):
+                # A task id that already exists is never re-bound to a step -
+                # whoever owns that row and whether or not it can be decoded.
+                return "conflict", ""
+            # B2. Predecessor authority is a fact about NOW, re-read and
+            # re-proved on this connection, never the caller's older proof.
+            if self._chain_predecessor_refusal(
+                connection, session_id, stored, step_index, task
+            ) is not None:
+                return "conflict", ""
+            # B1. The proposal is proven, but the proposal is not what will be
+            # stored: persistence normalizes the scope before writing. The
+            # representation that will actually exist is built here the way
+            # the loader builds it, and re-proved in STORED mode BEFORE the
+            # slot is bound - so nothing can be bound on pre-serialization
+            # proof alone and then fail its own authority on first read.
+            try:
+                persisted = Task.from_dict(task.to_dict())
+            except (TypeError, ValueError):
+                return "conflict", ""
+            if chain_task_refusal(
+                persisted, stored, step_index, mode=ChainTaskMode.STORED
+            ) is not None:
+                return "conflict", ""
+            bound = list(stored.step_task_ids)
+            bound[step_index] = task.id
+            candidate = replace(stored, step_task_ids=tuple(bound))
+            if chain_state_refusal(candidate) is not None:
+                # The chain this write WOULD leave behind is judged before
+                # anything is written, so no transaction can commit a chain
+                # that the next load would refuse. Nothing has been inserted
+                # at this point, so returning is the whole rollback.
+                return "conflict", ""
+            self._upsert_task(connection, session_id, task, force=True)
+            session = SessionState.from_dict(
+                json.loads(
+                    connection.execute(
+                        "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()[0]
+                )
+            )
+            session.chain = candidate
+            self._upsert_session(connection, session, chain_authority=True)
+            return "created", task.id
+
+    def advance_chain_step(
+        self, session_id: str, chain_id: str, chain_digest: str, step_index: int
+    ) -> str:
+        """Move the chain according to the STORED outcome of its current step.
+
+        Returns ``"advanced"``, ``"completed"``, ``"failed"``, ``"cancelled"``,
+        ``"blocked"``, ``"conflict"``, ``"inactive"``, ``"unbound"`` or
+        ``"unknown"``.
+
+        A caller-held Task object is never proof of anything. Inside one
+        transaction this re-reads the chain, re-reads the BOUND task row,
+        re-proves that the row is this chain's task for this step, and only
+        then reads the authoritative status. "The driver says it completed" is
+        not a fact this product has ever accepted, and it is not accepted here.
+
+        The cursor only moves forward, one step, and only off a COMPLETED
+        task. A task in doubt - non-terminal, or with an IN_FLIGHT or
+        UNKNOWN_OUTCOME attempt - blocks the chain in place: no advance, no
+        replay, no fabricated status.
+        """
+        with self._connection(write=True) as connection:
+            stored, verdict = self._chain_for_update(
+                connection, session_id, chain_id, chain_digest
+            )
+            if stored is None:
+                return verdict or "conflict"
+            if type(step_index) is not int or step_index != stored.cursor:
+                return "conflict"
+            bound = stored.step_task_ids[step_index]
+            if not bound:
+                return "unbound"
+            found = self._stored_task(connection, bound)
+            if found is None:
+                return "conflict"
+            owner, task = found
+            if owner != session_id:
+                return "conflict"
+            # The COMPLETE proof, not just the binding: a task whose
+            # objective, scope, classification, write mode or sanctioned
+            # source routing was tampered with has lost chain authority,
+            # however plausible its stored status looks.
+            if chain_task_refusal(
+                task, stored, step_index, mode=ChainTaskMode.STORED
+            ) is not None:
+                return "conflict"
+            if task.status is TaskStatus.FAILED:
+                updated = replace(stored, status=ChainStatus.FAILED)
+                outcome = "failed"
+            elif task.status in (TaskStatus.CANCELLED, TaskStatus.REJECTED):
+                updated = replace(stored, status=ChainStatus.CANCELLED)
+                outcome = "cancelled"
+            elif task.status is not TaskStatus.COMPLETED:
+                return "blocked"
+            elif self._attempt_blocks_advance(connection, bound):
+                return "blocked"
+            elif step_index == len(stored.steps) - 1:
+                updated = replace(stored, status=ChainStatus.COMPLETED)
+                outcome = "completed"
+            else:
+                updated = replace(stored, cursor=step_index + 1)
+                outcome = "advanced"
+            session = SessionState.from_dict(
+                json.loads(
+                    connection.execute(
+                        "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()[0]
+                )
+            )
+            session.chain = updated
+            self._upsert_session(connection, session, chain_authority=True)
+            return outcome
+
+    def cancel_chain(self, session_id: str, chain_id: str) -> str:
+        """Mark the chain CANCELLED. The only path to that status.
+
+        Returns ``"cancelled"``, ``"terminal"``, ``"conflict"`` or
+        ``"unknown"``. Cursor and every bound task id are preserved exactly:
+        cancellation stops what has not started, it does not undo what has.
+        Once CANCELLED the chain is no longer ACTIVE, so ``_chain_for_update``
+        refuses every later materialize and advance - a cancel cannot be
+        raced into a new step task.
+        """
+        with self._connection(write=True) as connection:
+            stored = self._stored_chain(connection, session_id)
+            if stored is None:
+                return "unknown"
+            if stored.id != chain_id:
+                return "conflict"
+            if stored.status is not ChainStatus.ACTIVE:
+                return "terminal"
+            session = SessionState.from_dict(
+                json.loads(
+                    connection.execute(
+                        "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()[0]
+                )
+            )
+            session.chain = replace(stored, status=ChainStatus.CANCELLED)
+            self._upsert_session(connection, session, chain_authority=True)
+            return "cancelled"
+
+    def declare_chain_if_absent(self, session_id: str, chain: ChainState) -> str:
+        """Atomically claim the session's one chain slot. THE only creator.
+
+        Returns ``"declared"``, ``"occupied"`` or ``"unknown"`` - a
+        deterministic verdict in the shape ``cancel_task`` already uses, so a
+        loser is told what happened rather than being handed a silent success.
+
+        The authoritative read, the decision and the write all happen inside
+        one ``BEGIN IMMEDIATE`` transaction. SQLite admits one writer at a
+        time, so two concurrent declarers cannot both observe an empty slot:
+        the second blocks on the write lock, then reads the winner's chain and
+        loses. Correctness comes from the database, never from a Python lock,
+        which would protect only one process.
+
+        Occupied means occupied in EVERY state. ACTIVE, COMPLETED, FAILED,
+        CANCELLED and INVALID all count, because ``None`` is the one spelling
+        of absence and a finished or corrupted chain is not it. What may
+        replace a terminal chain is a policy this product has not decided, so
+        it fails closed here rather than guessing.
+        """
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return "unknown"
+            if self._stored_chain(connection, session_id) is not None:
+                return "occupied"
+            session = SessionState.from_dict(json.loads(row[0]))
+            session.chain = chain
+            self._upsert_session(connection, session, chain_authority=True)
+            return "declared"
 
     def load_session(self, session_id: str) -> SessionState | None:
         with self._connection() as connection:
@@ -1337,6 +2003,12 @@ class SQLiteMemoryStore:
                     "SELECT status FROM tasks WHERE id = ?", (task_id,)
                 ).fetchone()
                 if row is None or row[0] in _EXECUTION_BLOCKING_STATUSES:
+                    return ExecutionClaimOutcome.LOST
+                # Window A2 (S3B P1-1): for a CHAIN task, the chain's own
+                # authority is arbitrated against this claim HERE, in the same
+                # transaction that grants ownership, so a cancellation that
+                # commits before the claim can never be executed past.
+                if not self._chain_claim_authority(connection, session_id, task_id):
                     return ExecutionClaimOutcome.LOST
                 # P1-D: ownership before money. The attempt must exist, belong
                 # to this exact session/task and still be claimable.

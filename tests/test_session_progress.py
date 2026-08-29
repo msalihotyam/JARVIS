@@ -1127,7 +1127,7 @@ class EnvelopeProgressTests(ProcessBoundaryTestCase):
         # M3 bumped the public envelope contract 2 -> 3 (bounded ``local_read``
         # block) and M5 bumped it 3 -> 4 (bounded ``local_write`` block). The
         # progress object below is unchanged by both bumps.
-        self.assertEqual(5, result.payload["schema_version"])
+        self.assertEqual(6, result.payload["schema_version"])
         progress = result.payload["progress"]
         task = self.memory.load_task(result.payload["task"]["id"])
         self.assertEqual(

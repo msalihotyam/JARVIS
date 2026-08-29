@@ -2231,6 +2231,16 @@ class LocalReadSnapshot:
 #: same thing.
 LOCAL_WRITE_CAPABILITY = "file_write"
 
+#: The EXACT capabilities whose ordinary trusted lifecycle rewrites
+#: ``ActionScope.target`` through ``canonical_path``. THE single list, named
+#: once: ``AgentCore._bind_canonical_local_target`` decides which tasks it
+#: canonicalizes from it, and ``chain_task_refusal`` decides from the same
+#: constant which STORED tasks may legitimately carry the canonical spelling
+#: instead of the declared one. Two lists would drift, and a drift here is an
+#: authority widening: a capability the runtime never canonicalizes must not
+#: be able to hold chain authority under a rewritten target.
+CANONICAL_TARGET_CAPABILITIES = (LOCAL_READ_CAPABILITY, LOCAL_WRITE_CAPABILITY)
+
 #: The single ``ToolResult.data`` key a local-write connector uses to hand its
 #: typed record to ``AgentCore``. ``_sanitize_result`` reduces ``data`` to
 #: ``next_step``, so this transport is read once and never persisted.
@@ -3140,6 +3150,1199 @@ def local_read_region_refusal(kind: Any, start_line: Any, max_lines: Any) -> str
 
 
 # --------------------------------------------------------------------------
+# M11. Sequential task chain (inert declaration, never authority)
+# --------------------------------------------------------------------------
+
+#: Hard ceiling on how many steps ONE chain may declare. Deliberately a
+#: SEPARATE policy surface from ``PLAN_STEP_COUNT`` (six advisory prose steps
+#: that describe ONE action) and from ``LOCAL_READ_MAX_SOURCES`` (how many
+#: completed reads ONE task may consume): the three answer different
+#: questions and must stay free to diverge, so none may alias another.
+MAX_CHAIN_STEPS = 3
+
+#: Hard ceiling on one persisted chain identifier or step task id.
+#: Deliberately a SEPARATE policy surface from ``LOCAL_READ_SOURCE_MAX_CHARS``
+#: and ``LOCAL_WRITE_SOURCE_MAX_CHARS``: all three are equal today and must
+#: stay free to diverge, so none may alias another.
+CHAIN_ID_MAX_CHARS = 64
+
+#: Hard ceiling on one declared symbolic name (capability, action, write
+#: mode). Separate policy surface from ``PLAN_SYMBOL_MAX_CHARS``.
+CHAIN_SYMBOL_MAX_CHARS = 64
+
+#: Hard ceiling on one declared locator (target, destination). Separate
+#: policy surface from ``LOCAL_READ_PATH_MAX_CHARS``, which bounds a
+#: PERSISTED ROOT-RELATIVE result path rather than a DECLARED request.
+CHAIN_LOCATOR_MAX_CHARS = 512
+
+#: Hard ceiling on one declared step objective. The ordinary task boundary
+#: bounds an objective only by the whole-document byte limit, so there is no
+#: existing per-field rule to reuse and this is a NEW policy surface rather
+#: than an alias of one. It is deliberately its own number: a step objective
+#: is USER INTENT that becomes part of the outbound payload for a model step,
+#: so bounding it bounds egress, and it must stay free to diverge from
+#: ``PLAN_STEP_MAX_CHARS`` (display prose) and ``PROJECT_MEMORY_TEXT_CAP``
+#: (stored reference text), which answer entirely different questions.
+CHAIN_OBJECTIVE_MAX_CHARS = 480
+
+#: Which write modes a CHAIN step may declare. Deliberately a SEPARATE policy
+#: surface from ``LOCAL_WRITE_ENABLED_MODES``: an ordinary standalone task may
+#: still overwrite, and M10 is untouched. A chain may not, because a chain
+#: step carries no literal content - by design - and an overwrite requires
+#: direct bytes: ``write.model_answer_task_id`` is refused for overwrite, so a
+#: declared chain overwrite could never be materialized into a real task. It
+#: is refused HERE, at declaration, rather than accepted and then found
+#: unrunnable much later.
+CHAIN_ENABLED_WRITE_MODES = ("create",)
+
+#: The ``consumes`` value meaning "this step consumes no earlier step". A
+#: real predecessor index is always >= 0, so a sentinel outside that range
+#: can never be confused with step 0.
+CHAIN_NO_PREDECESSOR = -1
+
+#: The only keys one declared chain step may carry, at the trusted input
+#: boundary and at the persistence load boundary alike. Default-deny, and
+#: the ABSENCES are the contract: no ``task_id``, no ``local_read_task_id``,
+#: no ``model_answer_task_id``, no ``steps``, no ``chain`` and - deliberately
+#: - no ``classification``. A predecessor is named by INDEX and by nothing
+#: else; a model answer, a retrieved memory item, a nested chain and a data
+#: classification have no spelling here at all, so none of them can author a
+#: step. Classification in particular is POLICY, not intent: letting a caller
+#: declare it would let a declaration claim PUBLIC for a step whose real
+#: scope is SECRET, and the trusted core must derive it instead - exactly as
+#: ``AgentCore`` already binds a read snapshot's classification from the
+#: reading task's own scope rather than from what the producer claimed.
+_CHAIN_STEP_KEYS = frozenset(
+    {
+        "objective",
+        "capability",
+        "action",
+        "target",
+        "destination",
+        "write_mode",
+        "consumes",
+    }
+)
+
+#: The only keys one persisted chain may carry.
+_CHAIN_STATE_KEYS = frozenset({"id", "steps", "step_task_ids", "cursor", "status"})
+
+
+class ChainStatus(str, Enum):
+    """Durable status of the ONE sequential chain a session may own.
+
+    Internal persisted state, never user-supplied authority: a caller
+    declares steps, never a status. ``ACTIVE`` means the chain still has work
+    at its cursor; ``COMPLETED`` means every declared step produced a task and
+    the last one finished; ``FAILED`` and ``CANCELLED`` are the terminal
+    outcomes of a chain that stopped early, and neither implies any undo -
+    completed steps stay completed, because no rollback exists.
+
+    A malformed or inconsistent chain loads as ``INVALID`` - a typed verdict
+    every later authority stage refuses - rather than as an active chain or as
+    no chain at all. ``INVALID`` is never produced by the input boundary; it is
+    accepted on load only so that load -> resave -> load stays invalid.
+    Degrading a corrupted chain to ABSENCE would be the more dangerous repair:
+    absence reads as "this session may start a chain", so a tampered
+    declaration would quietly clear the way for a new one.
+    """
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    INVALID = "invalid"
+
+
+def chain_symbol_refusal(value: Any) -> str | None:
+    """Why this is not a usable declared symbol, or ``None``.
+
+    THE single grammar for a chain-declared symbolic name. Nothing is coerced
+    or canonicalized: a padded name is REFUSED, not stripped, so the
+    declaration that will be shown at approval is the declaration that was
+    typed. Deliberately independent of ``normalize_symbol``, which exists to
+    keep a fingerprint stable, not to accept sloppy input here.
+    """
+    if type(value) is not str:
+        return "symbol is not a string"
+    if not value:
+        return "symbol is empty"
+    if chr(0) in value:
+        return "symbol contains a NUL character"
+    if value != value.strip():
+        return "symbol carries surrounding whitespace"
+    if len(value) > CHAIN_SYMBOL_MAX_CHARS:
+        return "symbol exceeds its character ceiling"
+    return None
+
+
+def chain_locator_refusal(value: Any) -> str | None:
+    """Why this is not a usable declared locator, or ``None``.
+
+    Empty is allowed and meaningful: a step that names no filesystem target or
+    no outbound destination declares the empty string, exactly as
+    ``ActionScope`` does. Everything else is the symbol grammar with a wider
+    ceiling. GRAMMAR only - containment, allowed roots, the secret-file policy
+    and the whole no-follow chain are asked far later, by the connector that
+    would actually open something.
+    """
+    if type(value) is not str:
+        return "locator is not a string"
+    if chr(0) in value:
+        return "locator contains a NUL character"
+    if value != value.strip():
+        return "locator carries surrounding whitespace"
+    if len(value) > CHAIN_LOCATOR_MAX_CHARS:
+        return "locator exceeds its character ceiling"
+    return None
+
+
+def chain_objective_refusal(value: Any) -> str | None:
+    """Why this is not a usable declared objective, or ``None``.
+
+    Deliberately NOT the symbol grammar. An objective is USER INTENT in prose,
+    and it is the one declared field whose text a person wrote to be read, so
+    surrounding whitespace is PRESERVED rather than refused or stripped -
+    exactly as the ordinary task boundary preserves it. Blank is still
+    refused, because a task with no objective is refused by the loop itself.
+
+    Nothing is normalized: the objective a chain step declares is the
+    objective a later task will carry and, for a model step, the objective
+    that reaches the outbound payload verbatim. Quietly rewriting it would
+    change what the user asked for.
+    """
+    if type(value) is not str:
+        return "objective is not a string"
+    if not value.strip():
+        return "objective is blank"
+    if chr(0) in value:
+        return "objective contains a NUL character"
+    if len(value) > CHAIN_OBJECTIVE_MAX_CHARS:
+        return "objective exceeds its character ceiling"
+    return None
+
+
+def chain_id_refusal(value: Any) -> str | None:
+    """Why this is not a usable chain or step-task identifier, or ``None``."""
+    if type(value) is not str:
+        return "identifier is not a string"
+    if not value:
+        return "identifier is empty"
+    if chr(0) in value:
+        return "identifier contains a NUL character"
+    if value != value.strip():
+        return "identifier carries surrounding whitespace"
+    if len(value) > CHAIN_ID_MAX_CHARS:
+        return "identifier exceeds its character ceiling"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ChainStep:
+    """One ordered DECLARATION of a future ordinary single-action task.
+
+    Inert data with NO authority: a step is not an approval, not a scope, not
+    an execution opportunity and not a billing input. It describes what one
+    later ordinary ``Task`` would ask for, and every gate that task meets -
+    its own permission request, its own ``EgressAttestation``, its own
+    execution attempt, its own reservation, its own result - stays exactly as
+    it is today, unshared with any other step.
+
+    ``consumes`` names a predecessor BY INDEX, never by task id. An index
+    cannot address a task in another session, cannot address an unrelated
+    completed row, and cannot be forged into a reference the existing
+    resolvers would accept - the three things a caller-supplied task id could
+    attempt. The concrete id of a predecessor is not even knowable when the
+    chain is declared, because that task does not exist yet; it is discovered
+    later, from storage, and the existing resolvers still prove it.
+
+    A step expresses INTENT AND ROUTING ONLY, plus the one thing intent cannot
+    be derived from: its ``objective``. That field is the user's own words and
+    is deliberately caller-controlled, because it is INTENT, not policy - and
+    because a later task requires one, which no amount of capability/action/
+    target could honestly synthesize. For a model step the objective IS the
+    request and reaches the outbound payload verbatim, so it is bounded and
+    never rewritten. Model output, retrieved memory and file excerpts still
+    cannot author or mutate it: it arrives only through the trusted boundary.
+
+    ``classification`` is NOT declarable: data classification is policy the
+    trusted core owns. A declaration that could name a classification could
+    name PUBLIC for a SECRET target, and the digest below would then have a
+    caller-controlled policy surface in it. Whatever creates the ordinary task
+    for a step must set the classification EXPLICITLY on the trusted side -
+    for M11 that is ``DataClassification.INTERNAL``, matching what the
+    ordinary task boundary already applies when the field is absent - and must
+    never derive it from the objective text, from model output, from the
+    target string or from a predecessor's content. SECRET-classified chain
+    execution is deferred until a genuine trusted derivation policy exists.
+    """
+
+    objective: str = ""
+    capability: str = ""
+    action: str = ""
+    target: str = ""
+    destination: str = ""
+    #: Empty for every non-write step; an exact ``LOCAL_WRITE_MODES`` value for
+    #: a write step. GRAMMAR only - whether the running platform and policy may
+    #: PERFORM the mode stays ``local_write_mode_unsupported``'s question,
+    #: asked far later and by someone else.
+    write_mode: str = ""
+    consumes: int = CHAIN_NO_PREDECESSOR
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "capability": self.capability,
+            "action": self.action,
+            "target": self.target,
+            "destination": self.destination,
+            "write_mode": self.write_mode,
+            "consumes": self.consumes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ChainStep":
+        """Rebuild defensively; anything malformed degrades to the empty step.
+
+        No repair and no coercion of any kind: ``str()`` on a capability,
+        ``int()`` on a predecessor index or ``bool()`` on anything would each
+        turn tampered persisted state into a plausible ACTIVE declaration. An
+        unknown key is REFUSED rather than filtered, because a key this
+        contract does not know is either a spelling from a future contract or
+        an attempt to smuggle authority - a task id, a model answer, a nested
+        chain - and neither may be silently dropped into a step that then
+        looks well-formed.
+
+        The empty step returned here carries an empty capability, which the one
+        canonical contract below always refuses. That is deliberate: one
+        malformed step must refuse the WHOLE chain, never be dropped from it.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        if not set(data) <= _CHAIN_STEP_KEYS:
+            return cls()
+        # Every field is read exactly ONCE here, so this object is a snapshot
+        # of the mapping at one instant. An OMITTED key falls back to its
+        # typed default; a PRESENT value of the wrong type is tampered state
+        # and is judged - never coerced - by the one contract below.
+        return cls(
+            objective=data.get("objective", ""),
+            capability=data.get("capability", ""),
+            action=data.get("action", ""),
+            target=data.get("target", ""),
+            destination=data.get("destination", ""),
+            write_mode=data.get("write_mode", ""),
+            consumes=data.get("consumes", CHAIN_NO_PREDECESSOR),
+        )
+
+
+def _canonical_step_scope_field(value: Any, *, destination: bool = False) -> Any:
+    """One declared scope field in the EXACT spelling persistence will hold.
+
+    B1. ``ActionScope.to_dict`` normalizes before writing, so the row never
+    holds what the caller typed - it holds the normalized form. A declaration
+    that froze the RAW spelling therefore accepted a proposal whose own stored
+    representation could no longer prove it belonged to the step: the task was
+    bound and then permanently failed STORED authority. The declaration is
+    frozen in the persisted spelling instead, so the round trip is the
+    identity and the digest is over the representation that actually exists.
+
+    The SAME normalizers ``ActionScope`` uses, never a second spelling of
+    them. Applied only to a real ``str``: a non-string is tampered state and
+    stays untouched so the grammar below still refuses it by type, and
+    ``str()`` here would be exactly the coercion this contract forbids.
+    """
+    if type(value) is not str:
+        return value
+    return normalize_destination(value) if destination else normalize_symbol(value)
+
+
+def _canonical_step_target(value: Any) -> Any:
+    """A declared target in its persisted spelling, WITHOUT resolving a path.
+
+    A symbolic target converges here, because that is all
+    ``normalize_locator`` does to it. A PATH-SHAPED target deliberately does
+    not: ``normalize_locator`` would resolve it against the current working
+    directory, so the declaration - and its digest - would carry an absolute
+    machine path and would differ between machines and between runs. That
+    rewrite belongs to the trusted runtime, which performs it later, and
+    STORED already sanctions exactly that one canonical form for exactly the
+    capabilities whose lifecycle produces it.
+    """
+    if type(value) is not str or looks_like_path(value):
+        return value
+    return normalize_symbol(value)
+
+
+def _canonical_step(step: ChainStep) -> ChainStep:
+    """An ACCEPTED step, respelled exactly as persistence will hold it.
+
+    Called only after ``chain_steps_refusal`` has already accepted the step,
+    so this can never repair a value the grammar refuses.
+    """
+    return replace(
+        step,
+        action=_canonical_step_scope_field(step.action),
+        target=_canonical_step_target(step.target),
+        destination=_canonical_step_scope_field(step.destination, destination=True),
+    )
+
+
+def chain_step_refusal(step: Any, index: Any, total: Any) -> str | None:
+    """Why this step is not usable AT THIS POSITION, or ``None``.
+
+    THE single contract for one declared step, asked by the trusted input
+    boundary, by the persistence load boundary and by the whole-chain contract
+    below. Position is a parameter because two of the rules are positional and
+    cannot be judged by a step alone: a step may not consume ITSELF, and a step
+    may not consume a LATER step. A sequential chain that could look forward
+    would be declaring a dependency no execution order can satisfy.
+
+    Exact types only - ``type() is int`` and not ``isinstance``, because
+    ``True`` is an ``int`` and a boolean must never be read as a step index.
+    """
+    if type(step) is not ChainStep:
+        return "step is not an exact ChainStep"
+    if type(index) is not int or type(total) is not int:
+        return "step position is not an exact integer"
+    if not 0 <= index < total:
+        return "step position is outside the chain"
+    reason = chain_objective_refusal(step.objective)
+    if reason is not None:
+        return f"objective is malformed: {reason}"
+    reason = chain_symbol_refusal(step.capability)
+    if reason is not None:
+        return f"capability is malformed: {reason}"
+    reason = chain_symbol_refusal(step.action)
+    if reason is not None:
+        return f"action is malformed: {reason}"
+    reason = chain_locator_refusal(step.target)
+    if reason is not None:
+        return f"target is malformed: {reason}"
+    reason = chain_locator_refusal(step.destination)
+    if reason is not None:
+        return f"destination is malformed: {reason}"
+    # Exact type FIRST, ungated by truthiness. ``""`` is the legitimate
+    # non-write default; every OTHER falsy value - ``None``, ``0``, ``False``,
+    # ``[]``, ``b""`` - is tampered state wearing the default's clothes. A
+    # truthiness gate would admit all of them: the declared ``str`` type would
+    # be violated in a chain this contract calls valid, one displayed
+    # declaration would have several distinct digests, and a non-encodable
+    # value would leave a chain whose digest cannot be computed at all.
+    if type(step.write_mode) is not str:
+        return "write mode is not an exact string"
+    if step.write_mode:
+        reason = local_write_mode_refusal(step.write_mode)
+        if reason is not None:
+            return f"write mode is malformed: {reason}"
+        if step.write_mode not in CHAIN_ENABLED_WRITE_MODES:
+            # Grammar recognizes the mode; CHAIN policy refuses it. Standalone
+            # M10 overwrite is untouched - this is only about what a chain,
+            # which declares no bytes, could ever actually perform.
+            return "a chain step may not declare this write mode"
+        if step.capability != LOCAL_WRITE_CAPABILITY:
+            return "a step declares a write mode without the write capability"
+    elif step.capability == LOCAL_WRITE_CAPABILITY:
+        return "a write step declares no write mode"
+    if type(step.consumes) is not int:
+        return "predecessor is not an exact integer"
+    if step.consumes == CHAIN_NO_PREDECESSOR:
+        return None
+    if step.consumes < 0:
+        return "predecessor is not a real step index"
+    if step.consumes == index:
+        return "a step consumes itself"
+    if step.consumes > index:
+        return "a step consumes a later step"
+    return None
+
+
+#: The ``step_index`` value meaning "this task was not created for a chain".
+#: A real index is always >= 0, so the sentinel can never be step 0.
+CHAIN_NO_STEP = -1
+
+#: Hard ceiling on a persisted chain digest string. A SHA-256 hex digest is
+#: exactly this long; the constant exists so the check is a stated policy
+#: rather than a magic number, and so it cannot drift from the digest that
+#: produces it.
+CHAIN_DIGEST_CHARS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ChainBinding:
+    """Trusted provenance proving a Task was created FOR one chain step.
+
+    Internal state only. It is deliberately absent from the task input
+    allowlist, so untrusted task JSON naming it is refused BY NAME and no
+    caller can mint a task that claims to belong to a chain. Only the trusted
+    derivation that materializes a step sets it.
+
+    It is a CLAIM that must still be checked, never a permission. A consumer
+    proves chain ownership by re-asking storage: the task's session must be
+    the chain's session, this binding must name the chain's id, the chain's
+    CURRENT declaration digest and the step index whose slot holds this task's
+    id, and the task's own capability and scope must still match the frozen
+    step. A forged ordinary task fails every one of those, and a genuine
+    chain task whose declaration was edited afterwards fails the digest.
+    """
+
+    chain_id: str = ""
+    chain_digest: str = ""
+    step_index: int = CHAIN_NO_STEP
+
+    @property
+    def present(self) -> bool:
+        return bool(self.chain_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chain_id": self.chain_id,
+            "chain_digest": self.chain_digest,
+            "step_index": self.step_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ChainBinding":
+        """Rebuild defensively; anything malformed loads as NO binding.
+
+        Absence is the safe degradation here, and only here: a task with no
+        binding simply cannot prove chain ownership, so every chain consumer
+        refuses it. Nothing is coerced - a tampered binding does not become a
+        plausible one wearing a valid shape.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        candidate = cls(
+            chain_id=data.get("chain_id", ""),
+            chain_digest=data.get("chain_digest", ""),
+            step_index=data.get("step_index", CHAIN_NO_STEP),
+        )
+        return candidate if chain_binding_refusal(candidate) is None else cls()
+
+
+def chain_binding_refusal(binding: Any) -> str | None:
+    """Why this is not a usable chain binding, or ``None``.
+
+    An ABSENT binding is usable: most tasks are not chain steps, and the empty
+    binding is how they say so. A PARTIAL one never is - a binding that names
+    a chain but no digest, or a digest but no chain, is tampered state.
+    """
+    if type(binding) is not ChainBinding:
+        return "binding is not an exact ChainBinding"
+    if type(binding.step_index) is not int:
+        return "step index is not an exact integer"
+    if type(binding.chain_id) is not str or type(binding.chain_digest) is not str:
+        return "binding identifiers are not strings"
+    if not binding.present:
+        if binding.chain_digest or binding.step_index != CHAIN_NO_STEP:
+            return "an unbound task carries chain state"
+        return None
+    reason = chain_id_refusal(binding.chain_id)
+    if reason is not None:
+        return f"chain id is malformed: {reason}"
+    if len(binding.chain_digest) != CHAIN_DIGEST_CHARS:
+        return "chain digest is not a digest"
+    if any(character not in "0123456789abcdef" for character in binding.chain_digest):
+        return "chain digest is not lowercase hexadecimal"
+    if not 0 <= binding.step_index < MAX_CHAIN_STEPS:
+        return "step index is outside the chain"
+    return None
+
+
+#: Loop stages during which a chain step task may not yet name a selected
+#: connector. Selection HAPPENS AT PLAN, and the successful choice is
+#: persisted only as the task leaves PLAN for RISK_PERMISSION - so a task
+#: whose stored stage is still PLAN has not selected anything yet, and PLAN
+#: belongs in this set. Storage cannot prove WHICH connector is legitimate;
+#: that needs the registry, which is AgentCore's. It can prove that a task
+#: which has not got past PLAN has no business naming one at all.
+_PRE_SELECTION_STAGES = frozenset(
+    {
+        LoopStage.UNDERSTAND,
+        LoopStage.CONTEXT_RETRIEVAL,
+        LoopStage.CLARIFY_OR_ASSUME,
+        LoopStage.PLAN,
+    }
+)
+
+
+class ChainTaskMode(str, Enum):
+    """Which chain-task question is being asked.
+
+    ``PROPOSAL``: a task that has not been persisted yet, offered for
+    materialization. It must be PRISTINE - the exact shape trusted derivation
+    produces and nothing more - because after this moment its identity is
+    fixed and nobody re-derives it.
+
+    ``STORED``: a task that already exists and may have progressed through the
+    ordinary loop. Its chain-derived AUTHORITY must still be untouched, while
+    its ordinary lifecycle state is allowed to have moved on.
+    """
+
+    PROPOSAL = "proposal"
+    STORED = "stored"
+
+
+def chain_task_refusal(
+    task: Any, chain: Any, index: Any, *, mode: Any
+) -> str | None:
+    """Why this task is NOT the chain's task for this step, or ``None``.
+
+    THE single ownership contract. A valid ``ChainBinding`` is NECESSARY but
+    never SUFFICIENT: a binding is a claim, and this function is where the
+    claim is checked against the frozen declaration, the authoritative chain
+    mapping and trusted M11 policy. What it proves is one sentence - this
+    stored task is exactly the ordinary task the frozen step plus trusted
+    derivation plus authoritative predecessor routing would produce - so a
+    task cannot keep chain authority after ANY material change to its user
+    intent, its scope, its policy or its sanctioned source routing.
+
+    A. IMMUTABLE CHAIN-DERIVED AUTHORITY - checked in BOTH modes, because
+    changing any of them changes what the user asked for or what the task is
+    allowed to do:
+        the binding (chain id, CURRENT declaration digest, step index);
+        ``objective`` verbatim; ``capability``; ``scope.action``,
+        ``scope.target``, ``scope.destination``;
+        ``scope.data_classification`` == INTERNAL;
+        ``write_mode``; the M7/M8 predecessor routing fields
+        (``write_source``, ``write_source_task_id``,
+        ``local_read_context_kind``, ``local_read_source_task_ids``);
+        the absence of the M3 singular reference; the HEAD-only read window;
+        ``project_id``.
+
+    B. LEGITIMATE ORDINARY-TASK RUNTIME PROGRESSION - pinned pristine in
+    PROPOSAL mode and then left alone, because the ordinary loop owns them:
+        ``status``, ``stage``, ``plan``, ``estimate``, ``preferences``,
+        ``visible_assumption``, ``result_snapshot``, ``retrieved_context``,
+        ``local_read``, ``local_read_sources``, ``local_write``,
+        ``model_answer``, ``write_content`` (frozen by the M7 resolver),
+        ``progress``, ``cancellation_requested``, ``selected_connector``.
+
+    ``selected_connector`` is the one field in group B that still gets a rule
+    in STORED mode, and only the rule storage can honestly enforce: a task
+    that has not reached PLAN may not name one. WHICH connector is legitimate
+    is a registry question and stays in ``AgentCore``; duplicating that
+    authority into storage would create a second source of truth for it.
+    """
+    if type(mode) is not ChainTaskMode:
+        return "chain task mode is not an exact ChainTaskMode"
+    if type(task) is not Task:
+        return "task is not an exact Task"
+    if type(chain) is not ChainState:
+        return "chain is not an exact ChainState"
+    if chain_state_refusal(chain) is not None:
+        return "chain is not usable"
+    if type(index) is not int or not 0 <= index < len(chain.steps):
+        return "step index is outside the chain"
+    step = chain.steps[index]
+
+    binding = task.chain_binding
+    if chain_binding_refusal(binding) is not None:
+        return "task binding is malformed"
+    if not binding.present:
+        return "task carries no chain binding"
+    if binding.chain_id != chain.id:
+        return "task belongs to another chain"
+    if binding.chain_digest != chain.digest:
+        return "chain declaration changed after the task was created"
+    if binding.step_index != index:
+        return "task belongs to another step of this chain"
+
+    if task.objective != step.objective:
+        return "task objective does not match the declared step"
+    if task.capability != step.capability:
+        return "task capability does not match the declared step"
+    if type(task.scope) is not ActionScope:
+        return "task scope is not an exact ActionScope"
+    if task.scope.action != step.action:
+        return "task action does not match the declared step"
+    if task.scope.target != step.target and not (
+        mode is ChainTaskMode.STORED
+        and step.capability in CANONICAL_TARGET_CAPABILITIES
+        and task.scope.target == canonical_path(step.target)
+    ):
+        # The ONE transformation the ordinary loop performs on a target, and
+        # only where it actually performs it. ``_bind_canonical_local_target``
+        # canonicalizes the target of a ``CANONICAL_TARGET_CAPABILITIES``
+        # task at the top of the loop, so such a task, once it has actually
+        # RUN, legitimately carries the canonical spelling of what the step
+        # declared. Exactly that value is accepted, for exactly those
+        # capabilities, in STORED mode, and nothing else is.
+        #
+        # S3B P1-2. Allowing the canonical alternative for EVERY capability
+        # granted target-transformation authority the trusted lifecycle never
+        # grants: no ordinary run rewrites a model step's symbolic target, so
+        # a stored model task whose target had become
+        # ``canonical_path(target)`` was a task nothing sanctioned produced,
+        # and it kept chain authority anyway. It is gated on the shared
+        # predicate now, so the validator and the runtime cannot disagree
+        # about which capabilities are transformed. A PROPOSAL has not run at
+        # all, so it must still carry the declared spelling verbatim,
+        # whatever its capability.
+        return "task target does not match the declared step"
+    if task.scope.destination != step.destination:
+        return "task destination does not match the declared step"
+    if task.scope.connector != "":
+        # FROZEN SCOPE AUTHORITY, and deliberately not the same thing as
+        # ``selected_connector``. Trusted derivation leaves this empty, so
+        # the scope - and therefore the approval fingerprint built from it -
+        # names no connector. A chain task may never acquire authority under
+        # an arbitrary one. Which connector RUNS the task is the separate,
+        # later, registry-owned question ``selected_connector`` answers.
+        return "task scope names a connector"
+    if task.scope.data_classification is not DataClassification.INTERNAL:
+        return "task classification is not the trusted chain classification"
+    if task.project_id is not None:
+        return "a chain task carries a project binding"
+
+    expected_mode = step.write_mode if step.capability == LOCAL_WRITE_CAPABILITY else ""
+    if expected_mode and expected_mode not in CHAIN_ENABLED_WRITE_MODES:
+        return "the declared step names a write mode a chain may not perform"
+    if task.write_mode != expected_mode:
+        return "task write mode does not match the declared step"
+
+    # A chain declares no region window, so a task carrying one was not
+    # derived from this declaration. Checked by EXACT TYPE and EXACT VALUE:
+    # ``type() is int`` and not ``isinstance``, because ``bool`` is an ``int``
+    # subclass and ``False`` would otherwise read as the canonical 0 - and a
+    # truthiness test would admit ``False``, ``0.0``, ``""`` and ``None``
+    # alike, each of which is a different fact from "no window".
+    if task.local_read_kind is not LocalReadKind.HEAD:
+        return "a chain task carries a read window"
+    if type(task.read_start_line) is not int or task.read_start_line != 0:
+        return "a chain task carries a read window start line"
+    if type(task.read_max_lines) is not int or task.read_max_lines != 0:
+        return "a chain task carries a read window line count"
+    # A4. SHAPE BEFORE MEMBERSHIP. ``in`` is not a safe question to ask of an
+    # unproven value: a persisted ``"context": null`` rebuilds as ``None`` -
+    # nothing coerces it - and the membership test below would raise
+    # ``TypeError`` out of a validator whose entire contract is to RETURN a
+    # refusal. A raise here escapes into materialization and the driver, where
+    # a deterministic refusal was the only thing keeping the boundary closed.
+    # Exact type, so a ``dict`` subclass with a stateful ``__contains__``
+    # cannot answer this question either.
+    if type(task.context) is not dict:
+        return "task context is not an exact mapping"
+    if LOCAL_READ_TASK_REFERENCE_KEY in task.context:
+        return "a chain task carries an unsanctioned read reference"
+
+    reason = _chain_routing_refusal(task, chain, step)
+    if reason is not None:
+        return reason
+
+    if mode is ChainTaskMode.STORED:
+        if task.selected_connector is not None and (
+            type(task.selected_connector) is not str
+            or task.selected_connector == ""
+        ):
+            return "task names a malformed connector"
+        if (
+            task.stage in _PRE_SELECTION_STAGES
+            and task.selected_connector is not None
+        ):
+            return "task named a connector before it was planned"
+        return None
+
+    # PROPOSAL: pristine, exactly what trusted derivation produces.
+    if task.status is not TaskStatus.PENDING or task.stage is not LoopStage.UNDERSTAND:
+        return "a proposed chain task is not at the start of the loop"
+    if task.selected_connector is not None:
+        return "a proposed chain task already names a connector"
+    if task.result_snapshot is not None:
+        return "a proposed chain task already carries a result"
+    # Every remaining POLICY and RUNTIME field trusted derivation leaves at
+    # its canonical default, checked by EXACT TYPE and EXACT VALUE.
+    #
+    # Truthiness and ``.present`` are deliberately NOT used here. An
+    # empty-LOOKING value is not the same fact as the canonical default,
+    # and this is the last boundary before a task identity is fixed:
+    # ``LocalReadSnapshot(classification=PUBLIC)`` is not ``present`` and is
+    # not the default either; ``LocalWriteRecord(pre_present=True)`` and
+    # ``ModelAnswer(content=...)`` are the same trick; ``plan=()`` and
+    # ``context=[]`` are falsy and are not the declared types;
+    # ``cancellation_requested=0`` is falsy and is not ``False``.
+    #
+    # Pinned HERE rather than left to downstream recomputation: a boundary
+    # that admits hostile state and hopes a later stage overwrites it is not
+    # a boundary. A proposal must BE the trusted initial state, and the only
+    # fields allowed to differ are the ones construction varies by nature -
+    # ``id``, ``created_at`` and ``updated_at``.
+    if type(task.write_content) is not str or task.write_content != "":
+        return "a proposed chain task already carries write content"
+    if type(task.plan) is not list or task.plan != []:
+        return "a proposed chain task already carries a plan"
+    if task.visible_assumption is not None:
+        return "a proposed chain task already carries an assumption"
+    if type(task.context) is not dict or task.context != {}:
+        return "a proposed chain task carries context"
+    if type(task.preferences) is not dict or task.preferences != {}:
+        return "a proposed chain task carries preferences"
+    if (
+        type(task.local_read) is not LocalReadSnapshot
+        or task.local_read != LocalReadSnapshot()
+    ):
+        return "a proposed chain task already carries a read snapshot"
+    if (
+        type(task.local_write) is not LocalWriteRecord
+        or task.local_write != LocalWriteRecord()
+    ):
+        return "a proposed chain task already carries a write record"
+    if (
+        type(task.model_answer) is not ModelAnswer
+        or task.model_answer != ModelAnswer()
+    ):
+        return "a proposed chain task already carries a model answer"
+    if type(task.local_read_sources) is not tuple or task.local_read_sources != ():
+        return "a proposed chain task already carries a frozen bundle"
+    if task.cancellation_requested is not False:
+        return "a proposed chain task is already cancelled"
+    if task.risk_level is not RiskLevel.LOW:
+        return "a proposed chain task carries a risk level"
+    if (
+        type(task.side_effect) is not SideEffectProfile
+        or task.side_effect != SideEffectProfile()
+    ):
+        return "a proposed chain task carries a side-effect profile"
+    if type(task.estimate) is not CostEstimate or task.estimate != CostEstimate():
+        return "a proposed chain task carries a cost estimate"
+    if (
+        type(task.retrieved_context) is not RetrievedContext
+        or task.retrieved_context != RetrievedContext()
+    ):
+        return "a proposed chain task carries retrieved context"
+    if type(task.progress) is not TaskProgress or task.progress != TaskProgress():
+        return "a proposed chain task carries progress"
+    return None
+
+
+def _chain_routing_refusal(task: Task, chain: ChainState, step: ChainStep) -> str | None:
+    """Whether the task's source routing is EXACTLY what this step sanctions.
+
+    The predecessor id is taken from the chain's own authoritative mapping and
+    from nowhere else, so a task naming any other source - a transitive one, a
+    caller-chosen one, an extra one alongside the right one - is refused. Each
+    aperture also excludes the other: a model consumer may not carry a write
+    source, and a create consumer may not carry read references.
+    """
+    # Every shape below is checked by EXACT TYPE and EXACT VALUE. Truthiness
+    # would let a wrong-type falsy value masquerade as the canonical empty
+    # default - ``write_source_task_id=0``, ``local_read_source_task_ids=[]`` -
+    # and be materialized as though trusted derivation had produced it.
+    if step.consumes == CHAIN_NO_PREDECESSOR:
+        if task.write_source is not WriteSource.DIRECT:
+            return "a step with no predecessor names a write source"
+        if _not_empty_reference(task.write_source_task_id):
+            return "a step with no predecessor carries a write source id"
+        if task.local_read_context_kind is not LocalReadContextKind.NONE:
+            return "a step with no predecessor names a read context"
+        if _not_empty_references(task.local_read_source_task_ids):
+            return "a step with no predecessor carries read references"
+        return None
+    predecessor = chain.step_task_ids[step.consumes]
+    if type(predecessor) is not str or predecessor == "":
+        return "the predecessor step has produced no task"
+    if step.capability == LOCAL_WRITE_CAPABILITY:
+        if task.write_source is not WriteSource.MODEL_ANSWER:
+            return "a chain write step does not name the model-answer source"
+        if (
+            type(task.write_source_task_id) is not str
+            or task.write_source_task_id != predecessor
+        ):
+            return "task write source is not the authoritative predecessor"
+        if task.local_read_context_kind is not LocalReadContextKind.NONE:
+            return "a chain write step names a read context"
+        if _not_empty_references(task.local_read_source_task_ids):
+            return "a chain write step carries read references"
+        return None
+    if task.local_read_context_kind is not LocalReadContextKind.REFERENCES:
+        return "a chain consumer does not name a read context"
+    if (
+        type(task.local_read_source_task_ids) is not tuple
+        or task.local_read_source_task_ids != (predecessor,)
+    ):
+        return "task read references are not exactly the authoritative predecessor"
+    if task.write_source is not WriteSource.DIRECT:
+        return "a chain read consumer names a write source"
+    if _not_empty_reference(task.write_source_task_id):
+        return "a chain read consumer carries a write source id"
+    return None
+
+
+def _not_empty_reference(value: Any) -> bool:
+    """Whether this is NOT the canonical empty reference, an exact ``""``.
+
+    ``0``, ``False``, ``None`` and ``b""`` are each falsy and each a different
+    fact from "no reference", so none of them may pass as the default.
+    """
+    return type(value) is not str or value != ""
+
+
+def _not_empty_references(value: Any) -> bool:
+    """Whether this is NOT the canonical empty reference tuple, an exact ``()``.
+
+    A list, a string or ``None`` is not an empty tuple, however falsy it looks.
+    """
+    return type(value) is not tuple or value != ()
+
+
+def chain_steps_refusal(steps: Any) -> str | None:
+    """Why this ordered step tuple is not a usable declaration, or ``None``.
+
+    THE single grammar for a WHOLE declaration: every per-step rule, plus the
+    rules no step can answer about itself. It exists so the trusted input
+    boundary and the persistence load boundary ask the same question once,
+    instead of each growing its own idea of what a chain may say.
+
+    The cross-step rule is the write aperture. A chain step carries no literal
+    content - deliberately, so a declaration can never be a payload - so the
+    only way a chain write can obtain bytes is the existing M7 ModelAnswer ->
+    create hop. A create step must therefore consume an earlier step that
+    declares an outbound destination, which is the declarative shape of a step
+    that can produce a model answer.
+
+    That check is a STATIC PRE-CHECK and nothing more: it refuses early a
+    declaration that could never be materialized. The AUTHORITATIVE proof that
+    a predecessor really produced a model answer stays exactly where it is
+    today - the existing resolver, which requires a same-session COMPLETED
+    task whose selected connector's own manifest declares external egress.
+    Nothing here invents a generic "consume an arbitrary task result" channel.
+    """
+    if type(steps) is not tuple:
+        return "chain steps are not a tuple"
+    if not steps:
+        return "a chain declares no step"
+    if len(steps) > MAX_CHAIN_STEPS:
+        return "chain exceeds its step ceiling"
+    total = len(steps)
+    for index, step in enumerate(steps):
+        reason = chain_step_refusal(step, index, total)
+        if reason is not None:
+            return f"chain step {index} is malformed: {reason}"
+    # Every step above is now known to be an exact ChainStep whose predecessor
+    # index, when present, is a real EARLIER position, so the lookup below is
+    # safe and can never reach forward.
+    for index, step in enumerate(steps):
+        if step.capability != LOCAL_WRITE_CAPABILITY:
+            continue
+        if step.consumes == CHAIN_NO_PREDECESSOR:
+            return (
+                f"chain step {index} writes without consuming a producer step"
+            )
+        if not steps[step.consumes].destination:
+            return (
+                f"chain step {index} consumes a step that declares no "
+                "outbound destination"
+            )
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ChainState:
+    """The ONE sequential chain a session may own. Inert until orchestrated.
+
+    A chain is a DECLARATION plus a cursor plus the ids of the ordinary tasks
+    already created for it. It holds no approval, no attestation, no attempt
+    and no reservation of its own, and it grants none: declaring a chain causes
+    nothing to happen, because every side effect still belongs to an ordinary
+    single-action task that must pass every existing gate by itself.
+
+    ``step_task_ids`` is a ROUTING record, never a proof. It says which task
+    was created for which step so orchestration can find it again; it never
+    says that a step SUCCEEDED. That question is answered only by the
+    storage-owned task row and the execution journal, re-asked every time,
+    exactly as the billing preflight marker routes while the grant proves. For
+    the same reason no per-step status is persisted here: a status field would
+    be a forgeable second opinion about a fact storage already owns.
+
+    Sequential and singular by construction: one chain per session, one cursor,
+    at most ``MAX_CHAIN_STEPS`` steps, no nesting and no branch.
+    """
+
+    id: str = ""
+    steps: tuple[ChainStep, ...] = ()
+    #: One entry per declared step, in declaration order. An empty string means
+    #: "no task created for this step yet"; created ids form a LEADING RUN,
+    #: because a sequential chain cannot have created a later task before an
+    #: earlier one.
+    step_task_ids: tuple[str, ...] = ()
+    cursor: int = 0
+    status: ChainStatus = ChainStatus.ACTIVE
+
+    @classmethod
+    def declared(cls, steps: Any) -> "ChainState | None":
+        """A freshly declared chain, or ``None`` if these steps cannot make one.
+
+        THE single constructor for a new chain, so the four runtime fields
+        can only ever start one way: a JARVIS-generated identity, one
+        uncreated marker per declared step, the cursor on step 0, and
+        ``ACTIVE``. None of them is reachable from input - the id in
+        particular is minted HERE, from ``uuid4``, so no caller can choose,
+        collide with or replay a chain identity, and no boundary has to
+        remember to strip one.
+
+        The steps are FROZEN ONCE and then the candidate built from that exact
+        tuple is judged by ``chain_state_refusal`` - the one grammar, not a
+        second competing one - before it is returned. A trusted constructor
+        that could hand back a state its own contract refuses would make every
+        downstream ``chain_state_refusal`` call optional in practice, which is
+        how a malformed chain reaches storage. Callers already validate their
+        input; this is the guarantee that holds even when one forgets.
+
+        The digest is computed here too, for the same reason: a chain whose
+        canonical encoding raises is a chain no approval could ever be bound
+        to, so it must not exist rather than fail later at the display.
+        """
+        try:
+            frozen = tuple(steps)
+        except TypeError:
+            return None
+        candidate = cls(
+            id=str(uuid4()),
+            steps=frozen,
+            step_task_ids=("",) * len(frozen),
+            cursor=0,
+            status=ChainStatus.ACTIVE,
+        )
+        if chain_state_refusal(candidate) is not None:
+            return None
+        try:
+            candidate.digest
+        except (TypeError, ValueError):
+            return None
+        return candidate
+
+    @property
+    def present(self) -> bool:
+        """Always ``True``: a chain OBJECT is a chain, whatever its status.
+
+        Existence, never validity. Absence has exactly one spelling in this
+        product - ``SessionState.chain is None`` - and nothing else may be
+        read as it. The INVALID verdict is therefore PRESENT: a corrupted
+        declaration is a chain this session already has, not a blank slate.
+
+        This deliberately answers ``True`` for the INVALID sentinel, whose
+        declaration fields are empty. Answering ``False`` there would hand the
+        house's ordinary first-gate idiom - ``if chain is None or not
+        chain.present`` - the exact degradation ``ChainStatus`` exists to
+        prevent, letting a tampered chain read as "free to start a new one".
+        Whether a present chain may be ACTED ON is a different question with a
+        different answer: ``chain_state_refusal`` is the only admissible
+        validity gate, and it refuses the sentinel unconditionally.
+        """
+        return True
+
+    @property
+    def digest(self) -> str:
+        """Deterministic SHA-256 over the canonical DECLARATION encoding.
+
+        Covers the chain identity and the ordered declaration, and nothing that
+        moves while the chain runs: not the cursor, not the created task ids,
+        not the status. That is precisely what makes it usable later as an
+        approval-display binding - the one digest can be shown with every step,
+        it does not drift as steps complete, and any edit to the declaration
+        between two steps changes it.
+
+        ``sort_keys`` orders the mapping keys and deliberately does NOT reorder
+        the step LIST: for a sequential chain the order IS the contract, so a
+        reordered declaration is a different identity.
+        """
+        encoded = json.dumps(
+            {"id": self.id, "steps": [step.to_dict() for step in self.steps]},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "steps": [step.to_dict() for step in self.steps],
+            "step_task_ids": list(self.step_task_ids),
+            "cursor": self.cursor,
+            "status": self.status.value,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ChainState":
+        """Rebuild defensively; anything malformed loads as the INVALID chain.
+
+        Default-deny on keys and exact types throughout, with no coercion and
+        no partial acceptance: a chain whose cursor, status, step list or task
+        id mapping cannot be read is not shortened, not repaired and not
+        dropped - it becomes the one typed INVALID verdict, which every later
+        authority stage refuses and which survives its own resave.
+        """
+        if not isinstance(data, dict):
+            return _INVALID_CHAIN
+        if not set(data) <= _CHAIN_STATE_KEYS:
+            return _INVALID_CHAIN
+        raw_status = data.get("status")
+        if type(raw_status) is not str:
+            return _INVALID_CHAIN
+        try:
+            status = ChainStatus(raw_status)
+        except ValueError:
+            return _INVALID_CHAIN
+        raw_steps = data.get("steps")
+        raw_ids = data.get("step_task_ids")
+        if not isinstance(raw_steps, list) or not isinstance(raw_ids, list):
+            return _INVALID_CHAIN
+        candidate = cls(
+            id=data.get("id", ""),
+            steps=tuple(ChainStep.from_dict(item) for item in raw_steps),
+            step_task_ids=tuple(raw_ids),
+            cursor=data.get("cursor", 0),
+            status=status,
+        )
+        return candidate if chain_state_refusal(candidate) is None else _INVALID_CHAIN
+
+
+#: The one typed verdict a malformed persisted chain degrades to. Empty of
+#: every declaration field, so it can neither be executed nor mistaken for a
+#: shorter chain, and it reloads as itself.
+_INVALID_CHAIN = ChainState(status=ChainStatus.INVALID)
+
+
+def chain_state_refusal(chain: Any) -> str | None:
+    """Why this chain is not usable, or ``None``.
+
+    THE single stage-INDEPENDENT contract for one sequential chain, asked by
+    the persistence load boundary and by every later stage that would act on a
+    chain. It judges the DECLARATION, the cursor and the created-task mapping
+    together, because each is meaningless alone: a cursor is only valid against
+    a step count, and a task id is only valid at a position the chain could
+    already have reached.
+
+    It deliberately does not know, and must never learn, whether any step
+    SUCCEEDED. That is storage's answer, re-asked at the moment it matters.
+    """
+    if type(chain) is not ChainState:
+        return "chain is not an exact ChainState"
+    if type(chain.status) is not ChainStatus:
+        return "chain status is not an exact ChainStatus"
+    if chain.status is ChainStatus.INVALID:
+        return "chain identity is invalid"
+    reason = chain_id_refusal(chain.id)
+    if reason is not None:
+        return f"chain id is malformed: {reason}"
+    reason = chain_steps_refusal(chain.steps)
+    if reason is not None:
+        return reason
+    total = len(chain.steps)
+    if type(chain.step_task_ids) is not tuple:
+        return "chain step task ids are not a tuple"
+    if len(chain.step_task_ids) != total:
+        return "chain step task ids do not match the declared steps"
+    created = 0
+    uncreated_seen = False
+    for task_id in chain.step_task_ids:
+        if type(task_id) is not str:
+            return "a chain step task id is not a string"
+        if not task_id:
+            uncreated_seen = True
+            continue
+        if uncreated_seen:
+            return "chain step task ids skip an earlier step"
+        reason = chain_id_refusal(task_id)
+        if reason is not None:
+            return f"a chain step task id is malformed: {reason}"
+        created += 1
+    named = [task_id for task_id in chain.step_task_ids if task_id]
+    if len(set(named)) != len(named):
+        return "chain names the same step task twice"
+    if type(chain.cursor) is not int:
+        return "chain cursor is not an exact integer"
+    if not 0 <= chain.cursor < total:
+        return "chain cursor is outside the chain"
+    # At most the step AT the cursor may already have a task; anything beyond
+    # it would mean a later step was created before the chain reached it.
+    if created > chain.cursor + 1:
+        return "chain created a task beyond its cursor"
+    if chain.status is ChainStatus.ACTIVE and created < chain.cursor:
+        return "chain advanced past a step it never created"
+    # The cursor is not re-checked for a completed chain: "created beyond
+    # the cursor" above already forces cursor == total - 1 once every step
+    # has a task, and a second unreachable rule would read as live policy.
+    if chain.status is ChainStatus.COMPLETED and created != total:
+        return "a completed chain left a step uncreated"
+    return None
+
+
+def _parsed_chain_declaration(
+    value: Any,
+) -> tuple[tuple[ChainStep, ...], str | None]:
+    """The steps a declaration yields AND why it is unusable, decided once.
+
+    PARSE ONCE, VALIDATE ONCE: each item is read into a ``ChainStep`` exactly
+    one time, and the object that is JUDGED is the object that is RETURNED.
+    Validating one parse and then re-parsing for the caller would mean the
+    grammar's verdict describes an object nobody ever uses - and for an input
+    whose reads are not referentially transparent, such as a mapping subclass
+    with a stateful ``get``, the accepted step and the returned step could
+    differ. That is the same law ``ChainState.from_dict`` already follows:
+    build the candidate, judge THAT candidate, return THAT candidate.
+
+    A declaration is an ordered list of step objects and nothing else: no
+    identity, no cursor, no status and no task ids, because a caller declares
+    intent and never declares progress. Unknown keys are refused rather than
+    filtered, so a step carrying a task id, a model answer reference, a data
+    classification or a nested chain is rejected by name instead of quietly
+    becoming a step that happens to look well-formed.
+    """
+    if not isinstance(value, list):
+        return (), "chain declaration is not a list"
+    if not value:
+        return (), "chain declaration names no step"
+    if len(value) > MAX_CHAIN_STEPS:
+        return (), "chain declaration exceeds its step ceiling"
+    steps: list[ChainStep] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            return (), f"chain step {index} is not an object"
+        if not set(item) <= _CHAIN_STEP_KEYS:
+            return (), f"chain step {index} carries an unsupported key"
+        steps.append(ChainStep.from_dict(item))
+    frozen = tuple(steps)
+    reason = chain_steps_refusal(frozen)
+    if reason is not None:
+        return (), reason
+    # B1. ONLY NOW, on steps the grammar has already ACCEPTED, are the three
+    # SCOPE fields frozen in the spelling persistence will hold. Order is the
+    # whole point: canonicalizing first would REPAIR values the grammar exists
+    # to refuse - a padded locator would silently become a clean one - which
+    # is precisely the silent widening this must not do. Nothing here changes
+    # a capability, a routing decision or a predecessor index; it changes only
+    # how one accepted value is spelled.
+    #
+    # And the result is judged again, by the same grammar, because a
+    # transformation whose output nobody validates is a second boundary.
+    canonical = tuple(_canonical_step(step) for step in frozen)
+    reason = chain_steps_refusal(canonical)
+    if reason is not None:
+        return (), reason
+    return canonical, None
+
+
+def chain_declaration_refusal(value: Any) -> str | None:
+    """Why this caller-supplied declaration is not a usable chain, or ``None``.
+
+    THE single grammar for what the TRUSTED input boundary may accept.
+    """
+    return _parsed_chain_declaration(value)[1]
+
+
+def chain_steps_from_declaration(value: Any) -> tuple[ChainStep, ...]:
+    """The typed ordered steps of an ACCEPTED declaration, or ``()``.
+
+    These are the very objects the grammar judged, not a second parse of the
+    same input, so a caller can never receive a step the grammar did not
+    accept.
+    """
+    return _parsed_chain_declaration(value)[0]
+
+
+# --------------------------------------------------------------------------
 # Task-scoped progress (informational display state, never lifecycle authority)
 # --------------------------------------------------------------------------
 
@@ -3979,6 +5182,12 @@ class Task:
     #: produced is described by the snapshot's own span.
     read_start_line: int = 0
     read_max_lines: int = 0
+    #: M11. Trusted provenance proving this task was created FOR one chain
+    #: step. Absent from the task input allowlist, so untrusted JSON naming it
+    #: is refused by name; only the trusted chain derivation sets it. It is a
+    #: claim a consumer must still check against the stored chain, never a
+    #: permission, and it grants nothing on its own.
+    chain_binding: ChainBinding = field(default_factory=ChainBinding)
     #: Typed informational progress maintained by AgentCore. Never accepted
     #: from untrusted task input and never consumed as lifecycle authority.
     progress: TaskProgress = field(default_factory=TaskProgress)
@@ -4026,6 +5235,7 @@ class Task:
                 else WriteSource.INVALID.value
             ),
             "write_source_task_id": self.write_source_task_id,
+            "chain_binding": self.chain_binding.to_dict(),
             # M8. Persisted verbatim and never erased. The kind is defended
             # here for the same reason the M7 one is: ``.value`` on a raw
             # string would raise, and that raw string would then satisfy a
@@ -4169,6 +5379,9 @@ class Task:
         return cls(
             objective=data["objective"],
             capability=data["capability"],
+            # M11. A tampered or absent binding loads as NO binding, which
+            # simply cannot prove chain ownership to any consumer.
+            chain_binding=ChainBinding.from_dict(data.get("chain_binding")),
             scope=ActionScope.from_dict(data["scope"]),
             context=data.get("context", {}),
             estimate=CostEstimate.from_dict(data.get("estimate")),
@@ -4595,6 +5808,15 @@ class SessionState:
     #: the session, only to an existing active project. Scopes retrieval
     #: only; it is never approval, billing or lifecycle authority.
     project_id: str | None = None
+    #: M11. The ONE sequential chain this session owns, or ``None``. Absence
+    #: means no chain, and a legacy session row is indistinguishable from a
+    #: session that simply never declared one - correctly, because both have
+    #: nothing to orchestrate. A MALFORMED persisted chain deliberately does
+    #: NOT join that absence: it loads as the typed INVALID chain, so a
+    #: tampered declaration can never read as "this session is free to start
+    #: one" and be quietly overwritten. The field is inert here: it is a
+    #: declaration and a cursor, never an approval, a grant or an attempt.
+    chain: "ChainState | None" = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -4602,7 +5824,13 @@ class SessionState:
         self.updated_at = utc_now()
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Written explicitly rather than left to ``asdict``: the chain owns a
+        # canonical encoding (enum values, lists, fixed key order) and the
+        # session must persist THAT, not a recursive field dump that happens
+        # to serialize today.
+        data["chain"] = None if self.chain is None else self.chain.to_dict()
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionState":
@@ -4613,6 +5841,7 @@ class SessionState:
             "latest_task_id",
             "next_step",
             "project_id",
+            "chain",
             "created_at",
             "updated_at",
         }
@@ -4634,6 +5863,12 @@ class SessionState:
             and PROJECT_ID_PATTERN.fullmatch(raw_project)
             else None
         )
+        # M11. Absent or explicitly null means no chain; a legacy session row
+        # takes this path. Anything else is judged by the one canonical chain
+        # contract, which degrades a malformed chain to the typed INVALID
+        # verdict rather than to absence.
+        raw_chain = payload.get("chain")
+        payload["chain"] = None if raw_chain is None else ChainState.from_dict(raw_chain)
         return cls(**payload)
 
 
@@ -4739,6 +5974,48 @@ class MemoryStore(Protocol):
     def save_session(self, session: SessionState) -> None: ...
 
     def load_session(self, session_id: str) -> SessionState | None: ...
+
+    # M11. The storage-owned chain authority family. Each is a single-
+    # transaction decision: the caller proposes, storage decides, and a
+    # caller-held SessionState or Task is never proof of anything. They are
+    # declared HERE, on the provider-independent surface, so AgentCore can
+    # depend on this contract rather than on one storage implementation.
+    # Verdicts are plain strings, so no storage type crosses the interface.
+
+    #: The ONLY way a chain is created. Generic ``save_session`` may never
+    #: create, clear or replace one.
+    #: Returns "declared" | "occupied" | "unknown".
+    def declare_chain_if_absent(
+        self, session_id: str, chain: ChainState
+    ) -> str: ...
+
+    #: The ONLY way a step task is created. Creation and binding commit
+    #: together, and the COMPLETE proposal is re-validated against the
+    #: frozen step first. An already-bound step is OBSERVED - after its
+    #: stored task is re-proved - and never replaced.
+    #: Returns ("created" | "observed" | "conflict" | "inactive" |
+    #: "unknown", task_id); task_id is empty unless a task is named.
+    def materialize_chain_step(
+        self,
+        session_id: str,
+        chain_id: str,
+        chain_digest: str,
+        step_index: int,
+        task: Task,
+    ) -> tuple[str, str]: ...
+
+    #: The ONLY way chain progress changes. The stored task status is
+    #: re-read and its chain authority re-proved inside the transaction.
+    #: Returns "advanced" | "completed" | "failed" | "cancelled" |
+    #: "blocked" | "conflict" | "inactive" | "unbound" | "unknown".
+    def advance_chain_step(
+        self, session_id: str, chain_id: str, chain_digest: str,
+        step_index: int,
+    ) -> str: ...
+
+    #: The ONLY way a chain reaches CANCELLED. Completed steps are kept.
+    #: Returns "cancelled" | "terminal" | "conflict" | "unknown".
+    def cancel_chain(self, session_id: str, chain_id: str) -> str: ...
 
     def save_task(self, session_id: str, task: Task) -> None: ...
 
@@ -4872,12 +6149,59 @@ class MemoryStore(Protocol):
         billing: BillingClaim,
     ) -> ExecutionClaimOutcome:
         """Atomically claim ownership in ONE transaction: verify authoritative
-        task lifecycle (reject if cancelled/terminal), rebuild the authoritative
-        ledger snapshot, verify month/exposure against ``billing``, recompute
-        the projection, require the exact approved cost-override grant when it
+        task lifecycle (reject if cancelled/terminal), arbitrate CHAIN
+        authority against this claim, rebuild the authoritative ledger
+        snapshot, verify month/exposure against ``billing``, recompute the
+        projection, require the exact approved cost-override grant when it
         crosses the hard limit, transition PREPARED -> IN_FLIGHT, consume every
         required one-shot grant and create the attempt-bound reservation - all
         or nothing.
+
+        AUTHORITATIVE OWNERSHIP is the first thing this transaction must
+        settle, and every store must settle it the same way: the owner the
+        store itself records for ``task_id`` must equal ``session_id``, or the
+        outcome is ``LOST``. It is proven BEFORE the task is classified as
+        ordinary, bound, unbound or chain-associated, before any chain is
+        read, before ownership is granted, before a grant is consumed and
+        before a reservation exists. An attempt row is not evidence of this:
+        its session id is whatever a caller wrote next to the task, so a store
+        that trusted it - or that asked about ownership only on its chain path
+        - would let one session claim execution of another session's ordinary
+        task, which is the default shape of every task.
+
+        CHAIN ARBITRATION is likewise part of the contract, not an
+        implementation detail, and every store must honour it EXACTLY.
+
+        A task is CHAIN-ASSOCIATED when EITHER it carries a chain binding OR
+        the chain of its authoritative owning session names that exact
+        ``task_id`` in any step slot. Association is never decided from the
+        task's own binding alone: a store that did so would let a chain step
+        become an ordinary task by having its binding removed or corrupted -
+        and since a malformed binding loads as canonical ABSENCE, that is a
+        fail-open a single damaged byte can reach.
+
+        Chain association is read from the OWNING session's chain, never from
+        the caller's, so a slot in a caller-controlled chain can never
+        manufacture ownership of a task it does not own.
+
+        For a chain-associated task this same transaction must prove: the
+        binding is PRESENT and well formed; that owning session's chain is
+        ACTIVE and usable; the binding
+        names that chain's id AND its current declaration digest; the bound
+        step index is the chain's CURRENT cursor; and the cursor's slot holds
+        exactly ``task_id``. Any failure is ``LOST``, written nothing - in
+        particular a slot-named task whose binding is absent or malformed is
+        ``LOST``, never treated as ordinary. A task that is neither bound nor
+        named by any slot is unaffected.
+
+        This is what makes cancellation and execution ONE decision. A store
+        that checks the chain outside this transaction leaves the window a
+        chain cancellation can be executed through: cancelling never rewrites
+        the task rows of steps it stopped, so a task-only check cannot see it.
+        Cancellation-first means no attempt is ever claimed and no connector
+        is ever reached; claim-first means the attempt stands and a later
+        cancellation stops the chain advancing without pretending the claimed
+        attempt never started.
 
         Exactly one concurrent contender gets ``CLAIMED``; every other outcome
         wrote nothing and must not cross the connector boundary. Durable before

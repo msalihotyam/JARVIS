@@ -44,6 +44,8 @@ from jarvis.contracts import (
     AgentRun,
     BillingClass,
     BillingIntegrityError,
+    ChainState,
+    ChainStep,
     CostEstimate,
     DataClassification,
     ErrorCode,
@@ -69,6 +71,9 @@ from jarvis.contracts import (
     ToolResult,
     WriteSource,
     canonical_usd,
+    chain_declaration_refusal,
+    chain_state_refusal,
+    chain_steps_from_declaration,
     is_expired,
     local_read_reference_refusal,
     local_read_region_refusal,
@@ -95,12 +100,21 @@ from jarvis.settings import Settings
 #: Version 3 (M3) added the bounded top-level ``local_read`` object and the
 #: ``session.project_id`` field that M1 added without a bump.
 #: Version 4 (M5) added the bounded top-level ``local_write`` object.
-#: Version 5 (M6) added the bounded top-level ``model_answer`` object. The
-#: SQLite schema is a separate contract and stays at its own version.
-OUTPUT_SCHEMA_VERSION = 5
+#: Version 5 (M6) added the bounded top-level ``model_answer`` object.
+#: Version 6 (M11) added the top-level ``chain`` object: the session's inert
+#: sequential declaration, presentation only. The SQLite schema is a separate
+#: contract and stays at its own version.
+OUTPUT_SCHEMA_VERSION = 6
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
+
+#: M11. The only key a chain declaration document may carry. Default-deny,
+#: and the ABSENCES are the contract: ``id``, ``cursor``, ``status`` and
+#: ``step_task_ids`` are runtime state JARVIS owns, so a caller naming any of
+#: them is refused BY NAME rather than having it quietly ignored. A caller
+#: declares intent; it never declares identity or progress.
+_CHAIN_DOCUMENT_KEYS = frozenset({"steps"})
 
 #: The only outbound endpoint a task may name in this build. Task input can
 #: confirm it but never redirect it.
@@ -307,6 +321,32 @@ def _string(
         # loop refuses it independently for programmatically built tasks.
         raise TaskInputError(f"'{where}.{key}' must not contain a NUL character.")
     return value
+
+
+def decode_chain_declaration(raw: str | bytes) -> tuple[ChainStep, ...]:
+    """The trusted boundary for one inert chain declaration.
+
+    Deliberately NOT a second grammar: the document shell is checked here -
+    same byte ceiling, same duplicate-key and non-finite refusals every task
+    document gets - and the steps themselves are judged by the ONE S1
+    contract, ``chain_declaration_refusal``, then built by the same
+    parse-once constructor that judged them. Nothing about a step is
+    re-implemented, so the boundary and the persistence loader can never
+    drift apart.
+
+    Accepting a declaration performs no action and needs no approval: the
+    result is inert data. Every side effect a step may eventually cause still
+    belongs to an ordinary single-action task that must pass every existing
+    gate by itself.
+    """
+    document = _load_document(raw)
+    _reject_unknown(document, _CHAIN_DOCUMENT_KEYS, "chain")
+    if "steps" not in document:
+        raise TaskInputError("'chain.steps' is required.")
+    reason = chain_declaration_refusal(document["steps"])
+    if reason is not None:
+        raise TaskInputError(f"Chain declaration refused: {reason}")
+    return chain_steps_from_declaration(document["steps"])
 
 
 def decode_task_json(raw: str | bytes) -> Task:
@@ -880,6 +920,44 @@ def _model_answer_payload(answer: ModelAnswer) -> dict[str, Any] | None:
     }
 
 
+def _chain_payload(
+    session: SessionState | None, verdict: str | None = None
+) -> dict[str, Any] | None:
+    """The session's chain as descriptive state, or ``None`` for no chain.
+
+    Presentation only: it creates no authority, and nothing reads it back.
+
+    Unlike ``_local_read_payload`` this does NOT return ``None`` for a chain
+    it cannot vouch for. A corrupted chain is rendered as itself, with
+    ``usable`` false, because ``None`` is the one spelling of ABSENCE and a
+    tampered declaration must never be shown as "this session has no chain".
+    ``usable`` is the single canonical verdict, asked here exactly as every
+    other consumer must ask it.
+
+    ``step_task_ids`` is descriptive ROUTING state - which ordinary task was
+    created for which step - and never a claim that a step succeeded. The
+    storage-owned task row remains the only answer to that question.
+    """
+    chain = session.chain if session is not None else None
+    if chain is None:
+        return None
+    return {
+        "id": chain.id,
+        "digest": chain.digest,
+        "status": chain.status.value,
+        "usable": chain_state_refusal(chain) is None,
+        "cursor": chain.cursor,
+        "steps": [step.to_dict() for step in chain.steps],
+        "step_task_ids": list(chain.step_task_ids),
+        # M11 S3B. Why the driver stopped, when a driver ran. ``None`` for
+        # every other command, because nothing was driven. A field inside an
+        # existing block, not a new top-level key, so the envelope version is
+        # unchanged - the same shape M9 used when it added a span to the read
+        # block.
+        "verdict": verdict,
+    }
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -910,9 +988,18 @@ def build_envelope(
     permission_mode: PermissionMode,
     run: AgentRun | None = None,
     error: StructuredError | None = None,
+    *,
+    session: SessionState | None = None,
+    chain_verdict: str | None = None,
 ) -> dict[str, Any]:
-    """One fixed-key, redacted envelope for every non-status command."""
-    session = run.session if run is not None else None
+    """One fixed-key, redacted envelope for every non-status command.
+
+    ``session`` is keyword-only and is used ONLY when there is no run: the
+    M11 chain commands touch a session without running a task, and they must
+    report through this same envelope rather than growing a second shape. A
+    run always wins, so no existing caller changes behaviour.
+    """
+    session = run.session if run is not None else session
     task = run.task if run is not None else None
     request = run.permission_request if run is not None else None
     result = run.result if run is not None else None
@@ -960,6 +1047,10 @@ def build_envelope(
         "model_answer": (
             None if task is None else _model_answer_payload(task.model_answer)
         ),
+        # M11. The session's inert sequential declaration. Presentation only:
+        # it grants nothing, and declaring a chain never creates a task,
+        # requests an approval, opens an attempt or reserves a cent.
+        "chain": _chain_payload(session, chain_verdict),
         "result": None if result is None else _result_payload(result),
         # ``details`` is deliberately dropped: it carries free-form diagnostics.
         "error": (
@@ -1121,6 +1212,100 @@ def memory_list_result(
     )
 
 
+def chain_declare_result(
+    memory: MemoryStore,
+    settings: Settings,
+    session_id: str,
+    raw_declaration: str | bytes,
+) -> CommandResult:
+    """Declare ONE inert chain on an existing session.
+
+    Order is the contract: the session is found, the declaration is fully
+    parsed and validated, the one-chain rule is applied, the chain is built
+    and judged - and only then is the session written, exactly once. A
+    refusal at any point returns before ``save_session`` is reached, so a
+    rejected declaration leaves the persisted session byte-identical.
+    """
+    command = "chain-declare"
+    unknown = failure_result(
+        command,
+        settings.permission_mode,
+        ErrorCode.UNKNOWN_SESSION,
+        f"Unknown session: {session_id}",
+        EXIT_NOT_FOUND,
+    )
+    occupied = failure_result(
+        command,
+        settings.permission_mode,
+        ErrorCode.INVALID_TASK,
+        "This session already owns a chain.",
+        EXIT_INVALID_INPUT,
+    )
+    session = memory.load_session(session_id)
+    if session is None:
+        return unknown
+    # An EARLY REPORT, never the authority. It saves the caller a parse when
+    # the answer is already obvious, but the real decision - and the only one
+    # that is safe against a concurrent declarer - is made by storage, inside
+    # one transaction, below. A check here could always be stale by the time
+    # the write lands, which is exactly the lost update this no longer has.
+    if session.chain is not None:
+        return occupied
+    try:
+        steps = decode_chain_declaration(raw_declaration)
+    except TaskInputError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    chain = ChainState.declared(steps)
+    if chain is None:
+        # The trusted constructor refused the steps. Unreachable through the
+        # grammar above; kept because a chain is never persisted on the
+        # strength of how it was built.
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            "Chain declaration refused: the declared steps do not form a chain.",
+            EXIT_INVALID_INPUT,
+        )
+    verdict = memory.declare_chain_if_absent(session_id, chain)
+    if verdict == "unknown":
+        return unknown
+    if verdict != "declared":
+        # A concurrent declarer won. Report the same one-chain refusal, and
+        # touch nothing: the winner's chain is already persisted and this
+        # caller has no authority over it.
+        return occupied
+    stored = memory.load_session(session_id)
+    return CommandResult(
+        build_envelope(command, settings.permission_mode, session=stored), EXIT_OK
+    )
+
+
+def chain_show_result(
+    memory: MemoryStore, settings: Settings, session_id: str
+) -> CommandResult:
+    """Report the session's chain. Reads only; it advances nothing."""
+    command = "chain-show"
+    session = memory.load_session(session_id)
+    if session is None:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.UNKNOWN_SESSION,
+            f"Unknown session: {session_id}",
+            EXIT_NOT_FOUND,
+        )
+    return CommandResult(
+        build_envelope(command, settings.permission_mode, session=session), EXIT_OK
+    )
+
+
 # --------------------------------------------------------------------------
 # Command facade
 # --------------------------------------------------------------------------
@@ -1200,6 +1385,36 @@ class JarvisApp:
             approved=False,
             remember_for_session=False,
         )
+
+    def declare_chain(
+        self, session_id: str, raw_declaration: str | bytes
+    ) -> CommandResult:
+        """Declare one inert chain. Creates no task and executes nothing."""
+        return chain_declare_result(
+            self.memory, self.settings, session_id, raw_declaration
+        )
+
+    def run_chain(self, session_id: str) -> CommandResult:
+        """Drive the session's chain. Every step runs the ordinary way.
+
+        The driver reaches ``AgentCore.run_chain``, which reaches ``resume``,
+        which is the same entry point a standalone task uses - so approval,
+        billing and the attempt journal are the existing authorities and this
+        command adds none of its own.
+        """
+        run, verdict = self.core.run_chain(session_id)
+        return CommandResult(
+            build_envelope(
+                "chain-run",
+                self.settings.permission_mode,
+                run,
+                chain_verdict=verdict,
+            ),
+            self._exit_code(run),
+        )
+
+    def show_chain(self, session_id: str) -> CommandResult:
+        return chain_show_result(self.memory, self.settings, session_id)
 
     def cancel(self, session_id: str, task_id: str) -> CommandResult:
         owned = self._ownership_failure("cancel", session_id, task_id)

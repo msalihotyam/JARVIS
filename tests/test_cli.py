@@ -614,7 +614,7 @@ class CliTestCase(unittest.TestCase):
         # added without a bump, is now covered by a version too).
         # M5 bumped it again, 3 -> 4, for the bounded ``local_write`` block.
         # M6 bumped it again, 4 -> 5, for the bounded ``model_answer`` block.
-        self.assertEqual(5, payload["schema_version"])
+        self.assertEqual(6, payload["schema_version"])
         self.assertEqual(
             {
                 "schema_version",
@@ -629,6 +629,7 @@ class CliTestCase(unittest.TestCase):
                 "local_read",
                 "local_write",
                 "model_answer",
+                "chain",
                 "result",
                 "error",
             },
@@ -636,6 +637,7 @@ class CliTestCase(unittest.TestCase):
         )
         # A task that read, wrote or asked a model nothing carries the key
         # with a null value: the envelope shape is fixed, never conditional.
+        self.assertIsNone(payload["chain"])
         self.assertIsNone(payload["local_read"])
         self.assertIsNone(payload["local_write"])
         self.assertIsNone(payload["model_answer"])

@@ -1759,7 +1759,7 @@ class PublicShapeTests(EditTestCase):
         from jarvis.memory import SCHEMA_VERSION
 
         self.assertEqual(6, SCHEMA_VERSION)
-        self.assertEqual(5, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
         self.assertEqual((), EGRESS_TOOL_GRANTS)
 
     def test_the_write_effect_is_honest(self) -> None:

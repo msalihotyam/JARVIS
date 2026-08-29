@@ -10,6 +10,10 @@ from typing import Any
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
+    CANONICAL_TARGET_CAPABILITIES,
+    CHAIN_ENABLED_WRITE_MODES,
+    CHAIN_NO_PREDECESSOR,
+    MAX_CHAIN_STEPS,
     COST_CAP_GATE,
     DIAGNOSTIC_DETAIL_MAX_CHARS,
     LOCAL_READ_CAPABILITY,
@@ -36,6 +40,10 @@ from jarvis.contracts import (
     BillingClass,
     BillingIntegrityError,
     BillingReconciliation,
+    ChainBinding,
+    ChainState,
+    ChainStatus,
+    ChainTaskMode,
     CostEstimate,
     DataClassification,
     DecisionRecord,
@@ -77,6 +85,8 @@ from jarvis.contracts import (
     WriteSource,
     canonical_path,
     canonical_usd,
+    chain_state_refusal,
+    chain_task_refusal,
     diagnostic_from_exception,
     format_usd,
     handoff_eligible,
@@ -2855,7 +2865,7 @@ class AgentCore:
         decided whether the product failed cleanly. It is refused explicitly
         instead, identically everywhere.
         """
-        if task.capability not in (LOCAL_READ_CAPABILITY, LOCAL_WRITE_CAPABILITY):
+        if task.capability not in CANONICAL_TARGET_CAPABILITIES:
             return None
         noun = "Read" if task.capability == LOCAL_READ_CAPABILITY else "Write"
         target = task.scope.target
@@ -3433,11 +3443,29 @@ class AgentCore:
         precedes ``open_execution_attempt``/``begin_execution``, so no
         attempt is opened, claimed or duplicated. ``None`` means proceed.
         """
-        reason = local_read_context_refusal(
-            task.local_read_context_kind,
-            task.local_read_source_task_ids,
-            task.local_read_sources,
-        )
+        # F6. SHAPE BEFORE MEMBERSHIP, and before anything downstream reads a
+        # key. A persisted ``"context": null`` rebuilds as ``None`` - nothing
+        # coerces it - so the membership tests below would raise ``TypeError``
+        # straight out of a direct ``resume``, past a lifecycle whose entire
+        # job is to turn a bad row into deterministic terminal state. This
+        # gate is the FIRST thing every stage that later touches ``context``
+        # runs, so proving the shape here closes the retrieval counter, both
+        # reference resolvers and the connector payload at once, and it
+        # refuses through the ordinary bounded invalid-task path below rather
+        # than inventing a second one.
+        #
+        # Exact type: a mapping SUBCLASS with a stateful ``__contains__`` or
+        # ``get`` is not the declared type, and this contract is checked by
+        # exact type everywhere else it is checked at all.
+        reason: str | None = None
+        if type(task.context) is not dict:
+            reason = "task context is not an exact mapping"
+        if reason is None:
+            reason = local_read_context_refusal(
+                task.local_read_context_kind,
+                task.local_read_source_task_ids,
+                task.local_read_sources,
+            )
         if reason is None and LOCAL_READ_CONTEXT_REFERENCE_KEY in task.context:
             # The plural references are TYPED fields. A copy inside context
             # would travel verbatim into the outbound payload.
@@ -3881,6 +3909,331 @@ class AgentCore:
                 session,
             )
         session.project_id = requested
+        return None
+
+    # ------------------------------------------------------------------
+    # M11 S3B. The sequential chain driver.
+    #
+    # It ORCHESTRATES and never executes. Every step is an ordinary
+    # single-action task driven through ``resume`` - the same entry point a
+    # standalone task uses - so H1 approval, H2 attempt arbitration, H3
+    # reservation, connector selection, execution and result persistence are
+    # the existing authorities, reached the existing way. There is no second
+    # execution path here to keep in step with the first, because there is no
+    # second execution path.
+    # ------------------------------------------------------------------
+
+    def run_chain(self, session_id: str) -> tuple[AgentRun, str]:
+        """Drive the session's chain forward, one authoritative step at a time.
+
+        Returns the ordinary ``AgentRun`` of the last step it touched and a
+        verdict describing why it stopped.
+
+        Every pass re-reads the session and chain from storage before deciding
+        anything: an in-memory chain from the previous iteration is a
+        SNAPSHOT, and acting on it would be exactly the stale-driver bug the
+        S3A progress CAS exists to refuse. The loop is bounded by
+        ``MAX_CHAIN_STEPS`` because a chain cannot be longer than that; it is
+        a structural bound, not a retry budget.
+
+        It stops at the first thing that is not a clean advance - an approval,
+        a failure, a cancellation, an in-doubt attempt, or any authority
+        conflict - and never starts a step it has not first proved.
+        """
+        session = self.memory.load_session(session_id)
+        if session is None:
+            return (
+                self._input_failure(
+                    None, ErrorCode.UNKNOWN_SESSION, f"Unknown session: {session_id}"
+                ),
+                "unknown",
+            )
+        if session.chain is None:
+            return (
+                self._input_failure(
+                    None,
+                    ErrorCode.INVALID_TASK,
+                    "This session owns no chain.",
+                    session,
+                ),
+                "unknown",
+            )
+        last: AgentRun | None = None
+        verdict = "blocked"
+        for _ in range(MAX_CHAIN_STEPS):
+            session = self.memory.load_session(session_id)
+            if session is None or session.chain is None:
+                verdict = "conflict"
+                break
+            chain = session.chain
+            if chain_state_refusal(chain) is not None:
+                verdict = "conflict"
+                break
+            if chain.status is not ChainStatus.ACTIVE:
+                verdict = chain.status.value
+                break
+            run, verdict = self._run_chain_step(session, chain, chain.cursor)
+            if run is not None:
+                last = run
+            if verdict != "advanced":
+                break
+        final = self.memory.load_session(session_id)
+        if last is None:
+            last = AgentRun(RunStatus.COMPLETED, final, None)
+        elif final is not None:
+            # Report the chain as storage holds it NOW, not as it looked when
+            # the step began.
+            last = replace(last, session=final)
+        return last, verdict
+
+    def _run_chain_step(
+        self, session: SessionState, chain: ChainState, index: int
+    ) -> tuple[AgentRun | None, str]:
+        """Prove, materialize, run and settle exactly one step."""
+        task, reason = self.build_chain_step_task(session, chain, index)
+        if task is None:
+            return (
+                self._input_failure(
+                    None,
+                    ErrorCode.INVALID_TASK,
+                    f"Chain step {index} cannot be prepared: {reason}",
+                    session,
+                ),
+                "refused",
+            )
+        outcome, task_id = self.memory.materialize_chain_step(
+            session.id, chain.id, chain.digest, index, task
+        )
+        if outcome not in ("created", "observed") or not task_id:
+            return (
+                self._input_failure(
+                    None,
+                    ErrorCode.INVALID_TASK,
+                    f"Chain step {index} could not be bound: {outcome}",
+                    session,
+                ),
+                outcome if outcome else "conflict",
+            )
+        stored = self.memory.load_task(task_id)
+        if stored is None:
+            return (
+                self._input_failure(
+                    None,
+                    ErrorCode.TASK_NOT_FOUND,
+                    f"Chain step {index} names a task that cannot be loaded.",
+                    session,
+                ),
+                "conflict",
+            )
+        # The bound row is re-proved HERE too, not only by storage: this is the
+        # last point before an ordinary execution begins, and a task that lost
+        # its chain authority must not be the one that runs.
+        if (
+            chain_task_refusal(stored, chain, index, mode=ChainTaskMode.STORED)
+            is not None
+        ):
+            return (
+                self._input_failure(
+                    stored,
+                    ErrorCode.INVALID_TASK,
+                    f"Chain step {index} is not this chain's task.",
+                    session,
+                ),
+                "conflict",
+            )
+        # Registry-side proof, which storage deliberately cannot make. S3A
+        # proves the SHAPE of a persisted connector name; only the registry
+        # knows whether that connector is a legitimate one for this task.
+        refusal = self._chain_connector_refusal(stored)
+        if refusal is not None:
+            return (
+                self._input_failure(
+                    stored,
+                    ErrorCode.INVALID_TASK,
+                    f"Chain step {index} names an illegitimate connector: {refusal}",
+                    session,
+                ),
+                "conflict",
+            )
+        # The ORDINARY entry point. Everything after this line - approval,
+        # billing, the attempt journal, the connector call, verification,
+        # persistence - is the existing single-task machinery, unchanged.
+        run = self.resume(session.id, task_id)
+        if run.status is RunStatus.AWAITING_APPROVAL:
+            return run, "awaiting_approval"
+        if run.status is RunStatus.AWAITING_CLARIFICATION:
+            return run, "awaiting_clarification"
+        # Advancement is decided by storage from the STORED task status, never
+        # from what this run object happens to say.
+        return run, self.memory.advance_chain_step(
+            session.id, chain.id, chain.digest, index
+        )
+
+    def _chain_connector_refusal(self, task: Task) -> str | None:
+        """Why this task's SELECTED connector is not legitimate, or ``None``.
+
+        A stored ``selected_connector`` is a name, and a name proves nothing.
+        The registry is the authority on which connector may serve a task, so
+        the question is asked here rather than duplicated into storage: the
+        connector must be registered, its own manifest must declare the task's
+        capability, and it must accept the task.
+
+        ``None`` is the answer when nothing is selected yet - that is the
+        ordinary pre-PLAN state, and PLAN will select through the registry in
+        the usual way.
+        """
+        name = task.selected_connector
+        if name is None:
+            return None
+        if type(name) is not str or not name:
+            return "the selected connector is malformed"
+        try:
+            connector = self.registry.get(name)
+        except Exception:  # noqa: BLE001 - an unknown connector is a refusal
+            connector = None
+        if connector is None:
+            return "the selected connector is not registered"
+        manifest = getattr(connector, "manifest", None)
+        capabilities = getattr(manifest, "capabilities", ())
+        if task.capability not in capabilities:
+            return "the selected connector does not declare this capability"
+        try:
+            handled = connector.can_handle(task)
+        except Exception:  # noqa: BLE001 - connector boundary; fail closed
+            handled = False
+        if not handled:
+            return "the selected connector cannot handle this task"
+        return None
+
+    # ------------------------------------------------------------------
+    # M11. Trusted derivation of ONE ordinary task from ONE chain step.
+    # ------------------------------------------------------------------
+
+    def build_chain_step_task(
+        self, session: SessionState, chain: ChainState, index: int
+    ) -> tuple[Task | None, str | None]:
+        """The ordinary task a chain step would become, or why it cannot.
+
+        Derivation only: this builds a proposal and PROVES the facts that
+        materializing it would rely on. It executes nothing, approves nothing
+        and writes nothing - storage decides whether the proposal ever becomes
+        a row, and every gate the resulting task must pass is unchanged.
+
+        Every field comes from the FROZEN declaration or from trusted policy.
+        The objective is copied verbatim, because it is the user's own words
+        and nothing may rewrite it. The classification is set EXPLICITLY to
+        INTERNAL - the same value the ordinary input boundary applies when the
+        field is absent - and is never derived from the objective text, the
+        target string, a predecessor's content or any model output. No caller
+        task id, no model answer and no retrieved memory reaches any field.
+
+        A predecessor is consumed only through an EXISTING sanctioned
+        aperture, chosen by what the consumer is:
+
+            file_read producer -> model consumer : M8 read-context references
+            model producer     -> create consumer: M7 write-source reference
+
+        There is no general "consume an arbitrary task result" channel, and
+        the declaration's ``destination`` is NEVER producer authority. For a
+        create step the producer is proven here the way M7 proves it - the
+        predecessor id comes from the chain's own authoritative mapping, the
+        task must be same-session and COMPLETED, and its SELECTED CONNECTOR's
+        own manifest must declare EXTERNAL_EGRESS. That proof is repeated
+        independently by the M7 resolver when the task actually runs; this is
+        the earlier of the two, not a replacement for it.
+        """
+
+        def refuse(reason: str) -> tuple[None, str]:
+            return None, reason
+
+        if type(chain) is not ChainState or chain_state_refusal(chain) is not None:
+            return refuse("the chain is not usable")
+        if type(index) is not int or not 0 <= index < len(chain.steps):
+            return refuse("the step index is outside the chain")
+        step = chain.steps[index]
+        if step.write_mode and step.write_mode not in CHAIN_ENABLED_WRITE_MODES:
+            return refuse("a chain step may not declare this write mode")
+        task = Task(
+            objective=step.objective,
+            capability=step.capability,
+            scope=ActionScope(
+                action=step.action,
+                target=step.target,
+                destination=step.destination,
+                # Trusted policy, set explicitly and never derived.
+                data_classification=DataClassification.INTERNAL,
+            ),
+            chain_binding=ChainBinding(
+                chain_id=chain.id, chain_digest=chain.digest, step_index=index
+            ),
+        )
+        if step.consumes == CHAIN_NO_PREDECESSOR:
+            if step.capability == LOCAL_WRITE_CAPABILITY:
+                return refuse("a chain write step consumes no producer")
+            return task, None
+        # The predecessor id comes from the chain's own mapping and from
+        # nowhere else: not from the declaration, not from input, not from a
+        # model answer.
+        predecessor_id = chain.step_task_ids[step.consumes]
+        if not predecessor_id:
+            return refuse("the predecessor step has produced no task")
+        if self.memory.task_session_id(predecessor_id) != session.id:
+            return refuse("the predecessor task belongs to another session")
+        try:
+            source = self.memory.load_task(predecessor_id)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            source = None
+        if source is None:
+            return refuse("the predecessor task could not be loaded")
+        if source.status is not TaskStatus.COMPLETED:
+            return refuse("the predecessor task did not complete")
+        # The COMPLETE proof of the producer, not just its binding:
+        # tampering with the producer's objective, scope or policy
+        # invalidates it as a source of write bytes.
+        if (
+            chain_task_refusal(
+                source, chain, step.consumes, mode=ChainTaskMode.STORED
+            )
+            is not None
+        ):
+            return refuse("the predecessor task is not this chain's step task")
+        if step.capability == LOCAL_WRITE_CAPABILITY:
+            reason = self._chain_producer_refusal(source)
+            if reason is not None:
+                return refuse(reason)
+            task.write_mode = step.write_mode
+            task.write_source = WriteSource.MODEL_ANSWER
+            task.write_source_task_id = predecessor_id
+            return task, None
+        if source.capability != LOCAL_READ_CAPABILITY:
+            return refuse("the predecessor task is not a local read")
+        task.local_read_context_kind = LocalReadContextKind.REFERENCES
+        task.local_read_source_task_ids = (predecessor_id,)
+        return task, None
+
+    def _chain_producer_refusal(self, source: Task) -> str | None:
+        """Why this completed task cannot be a model-answer producer.
+
+        The same question M7 asks, asked earlier. A declared destination is
+        not an answer to it: what proves a producer is the connector that
+        actually ran, and its own manifest.
+        """
+        producer_name = source.selected_connector
+        if type(producer_name) is not str or not producer_name:
+            return "the predecessor task names no producer"
+        try:
+            producer = self.registry.get(producer_name)
+        except Exception:  # noqa: BLE001 - an unknown producer is a refusal
+            producer = None
+        if producer is None:
+            return "the predecessor producer is not a registered connector"
+        manifest = getattr(producer, "manifest", None)
+        effect = getattr(getattr(manifest, "default_side_effect", None), "effect", None)
+        if effect is not SideEffect.EXTERNAL_EGRESS:
+            return "the predecessor producer is not an external-model connector"
+        answer = source.model_answer
+        if type(answer) is not ModelAnswer or not answer.present:
+            return "the predecessor task carries no model answer"
         return None
 
     @staticmethod
