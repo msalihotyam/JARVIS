@@ -40,7 +40,11 @@ from jarvis.contracts import (
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_MODES,
     LOCAL_WRITE_SOURCE_KEY,
+    VISIBILITY_DEFAULT_LIMIT,
+    VISIBILITY_MAX_LIMIT,
     ActionScope,
+    ApprovalSummary,
+    AttemptSummary,
     AgentRun,
     BillingClass,
     BillingIntegrityError,
@@ -65,9 +69,11 @@ from jarvis.contracts import (
     RiskLevel,
     RunStatus,
     SessionState,
+    SessionSummary,
     StructuredError,
     Task,
     TaskStatus,
+    TaskSummary,
     ToolResult,
     WriteSource,
     canonical_usd,
@@ -1210,6 +1216,347 @@ def memory_list_result(
         },
         EXIT_OK,
     )
+
+
+# --------------------------------------------------------------------------
+# M12 S1. Read-only operator visibility - local, deterministic and inert.
+#
+# Like ``status``, ``project`` and ``memory``, these build no registry, no
+# connector and no AgentCore, so their inertness is STRUCTURAL rather than
+# merely intended: there is nothing here that could execute, approve, open an
+# attempt or reserve a cent even if it tried. They read persisted rows and
+# render OPERATIONAL METADATA - identity, lifecycle position, timestamps,
+# counts and the small set of already-bounded payloads the envelope already
+# knows how to render. No objective, no context, no model answer, no file
+# bytes and no raw persisted document is rendered by any of them.
+# --------------------------------------------------------------------------
+
+
+def _bounded_limit(value: Any) -> int:
+    """The row bound a listing may use, or a refusal.
+
+    Exact ``int`` and not ``isinstance``: ``True`` is an ``int`` and a boolean
+    is not a row count. The ceiling is policy, not a suggestion - a listing is
+    an operator convenience, and an unbounded one would quietly become a bulk
+    reader of task state.
+    """
+    if value is None:
+        return VISIBILITY_DEFAULT_LIMIT
+    if type(value) is not int or isinstance(value, bool):
+        raise ValueError("'--limit' must be an integer.")
+    if value < 1:
+        raise ValueError("'--limit' must be at least 1.")
+    if value > VISIBILITY_MAX_LIMIT:
+        raise ValueError(f"'--limit' may not exceed {VISIBILITY_MAX_LIMIT}.")
+    return value
+
+
+def _visibility_chain_payload(summary: SessionSummary) -> dict[str, Any] | None:
+    """The session's chain as ORIENTATION ONLY, for the visibility surface.
+
+    F1. Deliberately NOT ``_chain_payload``. That builder serializes every
+    ``ChainStep`` - objective, target, destination, write mode - because the
+    commands it serves are the ones the user just drove, and seeing their own
+    declaration echoed back is the point there. A visibility command has a
+    different contract: operational metadata only. Reusing the wide builder
+    turned ``show`` into a reader of declaration text for any task in a
+    chain-owning session, which is exactly what this slice promised not to be.
+
+    So this is a separate, narrower projection - the wide one is untouched and
+    keeps serving run/resume/approve/chain-run unchanged. What crosses here is
+    only what an operator needs to ORIENT: which chain, whether it is usable,
+    what status it is in, where the cursor is and how many steps exist. Not
+    one field of the declaration, and not the bound task ids either: those are
+    routing state a listing does not need to answer "where am I".
+
+    F2. It takes the VALIDATED summary, never a raw ``SessionState``, so both
+    the listing and the single-session view render this block from exactly
+    the same proven fields. A document that failed validation carries no
+    chain, so an unreadable row cannot show one.
+
+    ``digest`` is a fixed-size hex fingerprint of the declaration, not its
+    content: it identifies WHICH declaration without revealing any of it, and
+    it is what makes two chains distinguishable across a redeclaration.
+    """
+    if not summary.readable or summary.chain_status is None:
+        return None
+    return {
+        "id": summary.chain_id,
+        "digest": summary.chain_digest,
+        "status": summary.chain_status,
+        "usable": summary.chain_usable,
+        "cursor": summary.chain_cursor,
+        "step_count": summary.chain_step_count,
+    }
+
+
+def _visibility_progress(
+    view: TaskSummary, session: SessionSummary
+) -> dict[str, Any] | None:
+    """The progress block, composed ONLY from frozen validated projections.
+
+    P1. This used to reopen the task and the session through the ordinary
+    loaders to build the block. That reintroduced everything the validation
+    above had just established: the persisted document could be REPLACED
+    between the proof and this render, so a forged id, a forged lifecycle and
+    a forged artifact label reached the output under a projection that had
+    already been approved - and an UNREADABLE session still contributed its
+    ``next_step`` text, because the raw row was read again regardless of the
+    verdict on it.
+
+    Nothing is re-read now. The task-derived half was frozen at the instant
+    the document was validated, and the session-derived half comes from the
+    session projection, which is ``None`` unless that document validated too.
+    There is no window left, because there is no second read.
+    """
+    if not view.readable or view.progress is None:
+        return None
+    progress = view.progress
+    return {
+        "task_id": view.id,
+        "plan": list(progress.plan),
+        "current_stage": progress.current_stage,
+        "next_stage": progress.next_stage,
+        # SESSION-derived, and therefore gated on the SESSION's own verdict:
+        # an unreadable session contributes no display text at all.
+        "post_completion_next_step": (
+            session.next_step
+            if session.readable and view.status == TaskStatus.COMPLETED.value
+            else None
+        ),
+        "completed_stages": list(progress.completed_stages),
+        "open_issues": [dict(issue) for issue in progress.open_issues],
+        "artifacts": [dict(artifact) for artifact in progress.artifacts],
+    }
+
+
+def _attempt_summary_payload(summary: AttemptSummary) -> dict[str, Any]:
+    return {
+        "state": None if summary.state is None else summary.state.value,
+        "connector": summary.connector,
+        "updated_at": summary.updated_at,
+        # ``None`` where the state could not be trusted: unknown is not "yes".
+        "replayable": summary.replayable,
+        "readable": summary.readable,
+    }
+
+
+def _approval_summary_payload(summary: ApprovalSummary) -> dict[str, Any]:
+    return {
+        "request_id": summary.request_id,
+        "fingerprint": summary.fingerprint,
+        "expires_at": summary.expires_at,
+        "readable": summary.readable,
+    }
+
+
+def _session_summary_payload(summary: SessionSummary) -> dict[str, Any]:
+    return {
+        "session_id": summary.id,
+        "updated_at": summary.updated_at,
+        "readable": summary.readable,
+        "project_id": summary.project_id,
+        "active_task_id": summary.active_task_id,
+        "latest_task_id": summary.latest_task_id,
+        "task_count": summary.task_count,
+        "chain": _visibility_chain_payload(summary),
+    }
+
+
+def _task_summary_payload(summary: TaskSummary) -> dict[str, Any]:
+    return {
+        "task_id": summary.id,
+        "session_id": summary.session_id,
+        "status": summary.status,
+        "stage": summary.stage,
+        "updated_at": summary.updated_at,
+        "readable": summary.readable,
+        "capability": summary.capability,
+        "action": summary.action,
+        "selected_connector": summary.selected_connector,
+        "chain_step_index": summary.chain_step_index,
+    }
+
+
+def sessions_result(
+    memory: MemoryStore, settings: Settings, limit: Any = None
+) -> CommandResult:
+    """Every recently touched session, newest first. Reads only."""
+    command = "sessions"
+    try:
+        bound = _bounded_limit(limit)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    summaries = memory.list_sessions(bound)
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "limit": bound,
+                "count": len(summaries),
+                "sessions": [
+                    _session_summary_payload(summary) for summary in summaries
+                ],
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def tasks_result(
+    memory: MemoryStore, settings: Settings, session_id: str, limit: Any = None
+) -> CommandResult:
+    """Every task of ONE session, newest first. Reads only."""
+    command = "tasks"
+    try:
+        bound = _bounded_limit(limit)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    if memory.session_summary(session_id) is None:
+        # An unknown session is NOT an empty listing: reporting "no tasks"
+        # for a session that does not exist would send an operator looking
+        # for work in the wrong place. Asked through the VALIDATED projection
+        # (F2), not ``load_session``: existence is a question about the ROW,
+        # and the ordinary loader would also answer questions about a
+        # document this command has no business trusting.
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.UNKNOWN_SESSION,
+            f"Unknown session: {session_id}",
+            EXIT_NOT_FOUND,
+        )
+    summaries = memory.list_tasks(session_id, bound)
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "session_id": session_id,
+                "limit": bound,
+                "count": len(summaries),
+                "tasks": [_task_summary_payload(summary) for summary in summaries],
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def show_result(
+    memory: MemoryStore, settings: Settings, session_id: str, task_id: str
+) -> CommandResult:
+    """One task's operational snapshot: what it is doing, and what to look at.
+
+    Ownership is proven against the AUTHORITATIVE owning session before
+    anything is rendered, so a task cannot be inspected under a session that
+    does not own it - the same rule every executing command already applies,
+    asked here of storage rather than of the caller.
+
+    Everything rendered is either a small identifier/enum or one of the
+    EXISTING bounded payload builders. There is no new redaction system and no
+    new free-text channel: the persisted objective, context, model answer,
+    file excerpt and raw document are all deliberately absent.
+    """
+    command = "show"
+    session = memory.session_summary(session_id)
+    if session is None:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.UNKNOWN_SESSION,
+            f"Unknown session: {session_id}",
+            EXIT_NOT_FOUND,
+        )
+    if memory.task_session_id(task_id) != session_id:
+        # Covers both "no such task" and "belongs to another session", and
+        # deliberately says the same thing for both: which other session owns
+        # a task is not this caller's business.
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.TASK_NOT_FOUND,
+            f"Unknown task for this session: {task_id}",
+            EXIT_NOT_FOUND,
+        )
+    # F2. The VALIDATED projection, never ``load_task``. Identity, status and
+    # stage have been proven against the authoritative columns inside it, so
+    # a forged document cannot make this command report a lifecycle the
+    # product is not actually in.
+    view = memory.task_summary(task_id)
+    if view is None:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            f"Task state could not be read: {task_id}",
+            EXIT_NOT_FOUND,
+        )
+    # F3. The BOUNDED projections, never the raw rows. A malformed attempt,
+    # approval or journal row is a thing an operator runs this command to
+    # find out about, so each one degrades to bounded "unreadable" metadata
+    # instead of raising or echoing whatever the row happened to hold.
+    attempt = memory.latest_attempt_summary(task_id)
+    pending = memory.pending_approval_summary(task_id, session_id)
+    event = memory.latest_task_event(task_id)
+    payload = {
+        "command": command,
+        "session_id": session_id,
+        "task": {
+            "task_id": view.id,
+            # The authoritative COLUMNS, which is what the product acts on.
+            "status": view.status,
+            "stage": view.stage,
+            # Document-derived, and therefore ``None`` unless the document
+            # was proven consistent with those columns.
+            "capability": view.capability,
+            "action": view.action,
+            "selected_connector": view.selected_connector,
+            "readable": view.readable,
+        },
+        # The ordinary bounded progress view - rendered ONLY for a document
+        # that passed validation. It is entirely document-derived, so showing
+        # it for a row whose identity or lifecycle disagrees with storage
+        # would be exactly the forged metadata F2 exists to refuse.
+        "progress": _visibility_progress(view, session),
+        "latest_event": (
+            None
+            if event is None
+            else {
+                "event_type": event.event_type,
+                "created_at": event.created_at,
+                "readable": event.readable,
+            }
+        ),
+        # H2 position. The attempt's own identity is enough to decide what to
+        # do next; nothing it wrapped is rendered. An attempt in doubt must
+        # never be replayed automatically, so the operator is told plainly
+        # which state that is - and told ``null`` when the row cannot say.
+        "attempt": None if attempt is None else _attempt_summary_payload(attempt),
+        # Approval METADATA only - exactly the three fields a caller needs to
+        # answer an open request. The scope, risk, reason and side-effect
+        # detail stay with the approval-issuing envelope that renders them
+        # under its own contract; here they would be an unbounded channel.
+        "pending_approval": (
+            None if pending is None else _approval_summary_payload(pending)
+        ),
+        # The NARROW visibility projection, not the wide envelope builder:
+        # orientation without one field of the declaration (F1).
+        "chain": _visibility_chain_payload(session),
+        # Already validated inside the projection.
+        "chain_step_index": view.chain_step_index,
+    }
+    return CommandResult(_redact(payload), EXIT_OK)
 
 
 def chain_declare_result(

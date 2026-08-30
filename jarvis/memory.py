@@ -20,6 +20,7 @@ from jarvis.contracts import (
     PROJECT_MEMORY_CANDIDATE_WINDOW,
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
+    ActionScope,
     AttemptState,
     BillingClaim,
     CHAIN_NO_PREDECESSOR,
@@ -51,8 +52,22 @@ from jarvis.contracts import (
     ReservationState,
     RetrievedContext,
     SessionState,
+    ApprovalSummary,
+    AttemptSummary,
+    ProgressSummary,
+    VISIBILITY_DECODE_ERRORS,
+    VISIBILITY_MAX_LIMIT,
+    VISIBILITY_SESSION_KEYS,
+    VISIBILITY_TASK_KEYS,
+    canonical_utc_timestamp,
+    next_loop_stage,
+    normalize_session_next_step,
+    visibility_text,
+    SessionSummary,
     Task,
+    TaskEvent,
     TaskStatus,
+    TaskSummary,
     UsageRecord,
     billing_class_from_raw,
     build_retrieved_context,
@@ -78,6 +93,7 @@ from jarvis.contracts import (
     utc_now,
 )
 from jarvis.lifecycle import is_terminal
+from jarvis.planning import build_task_plan
 
 
 SCHEMA_VERSION = 6
@@ -3110,6 +3126,434 @@ class SQLiteMemoryStore:
             )
         except (TypeError, KeyError, ValueError):
             return DataClassification.SECRET
+
+    # -- M12 S1: read-only operator visibility -----------------------------
+    #
+    # Pure reads. No ``write=True`` connection is opened, so none of them can
+    # create, repair or touch a row even by accident: a listing that healed
+    # what it looked at would be a write path wearing a display command's
+    # name. Every projection is built from real COLUMNS first and enriched
+    # from the persisted document only if that document can be rebuilt, which
+    # is what makes a corrupted row reportable instead of fatal.
+
+    @staticmethod
+    def _visibility_rows(limit: Any) -> int:
+        """How many rows a listing may ask storage for. THE bound.
+
+        F4. Enforced HERE, not by the caller. The command layer separately
+        refuses a user-supplied limit above the ceiling - that is input
+        validation - but the ceiling itself has to hold for every caller,
+        including a future command, a script or another front end that calls
+        the store directly. A store that trusted its argument would let any
+        such caller turn a display listing into an unbounded export.
+
+        Exact positive ``int`` only: ``bool`` is an ``int`` and ``True`` must
+        never silently become "one row". Anything else yields 0, which the
+        callers below turn into an empty listing rather than a guess.
+        """
+        if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
+            return 0
+        return min(limit, VISIBILITY_MAX_LIMIT)
+
+    @staticmethod
+    def _visibility_document(
+        raw: Any, required: frozenset[str] | None = None
+    ) -> dict[str, Any] | None:
+        """One persisted document as an EXACT mapping of the right SHAPE.
+
+        F2. Two separate proofs, both before any loader sees the value.
+
+        The ROOT: a persisted ``"null"``, ``"123"`` or ``"[]"`` is perfectly
+        valid JSON, so ``json.loads`` succeeds and the loader then raises
+        ``AttributeError`` out of a display command.
+
+        The SHAPE: ``from_dict`` is defensive by design - it fills absent
+        fields with typed defaults so a partially-written row still loads.
+        That is right for the execution path, which needs to keep going, and
+        wrong here: a fragment like ``{"id": ...}`` would rebuild into a
+        complete-looking object and be REPORTED as this session's state.
+        Requiring the identity and lifecycle keys means a display command
+        describes rows that exist, not defaults it invented.
+        """
+        try:
+            document = json.loads(raw)
+        except VISIBILITY_DECODE_ERRORS:
+            return None
+        if type(document) is not dict:
+            return None
+        if required is not None and not required <= set(document):
+            return None
+        return document
+
+    def list_sessions(self, limit: int) -> list[SessionSummary]:
+        """The most recently touched sessions, newest first.
+
+        Ordered by ``updated_at`` descending with an ASCENDING id tie-break,
+        so two rows written in the same instant still have exactly one order
+        and repeated calls agree. The row bound is the STORE'S, applied to
+        the query itself, so no caller can widen it.
+
+        The task count is a single grouped COUNT, not a per-row query, so a
+        listing stays one round trip whatever it returns.
+        """
+        bound = self._visibility_rows(limit)
+        if bound == 0:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.id AS id,
+                       s.updated_at AS updated_at,
+                       s.project_id AS project_id,
+                       s.state_json AS state_json,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.session_id = s.id)
+                           AS task_count
+                FROM sessions AS s
+                ORDER BY s.updated_at DESC, s.id ASC
+                LIMIT ?
+                """,
+                (bound,),
+            ).fetchall()
+        return [self._session_summary(row) for row in rows]
+
+    @staticmethod
+    def _session_summary(row: sqlite3.Row) -> SessionSummary:
+        """One session row as a display projection, whatever shape it is in."""
+        identity = str(row["id"])
+        updated_at = str(row["updated_at"])
+        count = int(row["task_count"])
+        unreadable = SessionSummary(
+            id=identity, updated_at=updated_at, readable=False, task_count=count
+        )
+        document = SQLiteMemoryStore._visibility_document(
+            row["state_json"], VISIBILITY_SESSION_KEYS
+        )
+        if document is None:
+            # Unreadable, and said so. The columns are still true.
+            return unreadable
+        try:
+            session = SessionState.from_dict(document)
+        except VISIBILITY_DECODE_ERRORS:
+            return unreadable
+        # F2. The document must AGREE with the authoritative row. A blank or
+        # truncated document rebuilds into a perfectly well-formed default
+        # SessionState carrying a freshly minted id - which would be reported
+        # as readable state this session never had. Corruption is never
+        # defaulted into readability.
+        if session.id != identity:
+            return unreadable
+        chain = session.chain
+        return SessionSummary(
+            id=identity,
+            updated_at=updated_at,
+            readable=True,
+            # The COLUMN is the authoritative project binding, not the
+            # document's copy of it.
+            project_id=None if row["project_id"] is None else str(row["project_id"]),
+            active_task_id=session.active_task_id,
+            latest_task_id=session.latest_task_id,
+            task_count=count,
+            # Through the SAME canonical rule the loader applies, so the
+            # visibility copy can never be looser than the persisted one.
+            next_step=(
+                None
+                if session.next_step is None
+                else normalize_session_next_step(session.next_step)
+            ),
+            chain_id=None if chain is None else chain.id,
+            chain_digest=None if chain is None else chain.digest,
+            chain_status=None if chain is None else chain.status.value,
+            chain_cursor=None if chain is None else chain.cursor,
+            chain_step_count=None if chain is None else len(chain.steps),
+            # The ONE canonical verdict, asked here exactly as every other
+            # consumer must ask it - never restated.
+            chain_usable=(
+                None if chain is None else chain_state_refusal(chain) is None
+            ),
+        )
+
+    def list_tasks(self, session_id: str, limit: int) -> list[TaskSummary]:
+        """The tasks of EXACTLY this session, newest first.
+
+        Ownership is a WHERE clause on the authoritative column, so a caller
+        cannot widen a listing into another session's tasks by asking louder.
+        An unknown session simply has no tasks; distinguishing "no session"
+        from "no tasks" is the command layer's question, and it asks storage
+        for the session itself.
+        """
+        bound = self._visibility_rows(limit)
+        if bound == 0:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, session_id, status, stage, updated_at, state_json
+                FROM tasks
+                WHERE session_id = ?
+                ORDER BY updated_at DESC, id ASC
+                LIMIT ?
+                """,
+                (session_id, bound),
+            ).fetchall()
+        return [self._task_summary(row) for row in rows]
+
+    @staticmethod
+    def _task_summary(row: sqlite3.Row) -> TaskSummary:
+        """One task row as a display projection. Columns first, document second."""
+        summary = TaskSummary(
+            id=str(row["id"]),
+            session_id=str(row["session_id"]),
+            status=str(row["status"]),
+            stage=str(row["stage"]),
+            updated_at=str(row["updated_at"]),
+            readable=False,
+        )
+        document = SQLiteMemoryStore._visibility_document(
+            row["state_json"], VISIBILITY_TASK_KEYS
+        )
+        if document is None:
+            return summary
+        try:
+            task = Task.from_dict(document)
+        except VISIBILITY_DECODE_ERRORS:
+            return summary
+        # F2. Identity AND lifecycle must agree with the authoritative
+        # columns. A document that disagrees about which task it is, or about
+        # what state that task is in, is not a readable description of this
+        # row - it is two contradictory answers, and the columns are the ones
+        # the product actually acts on.
+        if task.id != summary.id:
+            return summary
+        if task.status.value != summary.status or task.stage.value != summary.stage:
+            return summary
+        binding = task.chain_binding
+        return replace(
+            summary,
+            readable=True,
+            capability=task.capability,
+            selected_connector=visibility_text(task.selected_connector),
+            action=task.scope.action if type(task.scope) is ActionScope else None,
+            chain_step_index=(
+                binding.step_index
+                if chain_binding_refusal(binding) is None and binding.present
+                else None
+            ),
+            # P1. FROZEN HERE, from the document that was just proven, so no
+            # later render has to reopen the row and race a replacement.
+            progress=SQLiteMemoryStore._progress_summary(task),
+        )
+
+    @staticmethod
+    def _progress_summary(task: Task) -> ProgressSummary:
+        """The progress view of an ALREADY-VALIDATED task.
+
+        Called only after identity, status and stage have been proved against
+        the authoritative columns, so everything captured here describes this
+        row. The values are the ones the ordinary progress contract already
+        produces: typed issue and artifact dicts, which have no free-form
+        message field, and the CANONICAL REBUILT plan rather than the
+        persisted strings.
+        """
+        successor = next_loop_stage(task.stage)
+        snapshot = task.progress.to_dict()
+        return ProgressSummary(
+            current_stage=task.stage.value,
+            next_stage=None if successor is None else successor.value,
+            completed_stages=tuple(snapshot["completed_stages"]),
+            open_issues=tuple(snapshot["open_issues"]),
+            artifacts=tuple(snapshot["artifacts"]),
+            plan=tuple(build_task_plan(task)) if task.plan else (),
+        )
+
+    def session_summary(self, session_id: str) -> SessionSummary | None:
+        """ONE session, through the SAME projection a listing uses.
+
+        F2. The command surface must not fall back to ``load_session`` for a
+        single row: that loader is the execution path's, it rebuilds a
+        fragment into a plausible default object, and a display command that
+        trusted it would report a session state that never existed. Reusing
+        ``_session_summary`` means a one-row view can never be looser than a
+        listing of the same row, because it is literally the same rule.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT s.id AS id,
+                       s.updated_at AS updated_at,
+                       s.project_id AS project_id,
+                       s.state_json AS state_json,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.session_id = s.id)
+                           AS task_count
+                FROM sessions AS s
+                WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return None if row is None else self._session_summary(row)
+
+    def task_summary(self, task_id: str) -> TaskSummary | None:
+        """ONE task, through the SAME projection a listing uses.
+
+        Identity, status and stage are proved against the authoritative
+        COLUMNS inside ``_task_summary``, so a forged document cannot make
+        this report a lifecycle the product is not actually in.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, session_id, status, stage, updated_at, state_json
+                FROM tasks WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return None if row is None else self._task_summary(row)
+
+    def latest_task_event(self, task_id: str) -> TaskEvent | None:
+        """The TYPE and time of this task's most recent journal event.
+
+        The payload is deliberately not selected at all: it is arbitrary
+        diagnostic state, and a display command has no business widening into
+        it. The event TYPE is fixed internal vocabulary and is what answers
+        "what happened last".
+
+        F3. Both surviving fields are BOUNDED before they cross. A row edited
+        outside the product can hold a megabyte of text in ``event_type`` and
+        four hundred digits in ``created_at``; echoing either back would make
+        this command the thing that prints them. Anything that is not the
+        canonical bounded shape yields an unreadable projection instead.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT event_type, created_at FROM event_log
+                WHERE task_id = ? ORDER BY id DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        event_type = visibility_text(row[0])
+        # The SAME canonical timestamp contract every other consumer uses.
+        created_at = canonical_utc_timestamp(row[1])
+        if event_type is None or created_at is None:
+            return TaskEvent(readable=False)
+        return TaskEvent(event_type=event_type, created_at=created_at)
+
+    def latest_attempt_summary(self, task_id: str) -> AttemptSummary | None:
+        """This task's latest execution attempt, as bounded display metadata.
+
+        F3. ``AttemptState(row)`` raises on an unrecognized persisted value,
+        so the enum is resolved defensively and an unknown state decodes to
+        ``None`` - which makes ``replayable`` ``None`` too. That is the whole
+        point: a corrupted attempt row must never be DISPLAYED as safe to run
+        again, and this projection has no way to say "yes" without a trusted
+        enum member to say it from.
+
+        The attempt is selected by this task's own id, so no other task's
+        attempt can be shown here.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT state, connector, updated_at, task_id
+                FROM execution_attempts
+                WHERE task_id = ? ORDER BY rowid DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["task_id"]) != task_id:
+            return AttemptSummary(readable=False)
+        try:
+            state = AttemptState(row["state"])
+        except VISIBILITY_DECODE_ERRORS:
+            state = None
+        connector = visibility_text(row["connector"])
+        updated_at = canonical_utc_timestamp(row["updated_at"])
+        if state is None or connector is None or updated_at is None:
+            # Partial truth is still reported: the state is the one field an
+            # operator needs, and withholding a VALID one because a sibling
+            # field is corrupt would hide the answer they came for.
+            return AttemptSummary(
+                state=state,
+                connector=connector,
+                updated_at=updated_at,
+                readable=False,
+            )
+        return AttemptSummary(
+            state=state, connector=connector, updated_at=updated_at
+        )
+
+    def pending_approval_summary(
+        self, task_id: str, session_id: str
+    ) -> ApprovalSummary | None:
+        """The open approval for THIS task and session, as bounded metadata.
+
+        F3. Only the three fields that answer a request cross. Identity and
+        expiry come from AUTHORITATIVE COLUMNS, and the persisted
+        ``request_json`` - which also carries the reason, the scope and the
+        outbound preview - is opened for exactly ONE field, the fingerprint,
+        which is then bounded like any other auxiliary token. Nothing else in
+        that body is read, so a hostile or oversized one can neither raise
+        nor be echoed.
+
+        Only a still-PENDING row is reported: a resolved request is not an
+        open question and must not be shown as one.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, request_json, expires_at FROM pending_approvals
+                WHERE task_id = ? AND session_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (task_id, session_id),
+            ).fetchone()
+        if row is None:
+            return None
+        request_id = visibility_text(row["id"])
+        expires_at = canonical_utc_timestamp(row["expires_at"])
+        # The fingerprint is COMPUTED from the request, never persisted, so
+        # the body has to be rebuilt to obtain it. Rebuilding is not
+        # exposing: exactly one derived value leaves this block, and the
+        # reason, scope, risk and outbound preview the object also carries
+        # are simply never read. A body that cannot be rebuilt, or that
+        # disagrees with the authoritative columns about which task and
+        # session it belongs to, yields no fingerprint at all.
+        fingerprint = None
+        document = self._visibility_document(row["request_json"])
+        if document is not None:
+            try:
+                request = PermissionRequest.from_dict(document)
+            except VISIBILITY_DECODE_ERRORS:
+                request = None
+            if (
+                request is not None
+                # F3. The body must agree with the authoritative row about
+                # WHICH REQUEST IT IS. Without this, tampering only the
+                # embedded id produced a projection carrying the row's id
+                # beside a fingerprint derived from a different request -
+                # metadata the approval path will later reject, reported here
+                # as though it were actionable.
+                and request.id == request_id
+                and request.task_id == task_id
+                and request.session_id == session_id
+            ):
+                fingerprint = visibility_text(request.fingerprint)
+        if request_id is None or fingerprint is None or expires_at is None:
+            # The columns that ARE trustworthy still travel; withholding a
+            # valid request id because the body is damaged would hide the one
+            # handle the operator needs to act on it.
+            return ApprovalSummary(
+                request_id=request_id,
+                fingerprint=fingerprint,
+                expires_at=expires_at,
+                readable=False,
+            )
+        return ApprovalSummary(
+            request_id=request_id, fingerprint=fingerprint, expires_at=expires_at
+        )
 
     def list_events(self, session_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:

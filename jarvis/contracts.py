@@ -5968,12 +5968,303 @@ class ModelAdapter(Protocol):
     def cancel(self, task_id: str) -> bool: ...
 
 
+# --------------------------------------------------------------------------
+# M12 S1. Read-only operator visibility.
+#
+# These are PROJECTIONS, not state: they are built for display, nothing reads
+# them back, and no lifecycle, approval, billing or chain decision may ever be
+# taken from one. They carry OPERATIONAL METADATA ONLY - identifiers,
+# lifecycle position, timestamps and counts. No objective, no context, no
+# model answer, no file bytes and no persisted free text crosses this
+# boundary, so the visibility surface cannot become a second, unbounded read
+# path into task state.
+# --------------------------------------------------------------------------
+
+#: How many rows a listing returns when the caller asks for no bound, and the
+#: ceiling it may never exceed. A listing is an operator convenience, not an
+#: export: an unbounded one would turn a display command into a bulk reader.
+VISIBILITY_DEFAULT_LIMIT = 20
+VISIBILITY_MAX_LIMIT = 100
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    """One session, as an operator needs to rediscover it after a restart.
+
+    ``readable`` is the honest answer to a row whose persisted state cannot be
+    rebuilt. Such a row is REPORTED, never skipped and never guessed at: the
+    identity and timestamp come from real columns, everything derived from the
+    unreadable document is ``None``, and the operator is told which it is.
+    Hiding a corrupted row would be the one outcome that leaves someone
+    hunting for work the product can see and will not mention.
+    """
+
+    id: str
+    updated_at: str
+    readable: bool = True
+    project_id: str | None = None
+    active_task_id: str | None = None
+    latest_task_id: str | None = None
+    task_count: int = 0
+    #: The session's bounded next-step hint, through the SAME canonical rule
+    #: the loader applies. ``None`` whenever the document did not validate,
+    #: so an unreadable session cannot contribute display text.
+    next_step: str | None = None
+    chain_id: str | None = None
+    chain_digest: str | None = None
+    chain_status: str | None = None
+    chain_cursor: int | None = None
+    chain_step_count: int | None = None
+    chain_usable: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSummary:
+    """One task's progress view, FROZEN at the moment it was validated.
+
+    P1. This exists so the visibility surface never has to reopen a task
+    document after proving it. The previous shape validated a projection and
+    then, later in the same command, loaded the raw row again to build
+    progress - a window in which the persisted document could be replaced,
+    and one through which a forged id, a forged lifecycle and a forged
+    artifact label all reached the output. A value captured at validation
+    time cannot be swapped afterwards, because there is nothing left to
+    re-read.
+
+    Every field is either a fixed enum spelling or a value the existing
+    bounded diagnostic contracts already produce. Nothing raw is carried.
+    """
+
+    current_stage: str | None = None
+    next_stage: str | None = None
+    completed_stages: tuple[str, ...] = ()
+    #: Already-bounded typed dicts from ``ProgressIssue.to_dict`` /
+    #: ``ProgressArtifact.to_dict`` - neither has a free-form message field,
+    #: and the artifact label passes the ordinary progress-text rule.
+    open_issues: tuple[dict[str, Any], ...] = ()
+    artifacts: tuple[dict[str, Any], ...] = ()
+    #: The canonical rebuilt plan, never the persisted strings.
+    plan: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TaskSummary:
+    """One task's lifecycle position. Never its content.
+
+    ``capability`` and ``action`` are declared vocabulary the product routes
+    on, not free text, and they are what makes a listing legible at all. The
+    objective - the user's own words - is deliberately absent.
+    """
+
+    id: str
+    session_id: str
+    status: str
+    stage: str
+    updated_at: str
+    readable: bool = True
+    capability: str | None = None
+    action: str | None = None
+    selected_connector: str | None = None
+    chain_step_index: int | None = None
+    #: Present only for a document that PASSED validation. ``None`` is the
+    #: honest answer for a row whose identity or lifecycle disagrees with
+    #: storage: there is no progress to report about a description that is
+    #: not this task's.
+    progress: ProgressSummary | None = None
+
+
+#: The exception family a persisted document raises when it is not the shape
+#: its loader expects. ``json.loads`` raises ``ValueError`` for malformed
+#: text; a loader handed VALID json of the wrong ROOT SHAPE raises
+#: ``AttributeError`` (``None.items``, ``int.get``) or ``KeyError`` (a
+#: required field that is simply absent); ``TypeError`` covers the rest.
+#: Named ONCE so every visibility projection degrades on exactly the same
+#: set and none of them can quietly narrow it.
+VISIBILITY_DECODE_ERRORS = (TypeError, ValueError, AttributeError, KeyError)
+
+#: The keys a persisted SESSION document must carry to be a description of a
+#: real session rather than a fragment that ``from_dict`` will happily fill
+#: with defaults. ``chain`` is deliberately ABSENT from the set: a session
+#: that never declared one legitimately omits the key, and the documented
+#: legacy shape does exactly that.
+VISIBILITY_SESSION_KEYS = frozenset({"id", "objective", "created_at", "updated_at"})
+
+#: The same for a TASK document: identity, lifecycle and the scope every
+#: projection reads. Everything else a task carries is optional runtime state
+#: that a legitimate row may genuinely lack.
+VISIBILITY_TASK_KEYS = frozenset(
+    {"id", "objective", "capability", "scope", "status", "stage",
+     "created_at", "updated_at"}
+)
+
+#: Ceiling for every free-ish string a visibility projection may echo back
+#: from an auxiliary row. A persisted row edited outside the product can hold
+#: megabytes; a display command must not become the thing that prints them.
+VISIBILITY_TEXT_MAX_CHARS = 120
+
+
+def visibility_text(value: Any) -> str | None:
+    """One auxiliary field, bounded, or ``None`` when it is not usable.
+
+    The single normalizer every auxiliary projection uses. It is deliberately
+    STRICTER than the progress text rule: this is machine metadata - an
+    attempt's connector name, an event's type - not prose, so anything that
+    is not a plain bounded single-line token is refused outright rather than
+    truncated into something that looks legitimate.
+    """
+    if type(value) is not str:
+        return None
+    text = value.strip()
+    if not text or len(text) > VISIBILITY_TEXT_MAX_CHARS:
+        return None
+    if any(character.isspace() for character in text):
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        return None
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class TaskEvent:
+    """The TYPE and time of one journal event. Never its payload.
+
+    The payload is arbitrary diagnostic state; the type is a fixed internal
+    vocabulary. Only the type crosses, so "what happened last" is answerable
+    without opening a channel for whatever a checkpoint happened to record.
+
+    ``readable`` false is a row whose type or timestamp is not the bounded
+    canonical shape. Its fields are then ``None``: a malformed journal row is
+    reported as unreadable, never echoed back verbatim.
+    """
+
+    event_type: str | None = None
+    created_at: str | None = None
+    readable: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptSummary:
+    """One execution attempt's H2 position, bounded. Never a raw row.
+
+    ``state`` is an exact ``AttemptState`` or ``None``: an unrecognized
+    persisted state is NOT coerced into a known one and never becomes
+    ``replayable``. ``replayable`` is derived from the trusted enum alone, so
+    a corrupted row can never be displayed as safe to run again.
+    """
+
+    state: AttemptState | None = None
+    connector: str | None = None
+    updated_at: str | None = None
+    readable: bool = True
+
+    @property
+    def replayable(self) -> bool | None:
+        """Whether H2 would allow another attempt. ``None`` when unknown.
+
+        Unknown is NOT "yes". A row whose state could not be decoded has no
+        replayability answer, and inventing one here would be the display
+        surface making an execution claim.
+        """
+        if self.state is None:
+            return None
+        return self.state not in ATTEMPT_NON_REPLAYABLE
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalSummary:
+    """The three fields needed to answer an open approval. Nothing else.
+
+    The request's reason, scope, risk and outbound preview are deliberately
+    absent - they belong to the approval-issuing envelope, which already
+    renders them under its own contract. Here they would be an unbounded
+    channel carrying the user's own words into a listing.
+    """
+
+    request_id: str | None = None
+    fingerprint: str | None = None
+    expires_at: str | None = None
+    readable: bool = True
+
+
+
+
 class MemoryStore(Protocol):
     """Provider-independent persistence surface required by ``AgentCore``."""
 
     def save_session(self, session: SessionState) -> None: ...
 
     def load_session(self, session_id: str) -> SessionState | None: ...
+
+    # -- M12 S1: read-only operator visibility -----------------------------
+    #
+    # Declared HERE so the command surface depends on this contract and never
+    # on one storage implementation. Every one of them is a pure read: a
+    # conforming store must not write, must not create a session, task,
+    # attempt, approval or reservation, and must not repair a row it cannot
+    # read. A row whose persisted document is unreadable is REPORTED with
+    # ``readable`` false and its derived fields absent - never skipped, never
+    # rebuilt from a guess, and never raised out of the call.
+
+    #: Newest first by ``updated_at``, ties broken by ascending id so two
+    #: rows written in the same instant still have ONE stable order.
+    #:
+    #: THE BOUND IS THE STORE'S, NOT THE CALLER'S. A conforming store returns
+    #: at most ``min(limit, VISIBILITY_MAX_LIMIT)`` rows and asks its backing
+    #: storage for no more than that, whoever is calling and whatever they
+    #: pass. The command layer separately REFUSES a user-supplied limit above
+    #: the ceiling, but that refusal is input validation, not the bound: a
+    #: store that trusted its caller would let any direct caller - a future
+    #: command, a script, a different front end - turn a display listing into
+    #: an unbounded export of task state. A limit that is not an exact
+    #: positive ``int`` (``bool`` included, since ``True`` is an ``int``)
+    #: yields an EMPTY list, never a row count.
+    def list_sessions(self, limit: int) -> list[SessionSummary]: ...
+
+    #: The tasks of EXACTLY this session, newest first with the same stable
+    #: tie-break and the same store-side bound. A task owned by another
+    #: session is never returned, whatever the caller passes.
+    def list_tasks(self, session_id: str, limit: int) -> list[TaskSummary]: ...
+
+    #: The TYPE and time of this task's most recent journal event, or None.
+    #: The payload never crosses, and a row whose type or timestamp is not
+    #: the bounded canonical shape is returned as ``readable`` false rather
+    #: than echoed back.
+    def latest_task_event(self, task_id: str) -> TaskEvent | None: ...
+
+    #: ONE session as the same validated projection a listing returns, or
+    #: ``None`` when no such row exists. The command surface uses THIS rather
+    #: than ``load_session`` so a single-session view cannot be looser than a
+    #: listing of the same row: the ordinary loader rebuilds a fragment into
+    #: a plausible default object, and a display command that trusted it
+    #: would report state the session never had.
+    def session_summary(self, session_id: str) -> SessionSummary | None: ...
+
+    #: ONE task as the same validated projection, or ``None``. Identity,
+    #: status and stage must agree with the authoritative COLUMNS before any
+    #: document-derived field is reported; a document that disagrees is
+    #: ``readable`` false and contributes nothing.
+    #:
+    #: The returned summary is COMPLETE and FROZEN: it already carries every
+    #: progress field a display surface may render, captured at the instant
+    #: the document was validated. A conforming store must not require - and
+    #: a caller must not perform - a second read of the same row afterwards.
+    #: That second read is a TOCTOU window: the document can be replaced
+    #: between the proof and the render, and a forged identity, lifecycle or
+    #: artifact would then reach the output under a projection that had
+    #: already been approved.
+    def task_summary(self, task_id: str) -> TaskSummary | None: ...
+
+    #: This task's latest execution attempt as BOUNDED display metadata, or
+    #: ``None`` when it has none. An unrecognized persisted state must decode
+    #: to ``None`` and must never be reported replayable.
+    def latest_attempt_summary(self, task_id: str) -> AttemptSummary | None: ...
+
+    #: The open approval for this exact task and session as BOUNDED display
+    #: metadata, or ``None``. Only request id, fingerprint and expiry; the
+    #: reason and scope never cross.
+    def pending_approval_summary(
+        self, task_id: str, session_id: str
+    ) -> ApprovalSummary | None: ...
 
     # M11. The storage-owned chain authority family. Each is a single-
     # transaction decision: the caller proposes, storage decides, and a

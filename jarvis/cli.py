@@ -23,7 +23,10 @@ from jarvis.app import (
     memory_add_result,
     memory_list_result,
     project_create_result,
+    sessions_result,
+    show_result,
     status_payload,
+    tasks_result,
 )
 from jarvis.contracts import (
     DataClassification,
@@ -61,6 +64,26 @@ def _build_parser() -> _ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("status", help="Show local settings and SQLite schema state.")
+
+    # M12 S1: read-only operator visibility. Like ``status`` these build no
+    # registry, connector or AgentCore, so they cannot execute, approve, open
+    # an attempt or reserve anything even in principle.
+    sessions_command = commands.add_parser(
+        "sessions", help="List recently touched sessions (read-only)."
+    )
+    sessions_command.add_argument("--limit", type=int, default=None)
+
+    tasks_command = commands.add_parser(
+        "tasks", help="List one session's tasks (read-only)."
+    )
+    tasks_command.add_argument("--session-id", required=True)
+    tasks_command.add_argument("--limit", type=int, default=None)
+
+    show_command = commands.add_parser(
+        "show", help="Show one task's operational snapshot (read-only)."
+    )
+    show_command.add_argument("--session-id", required=True)
+    show_command.add_argument("--task-id", required=True)
 
     run_command = commands.add_parser("run", help="Start a task from task JSON.")
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
@@ -206,6 +229,18 @@ def _dispatch_memory_command(
     )
 
 
+def _dispatch_visibility_command(
+    settings: Settings, command: str, args: argparse.Namespace
+) -> CommandResult:
+    """Read-only visibility. Constructs a store and nothing else."""
+    memory = SQLiteMemoryStore(settings.memory_database)
+    if command == "sessions":
+        return sessions_result(memory, settings, args.limit)
+    if command == "tasks":
+        return tasks_result(memory, settings, args.session_id, args.limit)
+    return show_result(memory, settings, args.session_id, args.task_id)
+
+
 def _dispatch_chain_command(
     settings: Settings, args: argparse.Namespace
 ) -> CommandResult:
@@ -291,6 +326,13 @@ def main(
         payload: dict[str, Any] = status_payload(effective, memory)
         print(json.dumps(payload, indent=2))
         return 0
+
+    if command in ("sessions", "tasks", "show"):
+        # Read-only, and routed here so that stays STRUCTURAL: no application,
+        # registry or connector is built for these commands at all.
+        visibility = _dispatch_visibility_command(effective, command, args)
+        print(visibility.render())
+        return visibility.exit_code
 
     if command in ("project", "memory"):
         # Local-only project memory commands: no registry, connector, probe
