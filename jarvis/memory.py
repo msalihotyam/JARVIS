@@ -36,6 +36,7 @@ from jarvis.contracts import (
     BillingReconciliation,
     DataClassification,
     DecisionRecord,
+    ErrorCode,
     ExecutionAttempt,
     ExecutionClaimOutcome,
     LedgerSnapshot,
@@ -46,13 +47,18 @@ from jarvis.contracts import (
     PermissionGrant,
     PermissionRequest,
     ProjectMemoryItem,
+    ProgressIssueKind,
     ProjectRecord,
     ReconciliationOutcome,
     ReconciliationResult,
+    CancellationOutcome,
     ReservationState,
+    StructuredError,
     RetrievedContext,
     SessionState,
     ApprovalSummary,
+    AttemptRecovery,
+    AttemptRecoveryOutcome,
     AttemptSummary,
     ProgressSummary,
     VISIBILITY_DECODE_ERRORS,
@@ -87,12 +93,15 @@ from jarvis.contracts import (
     redact_credentials,
     redact_local_paths,
     require_billing_class,
+    result_to_dict,
+    terminal_failure_result,
     require_monetary_state,
     reservation_state_from_raw,
     usd_from_nano,
     utc_now,
 )
 from jarvis.lifecycle import is_terminal
+from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 
 
@@ -283,6 +292,23 @@ def ledger_timestamp(month: str, claimed_at: Any) -> str:
     if isinstance(claimed_at, str) and claimed_at[:7] == key:
         return claimed_at
     return f"{key}-01T00:00:00+00:00"
+
+
+class _CancellationLost(Exception):
+    """Roll back a cancellation whose guarded task write lost arbitration.
+
+    Never escapes storage: ``cancel_task`` turns it back into a ``"lost"``
+    receipt. It exists so the session pointer, the checkpoint and the event
+    cannot survive a task write that did not happen - a partial cancellation
+    is a worse lie than a refused one. It carries the rows that WERE rebound,
+    so the refusal can still be reported against real state rather than
+    against nothing.
+    """
+
+    def __init__(self, session: SessionState, task: Task) -> None:
+        super().__init__("cancellation lost ownership arbitration")
+        self.session = session
+        self.task = task
 
 
 class _ClaimAborted(Exception):
@@ -892,8 +918,17 @@ class SQLiteMemoryStore:
         task: Task,
         *,
         force: bool = False,
+        expected_owner: str | None = None,
     ) -> bool:
         """Persist a task row; True when this writer actually won.
+
+        ``expected_owner`` adds ownership to the guard. The upsert writes
+        ``session_id`` from the CALLER, so a writer holding an older view of
+        who owns a task would quietly take it back - which is precisely what a
+        cancellation finalization did after its task legitimately moved on
+        during the connector call. Callers that cross a window where ownership
+        can change pass the owner they proved, and lose the write instead of
+        re-owning the row.
 
         Terminal immutability at the storage layer: once a row holds a terminal
         status, a stale writer carrying an older non-terminal task object can
@@ -959,8 +994,12 @@ class SQLiteMemoryStore:
                 stage = excluded.stage,
                 updated_at = excluded.updated_at
             WHERE tasks.status NOT IN ('completed', 'failed', 'rejected', 'cancelled')
+              -- Bound, never built: a NULL expected_owner makes this half of
+              -- the guard vacuously true, so one statement serves both callers
+              -- and no SQL is ever assembled from Python strings.
+              AND (? IS NULL OR tasks.session_id = ?)
             """,
-            parameters,
+            (*parameters, expected_owner, expected_owner),
         )
         # 0 modified rows means the guard blocked the write: a terminal row
         # already holds authority and this writer lost.
@@ -1826,56 +1865,135 @@ class SQLiteMemoryStore:
         return True
 
     def cancel_task(
-        self,
-        session: SessionState,
-        task: Task,
-        *,
-        connector_cancelled: bool,
-    ) -> str:
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
         """Atomically arbitrate cancellation against the execution attempt in
         ONE transaction (P1-B).
 
-        Reads the authoritative task lifecycle and the latest attempt state
-        together, then writes the decision, so a claim and a cancel cannot both
-        succeed on stale observations. Returns ``"terminal"`` (already
-        immutable, no write), ``"cancelled"`` (finalized terminal cancellation:
-        no execution was claimed, or the connector confirmed the stop), or
-        ``"cancelling"`` (an IN_FLIGHT attempt exists: intent recorded but not
-        final; the executing owner finalizes at conclusion).
+        THE REQUESTED ``task_id`` IS THE ONLY ROW SELECTOR. Callers used to
+        hand in a decoded ``Task`` and storage used ITS id to write and ITS
+        status and stage to decide, so a persisted document could:
+
+        * name another task and get that one cancelled instead - the requested
+          task left untouched, and the wrong task's row rewritten;
+        * carry a stage the row never had, and see that stage persisted into
+          the authoritative column by the cancellation write;
+        * carry a terminal status and be reported as terminal.
+
+        None of that is expressible now: the caller passes two ids, and the
+        task and session are rebound to their own rows here, inside the write
+        transaction, before anything is mutated. The attempt is resolved by the
+        requested ``task_id`` too, never by a decoded one.
+
+        Returns a bounded :class:`CancellationOutcome` carrying the verdict and
+        the rebound rows. ``"unknown_session"`` and ``"not_found"`` cover every
+        identity, ownership and shape refusal alike - which row a document
+        really describes is not something a refusal may disclose - and each
+        returns having written nothing and raised nothing.
+
+        S2A CLOSEOUT. There is deliberately no ``connector_cancelled``
+        parameter. It existed to let a caller report that a connector had
+        confirmed the stop, and S2A no longer signals connectors at all, so no
+        caller can hold that evidence. Accepting the boolean anyway would have
+        let anyone terminalize a running task as CANCELLED by passing ``True``
+        - an assertion about the outside world that storage cannot check, about
+        work that may still be happening. An authoritative IN_FLIGHT attempt
+        therefore always yields ``"cancelling"``, and the execution owner stays
+        the only authority that can terminalize it.
+
+        S2A. ``UNKNOWN_OUTCOME`` used to fall into the ``not in_flight``
+        branch and terminalize the task as CANCELLED. That is a false
+        statement about the world: the attempt reached the connector boundary
+        and its effect may already have happened, so "cancelled" would tell
+        the operator nothing was done when nobody knows that. Such a task is
+        refused here and routed to the explicit abandon recovery instead,
+        which records the honest outcome - FAILED, with the uncertainty and
+        its monetary exposure preserved.
+
+        Ownership is re-proved and the task write is GUARDED on it, so a
+        finalization whose task changed owner returns ``"lost"`` having written
+        nothing rather than taking the task back from whoever holds it now.
         """
+        try:
+            return self._cancel_task_atomically(session_id, task_id)
+        except _CancellationLost as lost:
+            return CancellationOutcome("lost", lost.session, lost.task)
+
+    def _cancel_task_atomically(
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
         with self._connection(write=True) as connection:
-            row = connection.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task.id,)
-            ).fetchone()
-            if row is None:
-                return "not_found"
-            if row[0] in _TERMINAL_STATUS_VALUES:
-                return "terminal"
+            # Both rows first, each rebound to its own identity. The session is
+            # proved before the task because the task proof is stated in terms
+            # of it, and because a cancellation writes the session back.
+            session = self._authoritative_session_row(connection, session_id)
+            if session is None:
+                return CancellationOutcome("unknown_session")
+            task = self._authoritative_task_row(connection, session_id, task_id)
+            if task is None:
+                # ONE verdict for a missing row, a foreign row, a malformed
+                # document and a document whose id, status or stage disagrees
+                # with its columns. Distinguishing them would leak which of
+                # those it was, and which other session owns something is not
+                # a fact a refusal may reveal.
+                return CancellationOutcome("not_found")
+            # The status is the COLUMN's, proved equal to the document's above,
+            # so a forged terminal document cannot short-circuit anything.
+            if task.status.value in _TERMINAL_STATUS_VALUES:
+                return CancellationOutcome("terminal", session, task)
             attempt = connection.execute(
                 "SELECT state FROM execution_attempts WHERE task_id = ? "
                 "ORDER BY rowid DESC LIMIT 1",
-                (task.id,),
+                (task_id,),
             ).fetchone()
-            in_flight = attempt is not None and attempt[0] == AttemptState.IN_FLIGHT.value
-            if not in_flight or connector_cancelled:
+            if (
+                attempt is not None
+                and attempt[0] == AttemptState.UNKNOWN_OUTCOME.value
+            ):
+                # S2A: refused BEFORE any write. The task, the attempt, the
+                # reservation and the chain are all left exactly as they are.
+                return CancellationOutcome("in_doubt", session, task)
+            # Only the rebound objects are mutated from here. A caller's stale
+            # lifecycle and progress fields never reach a row, because the
+            # caller no longer supplies any.
+            task.cancellation_requested = True
+            session.latest_task_id = task_id
+            clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
+            set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
+            if attempt is not None and attempt[0] == AttemptState.IN_FLIGHT.value:
+                # FINDING 2. An authoritative IN_FLIGHT attempt is never
+                # terminalized here, by anyone. Storage has no evidence the
+                # execution stopped - S2A signals no connector, so no such
+                # evidence exists anywhere - and writing CANCELLED without it
+                # tells the operator the work is over while it may still be
+                # running. The intent is durable, the verdict is not final,
+                # and the execution owner concludes it.
+                task.status = TaskStatus.CANCEL_REQUESTED
+                verdict = "cancelling"
+            else:
+                # Nothing was ever claimed, so there is nothing running to
+                # stop: this cancellation IS final and honest.
                 task.status = TaskStatus.CANCELLED
                 task.stage = LoopStage.CANCELLED
                 session.active_task_id = None
                 task.progress = replace(task.progress, open_issues=())
-                outcome = "cancelled"
-            else:
-                task.status = TaskStatus.CANCEL_REQUESTED
-                outcome = "cancelling"
+                verdict = "cancelled"
             self._upsert_session(connection, session)
-            self._upsert_task(connection, session.id, task)
+            if not self._upsert_task(
+                connection, session_id, task, expected_owner=session_id
+            ):
+                # The guard refused. Roll the whole transaction back rather
+                # than leaving a session pointer and an event describing a
+                # cancellation that was never written to the task.
+                raise _CancellationLost(session, task)
             self._write_checkpoint_and_event(
                 connection,
                 session,
                 task,
                 "cancellation_requested",
-                {"connector_cancelled": connector_cancelled},
+                {"connector_cancelled": False},
             )
-        return outcome
+        return CancellationOutcome(verdict, session, task)
 
     def has_remembered_scope_grant(
         self, session_id: str, scope_fingerprint: str
@@ -2427,6 +2545,211 @@ class SQLiteMemoryStore:
                     AttemptState.IN_FLIGHT.value,
                 ),
             )
+
+    @staticmethod
+    def _authoritative_task_row(
+        connection: sqlite3.Connection, session_id: str, task_id: str
+    ) -> Task | None:
+        """The task, REBOUND to its authoritative row, or ``None``.
+
+        THE definition of "this task, as storage knows it", shared by every
+        mutating path - abandon recovery and ordinary cancellation both. One
+        definition on purpose: two would drift, and the weaker one would become
+        the way in.
+
+        A decoded document is not a description of the row it was found in, and
+        ``task_id`` here is always the id the CALLER asked about, never one
+        read out of a document. Every field a mutation will write is tied back
+        to the columns storage actually acts on:
+
+        * the row exists and its ``session_id`` column is the caller's
+        * the document is an EXACT mapping of the canonical shape - not a
+          fragment ``from_dict`` would happily complete with defaults
+        * the decoded id is THIS row's id, so a forged identity can never be
+          written out as a NEW task
+        * the decoded status and stage are the columns' own values, so a
+          forged lifecycle cannot ride along into the terminal write
+
+        Returning ``None`` is the single non-disclosing refusal for all of
+        them: which row a document really describes is not something a
+        refusal may reveal.
+        """
+        row = connection.execute(
+            "SELECT session_id, status, stage, state_json FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["session_id"] != session_id:
+            return None
+        try:
+            document = json.loads(row["state_json"])
+        except VISIBILITY_DECODE_ERRORS:
+            return None
+        # The canonical document shape, shared with the read surface: one
+        # definition of "a complete persisted task", not two that can drift.
+        if type(document) is not dict or not VISIBILITY_TASK_KEYS <= set(document):
+            return None
+        try:
+            task = Task.from_dict(document)
+        except VISIBILITY_DECODE_ERRORS:
+            return None
+        if task.id != task_id:
+            return None
+        if task.status.value != row["status"] or task.stage.value != row["stage"]:
+            return None
+        return task
+
+    @staticmethod
+    def _authoritative_session_row(
+        connection: sqlite3.Connection, session_id: str
+    ) -> SessionState | None:
+        """The session, REBOUND to its authoritative row, or ``None``.
+
+        F2. The same rule, and for a sharper reason: recovery writes the
+        session back. A document carrying somebody else's id used to be
+        written out under THAT id, so a forged field mutated a session the
+        operator never named. The decoded identity must be this row's own.
+        """
+        row = connection.execute(
+            "SELECT state_json FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            document = json.loads(row[0])
+        except VISIBILITY_DECODE_ERRORS:
+            return None
+        if type(document) is not dict or not VISIBILITY_SESSION_KEYS <= set(document):
+            return None
+        try:
+            session = SessionState.from_dict(document)
+        except VISIBILITY_DECODE_ERRORS:
+            return None
+        if session.id != session_id:
+            return None
+        return session
+
+    def abandon_unknown_attempt(
+        self,
+        session_id: str,
+        task_id: str,
+        attempt_id: str,
+        recovery: AttemptRecovery,
+    ) -> AttemptRecoveryOutcome:
+        """Accept that an UNKNOWN-outcome attempt will never resolve.
+
+        THE only exit from the one H2 state that has none. Everything happens
+        in a single ``BEGIN IMMEDIATE`` transaction: the proofs are read and
+        the writes committed together, so a concurrent conclusion, a
+        cancellation or a second operator cannot interleave between them.
+
+        The task write goes through the ORDINARY guarded upsert, so the
+        terminal-immutability rule that protects every other lifecycle write
+        protects this one too - and that guard is exactly what makes a double
+        recovery, or a race against a real conclusion, resolve to a single
+        winner rather than to two terminal statements about one task.
+
+        Nothing here reaches a connector, returns the attempt to a claimable
+        state, invents an outcome or touches money except to make an ACTIVE
+        reservation UNRESOLVED - which is not a release: the exposure keeps
+        counting, because the outcome remains unknown.
+        """
+        if type(recovery) is not AttemptRecovery:
+            # A closed vocabulary, enforced rather than assumed.
+            return AttemptRecoveryOutcome.NOT_RECOVERABLE
+        with self._connection(write=True) as connection:
+            attempt = connection.execute(
+                "SELECT session_id, task_id, state FROM execution_attempts "
+                "WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            # Identity first, and deliberately ONE verdict for every way it
+            # can fail: which other session or task owns an attempt is not
+            # something a refusal may disclose.
+            if (
+                attempt is None
+                or attempt["session_id"] != session_id
+                or attempt["task_id"] != task_id
+            ):
+                return AttemptRecoveryOutcome.UNKNOWN
+            # F2. The task, REBOUND to its own row: identity, ownership and
+            # lifecycle all proven against the columns before anything is
+            # written from the document.
+            task = self._authoritative_task_row(connection, session_id, task_id)
+            if task is None:
+                return AttemptRecoveryOutcome.UNKNOWN
+            if attempt["state"] != AttemptState.UNKNOWN_OUTCOME.value:
+                # PREPARED is still legitimately claimable, IN_FLIGHT may
+                # still have a live owner holding connector authority, and
+                # FINISHED already has its answer. None of them is this
+                # operator's decision to make.
+                return AttemptRecoveryOutcome.NOT_RECOVERABLE
+            if task.status.value in _TERMINAL_STATUS_VALUES:
+                return AttemptRecoveryOutcome.TERMINAL
+            # F2. And the session, rebound the same way: recovery writes it
+            # back, so a document naming another session must never decide
+            # which row that write lands on.
+            session = self._authoritative_session_row(connection, session_id)
+            if session is None:
+                return AttemptRecoveryOutcome.UNKNOWN
+            payload = {
+                "recovery": recovery.value,
+                "attempt_id": attempt_id,
+                # The attempt KEEPS this state; it is recorded so the audit
+                # trail says what was abandoned, not what it became.
+                "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                "error_code": ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+            }
+            task.status = TaskStatus.FAILED
+            task.stage = LoopStage.FAILED
+            task.cancellation_requested = False
+            # F3. The canonical typed failure, made DURABLE. Without it the
+            # row is FAILED with no recorded reason, and a restart reports a
+            # terminal task that cannot say why - which is precisely the
+            # question an operator restarts to ask. Any stale snapshot from a
+            # partial run is replaced: the authoritative outcome of this task
+            # is now the abandonment, not whatever it was mid-flight.
+            task.result_snapshot = result_to_dict(
+                terminal_failure_result(
+                    StructuredError(
+                        ErrorCode.EXECUTION_UNKNOWN_OUTCOME,
+                        "A prior execution attempt is in doubt and was "
+                        "explicitly abandoned; it was never replayed.",
+                        retryable=False,
+                    )
+                )
+            )
+            clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
+            set_issue(
+                task,
+                ProgressIssueKind.FAILURE,
+                ErrorCode.EXECUTION_UNKNOWN_OUTCOME,
+                False,
+            )
+            session.active_task_id = None
+            session.latest_task_id = task.id
+            if not self._upsert_task(connection, session_id, task):
+                # The guarded upsert refused: a terminal writer won this race.
+                # Nothing else in this transaction has written yet.
+                return AttemptRecoveryOutcome.TERMINAL
+            self._upsert_session(connection, session)
+            self._write_checkpoint_and_event(
+                connection, session, task, "execution_abandoned", payload
+            )
+            # H3. UNRESOLVED, never released: the money stays visible because
+            # the outcome stays unknown. ACTIVE is the only source state, so a
+            # RECONCILED reservation is never reopened and an already
+            # UNRESOLVED one is left exactly as it is.
+            connection.execute(
+                "UPDATE attempt_billing SET state = ?, updated_at = ? "
+                "WHERE attempt_id = ? AND state = ?",
+                (
+                    ReservationState.UNRESOLVED.value,
+                    utc_now(),
+                    attempt_id,
+                    ReservationState.ACTIVE.value,
+                ),
+            )
+        return AttemptRecoveryOutcome.RECOVERED
 
     def conclude_execution(
         self,

@@ -5900,6 +5900,113 @@ class AttemptState(str, Enum):
     UNKNOWN_OUTCOME = "unknown_outcome"
 
 
+def result_to_dict(result: ToolResult) -> dict[str, Any]:
+    """THE canonical serialization of a persisted execution result.
+
+    F3. It lives here, on the provider-independent surface, because two
+    things now need to write one: the ordinary loop, which persists what a
+    connector returned, and storage-side recovery, which persists the typed
+    failure of an outcome that will never be known. A second serializer would
+    mean a second failure schema, and a task restored from the wrong one
+    would report a different diagnostic depending on who wrote it.
+    """
+    return {
+        "outcome": result.outcome.value,
+        "summary": result.summary,
+        "data": result.data,
+        "error": result.error.to_dict() if result.error else None,
+        "usage": result.usage.to_dict(),
+        "verification": result.verification.to_dict(),
+    }
+
+
+def terminal_failure_result(error: StructuredError) -> ToolResult:
+    """The canonical bounded result a typed terminal failure persists.
+
+    The snapshot a restart reads back, so the same task reports the same
+    diagnostic however it got there. It describes ITS OWN failure - the error
+    rides inside the result, not merely beside it - and carries no connector,
+    model, file or task content: the summary is the typed error message that
+    the diagnostic contract has already bounded.
+
+    Usage is the explicit no-charge record rather than an absent one. A
+    result that reported nothing about money would be indistinguishable from
+    an unrecorded route, and H3 refuses to infer a route from absence.
+    """
+    return ToolResult(
+        outcome=OutcomeStatus.ERROR,
+        summary=error.message,
+        error=error,
+        usage=UsageRecord(
+            billing_class=BillingClass.NO_ADDITIONAL_CHARGE,
+            monetary_state=MonetaryState.NOT_APPLICABLE,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class CancellationOutcome:
+    """One cancellation verdict, with the AUTHORITATIVE state behind it.
+
+    A caller used to bring its own decoded ``Task`` to a cancellation and get a
+    verdict about it. That made a persisted document the thing being cancelled
+    rather than a row: a document carrying another task's id cancelled THAT
+    task, and a document carrying a forged status let the caller report a
+    terminal outcome storage never agreed to.
+
+    So the request is now two ids, and everything that comes back was rebound
+    to its own row inside the deciding transaction. ``session`` and ``task``
+    are present for every verdict that identified a task at all, and they are
+    the rows - not what anybody claimed about them.
+
+    Frozen, because a receipt that could be edited afterwards would be back to
+    being a claim.
+    """
+
+    verdict: str
+    session: SessionState | None = None
+    task: Task | None = None
+
+
+class AttemptRecovery(str, Enum):
+    """The CLOSED set of operator recoveries an execution attempt admits.
+
+    Exactly one member, and that is the design rather than a placeholder.
+    An attempt whose outcome is UNKNOWN may be ABANDONED - the operator
+    states that the result will never be established and accepts the task as
+    failed. Nothing else is expressible here: there is deliberately no
+    ``retry``, no ``succeeded`` and no ``release``, because storage cannot
+    know whether the external effect happened, and a vocabulary that offered
+    those words would invite a caller to assert something no evidence
+    supports.
+    """
+
+    ABANDONED = "abandoned"
+
+
+class AttemptRecoveryOutcome(str, Enum):
+    """The CLOSED verdict of one attempted operator recovery.
+
+    Only ``RECOVERED`` wrote anything. Every other member describes a refusal
+    that left storage exactly as it was, so a caller can report what happened
+    without inspecting rows itself.
+
+    ``NOT_RECOVERABLE`` deliberately does not say WHICH state the attempt was
+    in, and ``UNKNOWN`` covers a missing attempt, a foreign session, a foreign
+    task and a mismatched pair alike: which other session owns something is
+    not a fact this verdict may reveal.
+    """
+
+    #: The task is now terminally FAILED and the reservation is unresolved.
+    RECOVERED = "recovered"
+    #: No such attempt for this exact session and task.
+    UNKNOWN = "unknown"
+    #: The attempt exists but is not in a recoverable state.
+    NOT_RECOVERABLE = "not_recoverable"
+    #: The task already reached a terminal state; nothing was rewritten.
+    TERMINAL = "terminal"
+
+
 #: Attempt states that must never trigger an automatic re-execution.
 ATTEMPT_NON_REPLAYABLE = frozenset(
     {AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED}
@@ -6388,16 +6495,40 @@ class MemoryStore(Protocol):
         ...
 
     def cancel_task(
-        self,
-        session: SessionState,
-        task: Task,
-        *,
-        connector_cancelled: bool,
-    ) -> str:
-        """Atomically arbitrate cancellation against the execution attempt in
-        one transaction. Returns ``"terminal"`` (already immutable, no write),
-        ``"cancelled"`` (finalized), or ``"cancelling"`` (IN_FLIGHT: intent
-        recorded, not final)."""
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
+        """Atomically finalize a cancellation in one transaction.
+
+        THE REQUESTED ``task_id`` IS THE ONLY THING THAT SELECTS A ROW. Nothing
+        decoded from a persisted document - not an embedded task id, not a
+        status, not a stage, not an embedded session id - may choose or
+        redefine which row is read or written. A caller-held ``Task`` cannot be
+        passed at all, because being able to pass one was the defect.
+
+        Inside the write transaction, before any mutation, the requested task
+        and the supplied session are each rebound to their own rows: the row
+        exists, its ``session_id`` is the caller's, its document decodes to an
+        exact dict of the complete canonical shape, and the embedded id, status
+        and stage agree with the columns. Any mismatch, malformed document or
+        foreign ownership returns ONE bounded, non-disclosing refusal having
+        written nothing and raised nothing.
+
+        Verdicts: ``"unknown_session"``, ``"not_found"`` (also every identity
+        and shape refusal - which row a document really describes is not
+        something a refusal may reveal), ``"terminal"`` (already immutable, no
+        write), ``"cancelled"`` (finalized: nothing was ever claimed, so there
+        is nothing running to stop), ``"cancelling"`` (an authoritative
+        IN_FLIGHT attempt exists: the intent is durable, the cancellation is
+        NOT final, and the execution owner concludes it), ``"in_doubt"`` (the
+        attempt is UNKNOWN_OUTCOME, so no cancellation verdict is truthful), or
+        ``"lost"`` (the task changed owner; nothing was written).
+
+        There is deliberately no argument for "the connector confirmed the
+        stop": nothing in S2A can hold that evidence, because S2A signals no
+        connector. Ownership is re-proved and the task write is guarded on it,
+        so a finalization racing an ownership change loses rather than taking
+        the task back.
+        """
         ...
 
     def has_remembered_scope_grant(
@@ -6428,6 +6559,49 @@ class MemoryStore(Protocol):
         Inserts ``attempt`` (PREPARED) only when the task has no attempt yet;
         otherwise returns the existing latest attempt unchanged. The caller
         proceeds only when the returned attempt is still PREPARED.
+        """
+        ...
+
+    def abandon_unknown_attempt(
+        self,
+        session_id: str,
+        task_id: str,
+        attempt_id: str,
+        recovery: AttemptRecovery,
+    ) -> AttemptRecoveryOutcome:
+        """Atomically accept that an UNKNOWN-outcome attempt never resolved.
+
+        THE operator recovery for the one state H2 leaves with no exit. An
+        attempt marked ``UNKNOWN_OUTCOME`` may never be replayed and never
+        concludes on its own, so without this the task, and any chain waiting
+        on it, stay blocked forever. This is the human saying "that result
+        will never be established"; it is not a retry and not a verdict about
+        what the external world did.
+
+        What it must prove, in ONE transaction, before writing anything: the
+        attempt exists and its own ``session_id``/``task_id`` columns match
+        the caller's; the task's authoritative owner is ``session_id``; the
+        attempt's state is EXACTLY ``UNKNOWN_OUTCOME``; and the task is not
+        already terminal. Any failure returns a refusal verdict having
+        written nothing at all.
+
+        What it then does, atomically: the task becomes terminally FAILED
+        carrying the ``EXECUTION_UNKNOWN_OUTCOME`` diagnostic, a bounded
+        recovery checkpoint and event are recorded, and an ACTIVE monetary
+        reservation for that attempt becomes UNRESOLVED.
+
+        What it must NEVER do: reach a connector, replay, return the attempt
+        to a claimable state, invent a COMPLETED outcome, consume a grant,
+        create a reservation, or release monetary exposure. The attempt stays
+        ``UNKNOWN_OUTCOME`` permanently - that is the durable record that
+        something may have happened out there - and an UNRESOLVED reservation
+        keeps counting against the monthly position, because abandoning an
+        unknown outcome is an admission of uncertainty, not its resolution.
+
+        A RECONCILED reservation is never reopened. The chain is never
+        written: the ordinary chain authority observes the FAILED task on its
+        next pass and terminalizes itself, exactly as it does for any other
+        failure.
         """
         ...
 

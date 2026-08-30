@@ -26,9 +26,11 @@ from jarvis.app import (
     sessions_result,
     show_result,
     status_payload,
+    task_resolve_result,
     tasks_result,
 )
 from jarvis.contracts import (
+    AttemptRecovery,
     DataClassification,
     ErrorCode,
     PermissionMode,
@@ -84,6 +86,29 @@ def _build_parser() -> _ArgumentParser:
     )
     show_command.add_argument("--session-id", required=True)
     show_command.add_argument("--task-id", required=True)
+
+    # M12 S2A: explicit operator recovery. Local-only like the visibility
+    # verbs - it builds no registry, connector or AgentCore, so it is
+    # structurally incapable of executing or replaying anything.
+    task_command = commands.add_parser(
+        "task", help="Operator recovery for an execution attempt in doubt."
+    )
+    task_actions = task_command.add_subparsers(dest="task_action")
+    task_resolve = task_actions.add_parser(
+        "resolve",
+        help="Abandon an attempt whose outcome will never be established.",
+    )
+    task_resolve.add_argument("--session-id", required=True)
+    task_resolve.add_argument("--task-id", required=True)
+    # Mandatory on purpose: the operator names the EXACT attempt they read in
+    # `jarvis show`, so a blind recovery of whatever happens to be latest is
+    # not expressible.
+    task_resolve.add_argument("--attempt-id", required=True)
+    task_resolve.add_argument(
+        "--resolution",
+        required=True,
+        choices=[recovery.value for recovery in AttemptRecovery],
+    )
 
     run_command = commands.add_parser("run", help="Start a task from task JSON.")
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
@@ -229,6 +254,29 @@ def _dispatch_memory_command(
     )
 
 
+def _dispatch_task_command(
+    settings: Settings, args: argparse.Namespace
+) -> CommandResult:
+    """Operator recovery. Constructs a store and nothing else."""
+    memory = SQLiteMemoryStore(settings.memory_database)
+    if getattr(args, "task_action", None) == "resolve":
+        return task_resolve_result(
+            memory,
+            settings,
+            args.session_id,
+            args.task_id,
+            args.attempt_id,
+            args.resolution,
+        )
+    return failure_result(
+        "task",
+        settings.permission_mode,
+        ErrorCode.INVALID_TASK,
+        "'task' requires the 'resolve' sub-command.",
+        EXIT_INVALID_INPUT,
+    )
+
+
 def _dispatch_visibility_command(
     settings: Settings, command: str, args: argparse.Namespace
 ) -> CommandResult:
@@ -326,6 +374,13 @@ def main(
         payload: dict[str, Any] = status_payload(effective, memory)
         print(json.dumps(payload, indent=2))
         return 0
+
+    if command == "task":
+        # Local-only, and routed here so that stays STRUCTURAL: recovery must
+        # never be able to reach a connector, so no application is built.
+        recovery = _dispatch_task_command(effective, args)
+        print(recovery.render())
+        return recovery.exit_code
 
     if command in ("sessions", "tasks", "show"):
         # Read-only, and routed here so that stays STRUCTURAL: no application,

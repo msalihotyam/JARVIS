@@ -103,6 +103,7 @@ from jarvis.contracts import (
     nano_usd,
     normalize_destination,
     require_billing_class,
+    result_to_dict,
     require_monetary_state,
     retrieval_eligible,
     sanitize_diagnostic_text,
@@ -494,52 +495,99 @@ class AgentCore:
         return self._advance(session, task, None)
 
     def cancel(self, session_id: str, task_id: str) -> AgentRun:
-        session = self.memory.load_session(session_id)
-        task = self.memory.load_task(task_id)
-        if session is None:
+        """Cancel by ID. Storage rebinds, decides, and hands back the rows.
+
+        Nothing is loaded here first and nothing is judged here first. Core
+        used to read the task, decide from the DOCUMENT whether it was already
+        terminal, and only then ask storage - so a forged terminal document
+        produced a terminal AgentRun that storage had never agreed to, and a
+        forged id sent the whole cancellation at another task. Both were
+        decisions taken on a caller-decoded object, which is exactly the
+        authority core must not hold.
+
+        S2A CLOSEOUT. NO CONNECTOR IS SIGNALLED, at all, from here.
+
+        A cancellation that stops a live execution has to cross an external
+        boundary, and that crossing cannot be made atomic with the storage
+        decision that authorizes it: no transaction may be held across it, the
+        execution owner must never be blocked waiting for it, and S2A admits no
+        lease, heartbeat or automatic reclaim to bound it. A durable claim made
+        ACQUISITION unique but left the signal itself detached - still able to
+        go stale between the arbitration and the actual call - so it bought
+        uniqueness, not safety.
+
+        S2A therefore fails closed instead of pretending otherwise: the
+        cancellation intent is recorded honestly and nothing is asked of any
+        connector. Safe live IN_FLIGHT connector-boundary coordination is
+        deferred to S2B. This is a deliberate capability gap, not an oversight,
+        and the registry is not consulted below.
+        """
+        outcome = self.memory.cancel_task(session_id, task_id)
+        if outcome.verdict == "unknown_session":
             return self._input_failure(
-                task, ErrorCode.UNKNOWN_SESSION, f"Unknown session: {session_id}"
+                None, ErrorCode.UNKNOWN_SESSION, f"Unknown session: {session_id}"
             )
-        if task is None or self.memory.task_session_id(task_id) != session_id:
+        if outcome.verdict == "not_found":
+            # One bounded refusal for a missing task, a foreign one, and a
+            # persisted document that does not describe its own row.
             return self._input_failure(
-                task, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}", session
+                None, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}"
             )
-        # Fast path: a terminal task is reported as-is (the atomic op below
-        # re-checks terminality authoritatively).
-        terminal = self._terminal_run(session, task)
-        if terminal is not None:
-            return terminal
-        # Best-effort connector cancellation signal, taken before the atomic
-        # arbitration; its result only matters when an attempt is IN_FLIGHT.
-        cancelled = False
-        if task.selected_connector:
-            try:
-                cancelled = self.registry.get(task.selected_connector).cancel(task.id)
-            except ConnectorNotFoundError:
-                cancelled = False
-        # Prepare the pending-cancellation view; the atomic op upgrades it to a
-        # final CANCELLED only if no execution has been claimed (or the
-        # connector confirmed the stop), all within one transaction (P1-B).
-        task.cancellation_requested = True
-        task.status = TaskStatus.CANCEL_REQUESTED
-        session.latest_task_id = task.id
-        clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
-        set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
-        outcome = self.memory.cancel_task(session, task, connector_cancelled=cancelled)
-        if outcome == "terminal":
-            # Execution legitimately reached a terminal state first; never
-            # overwrite it. Report the authoritative persisted state.
-            fresh = self.memory.load_task(task.id)
-            reported = self._terminal_run(session, fresh) if fresh is not None else None
+        # Everything below renders the REBOUND rows storage returned. Every
+        # remaining verdict carries them; a receipt without them would mean
+        # storage identified no task, which the two refusals above already
+        # covered - so treat it as the same refusal rather than trusting it.
+        session, task = outcome.session, outcome.task
+        if session is None or task is None:
+            return self._input_failure(
+                None, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}"
+            )
+        if outcome.verdict == "terminal":
+            reported = self._terminal_run(session, task)
             return reported if reported is not None else AgentRun(
-                RunStatus.CANCELLED, session, fresh or task
+                RunStatus.CANCELLED, session, task
             )
-        if outcome == "cancelled":
+        if outcome.verdict == "in_doubt":
+            # No connector call, and no write: the attempt's outcome is
+            # unknown, so no cancellation verdict would be truthful. The
+            # operator is pointed at the explicit abandon recovery.
+            return self._execution_in_doubt(
+                session, task, self.memory.latest_execution_attempt(task_id)
+            )
+        if outcome.verdict == "lost":
+            # The task changed owner between the read and the guarded write.
+            # Nothing was written; reporting CANCELLED here would be the exact
+            # lie the ownership guard exists to stop.
+            return self._cancellation_not_authorized(session, task)
+        if outcome.verdict == "cancelled":
             return AgentRun(RunStatus.CANCELLED, session, task)
-        if outcome == "cancelling":
+        if outcome.verdict == "cancelling":
             return AgentRun(RunStatus.CANCELLING, session, task)
         return self._input_failure(
             task, ErrorCode.TASK_NOT_FOUND, f"Unknown task: {task_id}", session
+        )
+
+    def _cancellation_not_authorized(
+        self, session: SessionState, task: Task
+    ) -> AgentRun:
+        """A cancellation that no longer holds authority over its task.
+
+        Bounded and non-disclosing: it does not say which session owns the
+        task now, because a refusal is not a channel for facts about somebody
+        else's work. Nothing was written, so the honest report is that this
+        cancellation did not happen - not a CANCELLED that would tell the
+        operator the work stopped.
+        """
+        return AgentRun(
+            RunStatus.FAILED,
+            session,
+            task,
+            error=StructuredError(
+                ErrorCode.TASK_NOT_FOUND,
+                "This cancellation no longer holds authority over the task; "
+                "nothing was changed. Re-read the task and try again.",
+                retryable=True,
+            ),
         )
 
     def _advance(
@@ -4253,14 +4301,13 @@ class AgentCore:
 
     @staticmethod
     def _result_to_dict(result: ToolResult) -> dict[str, Any]:
-        return {
-            "outcome": result.outcome.value,
-            "summary": result.summary,
-            "data": result.data,
-            "error": result.error.to_dict() if result.error else None,
-            "usage": result.usage.to_dict(),
-            "verification": result.verification.to_dict(),
-        }
+        """THE canonical serialization, which now lives in ``jarvis.contracts``.
+
+        F3. Storage-side recovery must persist the same terminal-failure
+        snapshot this loop persists, so the shape has exactly one definition
+        and this delegates to it rather than restating it.
+        """
+        return result_to_dict(result)
 
     @staticmethod
     def _result_from_dict(data: dict[str, Any] | None) -> ToolResult | None:

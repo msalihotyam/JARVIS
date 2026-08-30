@@ -14,6 +14,7 @@ from jarvis.contracts import (
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
     AttemptState,
+    CancellationOutcome,
     BillingClaim,
     BillingClass,
     BillingIntegrityError,
@@ -441,32 +442,42 @@ class InMemoryStore:
         return True
 
     def cancel_task(
-        self,
-        session: SessionState,
-        task: Task,
-        *,
-        connector_cancelled: bool,
-    ) -> str:
-        persisted = self.tasks.get(task.id)
-        if persisted is None:
-            return "not_found"
-        if persisted.status in _TERMINAL_STATUSES:
-            return "terminal"
-        history = self.attempts.get(task.id, [])
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
+        # Two ids in, rebound rows out: the caller supplies no Task and no
+        # SessionState, so nothing it decoded can select or redefine a row.
+        # The protocol also takes no "the connector confirmed the stop"
+        # argument - nothing can hold that evidence, because nothing signals
+        # a connector.
+        session = self.load_session(session_id)
+        if session is None:
+            return CancellationOutcome("unknown_session")
+        task = self.load_task(task_id)
+        if task is None or self.task_session_id(task_id) != session_id:
+            # One non-disclosing refusal for missing and foreign alike.
+            return CancellationOutcome("not_found")
+        if task.status in _TERMINAL_STATUSES:
+            return CancellationOutcome("terminal", session, task)
+        history = self.attempts.get(task_id, [])
         latest = history[-1] if history else None
-        in_flight = latest is not None and latest.state is AttemptState.IN_FLIGHT
-        if not in_flight or connector_cancelled:
+        if latest is not None and latest.state is AttemptState.UNKNOWN_OUTCOME:
+            # No cancellation verdict is truthful about an unknown outcome.
+            return CancellationOutcome("in_doubt", session, task)
+        task.cancellation_requested = True
+        session.latest_task_id = task_id
+        if latest is not None and latest.state is AttemptState.IN_FLIGHT:
+            # Never terminal: the execution owner concludes a live attempt.
+            task.status = TaskStatus.CANCEL_REQUESTED
+            verdict = "cancelling"
+        else:
             task.status = TaskStatus.CANCELLED
             task.stage = LoopStage.CANCELLED
             session.active_task_id = None
             task.progress = replace(task.progress, open_issues=())
-            outcome = "cancelled"
-        else:
-            task.status = TaskStatus.CANCEL_REQUESTED
-            outcome = "cancelling"
+            verdict = "cancelled"
         self.save_session(session)
-        self._save_task_guarded(session.id, task)
-        return outcome
+        self._save_task_guarded(session_id, task)
+        return CancellationOutcome(verdict, session, task)
 
     def has_remembered_scope_grant(
         self, session_id: str, scope_fingerprint: str

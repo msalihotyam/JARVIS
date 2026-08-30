@@ -163,7 +163,9 @@ class CostAndVerificationTests(unittest.TestCase):
 
         cancelled = core.cancel(session.id, task.id)
         self.assertEqual(RunStatus.CANCELLED, cancelled.status)
-        self.assertEqual(1, connector.cancel_calls)
+        # No persisted IN_FLIGHT attempt means there is no authority to cross
+        # the connector cancellation boundary.
+        self.assertEqual(0, connector.cancel_calls)
         restored = self.memory.load_task(task.id)
         self.assertEqual(TaskStatus.CANCELLED, restored.status)
 

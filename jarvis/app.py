@@ -44,6 +44,9 @@ from jarvis.contracts import (
     VISIBILITY_MAX_LIMIT,
     ActionScope,
     ApprovalSummary,
+    AttemptRecovery,
+    AttemptRecoveryOutcome,
+    AttemptState,
     AttemptSummary,
     AgentRun,
     BillingClass,
@@ -1557,6 +1560,111 @@ def show_result(
         "chain_step_index": view.chain_step_index,
     }
     return CommandResult(_redact(payload), EXIT_OK)
+
+
+#: What each recovery verdict means to the operator, and the exit code that
+#: carries it. Every refusal wrote nothing at all.
+_RECOVERY_REFUSALS: dict[AttemptRecoveryOutcome, tuple[ErrorCode, str, int]] = {
+    AttemptRecoveryOutcome.UNKNOWN: (
+        ErrorCode.TASK_NOT_FOUND,
+        "No such execution attempt for this session and task.",
+        EXIT_NOT_FOUND,
+    ),
+    AttemptRecoveryOutcome.NOT_RECOVERABLE: (
+        ErrorCode.INVALID_TASK,
+        (
+            "Only an attempt whose outcome is UNKNOWN may be abandoned; this "
+            "one is in another state and nothing was changed."
+        ),
+        EXIT_INVALID_INPUT,
+    ),
+    AttemptRecoveryOutcome.TERMINAL: (
+        ErrorCode.INVALID_TASK,
+        "The task already reached a terminal state; nothing was changed.",
+        EXIT_INVALID_INPUT,
+    ),
+}
+
+
+def task_resolve_result(
+    memory: MemoryStore,
+    settings: Settings,
+    session_id: str,
+    task_id: str,
+    attempt_id: str,
+    resolution: str,
+) -> CommandResult:
+    """Abandon an attempt whose outcome will never be established.
+
+    Local and deterministic like the visibility commands: it builds no
+    registry, no connector and no ``AgentCore``, because recovery must be
+    structurally incapable of executing anything. The only authority it
+    exercises is the single storage transaction, which decides everything.
+
+    The response states the bounded facts an operator needs to know they were
+    not sold a retry: what the attempt still is, that no connector will run,
+    what the task became, that the money stays exposed, and that the chain was
+    not touched.
+    """
+    command = "task-resolve"
+    try:
+        recovery = AttemptRecovery(resolution)
+    except ValueError:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            f"Unsupported resolution: {resolution}",
+            EXIT_INVALID_INPUT,
+        )
+    outcome = memory.abandon_unknown_attempt(
+        session_id, task_id, attempt_id, recovery
+    )
+    if outcome is not AttemptRecoveryOutcome.RECOVERED:
+        code, message, exit_code = _RECOVERY_REFUSALS[outcome]
+        return failure_result(
+            command, settings.permission_mode, code, message, exit_code
+        )
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "session_id": session_id,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "resolution": recovery.value,
+                "outcome": outcome.value,
+                # The bounded facts, stated rather than implied.
+                "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                "connector_replay": False,
+                "task_status": TaskStatus.FAILED.value,
+                "error_code": ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+                # F3. Only what is UNIVERSALLY true. Storage returns a closed
+                # recovery verdict, not a reservation receipt, so this surface
+                # has no proof of what happened to THIS attempt's reservation
+                # row - it may have had none at all, or an already RECONCILED
+                # one that recovery correctly refused to reopen. Naming the
+                # ACTIVE -> UNRESOLVED transition here asserted a fact about a
+                # row nothing on this path read, so the field is gone rather
+                # than made conditional on a guess. What remains holds in
+                # every case, including the case of no reservation.
+                "monetary_exposure_released": False,
+                "new_reservation_created": False,
+                "reconciled_reservation_reopened": False,
+                "chain_modified": False,
+                "next_step": (
+                    "The attempt stays UNKNOWN_OUTCOME and will never be "
+                    "replayed. The task is FAILED. No monetary exposure was "
+                    "released and no reservation was created; recovery never "
+                    "reopens a reconciled one. This command does not report "
+                    "this attempt's reservation state - read the billing "
+                    "position for that. A chain owning this task terminalizes "
+                    "on its next chain run."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
 
 
 def chain_declare_result(
