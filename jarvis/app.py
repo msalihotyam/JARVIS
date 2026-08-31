@@ -1348,6 +1348,10 @@ def _visibility_progress(
 
 def _attempt_summary_payload(summary: AttemptSummary) -> dict[str, Any]:
     return {
+        # The handle 'task resolve --attempt-id' asks for. Naming an attempt
+        # is not authority over it: recovery re-proves the attempt it is
+        # given against the authoritative rows before it changes anything.
+        "id": summary.id,
         "state": None if summary.state is None else summary.state.value,
         "connector": summary.connector,
         "updated_at": summary.updated_at,

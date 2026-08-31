@@ -1126,6 +1126,131 @@ class CommandSurfaceTests(RecoveryTestCase):
         self.assertEqual(json.loads(output)["error"]["code"], "invalid_task")
 
 
+class ShownAttemptIdFlowTests(RecoveryTestCase):
+    """P2-1. The id the operator READS is the id recovery ACCEPTS.
+
+    ``task resolve`` has always required the exact attempt id, which is the
+    right shape - a blind "recover whatever is latest" is not expressible -
+    but the id was not rendered anywhere, so the shipped authority could only
+    be reached by opening SQLite. These pin the closed loop: show it, pass it
+    back, and let the existing S2A authority do exactly what it always did.
+
+    Knowing an id grants nothing. Every refusal below is the recovery path
+    re-proving the attempt against the authoritative rows, not the display
+    surface withholding something.
+    """
+
+    def run_cli(self, argv: list[str]) -> tuple[int, dict]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli_main(argv, settings=self.settings)
+        return code, json.loads(buffer.getvalue())
+
+    def shown_attempt_id(self, task_id: str, session_id: str | None = None) -> str:
+        """The id exactly as an operator reads it out of ``jarvis show``."""
+        code, payload = self.run_cli(
+            ["show", "--session-id", session_id or self.session.id,
+             "--task-id", task_id]
+        )
+        self.assertEqual(code, EXIT_OK)
+        return payload["attempt"]["id"]
+
+    def resolve(self, task_id: str, attempt_id: str, session_id: str | None = None):
+        return self.run_cli(
+            ["task", "resolve", "--session-id", session_id or self.session.id,
+             "--task-id", task_id, "--attempt-id", attempt_id,
+             "--resolution", "abandoned"]
+        )
+
+    def test_the_shown_id_resolves_the_attempt_it_names(self) -> None:
+        """THE flow, with no database access anywhere in this test."""
+        task, attempt_id = self.in_doubt_task()
+        shown = self.shown_attempt_id(task.id)
+        self.assertEqual(shown, attempt_id)
+        code, payload = self.resolve(task.id, shown)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(
+            payload["outcome"], AttemptRecoveryOutcome.RECOVERED.value
+        )
+        # Unchanged S2A semantics: the attempt KEEPS its unknown state and
+        # the task becomes terminally FAILED. Recovery is not a retry.
+        self.assertEqual(
+            payload["attempt_state"], AttemptState.UNKNOWN_OUTCOME.value
+        )
+        self.assertEqual(payload["task_status"], TaskStatus.FAILED.value)
+        self.assertIs(payload["connector_replay"], False)
+        self.assertEqual(self.connector.calls, [])
+
+    def test_reading_the_id_changes_nothing_before_the_decision(self) -> None:
+        task, attempt_id = self.in_doubt_task()
+        before = self.database_content()
+        for _ in range(3):
+            self.assertEqual(self.shown_attempt_id(task.id), attempt_id)
+        self.assertEqual(before, self.database_content(), "show wrote a row")
+
+    def test_a_wrong_attempt_id_still_refuses(self) -> None:
+        task, _ = self.in_doubt_task()
+        self.shown_attempt_id(task.id)
+        before = self.database_content()
+        code, _ = self.resolve(
+            task.id, "00000000-0000-0000-0000-000000000000"
+        )
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(before, self.database_content(), "a refusal wrote")
+        self.assertEqual(self.connector.calls, [])
+
+    def test_another_tasks_shown_id_cannot_resolve_this_task(self) -> None:
+        """An id is a handle, never an authority over a different task."""
+        mine, _ = self.in_doubt_task()
+        theirs, _ = self.in_doubt_task()
+        foreign = self.shown_attempt_id(theirs.id)
+        before = self.database_content()
+        code, _ = self.resolve(mine.id, foreign)
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(before, self.database_content())
+
+    def test_a_foreign_session_can_neither_read_nor_use_the_id(self) -> None:
+        task, attempt_id = self.in_doubt_task()
+        stranger = SessionState(objective="stranger")
+        self.memory.save_session(stranger)
+        code, payload = self.run_cli(
+            ["show", "--session-id", stranger.id, "--task-id", task.id]
+        )
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertNotIn(attempt_id, json.dumps(payload))
+        before = self.database_content()
+        code, _ = self.resolve(task.id, attempt_id, session_id=stranger.id)
+        self.assertEqual(code, EXIT_NOT_FOUND)
+        self.assertEqual(before, self.database_content())
+
+    def test_an_in_flight_attempt_is_shown_but_still_cannot_be_abandoned(self) -> None:
+        """Visibility is not permission, and there is no IN_FLIGHT recovery."""
+        task = self.make_task()
+        attempt_id = self.open_attempt(task.id, AttemptState.IN_FLIGHT)
+        self.assertEqual(self.shown_attempt_id(task.id), attempt_id)
+        before = self.database_content()
+        code, payload = self.resolve(task.id, attempt_id)
+        self.assertEqual(code, EXIT_INVALID_INPUT)
+        # A refusal renders the ordinary error envelope, not a recovery
+        # outcome: nothing was recovered, so there is no outcome to report.
+        self.assertEqual(payload["error"]["code"], ErrorCode.INVALID_TASK.value)
+        self.assertIn("UNKNOWN", payload["error"]["message"])
+        self.assertEqual(before, self.database_content(), "IN_FLIGHT was written")
+        self.assertEqual(self.connector.calls, [])
+        latest = self.memory.latest_execution_attempt(task.id)
+        assert latest is not None
+        self.assertIs(latest.state, AttemptState.IN_FLIGHT)
+
+    def test_a_prepared_attempt_is_shown_but_still_cannot_be_abandoned(self) -> None:
+        task = self.make_task()
+        attempt_id = self.open_attempt(task.id, AttemptState.PREPARED)
+        self.assertEqual(self.shown_attempt_id(task.id), attempt_id)
+        before = self.database_content()
+        code, _ = self.resolve(task.id, attempt_id)
+        self.assertEqual(code, EXIT_INVALID_INPUT)
+        self.assertEqual(before, self.database_content())
+
+
 class ScopeTests(RecoveryTestCase):
     """S2A adds exactly one recovery, and no more."""
 

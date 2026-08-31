@@ -1265,6 +1265,116 @@ class AuxiliaryProjectionTests(VisibilityTestCase):
             "another task's attempt was reported",
         )
 
+    # -- P2-1: the attempt's own identity ------------------------------
+
+    def test_the_summary_carries_the_exact_authoritative_attempt_id(self) -> None:
+        """The handle 'task resolve --attempt-id' demands.
+
+        Without it that shipped authority is reachable only by reading the
+        database by hand, which is not an operator flow.
+        """
+        _, task = self.prepared()
+        planted = self.memory.latest_execution_attempt(task.id)
+        assert planted is not None
+        summary = self.memory.latest_attempt_summary(task.id)
+        assert summary is not None
+        self.assertEqual(summary.id, planted.id)
+        self.assertTrue(summary.readable)
+
+    def test_show_renders_the_exact_attempt_id(self) -> None:
+        session, task = self.prepared()
+        planted = self.memory.latest_execution_attempt(task.id)
+        assert planted is not None
+        attempt = self.shown(session, task)["attempt"]
+        # Presence first, so a payload that simply dropped the field FAILS
+        # here rather than exploding on a missing key.
+        self.assertIn("id", attempt, "the attempt payload carries no id")
+        self.assertEqual(attempt.get("id"), planted.id)
+        # It is the ATTEMPT's identity, not the task's or the session's.
+        self.assertNotEqual(attempt.get("id"), task.id)
+        self.assertNotEqual(attempt.get("id"), session.id)
+
+    def test_the_attempt_id_is_shown_in_every_state_including_unknown(self) -> None:
+        """UNKNOWN_OUTCOME is the state the operator actually recovers from."""
+        for state in AttemptState:
+            with self.subTest(state=state.value):
+                session = self.make_session()
+                task = self.make_task(session.id)
+                planted_id = self.plant_attempt(session.id, task.id, state)
+                attempt = self.shown(session, task)["attempt"]
+                self.assertEqual(attempt.get("id"), planted_id)
+                self.assertEqual(attempt["state"], state.value)
+                self.assertTrue(attempt["readable"])
+
+    def test_the_payload_gained_no_other_field(self) -> None:
+        session, task = self.prepared()
+        self.assertEqual(
+            set(self.shown(session, task)["attempt"]),
+            {"id", "state", "connector", "updated_at", "replayable", "readable"},
+        )
+
+    def test_a_task_with_no_attempt_stays_bounded(self) -> None:
+        session = self.make_session()
+        task = self.make_task(session.id)
+        self.assertIsNone(self.memory.latest_attempt_summary(task.id))
+        self.assertIsNone(self.shown(session, task)["attempt"])
+
+    def test_an_attempt_owned_by_another_task_leaks_no_id(self) -> None:
+        """The identity travels only with the task that actually owns it.
+
+        The projection is scoped by the task's own id, so an attempt
+        reassigned to another task simply stops being this task's - and its
+        handle must not appear anywhere in this task's output. Handing the
+        operator an id belonging to someone else's attempt is precisely the
+        leak the scoping exists to prevent.
+        """
+        session, task = self.prepared()
+        planted = self.memory.latest_execution_attempt(task.id)
+        assert planted is not None
+        other = self.make_task(session.id)
+        # ``task_id`` is the scoping column itself, so it is rewritten
+        # directly rather than through ``write_attempt``.
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_attempts SET task_id = ? WHERE id = ?",
+                (other.id, planted.id),
+            )
+            connection.commit()
+        self.assertIsNone(
+            self.memory.latest_attempt_summary(task.id),
+            "an attempt owned by another task was reported",
+        )
+        rendered = self.rendered(
+            show_result(self.memory, self.settings, session.id, task.id)
+        )
+        self.assertNotIn(planted.id, rendered, "another task's attempt id leaked")
+        # ...and it IS still reachable from the task that now owns it, so the
+        # assertion above is scoping and not an emptied table.
+        moved = self.memory.latest_attempt_summary(other.id)
+        assert moved is not None
+        self.assertEqual(moved.id, planted.id)
+
+    def test_an_oversized_attempt_id_is_refused_not_echoed(self) -> None:
+        session, task = self.prepared()
+        self.write_attempt(task.id, id="ATTEMPT-ID-CANARY-" + "q" * 5000)
+        rendered = self.rendered(
+            show_result(self.memory, self.settings, session.id, task.id)
+        )
+        self.assertNotIn("ATTEMPT-ID-CANARY", rendered)
+        attempt = self.shown(session, task)["attempt"]
+        self.assertIsNone(attempt["id"])
+        self.assertFalse(attempt["readable"])
+        # The state is still valid, so it still travels.
+        self.assertEqual(attempt["state"], AttemptState.PREPARED.value)
+
+    def test_reading_the_attempt_id_writes_nothing(self) -> None:
+        session, task = self.prepared()
+        before = self.database_content()
+        for _ in range(3):
+            self.assertIsNotNone(self.shown(session, task)["attempt"]["id"])
+            self.assertIsNotNone(self.memory.latest_attempt_summary(task.id).id)
+        self.assertEqual(before, self.database_content(), "visibility wrote a row")
+
     # -- approvals -----------------------------------------------------
 
     def write_approval(self, task_id: str, session_id: str, **columns: object) -> None:

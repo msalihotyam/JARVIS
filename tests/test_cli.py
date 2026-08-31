@@ -8,6 +8,7 @@ subprocess, an auth probe or a model call.
 from __future__ import annotations
 
 import contextlib
+import sqlite3
 import io
 import json
 import sys
@@ -27,7 +28,9 @@ from jarvis.app import (
 )
 from jarvis.connectors import claude_code
 from jarvis.contracts import (
+    AttemptState,
     BillingClass,
+    ExecutionAttempt,
     OutboundDataPreview,
     OutcomeStatus,
     PermissionMode,
@@ -1042,6 +1045,78 @@ class CliTestCase(unittest.TestCase):
         self.assertFalse(self.production_connector.called)
         for process_mock in self.process_mocks:
             self.assertFalse(process_mock.called)
+
+
+class ShownAttemptIdCommandTests(CliTestCase):
+    """P2-1 at the command surface: the operator never opens SQLite.
+
+    The whole point of the fix is that these two commands compose. ``show``
+    prints an id and ``task resolve`` consumes the very same string, with no
+    other tool in between.
+    """
+
+    def in_doubt(self, connector) -> tuple[str, str, str]:
+        """A task left the way a crash leaves one: an attempt in doubt."""
+        _, session_id, task_id = self.start_awaiting_approval(connector)
+        attempt = self.memory.open_execution_attempt(
+            ExecutionAttempt(
+                session_id=session_id,
+                task_id=task_id,
+                connector="dummy",
+                fingerprint="f" * 64,
+            )
+        )
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_attempts SET state = ? WHERE id = ?",
+                (AttemptState.UNKNOWN_OUTCOME.value, attempt.id),
+            )
+            connection.commit()
+        return session_id, task_id, attempt.id
+
+    def test_show_prints_an_id_that_task_resolve_accepts(self) -> None:
+        connector = FakeConnector(risk=RiskLevel.MEDIUM)
+        session_id, task_id, attempt_id = self.in_doubt(connector)
+        code, output, _ = self.invoke(
+            ["show", "--session-id", session_id, "--task-id", task_id], connector
+        )
+        self.assertEqual(0, code)
+        shown = json.loads(output)["attempt"]["id"]
+        self.assertEqual(shown, attempt_id)
+        # Copied verbatim out of the rendered output, exactly as a person
+        # would: nothing else in this test knows the id.
+        code, output, _ = self.invoke(
+            ["task", "resolve", "--session-id", session_id, "--task-id", task_id,
+             "--attempt-id", shown, "--resolution", "abandoned"],
+            connector,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(
+            json.loads(output)["attempt_state"],
+            AttemptState.UNKNOWN_OUTCOME.value,
+        )
+        # Recovery is not a retry: nothing was executed on the way through.
+        self.assertEqual(connector.execute_calls, 0, "recovery replayed it")
+
+    def test_the_rendered_id_is_the_attempt_not_the_task_or_session(self) -> None:
+        connector = FakeConnector(risk=RiskLevel.MEDIUM)
+        session_id, task_id, expected = self.in_doubt(connector)
+        _, output, _ = self.invoke(
+            ["show", "--session-id", session_id, "--task-id", task_id], connector
+        )
+        attempt = json.loads(output)["attempt"]
+        self.assertEqual(attempt["id"], expected)
+        self.assertNotEqual(attempt["id"], task_id)
+        self.assertNotEqual(attempt["id"], session_id)
+
+    def test_a_task_with_no_attempt_renders_no_attempt_block(self) -> None:
+        connector = FakeConnector(risk=RiskLevel.MEDIUM)
+        _, session_id, task_id = self.start_awaiting_approval(connector)
+        code, output, _ = self.invoke(
+            ["show", "--session-id", session_id, "--task-id", task_id], connector
+        )
+        self.assertEqual(0, code)
+        self.assertIsNone(json.loads(output)["attempt"])
 
 
 if __name__ == "__main__":

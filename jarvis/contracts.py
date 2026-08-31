@@ -6273,8 +6273,16 @@ class AttemptSummary:
     persisted state is NOT coerced into a known one and never becomes
     ``replayable``. ``replayable`` is derived from the trusted enum alone, so
     a corrupted row can never be displayed as safe to run again.
+
+    ``id`` is the attempt's authoritative identity, and it is here for one
+    reason: ``task resolve`` requires the operator to name the EXACT attempt
+    they are recovering, and without it that shipped authority is only
+    reachable by reading the database by hand. It is a handle, not a
+    permission - recovery re-reads and re-proves the attempt it is given,
+    so knowing an id grants nothing.
     """
 
+    id: str | None = None
     state: AttemptState | None = None
     connector: str | None = None
     updated_at: str | None = None

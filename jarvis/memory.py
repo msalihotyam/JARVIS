@@ -3802,12 +3802,16 @@ class SQLiteMemoryStore:
         enum member to say it from.
 
         The attempt is selected by this task's own id, so no other task's
-        attempt can be shown here.
+        attempt can be shown here. Its own identity travels with it, from
+        the SAME authoritative row and the same single query - the operator
+        needs that handle to name the attempt to ``task resolve``, and a
+        second lookup to fetch it could return a different attempt than the
+        one being described.
         """
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT state, connector, updated_at, task_id
+                SELECT id, state, connector, updated_at, task_id
                 FROM execution_attempts
                 WHERE task_id = ? ORDER BY rowid DESC LIMIT 1
                 """,
@@ -3816,25 +3820,43 @@ class SQLiteMemoryStore:
         if row is None:
             return None
         if str(row["task_id"]) != task_id:
+            # The row does not agree that it belongs to this task, so nothing
+            # from it is this task's to show - the id least of all, since
+            # that would hand the operator a handle to another task's
+            # attempt.
             return AttemptSummary(readable=False)
+        # Bounded like every other auxiliary token: an id that is not a plain
+        # single-line string is refused outright rather than echoed.
+        attempt_id = visibility_text(row["id"])
         try:
             state = AttemptState(row["state"])
         except VISIBILITY_DECODE_ERRORS:
             state = None
         connector = visibility_text(row["connector"])
         updated_at = canonical_utc_timestamp(row["updated_at"])
-        if state is None or connector is None or updated_at is None:
+        if (
+            attempt_id is None
+            or state is None
+            or connector is None
+            or updated_at is None
+        ):
             # Partial truth is still reported: the state is the one field an
             # operator needs, and withholding a VALID one because a sibling
-            # field is corrupt would hide the answer they came for.
+            # field is corrupt would hide the answer they came for. The id
+            # travels under the same rule, for the same reason the approval
+            # projection lets a valid request id through a damaged body.
             return AttemptSummary(
+                id=attempt_id,
                 state=state,
                 connector=connector,
                 updated_at=updated_at,
                 readable=False,
             )
         return AttemptSummary(
-            state=state, connector=connector, updated_at=updated_at
+            id=attempt_id,
+            state=state,
+            connector=connector,
+            updated_at=updated_at,
         )
 
     def pending_approval_summary(
