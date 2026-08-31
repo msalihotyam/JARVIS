@@ -155,6 +155,21 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
 - Oturum/karar kaydını yerel depoya yazıp tekrar okuyabilmeli.
 - Harici model ve ücretli servis olmadan otomatik test edilebilmelidir.
 
+## Kalıcı yapılandırma (M12 S4)
+
+- Operatör tercihleri `~/.jarvis/config.json` (`config_version: 1`), kurulum
+  başına tek belge. SQLite şeması değişmedi (6/6); belge veritabanını
+  seçtiği için veritabanının içinde tutulamaz.
+- Öncelik: verilen `Settings` → geçici `--permission-mode` → kalıcı belge →
+  kod varsayılanı. Bu, S4 ile bilinçli olarak değişti: verilen `Settings`
+  artık geçici bayrağı yener.
+- `execution_enabled` genel yürütme bariyeridir ve onaylanamaz; ücretli rota
+  kapısı olan `paid_api_enabled` ondan ayrıdır.
+- Bozuk belge fail-closed: yürütme kapalı, mod STRICT, hiçbir alan kısmen
+  uygulanmaz. Onarım yolu `jarvis config reset --all`.
+- Aylık 20 USD sert sınırı yapılandırılabilir değildir ve öyle bir anahtar
+  belgeyi geçersiz kılar. Sır saklanmaz.
+
 ## Maliyet ve onay sınırları
 
 - **Kullanıcı kararı (yeni):** Claude Code, kullanıcının mevcut Claude Max aboneliği/OAuth oturumu üzerinden çalıştığında ve ek ölçülen parasal ücret doğurmadığında bu kullanım JARVIS'in 20 USD aylık parasal bütçesini tüketmez, ücretli API kullanımı sayılmaz ve uydurma USD harcaması üretilmez. Güvenilir biçimde elde edilebilen token/model/çağrı sayısı/sağlayıcı telemetrisi kaydedilebilir; dışarı veri gönderme onayı ve tüm güvenlik/izin politikası aynen geçerlidir.

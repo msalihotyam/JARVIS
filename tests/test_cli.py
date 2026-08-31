@@ -37,7 +37,8 @@ from jarvis.contracts import (
 )
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
-from jarvis.settings import Settings
+from jarvis import settings as settings_module
+from jarvis.settings import ConfigStore, Settings
 from tests.helpers import DummyConnector, safe_cleanup
 from tests.test_app import task_document
 
@@ -405,6 +406,15 @@ class CliTestCase(unittest.TestCase):
     # -- permission mode ---------------------------------------------------
 
     def test_permission_mode_precedence(self) -> None:
+        """M12 S4 locked the order: injected, then flag, then file, then code.
+
+        The change from earlier behaviour is deliberate and is the second
+        case below: a caller that hands in Settings has already decided, and
+        a transient flag no longer edits that decision. The flag still wins
+        over the persisted document and the defaults, which is what the third
+        case proves - with nothing injected, and against a config store of
+        its own so the developer's real one is never read.
+        """
         code, output, _ = self.invoke(["run", "--task-json", self.task_file()])
         self.assertEqual("session", json.loads(output)["effective_permission_mode"])
 
@@ -415,17 +425,29 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(10, code)
         self.assertEqual("strict", json.loads(output)["effective_permission_mode"])
 
-        # An explicit flag wins over the injected settings.
+        # Injected Settings now WIN over an explicit flag: the caller who
+        # supplied them is the higher authority, and the flag does not
+        # silently rewrite what they asked for.
         code, output, _ = self.invoke(
             ["--permission-mode", "smart_auto", "run", "--task-json", self.task_file()],
             settings=injected,
         )
-        self.assertEqual("smart_auto", json.loads(output)["effective_permission_mode"])
+        self.assertEqual("strict", json.loads(output)["effective_permission_mode"])
 
-        code, output, _ = self.invoke(
-            ["--permission-mode", "strict", "status"], app_factory=_must_not_build
-        )
-        self.assertEqual("strict", json.loads(output)["permission_mode"])
+        # With nothing injected, the transient flag beats the persisted
+        # document - and never writes it.
+        store_path = self.root / "config.json"
+        with mock.patch.object(settings_module, "default_config_path", lambda: store_path):
+            ConfigStore(store_path).reset_all()
+            ConfigStore(store_path).mutate(
+                lambda current: replace(current, permission_mode=PermissionMode.SESSION)
+            )
+            before = store_path.read_bytes()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cli.main(["--permission-mode", "strict", "status"], app_factory=_must_not_build)
+            self.assertEqual("strict", json.loads(out.getvalue())["permission_mode"])
+            self.assertEqual(before, store_path.read_bytes(), "the flag was written")
 
     # -- exit codes --------------------------------------------------------
 

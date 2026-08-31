@@ -575,6 +575,12 @@ class AgentCore:
                 terminal = self._terminal_run(session, task)
                 if terminal is not None:
                     return terminal
+        # S4. Ahead of registration, because registering a task is already a
+        # write: a run that cannot execute should leave no trace of having
+        # been asked. The loop carries the same barrier for resume.
+        barrier = self._execution_barrier(session, task)
+        if barrier is not None:
+            return barrier
         binding_failure = self._bind_project(session, task)
         if binding_failure is not None:
             return binding_failure
@@ -785,6 +791,20 @@ class AgentCore:
         task: Task,
         grant: PermissionGrant | None,
     ) -> AgentRun:
+        # S4. THE global execution barrier, and it is placed here on purpose:
+        # ahead of the canonical target binding, the connector lookup, the
+        # estimate, the attestation, any approval, any grant consumption, any
+        # attempt row and any reservation. Nothing downstream has run yet, so
+        # a disabled refusal costs nothing and leaves nothing behind.
+        #
+        # What it does NOT get to override is what already happened: a
+        # terminal task is still reported, and an attempt that is IN_FLIGHT
+        # or UNKNOWN_OUTCOME keeps its own H2 in-doubt verdict. Switching
+        # execution off is a statement about the future, not a way to
+        # relabel work whose outcome is already recorded.
+        barrier = self._execution_barrier(session, task)
+        if barrier is not None:
+            return barrier
         # P1-2: bind a filesystem target to its canonical identity ONCE, at
         # the single entry point every path into the loop passes through
         # (``run`` and ``resume`` both reach the loop only through here), and
@@ -2648,6 +2668,51 @@ class AgentCore:
             ),
         )
 
+    def _execution_barrier(
+        self, session: SessionState, task: Task
+    ) -> AgentRun | None:
+        """Refuse everything that could start work while execution is off.
+
+        A BARRIER rather than a gate. It asks no question, so nothing can
+        answer it: no permission mode, no approval, no grant, no
+        ``paid_api_approval_id`` and no paid-API decision changes the outcome.
+        That is the difference between this and ``PAID_API_GATE``, which is a
+        gate and is meant to be satisfiable.
+
+        Reads only. Existing authority still speaks first - a terminal task is
+        reported as it stands, and an in-doubt attempt is reported through the
+        ordinary H2 path - so the switch never rewrites a task, a checkpoint or
+        an attempt, and never replays anything. Turning execution back on
+        starts nothing either; only a later explicit run or resume can.
+        """
+        if self.settings.execution_enabled:
+            return None
+        terminal = self._terminal_run(session, task)
+        if terminal is not None:
+            return terminal
+        if task.stage is LoopStage.EXECUTE:
+            # H2 keeps precedence over the switch: an attempt whose outcome is
+            # unknown is in doubt whether or not execution is enabled, and
+            # saying "disabled" instead would hide the thing that matters.
+            attempt = self.memory.latest_execution_attempt(task.id)
+            if attempt is not None and attempt.state in (
+                AttemptState.IN_FLIGHT,
+                AttemptState.UNKNOWN_OUTCOME,
+            ):
+                return self._execution_in_doubt(session, task, attempt)
+        return AgentRun(
+            RunStatus.FAILED,
+            session,
+            task,
+            error=StructuredError(
+                ErrorCode.EXECUTION_DISABLED,
+                "Execution is disabled for this installation. No connector "
+                "was called and nothing was changed. Re-enable it with "
+                "'jarvis config set execution_enabled true'.",
+                retryable=True,
+            ),
+        )
+
     def _execution_journal_precheck(
         self, session: SessionState, task: Task
     ) -> AgentRun | str | None:
@@ -4239,6 +4304,40 @@ class AgentCore:
         self, session: SessionState, chain: ChainState, index: int
     ) -> tuple[AgentRun | None, str]:
         """Prove, materialize, run and settle exactly one step."""
+        # S4. The kill-switch reaches the chain HERE, before a step task is
+        # derived, materialized or bound, and before the registry is asked
+        # anything. Refusing later - at the ordinary resume below - would be
+        # too late: materialization creates a task row and writes the binding
+        # into step_task_ids, so the chain would already have moved even
+        # though nothing was allowed to run.
+        #
+        # An already-bound step is a different question, and it is not this
+        # one: it belongs to the durable authority that owns it. So the bound
+        # id is looked up FIRST, and anything already there is handed
+        # straight to resume, whose barrier and H2 precheck give the honest
+        # verdict - terminal reported, in-doubt reported as in doubt, and an
+        # ordinary bound task refused as disabled. Nothing here inspects the
+        # registry or a connector on the way.
+        if not self.settings.execution_enabled:
+            bound = chain.step_task_ids[index] if index < len(chain.step_task_ids) else ""
+            if bound:
+                return self.resume(session.id, bound), "blocked"
+            return (
+                AgentRun(
+                    RunStatus.FAILED,
+                    session,
+                    None,
+                    error=StructuredError(
+                        ErrorCode.EXECUTION_DISABLED,
+                        "Execution is disabled for this installation. No chain "
+                        "step was created, bound or started, and nothing was "
+                        "changed. Re-enable it with 'jarvis config set "
+                        "execution_enabled true'.",
+                        retryable=True,
+                    ),
+                ),
+                "blocked",
+            )
         task, reason = self.build_chain_step_task(session, chain, index)
         if task is None:
             return (

@@ -340,6 +340,22 @@ class ErrorCode(str, Enum):
     #: usage reconciliation failed. Always fail closed; never a retryable
     #: "probably fine" state, and never accompanied by a completed decision.
     BILLING_INTEGRITY_FAILED = "billing_integrity_failed"
+    #: The operator has switched execution off globally. A BARRIER, not a
+    #: gate: no permission mode, approval, grant or paid-API decision can
+    #: satisfy it, because it is not asking a question. It is refused before
+    #: any authority that could start work - connector selection, estimation,
+    #: attestation, approval creation, grant consumption, attempt opening or
+    #: a billing reservation - so a disabled run costs nothing and changes
+    #: nothing. Existing in-doubt work keeps its own H2 verdict.
+    EXECUTION_DISABLED = "execution_disabled"
+    #: The persisted configuration document could not be accepted. Every
+    #: refusal shape - malformed JSON, an unknown key, a wrong version, an
+    #: invalid value - reads the same way, and none of them applies a single
+    #: field. The runtime falls back to a fail-closed posture instead.
+    CONFIG_INVALID = "config_invalid"
+    #: The configuration store could not be read or written. Never carries
+    #: the underlying OS error, the path or a traceback.
+    CONFIG_IO_FAILED = "config_io_failed"
 
 
 class AttestationError(Exception):

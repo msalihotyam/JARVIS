@@ -2516,4 +2516,56 @@ Aşağıdakiler konuşmada değerlendirildi fakat çekirdeğin zorunlu bağıml�
 - Otomatik model yönlendirme, derin görev modeli ve yerel modeller.
 - Tam bilgisayar kontrolü ve banka/ekspertiz sistemi keşif otomasyonu.
 
+### 4.20 Kalıcı operatör yapılandırması ve genel yürütme bariyeri (M12 S4, uygulandı)
+
+Tek çalışma zamanı yetkisi `Settings` olarak kalır. S4 ona tek bir alan
+ekler — `execution_enabled: bool = True` — ve `Settings`'i dolduran kalıcı
+bir depo tanımlar. İkinci bir politika yetkisi yoktur.
+
+**Depo.** `~/.jarvis/config.json`, tek düz JSON belgesi, `config_version: 1`,
+en fazla 16 KiB. Belgenin anahtar kümesi kapalıdır ve her yazım **tam**
+kanonik belgeyi üretir (UTF-8, sıralı anahtarlar, `allow_nan=False`, tek
+sonda satır sonu). Eksik/bilinmeyen/tekrar eden anahtar, yanlış sürüm,
+JSON hatası, aşırı boyut, geçersiz tip veya geçersiz ilişki belgenin
+tamamını reddeder; hiçbir alan kısmen uygulanmaz. Ayrıştırılan değerler son
+olarak mevcut `Settings` kurucusundan geçer, böylece sabit aylık tavan ve
+ücretli rota ilişkisi gibi değişmezler zaten sahibi olan kodda kalır.
+
+Belge veritabanını *seçtiği* için veritabanının *içinde* yaşayamaz: kapsam
+operatör/kurulum başınadır, SQLite şeması değişmez (6/6) ve config sürümü
+onlarla karıştırılmaz.
+
+**Yazım.** Her `set`/`reset` aynı dizindeki süreçler arası bir kilit altında
+yürür: kilit alınır, belge kilit **içinde** yeniden okunup doğrulanır, yeni
+belge türetilir, geçici dosyaya yazılır, `flush` + `os.fsync` yapılır, dosya
+kapatılır ve `os.replace` ile yerine konur. Kilit içindeki yeniden okuma
+kritik: onsuz eski bir okuyucu, az önce kapatılmış bir yürütme anahtarını
+sessizce geri açabilirdi.
+
+**Öncelik.** Verilen `Settings` → geçici CLI bayrağı → kalıcı belge → kod
+varsayılanı. Bir çağıran `Settings` verdiyse dosya hiç okunmaz ve bayrak
+onun kararını değiştirmez. Bayraklar asla yazılmaz.
+
+**Bariyer.** `execution_enabled=False` bir kapı değil bariyerdir: izin modu,
+onay, grant veya `paid_api_approval_id` onu karşılayamaz. `run` içinde görev
+kaydından önce, döngüde ise kanonik hedef bağlamadan, konektör seçiminden,
+tahminden, attestation'dan, onay oluşturmadan, grant tüketiminden, deneme
+açmadan ve rezervasyondan önce reddedilir. Mevcut yetki önce konuşur:
+terminal görev raporlanır, IN_FLIGHT/UNKNOWN_OUTCOME kendi H2 in-doubt
+verdiktini korur, hiçbir şey yeniden oynatılmaz ve hiçbir görev, checkpoint
+veya deneme yalnızca yürütme kapalı diye yeniden yazılmaz. Yürütmeyi tekrar
+açmak da kendiliğinden hiçbir şey başlatmaz.
+
+**Fail-closed.** Reddedilen veya okunamayan belge `execution_enabled=False`,
+`permission_mode=STRICT`, `paid_api_enabled=False` duruşuna düşer; sıradan
+komutlar bounded bir hatayla reddedilir ve özellikle **varsayılan
+veritabanı sessizce açılmaz**. `config show` ve `config reset --all`
+erişilebilir kalır; `set` ve `reset <key>` bozuk belgeyi reddeder ve
+baytlarını değiştirmez.
+
+**Sır yok.** Belgede kimlik bilgisi tutulmaz ve `paid_api_approval_id`
+kimlik bilgisi biçimli değerleri reddeder. Çıktı sınırlı ve redakte
+edilmiştir: onay kimliği yalnızca *var/yok* olarak, veritabanı yolu ev
+dizinine göreli ya da `[PATH]` olarak raporlanır.
+
 Bu maddeler ihtiyaç doğduğunda güvenlik, lisans, bakım maliyeti ve gerçek fayda açısından ayrıca değerlendirilecektir.

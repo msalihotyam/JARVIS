@@ -181,9 +181,56 @@ jarvis [--permission-mode ...] reject  --session-id ID --task-id ID \
 jarvis [--permission-mode ...] cancel  --session-id ID --task-id ID
 ```
 
-İzin modu önceliği: açık `--permission-mode`, sonra verilen `Settings`, sonra
-varsayılan. Mod yalnız o çağrı için geçerlidir, task JSON'undan alınmaz ve task
-girdisine yazılmaz. Zorunlu onay gerektiren yan etkiler her modda onay ister.
+İzin modu önceliği (M12 S4): verilen `Settings`, sonra açık
+`--permission-mode`, sonra kalıcı yapılandırma, sonra kod varsayılanı. Bir
+çağıran `Settings` verdiyse karar onundur; geçici bayrak bunu sessizce
+değiştirmez. Bayrak yalnız o çağrı için geçerlidir, task JSON'undan alınmaz,
+task girdisine yazılmaz ve yapılandırma dosyasına **asla** yazılmaz. Zorunlu
+onay gerektiren yan etkiler her modda onay ister.
+
+### Kalıcı yapılandırma (M12 S4)
+
+Operatör tercihleri `~/.jarvis/config.json` içinde, tek bir düz JSON belgesi
+olarak tutulur (`config_version: 1`). Belge ya tamamen kabul edilir ya
+tamamen reddedilir: eksik anahtar, bilinmeyen anahtar, tekrar eden anahtar,
+yanlış sürüm veya geçersiz değer belgenin tamamını geçersiz kılar. Yazımlar
+aynı dizinde süreçler arası bir kilit altında, geçici dosya + `os.replace`
+ile atomiktir.
+
+```bash
+jarvis config show
+jarvis config set execution_enabled false
+jarvis config reset permission_mode
+jarvis config reset --all
+```
+
+Anahtarlar kapalı bir kümedir: `execution_enabled`, `permission_mode`,
+`paid_api_enabled`, `paid_api_approval_id`, `claude_call_budget_usd`,
+`approval_ttl_minutes`, `memory_database`.
+
+- **Genel yürütme anahtarı (`execution_enabled`)**: `false` olduğunda hiçbir
+  iş başlamaz. Bu bir *bariyer*, bir kapı değildir: izin modu, onay, grant
+  veya `paid_api_approval_id` onu aşamaz. Konektör seçimi, tahmin,
+  attestation, onay oluşturma, grant tüketimi, deneme kaydı ve rezervasyondan
+  **önce** reddedilir; hiçbir şey yazılmaz. `paid_api_enabled` bundan
+  ayrıdır ve yalnızca ücretli rota kapısıdır.
+- **Bozuk yapılandırma fail-closed'dır**: hiçbir alan kısmen uygulanmaz;
+  çalışma zamanı `execution_enabled=false` ve `permission_mode=strict`
+  duruşuna düşer, sıradan komutlar reddedilir. `jarvis config show` ve
+  `jarvis config reset --all` erişilebilir kalır.
+- **`reset --all` onarım işlemidir**: bozuk bir belgeyi kanonik
+  varsayılanlarla değiştirir ve bunu yaparken yürütmeyi tekrar **açar**;
+  çıktı bunu açıkça söyler.
+- **Sır saklanmaz**: API anahtarı, token, parola veya sağlayıcı kimlik
+  bilgisi yapılandırmaya yazılmaz. `paid_api_approval_id` yalnızca eylemsiz
+  meta veridir ve kimlik bilgisi biçimli değerler reddedilir.
+- **Aylık 20 USD sert sınırı yapılandırılabilir değildir**; kod/depolama
+  değişmezidir ve onu ayarlamaya çalışan bir anahtar belgeyi geçersiz kılar.
+  `claude_call_budget_usd` çağrı başına bir tavandır, aylık yetki değildir.
+- **`memory_database` bir kez kanonikleştirilir**: `config set` sırasında
+  `~` genişletilir ve göreli yol o komutun çalışma dizinine göre çözülür;
+  saklanan mutlak yol daha sonra hangi dizinden çalışılırsa çalışılsın aynı
+  veritabanını gösterir. Veritabanı veya üst dizini oluşturulmaz.
 
 ### Task JSON sınırı
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Callable
 from jarvis.app import (
     EXIT_INTERNAL,
     EXIT_INVALID_INPUT,
+    EXIT_POLICY,
     MAX_TASK_JSON_BYTES,
     CommandResult,
     JarvisApp,
@@ -20,6 +22,9 @@ from jarvis.app import (
     chain_cancel_result,
     chain_declare_result,
     chain_show_result,
+    config_failure_result,
+    config_mutation_result,
+    config_show_result,
     failure_result,
     memory_add_result,
     memory_list_result,
@@ -38,7 +43,15 @@ from jarvis.contracts import (
     ProjectMemoryKind,
 )
 from jarvis.memory import SQLiteMemoryStore
-from jarvis.settings import Settings
+from jarvis.settings import (
+    ConfigError,
+    ConfigStatus,
+    ConfigStore,
+    Settings,
+    SettingsLoadResult,
+    load_settings,
+    normalize_database_path,
+)
 
 
 class _ArgumentFailure(Exception):
@@ -67,6 +80,27 @@ def _build_parser() -> _ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("status", help="Show local settings and SQLite schema state.")
+    # Persistent operator configuration (M12 S4). Local-only, like ``status``:
+    # reading or changing a preference builds no database, no application, no
+    # registry and no connector, so configuring JARVIS can never run anything.
+    config_command = commands.add_parser(
+        "config", help="Show or change persistent operator settings."
+    )
+    config_actions = config_command.add_subparsers(dest="config_action")
+    config_actions.add_parser("show", help="Show the effective configuration.")
+    config_set = config_actions.add_parser("set", help="Set one known setting.")
+    config_set.add_argument("key", choices=list(CONFIG_SETTABLE_KEYS))
+    config_set.add_argument("value")
+    config_reset = config_actions.add_parser(
+        "reset", help="Reset one setting, or every setting."
+    )
+    config_reset.add_argument("key", nargs="?", choices=list(CONFIG_SETTABLE_KEYS))
+    config_reset.add_argument(
+        "--all",
+        action="store_true",
+        dest="reset_all",
+        help="Rewrite the whole document with canonical defaults.",
+    )
 
     # M12 S1: read-only operator visibility. Like ``status`` these build no
     # registry, connector or AgentCore, so they cannot execute, approve, open
@@ -299,6 +333,169 @@ def _dispatch_visibility_command(
     return show_result(memory, settings, args.session_id, args.task_id)
 
 
+#: The keys an operator may set or reset. Closed: anything else is refused
+#: by the parser before a single byte is read or written.
+CONFIG_SETTABLE_KEYS = (
+    "execution_enabled",
+    "permission_mode",
+    "paid_api_enabled",
+    "paid_api_approval_id",
+    "claude_call_budget_usd",
+    "approval_ttl_minutes",
+    "memory_database",
+)
+
+
+def _config_bool(key: str, raw: str) -> bool:
+    if raw in ("true", "false"):
+        return raw == "true"
+    raise ConfigError(
+        ErrorCode.CONFIG_INVALID, f"'{key}' must be exactly 'true' or 'false'."
+    )
+
+
+def _config_int(key: str, raw: str) -> int:
+    try:
+        return int(raw, 10)
+    except ValueError:
+        raise ConfigError(
+            ErrorCode.CONFIG_INVALID, f"'{key}' must be a whole number."
+        ) from None
+
+
+def _config_amount(key: str, raw: str) -> float:
+    try:
+        amount = float(raw)
+    except ValueError:
+        raise ConfigError(
+            ErrorCode.CONFIG_INVALID, f"'{key}' must be a number."
+        ) from None
+    if not math.isfinite(amount):
+        raise ConfigError(
+            ErrorCode.CONFIG_INVALID, f"'{key}' must be a finite number."
+        )
+    return amount
+
+
+def _config_change(key: str, raw: str):
+    """Turn one operator string into a change over Settings.
+
+    Conversion lives here and validation lives in ``settings``: the parser's
+    job is to say what the operator typed, and the store's job is to decide
+    whether it is allowed. Every change below returns a whole new Settings,
+    which the store then re-validates before anything is written.
+    """
+    if key == "execution_enabled":
+        value = _config_bool(key, raw)
+        return lambda current: replace(current, execution_enabled=value)
+    if key == "permission_mode":
+        try:
+            mode = PermissionMode(raw)
+        except ValueError:
+            raise ConfigError(
+                ErrorCode.CONFIG_INVALID,
+                "'permission_mode' must be one of: "
+                + ", ".join(mode.value for mode in PermissionMode)
+                + ".",
+            ) from None
+        return lambda current: replace(current, permission_mode=mode)
+    if key == "paid_api_enabled":
+        value = _config_bool(key, raw)
+        return lambda current: replace(current, paid_api_enabled=value)
+    if key == "paid_api_approval_id":
+        return lambda current: replace(current, paid_api_approval_id=raw)
+    if key == "claude_call_budget_usd":
+        amount = _config_amount(key, raw)
+        return lambda current: replace(current, claude_call_budget_usd=amount)
+    if key == "approval_ttl_minutes":
+        minutes = _config_int(key, raw)
+        return lambda current: replace(current, approval_ttl_minutes=minutes)
+    # memory_database: canonicalized ONCE here, against the directory this
+    # command actually ran in, so the stored absolute path keeps meaning the
+    # same database from anywhere later.
+    resolved = normalize_database_path(raw)
+    return lambda current: replace(current, memory_database=resolved)
+
+
+def _config_reset_change(key: str):
+    """Reset one key to its code default, keeping every relationship."""
+    defaults = Settings()
+    if key == "paid_api_approval_id":
+        def reset_id(current: Settings) -> Settings:
+            if current.paid_api_enabled:
+                # The relationship is the point: clearing the id while the
+                # paid route is on would leave a switch nothing authorized.
+                raise ConfigError(
+                    ErrorCode.CONFIG_INVALID,
+                    "'paid_api_approval_id' cannot be reset while "
+                    "'paid_api_enabled' is true. Disable it first.",
+                )
+            return replace(current, paid_api_approval_id=None)
+
+        return reset_id
+    value = getattr(defaults, key)
+    return lambda current: replace(current, **{key: value})
+
+
+def _dispatch_config_command(
+    settings_result, args: argparse.Namespace, store: ConfigStore
+) -> CommandResult:
+    """Local-only configuration commands. Nothing here can execute anything.
+
+    ``show`` reports even a refused store, because that is exactly when an
+    operator needs to see it. ``set`` and ``reset <key>`` REFUSE a document
+    they could not read, and leave its bytes untouched: deriving a "next"
+    document from one this build does not understand would silently discard
+    whatever the operator actually had. ``reset --all`` is the way out, and
+    is the one mutation that does not require the current document to be
+    valid.
+    """
+    action = getattr(args, "config_action", None)
+    mode = settings_result.settings.permission_mode
+    if action == "show":
+        # Read the store again rather than reporting whatever startup
+        # happened to load: this command's whole purpose is to say what is in
+        # there NOW, and reporting a value from earlier in the same process
+        # would be the one place it could be wrong.
+        return config_show_result(store, store.load())
+    if action == "reset" and getattr(args, "reset_all", False):
+        try:
+            updated = store.reset_all()
+        except ConfigError as exc:
+            return config_failure_result("config-reset-all", mode, exc)
+        return config_mutation_result(
+            "config-reset-all", store, updated, store.load()
+        )
+    if action in ("set", "reset"):
+        command = "config-set" if action == "set" else "config-reset"
+        key = getattr(args, "key", None)
+        if not key:
+            return failure_result(
+                command,
+                mode,
+                ErrorCode.CONFIG_INVALID,
+                "'config reset' requires a key, or '--all'.",
+                EXIT_INVALID_INPUT,
+            )
+        try:
+            change = (
+                _config_change(key, args.value)
+                if action == "set"
+                else _config_reset_change(key)
+            )
+            updated = store.mutate(change)
+        except ConfigError as exc:
+            return config_failure_result(command, mode, exc)
+        return config_mutation_result(command, store, updated, store.load())
+    return failure_result(
+        "config",
+        mode,
+        ErrorCode.CONFIG_INVALID,
+        "'config' requires the 'show', 'set' or 'reset' sub-command.",
+        EXIT_INVALID_INPUT,
+    )
+
+
 def _dispatch_chain_command(
     settings: Settings, args: argparse.Namespace
 ) -> CommandResult:
@@ -353,7 +550,20 @@ def main(
     app_factory: Callable[[Settings], JarvisApp] = build_default_app,
 ) -> int:
     parser = _build_parser()
-    base: Settings = settings or Settings()
+    # S4 PRECEDENCE, and it is deliberate:
+    #   1. explicitly injected Settings  - a caller that hands us settings has
+    #      already decided; the file is not read at all, and even a transient
+    #      flag does not edit their decision
+    #   2. transient CLI flags           - this invocation only, never written
+    #   3. the persisted document        - the operator's standing choice
+    #   4. code defaults
+    injected = settings is not None
+    settings_result = (
+        SettingsLoadResult(settings, ConfigStatus.VALID)
+        if settings is not None
+        else load_settings()
+    )
+    base: Settings = settings_result.settings
     try:
         args = parser.parse_args(argv)
     except _ArgumentFailure as exc:
@@ -374,11 +584,41 @@ def main(
 
     # Precedence: explicit CLI flag, then injected settings, then defaults.
     effective: Settings = base
-    if args.permission_mode:
+    if args.permission_mode and not injected:
+        # Transient, and only where nobody injected a decision of their own.
         effective = replace(
             effective, permission_mode=PermissionMode(args.permission_mode)
         )
     command = args.command or "status"
+
+    if command == "config":
+        # Before any store, application, registry, connector or model: a
+        # configuration command must be structurally incapable of running
+        # anything, exactly like ``status``.
+        config_result = _dispatch_config_command(
+            SettingsLoadResult(effective, settings_result.status, settings_result.reason),
+            args,
+            ConfigStore(),
+        )
+        print(config_result.render())
+        return config_result.exit_code
+
+    if not settings_result.usable:
+        # The stored configuration was refused. Ordinary commands do not get
+        # to proceed on a guess - notably they must not open the DEFAULT
+        # database when the operator had selected another one. Repair and
+        # inspection stay reachable through ``config`` above.
+        refusal = failure_result(
+            command,
+            effective.permission_mode,
+            ErrorCode.CONFIG_INVALID,
+            "The stored configuration was refused, so execution is disabled. "
+            "Inspect it with 'jarvis config show' or repair it with "
+            "'jarvis config reset --all'.",
+            EXIT_POLICY,
+        )
+        print(refusal.render())
+        return refusal.exit_code
 
     if command == "status":
         # Local metadata only: no registry, connector, probe or model call.

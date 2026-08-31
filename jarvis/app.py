@@ -104,7 +104,13 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
-from jarvis.settings import Settings
+from jarvis.settings import (
+    CONFIG_VERSION,
+    MONTHLY_HARD_LIMIT_USD,
+    ConfigError,
+    ConfigStore,
+    Settings,
+)
 
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
 #: Version 2 added the deterministic, redacted top-level ``progress`` object.
@@ -169,6 +175,11 @@ _ERROR_EXIT = {
     ErrorCode.PAID_API_DISABLED: EXIT_POLICY,
     ErrorCode.BILLING_ROUTE_UNKNOWN: EXIT_POLICY,
     ErrorCode.BILLING_INTEGRITY_FAILED: EXIT_POLICY,
+    # A policy refusal, and the strongest one: not a gate somebody can
+    # satisfy, so it shares the policy exit rather than an input one.
+    ErrorCode.EXECUTION_DISABLED: EXIT_POLICY,
+    ErrorCode.CONFIG_INVALID: EXIT_POLICY,
+    ErrorCode.CONFIG_IO_FAILED: EXIT_INTERNAL,
     ErrorCode.CONNECTOR_AMBIGUOUS: EXIT_POLICY,
     ErrorCode.EGRESS_REFUSED: EXIT_POLICY,
     ErrorCode.EXECUTION_UNKNOWN_OUTCOME: EXIT_POLICY,
@@ -1741,6 +1752,100 @@ def chain_declare_result(
     stored = memory.load_session(session_id)
     return CommandResult(
         build_envelope(command, settings.permission_mode, session=stored), EXIT_OK
+    )
+
+
+def _display_database(path: Path) -> str:
+    """The database path, home-relative where that is safe, else bounded.
+
+    A configuration report is not a place to hand out an operator's full
+    filesystem layout. Anything under the home directory is shown relative to
+    it, which is both shorter and less revealing; anything else is reduced to
+    a marker, because the exact location is not what the operator is checking
+    here.
+    """
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        return "[PATH]"
+    try:
+        return "~/" + path.relative_to(home).as_posix()
+    except ValueError:
+        return "[PATH]"
+
+
+def _config_payload(command: str, settings: Settings, result) -> dict[str, Any]:
+    """The bounded, effective view of configuration. Never the raw document.
+
+    Reports what the runtime WILL use, not what the file happens to contain -
+    on a refused store those differ, and the effective posture is the fact an
+    operator needs. No raw file content, no path beyond the bounded form
+    above, no credential-shaped value, and no key outside the closed set.
+    """
+    return {
+        "command": command,
+        "config_status": result.status.value,
+        "config_version": CONFIG_VERSION,
+        "config_reason": result.reason,
+        "execution_enabled": settings.execution_enabled,
+        "permission_mode": settings.permission_mode.value,
+        "paid_api_enabled": settings.paid_api_enabled,
+        "paid_api_approval_id_present": settings.paid_api_approval_id is not None,
+        "claude_call_budget_usd": settings.claude_call_budget_usd,
+        "approval_ttl_minutes": settings.approval_ttl_minutes,
+        "memory_database": _display_database(settings.memory_database),
+        # Stated because it is the question this surface most invites, and
+        # the answer is permanent: the monthly cap is not configuration.
+        "monthly_hard_limit_usd": MONTHLY_HARD_LIMIT_USD,
+        "monthly_hard_limit_configurable": False,
+    }
+
+
+def config_show_result(store: ConfigStore, settings_result) -> CommandResult:
+    """Report the effective configuration and the store's health.
+
+    Available even when the document is refused - especially then. An
+    operator whose store is broken needs to be told so, shown what the
+    runtime is actually doing instead, and pointed at the repair; a command
+    that simply failed would tell them none of that.
+    """
+    payload = _config_payload("config-show", settings_result.settings, settings_result)
+    if settings_result.usable:
+        return CommandResult(_redact(payload), EXIT_OK)
+    payload["next_step"] = (
+        "The stored configuration was refused, so a fail-closed posture is "
+        "in effect: execution is off and approvals are strict. Repair it "
+        "with 'jarvis config reset --all'."
+    )
+    return CommandResult(_redact(payload), EXIT_POLICY)
+
+
+def config_mutation_result(
+    command: str, store: ConfigStore, settings: Settings, settings_result
+) -> CommandResult:
+    """Report a completed mutation as the new effective configuration."""
+    payload = _config_payload(command, settings, settings_result)
+    if command == "config-reset-all" and settings.execution_enabled:
+        # Said plainly, because a repair that silently switches execution
+        # back on is a surprise an operator should never get from a command
+        # they ran to fix a file.
+        payload["next_step"] = (
+            "The configuration was reset to defaults. Execution is now "
+            "ENABLED and the permission mode is 'session'."
+        )
+    return CommandResult(_redact(payload), EXIT_OK)
+
+
+def config_failure_result(
+    command: str, permission_mode: PermissionMode, error: ConfigError
+) -> CommandResult:
+    """A bounded configuration refusal: a code and a short reason, no more."""
+    return failure_result(
+        command,
+        permission_mode,
+        error.code,
+        error.message,
+        _ERROR_EXIT.get(error.code, EXIT_POLICY),
     )
 
 
