@@ -231,4 +231,32 @@ class BaseConnector(ABC):
         )
 
     def cancel(self, task_id: str) -> bool:
+        """Ask THIS instance's own live operation for ``task_id`` to stop.
+
+        Advisory, best-effort, and owner-local. The only caller is the
+        AgentCore invocation that won the execution claim and is inside this
+        object's ``execute`` right now, on a watcher thread beside it. No
+        other process, no registry lookup and no freshly constructed
+        connector may call it: the live operation exists only in the
+        executing instance's own memory, so anyone else would be signalling
+        nothing, or something that is not theirs.
+
+        Return promptly. The owner joins the watcher before it resumes
+        lifecycle work, so a slow implementation delays the whole execution.
+        Do not block on the operation actually ending.
+
+        THE RETURN VALUE IS NOT EVIDENCE. ``True`` means a local signal was
+        delivered to something that looked alive - not that provider-side
+        work stopped, not that an external effect did not happen, not that
+        money stopped being spent, and never that the task is CANCELLED or
+        the attempt FINISHED. ``False`` is an equally valid answer for a
+        connector that supports no stop, or whose operation had already
+        finished, and it is the correct default here. An exception is no
+        different from ``False``.
+
+        Nothing about the call is persisted, and it is never retried. The
+        cancellation the operator asked for is already durable as
+        CANCEL_REQUESTED; the execution owner's normal post-execute path is
+        what turns it into an outcome.
+        """
         return False

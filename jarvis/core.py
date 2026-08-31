@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -338,6 +339,182 @@ _UNKNOWABLE_ON_RAISE_EFFECTS = frozenset(
         SideEffect.DESTRUCTIVE,
     }
 )
+
+
+#: How often the owner-local stop watcher asks storage whether a
+#: cancellation has been requested, in seconds. A calibration knob, not a
+#: correctness boundary: a longer interval only makes a stop less prompt,
+#: never less safe, because the watcher's authority does not depend on how
+#: fresh its read is - it can only ask its OWN live operation to stop.
+#: Read inside the loop so a test can tighten it without touching behaviour.
+_LIVE_STOP_POLL_SECONDS = 0.25
+
+#: How long the owner waits for its watcher to finish after the connector
+#: call returns. Sized above the storage busy timeout (5s) plus margin,
+#: because the one thing the watcher can be blocked in is a short SELECT on a
+#: busy database, which fails on its own within that bound. A watcher still
+#: alive after this would be a thread leak rather than a slow poll, so tests
+#: assert liveness rather than trusting the number.
+_LIVE_STOP_JOIN_SECONDS = 10.0
+
+
+class _LiveStopWatcher:
+    """One claimed execution's advisory, owner-local stop attempt.
+
+    S2B. Stopping live external work needs an external call, and an external
+    call cannot be made atomic with the storage decision authorizing it. S2A
+    proved that guarding it with a durable claim makes ACQUISITION unique
+    without making the SIGNAL safe, because a second actor's permission can
+    go stale between the two.
+
+    This dissolves that instead of guarding it. The only actor that ever
+    signals is the one that already won ``begin_execution`` and is holding
+    the connector object mid-call, in the same process - so "may I still
+    signal?" is answered by the connector's own live handle at the instant of
+    signalling, under the connector's own lock, not by a storage read that
+    could have gone stale. There is no second authority, because there is no
+    second actor.
+
+    What it may do: poll one bit of persisted intent, and ask THAT connector
+    object to stop THAT task, at most once, ever.
+
+    What it may never do: conclude an attempt, mark an outcome unknown, touch
+    a reservation, a grant, an approval or a chain, persist anything at all
+    about the stop, or retry. Its return value is ignored, and so is any
+    exception it raises: a connector that says True has delivered a local
+    signal, which is not evidence that provider-side work stopped, that money
+    stopped, or that any effect did not happen. The execution owner's normal
+    post-execute path remains the sole finalizer.
+    """
+
+    def __init__(
+        self,
+        memory: MemoryStore,
+        session_id: str,
+        task_id: str,
+        connector: BaseConnector,
+    ) -> None:
+        self._memory = memory
+        self._session_id = session_id
+        self._task_id = task_id
+        # THE EXACT OBJECT the owner is calling execute on. Never a registry
+        # lookup, never task.selected_connector, never a fresh construction:
+        # only this instance holds the live operation, and any other one
+        # would be signalling somebody else's work or nothing at all.
+        self._connector = connector
+        self._stop = threading.Event()
+        # THE signal-authority lock. It guards three things that must agree:
+        # whether authority has been revoked, whether the one attempt is
+        # spent, and the connector call itself. Holding it ACROSS the external
+        # call is the point - it is what lets ``stop`` mean "no signal can
+        # still be on its way", rather than "no signal has started yet".
+        self._signal_lock = threading.Lock()
+        self._revoked = False
+        # One attempt per claimed execution, consumed BEFORE the call so that
+        # a raising connector cannot leave a second attempt available.
+        self._attempted = False
+        self._thread = threading.Thread(
+            target=self._watch, name="jarvis-live-stop", daemon=True
+        )
+        #: Contained failures, kept visible but never consulted by anything
+        #: that decides an outcome.
+        self.last_read_error: Exception | None = None
+        self.last_stop_error: Exception | None = None
+
+    @property
+    def attempted(self) -> bool:
+        """Whether the single stop attempt has been consumed."""
+        return self._attempted
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """REVOKE stop authority, and return only once none can still be used.
+
+        This is a barrier, not a request. Two things have to be true before
+        the owner may touch a single piece of lifecycle state, and a timed
+        join delivers neither of them:
+
+        * a watcher parked in a slow storage read may wake up long after the
+          owner has finalized, so authority is revoked UNDER the signal lock -
+          its later ``_signal_once`` sees ``_revoked`` and refuses. The thread
+          ending is not what makes this safe; the flag is.
+        * a connector call already in flight must be FINISHED, not merely
+          started, or the owner would be concluding an execution while an
+          external stop is still crossing the boundary. Acquiring the lock
+          waits for exactly that.
+
+        So correctness rests on the lock, and nothing rests on the join. If a
+        connector ignores its prompt-return contract badly enough, the owner
+        waits here - fail-closed, and deliberately: the alternative is moving
+        lifecycle forward with an uncontrolled external call still running. A
+        process killed while waiting falls back to the existing crash and
+        in-doubt semantics, which is a state S2A already handles honestly.
+        """
+        self._stop.set()
+        with self._signal_lock:
+            # Crossing this lock is the guarantee. Anything already inside it
+            # has finished; anything arriving later finds authority gone.
+            self._revoked = True
+        # Cleanup only. A thread still parked in a read is now harmless, and
+        # its liveness is never treated as authority - which is also why a
+        # watcher that never started is stopped just as validly as one that
+        # did: revocation above is the whole guarantee.
+        if self._thread.ident is not None:
+            self._thread.join(timeout=_LIVE_STOP_JOIN_SECONDS)
+
+    @property
+    def revoked(self) -> bool:
+        """Whether stop authority has been revoked. Never re-granted."""
+        return self._revoked
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def _watch(self) -> None:
+        while not self._stop.wait(_LIVE_STOP_POLL_SECONDS):
+            if self._cancellation_requested():
+                self._signal_once()
+                return
+
+    def _cancellation_requested(self) -> bool:
+        """The one bit, or ``False`` when storage could not be asked.
+
+        A failed poll is not a cancellation and not a reason to give up:
+        storage may simply be busy, and the next poll asks again. A
+        permanently failing read therefore means no stop is ever attempted -
+        exactly the behaviour before this watcher existed.
+        """
+        try:
+            return self._memory.execution_cancellation_requested(
+                self._session_id, self._task_id
+            )
+        except Exception as exc:  # noqa: BLE001 - storage boundary
+            self.last_read_error = exc
+            return False
+
+    def _signal_once(self) -> None:
+        with self._signal_lock:
+            if self._revoked:
+                # The owner has moved on. A read that started before the
+                # barrier and finished after it carries no authority with it.
+                return
+            if self._attempted:
+                return
+            # Consumed FIRST. If the call raises, the attempt is still spent:
+            # a connector that failed to stop may equally have half-stopped,
+            # and asking again would be a second uninvited crossing of the
+            # same boundary on no better evidence.
+            self._attempted = True
+            try:
+                self._connector.cancel(self._task_id)
+            except Exception as exc:  # noqa: BLE001 - connector boundary
+                # Advisory, so a failure is indistinguishable from a refusal
+                # and neither is authority. Kept for inspection rather than
+                # discarded silently, and read by nothing that decides
+                # anything.
+                self.last_stop_error = exc
 
 
 class AgentCore:
@@ -1205,9 +1382,33 @@ class AgentCore:
                 unknowable_on_raise = (
                     current.side_effect.effect in _UNKNOWABLE_ON_RAISE_EFFECTS
                 )
+                # S2B. The claim is won and the reservation is committed, so
+                # THIS invocation is the execution owner and the only actor
+                # entitled to ask its own live operation to stop. The watcher
+                # exists for exactly the span of the blocking call below and
+                # is joined before any lifecycle work resumes; nothing it does
+                # is persisted, and nothing downstream reads its outcome.
+                stop_watcher = _LiveStopWatcher(
+                    self.memory, session.id, task.id, connector
+                )
+                stop_watcher.start()
+                # The call, and NOTHING else. The exception is captured rather
+                # than handled here: handling it would mean marking an attempt
+                # UNKNOWN - a lifecycle write - while the watcher could still
+                # be inside a connector stop. Everything waits for the barrier
+                # in the finally below.
+                execute_error: Exception | None = None
                 try:
                     result = connector.execute(task, session)
                 except Exception as exc:  # noqa: BLE001 - connector boundary
+                    execute_error = exc
+                finally:
+                    # THE BARRIER. Authority is revoked and any in-flight
+                    # connector stop has finished before one byte of lifecycle
+                    # state is touched.
+                    stop_watcher.stop()
+                if execute_error is not None:
+                    exc = execute_error
                     if unknowable_on_raise:
                         # The outcome is unknowable after a raise: mark the
                         # attempt non-replayable rather than inventing a clean

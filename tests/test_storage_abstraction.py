@@ -441,6 +441,18 @@ class InMemoryStore:
         self._save_task_guarded(session.id, task)
         return True
 
+    def execution_cancellation_requested(
+        self, session_id: str, task_id: str
+    ) -> bool:
+        # The narrow bit the owner-local stop watcher polls: authoritative
+        # state only, never a persisted document. The double's authoritative
+        # state is the stored Task and its ownership map, so it answers from
+        # those and nothing else.
+        task = self.tasks.get(task_id)
+        if task is None or self.task_sessions.get(task_id) != session_id:
+            return False
+        return task.status is TaskStatus.CANCEL_REQUESTED
+
     def cancel_task(
         self, session_id: str, task_id: str
     ) -> CancellationOutcome:

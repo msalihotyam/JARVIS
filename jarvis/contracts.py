@@ -6494,6 +6494,35 @@ class MemoryStore(Protocol):
         or terminal (no writes)."""
         ...
 
+    def execution_cancellation_requested(
+        self, session_id: str, task_id: str
+    ) -> bool:
+        """Whether this exact task is authoritatively CANCEL_REQUESTED.
+
+        The NARROWEST possible read, and deliberately so. Its only caller is
+        the owner-local stop watcher: a thread that runs beside a blocking
+        ``connector.execute`` and needs one bit - has the operator asked for
+        this to stop - polled repeatedly while an external call is in
+        progress. Everything a richer read would carry (the objective, the
+        progress, the persisted document, the connector metadata) is both
+        useless to that decision and a way for a corrupted document to reach
+        a code path that touches a live external operation.
+
+        So it answers from the task row's own columns and nothing else. No
+        ``state_json`` is decoded, no summary is projected, and no
+        transaction is held open across polls.
+
+        ``True`` only when the row exists, its ``session_id`` column is the
+        caller's, and its ``status`` column is exactly ``CANCEL_REQUESTED``.
+        A missing task, a foreign task and every other status are all
+        ``False`` - one answer, disclosing nothing about what else might be
+        true.
+
+        Reads only. It may never mutate anything, and a caller may never
+        treat it as authority over lifecycle: it reports intent, not outcome.
+        """
+        ...
+
     def cancel_task(
         self, session_id: str, task_id: str
     ) -> CancellationOutcome:

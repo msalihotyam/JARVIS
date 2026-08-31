@@ -1864,6 +1864,35 @@ class SQLiteMemoryStore:
             )
         return True
 
+    def execution_cancellation_requested(
+        self, session_id: str, task_id: str
+    ) -> bool:
+        """Whether this exact task is authoritatively CANCEL_REQUESTED.
+
+        S2B. The owner-local stop watcher's ONLY view of storage, and it is
+        two columns wide on purpose. The watcher polls this while a connector
+        call is in flight, so every byte it can see is a byte that could
+        steer a live external operation - and a persisted document is exactly
+        the thing S2A proved must not steer anything. ``state_json`` is never
+        read here, never decoded, and could be arbitrarily corrupt without
+        changing this answer.
+
+        Ownership is proved from the ``session_id`` column, so a foreign task
+        reads as ``False`` rather than as a fact about somebody else's work.
+        A missing row and every non-CANCEL_REQUESTED status read the same
+        way: one bit, no disclosure.
+
+        Reads only, one short statement, no transaction held across polls.
+        It reports INTENT. It is never evidence that anything stopped.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id, status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if row is None or row["session_id"] != session_id:
+            return False
+        return row["status"] == TaskStatus.CANCEL_REQUESTED.value
+
     def cancel_task(
         self, session_id: str, task_id: str
     ) -> CancellationOutcome:
