@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from jarvis.connectors.base import BaseConnector
+
 # Imported only because this module is the production composition root. The
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
-from jarvis.connectors.base import BaseConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
@@ -40,18 +41,20 @@ from jarvis.contracts import (
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_MODES,
     LOCAL_WRITE_SOURCE_KEY,
+    VISIBILITY_DECODE_ERRORS,
     VISIBILITY_DEFAULT_LIMIT,
     VISIBILITY_MAX_LIMIT,
     ActionScope,
+    AgentRun,
     ApprovalSummary,
     AttemptRecovery,
     AttemptRecoveryOutcome,
     AttemptState,
     AttemptSummary,
-    AgentRun,
     BillingClass,
     BillingIntegrityError,
     ChainState,
+    ChainStatus,
     ChainStep,
     CostEstimate,
     DataClassification,
@@ -102,7 +105,6 @@ from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-
 
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
 #: Version 2 added the deterministic, redacted top-level ``progress`` object.
@@ -1739,6 +1741,102 @@ def chain_declare_result(
     stored = memory.load_session(session_id)
     return CommandResult(
         build_envelope(command, settings.permission_mode, session=stored), EXIT_OK
+    )
+
+
+def chain_cancel_result(
+    memory: MemoryStore, settings: Settings, session_id: str
+) -> CommandResult:
+    """Cancel the session's chain through the EXISTING chain authority.
+
+    This surface decides nothing. It resolves which chain the session owns,
+    hands both ids to ``cancel_chain``, and reports the verdict that came
+    back. Every rule that matters already lives in that one transaction: the
+    chain must exist, must be the one named, and must still be ACTIVE, and
+    the cursor and every bound task id are preserved because cancellation
+    stops what has not started rather than undoing what has.
+
+    Two things it deliberately does NOT do, because the existing authority
+    does not:
+
+    * it does not touch the currently live task. A chain cancellation is not
+      a task cancellation; ordinary ``cancel`` owns that, with the H2 rules
+      S2A and S2B established. Terminalizing a running task from here would
+      be exactly the false CANCELLED those milestones exist to prevent.
+    * it does not suppress the successor by writing anything. It does not
+      need to: once the chain is no longer ACTIVE, every materialize and
+      advance refuses on its own precondition, so no step can be raced into
+      existence behind this call.
+
+    Local-only by construction. Routed beside ``declare`` and ``show``, so no
+    registry, connector or ``AgentCore`` is built to cancel a chain - the
+    isolation is structural rather than merely intended.
+    """
+    command = "chain-cancel"
+    unknown = failure_result(
+        command,
+        settings.permission_mode,
+        ErrorCode.UNKNOWN_SESSION,
+        f"Unknown session: {session_id}",
+        EXIT_NOT_FOUND,
+    )
+    inactive = failure_result(
+        command,
+        settings.permission_mode,
+        ErrorCode.INVALID_TASK,
+        "This session owns no active chain; nothing was cancelled.",
+        EXIT_INVALID_INPUT,
+    )
+    try:
+        session = memory.load_session(session_id)
+    except VISIBILITY_DECODE_ERRORS:
+        # An unreadable session row is not an invitation to guess which chain
+        # it meant. It reads as the same bounded refusal a missing one does:
+        # which of the two it was is not a fact this surface may disclose,
+        # and no traceback reaches the operator either way.
+        return unknown
+    if session is None:
+        return unknown
+    chain = session.chain
+    if chain is None:
+        return inactive
+    # The id comes from the session and is handed straight back to storage,
+    # which re-reads it inside the write transaction. A chain replaced between
+    # the two loses there as a conflict rather than being cancelled by
+    # mistake, so this read is a lookup and never an authority.
+    verdict = memory.cancel_chain(session_id, chain.id)
+    if verdict == "unknown":
+        return unknown
+    if verdict != "cancelled":
+        # "terminal" and "conflict" alike: the chain named is not the ACTIVE
+        # one any more, and storage wrote nothing. One message for both -
+        # whether it finished, was already cancelled or was replaced is not
+        # something a refusal needs to say.
+        return inactive
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "session_id": session_id,
+                # The bounded facts an operator needs, and no declaration:
+                # the steps are their own input and are echoed by declare and
+                # show, but a cancellation has no reason to repeat them.
+                "chain_status": ChainStatus.CANCELLED.value,
+                "chain_cancelled": True,
+                "tasks_modified": False,
+                "connector_called": False,
+                "successor_started": False,
+                "billing_modified": False,
+                "next_step": (
+                    "The chain is CANCELLED, so no further step will be "
+                    "materialized or advanced. Work already started is "
+                    "untouched: cancel a running task with 'cancel', and "
+                    "resolve an attempt whose outcome is unknown with "
+                    "'task resolve'."
+                ),
+            }
+        ),
+        EXIT_OK,
     )
 
 

@@ -17,6 +17,7 @@ from jarvis.app import (
     JarvisApp,
     TaskInputError,
     build_default_app,
+    chain_cancel_result,
     chain_declare_result,
     chain_show_result,
     failure_result,
@@ -170,7 +171,8 @@ def _build_parser() -> _ArgumentParser:
     # build no registry, connector, probe or model call, and neither of them
     # can advance a chain, create a step task or approve anything.
     chain_command = commands.add_parser(
-        "chain", help="Declare or show the session's inert sequential chain."
+        "chain",
+        help="Declare, show or cancel the session's sequential chain.",
     )
     chain_actions = chain_command.add_subparsers(dest="chain_action")
     chain_declare = chain_actions.add_parser(
@@ -180,6 +182,14 @@ def _build_parser() -> _ArgumentParser:
     chain_declare.add_argument("--chain-json", required=True, metavar="PATH|-")
     chain_show = chain_actions.add_parser("show")
     chain_show.add_argument("--session-id", required=True)
+    # Cancelling is local-only for the same reason declaring is: it stops
+    # future steps by flipping the chain out of ACTIVE, and stopping work
+    # needs no connector, no model and no AgentCore. Work already running is
+    # not its business - 'cancel' owns a live task.
+    chain_cancel = chain_actions.add_parser(
+        "cancel", help="Cancel the session's chain (starts and stops nothing)."
+    )
+    chain_cancel.add_argument("--session-id", required=True)
     # ``run`` is the ONE chain verb that executes, so unlike declare/show it
     # deliberately goes through the ordinary application path: it needs the
     # registry, the connectors and AgentCore, exactly as ``run`` does.
@@ -301,11 +311,13 @@ def _dispatch_chain_command(
         )
     if action == "show":
         return chain_show_result(memory, settings, args.session_id)
+    if action == "cancel":
+        return chain_cancel_result(memory, settings, args.session_id)
     return failure_result(
         "chain",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'chain' requires the 'declare' or 'show' sub-command.",
+        "'chain' requires the 'declare', 'show' or 'cancel' sub-command.",
         EXIT_INVALID_INPUT,
     )
 
