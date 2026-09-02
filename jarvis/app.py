@@ -1575,6 +1575,20 @@ def show_result(
         "chain": _visibility_chain_payload(session),
         # Already validated inside the projection.
         "chain_step_index": view.chain_step_index,
+        # P2. What the lifecycle alone cannot say. A task that ends CANCELLED
+        # because the operator's request beat a returned result is reported
+        # as CANCELLED - correctly - but an approved local write that had
+        # already landed is not undone by that, and this surface used to
+        # imply it was. Two constant-vocabulary values: no path, no bytes, no
+        # digest. ``None`` whenever no such effect is KNOWN.
+        "effect_applied": (
+            None
+            if view.effect_applied is None
+            else {
+                "kind": view.effect_applied.kind,
+                "status": view.effect_applied.status,
+            }
+        ),
     }
     return CommandResult(_redact(payload), EXIT_OK)
 

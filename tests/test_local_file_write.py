@@ -13,12 +13,15 @@ intended bytes.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +33,7 @@ from jarvis.app import (
     build_envelope,
     create_app,
     decode_task_json,
+    show_result,
 )
 from jarvis.connectors import claude_code, local_files
 from jarvis.connectors.base import BaseConnector
@@ -38,6 +42,7 @@ from jarvis.connectors.local_files import (
     LocalFileWriteConnector,
 )
 from jarvis.contracts import (
+    APPLIED_EFFECT_LOCAL_WRITE,
     LOCAL_WRITE_AMBIGUOUS,
     LOCAL_WRITE_CAPABILITY,
     LOCAL_WRITE_DID_NOT_LAND,
@@ -56,10 +61,12 @@ from jarvis.contracts import (
     DataClassification,
     ErrorCode,
     LocalWriteRecord,
+    LoopStage,
     MonetaryState,
     OutcomeStatus,
     PermissionGrant,
     PermissionMode,
+    ReservationState,
     RiskLevel,
     RunStatus,
     SessionState,
@@ -2547,6 +2554,246 @@ class ClaudeIsolationTests(LocalWriteTestCase):
 # --------------------------------------------------------------------------
 # 14. The structural contract for the persisted record
 # --------------------------------------------------------------------------
+
+
+class BlockingWriteConnector(LocalFileWriteConnector):
+    """A write that is genuinely IN FLIGHT while the test acts on it.
+
+    Not a simulation of the race: the attempt really is IN_FLIGHT and the
+    reservation really is committed for the whole time ``execute`` is parked
+    here, because the core has already crossed both before calling it. The
+    test cancels from another thread in exactly that window, then releases
+    the write, which then really lands.
+
+    ``cancel`` is deliberately NOT overridden. The base connector returns
+    ``False`` - a local write has no stop, and that is the whole premise of
+    this case: the operator asks, nothing can honour it, and the bytes reach
+    the disk anyway.
+    """
+
+    manifest = replace(LocalFileWriteConnector.manifest, name="blocking-writer")
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.executions = 0
+
+    def execute(self, task: Task, session: SessionState) -> ToolResult:  # type: ignore[override]
+        self.executions += 1
+        self.entered.set()
+        # Parked with the claim held. Everything the operator does now
+        # happens against a durably IN_FLIGHT attempt.
+        assert self.release.wait(timeout=30), "the test never released the write"
+        return super().execute(task, session)
+
+
+class CancelledAfterWriteTests(LocalWriteTestCase):
+    """P2. A cancellation that arrives too late to stop an approved write.
+
+    The lifecycle answer is unchanged and is not on trial here: the operator
+    asked before the result came back, so the task ends CANCELLED and H2 is
+    right to keep it there. What is on trial is whether the surface an
+    operator reads AFTERWARDS still admits that the write landed. It cannot
+    be undone - M5 keeps no backup - so a view that says only "cancelled" is
+    describing the workflow while implying something false about the disk.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.connector = BlockingWriteConnector(
+            allowed_roots=(self.root,), default_working_directory=self.root
+        )
+        self.settings = replace(
+            self.settings, memory_database=self.root / "cancelled.db"
+        )
+        self.app = create_app(settings=self.settings, connectors=(self.connector,))
+        self.core = self.app.core
+        self.memory = self.app.memory
+
+    # -- the coordinated real flow --------------------------------------
+
+    def cancel_after_write_starts(self, content: str = "durable bytes\n"):
+        """Approve, block in the write, cancel, release. Returns the run."""
+        target = self.root / "landed.txt"
+        task = write_task(target, content)
+        run = self.core.run(task)
+        self.assertIs(run.status, RunStatus.AWAITING_APPROVAL, msg=str(run.error))
+        grant = PermissionGrant.for_request(run.permission_request)
+        session_id = run.session.id
+        finished: list[Any] = []
+
+        def drive() -> None:
+            finished.append(self.core.resume(session_id, task.id, grant=grant))
+
+        worker = threading.Thread(target=drive, name="write-owner")
+        worker.start()
+        self.addCleanup(self.connector.release.set)
+        try:
+            self.assertTrue(
+                self.connector.entered.wait(timeout=30), "the write never started"
+            )
+            # THE window: the attempt is durably IN_FLIGHT right now.
+            attempt = self.memory.latest_execution_attempt(task.id)
+            assert attempt is not None
+            self.assertIs(attempt.state, AttemptState.IN_FLIGHT)
+            outcome = self.memory.cancel_task(session_id, task.id)
+            # Storage refuses to terminalize a claimed attempt: the intent is
+            # durable, the verdict is not final, and the owner concludes it.
+            self.assertEqual(outcome.verdict, "cancelling")
+        finally:
+            self.connector.release.set()
+        worker.join(timeout=30)
+        self.assertFalse(worker.is_alive(), "the owner never finished")
+        self.assertEqual(len(finished), 1)
+        return task, session_id, target, finished[0]
+
+    def events(self, task_id: str) -> list[str]:
+        with contextlib.closing(sqlite3.connect(self.settings.memory_database)) as db:
+            return [
+                str(row[0])
+                for row in db.execute(
+                    "SELECT event_type FROM event_log WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )
+            ]
+
+    def shown(self, session_id: str, task_id: str) -> dict:
+        return show_result(self.memory, self.settings, session_id, task_id).payload
+
+    # -- what actually happened -----------------------------------------
+
+    def test_the_approved_bytes_really_reached_the_disk(self) -> None:
+        content = "durable bytes\n"
+        _, _, target, _ = self.cancel_after_write_starts(content)
+        self.assertTrue(target.exists(), "the write did not land")
+        # Bytes, not decoded text: the exact approved content, unaltered.
+        self.assertEqual(target.read_bytes(), content.encode("utf-8"))
+        self.assertEqual(self.connector.executions, 1, "the write ran more than once")
+
+    def test_the_lifecycle_answer_is_still_cancelled(self) -> None:
+        """Unchanged, and deliberately so: the operator asked in time."""
+        task, _, _, run = self.cancel_after_write_starts()
+        self.assertIs(run.status, RunStatus.CANCELLED)
+        stored = self.memory.load_task(task.id)
+        assert stored is not None
+        self.assertIs(stored.status, TaskStatus.CANCELLED)
+        self.assertIs(stored.stage, LoopStage.CANCELLED)
+
+    def test_the_record_and_the_journal_agree_that_it_landed(self) -> None:
+        task, _, _, _ = self.cancel_after_write_starts()
+        stored = self.memory.load_task(task.id)
+        assert stored is not None
+        self.assertIsNone(local_write_record_refusal(stored.local_write))
+        self.assertEqual(stored.local_write.status, "written")
+        attempt = self.memory.latest_execution_attempt(task.id)
+        assert attempt is not None
+        self.assertIs(attempt.state, AttemptState.FINISHED)
+        trail = self.events(task.id)
+        self.assertIn("cancellation_requested", trail)
+        self.assertIn("execution_cancelled", trail)
+
+    def test_the_money_was_reconciled_and_nothing_was_refunded(self) -> None:
+        task, _, _, _ = self.cancel_after_write_starts()
+        attempt = self.memory.latest_execution_attempt(task.id)
+        assert attempt is not None
+        billing = self.memory.attempt_billing_record(attempt.id)
+        assert billing is not None
+        self.assertEqual(billing["state"], ReservationState.RECONCILED.value)
+        # A local write is free, so the honest amount is zero - not a refund
+        # of something that was never charged.
+        self.assertEqual(int(billing["reserved_nano_usd"]), 0)
+        self.assertEqual(int(billing["actual_nano_usd"]), 0)
+
+    # -- and what the operator is told afterwards ------------------------
+
+    def test_show_states_the_applied_effect(self) -> None:
+        """THE regression. Cancelled, and it happened anyway."""
+        task, session_id, _, _ = self.cancel_after_write_starts()
+        payload = self.shown(session_id, task.id)
+        self.assertEqual(payload["task"]["status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(
+            payload["effect_applied"],
+            {"kind": APPLIED_EFFECT_LOCAL_WRITE, "status": "written"},
+        )
+
+    def test_show_states_it_without_the_content_or_the_path(self) -> None:
+        content = "SECRET-WRITE-CONTENT-CANARY\n"
+        task, session_id, target, _ = self.cancel_after_write_starts(content)
+        rendered = show_result(
+            self.memory, self.settings, session_id, task.id
+        ).render()
+        self.assertNotIn("SECRET-WRITE-CONTENT-CANARY", rendered)
+        self.assertNotIn(str(target), rendered)
+        self.assertNotIn(str(self.root), rendered)
+        self.assertNotIn(hashlib.sha256(content.encode()).hexdigest(), rendered)
+        # Two constant-vocabulary values, and nothing else at all.
+        self.assertEqual(
+            set(self.shown(session_id, task.id)["effect_applied"]), {"kind", "status"}
+        )
+
+    def test_reading_it_repeatedly_writes_nothing(self) -> None:
+        task, session_id, _, _ = self.cancel_after_write_starts()
+        before = self.database_content()
+        for _ in range(3):
+            self.assertIsNotNone(self.shown(session_id, task.id)["effect_applied"])
+        self.assertEqual(before, self.database_content(), "show wrote a row")
+
+    def test_resume_after_the_fact_never_writes_again(self) -> None:
+        task, session_id, target, _ = self.cancel_after_write_starts()
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        before = self.database_content()
+        run = self.core.resume(session_id, task.id)
+        self.assertIs(run.status, RunStatus.CANCELLED)
+        self.assertEqual(self.connector.executions, 1, "the write ran again")
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
+        after = self.database_content()
+        for table in ("tasks", "execution_attempts", "attempt_billing", "usage_ledger"):
+            with self.subTest(table=table):
+                self.assertEqual(before[table], after[table])
+
+    def database_content(self) -> dict:
+        with contextlib.closing(sqlite3.connect(self.settings.memory_database)) as db:
+            tables = sorted(
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            )
+            return {table: list(db.execute(f"SELECT * FROM {table}")) for table in tables}
+
+    # -- negative controls, on this same real flow -----------------------
+
+    def test_a_cancellation_before_any_write_shows_no_effect(self) -> None:
+        """THE control M2 has to fail: CANCELLED alone proves nothing."""
+        task = write_task(self.root / "never.txt", "unwritten\n")
+        run = self.core.run(task)
+        self.assertIs(run.status, RunStatus.AWAITING_APPROVAL)
+        session_id = run.session.id
+        cancelled = self.core.cancel(session_id, task.id)
+        self.assertIs(cancelled.status, RunStatus.CANCELLED)
+        self.assertFalse((self.root / "never.txt").exists())
+        self.assertEqual(self.connector.executions, 0)
+        payload = self.shown(session_id, task.id)
+        self.assertEqual(payload["task"]["status"], TaskStatus.CANCELLED.value)
+        self.assertIsNone(payload["effect_applied"], "an effect was invented")
+
+    def test_a_prepared_but_unexecuted_write_shows_no_effect(self) -> None:
+        """The authority exists and the bytes do not. Nothing was applied."""
+        task = write_task(self.root / "pending.txt", "pending\n")
+        run = self.core.run(task)
+        self.assertIs(run.status, RunStatus.AWAITING_APPROVAL)
+        stored = self.memory.load_task(task.id)
+        assert stored is not None
+        record = self.connector.pre_execution_record(stored)
+        assert record is not None
+        self.assertEqual(record.status, "prepared")
+        stored.local_write = record
+        self.memory.save_task(run.session.id, stored)
+        self.assertIsNone(
+            self.shown(run.session.id, task.id)["effect_applied"],
+            "a prepared intent was reported as an applied effect",
+        )
 
 
 class RecordContractTests(unittest.TestCase):

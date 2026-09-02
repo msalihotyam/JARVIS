@@ -6170,6 +6170,52 @@ class ProgressSummary:
     plan: tuple[str, ...] = ()
 
 
+#: The one effect kind this projection can report. A closed vocabulary of
+#: exactly one, because exactly one capability in this product produces an
+#: irreversible local effect whose occurrence outlives the task that asked
+#: for it.
+APPLIED_EFFECT_LOCAL_WRITE = "local_write"
+
+#: The exact ``LocalWriteRecord`` status meaning the bytes reached the disk.
+#: "prepared", "refused" and "unknown" are all NOT this, and none of them may
+#: ever be reported as an applied effect.
+LOCAL_WRITE_APPLIED_STATUS = "written"
+
+
+@dataclass(frozen=True, slots=True)
+class AppliedEffectSummary:
+    """An irreversible effect this task is KNOWN to have already applied.
+
+    P2. A cancellation that arrives while an approved local write is already
+    IN_FLIGHT is honoured as a cancellation - the task really does end
+    CANCELLED, and H2 is right to keep it that way, because the operator's
+    request beat the result that came back. But the write itself may already
+    have landed, and it cannot be undone: M5 keeps no backup and promises no
+    rollback. A later ``show`` that reported only CANCELLED therefore stated
+    something true about the WORKFLOW while implying something false about
+    the WORLD - that nothing happened.
+
+    This says the other half. It is a fact about an effect, not about a
+    lifecycle: it is derived from the validated write record alone and never
+    from the task's status, so it can neither be manufactured by a
+    cancellation nor suppressed by one.
+
+    Two constant-vocabulary fields and nothing else. There is no path, no
+    digest, no size and no timestamp here - not because they would be
+    unbounded, but because none of them is needed to answer the one question
+    this exists for, and every field that is not needed is a field that could
+    later be widened. The bounded metadata view stays where it already lives,
+    in the local-write envelope block.
+
+    Untrusted-free and authority-free: possessing or reading it permits
+    nothing. It is never consulted by execution, recovery, approval, billing
+    or the chain, and it is produced only inside a read-only projection.
+    """
+
+    kind: str
+    status: str
+
+
 @dataclass(frozen=True, slots=True)
 class TaskSummary:
     """One task's lifecycle position. Never its content.
@@ -6194,6 +6240,11 @@ class TaskSummary:
     #: storage: there is no progress to report about a description that is
     #: not this task's.
     progress: ProgressSummary | None = None
+    #: P2. An irreversible effect this task already applied, frozen at the
+    #: same moment and under the same proof as ``progress``. ``None`` means
+    #: no such effect is KNOWN - which is the honest answer for a task that
+    #: applied none, and equally for a row whose record cannot be trusted.
+    effect_applied: AppliedEffectSummary | None = None
 
 
 #: The exception family a persisted document raises when it is not the shape

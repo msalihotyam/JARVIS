@@ -26,6 +26,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -41,6 +42,10 @@ from jarvis.app import (
 )
 from jarvis.cli import main as cli_main
 from jarvis.contracts import (
+    APPLIED_EFFECT_LOCAL_WRITE,
+    LOCAL_READ_CAPABILITY,
+    LOCAL_WRITE_CAPABILITY,
+    LOCAL_WRITE_MAX_BYTES,
     PROGRESS_TEXT_MAX_CHARS,
     VISIBILITY_DECODE_ERRORS,
     VISIBILITY_DEFAULT_LIMIT,
@@ -53,6 +58,7 @@ from jarvis.contracts import (
     DataClassification,
     ExecutionAttempt,
     LocalReadSnapshot,
+    LocalWriteRecord,
     LoopStage,
     ModelAnswer,
     PermissionRequest,
@@ -64,6 +70,7 @@ from jarvis.contracts import (
     TaskStatus,
     build_model_answer,
     chain_steps_from_declaration,
+    local_write_record_refusal,
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
@@ -2291,6 +2298,278 @@ class FrozenProgressTests(VisibilityTestCase):
         self.assertTrue(summary.readable)
         assert summary.next_step is not None
         self.assertLessEqual(len(summary.next_step), PROGRESS_TEXT_MAX_CHARS)
+
+
+class AppliedEffectProjectionTests(VisibilityTestCase):
+    """P2. The one applied-effect fact, and everything that must not produce it.
+
+    It answers a question about the WORLD - did this irreversible write
+    already land - which is exactly why it may not be derived from the task's
+    LIFECYCLE. A fact taken from CANCELLED would be manufactured by the very
+    cancellation it exists to qualify; a fact suppressed by COMPLETED would
+    hide a true one. So the record decides, alone, and only when it survives
+    the one canonical structural contract and says exactly ``written``.
+    """
+
+    def written_record(self, **overrides: object) -> LocalWriteRecord:
+        record = LocalWriteRecord(
+            relative_path="notes.txt",
+            mode="create",
+            pre_present=False,
+            pre_sha256="",
+            pre_byte_size=0,
+            intended_sha256="a" * 64,
+            intended_byte_size=5,
+            status="written",
+            written_at="2026-08-28T00:00:00+00:00",
+        )
+        self.assertIsNone(
+            local_write_record_refusal(record), "the fixture is not a valid record"
+        )
+        return replace(record, **overrides) if overrides else record
+
+    def task_with(self, record: LocalWriteRecord | None, **fields: object):
+        session = self.make_session()
+        task = self.make_task(session.id, capability=LOCAL_WRITE_CAPABILITY, **fields)
+        if record is not None:
+            task.local_write = record
+            self.memory.save_task(session.id, task)
+        return session, task
+
+    def effect(self, session, task):
+        return show_result(
+            self.memory, self.settings, session.id, task.id
+        ).payload["effect_applied"]
+
+    # -- the one positive case -----------------------------------------
+
+    def test_a_written_record_is_reported_as_applied(self) -> None:
+        session, task = self.task_with(self.written_record())
+        self.assertEqual(
+            self.effect(session, task),
+            {"kind": APPLIED_EFFECT_LOCAL_WRITE, "status": "written"},
+        )
+        summary = self.memory.task_summary(task.id)
+        assert summary is not None
+        assert summary.effect_applied is not None
+        self.assertEqual(summary.effect_applied.kind, APPLIED_EFFECT_LOCAL_WRITE)
+        self.assertEqual(summary.effect_applied.status, "written")
+
+    def test_it_is_derived_from_the_record_and_never_from_the_status(self) -> None:
+        """The same record under every lifecycle, and one answer throughout."""
+        for status, stage in (
+            (TaskStatus.CANCELLED, LoopStage.CANCELLED),
+            (TaskStatus.COMPLETED, LoopStage.COMPLETED),
+            (TaskStatus.FAILED, LoopStage.FAILED),
+            (TaskStatus.RUNNING, LoopStage.EXECUTE),
+        ):
+            with self.subTest(status=status.value):
+                session, task = self.task_with(
+                    self.written_record(), status=status, stage=stage
+                )
+                self.assertIsNotNone(
+                    self.effect(session, task),
+                    "a lifecycle state suppressed a true applied effect",
+                )
+
+    # -- negative controls ---------------------------------------------
+
+    def test_a_cancelled_task_that_wrote_nothing_reports_no_effect(self) -> None:
+        """CANCELLED alone is not evidence of anything having happened."""
+        session, task = self.task_with(
+            None, status=TaskStatus.CANCELLED, stage=LoopStage.CANCELLED
+        )
+        self.assertFalse(task.local_write.present)
+        self.assertIsNone(self.effect(session, task))
+
+    def test_a_task_with_no_local_write_reports_no_effect(self) -> None:
+        session = self.make_session()
+        task = self.make_task(session.id)
+        self.assertIsNone(self.effect(session, task))
+
+    def test_a_non_write_capability_reports_no_effect(self) -> None:
+        """The weak half: a non-write task that carries no record at all."""
+        session = self.make_session()
+        task = self.make_task(session.id, capability="echo")
+        self.assertIsNone(self.effect(session, task))
+
+    def test_a_non_write_task_cannot_manufacture_an_effect(self) -> None:
+        """THE adversarial case: a valid written record on a task that
+        could never have written anything.
+
+        A ``LocalWriteRecord`` is a DESCRIPTION. Any task document can carry
+        a perfectly canonical one - injected into a row, restored from a
+        tampered store, or copied from a real write - and the record's own
+        structural contract has no way to notice, because nothing in it says
+        which capability produced it. Validating the record alone therefore
+        let an ``echo`` or ``file_read`` task assert a durable, irreversible
+        effect it has no mechanism to have caused.
+
+        The record is deliberately fully valid here. A malformed one would
+        be refused by the structural contract and would prove nothing about
+        the capability guard; only a record that passes every other check can
+        show that the capability is what does the refusing.
+        """
+        canary = "INJECTED-WRITE-CANARY.txt"
+        record = self.written_record(relative_path=canary)
+        self.assertIsNone(
+            local_write_record_refusal(record),
+            "the injected record must be fully valid for this to be a test",
+        )
+        for capability in ("echo", LOCAL_READ_CAPABILITY, "code_analysis"):
+            with self.subTest(capability=capability):
+                session = self.make_session()
+                task = self.make_task(session.id, capability=capability)
+                # Injected into the PERSISTED document, the way a hostile or
+                # tampered row would carry it - not through a write flow,
+                # because no write flow could produce this task.
+                with contextlib.closing(sqlite3.connect(self.database)) as db:
+                    raw = db.execute(
+                        "SELECT state_json FROM tasks WHERE id = ?", (task.id,)
+                    ).fetchone()[0]
+                    document = json.loads(raw)
+                    document["local_write"] = record.to_dict()
+                    db.execute(
+                        "UPDATE tasks SET state_json = ? WHERE id = ?",
+                        (json.dumps(document), task.id),
+                    )
+                    db.commit()
+                # The row stays otherwise VALID: this is not a corrupted
+                # document degrading to unreadable, it is a readable one
+                # making a false claim.
+                summary = self.memory.task_summary(task.id)
+                assert summary is not None
+                self.assertTrue(summary.readable, "the row must stay readable")
+                self.assertEqual(summary.capability, capability)
+                self.assertIsNone(
+                    summary.effect_applied,
+                    f"a {capability!r} task manufactured an applied effect",
+                )
+                result = show_result(
+                    self.memory, self.settings, session.id, task.id
+                )
+                rendered = self.rendered(result)
+                self.assertIsNone(result.payload["effect_applied"])
+                self.assertNotIn(canary, rendered, "the injected path leaked")
+                self.assertNotIn(record.intended_sha256, rendered)
+
+    def test_the_capability_is_never_inferred_from_the_record(self) -> None:
+        """Presence of write-shaped data is not evidence of a write."""
+        session = self.make_session()
+        task = self.make_task(session.id, capability="echo")
+        task.local_write = self.written_record()
+        self.memory.save_task(session.id, task)
+        summary = self.memory.task_summary(task.id)
+        assert summary is not None
+        self.assertEqual(summary.capability, "echo")
+        self.assertIsNone(summary.effect_applied)
+
+    def test_reading_a_manufactured_claim_writes_nothing(self) -> None:
+        session = self.make_session()
+        task = self.make_task(session.id, capability="echo")
+        task.local_write = self.written_record()
+        self.memory.save_task(session.id, task)
+        before = self.database_content()
+        for _ in range(3):
+            self.assertIsNone(self.effect(session, task))
+        self.assertEqual(before, self.database_content(), "visibility wrote a row")
+
+    def test_every_non_written_status_reports_no_effect(self) -> None:
+        """prepared, refused and unknown are each a different NOT-written."""
+        for status in ("prepared", "refused", "unknown"):
+            with self.subTest(status=status):
+                session, task = self.task_with(self.written_record(status=status))
+                self.assertIsNone(
+                    self.effect(session, task),
+                    f"'{status}' was reported as an applied effect",
+                )
+
+    def test_a_status_outside_the_vocabulary_reports_no_effect(self) -> None:
+        for status in ("WRITTEN", "written ", "written!", "", "wr"):
+            with self.subTest(status=repr(status)):
+                session, task = self.task_with(self.written_record(status=status))
+                self.assertIsNone(self.effect(session, task))
+
+    def test_a_malformed_record_reports_no_effect_and_echoes_nothing(self) -> None:
+        """Structurally invalid, yet claiming ``written``. Refused whole."""
+        canary = "WRITE-RECORD-CANARY"
+        for label, record in (
+            ("bad digest", self.written_record(intended_sha256=canary)),
+            ("absolute path", self.written_record(relative_path=f"C:/{canary}.txt")),
+            ("traversal", self.written_record(relative_path=f"../{canary}.txt")),
+            ("mode contradicts pre-state", self.written_record(pre_present=True)),
+            ("bad mode", self.written_record(mode=canary)),
+            ("bad timestamp", self.written_record(written_at=canary)),
+            (
+                "oversized",
+                self.written_record(intended_byte_size=LOCAL_WRITE_MAX_BYTES + 1),
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNotNone(
+                    local_write_record_refusal(record), "the fixture is not malformed"
+                )
+                session, task = self.task_with(record)
+                rendered = self.rendered(
+                    show_result(self.memory, self.settings, session.id, task.id)
+                )
+                self.assertNotIn(canary, rendered, "a tampered value was echoed")
+                self.assertIsNone(json.loads(rendered)["effect_applied"])
+
+    def test_a_document_that_denies_its_own_row_reports_no_effect(self) -> None:
+        """No effect from state whose task identity is not proven.
+
+        The projection freezes the effect only after identity and lifecycle
+        agree with the authoritative columns, so a document carrying a
+        perfectly valid written record while claiming to be a different task -
+        or a different lifecycle - contributes nothing at all.
+        """
+        for label, mutate in (
+            ("foreign id", lambda document: {**document, "id": "another-task"}),
+            ("forged status", lambda document: {**document, "status": "completed"}),
+            ("forged stage", lambda document: {**document, "stage": "completed"}),
+        ):
+            with self.subTest(label=label):
+                session, task = self.task_with(self.written_record())
+                with contextlib.closing(sqlite3.connect(self.database)) as connection:
+                    raw = connection.execute(
+                        "SELECT state_json FROM tasks WHERE id = ?", (task.id,)
+                    ).fetchone()[0]
+                    connection.execute(
+                        "UPDATE tasks SET state_json = ? WHERE id = ?",
+                        (json.dumps(mutate(json.loads(raw))), task.id),
+                    )
+                    connection.commit()
+                payload = show_result(
+                    self.memory, self.settings, session.id, task.id
+                ).payload
+                self.assertFalse(payload["task"]["readable"])
+                self.assertIsNone(
+                    payload["effect_applied"], "an unproven document produced an effect"
+                )
+
+    def test_another_tasks_written_record_never_travels(self) -> None:
+        """The effect belongs to the task that applied it, and to no other."""
+        session, applied = self.task_with(self.written_record())
+        bystander = self.make_task(session.id, capability=LOCAL_WRITE_CAPABILITY)
+        self.assertIsNotNone(self.effect(session, applied))
+        self.assertIsNone(
+            self.effect(session, bystander), "a sibling task inherited the effect"
+        )
+
+    def test_a_foreign_session_cannot_read_the_effect_at_all(self) -> None:
+        _, task = self.task_with(self.written_record())
+        stranger = self.make_session()
+        result = show_result(self.memory, self.settings, stranger.id, task.id)
+        self.assertEqual(result.exit_code, EXIT_NOT_FOUND)
+        self.assertNotIn("effect_applied", self.rendered(result))
+
+    def test_reporting_the_effect_writes_nothing(self) -> None:
+        session, task = self.task_with(self.written_record())
+        before = self.database_content()
+        for _ in range(3):
+            self.assertIsNotNone(self.effect(session, task))
+        self.assertEqual(before, self.database_content(), "visibility wrote a row")
 
 
 if __name__ == "__main__":  # pragma: no cover

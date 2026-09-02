@@ -12,6 +12,9 @@ from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
 from jarvis.contracts import (
+    APPLIED_EFFECT_LOCAL_WRITE,
+    LOCAL_WRITE_APPLIED_STATUS,
+    AppliedEffectSummary,
     COST_CAP_GATE,
     MAX_NANO_USD,
     MAX_SQLITE_INTEGER,
@@ -80,6 +83,7 @@ from jarvis.contracts import (
     canonical_usd,
     chain_binding_refusal,
     local_read_snapshot_refusal,
+    local_write_record_refusal,
     chain_id_refusal,
     chain_state_refusal,
     chain_task_refusal,
@@ -3693,6 +3697,67 @@ class SQLiteMemoryStore:
             # P1. FROZEN HERE, from the document that was just proven, so no
             # later render has to reopen the row and race a replacement.
             progress=SQLiteMemoryStore._progress_summary(task),
+            # P2. Frozen at the same instant and for the same reason. It is
+            # derived from THIS proven document and nothing else - no second
+            # read, no auxiliary row, no reopened task - so there is no window
+            # in which the record could be swapped after the proof.
+            effect_applied=SQLiteMemoryStore._applied_effect(task),
+        )
+
+    @staticmethod
+    def _applied_effect(task: Task) -> AppliedEffectSummary | None:
+        """The irreversible effect an ALREADY-VALIDATED task has applied.
+
+        P2. Reached only after identity, status and stage have been proved
+        against the authoritative columns, so the record examined here belongs
+        to this row. Four things must hold before anything is reported, and
+        the order is the point:
+
+        * the TASK must hold the one capability that can perform a local
+          write. A record describes an operation; it is not evidence that
+          this task could ever have performed one;
+        * the record must survive the ONE canonical structural contract, the
+          same ``local_write_record_refusal`` the load boundary, the execution
+          boundary and the envelope all ask. A tampered or half-written record
+          answers nothing here rather than answering approximately;
+        * its status must be EXACTLY ``written``. "prepared" is an authorized
+          intent that may never have run, "refused" is a write that did not
+          happen, and "unknown" is the state whose whole meaning is that
+          nobody can say - reporting any of them as an applied effect would be
+          the same false claim in the opposite direction; and
+        * nothing about the TASK's lifecycle is consulted at all. That is
+          deliberate: a fact derived from CANCELLED would be manufactured by
+          the very cancellation this exists to qualify, and a fact suppressed
+          by COMPLETED would hide a truthful one. The effect either happened
+          or it did not, and only the record knows.
+
+        Nothing from the record crosses. Both reported values are constants
+        from a closed vocabulary, so this projection cannot echo a persisted
+        string even if one were tampered into the row.
+        """
+        # The CAPABILITY first, and it is not a formality. A record is a
+        # description, and a description is not evidence that the task it
+        # rides on ever had the authority to write anything: any task
+        # document can carry a perfectly canonical LocalWriteRecord, so
+        # validating the record alone let an "echo" or "file_read" task
+        # manufacture a durable claim that an irreversible write had been
+        # applied. Only the ONE capability that can actually perform a local
+        # write may report having performed one, and it is asked of the
+        # task's own authoritative capability rather than inferred from the
+        # presence of write-shaped data - inferring it from the data would be
+        # the same mistake in a different place.
+        if task.capability != LOCAL_WRITE_CAPABILITY:
+            return None
+        record = task.local_write
+        if local_write_record_refusal(record) is not None:
+            return None
+        # Exact, not a prefix and not a truthiness test: the refusal above
+        # already proved the field is a ``str`` from the closed status
+        # vocabulary, so this comparison decides between known spellings.
+        if record.status != LOCAL_WRITE_APPLIED_STATUS:
+            return None
+        return AppliedEffectSummary(
+            kind=APPLIED_EFFECT_LOCAL_WRITE, status=LOCAL_WRITE_APPLIED_STATUS
         )
 
     @staticmethod
