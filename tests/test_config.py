@@ -55,6 +55,7 @@ from jarvis.settings import (
     CONFIG_KEYS,
     CONFIG_MAX_BYTES,
     CONFIG_VERSION,
+    LEGACY_CONFIG_KEYS,
     MONTHLY_HARD_LIMIT_USD,
     ConfigError,
     ConfigStatus,
@@ -97,6 +98,8 @@ class ConfigTestCase(unittest.TestCase):
             "claude_call_budget_usd": 0.25,
             "approval_ttl_minutes": 30,
             "memory_database": str(self.root / "jarvis.db"),
+            "claude_model": None,
+            "claude_effort": None,
         }
         document.update(overrides)
         return document
@@ -163,12 +166,14 @@ class ParsingTests(ConfigTestCase):
                 "config_version", "execution_enabled", "permission_mode",
                 "paid_api_enabled", "paid_api_approval_id",
                 "claude_call_budget_usd", "approval_ttl_minutes",
-                "memory_database",
+                "memory_database", "claude_model", "claude_effort",
             },
         )
 
-    def test_a_missing_key_invalidates_the_document(self) -> None:
-        for key in CONFIG_KEYS:
+    def test_a_missing_pre_existing_key_invalidates_the_document(self) -> None:
+        # Only the PRE-EXISTING keys: dropping exactly the two selection keys
+        # is the accepted legacy v1 shape, covered by its own tests below.
+        for key in sorted(LEGACY_CONFIG_KEYS):
             with self.subTest(missing=key):
                 document = self.canonical()
                 del document[key]
@@ -1679,6 +1684,246 @@ class RawTokenRefusalTests(ConfigTestCase):
                     shape.pattern.startswith("\\A"),
                     f"unanchored shape: {shape.pattern}",
                 )
+
+
+class ClaudeSelectionTests(ConfigTestCase):
+    """Manual Claude model/effort selection: operator authority, bounded data.
+
+    The selection is provider-scoped on purpose (only Claude is wired), is
+    validated at the one shared grammar in ``settings``, and is stored as
+    ordinary non-secret preference data. Nothing here may relax any other
+    setting.
+    """
+
+    def test_defaults_are_unset(self) -> None:
+        settings = self.load().settings
+        self.assertIsNone(settings.claude_model)
+        self.assertIsNone(settings.claude_effort)
+
+    def test_valid_values_round_trip_through_the_store(self) -> None:
+        def change(current: Settings) -> Settings:
+            return replace(
+                current,
+                claude_model="claude-sonnet-4-5",
+                claude_effort="high",
+            )
+
+        updated = self.store.mutate(change)
+        self.assertEqual(updated.claude_model, "claude-sonnet-4-5")
+        self.assertEqual(updated.claude_effort, "high")
+        reloaded = self.store.load()
+        self.assertIs(reloaded.status, ConfigStatus.VALID)
+        self.assertEqual(reloaded.settings.claude_model, "claude-sonnet-4-5")
+        self.assertEqual(reloaded.settings.claude_effort, "high")
+
+    def test_a_document_with_null_selection_is_valid(self) -> None:
+        self.write(self.canonical())
+        result = self.load()
+        self.assertIs(result.status, ConfigStatus.VALID)
+        self.assertIsNone(result.settings.claude_model)
+        self.assertIsNone(result.settings.claude_effort)
+
+    # -- Finding 1: the exact legacy ea1c123-era v1 shape -------------------
+
+    def _legacy_document(self, **overrides: object) -> dict:
+        document = self.canonical(**overrides)
+        del document["claude_model"]
+        del document["claude_effort"]
+        return document
+
+    def test_the_exact_legacy_v1_document_loads_valid(self) -> None:
+        self.write(self._legacy_document())
+        result = self.load()
+        self.assertIs(result.status, ConfigStatus.VALID)
+        self.assertIsNone(result.settings.claude_model)
+        self.assertIsNone(result.settings.claude_effort)
+        # Every persisted pre-existing setting survives untouched.
+        self.assertIs(result.settings.execution_enabled, True)
+        self.assertIs(result.settings.permission_mode, PermissionMode.SESSION)
+        self.assertIs(result.settings.paid_api_enabled, False)
+        self.assertIsNone(result.settings.paid_api_approval_id)
+        self.assertEqual(result.settings.claude_call_budget_usd, 0.25)
+        self.assertEqual(result.settings.approval_ttl_minutes, 30)
+        self.assertEqual(
+            result.settings.memory_database,
+            Path(self.canonical()["memory_database"]),
+        )
+
+    def test_the_legacy_document_preserves_non_default_values(self) -> None:
+        self.write(
+            self._legacy_document(
+                execution_enabled=False,
+                permission_mode="strict",
+                approval_ttl_minutes=90,
+                claude_call_budget_usd=1.5,
+                paid_api_enabled=True,
+                paid_api_approval_id="approval-1",
+            )
+        )
+        result = self.load()
+        self.assertIs(result.status, ConfigStatus.VALID)
+        self.assertIs(result.settings.execution_enabled, False)
+        self.assertIs(result.settings.permission_mode, PermissionMode.STRICT)
+        self.assertEqual(result.settings.approval_ttl_minutes, 90)
+        self.assertEqual(result.settings.claude_call_budget_usd, 1.5)
+        self.assertIs(result.settings.paid_api_enabled, True)
+        self.assertEqual(result.settings.paid_api_approval_id, "approval-1")
+        self.assertIsNone(result.settings.claude_model)
+        self.assertIsNone(result.settings.claude_effort)
+
+    def test_one_new_key_without_the_other_is_still_invalid(self) -> None:
+        for dropped in ("claude_model", "claude_effort"):
+            with self.subTest(dropped=dropped):
+                document = self.canonical()
+                del document[dropped]
+                self.write(document)
+                self.assertIs(self.load().status, ConfigStatus.INVALID)
+
+    def test_set_on_a_legacy_document_upgrades_it_to_the_current_shape(self) -> None:
+        self.write(self._legacy_document())
+        code, shown = self.payload(["config", "set", "claude_effort", "high"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(shown["claude_effort"], "high")
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), set(CONFIG_KEYS))
+        self.assertEqual(stored["claude_effort"], "high")
+        self.assertIsNone(stored["claude_model"])
+        self.assertIs(ConfigStore(self.path).load().status, ConfigStatus.VALID)
+
+    def test_reset_key_on_a_legacy_document_upgrades_it_too(self) -> None:
+        self.write(self._legacy_document(approval_ttl_minutes=90))
+        code, shown = self.payload(["config", "reset", "approval_ttl_minutes"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(shown["approval_ttl_minutes"], Settings().approval_ttl_minutes)
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored), set(CONFIG_KEYS))
+        self.assertIs(ConfigStore(self.path).load().status, ConfigStatus.VALID)
+
+    def test_a_mutated_legacy_document_keeps_its_old_values(self) -> None:
+        self.write(
+            self._legacy_document(
+                execution_enabled=False,
+                permission_mode="strict",
+            )
+        )
+        self.payload(["config", "set", "claude_model", "claude-opus-4-1"])
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertIs(stored["execution_enabled"], False)
+        self.assertEqual(stored["permission_mode"], "strict")
+        self.assertEqual(stored["claude_model"], "claude-opus-4-1")
+        self.assertIsNone(stored["claude_effort"])
+
+    # -- Finding 2: the full published effort vocabulary --------------------
+
+    def test_all_five_efforts_round_trip_through_the_store(self) -> None:
+        self.store.reset_all()
+        for value in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=value):
+                code, _ = self.payload(["config", "set", "claude_effort", value])
+                self.assertEqual(code, EXIT_OK)
+                _code, shown = self.payload(["config", "show"])
+                self.assertEqual(shown["claude_effort"], value)
+
+    def test_set_and_show_expose_the_selected_values(self) -> None:
+        self.store.reset_all()
+        code, _ = self.payload(["config", "set", "claude_model", "claude-opus-4-1"])
+        self.assertEqual(code, EXIT_OK)
+        code, _ = self.payload(["config", "set", "claude_effort", "medium"])
+        self.assertEqual(code, EXIT_OK)
+        code, shown = self.payload(["config", "show"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(shown["claude_model"], "claude-opus-4-1")
+        self.assertEqual(shown["claude_effort"], "medium")
+        # Unrelated settings semantics are untouched by the new keys.
+        self.assertIs(shown["execution_enabled"], True)
+        self.assertEqual(shown["permission_mode"], "session")
+        self.assertIs(shown["paid_api_enabled"], False)
+        self.assertIs(shown["paid_api_approval_id_present"], False)
+        self.assertEqual(shown["claude_call_budget_usd"], 0.25)
+        self.assertEqual(shown["approval_ttl_minutes"], 30)
+
+    def test_reset_returns_selection_to_unset(self) -> None:
+        self.store.reset_all()
+        self.payload(["config", "set", "claude_model", "claude-sonnet-4-5"])
+        self.payload(["config", "set", "claude_effort", "low"])
+        code, shown = self.payload(["config", "reset", "claude_model"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIsNone(shown["claude_model"])
+        # The untouched key survives the reset of its sibling.
+        self.assertEqual(shown["claude_effort"], "low")
+
+    def test_an_invalid_effort_is_refused_and_never_written(self) -> None:
+        self.store.reset_all()
+        before = self.path.read_bytes()
+        for value in ("extreme", "HIGH", "Low", "low medium", "", "ultracode"):
+            with self.subTest(value=value):
+                code, shown = self.payload(["config", "set", "claude_effort", value])
+                self.assertEqual(code, EXIT_POLICY)
+                # The refusal is value-free and the store bytes stand.
+                if value:
+                    self.assertNotIn(value, json.dumps(shown))
+                self.assertEqual(before, self.path.read_bytes())
+
+    def test_invalid_model_values_are_refused_at_construction(self) -> None:
+        for value in (
+            "-p",              # flag-like
+            "--model",         # flag-like
+            "-",
+            "a b",             # whitespace separator
+            "a;b",             # shell separator
+            "a|b",
+            "a&b",
+            "a\nb",            # control character
+            "a\tb",
+            "a\x00b",
+            "a/b",             # path separator
+            "a:b",
+            "a'b",
+            'a"b',
+            "",                # empty
+            "$HOME",
+            "a" * 65,          # over the length bound
+            7,                 # wrong type
+            True,
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    Settings(claude_model=value)
+
+    def test_an_invalid_model_is_refused_at_set_time_and_never_echoed(self) -> None:
+        self.store.reset_all()
+        before = self.path.read_bytes()
+        # A leading dash is refused by the closed parser itself; the other
+        # shapes reach the store and are refused by the shared grammar.
+        for value in ("-p", "--model"):
+            with self.subTest(value=value):
+                code, _ = self.payload(["config", "set", "claude_model", value])
+                self.assertNotEqual(EXIT_OK, code)
+                self.assertEqual(before, self.path.read_bytes())
+        for value in ("a;b", "a b"):
+            with self.subTest(value=value):
+                code, shown = self.payload(["config", "set", "claude_model", value])
+                self.assertEqual(code, EXIT_POLICY)
+                self.assertNotIn(value, json.dumps(shown))
+                self.assertEqual(before, self.path.read_bytes())
+
+    def test_an_invalid_effort_is_refused_at_construction(self) -> None:
+        for value in ("extreme", "HIGH", "", "low medium", 7, True):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    Settings(claude_effort=value)
+
+    def test_a_malformed_persisted_selection_invalidates_the_document(self) -> None:
+        for overrides in (
+            {"claude_model": 7},
+            {"claude_model": "-p"},
+            {"claude_model": "a b"},
+            {"claude_effort": 7},
+            {"claude_effort": "extreme"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.write(self.canonical(**overrides))
+                self.assertIs(self.load().status, ConfigStatus.INVALID)
 
 
 if __name__ == "__main__":  # pragma: no cover

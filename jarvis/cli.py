@@ -343,6 +343,8 @@ CONFIG_SETTABLE_KEYS = (
     "claude_call_budget_usd",
     "approval_ttl_minutes",
     "memory_database",
+    "claude_model",
+    "claude_effort",
 )
 
 
@@ -407,6 +409,13 @@ def _config_change(key: str, raw: str):
     if key == "claude_call_budget_usd":
         amount = _config_amount(key, raw)
         return lambda current: replace(current, claude_call_budget_usd=amount)
+    # claude_model / claude_effort: the raw operator string is passed through
+    # and the shared grammar in ``settings`` is the only validator - both here
+    # via the store's re-validation and at every later Settings construction.
+    if key == "claude_model":
+        return lambda current: replace(current, claude_model=raw)
+    if key == "claude_effort":
+        return lambda current: replace(current, claude_effort=raw)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)

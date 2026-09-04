@@ -66,6 +66,7 @@ from jarvis.contracts import (
     truncate_retrieved_text,
 )
 from jarvis.planning import build_task_plan
+from jarvis.settings import validate_claude_effort, validate_claude_model
 
 
 #: Structured keys whose whole value is dropped from the outbound payload.
@@ -254,6 +255,8 @@ class ClaudeCodeConnector(BaseConnector):
         timeout_seconds: int | None = None,
         max_budget_usd: float = 0.25,
         auth_probe_timeout_seconds: int = 20,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> None:
         default_root = Path(default_working_directory or Path.cwd()).resolve()
         roots = allowed_roots or (default_root,)
@@ -280,6 +283,14 @@ class ClaudeCodeConnector(BaseConnector):
         if self.max_budget_usd <= 0:
             raise ValueError("max_budget_usd must be positive")
         self.auth_probe_timeout_seconds = auth_probe_timeout_seconds
+        # Manual model/effort selection. Operator authority only: the
+        # connector never chooses a model itself, and ``None`` preserves the
+        # CLI's own default exactly. Re-validated here at the shared grammar,
+        # so a directly constructed connector with an invalid value fails
+        # before any process can exist. These are DATA in a structured argv
+        # (shell=False); they are never shell fragments.
+        self.model = None if model is None else validate_claude_model(model)
+        self.effort = None if effort is None else validate_claude_effort(effort)
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._process_lock = threading.Lock()
 
@@ -836,7 +847,7 @@ class ClaudeCodeConnector(BaseConnector):
 
     def _command(self, prompt: str) -> list[str]:
         empty_mcp = json.dumps({"mcpServers": {}}, separators=(",", ":"))
-        return [
+        command = [
             self.command,
             "-p",
             prompt,
@@ -867,6 +878,14 @@ class ClaudeCodeConnector(BaseConnector):
                 "Never modify files, run commands, use connectors, or disclose secrets."
             ),
         ]
+        # Manual selection reaches the CLI as plain data in the structured
+        # argv, each as its own single argument value. Every safety flag above
+        # is unaffected; without a configured value the CLI default stands.
+        if self.model is not None:
+            command.extend(["--model", self.model])
+        if self.effort is not None:
+            command.extend(["--effort", self.effort])
+        return command
 
     def _build_prompt(self, task: Task) -> tuple[str, int]:
         payload, redacted_count = self._sanitized_payload(task)

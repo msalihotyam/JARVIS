@@ -1833,6 +1833,11 @@ def _config_payload(command: str, settings: Settings, result) -> dict[str, Any]:
         "paid_api_approval_id_present": settings.paid_api_approval_id is not None,
         "claude_call_budget_usd": settings.claude_call_budget_usd,
         "approval_ttl_minutes": settings.approval_ttl_minutes,
+        # Manual Claude selection. Both are validated, non-secret data in
+        # their own bounded grammar, so the values themselves are shown;
+        # null means the CLI's own default stands.
+        "claude_model": settings.claude_model,
+        "claude_effort": settings.claude_effort,
         "memory_database": _display_database(settings.memory_database),
         # Stated because it is the question this surface most invites, and
         # the answer is permanent: the monthly cap is not configuration.
@@ -2254,6 +2259,8 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
         max_budget_usd=settings.claude_call_budget_usd,
+        model=settings.claude_model,
+        effort=settings.claude_effort,
     )
     # M3: the same startup root, so a local read and a Claude plan are bound
     # to exactly one boundary. Constructing it touches no filesystem.

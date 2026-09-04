@@ -1098,5 +1098,285 @@ class LocalReadPayloadTests(unittest.TestCase):
         self.assertIn("local_read.notice", preview.field_names)
 
 
+class ClaudeModelSelectionTests(unittest.TestCase):
+    """Manual model/effort selection reaches the Claude argv exactly as data.
+
+    The selection is operator authority only, validated at the shared
+    settings grammar before any connector is constructed, and never changes
+    the safety flags, the shell=False launch, the outbound payload or the
+    billing route.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.root = Path(self.temp.name).resolve()
+        self.connector = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            max_budget_usd=0.15,
+            model="claude-sonnet-4-5",
+            effort="high",
+        )
+        environment = patch_oauth_environment()
+        environment.start()
+        self.addCleanup(environment.stop)
+        auth = patch.object(
+            ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
+        )
+        auth.start()
+        self.addCleanup(auth.stop)
+
+    def task(self, context=None) -> Task:
+        return Task(
+            objective="Analyze without changing files",
+            capability="code_planning",
+            scope=ActionScope(
+                action="analyze",
+                target=str(self.root),
+                destination="anthropic/claude-code",
+                data_classification=DataClassification.SENSITIVE,
+            ),
+            context=context or {},
+        )
+
+    @staticmethod
+    def argv_value(command: list[str], flag: str) -> str:
+        return command[command.index(flag) + 1]
+
+    def test_configured_model_reaches_the_argv_exactly(self) -> None:
+        command = self.connector._command("safe prompt")
+        self.assertEqual(1, command.count("--model"))
+        self.assertEqual("claude-sonnet-4-5", self.argv_value(command, "--model"))
+
+    def test_configured_effort_reaches_the_argv_exactly(self) -> None:
+        command = self.connector._command("safe prompt")
+        self.assertEqual(1, command.count("--effort"))
+        self.assertEqual("high", self.argv_value(command, "--effort"))
+
+    def test_all_five_supported_efforts_are_accepted_and_reach_the_argv(
+        self,
+    ) -> None:
+        for value in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=value):
+                self.assertEqual(value, Settings(claude_effort=value).claude_effort)
+                connector = ClaudeCodeConnector(
+                    allowed_roots=(self.root,),
+                    default_working_directory=self.root,
+                    effort=value,
+                )
+                command = connector._command("safe prompt")
+                self.assertEqual(1, command.count("--effort"))
+                self.assertEqual(value, self.argv_value(command, "--effort"))
+
+    def test_xhigh_and_max_reach_the_argv_as_single_structured_elements(
+        self,
+    ) -> None:
+        for value in ("xhigh", "max"):
+            with self.subTest(effort=value):
+                connector = ClaudeCodeConnector(
+                    allowed_roots=(self.root,),
+                    default_working_directory=self.root,
+                    effort=value,
+                )
+                command = connector._command("safe prompt")
+                self.assertIn("--effort", command)
+                self.assertEqual(value, command[command.index("--effort") + 1])
+                # One value, one argv element: no merging or splitting.
+                self.assertEqual(value, self.argv_value(command, "--effort"))
+                self.assertNotIn(f"--effort={value}", command)
+                self.assertNotIn(f"--effort {value}", command)
+
+    def test_unknown_and_wrong_casing_efforts_are_rejected_before_launch(
+        self,
+    ) -> None:
+        for value in (
+            "extreme",
+            "ultracode",
+            "HIGH",
+            "Max",
+            "Xhigh",
+            "xhigh ",
+            " low",
+            "",
+            "low medium",
+            7,
+            True,
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    Settings(claude_effort=value)
+                with self.assertRaises(ValueError):
+                    ClaudeCodeConnector(
+                        allowed_roots=(self.root,),
+                        default_working_directory=self.root,
+                        effort=value,
+                    )
+
+    def test_foreign_string_tricks_do_not_widen_the_effort_vocabulary(
+        self,
+    ) -> None:
+        class EffortStr(str):
+            pass
+
+        class FakeEffort:
+            value = "high"
+
+        for value in (EffortStr("low"), FakeEffort(), ["high"], {"low"}):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    Settings(claude_effort=value)
+                with self.assertRaises(ValueError):
+                    ClaudeCodeConnector(
+                        allowed_roots=(self.root,),
+                        default_working_directory=self.root,
+                        effort=value,
+                    )
+
+    def test_each_value_can_be_configured_alone_and_both_together(self) -> None:
+        model_only = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            model="claude-opus-4-1",
+        )
+        command = model_only._command("safe prompt")
+        self.assertEqual("claude-opus-4-1", self.argv_value(command, "--model"))
+        self.assertNotIn("--effort", command)
+        effort_only = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            effort="medium",
+        )
+        command = effort_only._command("safe prompt")
+        self.assertEqual("medium", self.argv_value(command, "--effort"))
+        self.assertNotIn("--model", command)
+        command = self.connector._command("safe prompt")
+        self.assertEqual("claude-sonnet-4-5", self.argv_value(command, "--model"))
+        self.assertEqual("high", self.argv_value(command, "--effort"))
+
+    def test_absent_configuration_preserves_the_existing_argv(self) -> None:
+        connector = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            max_budget_usd=0.15,
+        )
+        self.assertIsNone(connector.model)
+        self.assertIsNone(connector.effort)
+        command = connector._command("safe prompt")
+        self.assertNotIn("--model", command)
+        self.assertNotIn("--effort", command)
+        # The safety posture is byte-for-byte the one that always existed.
+        for required in (
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "plan",
+            "--max-budget-usd",
+            "0.1500",
+            "--no-chrome",
+            "--no-session-persistence",
+        ):
+            self.assertIn(required, command)
+
+    def test_an_invalid_effort_is_rejected_before_any_launch(self) -> None:
+        for value in ("extreme", "HIGH", "", "low medium", 7, True):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    ClaudeCodeConnector(
+                        allowed_roots=(self.root,),
+                        default_working_directory=self.root,
+                        effort=value,
+                    )
+                with self.assertRaises(ValueError):
+                    Settings(claude_effort=value)
+
+    def test_flag_like_separator_and_control_character_models_are_rejected(
+        self,
+    ) -> None:
+        for value in (
+            "-p",
+            "--model",
+            "-",
+            "a b",
+            "a;b",
+            "a|b",
+            "a\nb",
+            "a\tb",
+            "a\x00b",
+            "a/b",
+            "a'b",
+            'a"b',
+            "",
+            "a" * 65,
+            7,
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    ClaudeCodeConnector(
+                        allowed_roots=(self.root,),
+                        default_working_directory=self.root,
+                        model=value,
+                    )
+
+    @patch("jarvis.connectors.claude_code.subprocess.Popen")
+    def test_selection_leaves_safety_flags_shell_false_and_success_intact(
+        self, popen
+    ) -> None:
+        popen.return_value = FakeProcess(
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Plan ready",
+                    "total_cost_usd": 0,
+                    "usage": {"input_tokens": 10, "output_tokens": 4},
+                }
+            )
+        )
+        result = self.connector.execute(self.task(), SessionState())
+        self.assertEqual(OutcomeStatus.SUCCESS, result.outcome)
+        command = popen.call_args.args[0]
+        self.assertEqual(False, popen.call_args.kwargs["shell"])
+        for required in (
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--max-budget-usd",
+        ):
+            self.assertIn(required, command)
+        self.assertEqual("claude-sonnet-4-5", self.argv_value(command, "--model"))
+        self.assertEqual("high", self.argv_value(command, "--effort"))
+
+    def test_selection_changes_no_outbound_payload_billing_or_approval_surface(
+        self,
+    ) -> None:
+        plain = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            max_budget_usd=0.15,
+        )
+        task = self.task()
+        self.assertEqual(
+            plain.canonical_outbound(task), self.connector.canonical_outbound(task)
+        )
+        plain_preview = plain.outbound_preview(task)
+        selected_preview = self.connector.outbound_preview(task)
+        self.assertEqual(plain_preview.approximate_bytes, selected_preview.approximate_bytes)
+        self.assertEqual(plain_preview.field_names, selected_preview.field_names)
+        self.assertEqual(
+            plain_preview.destination, selected_preview.destination
+        )
+        plain_estimate = plain.estimate_cost(task)
+        selected_estimate = self.connector.estimate_cost(task)
+        self.assertEqual(plain_estimate.billing_class, selected_estimate.billing_class)
+        self.assertEqual(plain_estimate.maximum_usd, selected_estimate.maximum_usd)
+        self.assertEqual(
+            plain.resource_boundary(task), self.connector.resource_boundary(task)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

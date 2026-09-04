@@ -883,6 +883,24 @@ class CompositionRootTests(unittest.TestCase):
         )
         self.assertIs(self.settings, app.settings)
 
+    def test_default_app_carries_the_manual_claude_selection(self) -> None:
+        settings = replace(
+            self.settings,
+            claude_model="claude-sonnet-4-5",
+            claude_effort="high",
+        )
+        with mock.patch.object(
+            claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
+        ), mock.patch.object(
+            claude_code.subprocess, "Popen", side_effect=AssertionError("no subprocess")
+        ), mock.patch.object(
+            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+        ):
+            app = build_default_app(settings)
+        connector = app.core.registry.get("claude-code-plan")
+        self.assertEqual("claude-sonnet-4-5", connector.model)
+        self.assertEqual("high", connector.effort)
+
     def test_default_app_binds_the_local_reader_to_the_same_startup_root(self) -> None:
         # M3: the local reader and the Claude connector share exactly one
         # boundary, and constructing it touches no filesystem and no process.

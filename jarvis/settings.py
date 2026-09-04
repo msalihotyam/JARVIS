@@ -40,6 +40,46 @@ MAX_CALL_BUDGET_USD = 20.0
 MIN_APPROVAL_TTL_MINUTES = 1
 MAX_APPROVAL_TTL_MINUTES = 1440
 
+#: The closed effort vocabulary the manual Claude selection accepts: the
+#: published ``--effort`` values of the installed Claude Code integration.
+#: These are DATA passed to the CLI as ``--effort <value>``; a closed set is
+#: what makes the value unspendable as a second CLI argument. Nothing
+#: speculative is admitted; the set is provider-scoped to Claude.
+CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "max")
+
+#: The grammar of a manually selected Claude model identifier. Bounded on
+#: purpose: it must start with a letter or digit (so it can never read as a
+#: CLI flag), admit only letters, digits, dots, underscores and hyphens (no
+#: whitespace, separators, quotes, slashes or control characters), and never
+#: exceed 64 characters. This is a SHAPE check, not a list of model
+#: releases; which names the installed CLI accepts stays the CLI's business.
+CLAUDE_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+_MODEL_GRAMMAR_MESSAGE = (
+    "claude_model must be 1-64 characters of letters, digits, dot, "
+    "underscore or hyphen, starting with a letter or digit"
+)
+
+
+def validate_claude_model(value: object) -> str:
+    """The one validation for a manually selected Claude model identifier.
+
+    Raises ``ValueError`` with a bounded, value-free message; the offending
+    text is never echoed back.
+    """
+    if type(value) is not str or not CLAUDE_MODEL_PATTERN.match(value):
+        raise ValueError(_MODEL_GRAMMAR_MESSAGE)
+    return value
+
+
+def validate_claude_effort(value: object) -> str:
+    """The one validation for a manually selected Claude effort value."""
+    if type(value) is not str or value not in CLAUDE_EFFORT_VALUES:
+        raise ValueError(
+            "claude_effort must be one of: " + ", ".join(CLAUDE_EFFORT_VALUES) + "."
+        )
+    return value
+
 
 def _finite(name: str, value: float) -> float:
     """Reject a monetary/limit setting that is not an ordinary finite number.
@@ -77,6 +117,13 @@ class Settings:
     paid_api_approval_id: str | None = None
     approval_ttl_minutes: int = 30
     claude_call_budget_usd: float = 0.25
+    #: Manual Claude selection (provider-scoped on purpose: only Claude is
+    #: wired, and the names must not pretend a multi-provider router exists).
+    #: ``None`` preserves the CLI's own default behavior exactly; a set value
+    #: is operator authority, never connector or runtime choice. Neither
+    #: field is a secret: both are bounded, validated, displayable data.
+    claude_model: str | None = None
+    claude_effort: str | None = None
 
     def __post_init__(self) -> None:
         # THE typed runtime authority, and it has to actually be typed. Core
@@ -155,6 +202,17 @@ class Settings:
                 "claude_call_budget_usd must be greater than 0 and at most "
                 f"{MAX_CALL_BUDGET_USD}"
             )
+        # Manual Claude selection. Validated here, at the one place every
+        # construction passes through, so an invalid value can never be
+        # persisted, loaded or handed to a connector.
+        if self.claude_model is not None:
+            object.__setattr__(
+                self, "claude_model", validate_claude_model(self.claude_model)
+            )
+        if self.claude_effort is not None:
+            object.__setattr__(
+                self, "claude_effort", validate_claude_effort(self.claude_effort)
+            )
 
     def enable_paid_api(self, approval_id: str) -> Settings:
         if not approval_id.strip():
@@ -199,7 +257,18 @@ CONFIG_KEYS = (
     "claude_call_budget_usd",
     "approval_ttl_minutes",
     "memory_database",
+    "claude_model",
+    "claude_effort",
 )
+
+#: The legacy v1 key set: the document exactly as the canonical ea1c123 build
+#: wrote it, before manual Claude selection existed. A document carrying
+#: EXACTLY this key set still loads VALID with both new settings unset, so an
+#: operator's existing preferences survive without a repair. Any other shape
+#: - one new key without the other, any unknown key, any missing
+#: pre-existing key - is refused whole: this is a second accepted CLOSED
+#: shape, never a general "optional keys" hole.
+LEGACY_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"claude_model", "claude_effort"}
 
 #: Raw provider tokens the canonical policy does not classify. It is
 #: syntax-aware - it reads labels and delimiters - and a raw token carries
@@ -413,6 +482,37 @@ def normalize_database_path(raw: str, *, base: Path | None = None) -> Path:
     return resolved
 
 
+def _exact_claude_model(value: object) -> str | None:
+    """A validated model identifier or ``None``. The value is never echoed."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        _fail("'claude_model' must be a model identifier or null.")
+    try:
+        return validate_claude_model(value)
+    except ValueError:
+        _fail(_MODEL_GRAMMAR_MESSAGE)
+    raise AssertionError("unreachable")
+
+
+def _exact_claude_effort(value: object) -> str | None:
+    """A validated effort value or ``None``. The value is never echoed."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        _fail("'claude_effort' must be one of: "
+              + ", ".join(CLAUDE_EFFORT_VALUES) + ", or null.")
+    try:
+        return validate_claude_effort(value)
+    except ValueError:
+        _fail(
+            "'claude_effort' must be one of: "
+            + ", ".join(CLAUDE_EFFORT_VALUES)
+            + ", or null."
+        )
+    raise AssertionError("unreachable")
+
+
 def _document_from_settings(settings: Settings) -> dict[str, object]:
     """The complete canonical document for a Settings. Always every key."""
     return {
@@ -424,6 +524,8 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "claude_call_budget_usd": settings.claude_call_budget_usd,
         "approval_ttl_minutes": settings.approval_ttl_minutes,
         "memory_database": str(settings.memory_database),
+        "claude_model": settings.claude_model,
+        "claude_effort": settings.claude_effort,
     }
 
 
@@ -438,13 +540,14 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     if type(document) is not dict:
         _fail("The configuration document must be a JSON object.")
     keys = set(document)
-    if keys != set(CONFIG_KEYS):
+    if keys != set(CONFIG_KEYS) and keys != set(LEGACY_CONFIG_KEYS):
         # One verdict for missing and unknown alike: a typo silently ignored
-        # is a setting the operator believes they made and did not.
+        # is a setting the operator believes they made and did not. Exactly
+        # two shapes are accepted: the current full v1 key set, or the
+        # complete pre-selection v1 key set (see LEGACY_CONFIG_KEYS).
         _fail(
-            "The configuration document must contain exactly these keys: "
-            + ", ".join(CONFIG_KEYS)
-            + "."
+            "The configuration document must contain exactly the current v1 "
+            "keys: " + ", ".join(CONFIG_KEYS) + "."
         )
     if document["config_version"] != CONFIG_VERSION or type(
         document["config_version"]
@@ -472,6 +575,10 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             claude_call_budget_usd=_exact_amount(
                 document["claude_call_budget_usd"], "claude_call_budget_usd"
             ),
+            # The key-set check above guarantees both are present (current
+            # shape) or both absent (legacy shape); absent means unset.
+            claude_model=_exact_claude_model(document.get("claude_model")),
+            claude_effort=_exact_claude_effort(document.get("claude_effort")),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already
