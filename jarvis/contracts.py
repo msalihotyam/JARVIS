@@ -6217,6 +6217,33 @@ class AppliedEffectSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliverableSummary:
+    """A completed task's durable deliverable, as bounded METADATA.
+
+    The M6 ``ModelAnswer`` is the deliverable a task persists and keeps at
+    terminal state. Its CONTENT is deliberately absent here, exactly as it is
+    absent from every other visibility projection: this surface carries no
+    free-text channel, and the answer text is untrusted inbound model data
+    whose one reader-facing home is the envelope's own ``model_answer`` block.
+    What crosses instead are the four persisted fields that let an operator
+    SEE that a deliverable exists and judge it without reading it - how long
+    it is, whether it was cut, when it was produced, and the digest of exactly
+    the bytes the envelope would show (the same digest an M7 handoff write
+    cites as its source).
+
+    Every field is re-validated state from the ONE canonical structural
+    contract, frozen from the same proven document as ``progress`` and
+    ``effect_applied``. Untrusted-free and authority-free: knowing a digest
+    permits nothing, decides nothing and is consumed by no executing stage.
+    """
+
+    character_count: int
+    sha256: str
+    truncated: bool
+    produced_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class TaskSummary:
     """One task's lifecycle position. Never its content.
 
@@ -6245,6 +6272,13 @@ class TaskSummary:
     #: no such effect is KNOWN - which is the honest answer for a task that
     #: applied none, and equally for a row whose record cannot be trusted.
     effect_applied: AppliedEffectSummary | None = None
+    #: The task's durable deliverable (the M6 model answer) as bounded
+    #: metadata, frozen by the same proof as ``progress``. ``None`` means no
+    #: deliverable is KNOWN - the honest answer for a task that produced
+    #: none, for a row whose document cannot be read, and for an answer that
+    #: did not survive its own structural contract (which the load boundary
+    #: has already degraded to the empty answer).
+    deliverable: DeliverableSummary | None = None
 
 
 #: The exception family a persisted document raises when it is not the shape

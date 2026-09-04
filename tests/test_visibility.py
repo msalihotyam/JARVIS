@@ -573,6 +573,43 @@ class TaskInspectionTests(VisibilityTestCase):
             "latest event",
         )
 
+    def test_a_persisted_deliverable_is_reported_with_its_metadata(self) -> None:
+        """The durable M6 answer is visible as bounded metadata, never content."""
+        session = self.make_session()
+        answer = build_model_answer(SECRETS["model_answer"])
+        task = self.make_task(session.id, model_answer=answer)
+        payload = show_result(self.memory, self.settings, session.id, task.id).payload
+        self.assertEqual(
+            payload["deliverable"],
+            {
+                "character_count": answer.character_count,
+                "sha256": answer.sha256,
+                "truncated": answer.truncated,
+                "produced_at": answer.produced_at,
+            },
+        )
+        rendered = self.rendered(
+            show_result(self.memory, self.settings, session.id, task.id)
+        )
+        # The digest - the identity a handoff write cites - crosses; the
+        # answer text itself still has no channel through this surface.
+        self.assertIn(answer.sha256, rendered)
+        self.assertNotIn(SECRETS["model_answer"], rendered)
+
+    def test_a_task_with_no_deliverable_reports_none(self) -> None:
+        session = self.make_session()
+        task = self.make_task(session.id, model_answer=ModelAnswer())
+        payload = show_result(self.memory, self.settings, session.id, task.id).payload
+        self.assertIsNone(payload["deliverable"])
+
+    def test_an_unreadable_task_reports_no_deliverable(self) -> None:
+        """Nothing document-derived crosses for a row that cannot be read."""
+        session = self.make_session()
+        task = self.make_task(session.id)
+        self.corrupt("tasks", task.id)
+        payload = show_result(self.memory, self.settings, session.id, task.id).payload
+        self.assertIsNone(payload["deliverable"])
+
 
 def replace_binding(task: Task, chain: ChainState) -> Task:
     """The trusted binding a chain step task carries, built for the fixture."""

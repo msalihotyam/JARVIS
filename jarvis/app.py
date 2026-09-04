@@ -1485,8 +1485,11 @@ def show_result(
 
     Everything rendered is either a small identifier/enum or one of the
     EXISTING bounded payload builders. There is no new redaction system and no
-    new free-text channel: the persisted objective, context, model answer,
-    file excerpt and raw document are all deliberately absent.
+    new free-text channel: the persisted objective, context, model-answer
+    CONTENT, file excerpt and raw document are all deliberately absent. The
+    durable deliverable itself is reported as bounded metadata only - that a
+    completed answer exists, and the size, digest, truncation flag and
+    timestamp to judge it by.
     """
     command = "show"
     session = memory.session_summary(session_id)
@@ -1587,6 +1590,25 @@ def show_result(
             else {
                 "kind": view.effect_applied.kind,
                 "status": view.effect_applied.status,
+            }
+        ),
+        # The task's durable deliverable (the M6 model answer), as bounded
+        # METADATA only: how long it is, whether it was cut, when it was
+        # produced, and the digest of exactly the bytes the envelope's own
+        # ``model_answer`` block shows. The content itself is deliberately
+        # still absent - this surface has no free-text channel, and the
+        # answer text is untrusted inbound model data whose reader-facing
+        # home is the envelope. ``None`` means no deliverable is KNOWN: no
+        # answer was produced, the row's document cannot be read, or the
+        # answer did not survive its own structural contract.
+        "deliverable": (
+            None
+            if view.deliverable is None
+            else {
+                "character_count": view.deliverable.character_count,
+                "sha256": view.deliverable.sha256,
+                "truncated": view.deliverable.truncated,
+                "produced_at": view.deliverable.produced_at,
             }
         ),
     }

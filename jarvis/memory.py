@@ -15,6 +15,7 @@ from jarvis.contracts import (
     APPLIED_EFFECT_LOCAL_WRITE,
     LOCAL_WRITE_APPLIED_STATUS,
     AppliedEffectSummary,
+    DeliverableSummary,
     COST_CAP_GATE,
     MAX_NANO_USD,
     MAX_SQLITE_INTEGER,
@@ -84,6 +85,7 @@ from jarvis.contracts import (
     chain_binding_refusal,
     local_read_snapshot_refusal,
     local_write_record_refusal,
+    model_answer_refusal,
     chain_id_refusal,
     chain_state_refusal,
     chain_task_refusal,
@@ -3702,6 +3704,10 @@ class SQLiteMemoryStore:
             # read, no auxiliary row, no reopened task - so there is no window
             # in which the record could be swapped after the proof.
             effect_applied=SQLiteMemoryStore._applied_effect(task),
+            # Frozen at the same instant and for the same reason: the durable
+            # deliverable this task keeps, as bounded metadata, from THIS
+            # proven document and nothing else.
+            deliverable=SQLiteMemoryStore._deliverable_summary(task),
         )
 
     @staticmethod
@@ -3758,6 +3764,41 @@ class SQLiteMemoryStore:
             return None
         return AppliedEffectSummary(
             kind=APPLIED_EFFECT_LOCAL_WRITE, status=LOCAL_WRITE_APPLIED_STATUS
+        )
+
+    @staticmethod
+    def _deliverable_summary(task: Task) -> DeliverableSummary | None:
+        """The durable deliverable of an ALREADY-VALIDATED task, bounded.
+
+        Reached only after identity, status and stage have been proved against
+        the authoritative columns, so the answer examined here belongs to this
+        row. The M6 ``ModelAnswer`` is the deliverable a completed task keeps
+        at terminal state, and this projection exposes exactly its persisted
+        metadata - never its content, which has no channel through this
+        surface. Three guards, in the same order every other consumer asks:
+
+        * the object must be EXACTLY a ``ModelAnswer`` - a dict, a subclass
+          or a structurally impossible value answers nothing here;
+        * it must survive the ONE canonical structural contract, the same
+          ``model_answer_refusal`` the load boundary, the execution boundary
+          and the envelope all ask; and
+        * it must be PRESENT. The empty answer is not a small deliverable;
+          ``None`` is the one spelling of "this task produced none".
+
+        The load boundary has already degraded a tampered answer to the empty
+        one, so the refusal check is defence in depth - asked here exactly as
+        every other consumer must ask it, never restated.
+        """
+        answer = task.model_answer
+        if type(answer) is not ModelAnswer or not answer.present:
+            return None
+        if model_answer_refusal(answer) is not None:
+            return None
+        return DeliverableSummary(
+            character_count=answer.character_count,
+            sha256=answer.sha256,
+            truncated=answer.truncated,
+            produced_at=answer.produced_at,
         )
 
     @staticmethod
