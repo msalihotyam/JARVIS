@@ -61,10 +61,14 @@ from jarvis.contracts import (
     redact_credentials,
     utc_now,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 #: A marker inside the first 240 characters: it survives BOTH representations,
 #: so it proves the bounded summary path still works.
@@ -146,7 +150,15 @@ class ModelAnswerTestCase(unittest.TestCase):
             memory_database=self.database, permission_mode=self.permission_mode
         )
         self.connector = AnsweringConnector()
-        self.app = create_app(settings=self.settings, connectors=(self.connector,))
+        self.app = open_app(
+            settings=self.settings,
+            connectors=(self.connector,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant("answering", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+                }
+            ),
+        )
         self.core = self.app.core
         self.memory = self.app.memory
 
@@ -821,12 +833,17 @@ class ProducerGateTests(ModelAnswerTestCase):
     def test_a_non_egress_connector_cannot_smuggle_an_answer(self) -> None:
         """A local connector's result data is not external model output."""
         local = AnsweringConnector(name="local-ish", side_effect=SideEffect.LOCAL_READ)
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "local.db",
                 permission_mode=PermissionMode.SESSION,
             ),
             connectors=(local,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant("local-ish", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+                }
+            ),
         )
         task = make_task(effect=SideEffect.LOCAL_READ)
         task.capability = "echo"
@@ -847,12 +864,17 @@ class ProducerGateTests(ModelAnswerTestCase):
         """
         neutral = AnsweringConnector(name="neutral", side_effect=SideEffect.NONE)
         self.assertIs(SideEffect.NONE, neutral.manifest.default_side_effect.effect)
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "neutral.db",
                 permission_mode=PermissionMode.SESSION,
             ),
             connectors=(neutral,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant("neutral", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+                }
+            ),
         )
         task = make_task(effect=SideEffect.EXTERNAL_EGRESS)
         task.capability = "echo"
@@ -1354,12 +1376,17 @@ class EnvelopeTests(ModelAnswerTestCase):
         self.assertIn("model_answer", payload)
 
     def test_a_task_without_an_answer_carries_a_null_block(self) -> None:
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "plain.db",
                 permission_mode=PermissionMode.SESSION,
             ),
             connectors=(DummyConnector(),),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant("dummy", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+                }
+            ),
         )
         run = app.core.run(make_task())
         payload = build_envelope("run", PermissionMode.SESSION, run)
@@ -1405,12 +1432,17 @@ class EnvelopeTests(ModelAnswerTestCase):
             name="leaky",
             answer_text="here is the key sk-abcdefghijklmnopqrstuvwxyz012345 ok\n",
         )
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "leaky.db",
                 permission_mode=PermissionMode.SESSION,
             ),
             connectors=(connector,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant("leaky", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+                }
+            ),
         )
         task = self.egress_task()
         run = app.core.run(task)

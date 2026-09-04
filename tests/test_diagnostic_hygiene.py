@@ -70,10 +70,14 @@ from jarvis.contracts import (
 )
 from jarvis.connectors.local_files import LocalFileReadConnector
 from jarvis.core import AgentCore
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 
 #: A distinctive value that must never appear in any persisted row.
@@ -249,10 +253,19 @@ class DiagnosticHygieneTestCase(unittest.TestCase):
     ) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             memory or self.memory,
-            Settings(
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+            settings=Settings(
                 memory_database=self.database,
                 permission_mode=mode,
                 **overrides,
@@ -1800,7 +1813,9 @@ def _broken_permission_request(**overrides) -> PermissionRequest:
 def _valid_preview() -> OutboundDataPreview:
     """The exact preview contract, every field the type it declares."""
     return OutboundDataPreview(
-        destination="test-destination",
+        # The preview must name the SAME destination the scope carries, and
+        # the scope's destination is the one Core registered.
+        destination=CLAUDE_CODE_DESTINATION,
         data_classification=DataClassification.INTERNAL,
         field_names=("objective", "capability"),
         approximate_bytes=256,
@@ -3316,12 +3331,22 @@ class LocalReadDiagnosticHygieneTests(unittest.TestCase):
         self.connector = LocalFileReadConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        self.core = AgentCore(
+        self.core = open_core(
             self._registry(),
             self.memory,
             Settings(
                 memory_database=self.memory.database_path,
                 permission_mode=PermissionMode.SESSION,
+            ),
+            # The shipped local-read tuple, written out rather than borrowed:
+            # this fixture composes the real connector, so it declares the
+            # real row.
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "local-file-read", "file_read", CLAUDE_CODE_DESTINATION
+                    )
+                }
             ),
         )
 

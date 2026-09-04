@@ -38,11 +38,15 @@ from jarvis.contracts import (
     UsageRecord,
     ledger_month,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 
 def free_claim(memory, *, gate_state: str = "test_free_route") -> BillingClaim:
@@ -154,10 +158,19 @@ class ExecutionJournalTestCase(unittest.TestCase):
     def core(self, connector, memory=None) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             memory or self.store(),
             Settings(memory_database=self.database, permission_mode=PermissionMode.SESSION),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def egress_task(self, memory, connector, session_id: str) -> Task:
@@ -723,10 +736,12 @@ class TerminalLifecycleTests(ExecutionJournalTestCase):
     def test_terminal_task_reportable_with_connector_absent(self) -> None:
         memory, session, task = self._completed()
         # A core whose registry does not contain the task's connector.
-        core = AgentCore(
+        core = open_core(
             ToolRegistry(),
             self.store(),
             Settings(memory_database=self.database, permission_mode=PermissionMode.SESSION),
+            # Nothing is registered, so nothing is authorized.
+            destination_policy=frozenset(),
         )
         run = core.resume(session.id, task.id)
         self.assertEqual(RunStatus.COMPLETED, run.status)

@@ -47,6 +47,10 @@ from jarvis.contracts import (
     ledger_month,
     next_loop_stage,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
@@ -58,7 +62,7 @@ from jarvis.progress import (
 )
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 from tests.test_app import task_document
 from tests.test_billing_policy import SwitchingRouteConnector
 
@@ -110,13 +114,26 @@ class ProcessBoundaryTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def core(self, *connectors: object) -> AgentCore:
+        built = connectors or (DummyConnector(),)
         registry = ToolRegistry()
-        for connector in connectors or (DummyConnector(),):
+        for connector in built:
             registry.register(connector)
-        return AgentCore(
+        # ONE row per connector this fixture itself created, for the ONE
+        # capability a DummyConnector serves and the ONE destination it may
+        # reach. Nothing is read off a manifest's capability list, so a
+        # connector serving anything else stays unauthorized here.
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.database),
+            destination_policy=frozenset(
+                DestinationGrant(
+                    connector.manifest.name,
+                    DUMMY_CAPABILITY,
+                    CLAUDE_CODE_DESTINATION,
+                )
+                for connector in built
+            ),
         )
 
     def approve(self, core: AgentCore, run, **grant_kwargs):
@@ -458,8 +475,19 @@ class RestartResumeTests(ProcessBoundaryTestCase):
 
         registry = ToolRegistry()
         registry.register(connector)
-        fresh_core = AgentCore(
-            registry, reopened, Settings(memory_database=self.database)
+        fresh_core = open_core(
+            registry,
+            reopened,
+            Settings(memory_database=self.database),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         resumed = fresh_core.resume(
             waiting.session.id,
@@ -1112,11 +1140,20 @@ class ArtifactBuilderTests(unittest.TestCase):
 class EnvelopeProgressTests(ProcessBoundaryTestCase):
     def build_app(self, connector: DummyConnector | None = None):
         connector = connector or DummyConnector()
-        app = create_app(
+        app = open_app(
             settings=Settings(memory_database=self.database),
             memory=self.memory,
             registry=ToolRegistry(),
             connectors=(connector,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         return app, connector
 

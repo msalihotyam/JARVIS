@@ -31,11 +31,15 @@ from jarvis.contracts import (
     Task,
     validate_project_id,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 
 class ProjectMemoryTestCase(unittest.TestCase):
@@ -48,10 +52,19 @@ class ProjectMemoryTestCase(unittest.TestCase):
     def core(self, connector: DummyConnector) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.database),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def create_project(self, project_id: str = "proj-a") -> ProjectRecord:

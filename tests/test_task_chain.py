@@ -121,11 +121,15 @@ from jarvis.contracts import (
     local_read_snapshot_refusal,
     looks_like_path,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import safe_cleanup
+from tests.helpers import open_app, open_core, safe_cleanup
 
 #: Sentinel for ``rewrite_binding``: remove the key rather than replace it.
 _DROPPED = object()
@@ -2508,6 +2512,25 @@ class ClassificationPolicyTests(ChainTestCase):
 # --------------------------------------------------------------------------
 
 
+#: Exactly what the materialization fixture's two connectors may reach.
+_MATERIALIZATION_POLICY = frozenset(
+    {
+        DestinationGrant("planner", "code_analysis", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("planner", "code_planning", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("local", LOCAL_READ_CAPABILITY, CLAUDE_CODE_DESTINATION),
+    }
+)
+
+#: And what the reader/planner driver fixture's two connectors may reach.
+_DRIVER_POLICY = frozenset(
+    {
+        DestinationGrant("planner", "code_analysis", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("planner", "code_planning", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("reader", LOCAL_READ_CAPABILITY, CLAUDE_CODE_DESTINATION),
+    }
+)
+
+
 class _EgressConnector(BaseConnector):
     """A provider-neutral stand-in that DECLARES external egress."""
 
@@ -2548,8 +2571,11 @@ class MaterializationTestCase(BoundaryTestCase):
         self.registry = ToolRegistry()
         self.registry.register(_EgressConnector())
         self.registry.register(_LocalConnector())
-        self.core = AgentCore(
-            memory=self.memory, registry=self.registry, settings=self.settings
+        self.core = open_core(
+            memory=self.memory,
+            registry=self.registry,
+            settings=self.settings,
+            destination_policy=_MATERIALIZATION_POLICY,
         )
         self.assertEqual(self.declare(declaration_json(3)).exit_code, EXIT_OK)
 
@@ -2928,8 +2954,11 @@ class AtomicMaterializationTests(MaterializationTestCase):
                     state: ChainState = chain_state,
                 ) -> None:
                     store = SQLiteMemoryStore(self.database)
-                    core = AgentCore(
-                        memory=store, registry=self.registry, settings=self.settings
+                    core = open_core(
+                        memory=store,
+                        registry=self.registry,
+                        settings=self.settings,
+                        destination_policy=_MATERIALIZATION_POLICY,
                     )
                     session = store.load_session(session_id)
                     assert session is not None
@@ -4650,8 +4679,11 @@ class DriverTestCase(BoundaryTestCase):
         self.registry = ToolRegistry()
         self.registry.register(self.reader)
         self.registry.register(self.planner)
-        self.core = AgentCore(
-            memory=self.memory, registry=self.registry, settings=self.settings
+        self.core = open_core(
+            memory=self.memory,
+            registry=self.registry,
+            settings=self.settings,
+            destination_policy=_DRIVER_POLICY,
         )
         self.app = JarvisApp(self.core, self.memory, self.settings)
         self.assertEqual(self.declare(declaration_json(2)).exit_code, EXIT_OK)
@@ -5057,8 +5089,11 @@ class DriverConcurrencyTests(DriverTestCase):
                     session_id: str = self.session.id,
                 ) -> None:
                     store = SQLiteMemoryStore(self.database)
-                    core = AgentCore(
-                        memory=store, registry=self.registry, settings=self.settings
+                    core = open_core(
+                        memory=store,
+                        registry=self.registry,
+                        settings=self.settings,
+                        destination_policy=_DRIVER_POLICY,
                     )
                     gate.wait(timeout=10)
                     _run, verdict = core.run_chain(session_id)
@@ -5092,8 +5127,11 @@ class DriverConcurrencyTests(DriverTestCase):
                     session_id: str = self.session.id,
                 ) -> None:
                     store = SQLiteMemoryStore(self.database)
-                    core = AgentCore(
-                        memory=store, registry=self.registry, settings=self.settings
+                    core = open_core(
+                        memory=store,
+                        registry=self.registry,
+                        settings=self.settings,
+                        destination_policy=_DRIVER_POLICY,
                     )
                     gate.wait(timeout=10)
                     core.run_chain(session_id)
@@ -5269,8 +5307,11 @@ class ChainArbitrationTestCase(DriverTestCase):
         return SQLiteMemoryStore(self.database)
 
     def runner_core(self, memory: MemoryStore) -> AgentCore:
-        return AgentCore(
-            memory=memory, registry=self.registry, settings=self.settings
+        return open_core(
+            memory=memory,
+            registry=self.registry,
+            settings=self.settings,
+            destination_policy=_DRIVER_POLICY,
         )
 
     def cancel_from_another_store(self) -> str:
@@ -6605,8 +6646,17 @@ class MalformedContextTypeTests(MaterializationTestCase):
         )
         registry = ToolRegistry()
         registry.register(reader)
-        core = AgentCore(
-            memory=self.memory, registry=registry, settings=self.settings
+        core = open_core(
+            memory=self.memory,
+            registry=registry,
+            settings=self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "reader", LOCAL_READ_CAPABILITY, CLAUDE_CODE_DESTINATION
+                    )
+                }
+            ),
         )
         chain_state = self.chain_now()
         _verdict, bound = self.materialize(0)
@@ -6694,8 +6744,11 @@ class PersistedRoundTripAuthorityTests(BoundaryTestCase):
         self.registry = ToolRegistry()
         self.registry.register(_EgressConnector())
         self.registry.register(_LocalConnector())
-        self.core = AgentCore(
-            memory=self.memory, registry=self.registry, settings=self.settings
+        self.core = open_core(
+            memory=self.memory,
+            registry=self.registry,
+            settings=self.settings,
+            destination_policy=_MATERIALIZATION_POLICY,
         )
 
     def chain_now(self) -> ChainState:

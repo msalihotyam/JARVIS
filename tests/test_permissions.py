@@ -20,11 +20,15 @@ from jarvis.contracts import (
     SideEffect,
     SideEffectProfile,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 
 class PermissionPolicyTests(unittest.TestCase):
@@ -36,10 +40,19 @@ class PermissionPolicyTests(unittest.TestCase):
     def core(self, connector: DummyConnector, mode: PermissionMode) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path, permission_mode=mode),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def test_strict_requires_approval_even_for_low_reversible(self) -> None:
@@ -100,12 +113,21 @@ class PermissionPolicyTests(unittest.TestCase):
                 memory = SQLiteMemoryStore(Path(self.temp.name) / f"case-{index}.db")
                 registry = ToolRegistry()
                 registry.register(connector)
-                core = AgentCore(
+                core = open_core(
                     registry,
                     memory,
                     Settings(
                         memory_database=memory.database_path,
                         permission_mode=PermissionMode.SMART_AUTO,
+                    ),
+                    destination_policy=frozenset(
+                        {
+                            DestinationGrant(
+                                f"dummy-{index}",
+                                DUMMY_CAPABILITY,
+                                CLAUDE_CODE_DESTINATION,
+                            )
+                        }
                     ),
                 )
                 run = core.run(make_task(risk=risk, reversible=reversible))
@@ -140,10 +162,19 @@ class PermissionPolicyTests(unittest.TestCase):
                     connector = DummyConnector(name=f"matrix-{mode.value}-{risk.name}", risk=risk)
                     registry = ToolRegistry()
                     registry.register(connector)
-                    core = AgentCore(
+                    core = open_core(
                         registry,
                         memory,
                         Settings(memory_database=database, permission_mode=mode),
+                        destination_policy=frozenset(
+                            {
+                                DestinationGrant(
+                                    f"matrix-{mode.value}-{risk.name}",
+                                    DUMMY_CAPABILITY,
+                                    CLAUDE_CODE_DESTINATION,
+                                )
+                            }
+                        ),
                     )
                     run = core.run(make_task(risk=risk))
                     self.assertEqual(expected[mode][risk], run.status)
@@ -167,10 +198,19 @@ class PermissionPolicyTests(unittest.TestCase):
                     )
                     registry = ToolRegistry()
                     registry.register(connector)
-                    core = AgentCore(
+                    core = open_core(
                         registry,
                         memory,
                         Settings(memory_database=memory.database_path, permission_mode=mode),
+                        destination_policy=frozenset(
+                            {
+                                DestinationGrant(
+                                    f"mandatory-{mode.value}-{index}",
+                                    DUMMY_CAPABILITY,
+                                    CLAUDE_CODE_DESTINATION,
+                                )
+                            }
+                        ),
                     )
                     run = core.run(make_task(effect=effect))
                     self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status)

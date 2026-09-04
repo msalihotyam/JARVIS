@@ -67,6 +67,10 @@ from jarvis.contracts import (
     validated_metered_maximum,
     validated_resource_ceiling,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import (
     SCHEMA_VERSION,
@@ -76,7 +80,7 @@ from jarvis.memory import (
 )
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 
 def _past_month() -> str:
@@ -279,8 +283,19 @@ class BillingIntegrityTestCase(unittest.TestCase):
     def core(self, connector, memory=None, **overrides) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
-            registry, memory or self.memory, self.settings(**overrides)
+        return open_core(
+            registry,
+            memory or self.memory,
+            self.settings(**overrides),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def seed_spend(self, amount: float, memory=None) -> None:

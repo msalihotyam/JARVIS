@@ -48,6 +48,10 @@ from jarvis.contracts import (
     chain_steps_from_declaration,
     credential_bearing,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
@@ -63,7 +67,7 @@ from jarvis.settings import (
     Settings,
     load_settings,
 )
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 
 EXIT_OK = 0
 EXIT_INVALID_INPUT = 64
@@ -840,10 +844,19 @@ class KillSwitchTestCase(unittest.TestCase):
         self.registry.register(self.connector)
 
     def core(self, *, enabled: bool) -> AgentCore:
-        return AgentCore(
+        return open_core(
             self.registry,
             self.memory,
             Settings(memory_database=self.database, execution_enabled=enabled),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        self.connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def database_content(self) -> dict:
@@ -983,7 +996,20 @@ class GlobalKillSwitchTests(KillSwitchTestCase):
             paid_api_enabled=True,
             paid_api_approval_id="approval-1",
         )
-        core = AgentCore(self.registry, self.memory, settings)
+        core = open_core(
+            self.registry,
+            self.memory,
+            settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        self.connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         run = core.run(make_task())
         assert run.error is not None
         self.assertIs(run.error.code, ErrorCode.EXECUTION_DISABLED)

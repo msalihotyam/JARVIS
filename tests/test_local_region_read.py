@@ -63,9 +63,13 @@ from jarvis.contracts import (
     local_read_region_refusal,
     local_read_snapshot_refusal,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, open_app, safe_cleanup
 from tests.test_local_read_context import PlanningConnector
 
 ELLIPSIS = "…"
@@ -1050,10 +1054,23 @@ class CompositionTests(unittest.TestCase):
         self.reader = LocalFileReadConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        self.app = create_app(
+        self.app = open_app(
             settings=self.settings,
             memory=self.memory,
             connectors=(self.planner, self.reader),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "test-planner", "code_analysis", CLAUDE_CODE_DESTINATION
+                    ),
+                    DestinationGrant(
+                        "test-planner", "code_planning", CLAUDE_CODE_DESTINATION
+                    ),
+                    DestinationGrant(
+                        "local-file-read", "file_read", CLAUDE_CODE_DESTINATION
+                    ),
+                }
+            ),
         )
         self.session_id: str | None = None
 

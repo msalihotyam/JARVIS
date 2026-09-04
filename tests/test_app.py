@@ -17,7 +17,6 @@ from unittest import mock
 
 from jarvis import app as app_module
 from jarvis.app import (
-    ALLOWED_DESTINATION,
     MAX_TASK_JSON_BYTES,
     REDACTED,
     TaskInputError,
@@ -42,10 +41,14 @@ from jarvis.contracts import (
     TaskProgress,
     TaskStatus,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, open_core, safe_cleanup
 
 
 def task_document(**overrides: object) -> str:
@@ -92,7 +95,7 @@ class TaskInputBoundaryTests(unittest.TestCase):
         self.assertEqual("code_analysis", task.capability)
         self.assertEqual("read", task.scope.action)
         self.assertEqual("resource-a", task.scope.target)
-        self.assertEqual(ALLOWED_DESTINATION, task.scope.destination)
+        self.assertEqual(CLAUDE_CODE_DESTINATION, task.scope.destination)
         self.assertIs(DataClassification.SENSITIVE, task.scope.data_classification)
         self.assertEqual(
             {"working_directory": "workspace", "inputs": {"files": ["a.py"], "depth": 2}},
@@ -121,7 +124,7 @@ class TaskInputBoundaryTests(unittest.TestCase):
     def test_documented_defaults_and_internal_state(self) -> None:
         task = decode_task_json(task_document(scope={"action": "read"}))
         self.assertEqual("", task.scope.target)
-        self.assertEqual(ALLOWED_DESTINATION, task.scope.destination)
+        self.assertEqual(CLAUDE_CODE_DESTINATION, task.scope.destination)
         self.assertIs(DataClassification.INTERNAL, task.scope.data_classification)
         self.assertEqual({}, task.context)
         self.assertEqual({}, task.preferences)
@@ -275,7 +278,7 @@ class TaskInputBoundaryTests(unittest.TestCase):
         task = decode_task_json(
             task_document(scope={"action": "read", "destination": "Anthropic/Claude-Code"})
         )
-        self.assertEqual(ALLOWED_DESTINATION, task.scope.destination)
+        self.assertEqual(CLAUDE_CODE_DESTINATION, task.scope.destination)
 
     def test_rejects_retrieval_fields_at_the_boundary(self) -> None:
         # The retrieval snapshot and its metadata are internal state; task
@@ -490,11 +493,20 @@ class AppCommandTests(unittest.TestCase):
         mode: PermissionMode = PermissionMode.SESSION,
     ):
         connector = connector if connector is not None else DummyConnector()
-        app = create_app(
+        app = open_app(
             settings=replace(self.settings, permission_mode=mode),
             memory=self.memory,
             registry=ToolRegistry(),
             connectors=(connector,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         return app, connector
 
@@ -846,11 +858,20 @@ class CompositionRootTests(unittest.TestCase):
         memory = SQLiteMemoryStore(self.database)
         registry = ToolRegistry()
         connector = DummyConnector()
-        app = create_app(
+        app = open_app(
             settings=self.settings,
             memory=memory,
             registry=registry,
             connectors=(connector,),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         self.assertIs(memory, app.memory)
         self.assertIs(memory, app.core.memory)

@@ -7,7 +7,7 @@ import json
 import threading
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any
+from typing import AbstractSet, Any
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
@@ -113,6 +113,11 @@ from jarvis.contracts import (
     validate_cost_estimate,
     validated_measured_cost,
     validated_metered_maximum,
+)
+from jarvis.destinations import (
+    CONNECTOR_DESTINATION_POLICY,
+    DestinationGrant,
+    connector_destination_refusal,
 )
 from jarvis.lifecycle import is_terminal, terminal_run_status
 from jarvis.planning import build_task_plan
@@ -524,11 +529,24 @@ class AgentCore:
         memory: MemoryStore,
         settings: Settings | None = None,
         verifier: ResultVerifier | None = None,
+        *,
+        destination_policy: AbstractSet[DestinationGrant] | None = None,
     ) -> None:
         self.registry = registry
         self.memory = memory
         self.settings = settings or Settings()
         self.verifier = verifier
+        # The closed (connector, capability, destination) authorization table
+        # this build runs under. It is COMPOSITION state, fixed here and never
+        # touched again: no connector, task, chain declaration or model answer
+        # can add a row, and the frozen copy means a caller that keeps a
+        # mutable reference cannot widen it after construction either. The
+        # default is the shipped Core policy.
+        self.destination_policy: frozenset[DestinationGrant] = frozenset(
+            CONNECTOR_DESTINATION_POLICY
+            if destination_policy is None
+            else destination_policy
+        )
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)
@@ -2335,6 +2353,78 @@ class AgentCore:
                 exc,
             )
 
+    def _destination_policy_refusal(
+        self,
+        task: Task,
+        connector: BaseConnector,
+        scope: ActionScope,
+        floor: SideEffectProfile,
+    ) -> None:
+        """Core's own decision on capability + connector + canonical destination.
+
+        The connector is asked for nothing here. Every input is either Core's
+        (the registry, the destination policy) or already-validated task
+        state, so a connector cannot expand what it is allowed to reach by
+        declaring, returning or canonicalizing anything.
+
+        Three closed questions, each fail-closed and each about something a
+        persisted or tampered task could otherwise slip past the gate:
+
+        connector   the object about to execute must BE the one this build
+                    registered under the manifest name the scope carries. A
+                    connector that never entered the registry, or one whose
+                    manifest now claims another connector's name, is refused
+                    rather than allowed to inherit that name's policy.
+        capability  the registered connector must still serve the task's
+                    capability. ``PLAN`` recorded the selection; nothing
+                    afterwards re-asked it, so a capability changed in
+                    storage after the selection is refused here.
+        destination the EXACT (connector, capability, canonical destination)
+                    tuple must be a row of this build's Core-owned policy.
+                    Global destination membership, a manifest declaration and
+                    a truthful ``can_handle`` are each necessary and none of
+                    them is sufficient: a connector authorized for one
+                    destination is refused for another the same registry
+                    knows. Unknown fails closed; there is no wildcard row.
+        """
+
+        def refuse(detail: str) -> None:
+            raise AttestationError(
+                ErrorCode.EGRESS_REFUSED,
+                f"Core destination policy refuses this action: {detail}.",
+            )
+
+        # By the connector's OWN manifest name, which is the registration key.
+        # ``scope.connector`` is the normalized (case-folded) spelling of that
+        # same name, built by the caller from this manifest, so the scope
+        # binding is already established and this asks the other half: that
+        # the name really belongs to this object in this build's registry.
+        try:
+            registered = self.registry.get(connector.manifest.name)
+        except Exception:  # noqa: BLE001 - an unknown connector is a refusal
+            registered = None
+        if registered is not connector:
+            refuse("the executing connector is not registered under that name")
+        if not connector.can_handle(task):
+            refuse("the connector does not serve this task's capability")
+        # The AUTHORIZATION, and the only thing that grants a destination:
+        # exact membership of the Core-owned tuple. Validity of the canonical
+        # destination is asked inside it and is deliberately a separate
+        # question - a well-formed, globally registered destination is still
+        # refused unless THIS connector is authorized for it with THIS
+        # capability. The capability compared here is the task's own, the same
+        # value ``can_handle`` was just asked about, and the connector name is
+        # the registration key proven above.
+        reason = connector_destination_refusal(
+            self.destination_policy,
+            connector=connector.manifest.name,
+            capability=task.capability,
+            destination=scope.destination,
+            egress=floor.effect is SideEffect.EXTERNAL_EGRESS,
+        )
+        if reason is not None:
+            refuse(reason)
+
     def _authoritative_request(
         self,
         task: Task,
@@ -2387,6 +2477,18 @@ class AgentCore:
                 f"Permission request does not match the authoritative "
                 f"security state: {detail}.",
             )
+
+        # -- Core-owned destination policy -----------------------------------
+        # Asked FIRST, of Core's own recomputed state, and never of the
+        # request: a connector cannot authorize a destination by returning
+        # one, and a destination is never approved by string equality against
+        # whatever the task, a chain declaration or a model answer asked for.
+        # ``expected_scope`` is already canonical, so this decides on the very
+        # spelling the fingerprint and the attestation will bind. It runs on
+        # both paths through here - the approval gate and the pre-execution
+        # re-gate - so an unregistered destination fails closed before any
+        # pending request, grant, attempt or connector call can exist.
+        self._destination_policy_refusal(task, connector, expected_scope, floor)
 
         # -- binding: this request is for this task in this session ----------
         if request.task_id != task.id or request.session_id != session.id:

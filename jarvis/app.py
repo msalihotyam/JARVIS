@@ -19,7 +19,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import AbstractSet, Any, Iterable
 
 from jarvis.connectors.base import BaseConnector
 
@@ -96,11 +96,16 @@ from jarvis.contracts import (
     local_write_source_refusal,
     model_answer_refusal,
     next_loop_stage,
-    normalize_destination,
     require_billing_class,
     validate_project_id,
 )
 from jarvis.core import AgentCore
+from jarvis.destinations import (
+    DEFAULT_TASK_DESTINATION,
+    DestinationGrant,
+    canonical_destination,
+    destination_refusal,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
@@ -132,10 +137,6 @@ MAX_TASK_JSON_BYTES = 256 * 1024
 #: them is refused BY NAME rather than having it quietly ignored. A caller
 #: declares intent; it never declares identity or progress.
 _CHAIN_DOCUMENT_KEYS = frozenset({"steps"})
-
-#: The only outbound endpoint a task may name in this build. Task input can
-#: confirm it but never redirect it.
-ALLOWED_DESTINATION = "anthropic/claude-code"
 
 REDACTED = "[REDACTED]"
 
@@ -387,10 +388,21 @@ def decode_task_json(raw: str | bytes) -> Task:
     scope_input = _section(document, "scope", _SCOPE_KEYS)
     action = _string(scope_input, "action", "scope", required=True)
     target = _string(scope_input, "target", "scope")
-    destination = _string(scope_input, "destination", "scope")
-    if destination.strip() and normalize_destination(destination) != ALLOWED_DESTINATION:
+    # The REQUESTED destination is untrusted, and it is the one field of the
+    # scope that names somewhere outside this machine. Input may CONFIRM a
+    # destination Core already owns; it may never introduce one. The decision
+    # is ``jarvis.destinations``' - this boundary holds no endpoint of its own
+    # any more - and the canonical spelling it accepts is the one the task
+    # carries, so the value checked here is the value the fingerprint binds.
+    requested_destination = _string(scope_input, "destination", "scope")
+    destination = (
+        canonical_destination(requested_destination)
+        if requested_destination.strip()
+        else DEFAULT_TASK_DESTINATION
+    )
+    if destination is None or destination_refusal(destination) is not None:
         raise TaskInputError(
-            f"'scope.destination' must be '{ALLOWED_DESTINATION}'."
+            "'scope.destination' is not a destination this build permits."
         )
     classification_text = (
         _string(scope_input, "data_classification", "scope")
@@ -648,7 +660,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         scope=ActionScope(
             action=action,
             target=target,
-            destination=ALLOWED_DESTINATION,
+            destination=destination,
             data_classification=classification,
         ),
         context=context,
@@ -2241,14 +2253,31 @@ def create_app(
     registry: ToolRegistry | None = None,
     connectors: Iterable[BaseConnector] = (),
     verifier: ResultVerifier | None = None,
+    destination_policy: AbstractSet[DestinationGrant] | None = None,
 ) -> JarvisApp:
-    """Assemble an application from injected parts. Tests use this."""
+    """Assemble an application from injected parts. Tests use this.
+
+    ``destination_policy`` is the closed (connector, capability, canonical
+    destination) authorization table this build runs under. It belongs to
+    whoever composes the build; ``None`` means the shipped Core policy, which
+    is what production uses.
+    """
     settings = settings or Settings()
     memory = memory if memory is not None else SQLiteMemoryStore(settings.memory_database)
     registry = registry if registry is not None else ToolRegistry()
     for connector in connectors:
         registry.register(connector)
-    return JarvisApp(AgentCore(registry, memory, settings, verifier), memory, settings)
+    return JarvisApp(
+        AgentCore(
+            registry,
+            memory,
+            settings,
+            verifier,
+            destination_policy=destination_policy,
+        ),
+        memory,
+        settings,
+    )
 
 
 def build_default_app(settings: Settings | None = None) -> JarvisApp:

@@ -69,9 +69,13 @@ from jarvis.contracts import (
     local_write_identity_refusal,
     local_write_source_refusal,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 from tests.test_model_answer import AnsweringConnector
 
 #: A realistic deliverable: indentation, a blank line, non-ASCII text and a
@@ -152,6 +156,18 @@ CORRUPTIONS: tuple[tuple[str, Callable[[dict], None]], ...] = (
 )
 
 
+#: The exact rows the handoff fixtures authorize: the answering producer and
+#: the plain echo connector for their one capability, and the real local
+#: writer for its own. Written out, never derived from what is registered.
+_HANDOFF_POLICY = frozenset(
+    {
+        DestinationGrant("answering", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+        DestinationGrant("plain-echo", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION),
+        DestinationGrant("local-file-write", "file_write", CLAUDE_CODE_DESTINATION),
+    }
+)
+
+
 class HandoffTestCase(unittest.TestCase):
     """One temp root, one answering egress connector, one real write connector."""
 
@@ -173,9 +189,10 @@ class HandoffTestCase(unittest.TestCase):
         self.writer = LocalFileWriteConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        self.app = create_app(
+        self.app = open_app(
             settings=self.settings,
             connectors=(self.answering, self.plain, self.writer),
+            destination_policy=_HANDOFF_POLICY,
         )
         self.core = self.app.core
         self.memory = self.app.memory
@@ -350,7 +367,11 @@ class HandoffTestCase(unittest.TestCase):
                     allowed_roots=(self.root,), default_working_directory=self.root
                 ),
             )
-        return create_app(settings=self.settings, connectors=connectors)
+        return open_app(
+            settings=self.settings,
+            connectors=connectors,
+            destination_policy=_HANDOFF_POLICY,
+        )
 
     # -- lifecycle fixtures -------------------------------------------------
 
@@ -1262,12 +1283,22 @@ class CrashRestartTests(HandoffTestCase):
 
     def test_h2_unknown_outcome_semantics_are_unchanged(self) -> None:
         raiser = RaisingWriter(allowed_roots=(self.root,), default_working_directory=self.root)
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "raising.db",
                 permission_mode=PermissionMode.SESSION,
             ),
             connectors=(AnsweringConnector(answer_text=PROPOSED_FILE), raiser),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "answering", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION
+                    ),
+                    DestinationGrant(
+                        "raising-writer", "file_write", CLAUDE_CODE_DESTINATION
+                    ),
+                }
+            ),
         )
         source_task = self.source_task()
         run = app.core.run(source_task)
@@ -1380,7 +1411,7 @@ class PreparedAttemptTests(HandoffTestCase):
 class IsolationTests(HandoffTestCase):
     def test_the_write_path_never_selects_or_invokes_claude(self) -> None:
         claude = ClaudeCodeConnector(allowed_roots=(self.root,), default_working_directory=self.root)
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "isolated.db",
                 permission_mode=PermissionMode.SESSION,
@@ -1392,6 +1423,9 @@ class IsolationTests(HandoffTestCase):
                     allowed_roots=(self.root,), default_working_directory=self.root
                 ),
             ),
+            # Claude is registered but NOT authorized: the write path must
+            # never select it, and the policy says so out loud.
+            destination_policy=_HANDOFF_POLICY,
         )
         with mock.patch(
             "jarvis.connectors.claude_code.subprocess.Popen", side_effect=AssertionError

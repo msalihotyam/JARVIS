@@ -76,8 +76,12 @@ from jarvis.contracts import (
     ToolResult,
     WriteSource,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, safe_cleanup
 from tests.test_model_answer import AnsweringConnector
 
 #: 512 bytes per line, so a whole number of them lands exactly on the ceiling.
@@ -166,6 +170,15 @@ class IncludingModelConnector(AnsweringConnector):
         ).encode("utf-8")
 
 
+#: The two real local connectors these fixtures compose, written out.
+_LOCAL_ROWS = frozenset(
+    {
+        DestinationGrant("local-file-read", "file_read", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("local-file-write", "file_write", CLAUDE_CODE_DESTINATION),
+    }
+)
+
+
 class WroteThenRaised(LocalFileWriteConnector):
     """Really performs the write and THEN raises: the hardest recovery case."""
 
@@ -204,8 +217,10 @@ class EditTestCase(unittest.TestCase):
         self.writer = LocalFileWriteConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        self.app = create_app(
-            settings=self.settings, connectors=(self.reader, self.writer)
+        self.app = open_app(
+            settings=self.settings,
+            connectors=(self.reader, self.writer),
+            destination_policy=_LOCAL_ROWS,
         )
         self.core = self.app.core
         self.memory = self.app.memory
@@ -451,12 +466,20 @@ class GenuineSourceTests(EditTestCase):
         target = self.seed("notes.txt", "before\n")
         matching = self.snapshot("notes.txt")
         echo = DummyConnector(name="echo-source")
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / "forged.db",
                 permission_mode=PermissionMode.SMART_AUTO,
             ),
             connectors=(echo, self.reader, self.writer),
+            destination_policy=_LOCAL_ROWS
+            | frozenset(
+                {
+                    DestinationGrant(
+                        "echo-source", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION
+                    )
+                }
+            ),
         )
         source = Task(
             objective="pretend to be a read",
@@ -549,9 +572,17 @@ class GenuineSourceTests(EditTestCase):
             ),
             context={LOCAL_READ_TASK_REFERENCE_KEY: read_id},
         )
-        app = create_app(
+        app = open_app(
             settings=self.settings,
             connectors=(DummyConnector(name="carrier"), self.reader, self.writer),
+            destination_policy=_LOCAL_ROWS
+            | frozenset(
+                {
+                    DestinationGrant(
+                        "carrier", DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION
+                    )
+                }
+            ),
         )
         run = app.core.run(carrier, session_id=self.session_id)
         self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
@@ -1395,7 +1426,20 @@ class ModelAnswerDeferralTests(unittest.TestCase):
         writer = LocalFileWriteConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        app = create_app(settings=settings, connectors=(producer, writer))
+        app = open_app(
+            settings=settings,
+            connectors=(producer, writer),
+            destination_policy=_LOCAL_ROWS
+            | frozenset(
+                {
+                    DestinationGrant(
+                        producer.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         return app, writer
 
     def completed_source(self, app, snapshot: LocalReadSnapshot | None = None):
@@ -1405,6 +1449,9 @@ class ModelAnswerDeferralTests(unittest.TestCase):
             scope=ActionScope(
                 action="analyse",
                 target="repo",
+                # The producer's manifest declares an external egress, so the
+                # scope must name a destination Core actually registered.
+                destination=CLAUDE_CODE_DESTINATION,
                 data_classification=DataClassification.INTERNAL,
             ),
         )
@@ -1611,12 +1658,24 @@ class UnknownOutcomeTests(EditTestCase):
         reader = LocalFileReadConnector(
             allowed_roots=(self.root,), default_working_directory=self.root
         )
-        app = create_app(
+        app = open_app(
             settings=Settings(
                 memory_database=self.root / f"{connector.manifest.name}.db",
                 permission_mode=PermissionMode.SMART_AUTO,
             ),
             connectors=(reader, connector),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "local-file-read", "file_read", CLAUDE_CODE_DESTINATION
+                    ),
+                    DestinationGrant(
+                        connector.manifest.name,
+                        "file_write",
+                        CLAUDE_CODE_DESTINATION,
+                    ),
+                }
+            ),
         )
         read = app.run(json.dumps(self.read_document("notes.txt"))).payload
         self.assertEqual("completed", read["task"]["status"], read.get("error"))

@@ -56,14 +56,28 @@ from jarvis.contracts import (
     redact_credentials,
 )
 from jarvis.core import AgentCore
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
 from tests.test_claude_connector import (
     OAUTH_MAX_AUTH_STATUS,
     FakeProcess,
     patch_oauth_environment,
+)
+
+
+#: The shipped Claude rows, written out here rather than imported, so a
+#: fixture that composes the real connector still DECLARES its authority.
+CLAUDE_TUPLES = frozenset(
+    {
+        DestinationGrant("claude-code-plan", capability, CLAUDE_CODE_DESTINATION)
+        for capability in ("code_analysis", "code_planning")
+    }
 )
 
 
@@ -380,12 +394,25 @@ class SideEffectMergeTests(unittest.TestCase):
                 memory = SQLiteMemoryStore(Path(temp.name) / "jarvis.db")
                 registry = ToolRegistry()
                 registry.register(connector)
-                core = AgentCore(
+                core = open_core(
                     registry,
                     memory,
                     Settings(memory_database=memory.database_path, permission_mode=mode),
+                    destination_policy=frozenset(
+                        {
+                            DestinationGrant(
+                                connector.manifest.name,
+                                DUMMY_CAPABILITY,
+                                CLAUDE_CODE_DESTINATION,
+                            )
+                        }
+                    ),
                 )
-                run = core.run(make_task())
+                # The TASK's own effect stays NONE - the manifest floor is
+                # what this proves - but the scope must still name the
+                # destination Core registered, because the effective effect
+                # this connector forces is an external egress.
+                run = core.run(make_task(destination=CLAUDE_CODE_DESTINATION))
                 self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status)
 
 
@@ -531,8 +558,11 @@ class SecretExternalExecutionTests(unittest.TestCase):
     def test_agent_loop_fails_a_secret_task_closed_with_zero_processes(self) -> None:
         registry = ToolRegistry()
         registry.register(self.connector)
-        core = AgentCore(
-            registry, self.memory, Settings(memory_database=self.memory.database_path)
+        core = open_core(
+            registry,
+            self.memory,
+            Settings(memory_database=self.memory.database_path),
+            destination_policy=CLAUDE_TUPLES,
         )
         run = core.run(self.secret_task())
         self.assertEqual(RunStatus.FAILED, run.status)
@@ -542,8 +572,11 @@ class SecretExternalExecutionTests(unittest.TestCase):
     def test_fabricated_secret_execute_task_never_spawns_a_process(self) -> None:
         registry = ToolRegistry()
         registry.register(self.connector)
-        core = AgentCore(
-            registry, self.memory, Settings(memory_database=self.memory.database_path)
+        core = open_core(
+            registry,
+            self.memory,
+            Settings(memory_database=self.memory.database_path),
+            destination_policy=CLAUDE_TUPLES,
         )
         session = core.start_session("secret")
         task = self.secret_task()
@@ -681,12 +714,22 @@ class ClarificationLifecycleTests(unittest.TestCase):
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
     def core(self, connector=None, mode=PermissionMode.SESSION) -> AgentCore:
+        connector = connector or DummyConnector()
         registry = ToolRegistry()
-        registry.register(connector or DummyConnector())
-        return AgentCore(
+        registry.register(connector)
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path, permission_mode=mode),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def waiting_for_clarification(self, core):
@@ -792,8 +835,11 @@ class OldGrantCannotAuthorizeRefreshedRequestTests(unittest.TestCase):
         )
         registry = ToolRegistry()
         registry.register(self.connector)
-        self.core = AgentCore(
-            registry, self.memory, Settings(memory_database=self.memory.database_path)
+        self.core = open_core(
+            registry,
+            self.memory,
+            Settings(memory_database=self.memory.database_path),
+            destination_policy=CLAUDE_TUPLES,
         )
         environment = patch_oauth_environment()
         environment.start()
@@ -905,8 +951,11 @@ class ApprovedEgressEqualsExecutedEgressTests(unittest.TestCase):
         )
         registry = ToolRegistry()
         registry.register(self.connector)
-        self.core = AgentCore(
-            registry, self.memory, Settings(memory_database=self.memory.database_path)
+        self.core = open_core(
+            registry,
+            self.memory,
+            Settings(memory_database=self.memory.database_path),
+            destination_policy=CLAUDE_TUPLES,
         )
         environment = patch_oauth_environment()
         environment.start()
@@ -979,10 +1028,19 @@ class CostRequestReuseIntegrityTests(unittest.TestCase):
     def core(self, connector) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def append_metered(self, amount: float) -> None:
@@ -1159,10 +1217,19 @@ class ExpiredGrantTests(unittest.TestCase):
     def core(self, connector) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def egress_connector(self):
@@ -1404,10 +1471,19 @@ class TamperedRequestNotCurrentTests(unittest.TestCase):
     def core(self, connector) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def test_tampered_reason_forces_a_fresh_request_and_rejects_old_grant(self) -> None:
@@ -1473,10 +1549,19 @@ class UnattestedEgressConnectorTests(unittest.TestCase):
     def core(self, connector) -> AgentCore:
         registry = ToolRegistry()
         registry.register(connector)
-        return AgentCore(
+        return open_core(
             registry,
             self.memory,
             Settings(memory_database=self.memory.database_path),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
 
     def test_egress_without_canonical_outbound_fails_closed(self) -> None:

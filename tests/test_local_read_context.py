@@ -79,10 +79,14 @@ from jarvis.contracts import (
     local_read_context_refusal,
     local_read_reference_refusal,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, open_app, open_core, safe_cleanup
 
 #: Well-formed by the reference grammar, never a real task.
 OTHER_ID = "1" * 36
@@ -102,6 +106,28 @@ def snapshot(
         excerpt=excerpt,
         classification=classification,
         read_at=READ_AT,
+    )
+
+
+#: Exactly the rows these fixtures authorize. The planner's two model
+#: capabilities, the real reader's own, and each hostile late-claiming
+#: connector named one by one - never enumerated off a registry.
+_PLANNER_ROWS = frozenset(
+    {
+        DestinationGrant("test-planner", "code_analysis", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("test-planner", "code_planning", CLAUDE_CODE_DESTINATION),
+        DestinationGrant("local-file-read", "file_read", CLAUDE_CODE_DESTINATION),
+    }
+)
+
+
+def _late_rows(name: str) -> frozenset[DestinationGrant]:
+    """The two model capabilities ONE named late connector may reach."""
+    return frozenset(
+        {
+            DestinationGrant(name, "code_analysis", CLAUDE_CODE_DESTINATION),
+            DestinationGrant(name, "code_planning", CLAUDE_CODE_DESTINATION),
+        }
     )
 
 
@@ -236,10 +262,11 @@ class LocalReadContextBase(unittest.TestCase):
         self.memory = SQLiteMemoryStore(self.database)
         self.planner = PlanningConnector()
         self.reader = LocalFileReadConnector(allowed_roots=[self.root])
-        self.app = create_app(
+        self.app = open_app(
             settings=self.settings,
             memory=self.memory,
             connectors=(self.planner, self.reader),
+            destination_policy=_PLANNER_ROWS,
         )
         self.session_id: str | None = None
 
@@ -1739,10 +1766,11 @@ class ConsumerPolicyTests(LocalReadContextBase):
     def setUp(self) -> None:
         super().setUp()
         self.late = LateLocalConnector()
-        self.app = create_app(
+        self.app = open_app(
             settings=self.settings,
             memory=self.memory,
             connectors=(self.planner, self.late, self.reader),
+            destination_policy=_PLANNER_ROWS | _late_rows("late-local"),
         )
 
     def assert_never_routed(self, payload: dict[str, Any]) -> None:
@@ -1820,10 +1848,11 @@ class ConsumerPolicyTests(LocalReadContextBase):
         quiet = LateLocalConnector(name="late-local-quiet")
         quiet.manifest = replace(quiet.manifest, priority=1)
         self.late = quiet
-        self.app = create_app(
+        self.app = open_app(
             settings=self.settings,
             memory=self.memory,
             connectors=(self.planner, quiet, self.reader),
+            destination_policy=_PLANNER_ROWS | _late_rows("late-local-quiet"),
         )
         source = self.complete_read("a.txt")
         payload = self.run_consumer([source])
@@ -1896,10 +1925,11 @@ class ConsumerPolicyPositiveControlTests(LocalReadContextBase):
     def test_a_non_plural_task_is_not_subject_to_the_consumer_policy(self) -> None:
         """A NONE-kind task keeps whatever routing it always had."""
         late = LateLocalConnector(name="late-local-2")
-        app = create_app(
+        app = open_app(
             settings=self.settings,
             memory=self.memory,
             connectors=(self.planner, late, self.reader),
+            destination_policy=_PLANNER_ROWS | _late_rows("late-local-2"),
         )
         plain = json.dumps(
             {

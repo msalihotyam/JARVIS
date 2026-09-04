@@ -51,11 +51,15 @@ from jarvis.contracts import (
     VerificationRecord,
     VerificationStatus,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.core import AgentCore, _LiveStopWatcher
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import make_task, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, make_task, open_app, open_core, safe_cleanup
 
 
 def _executable_source(obj) -> str:
@@ -217,7 +221,20 @@ class LiveStopTestCase(unittest.TestCase):
         self.connector = _BlockingConnector()
         self.registry = _ExplodingRegistry()
         self.registry.register(self.connector)
-        self.core = AgentCore(self.registry, self.memory, self.settings)
+        self.core = open_core(
+            self.registry,
+            self.memory,
+            self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        self.connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         self.poll = mock.patch.object(
             __import__("jarvis.core", fromlist=["core"]),
             "_LIVE_STOP_POLL_SECONDS",
@@ -443,8 +460,19 @@ class WatcherEligibilityTests(LiveStopTestCase):
         fresh_connector = _BlockingConnector()
         fresh_registry = ToolRegistry()
         fresh_registry.register(fresh_connector)
-        fresh_core = AgentCore(
-            fresh_registry, SQLiteMemoryStore(self.database), self.settings
+        fresh_core = open_core(
+            fresh_registry,
+            SQLiteMemoryStore(self.database),
+            self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        fresh_connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         watchers: list = []
         real_start = _LiveStopWatcher.start
@@ -701,8 +729,19 @@ class RaceTests(LiveStopTestCase):
         connector = _BlockingConnector()
         registry = ToolRegistry()
         registry.register(connector)
-        core = AgentCore(
-            registry, memory, Settings(memory_database=database)
+        core = open_core(
+            registry,
+            memory,
+            Settings(memory_database=database),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
         )
         runs: list = []
         owner = threading.Thread(target=lambda: runs.append(core.run(make_task())))
@@ -802,7 +841,20 @@ class UnknownAfterStopTests(LiveStopTestCase):
         egress.raise_on_execute = RuntimeError("the network vanished")
         registry = ToolRegistry()
         registry.register(egress)
-        core = AgentCore(registry, self.memory, self.settings)
+        core = open_core(
+            registry,
+            self.memory,
+            self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "egress",
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         task = make_task(effect=SideEffect.EXTERNAL_EGRESS, reversible=False)
         gated = core.run(task)
         self.assertIs(gated.status, RunStatus.AWAITING_APPROVAL)
@@ -857,7 +909,20 @@ class BaseConnectorStopTests(LiveStopTestCase):
         plain = _NoStop(name="plain")
         registry = ToolRegistry()
         registry.register(plain)
-        core = AgentCore(registry, self.memory, self.settings)
+        core = open_core(
+            registry,
+            self.memory,
+            self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "plain",
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         runs: list = []
         thread = threading.Thread(target=lambda: runs.append(core.run(make_task())))
         thread.start()
@@ -1308,7 +1373,20 @@ class AuthorityBarrierTests(LiveStopTestCase):
         egress.raise_on_execute = RuntimeError("the network vanished")
         registry = ToolRegistry()
         registry.register(egress)
-        core = AgentCore(registry, self.memory, self.settings)
+        core = open_core(
+            registry,
+            self.memory,
+            self.settings,
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        "egress",
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
         task = make_task(effect=SideEffect.EXTERNAL_EGRESS, reversible=False)
         gated = core.run(task)
         self.assertIs(gated.status, RunStatus.AWAITING_APPROVAL)

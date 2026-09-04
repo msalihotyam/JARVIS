@@ -38,11 +38,15 @@ from jarvis.contracts import (
     SideEffect,
     StructuredError,
 )
+from jarvis.destinations import (
+    CLAUDE_CODE_DESTINATION,
+    DestinationGrant,
+)
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis import settings as settings_module
 from jarvis.settings import ConfigStore, Settings
-from tests.helpers import DummyConnector, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, open_core, safe_cleanup
 from tests.test_app import task_document
 
 
@@ -157,11 +161,20 @@ class CliTestCase(unittest.TestCase):
 
     def factory_for(self, connector: DummyConnector):
         def factory(settings: Settings):
-            return create_app(
+            return open_app(
                 settings=settings,
                 memory=self.memory,
                 registry=ToolRegistry(),
                 connectors=(connector,),
+                destination_policy=frozenset(
+                    {
+                        DestinationGrant(
+                            connector.manifest.name,
+                            DUMMY_CAPABILITY,
+                            CLAUDE_CODE_DESTINATION,
+                        )
+                    }
+                ),
             )
 
         return factory

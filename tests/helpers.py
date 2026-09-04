@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
+from jarvis.app import create_app
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
     ActionScope,
@@ -25,6 +26,9 @@ from jarvis.contracts import (
     VerificationRecord,
     VerificationStatus,
 )
+from jarvis.core import AgentCore
+from jarvis.destinations import CLAUDE_CODE_DESTINATION
+from jarvis.registry import ToolRegistry
 
 
 def safe_cleanup(temp: tempfile.TemporaryDirectory) -> None:
@@ -43,6 +47,65 @@ def safe_cleanup(temp: tempfile.TemporaryDirectory) -> None:
         temp.cleanup()
     except OSError:
         pass
+
+
+#: The capability every ``DummyConnector`` serves. Named here so a fixture can
+#: write its authorization row without reading it back off the manifest.
+DUMMY_CAPABILITY = "echo"
+
+
+def open_core(
+    registry: ToolRegistry,
+    memory,
+    settings=None,
+    verifier=None,
+    *,
+    destination_policy,
+) -> AgentCore:
+    """``AgentCore`` for a fixture build, under an EXPLICIT tuple policy.
+
+    ``destination_policy`` is REQUIRED and is never derived. Nothing here
+    reads the registry, a manifest, a capability list, ``can_handle`` or a
+    task's requested destination to manufacture a row: a fixture that
+    registers a connector without writing that connector's exact
+    ``DestinationGrant`` gets a build that refuses it, exactly as production
+    would. Omitting the argument is a ``TypeError``, not a permissive
+    default, so a new fixture cannot become accidentally authorized.
+
+    Pass ``CONNECTOR_DESTINATION_POLICY`` only when the test really is
+    composing the shipped production connectors.
+    """
+    return AgentCore(
+        registry,
+        memory,
+        settings,
+        verifier,
+        destination_policy=frozenset(destination_policy),
+    )
+
+
+def open_app(
+    *,
+    destination_policy,
+    settings=None,
+    memory=None,
+    registry: ToolRegistry | None = None,
+    connectors=(),
+    verifier=None,
+):
+    """``create_app`` for a fixture build, under an EXPLICIT tuple policy.
+
+    Same contract as ``open_core``: the policy is declared by the test at the
+    call site and is never reconstructed from what happens to be registered.
+    """
+    return create_app(
+        settings=settings,
+        memory=memory,
+        registry=registry,
+        connectors=connectors,
+        verifier=verifier,
+        destination_policy=frozenset(destination_policy),
+    )
 
 
 class DummyConnector(BaseConnector):
@@ -190,6 +253,7 @@ def make_task(
     reversible: bool = True,
     always_requires_approval: bool = False,
     classification: DataClassification = DataClassification.INTERNAL,
+    destination: str | None = None,
 ) -> Task:
     return Task(
         objective="echo this",
@@ -197,7 +261,19 @@ def make_task(
         scope=ActionScope(
             action="read",
             target=str(target),
-            destination="test-destination" if effect is SideEffect.EXTERNAL_EGRESS else "",
+            # An egress task must name a destination Core actually owns; the
+            # policy registry is the authority and no fake string passes it.
+            # ``destination`` overrides for a task whose own effect is not
+            # egress but whose connector's manifest makes it one.
+            destination=(
+                destination
+                if destination is not None
+                else (
+                    CLAUDE_CODE_DESTINATION
+                    if effect is SideEffect.EXTERNAL_EGRESS
+                    else ""
+                )
+            ),
             data_classification=classification,
         ),
         risk_level=risk,
