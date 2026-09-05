@@ -146,12 +146,15 @@ LOCAL_READ_NOTICE = (
 )
 
 #: The exact retrieved-memory kinds allowed to egress (M1). Default-deny:
-#: anything else - unknown kinds included - drops the whole item.
+#: anything else - unknown kinds included - drops the whole item. The V2
+#: closed vocabulary is decision/rule/thread/fact; the M1-era "preference"
+#: kind is canonicalized to RULE before it can ever reach this boundary.
 _EGRESS_MEMORY_KINDS = frozenset(
     {
         RetrievedMemoryKind.DECISION,
+        RetrievedMemoryKind.RULE,
+        RetrievedMemoryKind.THREAD,
         RetrievedMemoryKind.FACT,
-        RetrievedMemoryKind.PREFERENCE,
     }
 )
 

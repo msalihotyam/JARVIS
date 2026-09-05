@@ -117,7 +117,7 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         # H2 added the execution-attempt journal at schema 4; H3 added the
         # attempt-bound execution-billing/reservation journal at schema 5;
         # Project Memory M1 added projects/project_memory_items at schema 6.
-        self.assertEqual(6, SCHEMA_VERSION)
+        self.assertEqual(7, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
         connection = sqlite3.connect(self.memory.database_path)
         try:
@@ -172,7 +172,7 @@ class RegistryAndPersistenceTests(unittest.TestCase):
         # M3 stores the local-read snapshot inside the existing opaque task
         # JSON blob, so the database contract is unchanged. If this number
         # moves, a migration was added that M3 explicitly ruled out.
-        self.assertEqual(6, SCHEMA_VERSION)
+        self.assertEqual(7, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
 
     def test_local_read_snapshot_survives_a_task_round_trip(self) -> None:

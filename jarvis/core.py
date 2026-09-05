@@ -57,6 +57,7 @@ from jarvis.contracts import (
     LocalReadSnapshot,
     LocalWriteRecord,
     LoopStage,
+    MemoryOrigin,
     MemoryRetrievalQuery,
     MemoryStore,
     ModelAnswer,
@@ -293,6 +294,7 @@ def _validated_retrieved_item(item: Any) -> RetrievedMemoryItem:
     """
     _exact_type(item, RetrievedMemoryItem, "retrieved item")
     _exact_type(item.kind, RetrievedMemoryKind, "retrieved item kind")
+    _exact_type(item.origin, MemoryOrigin, "retrieved item origin")
     _exact_type(
         item.classification, DataClassification, "retrieved item classification"
     )
@@ -310,6 +312,34 @@ def _validated_retrieved_item(item: Any) -> RetrievedMemoryItem:
     _exact_count(item.relevance_score, "retrieved item relevance score")
     _exact_flag(item.truncated, "retrieved item truncated flag")
     return item
+
+
+def _demote_all_retrieved_rules(retrieved: RetrievedContext) -> RetrievedContext:
+    """Fail-closed fallback: strip RULE semantics from a snapshot wholesale.
+
+    Used only where the authoritative re-proof cannot run (a storage fault at
+    the loop boundary). Trust requires proof; when proof is unavailable the
+    safe direction is to demote every claimed RULE to non-authoritative
+    data rather than let a snapshot's self-description stand.
+    """
+    return replace(
+        retrieved,
+        items=tuple(
+            (
+                item
+                if (
+                    type(item) is not RetrievedMemoryItem
+                    or item.kind is not RetrievedMemoryKind.RULE
+                )
+                else replace(
+                    item,
+                    kind=RetrievedMemoryKind.FACT,
+                    origin=MemoryOrigin.INFERRED,
+                )
+            )
+            for item in retrieved.items
+        ),
+    )
 
 
 class _LifecycleLost(Exception):
@@ -809,6 +839,38 @@ class AgentCore:
         task: Task,
         grant: PermissionGrant | None,
     ) -> AgentRun:
+        # Memory V2 correction: a task resumed from persisted state carries a
+        # retrieved-memory SNAPSHOT, which is untrusted data. Before any
+        # consumer (plan step, connector payload, later stage logic) sees it,
+        # every claimed RULE is re-proved and RECONSTRUCTED from the
+        # authoritative SQLite memory row by the storage-owned re-proof; no
+        # snapshot semantic field survives into a trusted RULE, and an
+        # unprovable claim demotes to non-authoritative data. The query text
+        # is the same deterministic composition the retrieval stage uses, so
+        # relevance metadata is recomputed, not trusted from the snapshot. A
+        # fresh task's snapshot is empty, so this is a no-op on the first
+        # pass, and a storage fault here fails CLOSED (demote) rather than
+        # trusting the snapshot or crashing the boundary.
+        if task.retrieved_context.items:
+            try:
+                task.retrieved_context = self.memory.reprove_retrieved_rules(
+                    session.project_id,
+                    task.retrieved_context,
+                    # The same deterministic query composition as the
+                    # CONTEXT_RETRIEVAL stage.
+                    "\n".join(
+                        (
+                            task.objective,
+                            task.capability,
+                            task.scope.action,
+                            task.scope.target,
+                        )
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - fail-closed security boundary
+                task.retrieved_context = _demote_all_retrieved_rules(
+                    task.retrieved_context
+                )
         # S4. THE global execution barrier, and it is placed here on purpose:
         # ahead of the canonical target binding, the connector lookup, the
         # estimate, the attestation, any approval, any grant consumption, any

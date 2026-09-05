@@ -13,6 +13,7 @@ from jarvis.contracts import (
     PROJECT_MEMORY_CANDIDATE_WINDOW,
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
+    RETRIEVAL_SUMMARY_CAP,
     AttemptState,
     CancellationOutcome,
     BillingClaim,
@@ -25,6 +26,7 @@ from jarvis.contracts import (
     ExecutionClaimOutcome,
     LedgerSnapshot,
     LoopStage,
+    MemoryOrigin,
     MemoryRetrievalQuery,
     MonetaryState,
     PermissionGrant,
@@ -37,8 +39,10 @@ from jarvis.contracts import (
     ReconciliationResult,
     ReservationState,
     RetrievedContext,
+    RetrievedMemoryItem,
     RetrievedMemoryKind,
     RunStatus,
+    memory_lifecycle_refusal,
     SessionState,
     Task,
     TaskStatus,
@@ -50,6 +54,8 @@ from jarvis.contracts import (
     nano_usd,
     normalize_retrieved_text,
     redact_credentials,
+    retrieval_tokens,
+    truncate_retrieved_text,
     redact_local_paths,
     usd_from_nano,
     utc_now,
@@ -270,16 +276,23 @@ class InMemoryStore:
             )
         project_candidates: tuple[ProjectMemoryItem, ...] = ()
         if query.project_id is not None:
-            active_items = [
-                item
-                for item in self.memory_items
-                if item.project_id == query.project_id and item.active
-            ]
-            active_items.sort(key=lambda item: item.id)
-            active_items.sort(key=lambda item: item.created_at, reverse=True)
-            project_candidates = tuple(
-                copy.deepcopy(active_items[:PROJECT_MEMORY_CANDIDATE_WINDOW])
-            )
+            # Memory V2 parity: candidate acquisition is partitioned per
+            # canonical kind (one bounded window each), so a flood of newer
+            # records in one category cannot push the others out of the
+            # candidate set before fairness interleaving runs.
+            partitioned: list[ProjectMemoryItem] = []
+            for kind in ProjectMemoryKind:
+                same_kind = [
+                    item
+                    for item in self.memory_items
+                    if item.project_id == query.project_id
+                    and item.active
+                    and item.kind is kind
+                ]
+                same_kind.sort(key=lambda item: item.id)
+                same_kind.sort(key=lambda item: item.created_at, reverse=True)
+                partitioned.extend(same_kind[:PROJECT_MEMORY_CANDIDATE_WINDOW])
+            project_candidates = tuple(copy.deepcopy(partitioned))
             # M2 parity: decisions of the same project's OTHER sessions. A
             # decision whose session is missing or bound to another project
             # never enters; the querying session is excluded so the two
@@ -310,6 +323,76 @@ class InMemoryStore:
             query, current, candidates, project_candidates=project_candidates
         )
 
+    def reprove_retrieved_rules(
+        self,
+        project_id: str | None,
+        retrieved: RetrievedContext,
+        query_text: str = "",
+    ) -> RetrievedContext:
+        # Memory V2 parity with the SQLite store: a surviving RULE is
+        # RECONSTRUCTED from the authoritative current record - no snapshot
+        # semantic field (summary, rationale, next step, source binding,
+        # classification, created_at) is ever trusted into a trusted RULE.
+        # Relevance/truncation metadata is recomputed under the same
+        # deterministic rules as retrieval; an unprovable claim demotes.
+        if not any(
+            type(item) is RetrievedMemoryItem
+            and item.kind is RetrievedMemoryKind.RULE
+            for item in retrieved.items
+        ):
+            return retrieved
+        query_tokens = retrieval_tokens(query_text)
+        items: list[RetrievedMemoryItem] = []
+        for item in retrieved.items:
+            if (
+                type(item) is not RetrievedMemoryItem
+                or item.kind is not RetrievedMemoryKind.RULE
+            ):
+                items.append(item)
+                continue
+            proof: ProjectMemoryItem | None = None
+            if project_id is not None and item.record_id:
+                for record in self.memory_items:
+                    if (
+                        record.id == item.record_id
+                        and record.project_id == project_id
+                        and record.kind is ProjectMemoryKind.RULE
+                        and record.origin is MemoryOrigin.EXPLICIT_USER
+                        and record.lifecycle.value == "active"
+                    ):
+                        proof = record
+                        break
+            if proof is None:
+                items.append(
+                    replace(
+                        item,
+                        kind=RetrievedMemoryKind.FACT,
+                        origin=MemoryOrigin.INFERRED,
+                    )
+                )
+                continue
+            summary, summary_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(proof.text), RETRIEVAL_SUMMARY_CAP
+            )
+            items.append(
+                RetrievedMemoryItem(
+                    kind=RetrievedMemoryKind.RULE,
+                    record_id=proof.id,
+                    source_task_id=proof.project_id,
+                    summary=summary,
+                    rationale="",
+                    next_step=None,
+                    classification=proof.classification,
+                    created_at=proof.created_at,
+                    relevance_score=len(
+                        query_tokens & retrieval_tokens(proof.text)
+                    ),
+                    truncated=summary_truncated,
+                    origin=proof.origin,
+                )
+            )
+        return replace(retrieved, items=tuple(items))
+
     def save_project(self, project: ProjectRecord) -> None:
         if project.id in self.projects:
             raise ValueError(f"Project already exists: {project.id}")
@@ -326,9 +409,49 @@ class InMemoryStore:
     def save_memory_item(
         self, item: ProjectMemoryItem, *, supersedes: str | None = None
     ) -> ProjectMemoryItem:
-        # The same write-boundary contract as the SQLite store: normalize,
-        # hard-reject oversize (never truncate), canonical hygiene helpers,
-        # INSERT-only with supersede-only lifecycle flags.
+        # The same write-boundary contract as the SQLite store: the generic
+        # surface refuses explicit-user provenance outright (trusted
+        # provenance is established only by ``save_explicit_user_memory_item``),
+        # normalize, hard-reject oversize (never truncate), canonical hygiene
+        # helpers, INSERT-only with supersede-only lifecycle flags.
+        if item.origin is MemoryOrigin.EXPLICIT_USER:
+            raise ValueError(
+                "explicit-user provenance requires the trusted "
+                "explicit-human memory add path"
+            )
+        if item.kind is ProjectMemoryKind.RULE:
+            raise ValueError("a RULE requires explicit-user provenance")
+        return self._persist_memory_item(item, supersedes=supersedes)
+
+    def save_explicit_user_memory_item(
+        self,
+        project_id: str,
+        kind: str,
+        classification: str,
+        text: str,
+        *,
+        supersedes: str | None = None,
+    ) -> ProjectMemoryItem:
+        # Trusted explicit-human boundary parity: EXPLICIT_USER is
+        # established INTERNALLY, never accepted from the caller.
+        project_kind = (
+            ProjectMemoryKind.RULE
+            if kind == "preference"
+            else ProjectMemoryKind(kind)
+        )
+        item = ProjectMemoryItem(
+            project_id=project_id,
+            kind=project_kind,
+            text=text,
+            classification=DataClassification(classification),
+            origin=MemoryOrigin.EXPLICIT_USER,
+            origin_detail="cli-memory-add",
+        )
+        return self._persist_memory_item(item, supersedes=supersedes)
+
+    def _persist_memory_item(
+        self, item: ProjectMemoryItem, *, supersedes: str | None
+    ) -> ProjectMemoryItem:
         text = normalize_retrieved_text(item.text)
         if not text:
             raise ValueError("memory text must be a non-blank string")
@@ -350,10 +473,16 @@ class InMemoryStore:
                 if existing.id == supersedes:
                     old_index = index
                     break
+            predecessor = (
+                None if old_index is None else self.memory_items[old_index]
+            )
             if (
-                old_index is None
-                or self.memory_items[old_index].project_id != stored.project_id
-                or not self.memory_items[old_index].active
+                predecessor is None
+                or predecessor.project_id != stored.project_id
+                or memory_lifecycle_refusal(
+                    predecessor.active, predecessor.superseded_by
+                ) is not None
+                or predecessor.active is not True
             ):
                 raise ValueError(
                     "supersedes must reference an active memory item "

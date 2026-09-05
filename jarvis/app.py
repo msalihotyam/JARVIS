@@ -63,13 +63,14 @@ from jarvis.contracts import (
     LocalReadKind,
     LocalReadSnapshot,
     LocalWriteRecord,
+    MEMORY_ORIGIN_DETAIL_CAP,
     MemoryStore,
+    MemoryLifecycle,
     ModelAnswer,
     PermissionGrant,
     PermissionMode,
     PermissionRequest,
     ProjectMemoryItem,
-    ProjectMemoryKind,
     ProjectRecord,
     ResultVerifier,
     RiskLevel,
@@ -97,6 +98,7 @@ from jarvis.contracts import (
     model_answer_refusal,
     next_loop_stage,
     require_billing_class,
+    sanitize_diagnostic_text,
     validate_project_id,
 )
 from jarvis.core import AgentCore
@@ -1152,9 +1154,18 @@ def _memory_item_payload(item: ProjectMemoryItem) -> dict[str, Any]:
         "project_id": item.project_id,
         "kind": item.kind.value,
         "classification": item.classification.value,
+        # Provenance is rendered data about the record, never authority.
+        "origin": item.origin.value,
+        # Re-sanitized defensively for presentation (save and load already
+        # apply the same canonical pipeline, so this is a no-op on any value
+        # that passed those boundaries).
+        "origin_detail": sanitize_diagnostic_text(
+            item.origin_detail, MEMORY_ORIGIN_DETAIL_CAP
+        ),
         # Exactly what was persisted: already normalized, bounded and passed
         # through the canonical credential/path hygiene at the write boundary.
         "text": item.text,
+        "lifecycle": item.lifecycle.value,
         "active": item.active,
         "superseded_by": item.superseded_by,
         "created_at": item.created_at,
@@ -1192,15 +1203,22 @@ def memory_add_result(
 ) -> CommandResult:
     command = "memory-add"
     try:
-        # Kind and classification are explicit user input; an unknown value
-        # fails closed here and is never defaulted or downgraded.
-        item = ProjectMemoryItem(
-            project_id=validate_project_id(project_id),
-            kind=ProjectMemoryKind(kind),
-            text=text,
-            classification=DataClassification(classification),
+        # THE trusted explicit-human write boundary (Memory V2). Kind and
+        # classification are explicit user input; an unknown value fails
+        # closed and is never defaulted or downgraded. The one deterministic
+        # mapping is the deprecated M1-era "preference" input: it is an
+        # explicit human CLI action, so the trusted boundary writes it as a
+        # RULE. The boundary establishes EXPLICIT_USER provenance internally
+        # - this composition path is its single audited production caller,
+        # and generic/programmatic writers (which cannot self-assert
+        # explicit-user provenance) never inherit the alias.
+        stored = memory.save_explicit_user_memory_item(
+            project_id,
+            kind,
+            classification,
+            text,
+            supersedes=supersedes,
         )
-        stored = memory.save_memory_item(item, supersedes=supersedes)
     except ValueError as exc:
         return failure_result(
             command,
@@ -1220,14 +1238,19 @@ def memory_add_result(
 
 
 def memory_list_result(
-    memory: SQLiteMemoryStore, settings: Settings, project_id: str
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    project_id: str,
+    include_inactive: bool = False,
 ) -> CommandResult:
     command = "memory-list"
     try:
         valid_id = validate_project_id(project_id)
         if memory.load_project(valid_id) is None:
             raise ValueError(f"Unknown project: {valid_id}")
-        items = memory.list_memory_items(valid_id)
+        items = memory.list_memory_items(
+            valid_id, include_inactive=bool(include_inactive)
+        )
     except ValueError as exc:
         return failure_result(
             command,
@@ -1241,6 +1264,36 @@ def memory_list_result(
             "command": command,
             "project_id": valid_id,
             "items": [_memory_item_payload(item) for item in items],
+        },
+        EXIT_OK,
+    )
+
+
+def memory_retire_result(
+    memory: SQLiteMemoryStore, settings: Settings, project_id: str, item_id: str
+) -> CommandResult:
+    """Explicitly retire one ACTIVE memory item (V2 lifecycle transition)."""
+    command = "memory-retire"
+    try:
+        valid_id = validate_project_id(project_id)
+        if memory.load_project(valid_id) is None:
+            raise ValueError(f"Unknown project: {valid_id}")
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise ValueError("retire requires the id of the item to retire")
+        retired = memory.retire_memory_item(valid_id, item_id)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        {
+            "command": command,
+            "project_id": valid_id,
+            "item": _memory_item_payload(retired),
         },
         EXIT_OK,
     )

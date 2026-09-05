@@ -29,6 +29,7 @@ from jarvis.contracts import (
     ActionScope,
     DataClassification,
     DecisionRecord,
+    MemoryOrigin,
     MemoryRetrievalQuery,
     PermissionGrant,
     ProjectMemoryItem,
@@ -1416,19 +1417,23 @@ class ProjectMemoryPipelineContractTests(unittest.TestCase):
         result = build_retrieved_context(
             self.query(), DataClassification.INTERNAL, candidates, facts
         )
+        # V2 category-aware ordering: DECISION and FACT interleave in
+        # deterministic priority rounds (one DECISION, then one FACT per
+        # round); within a category the order stays (score desc -> created_at
+        # desc -> id asc).
         self.assertEqual(
-            ["f-new", "d-mid", "f-low-score"],
+            ["d-mid", "f-new", "f-low-score"],
             [item.record_id for item in result.items],
         )
         self.assertEqual(
             [
-                RetrievedMemoryKind.FACT,
                 RetrievedMemoryKind.DECISION,
+                RetrievedMemoryKind.FACT,
                 RetrievedMemoryKind.FACT,
             ],
             [item.kind for item in result.items],
         )
-        fact_item = result.items[0]
+        fact_item = result.items[1]
         self.assertEqual("", fact_item.rationale)
         self.assertIsNone(fact_item.next_step)
         self.assertEqual("proj-a", fact_item.source_task_id)
@@ -1469,10 +1474,14 @@ class ProjectMemoryPipelineContractTests(unittest.TestCase):
             ),
             ProjectMemoryItem(
                 project_id="proj-a",
-                kind=ProjectMemoryKind.PREFERENCE,
-                text="shared tokens query secret preference",
+                kind=ProjectMemoryKind.RULE,
+                text="shared tokens query secret rule",
                 classification=DataClassification.SECRET,
                 id="f-secret",
+                # A RULE record can only exist with explicit-user provenance
+                # (trusted write boundary); the classification ladder under
+                # test is unchanged by kind.
+                origin=MemoryOrigin.EXPLICIT_USER,
                 created_at="2026-08-22T00:00:00+00:00",
             ),
         )
@@ -1483,9 +1492,9 @@ class ProjectMemoryPipelineContractTests(unittest.TestCase):
 
 
 class ConnectorEgressKindAllowlistTests(unittest.TestCase):
-    """M1 regression pin for the connector serialization boundary.
+    """M1/V2 regression pin for the connector serialization boundary.
 
-    The egress kind allowlist is exactly {decision, fact, preference}: a
+    The egress kind allowlist is exactly {decision, rule, thread, fact}: a
     regression back to decision-only MUST fail here. Unknown or tampered
     kinds drop fail-closed without consuming an outbound slot, the
     classification ceiling is re-enforced per item, and the defensive
@@ -1520,18 +1529,19 @@ class ConnectorEgressKindAllowlistTests(unittest.TestCase):
         payload, _ = ClaudeCodeConnector._retrieved_memory(task)
         return payload
 
-    def test_all_three_supported_kinds_egress_in_snapshot_order(self) -> None:
+    def test_all_supported_kinds_egress_in_snapshot_order(self) -> None:
         payload = self.payload_for(
             self.snapshot_item(RetrievedMemoryKind.DECISION, record_id="r1"),
-            self.snapshot_item(RetrievedMemoryKind.FACT, record_id="r2"),
-            self.snapshot_item(RetrievedMemoryKind.PREFERENCE, record_id="r3"),
+            self.snapshot_item(RetrievedMemoryKind.RULE, record_id="r2"),
+            self.snapshot_item(RetrievedMemoryKind.THREAD, record_id="r3"),
+            self.snapshot_item(RetrievedMemoryKind.FACT, record_id="r4"),
         )
         self.assertEqual(RETRIEVED_MEMORY_NOTICE, payload["notice"])
         kinds = [item["kind"] for item in payload["items"]]
-        self.assertEqual(["decision", "fact", "preference"], kinds)
+        self.assertEqual(["decision", "rule", "thread", "fact"], kinds)
         # The pin itself: every supported kind MUST be present. If the
         # connector allowlist ever narrows back to decision-only, this fails.
-        self.assertEqual({"decision", "fact", "preference"}, set(kinds))
+        self.assertEqual({"decision", "rule", "thread", "fact"}, set(kinds))
         for item in payload["items"]:
             self.assertEqual(
                 {"kind", "summary", "rationale", "next_step", "classification"},
@@ -1580,9 +1590,9 @@ class ConnectorEgressKindAllowlistTests(unittest.TestCase):
             record_id="secret-fact",
         )
         sensitive = self.snapshot_item(
-            RetrievedMemoryKind.PREFERENCE,
+            RetrievedMemoryKind.RULE,
             classification=DataClassification.SENSITIVE,
-            record_id="higher-pref",
+            record_id="higher-rule",
         )
         eligible = self.snapshot_item(
             RetrievedMemoryKind.FACT, record_id="eligible-fact"

@@ -28,6 +28,7 @@ from jarvis.app import (
     failure_result,
     memory_add_result,
     memory_list_result,
+    memory_retire_result,
     project_create_result,
     sessions_result,
     show_result,
@@ -187,8 +188,14 @@ def _build_parser() -> _ArgumentParser:
     memory_actions = memory_command.add_subparsers(dest="memory_action")
     memory_add = memory_actions.add_parser("add")
     memory_add.add_argument("--project", required=True)
+    # Canonical kinds are fact|decision|rule|thread. "preference" is the
+    # deprecated M1-era input alias; it is written and persisted as a RULE.
     memory_add.add_argument(
-        "--kind", required=True, choices=[kind.value for kind in ProjectMemoryKind]
+        "--kind",
+        required=True,
+        choices=[kind.value for kind in ProjectMemoryKind] + ["preference"],
+        help="Canonical kind (fact|decision|rule|thread); 'preference' is a "
+        "deprecated alias written as 'rule'.",
     )
     memory_add.add_argument(
         "--classification",
@@ -199,6 +206,17 @@ def _build_parser() -> _ArgumentParser:
     memory_add.add_argument("--supersedes")
     memory_list = memory_actions.add_parser("list")
     memory_list.add_argument("--project", required=True)
+    memory_list.add_argument(
+        "--all",
+        dest="include_inactive",
+        action="store_true",
+        help="Include superseded and retired items (lifecycle history).",
+    )
+    memory_retire = memory_actions.add_parser(
+        "retire", help="Explicitly retire one ACTIVE memory item."
+    )
+    memory_retire.add_argument("--project", required=True)
+    memory_retire.add_argument("--item", required=True)
 
     # Sequential task chain (M11 S2): local-only, like ``project`` and
     # ``memory``. Declaring a chain performs no action, so these commands
@@ -288,12 +306,16 @@ def _dispatch_memory_command(
             args.supersedes,
         )
     if getattr(args, "memory_action", None) == "list":
-        return memory_list_result(memory, settings, args.project)
+        return memory_list_result(
+            memory, settings, args.project, args.include_inactive
+        )
+    if getattr(args, "memory_action", None) == "retire":
+        return memory_retire_result(memory, settings, args.project, args.item)
     return failure_result(
         "memory",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'memory' requires the 'add' or 'list' sub-command.",
+        "'memory' requires the 'add', 'list' or 'retire' sub-command.",
         EXIT_INVALID_INPUT,
     )
 

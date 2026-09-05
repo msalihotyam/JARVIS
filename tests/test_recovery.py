@@ -53,7 +53,7 @@ from jarvis.contracts import (
     TaskStatus,
 )
 from jarvis.core import AgentCore
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import safe_cleanup
@@ -1295,11 +1295,12 @@ class ScopeTests(RecoveryTestCase):
                 )
 
     def test_the_schema_is_untouched(self) -> None:
-        """S2A adds no storage schema at all: 6 in, 6 out."""
-        self.assertEqual(self.memory.schema_version(), 6)
+        """S2A adds no storage schema of its own: 7 in, 7 out (Memory V2
+        owns the current SQLite schema version; this milestone adds none)."""
+        self.assertEqual(self.memory.schema_version(), SCHEMA_VERSION)
         task, attempt_id = self.in_doubt_task()
         self.abandon(task.id, attempt_id)
-        self.assertEqual(self.memory.schema_version(), 6)
+        self.assertEqual(self.memory.schema_version(), SCHEMA_VERSION)
 
     def test_no_cancellation_claim_authority_is_persisted(self) -> None:
         """CLOSEOUT: the schema-7 claim mechanism is gone, not dormant.

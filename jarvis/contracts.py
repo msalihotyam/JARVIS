@@ -1378,10 +1378,18 @@ PROJECT_NAME_CAP = 120
 #: write boundary, never silently truncated: memory content is semantic user
 #: data, not diagnostics.
 PROJECT_MEMORY_TEXT_CAP = 480
-#: Newest active project items examined per retrieval, before scoring. An
-#: internal safety window like ``RETRIEVAL_CANDIDATE_WINDOW``, not a result
-#: limit; the absolute retrieval ceilings above stay unchanged.
+#: Newest active project items examined PER CANONICAL KIND per retrieval,
+#: before scoring (Memory V2 correction). Candidate acquisition runs one
+#: bounded per-kind query for each of RULE, DECISION, THREAD and FACT, so a
+#: flood of newer records in one category can never push the other
+#: categories out of the candidate set BEFORE category fairness interleaving
+#: runs. Like ``RETRIEVAL_CANDIDATE_WINDOW`` this is an internal safety
+#: window, not a result limit; the absolute retrieval ceilings stay unchanged.
 PROJECT_MEMORY_CANDIDATE_WINDOW = 25
+#: The strict total bound on project-memory candidates per retrieval: one
+#: bounded window per canonical kind (exactly four kinds). Candidate
+#: acquisition is partitioned but never unbounded.
+PROJECT_MEMORY_CANDIDATE_WINDOW_TOTAL = 4 * PROJECT_MEMORY_CANDIDATE_WINDOW
 #: Newest decisions of the SAME project's OTHER sessions examined per
 #: retrieval (M2). The querying session is always excluded, so a decision can
 #: never enter through two windows. Like every window above this is an
@@ -1402,8 +1410,158 @@ def validate_project_id(value: Any) -> str:
 
 
 class ProjectMemoryKind(str, Enum):
+    """The closed canonical typed-memory vocabulary (Memory V2 foundation).
+
+    Exactly four durable record kinds exist. The M1-era persisted kind
+    ``preference`` is gone from the canonical vocabulary:
+
+    * a NEW human ``memory add --kind preference`` input is a deprecated
+      alias handled by the trusted explicit-human write boundary and is
+      written as a ``RULE``;
+    * an OLD persisted schema-6 ``preference`` row carries no proof of
+      explicit-human sourcing, so migration preserves it as NON-authoritative
+      canonical ``FACT`` data with untrusted provenance and a
+      ``legacy-v6-preference`` ``origin_detail`` marker. It never gains RULE
+      semantics unless a human re-adds it through the trusted path.
+
+    * ``FACT`` - a durable factual statement or user-provided fact.
+    * ``DECISION`` - a durable decision already made.
+    * ``RULE`` - a durable explicit user correction, preference, instruction
+      or standing rule. Never created merely because a model inferred
+      something, and never created by a generic programmatic write: a RULE
+      requires explicit-user provenance established by the trusted
+      explicit-human write boundary.
+    * ``THREAD`` - a durable open topic, ongoing workstream or unresolved
+      continuation context.
+    """
+
     FACT = "fact"
-    PREFERENCE = "preference"
+    DECISION = "decision"
+    RULE = "rule"
+    THREAD = "thread"
+
+
+class MemoryOrigin(str, Enum):
+    """Closed provenance vocabulary for where one memory record came from.
+
+    Provenance is DATA about the record's history. It never grants execution,
+    approval, egress or any other authority, and imported, external or
+    model-generated content is untrusted data no matter how it is labelled.
+
+    * ``EXPLICIT_USER`` - provenance established by the trusted
+      explicit-human write boundary (the local CLI/app ``memory add``
+      composition path). It is a property the boundary ESTABLISHES
+      internally, never a caller-supplied authority token: a generic
+      programmatic writer cannot obtain RULE semantics by self-asserting
+      this class. It is the only origin that may carry a durable ``RULE``.
+    * ``SYSTEM_DECISION`` - JARVIS-created durable decision state.
+    * ``INFERRED`` - inferred/model-generated candidate (untrusted); also
+      the default for records whose history is unknown or unproven (e.g.
+      rows migrated from schema 6).
+    * ``IMPORTED`` - imported/external content (untrusted).
+
+    The generic programmatic write surface only persists the untrusted
+    classes; ``EXPLICIT_USER`` is established exclusively by the dedicated
+    trusted write method whose production callers are the local human
+    command/app composition path.
+    """
+
+    EXPLICIT_USER = "explicit_user"
+    SYSTEM_DECISION = "system_decision"
+    INFERRED = "inferred"
+    IMPORTED = "imported"
+
+
+#: Hard ceiling for one stored provenance detail string (a free-form source
+#: or event reference, e.g. a CLI command, import batch id or capture event).
+MEMORY_ORIGIN_DETAIL_CAP = 200
+
+
+class MemoryLifecycle(str, Enum):
+    """The closed lifecycle vocabulary of a structured memory record.
+
+    Derived deterministically from the persisted flags that already existed
+    (M1) through the ONE canonical shape validator
+    (``memory_lifecycle_refusal``): ``active=1`` with no successor is ACTIVE;
+    ``active=0`` with a non-blank ``superseded_by`` successor is SUPERSEDED;
+    ``active=0`` without one is RETIRED. Every other flag shape is refused,
+    never interpreted. Rows are INSERT-only and never deleted, so historical
+    records stay durably stored in exactly one lifecycle state; transitions
+    are the explicit, storage APIs only (``supersedes`` on write, the retire
+    operation) and no model text or retrieved content can mutate them.
+    """
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    RETIRED = "retired"
+
+
+def memory_lifecycle_refusal(active: Any, superseded_by: Any) -> str | None:
+    """THE one canonical fail-closed lifecycle-shape validator.
+
+    Every reader of persisted memory lifecycle state - construction,
+    ``from_dict``, the SQLite load boundary, active retrieval, retire and
+    supersede - asks THIS function and no other, so no code path can grow
+    its own weaker reading of the persisted flags. It validates SHAPE and
+    never coerces: a generic ``bool(value)`` would read ``2``, ``"yes"`` or
+    ``1.0`` as a lifecycle, and a truthiness check would read an impossible
+    ``active=1`` + successor row as a trusted ACTIVE record.
+
+    Valid states are exactly:
+
+    * ``ACTIVE``     - ``active`` is exact ``True``/persisted ``1`` AND
+      ``superseded_by`` is ``None``;
+    * ``SUPERSEDED`` - ``active`` is exact ``False``/persisted ``0`` AND
+      ``superseded_by`` is a non-blank string;
+    * ``RETIRED``    - ``active`` is exact ``False``/persisted ``0`` AND
+      ``superseded_by`` is ``None``.
+
+    Anything else - an active flag that is not an exact boolean or exact
+    persisted ``0``/``1`` (``2``, ``-1``, ``"yes"``, ``1.0``), a blank or
+    non-string successor id, a successor on an ACTIVE record, or any other
+    impossible combination - returns a refusal reason, and the caller must
+    fail closed. A row that fails this shape stays physically stored but can
+    never load, retrieve, retire or supersede as a trusted lifecycle state.
+    """
+    if type(active) is bool:
+        flag_active = active
+    elif type(active) is int and active in (0, 1):
+        flag_active = active == 1
+    else:
+        return "lifecycle: active is not an exact boolean or persisted 0/1"
+    if superseded_by is None:
+        successor = None
+    elif isinstance(superseded_by, str) and superseded_by.strip():
+        successor = superseded_by
+    else:
+        return (
+            "lifecycle: superseded_by is neither a non-blank successor id "
+            "nor None"
+        )
+    if flag_active and successor is not None:
+        return "lifecycle: an ACTIVE record must not carry a successor"
+    return None
+
+
+def memory_lifecycle_from_flags(
+    active: Any, superseded_by: Any
+) -> MemoryLifecycle:
+    """The one deterministic lifecycle reading of a VALID persisted record.
+
+    Raises ``ValueError`` for every shape ``memory_lifecycle_refusal``
+    rejects: an impossible flag combination is never silently read as a
+    lifecycle state.
+    """
+    refusal = memory_lifecycle_refusal(active, superseded_by)
+    if refusal is not None:
+        raise ValueError(refusal)
+    if active is True or (type(active) is int and active == 1):
+        return MemoryLifecycle.ACTIVE
+    return (
+        MemoryLifecycle.SUPERSEDED
+        if superseded_by is not None
+        else MemoryLifecycle.RETIRED
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1445,7 +1603,7 @@ class ProjectRecord:
 
 @dataclass(frozen=True, slots=True)
 class ProjectMemoryItem:
-    """One explicit, user-written project memory entry (fact or preference).
+    """One explicit, user-written project memory entry (typed record).
 
     Untrusted reference data with NO execution authority: it can never
     satisfy, create or influence approvals, grants, billing or lifecycle
@@ -1453,6 +1611,26 @@ class ProjectMemoryItem:
     mandatory at write time and is never downgraded automatically; a
     malformed persisted classification loads closed as SECRET through
     ``from_dict``, keeping the item permanently ineligible for egress.
+
+    Provenance (Memory V2 foundation): ``origin`` is the closed class of the
+    record's source and ``origin_detail`` an optional bounded source/event
+    reference. The DEFAULT origin is ``INFERRED`` - the LEAST trusted class -
+    because an unlabelled record has no provenance worth trusting.
+    ``EXPLICIT_USER`` is never a caller-supplied authority token: it is
+    established internally by the trusted explicit-human write boundary
+    (``SQLiteMemoryStore.save_explicit_user_memory_item``, called only from
+    the local CLI/app ``memory add`` composition path). Only explicit-user
+    provenance may carry a ``RULE`` - the boundary below refuses any other
+    combination, so inferred, model-generated or imported content can never
+    impersonate an explicit user rule.
+
+    ``origin_detail`` is persisted free-form diagnostic text, so it passes
+    through the ONE canonical ``sanitize_diagnostic_text`` pipeline
+    (credential/path redaction included) and its length stays inside
+    ``MEMORY_ORIGIN_DETAIL_CAP``. The lifecycle is not stored: it is derived
+    from the persisted flags through ``memory_lifecycle_from_flags`` (see
+    ``MemoryLifecycle``), and an impossible flag shape is refused here at
+    construction instead of loading as a trusted state.
     """
 
     project_id: str
@@ -1460,15 +1638,55 @@ class ProjectMemoryItem:
     text: str
     classification: DataClassification
     id: str = field(default_factory=lambda: str(uuid4()))
+    origin: MemoryOrigin = MemoryOrigin.INFERRED
+    origin_detail: str = ""
     active: bool = True
     superseded_by: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
+    @property
+    def lifecycle(self) -> MemoryLifecycle:
+        return memory_lifecycle_from_flags(self.active, self.superseded_by)
+
     def __post_init__(self) -> None:
         validate_project_id(self.project_id)
         if type(self.kind) is not ProjectMemoryKind:
             raise ValueError("kind must be a ProjectMemoryKind")
+        if type(self.origin) is not MemoryOrigin:
+            raise ValueError("origin must be a MemoryOrigin")
+        if not isinstance(self.origin_detail, str):
+            raise ValueError("origin_detail must be a string")
+        # Provenance detail is persisted free-form diagnostic metadata, so it
+        # takes the ONE canonical hygiene pipeline (NFKC, newline/whitespace
+        # normalization, credential and local-path redaction, hard bound).
+        # Running it here means the save boundary, the load boundary and the
+        # presentation payloads cannot diverge, and the pipeline is
+        # idempotent, so a hostile load -> sanitize -> resave -> reload
+        # converges on the same clean value.
+        object.__setattr__(
+            self,
+            "origin_detail",
+            sanitize_diagnostic_text(
+                self.origin_detail, MEMORY_ORIGIN_DETAIL_CAP
+            ),
+        )
+        lifecycle_refusal = memory_lifecycle_refusal(
+            self.active, self.superseded_by
+        )
+        if lifecycle_refusal is not None:
+            raise ValueError(lifecycle_refusal)
+        if self.kind is ProjectMemoryKind.RULE and (
+            self.origin is not MemoryOrigin.EXPLICIT_USER
+        ):
+            # RULE eligibility boundary: a durable rule is an explicit user
+            # correction, preference, instruction or standing rule, proven by
+            # the trusted explicit-human write boundary. Anything inferred,
+            # model-generated, imported or self-asserted must stay a candidate
+            # and can never become a RULE.
+            raise ValueError(
+                "a RULE requires explicit-user provenance"
+            )
         if not isinstance(self.classification, DataClassification):
             raise ValueError("classification must be a DataClassification")
         if not isinstance(self.text, str) or not self.text.strip():
@@ -1485,6 +1703,8 @@ class ProjectMemoryItem:
             "kind": self.kind.value,
             "text": self.text,
             "classification": self.classification.value,
+            "origin": self.origin.value,
+            "origin_detail": self.origin_detail,
             "active": self.active,
             "superseded_by": self.superseded_by,
             "created_at": self.created_at,
@@ -1501,27 +1721,71 @@ class ProjectMemoryItem:
             classification = DataClassification(data.get("classification"))
         except ValueError:
             classification = DataClassification.SECRET
+        # Provenance fails closed the same direction: an unreadable origin is
+        # the LEAST trusted class, never an explicit user. A persisted RULE
+        # whose origin is not explicit-user then raises below (the write
+        # boundary refuses that combination), so a tampered row is skipped by
+        # the loader instead of loading as a trusted rule.
+        try:
+            origin = MemoryOrigin(data.get("origin"))
+        except ValueError:
+            origin = MemoryOrigin.INFERRED
+        # Lifecycle flags pass through RAW. There is deliberately no
+        # ``bool(...)``/``isinstance`` coercion here: a hostile or corrupt
+        # value ("yes", 2, -1, 1.0, a blank successor id, a successor on an
+        # active row) reaches the canonical lifecycle validator in
+        # ``__post_init__`` and raises, so the caller skips the row instead
+        # of loading a silently normalized "valid" state.
+        origin_detail = data.get("origin_detail")
         return cls(
             project_id=data["project_id"],
             kind=kind,
             text=data["text"],
             classification=classification,
             id=str(data.get("id", "")) or str(uuid4()),
-            active=bool(data.get("active", True)),
-            superseded_by=(
-                data.get("superseded_by")
-                if isinstance(data.get("superseded_by"), str)
-                else None
+            origin=origin,
+            origin_detail=(
+                origin_detail if isinstance(origin_detail, str) else ""
             ),
+            active=data.get("active", True),
+            superseded_by=data.get("superseded_by"),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
         )
 
 
 class RetrievedMemoryKind(str, Enum):
+    """The closed kind vocabulary of one retrieved memory item.
+
+    Mirrors ``ProjectMemoryKind`` plus the same-session ``DECISION`` source.
+    The legacy M1 value ``preference`` is no longer produced by retrieval; a
+    persisted snapshot that still carries it decodes deterministically to
+    ``RULE`` - and is then subject to Core's authoritative re-proof like any
+    other claimed RULE, so an unproven legacy item demotes instead of
+    gaining trust.
+    """
+
     DECISION = "decision"
+    RULE = "rule"
+    THREAD = "thread"
     FACT = "fact"
-    PREFERENCE = "preference"
+
+
+#: Deterministic category priority for typed retrieval (Memory V2
+#: foundation): RULE first, then DECISION, then THREAD, then FACT. Any
+#: future member without a declared rank falls after all of them, so the
+#: ordering stays total and closed.
+_MEMORY_CATEGORY_RANK: dict[RetrievedMemoryKind, int] = {
+    RetrievedMemoryKind.RULE: 0,
+    RetrievedMemoryKind.DECISION: 1,
+    RetrievedMemoryKind.THREAD: 2,
+    RetrievedMemoryKind.FACT: 3,
+}
+
+
+def memory_category_rank(kind: RetrievedMemoryKind) -> int:
+    """The deterministic retrieval priority of one retrieved kind."""
+    return _MEMORY_CATEGORY_RANK.get(kind, len(_MEMORY_CATEGORY_RANK))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1538,6 +1802,22 @@ class MemoryRetrievalQuery:
 
 @dataclass(frozen=True, slots=True)
 class RetrievedMemoryItem:
+    """One retrieved memory record as serialized into a task snapshot.
+
+    ``record_id`` is the stable source identifier (the memory item id for
+    project records, the source task id for decisions) and ``origin`` the
+    closed provenance class of the source record, preserved through
+    serialization so provenance survives the persisted/resumed boundary.
+
+    Neither field is authority. A snapshot's claimed ``kind``/``origin`` are
+    data, and Core re-proves any claimed RULE against the authoritative
+    SQLite memory row (same source identity, kind RULE, explicit-user
+    provenance, ACTIVE lifecycle, bound content) before RULE semantics are
+    honoured after a resume; an unprovable claim demotes to non-authoritative
+    data. Decoding an unreadable origin falls closed to the LEAST trusted
+    class.
+    """
+
     kind: RetrievedMemoryKind
     record_id: str
     source_task_id: str
@@ -1548,6 +1828,7 @@ class RetrievedMemoryItem:
     created_at: str
     relevance_score: int
     truncated: bool
+    origin: MemoryOrigin = MemoryOrigin.INFERRED
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1561,12 +1842,30 @@ class RetrievedMemoryItem:
             "created_at": self.created_at,
             "relevance_score": self.relevance_score,
             "truncated": self.truncated,
+            "origin": self.origin.value,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RetrievedMemoryItem":
+        raw_kind = data.get("kind", RetrievedMemoryKind.DECISION.value)
+        # A legacy persisted snapshot may still carry the M1-era "preference"
+        # value; it decodes to the canonical RULE instead of breaking the
+        # task load. Decoding is NOT trust: Core re-proves the claimed RULE
+        # against the authoritative memory row before its semantics survive
+        # a resume.
+        kind = (
+            RetrievedMemoryKind.RULE
+            if raw_kind == "preference"
+            else RetrievedMemoryKind(raw_kind)
+        )
+        try:
+            origin = MemoryOrigin(data.get("origin"))
+        except ValueError:
+            # An unreadable claimed provenance decodes to the LEAST trusted
+            # class, never to an explicit user.
+            origin = MemoryOrigin.INFERRED
         return cls(
-            kind=RetrievedMemoryKind(data.get("kind", RetrievedMemoryKind.DECISION.value)),
+            kind=kind,
             record_id=data["record_id"],
             source_task_id=data["source_task_id"],
             summary=data.get("summary", ""),
@@ -1579,6 +1878,7 @@ class RetrievedMemoryItem:
             created_at=data.get("created_at", ""),
             relevance_score=int(data.get("relevance_score", 0)),
             truncated=bool(data.get("truncated", False)),
+            origin=origin,
         )
 
 
@@ -1682,6 +1982,18 @@ def build_retrieved_context(
     same tokenizer, ordering and eligibility ladder — they never extend the
     quota, and with ``project_candidates`` empty the result is byte-identical
     to the project-less behaviour.
+
+    Category-aware ordering (Memory V2 foundation): every scored candidate
+    belongs to one canonical category (RULE, DECISION, THREAD, FACT; a
+    same-session decision is DECISION). Each category is internally ordered
+    by the same relevance triple as before, and the categories are then
+    interleaved in deterministic priority rounds - each round yields one
+    candidate per category in the order RULE, DECISION, THREAD, FACT, so
+    RULE keeps the strongest priority at every round while a lower category
+    with relevant candidates still surfaces before the second candidate of a
+    higher one. No category with relevant candidates can be starved. With a
+    single category present the emitted order is exactly the pre-V2 global
+    ordering.
     """
     effective_max_items = max(0, min(query.max_items, RETRIEVAL_MAX_ITEMS))
     effective_max_characters = max(
@@ -1706,17 +2018,38 @@ def build_retrieved_context(
         score = len(query_tokens & retrieval_tokens(item.text))
         if score > 0:
             scored.append((item, item.classification, score))
-    # Stable triple sort: relevance desc, created_at desc, record id asc.
-    # One merged ordering across kinds; ids are unique so ties resolve
-    # deterministically.
-    scored.sort(key=lambda entry: entry[0].id)
-    scored.sort(key=lambda entry: entry[0].created_at, reverse=True)
-    scored.sort(key=lambda entry: entry[2], reverse=True)
+    # Category grouping first, then the same stable triple sort WITHIN each
+    # category (relevance desc, created_at desc, record id asc - ids are
+    # unique so ties resolve deterministically), then deterministic priority
+    # rounds across categories. Selection below walks this one sequence, so
+    # ranking still happens before the classification filter and ineligible
+    # records never consume a slot.
+    ranked: list[tuple[Any, DataClassification, int, RetrievedMemoryKind]] = []
+    for record, classification, score in scored:
+        if isinstance(record, ProjectMemoryItem):
+            kind = RetrievedMemoryKind(record.kind.value)
+        else:
+            kind = RetrievedMemoryKind.DECISION
+        ranked.append((record, classification, score, kind))
+    groups: dict[int, list[tuple[Any, DataClassification, int, RetrievedMemoryKind]]] = {}
+    for entry in ranked:
+        groups.setdefault(memory_category_rank(entry[3]), []).append(entry)
+    for bucket in groups.values():
+        bucket.sort(key=lambda entry: entry[0].id)
+        bucket.sort(key=lambda entry: entry[0].created_at, reverse=True)
+        bucket.sort(key=lambda entry: entry[2], reverse=True)
+    ordered: list[tuple[Any, DataClassification, int, RetrievedMemoryKind]] = []
+    rounds = max((len(bucket) for bucket in groups.values()), default=0)
+    for round_index in range(rounds):
+        for rank in sorted(groups):
+            bucket = groups[rank]
+            if round_index < len(bucket):
+                ordered.append(bucket[round_index])
 
     selected: list[RetrievedMemoryItem] = []
     character_count = 0
     overflow = False
-    for record, classification, score in scored:
+    for record, classification, score, _kind in ordered:
         if not retrieval_eligible(current_classification, classification):
             continue
         if len(selected) >= effective_max_items:
@@ -1770,6 +2103,16 @@ def build_retrieved_context(
                 truncated=summary_truncated
                 or rationale_truncated
                 or next_step_truncated,
+                # Provenance is preserved as DATA alongside the record: the
+                # project item's own stored class, or SYSTEM_DECISION for a
+                # JARVIS-recorded same-session decision. Neither grants any
+                # authority, and Core re-proves claimed RULEs against the
+                # authoritative store after a persisted/resumed boundary.
+                origin=(
+                    record.origin
+                    if isinstance(record, ProjectMemoryItem)
+                    else MemoryOrigin.SYSTEM_DECISION
+                ),
             )
         )
         character_count += contribution
@@ -6551,6 +6894,26 @@ class MemoryStore(Protocol):
 
     def retrieve_context(self, query: MemoryRetrievalQuery) -> RetrievedContext: ...
 
+    def reprove_retrieved_rules(
+        self,
+        project_id: str | None,
+        retrieved: RetrievedContext,
+        query_text: str = "",
+    ) -> RetrievedContext:
+        """Re-prove persisted snapshot RULE semantics against the store.
+
+        The single Core-owned re-proof for RULE claims that cross a
+        persisted/resumed boundary: a snapshot item claiming ``kind=RULE``
+        never keeps its snapshot semantic fields. A surviving RULE is
+        RECONSTRUCTED from the authoritative current memory row for its
+        ``record_id`` (same source identity, kind RULE, explicit-user
+        provenance, exactly-ACTIVE lifecycle, valid classification, valid
+        binding); anything unprovable fails closed and the claim demotes to
+        non-authoritative data. ``query_text`` is the current retrieval query
+        text, used only to recompute deterministic relevance metadata.
+        """
+        ...
+
     def save_project(self, project: ProjectRecord) -> None: ...
 
     def load_project(self, project_id: str) -> ProjectRecord | None: ...
@@ -6560,13 +6923,44 @@ class MemoryStore(Protocol):
     def save_memory_item(
         self, item: ProjectMemoryItem, *, supersedes: str | None = None
     ) -> ProjectMemoryItem:
-        """Persist one explicit memory item (INSERT-only).
+        """Persist one programmatic (non-explicit-user) memory item.
 
-        The write boundary applies canonical credential/path hygiene and the
-        text ceiling, verifies the target project exists and is active, and —
-        when ``supersedes`` names an active item of the SAME project — marks
-        that item inactive/superseded in the same transaction. Row content is
-        never rewritten; there is no destructive update or delete."""
+        The GENERIC write surface only accepts untrusted/non-human
+        provenance: it refuses an ``EXPLICIT_USER`` origin outright, so no
+        caller can manufacture a durable RULE - or any explicit-user record -
+        by self-asserting the enum. It applies canonical credential/path
+        hygiene and the text ceiling, verifies the target project exists and
+        is active, and — when ``supersedes`` names an active item of the SAME
+        project — marks that item inactive/superseded in the same
+        transaction. Row content is never rewritten; there is no destructive
+        update or delete."""
+        ...
+
+    def save_explicit_user_memory_item(
+        self,
+        project_id: str,
+        kind: str,
+        classification: str,
+        text: str,
+        *,
+        supersedes: str | None = None,
+    ) -> ProjectMemoryItem:
+        """THE trusted explicit-human write boundary (Memory V2).
+
+        Establishes ``EXPLICIT_USER`` provenance INTERNALLY, after the local
+        human command boundary has been identified - the caller supplies raw
+        inputs and never the origin, so no generic caller can pass a boolean
+        or enum that recreates trusted provenance. This is the only path that
+        can persist an explicit-user record (and therefore the only path a
+        durable ``RULE`` can enter through), and the deprecated
+        ``preference`` kind input maps to ``RULE`` here because the action is
+        an explicit human CLI command.
+
+        Audited production callers (Memory V2 correction): exactly one -
+        ``jarvis.app.memory_add_result``, the local CLI/app ``memory add``
+        composition path. No model, connector, import or programmatic caller
+        is sanctioned to use it.
+        """
         ...
 
     def list_memory_items(

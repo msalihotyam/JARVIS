@@ -19,6 +19,7 @@ from jarvis.contracts import (
     COST_CAP_GATE,
     MAX_NANO_USD,
     MAX_SQLITE_INTEGER,
+    MEMORY_ORIGIN_DETAIL_CAP,
     MONTHLY_HARD_LIMIT_NANO_USD,
     PROJECT_DECISION_CANDIDATE_WINDOW,
     PROJECT_MEMORY_CANDIDATE_WINDOW,
@@ -46,11 +47,14 @@ from jarvis.contracts import (
     LedgerSnapshot,
     LoopCheckpoint,
     LoopStage,
+    MemoryLifecycle,
     MemoryRetrievalQuery,
+    MemoryOrigin,
     MonetaryState,
     PermissionGrant,
     PermissionRequest,
     ProjectMemoryItem,
+    ProjectMemoryKind,
     ProgressIssueKind,
     ProjectRecord,
     ReconciliationOutcome,
@@ -59,6 +63,8 @@ from jarvis.contracts import (
     ReservationState,
     StructuredError,
     RetrievedContext,
+    RetrievedMemoryItem,
+    RetrievedMemoryKind,
     SessionState,
     ApprovalSummary,
     AttemptRecovery,
@@ -71,7 +77,12 @@ from jarvis.contracts import (
     VISIBILITY_TASK_KEYS,
     canonical_utc_timestamp,
     next_loop_stage,
+    memory_lifecycle_refusal,
     normalize_session_next_step,
+    normalize_retrieved_text,
+    retrieval_tokens,
+    truncate_retrieved_text,
+    RETRIEVAL_SUMMARY_CAP,
     visibility_text,
     SessionSummary,
     Task,
@@ -93,7 +104,6 @@ from jarvis.contracts import (
     ledger_month,
     monetary_state_from_raw,
     nano_usd,
-    normalize_retrieved_text,
     normalize_symbol,
     persistable_count,
     redact_credentials,
@@ -103,15 +113,17 @@ from jarvis.contracts import (
     terminal_failure_result,
     require_monetary_state,
     reservation_state_from_raw,
+    sanitize_diagnostic_text,
     usd_from_nano,
     utc_now,
+    validate_project_id,
 )
 from jarvis.lifecycle import is_terminal
 from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -430,6 +442,11 @@ class SQLiteMemoryStore:
                 )
                 current = target
             self._create_current_schema(connection)
+            # Provenance hygiene that must hold on EVERY open, not only while
+            # a migration fires: a database migrated by the pre-correction
+            # build is already at the current schema version and still
+            # carries invented explicit-user provenance on its legacy rows.
+            self._repair_invented_provenance(connection)
 
     def _apply_migration(
         self, connection: sqlite3.Connection, target_version: int
@@ -460,7 +477,114 @@ class SQLiteMemoryStore:
         if target_version == 6:
             self._migrate_project_memory(connection)
             return
+        if target_version == 7:
+            self._migrate_typed_memory(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
+
+    @staticmethod
+    def _migrate_typed_memory(connection: sqlite3.Connection) -> None:
+        """Typed memory records: provenance columns + canonical kinds (V2).
+
+        Strictly additive and idempotent; no row is deleted and no text,
+        identity, classification or lifecycle flag is rewritten, so every
+        schema-6 database keeps its full history:
+
+        * ``origin`` / ``origin_detail`` provenance columns are added. The
+          SQL-level default is ``inferred`` (the LEAST trusted class) and is
+          NOT backfilled upwards: a schema-6 row carries no proof of which
+          write path produced it, so its provenance stays
+          uncertain/untrusted. Stronger history is never invented here; only
+          the trusted explicit-human write boundary establishes
+          ``explicit_user``, and only for records written through it.
+        * The M1-era persisted kind ``preference`` has NO proven provenance,
+          so it is NOT promoted to RULE. It is preserved as NON-authoritative
+          compatibility memory: canonically remapped to ``fact`` (the
+          smallest non-authoritative kind in the closed four-kind
+          vocabulary) with a ``legacy-v6-preference`` ``origin_detail``
+          marker recording where the row came from, keeping its text,
+          identity, classification, flags and timestamps untouched. It stays
+          retrievable as ordinary untrusted memory and only becomes a RULE
+          again if a human re-adds it through the trusted explicit-human
+          write path.
+        * Rows stamped by the intermediate (pre-correction) migration that
+          invented ``explicit_user``/``legacy-v6-cli-add`` provenance for
+          every legacy row are repaired by ``_repair_invented_provenance``,
+          which runs on EVERY open for the same reason.
+        """
+        existing = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(project_memory_items)"
+            )
+        }
+        if not existing:
+            # Table not created yet (fresh database); the current schema below
+            # already declares the columns.
+            return
+        # Columns first, so the compatibility mapping below can always write
+        # its origin_detail marker.
+        if "origin" not in existing:
+            connection.execute(
+                "ALTER TABLE project_memory_items ADD COLUMN origin TEXT "
+                "NOT NULL DEFAULT 'inferred'"
+            )
+        if "origin_detail" not in existing:
+            connection.execute(
+                "ALTER TABLE project_memory_items ADD COLUMN origin_detail TEXT "
+                "NOT NULL DEFAULT ''"
+            )
+        # Unproven legacy preference compatibility mapping: non-authoritative
+        # canonical FACT, with a marker that records the legacy source.
+        connection.execute(
+            """
+            UPDATE project_memory_items
+               SET kind = 'fact', origin_detail = 'legacy-v6-preference'
+             WHERE kind = 'preference'
+            """
+        )
+
+    @staticmethod
+    def _repair_invented_provenance(connection: sqlite3.Connection) -> None:
+        """Demote every row carrying the invented legacy provenance stamp.
+
+        Runs on EVERY open, not only inside migration 7: a database migrated
+        by the pre-correction build is already at schema 7 and no migration
+        will ever fire for it again, yet its rows still carry the invented
+        ``explicit_user``/``legacy-v6-cli-add`` provenance. That mass-applied
+        stamp is proof of the OPPOSITE of what it claims - the trusted
+        explicit-human boundary writes ``cli-memory-add`` - so the rows fall
+        back to the least-trusted origin, and the ones the intermediate build
+        had promoted to RULE (legacy preferences) fall back to the same
+        non-authoritative compatibility mapping as the migration applies.
+        Idempotent by construction: healthy databases match no row and
+        nothing is rewritten.
+        """
+        # First remap the promoted legacy preferences (kind rule + the
+        # invented stamp) to the non-authoritative compatibility shape.
+        connection.execute(
+            """
+            UPDATE project_memory_items
+               SET kind = 'fact', origin_detail = 'legacy-v6-preference'
+             WHERE kind = 'rule' AND origin_detail = 'legacy-v6-cli-add'
+            """
+        )
+        # Then demote the invented explicit-user origin everywhere it was
+        # stamped, keeping the compatibility marker on the remapped rows and
+        # clearing the stamp from all the others.
+        connection.execute(
+            """
+            UPDATE project_memory_items
+               SET origin = 'inferred',
+                   origin_detail = CASE
+                       WHEN origin_detail = 'legacy-v6-preference'
+                           THEN 'legacy-v6-preference'
+                       ELSE ''
+                   END
+             WHERE origin = 'explicit_user'
+               AND origin_detail IN ('legacy-v6-cli-add', 'legacy-v6-preference')
+            """
+        )
 
     @staticmethod
     def _migrate_project_memory(connection: sqlite3.Connection) -> None:
@@ -636,6 +760,13 @@ class SQLiteMemoryStore:
                 kind TEXT NOT NULL,
                 text TEXT NOT NULL,
                 classification TEXT NOT NULL,
+                -- V2 provenance: closed origin class + bounded source/event
+                -- detail. The SQL default is the LEAST trusted class so a
+                -- row written without provenance can never load as an
+                -- explicit-user record; the write boundary always supplies
+                -- both explicitly.
+                origin TEXT NOT NULL DEFAULT 'inferred',
+                origin_detail TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
                 superseded_by TEXT,
                 created_at TEXT NOT NULL,
@@ -3250,15 +3381,91 @@ class SQLiteMemoryStore:
     def save_memory_item(
         self, item: ProjectMemoryItem, *, supersedes: str | None = None
     ) -> ProjectMemoryItem:
-        """Persist one explicit memory item (INSERT-only + supersede).
+        """Persist one programmatic memory item (INSERT-only + supersede).
+
+        The GENERIC write surface: untrusted/non-human provenance only. It
+        refuses an ``EXPLICIT_USER`` origin outright, so no arbitrary caller
+        can create a durable RULE - or any explicit-user record - merely by
+        supplying the origin enum. ``EXPLICIT_USER`` is established only by
+        ``save_explicit_user_memory_item``, the trusted explicit-human write
+        boundary whose audited production caller is the local CLI/app
+        ``memory add`` composition path.
 
         The write boundary applies exactly the hygiene the persistence
         contract needs and nothing more: newline normalization, the hard text
         ceiling (REJECT, never truncate - memory text is semantic user data,
         not diagnostics), and the canonical credential/path redaction
         helpers. Content columns are never rewritten; ``supersedes`` only
-        flips the referenced item's lifecycle flags, in the same transaction.
+        flips the referenced item's lifecycle flags, in the same transaction,
+        and only from a lifecycle shape the canonical validator proves is
+        exactly ACTIVE.
         """
+        if item.origin is MemoryOrigin.EXPLICIT_USER:
+            raise ValueError(
+                "explicit-user provenance requires the trusted "
+                "explicit-human memory add path"
+            )
+        if item.kind is ProjectMemoryKind.RULE:
+            # Unreachable through a valid record (the contract refuses a
+            # RULE without explicit-user provenance), restated here as
+            # defense in depth against a record mutated after construction.
+            raise ValueError("a RULE requires explicit-user provenance")
+        return self._persist_memory_item(item, supersedes=supersedes)
+
+    def save_explicit_user_memory_item(
+        self,
+        project_id: str,
+        kind: str,
+        classification: str,
+        text: str,
+        *,
+        supersedes: str | None = None,
+    ) -> ProjectMemoryItem:
+        """THE trusted explicit-human write boundary (Memory V2 foundation).
+
+        The caller supplies RAW command inputs and never a provenance value:
+        this method establishes ``EXPLICIT_USER`` internally, after the local
+        human command boundary has been identified, so trusted provenance can
+        neither be passed in nor forged through a generic boolean/enum
+        argument. Audited production callers: exactly one -
+        ``jarvis.app.memory_add_result``, the local CLI/app ``memory add``
+        composition path. No model, connector, import or other programmatic
+        caller is sanctioned; generic writers use ``save_memory_item``.
+
+        The deprecated M1-era ``preference`` kind input maps to RULE here -
+        and ONLY here - because this path is an explicit human CLI action.
+        An unknown kind or classification, a bad project id or oversized text
+        fails closed with ``ValueError``.
+        """
+        project_kind = (
+            ProjectMemoryKind.RULE
+            if kind == "preference"
+            else ProjectMemoryKind(kind)
+        )
+        item = ProjectMemoryItem(
+            project_id=validate_project_id(project_id),
+            kind=project_kind,
+            text=text,
+            classification=DataClassification(classification),
+            origin=MemoryOrigin.EXPLICIT_USER,
+            origin_detail="cli-memory-add",
+        )
+        return self._persist_memory_item(item, supersedes=supersedes)
+
+    def _persist_memory_item(
+        self, item: ProjectMemoryItem, *, supersedes: str | None
+    ) -> ProjectMemoryItem:
+        """The one INSERT-only persistence path shared by both write surfaces.
+
+        RULE eligibility is re-checked here even though the record contract
+        already refuses it: a durable RULE carries explicit-user provenance
+        established by the trusted boundary, and the storage boundary must
+        stay fail-closed independently of how the record object was built.
+        """
+        if item.kind is ProjectMemoryKind.RULE and (
+            item.origin is not MemoryOrigin.EXPLICIT_USER
+        ):
+            raise ValueError("a RULE requires explicit-user provenance")
         text = normalize_retrieved_text(item.text)
         if not text:
             raise ValueError("memory text must be a non-blank string")
@@ -3268,7 +3475,20 @@ class SQLiteMemoryStore:
             )
         text, _ = redact_credentials(text)
         text = redact_local_paths(text)
-        stored = replace(item, text=text, active=True, superseded_by=None)
+        # Defense in depth on the provenance detail: the record contract
+        # already ran the one canonical hygiene pipeline, and the storage
+        # boundary re-runs it rather than trusting the object it was handed.
+        origin_detail = sanitize_diagnostic_text(
+            item.origin_detail, MEMORY_ORIGIN_DETAIL_CAP
+        )
+        stored = replace(
+            item,
+            text=text,
+            origin=item.origin,
+            origin_detail=origin_detail,
+            active=True,
+            superseded_by=None,
+        )
         with self._connection(write=True) as connection:
             project_row = connection.execute(
                 "SELECT active FROM projects WHERE id = ?",
@@ -3280,14 +3500,20 @@ class SQLiteMemoryStore:
                 )
             if supersedes is not None:
                 old_row = connection.execute(
-                    "SELECT project_id, active FROM project_memory_items "
-                    "WHERE id = ?",
+                    "SELECT project_id, active, superseded_by FROM "
+                    "project_memory_items WHERE id = ?",
                     (supersedes,),
                 ).fetchone()
                 if (
                     old_row is None
                     or old_row["project_id"] != stored.project_id
-                    or not old_row["active"]
+                    # The predecessor must be a VALID lifecycle shape that is
+                    # exactly ACTIVE - a corrupt (e.g. active=2) row is never
+                    # transitionable, so it can never be superseded either.
+                    or memory_lifecycle_refusal(
+                        old_row["active"], old_row["superseded_by"]
+                    ) is not None
+                    or old_row["active"] != 1
                 ):
                     raise ValueError(
                         "supersedes must reference an active memory item "
@@ -3297,9 +3523,10 @@ class SQLiteMemoryStore:
                 connection.execute(
                     """
                     INSERT INTO project_memory_items
-                        (id, project_id, kind, text, classification, active,
-                         superseded_by, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                        (id, project_id, kind, text, classification, origin,
+                         origin_detail, active, superseded_by, created_at,
+                         updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
                     """,
                     (
                         stored.id,
@@ -3307,6 +3534,8 @@ class SQLiteMemoryStore:
                         stored.kind.value,
                         stored.text,
                         stored.classification.value,
+                        stored.origin.value,
+                        stored.origin_detail,
                         stored.created_at,
                         stored.updated_at,
                     ),
@@ -3329,10 +3558,24 @@ class SQLiteMemoryStore:
     def list_memory_items(
         self, project_id: str, *, include_inactive: bool = False
     ) -> list[ProjectMemoryItem]:
+        """List one project's memory items in stable created_at, id order.
+
+        With ``include_inactive=True`` (the CLI's ``memory list --all``) the
+        listing includes SUPERSEDED and RETIRED lifecycle history.
+
+        Deterministic corrupt-row behavior (Memory V2 correction): a row
+        whose shape the fail-closed loader refuses - an unknown kind, a
+        lifecycle shape the canonical validator rejects, a broken identity -
+        is SKIPPED. It is never silently normalized into a valid trusted
+        state, never listed as an active item and never repaired by a
+        display path; it stays physically stored exactly as it is. The
+        listing therefore shows the rows that ARE validly loadable, in the
+        same deterministic order on every call.
+        """
         sql = (
-            "SELECT id, project_id, kind, text, classification, active, "
-            "superseded_by, created_at, updated_at FROM project_memory_items "
-            "WHERE project_id = ?"
+            "SELECT id, project_id, kind, text, classification, origin, "
+            "origin_detail, active, superseded_by, created_at, updated_at "
+            "FROM project_memory_items WHERE project_id = ?"
         )
         if not include_inactive:
             sql += " AND active = 1"
@@ -3346,14 +3589,76 @@ class SQLiteMemoryStore:
                 items.append(item)
         return items
 
+    def retire_memory_item(self, project_id: str, item_id: str) -> ProjectMemoryItem:
+        """Explicitly retire one ACTIVE memory item of exactly this project.
+
+        The only lifecycle transition besides supersede, and like supersede it
+        flips nothing but the lifecycle flags of the referenced row in ONE
+        transaction: ``active -> 0`` with ``superseded_by`` left NULL, which
+        the closed lifecycle vocabulary reads as RETIRED. The row itself stays
+        durably stored and loadable with ``include_inactive=True``; it simply
+        stops being an active retrieval candidate. A missing id, an unknown
+        project, an item that is not an ACTIVE record of exactly this
+        project, or a row whose lifecycle shape the canonical validator
+        refuses (a corrupt row is never transitionable) is refused loudly -
+        there is no un-retire and no silent state rewrite.
+        """
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT project_id, active, superseded_by FROM "
+                "project_memory_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None or row["project_id"] != project_id:
+                raise ValueError(
+                    "retire must reference a memory item of exactly this project"
+                )
+            lifecycle_refusal = memory_lifecycle_refusal(
+                row["active"], row["superseded_by"]
+            )
+            if lifecycle_refusal is not None:
+                raise ValueError(
+                    "refusing to retire a record with an invalid lifecycle "
+                    f"shape: {lifecycle_refusal}"
+                )
+            if row["active"] != 1:
+                raise ValueError(
+                    "only an ACTIVE memory item can be retired"
+                )
+            connection.execute(
+                """
+                UPDATE project_memory_items
+                   SET active = 0, updated_at = ?
+                 WHERE id = ? AND active = 1
+                """,
+                (utc_now(), item_id),
+            )
+            updated = connection.execute(
+                "SELECT id, project_id, kind, text, classification, origin, "
+                "origin_detail, active, superseded_by, created_at, updated_at "
+                "FROM project_memory_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+        item = self._memory_item_from_row(updated)
+        if item is None:
+            raise ValueError("retired item could not be reloaded")
+        return item
+
     @staticmethod
     def _memory_item_from_row(row: sqlite3.Row) -> ProjectMemoryItem | None:
-        """Rebuild one persisted item defensively.
+        """Rebuild one persisted item defensively, fail-closed on bad shape.
 
-        An unknown kind, blank/oversized text or broken identity makes the
-        row unusable and it is skipped (fail closed); an unreadable
-        classification alone degrades to SECRET inside ``from_dict`` so the
-        item stays listable but never egress-eligible.
+        An unknown kind, blank/oversized text, broken identity or a lifecycle
+        shape the ONE canonical validator refuses (``active=2``/``-1``/``"yes"``,
+        a blank successor id, an ACTIVE row carrying a successor) makes the
+        row unusable and it is skipped (fail closed): corruption is never
+        silently normalized into a valid trusted state, and the row stays
+        physically stored. An unreadable classification alone degrades to
+        SECRET inside ``from_dict`` so the item stays listable but never
+        egress-eligible, and an unreadable provenance degrades to the LEAST
+        trusted origin. A persisted RULE whose provenance is not
+        explicit-user therefore refuses to build and the row is skipped: a
+        tampered rule can never load as trusted.
         """
         try:
             return ProjectMemoryItem.from_dict(
@@ -3363,7 +3668,12 @@ class SQLiteMemoryStore:
                     "kind": row["kind"],
                     "text": row["text"],
                     "classification": row["classification"],
-                    "active": bool(row["active"]),
+                    "origin": row["origin"],
+                    "origin_detail": row["origin_detail"],
+                    # Raw persisted value - deliberately NOT bool(...)-coerced.
+                    # An impossible flag shape raises inside the canonical
+                    # lifecycle validation and the row is skipped fail-closed.
+                    "active": row["active"],
                     "superseded_by": row["superseded_by"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
@@ -3381,10 +3691,16 @@ class SQLiteMemoryStore:
         closed as SECRET when that recovery is impossible.
 
         With a project scope (M1) the newest active
-        ``PROJECT_MEMORY_CANDIDATE_WINDOW`` items of exactly that project are
-        additionally examined; they compete inside the same absolute item and
-        character ceilings and the same eligibility ladder. Without a project
-        scope the behaviour is byte-identical to the project-less pipeline.
+        ``PROJECT_MEMORY_CANDIDATE_WINDOW`` items PER CANONICAL KIND of
+        exactly that project are additionally examined (Memory V2 correction:
+        candidate acquisition is partitioned by kind BEFORE any truncation,
+        so a flood of newer records in one category can no longer push the
+        other categories out of the candidate set before fairness
+        interleaving runs; the total stays strictly bounded by
+        ``PROJECT_MEMORY_CANDIDATE_WINDOW_TOTAL``); they compete inside the
+        same absolute item and character ceilings and the same eligibility
+        ladder. Without a project scope the behaviour is byte-identical to
+        the project-less pipeline.
 
         With a project scope (M2) the newest
         ``PROJECT_DECISION_CANDIDATE_WINDOW`` decisions recorded by the SAME
@@ -3423,14 +3739,33 @@ class SQLiteMemoryStore:
             item_rows: list[sqlite3.Row] = []
             cross_rows: list[sqlite3.Row] = []
             if query.project_id is not None:
-                item_rows = connection.execute(
-                    "SELECT id, project_id, kind, text, classification, "
-                    "active, superseded_by, created_at, updated_at "
-                    "FROM project_memory_items "
-                    "WHERE project_id = ? AND active = 1 "
-                    "ORDER BY created_at DESC, id ASC LIMIT ?",
-                    (query.project_id, PROJECT_MEMORY_CANDIDATE_WINDOW),
-                ).fetchall()
+                # Memory V2 correction: candidate acquisition is PARTITIONED
+                # per canonical kind before any truncation or interleaving.
+                # The previous single global newest-N window let 25+ newer
+                # RULE rows exclude every DECISION/THREAD/FACT from the
+                # candidate set entirely, defeating category fairness before
+                # it could run. One bounded query per kind keeps every
+                # category represented, and the total candidate set stays
+                # strictly bounded (one window per kind, never the whole
+                # table).
+                for kind_value in (
+                    kind.value for kind in ProjectMemoryKind
+                ):
+                    item_rows.extend(
+                        connection.execute(
+                            "SELECT id, project_id, kind, text, classification, "
+                            "origin, origin_detail, active, superseded_by, "
+                            "created_at, updated_at "
+                            "FROM project_memory_items "
+                            "WHERE project_id = ? AND active = 1 AND kind = ? "
+                            "ORDER BY created_at DESC, id ASC LIMIT ?",
+                            (
+                                query.project_id,
+                                kind_value,
+                                PROJECT_MEMORY_CANDIDATE_WINDOW,
+                            ),
+                        ).fetchall()
+                    )
                 # M2: decisions of the same project's OTHER sessions. The
                 # inner JOIN both scopes to exactly this project and drops
                 # orphaned decisions whose session row is missing; excluding
@@ -3470,6 +3805,153 @@ class SQLiteMemoryStore:
             candidates,
             project_candidates=tuple(project_candidates),
         )
+
+    def reprove_retrieved_rules(
+        self,
+        project_id: str | None,
+        retrieved: RetrievedContext,
+        query_text: str = "",
+    ) -> RetrievedContext:
+        """Re-prove persisted snapshot RULE semantics against the store.
+
+        THE one authoritative re-proof for RULE claims that cross a
+        persisted/resumed boundary (Memory V2 correction). A task snapshot is
+        untrusted data: editing its serialized fields must not manufacture
+        trusted RULE semantics, and - critically - an untrusted snapshot must
+        never be able to ATTACH SEMANTIC TEXT to a trusted human RULE
+        identity. A surviving RULE is therefore not a checked copy of the
+        snapshot item: it is RECONSTRUCTED entirely from authoritative state.
+
+        Every ``RetrievedMemoryItem`` field is classified explicitly:
+
+        * AUTHORITATIVE PROJECTION (taken only from the proven record):
+          ``kind`` (RULE), ``record_id``, ``source_task_id`` (the record's
+          project binding - a project memory record has NO authoritative
+          originating task, so the snapshot can never invent one), ``summary``
+          (the canonical text projection of the record's stored text),
+          ``rationale`` (canonical empty - no human RULE rationale is stored),
+          ``next_step`` (canonical None - same), ``classification``,
+          ``created_at`` and ``origin`` (EXPLICIT_USER, verified).
+        * DETERMINISTIC RETRIEVAL METADATA (recomputed by the same rules the
+          current retrieval pipeline uses): ``relevance_score`` (the shared
+          token-intersection score over the authoritative text and the current
+          retrieval query) and ``truncated`` (the canonical projection's own
+          truncation outcome).
+        * NON-AUTHORITATIVE SNAPSHOT METADATA: nothing at item level is
+          copied from the snapshot. Context-level ``candidate_count`` /
+          ``character_count`` are accounting metadata and never item
+          semantics; they are left as decoded data.
+
+        The proof reads the CURRENT SQLite row by the snapshot's stable source
+        identifier (``record_id``) and requires ALL of: the row exists, the
+        same source identity under exactly this project binding, authoritative
+        ``kind == RULE``, authoritative ``origin == EXPLICIT_USER``, a
+        lifecycle the canonical validator reads as exactly ACTIVE, and a valid
+        authoritative classification. Anything else - a missing row, changed
+        kind/provenance, retired or superseded state, a changed project
+        binding, a corrupt row, a malformed lifecycle or any storage failure -
+        FAILS CLOSED: the item is demoted to non-authoritative data
+        (``kind=FACT``, ``origin=INFERRED``) rather than trusted. The proof is
+        storage-owned and never delegated to a connector or to the snapshot
+        itself; provenance on non-RULE items is left as decoded data - it
+        grants no authority.
+        """
+        if not any(
+            type(item) is RetrievedMemoryItem
+            and item.kind is RetrievedMemoryKind.RULE
+            for item in retrieved.items
+        ):
+            return retrieved
+        query_tokens = retrieval_tokens(query_text)
+        items: list[RetrievedMemoryItem] = []
+        for item in retrieved.items:
+            if (
+                type(item) is not RetrievedMemoryItem
+                or item.kind is not RetrievedMemoryKind.RULE
+            ):
+                items.append(item)
+                continue
+            proof = (
+                self._explicit_rule_proof(project_id, item.record_id)
+                if project_id is not None
+                else None
+            )
+            if proof is None:
+                # Unprovable claim: demote to ordinary non-authoritative
+                # memory. The content stays as untrusted data; the trust does
+                # not.
+                items.append(
+                    replace(
+                        item,
+                        kind=RetrievedMemoryKind.FACT,
+                        origin=MemoryOrigin.INFERRED,
+                    )
+                )
+                continue
+            # Canonical RULE projection, built from AUTHORITATIVE state only.
+            # No snapshot field survives into a trusted RULE - not the
+            # summary, not the rationale, not the next step, not the source
+            # binding.
+            summary, summary_truncated = truncate_retrieved_text(
+                normalize_retrieved_text(proof.text), RETRIEVAL_SUMMARY_CAP
+            )
+            items.append(
+                RetrievedMemoryItem(
+                    kind=RetrievedMemoryKind.RULE,
+                    record_id=proof.id,
+                    # The project memory record's only authoritative binding
+                    # is its project scope; an originating task id does not
+                    # exist for it and is never taken from the snapshot.
+                    source_task_id=proof.project_id,
+                    summary=summary,
+                    rationale="",
+                    next_step=None,
+                    classification=proof.classification,
+                    created_at=proof.created_at,
+                    # Deterministic recomputation under the same scoring rule
+                    # the retrieval pipeline applies to project records.
+                    relevance_score=len(
+                        query_tokens & retrieval_tokens(proof.text)
+                    ),
+                    truncated=summary_truncated,
+                    origin=proof.origin,
+                )
+            )
+        return replace(retrieved, items=tuple(items))
+
+    def _explicit_rule_proof(
+        self, project_id: str | None, item_id: str
+    ) -> ProjectMemoryItem | None:
+        """The authoritative current row that proves one explicit-user RULE.
+
+        Reads the CURRENT SQLite row by the snapshot's stable source
+        identifier and re-establishes every eligibility condition from it.
+        The row is loaded through the fail-closed loader, so a tampered or
+        corrupt row yields ``None`` instead of trust. Anything less than a
+        same-project, explicit-user, ACTIVE RULE is no proof at all.
+        """
+        if project_id is None or not isinstance(item_id, str) or not item_id:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id, project_id, kind, text, classification, "
+                "origin, origin_detail, active, superseded_by, "
+                "created_at, updated_at "
+                "FROM project_memory_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+        item = self._memory_item_from_row(row) if row is not None else None
+        if item is None:
+            return None
+        if item.project_id != project_id:
+            return None
+        if item.kind is not ProjectMemoryKind.RULE:
+            return None
+        if item.origin is not MemoryOrigin.EXPLICIT_USER:
+            return None
+        if item.lifecycle is not MemoryLifecycle.ACTIVE:
+            return None
+        return item
 
     @staticmethod
     def _classification_from_state(state_json: Any) -> DataClassification:

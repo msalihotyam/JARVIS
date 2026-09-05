@@ -387,16 +387,17 @@ class RetrievedReferenceCountTests(unittest.TestCase):
                     step_with_references(count), self.plan_for(*items)[1]
                 )
 
-    def test_fact_and_preference_references_count_toward_the_step(self) -> None:
-        # M1: the canonical plan step counts every supported retrieved-memory
-        # kind, so a fact-only or mixed snapshot is never described as
-        # "without retrieved memory references".
+    def test_typed_references_count_toward_the_step(self) -> None:
+        # M1/V2: the canonical plan step counts every supported
+        # retrieved-memory kind, so a decision-only or mixed snapshot is never
+        # described as "without retrieved memory references".
         items = (
             retrieved_item(0),
             retrieved_item(1, kind=RetrievedMemoryKind.FACT),
-            retrieved_item(2, kind=RetrievedMemoryKind.PREFERENCE),
+            retrieved_item(2, kind=RetrievedMemoryKind.RULE),
+            retrieved_item(3, kind=RetrievedMemoryKind.THREAD),
         )
-        self.assertEqual(step_with_references(3), self.plan_for(*items)[1])
+        self.assertEqual(step_with_references(4), self.plan_for(*items)[1])
         fact_only = (retrieved_item(0, kind=RetrievedMemoryKind.FACT),)
         self.assertEqual(step_with_references(1), self.plan_for(*fact_only)[1])
 

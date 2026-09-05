@@ -72,7 +72,7 @@ from jarvis.contracts import (
     chain_steps_from_declaration,
     local_write_record_refusal,
 )
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.settings import Settings
 from tests.helpers import safe_cleanup
 
@@ -840,11 +840,11 @@ class InertnessTests(VisibilityTestCase):
     def test_the_schema_is_untouched(self) -> None:
         session = self.make_session()
         task = self.make_task(session.id)
-        self.assertEqual(self.memory.schema_version(), 6)
+        self.assertEqual(self.memory.schema_version(), SCHEMA_VERSION)
         sessions_result(self.memory, self.settings)
         tasks_result(self.memory, self.settings, session.id)
         show_result(self.memory, self.settings, session.id, task.id)
-        self.assertEqual(self.memory.schema_version(), 6)
+        self.assertEqual(self.memory.schema_version(), SCHEMA_VERSION)
 
 
 class CommandSurfaceTests(VisibilityTestCase):

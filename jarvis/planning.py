@@ -62,13 +62,15 @@ def normalize_plan_step(value: object) -> str:
     return text[: PLAN_STEP_MAX_CHARS - 1] + "…"
 
 
-#: The exact retrieved-memory kinds the plan step may count (M1). Mirrors the
-#: connector egress allowlist; an unknown kind never counts.
+#: The exact retrieved-memory kinds the plan step may count (M1, V2 closed
+#: vocabulary). Mirrors the connector egress allowlist; an unknown kind never
+#: counts. The M1-era "preference" kind is canonicalized to RULE on load.
 _PLAN_REFERENCE_KINDS = frozenset(
     {
         RetrievedMemoryKind.DECISION,
+        RetrievedMemoryKind.RULE,
+        RetrievedMemoryKind.THREAD,
         RetrievedMemoryKind.FACT,
-        RetrievedMemoryKind.PREFERENCE,
     }
 )
 

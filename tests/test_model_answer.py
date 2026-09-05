@@ -820,8 +820,10 @@ class PersistenceTests(ModelAnswerTestCase):
     def test_the_sqlite_schema_is_unchanged(self) -> None:
         from jarvis.memory import SCHEMA_VERSION
 
-        self.assertEqual(6, SCHEMA_VERSION)
-        self.assertEqual(6, self.memory.schema_version())
+        # Memory V2 owns the current SQLite schema version; this milestone
+        # adds no storage schema of its own.
+        self.assertEqual(7, SCHEMA_VERSION)
+        self.assertEqual(7, self.memory.schema_version())
 
 
 # --------------------------------------------------------------------------

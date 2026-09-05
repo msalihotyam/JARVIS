@@ -30,32 +30,61 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 - `jarvis/connectors/`: ortak connector, güvenli Claude Code plan connector'ı ve tek boğaz noktalı containment üzerine kurulu yerel okuma/yazma connector'ları.
 - Eski `Agent Core`, `Config`, `Connectors`, `Memory`, `Tools` dosyaları uyumluluk sarmalayıcıları olarak korunur.
 
-## Proje hafızası (M1)
+## Proje hafızası (Memory V2 temeli)
 
 Proje kimliği ve açık proje-kapsamlı hafıza tamamen yereldir ve model/ağ
-çağrısı yapmaz. SQLite şeması additive migration ile 6'dadır; eski projesiz
+çağrısı yapmaz. SQLite şeması additive migration ile 7'dedir; eski projesiz
 oturum/task davranışı birebir korunur.
 
 ```powershell
 jarvis project create --id jarvis-v1 --name "JARVIS v1"
 jarvis memory add --project jarvis-v1 --kind fact --classification internal --text "..."
 jarvis memory list --project jarvis-v1
+jarvis memory list --project jarvis-v1 --all   # superseded/retired geçmiş
+jarvis memory retire --project jarvis-v1 --item <id>
 ```
 
 Kurallar: proje otomatik yaratılmaz (bilinmeyen proje `64` ile reddedilir);
-`memory add` açık kind (`fact|preference`) ve classification ister, eksikse
-kapalı düşer; metin 480 karakteri aşarsa **reddedilir** (kesilmez) ve yazım
-anında kanonik kimlik-bilgisi/yol redaksiyonundan geçer; yazım INSERT-only +
-`--supersedes`'tir (içerik asla yeniden yazılmaz, edit/delete yoktur). Task
-JSON'una isteğe bağlı `project_id` alanı eklenmiştir; oturumun ilk
-proje-taşıyan task'ı oturumu bağlar ve zarfın `session.project_id` alanında
-görünür. Getirilen fact/preference öğeleri karar öğeleriyle aynı 5 öğe /
-4.000 karakter kotası içinde yarışır; cross-project izolasyon mutlaktır.
-M2 ile, projeye bağlı bir oturum aynı projenin diğer oturumlarının en yeni
-en çok 25 kararını da aynı kota ve aynı deterministik sıralama içinde aday
-olarak görür; sorgu oturumu hariç tutulur, kararın sınıfı kendi kaynak
-task'ından yeniden kazanılır (eksik/bozuk kaynak SECRET sayılır) ve projesiz
-oturum davranışı birebir değişmeden kalır.
+`memory add` açık kind (`fact|decision|rule|thread`) ve classification ister,
+eksikse kapalı düşer; eski M1 girdisi `--kind preference`, yalnızca bu
+güvenilir yerel insan komutunda deprecated bir takma ad olarak RULE yazar.
+Metin 480 karakteri aşarsa **reddedilir** (kesilmez) ve yazım anında kanonik
+kimlik-bilgisi/yol redaksiyonundan geçer; `origin_detail` de aynı kanonik
+sanitizasyon hattından geçer. Yazım INSERT-only + `--supersedes`'tir (içerik
+asla yeniden yazılmaz, edit/delete yoktur).
+
+Tipli kayıt sözlüğü dört kanonik kind'dan oluşur: FACT, DECISION, RULE,
+THREAD. Kanıtlanmış kaynak (provenance) sınıfları: `explicit_user`,
+`system_decision`, `inferred`, `imported`. Yalnızca güvenilir açık-insan
+yazım sınırı (yerel CLI/app `memory add` bileşimi) `explicit_user` kaynak
+kurar; genel/programatik yazım yüzeyi bunu reddeder. Bu nedenle kalıcı bir
+RULE yalnızca insanın bu yolla yazdığı kayıttan doğar; model/connector
+hafıza yazamaz ve kalıntı/şüpheli veri asla RULE'a yükselmez. Şema 6'dan
+gelen eski `preference` satırları kanıtsız kabul edilir: kanonik FACT olarak,
+`inferred` kaynakla ve `legacy-v6-preference` `origin_detail` işaretiyle
+saklanır; ancak insan trusted yolla yeniden eklerse RULE olur. Lifecycle
+kapalı sözlüktür (ACTIVE / SUPERSEDED / RETIRED), tek kanonik doğrulayıcı
+ile türetilir: imkansız bayrak kombinasyonları (ör. `active=1` +
+`superseded_by`, `active=2`) hiçbir geçerli durum gibi yüklenmez, getirilmez
+ve geçiş yapılamaz; bozuk satır fiziksel olarak saklı kalır.
+
+Getirmede aday edinimi kategori başına sınırlıdır: her kanonik kind için en
+yeni en çok 25 aktif öğe incelenir, böylece bir kategorinin taşkını diğer
+kategorileri aday kümesinden atamaz; kategoriler RULE -> DECISION -> THREAD
+-> FACT sırasında adil turlarla serpiştirilir. Mutlak tavanlar değişmez: en
+çok 5 öğe / 4.000 karakter. Task JSON'una isteğe bağlı `project_id` alanı
+eklenmiştir; oturumun ilk proje-taşıyan task'ı oturumu bağlar. Projeye bağlı
+bir oturum aynı projenin diğer oturumlarının en yeni en çok 25 kararını da
+aynı kota içinde aday görür; sorgu oturumu hariç tutulur. Getirilen kayıt
+kalıcı task anlık görüntüsünde provenance ile taşınır; bir resume sonrası
+RULE semantiği ancak Core/Store, kaynak satırı SQLite'ta yeniden kanıtlarsa
+(aynı kaynak kimliği, RULE, `explicit_user`, ACTIVE, geçerli bağ) geçerli
+kalır ve güvenilen RULE projeksiyonu tamamen otoriter durumdan yeniden
+kurulur - snapshot'ın anlamsal alanları (özet, rationale, next_step, kaynak
+bağlamı) asla güvenilen RULE'a taşınmaz; kanıt yoksa kayıt kapatılır ve
+yetkisiz veriye indirgenir. Hafıza
+güvenilmeyen referans veridir: hiçbir onay, egress, faturalandırma veya
+yaşam-döngüsü otoritesi taşımaz.
 
 ## Yerel dosya yazma (M5)
 
