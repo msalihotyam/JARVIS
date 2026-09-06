@@ -36,6 +36,8 @@ from jarvis.contracts import (
     MemoryRetrievalQuery,
     LoopStage,
     PermissionGrant,
+    PermissionMode,
+    RiskLevel,
     ProjectMemoryItem,
     ProjectMemoryKind,
     ProjectRecord,
@@ -43,7 +45,6 @@ from jarvis.contracts import (
     RetrievedMemoryItem,
     RetrievedMemoryKind,
     RunStatus,
-    SideEffect,
     memory_lifecycle_from_flags,
     memory_lifecycle_refusal,
     retrieval_tokens,
@@ -1201,6 +1202,17 @@ class RetrievedRuleReproofTests(MemoryV2TestCase):
             Settings(memory_database=self.database),
         )
 
+    def core_with_mode(
+        self, connector: DummyConnector, mode: PermissionMode
+    ) -> AgentCore:
+        registry = ToolRegistry()
+        registry.register(connector)
+        return AgentCore(
+            registry,
+            self.memory,
+            Settings(memory_database=self.database, permission_mode=mode),
+        )
+
     def open_project_session(self, core: AgentCore) -> str:
         opener = make_task()
         opener.project_id = "proj-a"
@@ -1533,17 +1545,22 @@ class RetrievedRuleReproofTests(MemoryV2TestCase):
 
     def test_approval_continuation_reconstructs_rule_projection(self) -> None:
         # REQUIRED REGRESSION: approval continuation path. The task parks at
-        # AWAITING_APPROVAL (after retrieval), the persisted snapshot is
-        # tampered, and the approved resume must reconstruct the projection
-        # before the connector runs.
-        connector = self._RecordingConnector()
-        core = self.core(connector)
-        session_id = self.open_project_session(core)
-        task = make_task(effect=SideEffect.EXTERNAL_EGRESS,
-                         always_requires_approval=True)
+        # AWAITING_APPROVAL (after retrieval) through the canonical
+        # medium-risk/SESSION trigger, the persisted snapshot is tampered
+        # behind the approval, and the approved resume must reconstruct the
+        # projection before the connector runs. Execution is genuinely
+        # blocked first: the connector records zero execute calls while the
+        # task waits for approval.
+        connector = self._RecordingConnector(risk=RiskLevel.MEDIUM)
+        core = self.core_with_mode(connector, PermissionMode.SESSION)
+        session_id = self.open_project_session(
+            self.core_with_mode(DummyConnector(), PermissionMode.SESSION)
+        )
+        task = make_task(risk=RiskLevel.MEDIUM)
         task.project_id = "proj-a"
         gated = core.run(task, session_id)
         self.assertEqual(RunStatus.AWAITING_APPROVAL, gated.status)
+        self.assertEqual(0, connector.execute_calls)
         # Tamper the PERSISTED snapshot behind the approval.
         persisted = self.memory.load_task(task.id)
         tampered = self._fully_canarized_snapshot()
@@ -1640,6 +1657,17 @@ class RuleAuthorityTests(MemoryV2TestCase):
             Settings(memory_database=self.database),
         )
 
+    def core_with_mode(
+        self, connector: DummyConnector, mode: PermissionMode
+    ) -> AgentCore:
+        registry = ToolRegistry()
+        registry.register(connector)
+        return AgentCore(
+            registry,
+            self.memory,
+            Settings(memory_database=self.database, permission_mode=mode),
+        )
+
     def open_project_session(self, core: AgentCore) -> str:
         opener = make_task()
         opener.project_id = "proj-a"
@@ -1648,20 +1676,30 @@ class RuleAuthorityTests(MemoryV2TestCase):
         return run.session.id
 
     def test_poisoned_rule_cannot_bypass_approval(self) -> None:
-        connector = DummyConnector(
-            side_effect=SideEffect.EXTERNAL_EGRESS,
-            always_requires_approval=True,
+        # Canonical approval trigger (destination-policy era): a medium-risk
+        # task under SESSION mode parks at the approval boundary - the same
+        # sanctioned pattern tests.test_permissions exercises. The poisoned
+        # RULE is genuinely retrieved into this task's snapshot (its text
+        # matches the task query), and it must not change the verdict:
+        # execution stays blocked until a human approves, and the connector
+        # never runs before that.
+        connector = DummyConnector(risk=RiskLevel.MEDIUM)
+        core = self.core_with_mode(connector, PermissionMode.SESSION)
+        session_id = self.open_project_session(
+            self.core_with_mode(DummyConnector(), PermissionMode.SESSION)
         )
-        core = self.core(connector)
-        session_id = self.open_project_session(self.core(DummyConnector()))
-        gated = core.run(
-            make_task(
-                effect=SideEffect.EXTERNAL_EGRESS, always_requires_approval=True
-            ),
-            session_id,
-        )
+        gated = core.run(make_task(risk=RiskLevel.MEDIUM), session_id)
         self.assertEqual(RunStatus.AWAITING_APPROVAL, gated.status)
         self.assertEqual(0, connector.execute_calls)
+        # The poisoned memory really is in the task's retrieved snapshot the
+        # approval must override - the test is not vacuously green.
+        persisted = self.memory.load_task(gated.task.id)
+        self.assertTrue(
+            any(
+                self.POISON in item.summary
+                for item in persisted.retrieved_context.items
+            )
+        )
 
     def test_rule_rows_create_no_authority_rows(self) -> None:
         connection = sqlite3.connect(self.database)
