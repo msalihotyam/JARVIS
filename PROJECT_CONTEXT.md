@@ -170,6 +170,33 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
 - Aylık 20 USD sert sınırı yapılandırılabilir değildir ve öyle bir anahtar
   belgeyi geçersiz kılar. Sır saklanmaz.
 
+## Zamanlayıcı durumu (Scheduler faz 1A + 1B)
+
+**Uygulandı**
+
+- Saf zamanlama çekirdeği (`jarvis/schedules.py`): `ONE_TIME`, `INTERVAL`,
+  `DAILY`, `WEEKLY`; açık IANA saat dilimi, DST boşluk/kat politikası, kendi
+  saati yok, kaçırılmış çalışma sayımı yok.
+- Saf koşul çekirdeği (`jarvis/conditions.py`): üç değerli, tam dosya
+  digest yüklemleri; `UNKNOWN` asla `FALSE` değildir ve hiçbir sonuç yetki
+  kurmaz.
+- Dayanıklı job/kuşak deposu (SQLite şeması 8): tipli job tanımı, revizyon
+  CAS'ı, oluş kimliği, job başına en fazla bir sonuçlanmamış kuşak,
+  değişmez kuşak anlık görüntüsü, kalıcı devre-dışı/arşiv, sınırlı
+  projeksiyonlar ve kapalı düşen bozuk-satır davranışı.
+
+**Henüz uygulanmadı**
+
+- Dağıtıcı; vadesi gelen job'da uyanan üretim yolu yok.
+- Lease/fencing yürütmesi ve devralma.
+- AgentCore task materyalizasyonu ve zamanlanmış iş için onay oluşturma.
+- Arka plan servisi/çalışanı.
+- Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi.
+
+Zamanlayıcı bu nedenle uçtan uca kullanılabilir değildir. Job oluşturmak
+hiçbir şey başlatmaz, onay vermez ve gelecekteki parasal harcamayı
+yetkilendirmez. Ayrıntılı sözleşme `ARCHITECTURE.md` §4.21'dedir.
+
 ## Maliyet ve onay sınırları
 
 - **Kullanıcı kararı (yeni):** Claude Code, kullanıcının mevcut Claude Max aboneliği/OAuth oturumu üzerinden çalıştığında ve ek ölçülen parasal ücret doğurmadığında bu kullanım JARVIS'in 20 USD aylık parasal bütçesini tüketmez, ücretli API kullanımı sayılmaz ve uydurma USD harcaması üretilmez. Güvenilir biçimde elde edilebilen token/model/çağrı sayısı/sağlayıcı telemetrisi kaydedilebilir; dışarı veri gönderme onayı ve tüm güvenlik/izin politikası aynen geçerlidir.

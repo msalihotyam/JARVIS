@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from jarvis.contracts import (
@@ -20,10 +22,19 @@ from jarvis.contracts import (
     BillingClass,
     BillingIntegrityError,
     BillingReconciliation,
+    ChainStep,
     DataClassification,
     DecisionRecord,
     ExecutionAttempt,
     ExecutionClaimOutcome,
+    JobError,
+    JobKind,
+    JobRecord,
+    JobRun,
+    JobRunStatus,
+    JobRunSummary,
+    JobSpec,
+    JobSummary,
     LedgerSnapshot,
     LoopStage,
     MemoryOrigin,
@@ -38,6 +49,8 @@ from jarvis.contracts import (
     ReconciliationOutcome,
     ReconciliationResult,
     ReservationState,
+    SETTLED_JOB_RUN_STATUSES,
+    VISIBILITY_MAX_LIMIT,
     RetrievedContext,
     RetrievedMemoryItem,
     RetrievedMemoryKind,
@@ -49,6 +62,7 @@ from jarvis.contracts import (
     UsageRecord,
     build_retrieved_context,
     canonical_usd,
+    canonical_utc_timestamp,
     is_expired,
     ledger_month,
     nano_usd,
@@ -63,6 +77,12 @@ from jarvis.contracts import (
 from jarvis.core import AgentCore
 from jarvis.memory import ledger_timestamp
 from jarvis.registry import ToolRegistry
+from jarvis.schedules import (
+    Interval,
+    ScheduleError,
+    latest_occurrence,
+    next_occurrence,
+)
 from jarvis.settings import Settings
 from tests.helpers import DummyConnector, make_task
 
@@ -191,6 +211,9 @@ class InMemoryStore:
         #: M1: project identities and INSERT-only memory items.
         self.projects: dict[str, ProjectRecord] = {}
         self.memory_items: list[ProjectMemoryItem] = []
+        #: Scheduler phase 1B: durable job definitions and their generations.
+        self.jobs: dict[str, JobRecord] = {}
+        self.job_runs: dict[str, JobRun] = {}
 
     def save_session(self, session: SessionState) -> None:
         self.sessions[session.id] = copy.deepcopy(session)
@@ -509,6 +532,249 @@ class InMemoryStore:
         ]
         items.sort(key=lambda item: (item.created_at, item.id))
         return copy.deepcopy(items)
+
+    # -- Scheduler phase 1B parity ----------------------------------------
+    #
+    # The same durable job semantics without SQL: storage-minted identity,
+    # revision compare-and-set, occurrence uniqueness, at most one unsettled
+    # generation per job, a never-reissued generation counter, durable
+    # disable, history-preserving archive, and bounded projections. Nothing
+    # here materializes a task, requests an approval or executes anything -
+    # exactly like the SQLite store, and for the same reason.
+
+    def _job_for_update(self, job_id: str, expected_revision) -> JobRecord:
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise JobError("expected_revision is not an exact positive integer")
+        record = self.jobs.get(job_id)
+        if record is None:
+            raise JobError("no usable job with that identity")
+        if record.revision != expected_revision:
+            raise JobError("stale job revision")
+        return record
+
+    @staticmethod
+    def _job_next_due(spec: JobSpec, after) -> str | None:
+        occurrence = next_occurrence(spec.schedule, after)
+        return None if occurrence is None else occurrence.isoformat()
+
+    def _require_active_project(self, project_id: str) -> None:
+        project = self.projects.get(project_id)
+        if project is None or not project.active:
+            raise JobError(f"Unknown or inactive project: {project_id}")
+
+    def create_job(self, spec: JobSpec, *, now) -> JobRecord:
+        if type(spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        self._require_active_project(spec.project_id)
+        record = JobRecord(spec=spec, next_due_at_utc=self._job_next_due(spec, now))
+        self.jobs[record.id] = record
+        return record
+
+    def load_job(self, job_id: str) -> JobRecord | None:
+        return self.jobs.get(job_id)
+
+    def edit_job(
+        self, job_id: str, expected_revision: int, spec: JobSpec, *, now
+    ) -> JobRecord:
+        if type(spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        record = self._job_for_update(job_id, expected_revision)
+        if record.archived:
+            raise JobError("an archived job cannot be edited")
+        self._require_active_project(spec.project_id)
+        updated = dataclasses.replace(
+            record,
+            spec=spec,
+            revision=record.revision + 1,
+            next_due_at_utc=self._job_next_due(spec, now) if record.enabled else None,
+            updated_at=utc_now(),
+        )
+        self.jobs[job_id] = updated
+        return updated
+
+    def set_job_enabled(
+        self, job_id: str, expected_revision: int, enabled: bool, *, now
+    ) -> JobRecord:
+        if type(enabled) is not bool:
+            raise JobError("enabled is not an exact boolean")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        record = self._job_for_update(job_id, expected_revision)
+        if record.archived:
+            raise JobError("an archived job cannot change enablement")
+        updated = dataclasses.replace(
+            record,
+            enabled=enabled,
+            next_due_at_utc=(
+                self._job_next_due(record.spec, now) if enabled else None
+            ),
+            updated_at=utc_now(),
+        )
+        self.jobs[job_id] = updated
+        return updated
+
+    def archive_job(self, job_id: str, expected_revision: int) -> JobRecord:
+        record = self._job_for_update(job_id, expected_revision)
+        if record.archived:
+            raise JobError("the job is already archived")
+        updated = dataclasses.replace(
+            record,
+            enabled=False,
+            next_due_at_utc=None,
+            archived_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.jobs[job_id] = updated
+        return updated
+
+    def record_job_run(self, job_id: str, nominal_due_at_utc: str) -> JobRun:
+        if canonical_utc_timestamp(nominal_due_at_utc) is None:
+            raise JobError("nominal_due_at_utc is not a canonical UTC timestamp")
+        moment = datetime.fromisoformat(nominal_due_at_utc)
+        record = self.jobs.get(job_id)
+        if record is None:
+            raise JobError("no usable job with that identity")
+        if not record.schedulable:
+            raise JobError("a job that is not schedulable records no generation")
+        try:
+            occurrence = latest_occurrence(record.spec.schedule, moment)
+        except ScheduleError:
+            occurrence = None
+        if occurrence is None or occurrence != moment:
+            raise JobError("the schedule does not name that instant")
+        # Same rule as the SQLite store: the occurrence is stored in the
+        # ENGINE'S spelling, so one instant can never become two rows.
+        nominal_due_at_utc = occurrence.isoformat()
+        mine = [run for run in self.job_runs.values() if run.job_id == job_id]
+        if any(not run.settled for run in mine):
+            raise JobError("an unsettled generation of this job is already open")
+        if any(
+            run.job_revision == record.revision
+            and run.nominal_due_at_utc == nominal_due_at_utc
+            for run in mine
+        ):
+            raise JobError("that occurrence has already been recorded")
+        run = JobRun(
+            job_id=record.id,
+            job_revision=record.revision,
+            generation=record.next_generation,
+            nominal_due_at_utc=nominal_due_at_utc,
+            spec=record.spec,
+        )
+        self.job_runs[run.id] = run
+        self.jobs[job_id] = dataclasses.replace(
+            record,
+            last_run_id=run.id,
+            next_generation=record.next_generation + 1,
+            next_due_at_utc=self._job_next_due(record.spec, moment),
+            updated_at=utc_now(),
+        )
+        return run
+
+    def settle_job_run(
+        self,
+        run_id: str,
+        status: JobRunStatus,
+        *,
+        blocking_code: str | None = None,
+        condition_result: str | None = None,
+    ) -> JobRun:
+        if type(status) is not JobRunStatus:
+            raise JobError("status is not an exact JobRunStatus")
+        if status not in SETTLED_JOB_RUN_STATUSES:
+            raise JobError("a generation settles only into a settled status")
+        run = self.job_runs.get(run_id)
+        if run is None:
+            raise JobError("no usable generation with that identity")
+        if run.settled:
+            raise JobError("the generation is already settled")
+        settled = dataclasses.replace(
+            run,
+            status=status,
+            blocking_code=blocking_code,
+            condition_result=condition_result,
+            settled_at=utc_now(),
+        )
+        self.job_runs[run_id] = settled
+        return settled
+
+    def load_job_run(self, run_id: str) -> JobRun | None:
+        run = self.job_runs.get(run_id)
+        if run is None:
+            return None
+        owner = self.jobs.get(run.job_id)
+        if owner is None or run.job_revision > owner.revision:
+            return None
+        return run
+
+    def list_jobs(
+        self, limit: int, *, include_archived: bool = False
+    ) -> list[JobSummary]:
+        if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
+            return []
+        bound = min(limit, VISIBILITY_MAX_LIMIT)
+        records = [
+            record
+            for record in self.jobs.values()
+            if include_archived or not record.archived
+        ]
+        records.sort(key=lambda record: (record.created_at, record.id))
+        return [
+            JobSummary(
+                id=record.id,
+                updated_at=record.updated_at,
+                kind=record.spec.kind.value,
+                label=record.spec.label,
+                project_id=record.project_id,
+                enabled=record.enabled,
+                archived=record.archived,
+                revision=record.revision,
+                timezone=record.spec.timezone,
+                next_due_at_utc=record.next_due_at_utc,
+                last_run_id=record.last_run_id,
+            )
+            for record in records[:bound]
+        ]
+
+    def job_summary(self, job_id: str) -> JobSummary | None:
+        record = self.jobs.get(job_id)
+        if record is None:
+            return None
+        matches = [
+            summary
+            for summary in self.list_jobs(VISIBILITY_MAX_LIMIT, include_archived=True)
+            if summary.id == job_id
+        ]
+        return matches[0] if matches else None
+
+    def list_job_runs(self, job_id: str, limit: int) -> list[JobRunSummary]:
+        if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
+            return []
+        bound = min(limit, VISIBILITY_MAX_LIMIT)
+        runs = [run for run in self.job_runs.values() if run.job_id == job_id]
+        runs.sort(key=lambda run: run.generation, reverse=True)
+        return [
+            JobRunSummary(
+                id=run.id,
+                job_id=run.job_id,
+                job_revision=run.job_revision,
+                generation=run.generation,
+                nominal_due_at_utc=run.nominal_due_at_utc,
+                status=run.status.value,
+                settled=run.settled,
+                snapshot_digest=run.snapshot_digest,
+                session_id=run.session_id,
+                task_id=run.task_id,
+                attempt_id=run.attempt_id,
+                blocking_code=run.blocking_code,
+                condition_result=run.condition_result,
+            )
+            for run in runs[:bound]
+        ]
 
     def save_pending_approval(self, request: PermissionRequest) -> None:
         # Terminal immutability extends to approval issuance: no fresh
@@ -1109,6 +1375,156 @@ class StorageAbstractionTests(unittest.TestCase):
         self.assertIs(
             AttemptState.PREPARED, memory.latest_execution_attempt(task.id).state
         )
+
+
+class SchedulerStorageParityTests(unittest.TestCase):
+    """The non-SQLite double enforces the same durable job semantics.
+
+    Scheduler phase 1B declares its storage surface on the provider-neutral
+    ``MemoryStore`` contract, so the invariants have to be the STORE'S rather
+    than SQLite's. These are the same proofs the SQLite suite makes, asked of
+    an implementation with no database under it at all.
+    """
+
+    NOW = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self) -> None:
+        self.memory = InMemoryStore()
+        self.memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+    def spec(self, *, label: str = "hourly digest", project_id: str = "proj-a"):
+        return JobSpec(
+            project_id=project_id,
+            kind=JobKind.RECURRING,
+            label=label,
+            schedule=Interval(anchor=self.NOW, every=timedelta(hours=1)),
+            steps=(
+                ChainStep(
+                    objective="summarize the log",
+                    capability="echo",
+                    action="read",
+                    target="notes.txt",
+                ),
+            ),
+        )
+
+    def test_creation_is_a_record_of_intent_and_nothing_else(self) -> None:
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        self.assertEqual(1, record.revision)
+        self.assertEqual(
+            (self.NOW + timedelta(hours=1)).isoformat(), record.next_due_at_utc
+        )
+        self.assertEqual(record, self.memory.load_job(record.id))
+        # No task, session, approval, grant, attempt, reservation or usage.
+        self.assertEqual({}, self.memory.tasks)
+        self.assertEqual({}, self.memory.sessions)
+        self.assertEqual({}, self.memory.pending)
+        self.assertEqual([], self.memory.grants)
+        self.assertEqual({}, self.memory.attempts)
+        self.assertEqual({}, self.memory.billing)
+        self.assertEqual({}, self.memory.usage)
+        with self.assertRaises(JobError):
+            self.memory.create_job(self.spec(project_id="proj-missing"), now=self.NOW)
+
+    def test_revision_compare_and_set_refuses_a_stale_writer(self) -> None:
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        edited = self.memory.edit_job(
+            record.id, record.revision, self.spec(label="one"), now=self.NOW
+        )
+        self.assertEqual(2, edited.revision)
+        with self.assertRaisesRegex(JobError, "stale job revision"):
+            self.memory.edit_job(
+                record.id, record.revision, self.spec(label="two"), now=self.NOW
+            )
+        self.assertEqual("one", self.memory.load_job(record.id).spec.label)
+
+    def test_occurrence_identity_and_one_unsettled_generation_hold(self) -> None:
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        first = self.memory.record_job_run(record.id, record.next_due_at_utc)
+        self.assertEqual(1, first.generation)
+        current = self.memory.load_job(record.id)
+        with self.assertRaisesRegex(JobError, "already open"):
+            self.memory.record_job_run(record.id, current.next_due_at_utc)
+        self.memory.settle_job_run(first.id, JobRunStatus.COMPLETED)
+        with self.assertRaisesRegex(JobError, "already been recorded"):
+            self.memory.record_job_run(record.id, first.nominal_due_at_utc)
+        second = self.memory.record_job_run(record.id, current.next_due_at_utc)
+        self.assertEqual(2, second.generation)
+        # An instant the schedule does not name is not an occurrence.
+        with self.assertRaisesRegex(JobError, "does not name"):
+            self.memory.record_job_run(
+                record.id, (self.NOW + timedelta(minutes=90)).isoformat()
+            )
+
+    def test_an_old_generation_snapshot_stays_immutable(self) -> None:
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        original = record.spec
+        run = self.memory.record_job_run(record.id, record.next_due_at_utc)
+        self.memory.edit_job(
+            record.id, record.revision, self.spec(label="renamed"), now=self.NOW
+        )
+        reloaded = self.memory.load_job_run(run.id)
+        self.assertEqual(original, reloaded.spec)
+        self.assertEqual(original.digest, reloaded.snapshot_digest)
+        self.assertEqual(1, reloaded.job_revision)
+
+    def test_disable_enable_and_archive_behave_the_same(self) -> None:
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        disabled = self.memory.set_job_enabled(
+            record.id, record.revision, False, now=self.NOW
+        )
+        self.assertIsNone(disabled.next_due_at_utc)
+        with self.assertRaises(JobError):
+            self.memory.record_job_run(record.id, record.next_due_at_utc)
+        later = self.NOW + timedelta(hours=5, minutes=30)
+        enabled = self.memory.set_job_enabled(
+            record.id, disabled.revision, True, now=later
+        )
+        self.assertEqual(
+            (self.NOW + timedelta(hours=6)).isoformat(), enabled.next_due_at_utc
+        )
+        run = self.memory.record_job_run(record.id, enabled.next_due_at_utc)
+        archived = self.memory.archive_job(
+            record.id, self.memory.load_job(record.id).revision
+        )
+        self.assertTrue(archived.archived)
+        self.assertIsNone(archived.next_due_at_utc)
+        # History is preserved, and the archived job stays reachable.
+        self.assertIsNotNone(self.memory.load_job_run(run.id))
+        self.assertEqual([], self.memory.list_jobs(10))
+        self.assertEqual(
+            [record.id],
+            [s.id for s in self.memory.list_jobs(10, include_archived=True)],
+        )
+
+    def test_projections_are_bounded_and_carry_no_declaration(self) -> None:
+        record = self.memory.create_job(
+            JobSpec(
+                project_id="proj-a",
+                kind=JobKind.RECURRING,
+                label="nightly export",
+                schedule=Interval(anchor=self.NOW, every=timedelta(hours=1)),
+                steps=(
+                    ChainStep(
+                        objective="email the api_key=HUNTER2 report",
+                        capability="echo",
+                        action="read",
+                        target="C:/Users/me/secret.txt",
+                    ),
+                ),
+            ),
+            now=self.NOW,
+        )
+        self.memory.record_job_run(record.id, record.next_due_at_utc)
+        payload = repr(self.memory.list_jobs(10)) + repr(
+            self.memory.list_job_runs(record.id, 10)
+        )
+        self.assertNotIn("HUNTER2", payload)
+        self.assertNotIn("secret.txt", payload)
+        self.assertEqual("nightly export", self.memory.job_summary(record.id).label)
+        for bad in (0, -1, True, "5", None):
+            self.assertEqual([], self.memory.list_jobs(bad))
+            self.assertEqual([], self.memory.list_job_runs(record.id, bad))
 
 
 if __name__ == "__main__":

@@ -33,8 +33,9 @@ JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel ça
 ## Proje hafızası (Memory V2 temeli)
 
 Proje kimliği ve açık proje-kapsamlı hafıza tamamen yereldir ve model/ağ
-çağrısı yapmaz. SQLite şeması additive migration ile 7'dedir; eski projesiz
-oturum/task davranışı birebir korunur.
+çağrısı yapmaz. SQLite şeması additive migration ile 8'dedir (7 tipli
+hafızayı, 8 zamanlayıcı job temelini ekler); eski projesiz oturum/task
+davranışı birebir korunur.
 
 ```powershell
 jarvis project create --id jarvis-v1 --name "JARVIS v1"

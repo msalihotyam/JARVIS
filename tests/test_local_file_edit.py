@@ -1817,9 +1817,9 @@ class PublicShapeTests(EditTestCase):
         from jarvis.connectors.claude_code import EGRESS_TOOL_GRANTS
         from jarvis.memory import SCHEMA_VERSION
 
-        # Memory V2 owns the SQLite schema (7); the output envelope
-        # contract is untouched by it and remains at version 6.
-        self.assertEqual(7, SCHEMA_VERSION)
+        # Scheduler phase 1B owns the current SQLite schema (8); the
+        # output envelope contract is untouched by it and remains at 6.
+        self.assertEqual(8, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
         self.assertEqual((), EGRESS_TOOL_GRANTS)
 

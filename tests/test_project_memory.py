@@ -640,8 +640,8 @@ class MigrationTests(unittest.TestCase):
     def test_v5_upgrades_additively(self) -> None:
         self._build_v5_database()
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(7, SCHEMA_VERSION)
-        self.assertEqual(7, store.schema_version())
+        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(8, store.schema_version())
         connection = sqlite3.connect(self.database)
         try:
             tables = {
@@ -675,12 +675,12 @@ class MigrationTests(unittest.TestCase):
         store = SQLiteMemoryStore(self.database)
         store.save_project(ProjectRecord(id="proj-a", name="Project A"))
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(7, again.schema_version())
+        self.assertEqual(8, again.schema_version())
         self.assertEqual(1, len(again.list_projects()))
         connection = sqlite3.connect(self.database)
         try:
             self.assertEqual(
-                [(5,), (6,), (7,)],
+                [(5,), (6,), (7,), (8,)],
                 connection.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 ).fetchall(),
@@ -692,7 +692,7 @@ class MigrationTests(unittest.TestCase):
         SQLiteMemoryStore(self.database)
         connection = sqlite3.connect(self.database)
         try:
-            connection.execute("UPDATE schema_version SET version = 8")
+            connection.execute("UPDATE schema_version SET version = 99")
             connection.commit()
         finally:
             connection.close()

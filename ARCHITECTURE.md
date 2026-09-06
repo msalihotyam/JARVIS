@@ -2655,3 +2655,142 @@ edilmiştir: onay kimliği yalnızca *var/yok* olarak, veritabanı yolu ev
 dizinine göreli ya da `[PATH]` olarak raporlanır.
 
 Bu maddeler ihtiyaç doğduğunda güvenlik, lisans, bakım maliyeti ve gerçek fayda açısından ayrıca değerlendirilecektir.
+
+### 4.21 Zamanlayıcı temeli — saf çekirdekler ve dayanıklı job deposu (Scheduler faz 1A + 1B, uygulandı)
+
+Zamanlayıcı ayrı katmanlara bölünmüştür ve bugüne kadar yalnızca aşağıdaki
+üçü vardır. Bu bölümün ilk işi neyin **olmadığını** söylemektir: JARVIS bugün
+zamanlanmış hiçbir işi kendiliğinden çalıştırmaz.
+
+**Uygulandı**
+
+1. **Saf zamanlama çekirdeği** (`jarvis/schedules.py`, faz 1A). Tek soru:
+   verilen bir program ve **açık** bir an için bir sonraki nominal oluş nedir
+   (`next_occurrence`) ve o andaki/öncesindeki en son nominal oluş nedir
+   (`latest_occurrence`). Kalıcılık, dağıtım, task üretimi, yürütme ve kendi
+   saati yoktur; naive datetime reddedilir, makinenin kendi saat dilimi hiç
+   okunmaz. Kapalı program kümesi tam olarak `ONE_TIME`, `INTERVAL`, `DAILY`,
+   `WEEKLY`'dir; cron/RRULE ayrıştırıcısı yoktur. Takvim türleri **açık** IANA
+   kimliği taşır; ilkbahar geçişinde var olmayan yerel saat o gün atlanır,
+   sonbaharda iki kez yaşanan saat yalnızca **erken** anda bir kez oluşur.
+   `INTERVAL` saf geçen-zaman aritmetiğidir, DST onu kaydırmaz. Kaçırılmış
+   çalışmalar sayılmaz: bir yıl kapalı kalan makine, beş dakika kapalı kalanla
+   aynı sınırlı işte yanıt alır.
+
+2. **Saf koşul çekirdeği** (`jarvis/conditions.py`, faz 1A). Tek soru:
+   doğrulanmış gözlem + tipli yüklem → `TRUE`/`FALSE`/`UNKNOWN`. Üç değer
+   ikiye çökmez; `UNKNOWN` asla `FALSE` değildir ve `ConditionResult`
+   truthiness'i reddeder. Yalnızca **tam dosya** gözlemi bu koşulları kurar;
+   bölge okuması, başarısız/eksik/reddedilmiş okuma ve başka bir dosyanın
+   gözlemi `UNKNOWN` verir. Vokabüler kapalıdır
+   (`LOCAL_READ_SHA256_EQUALS`, `LOCAL_READ_SHA256_DIFFERS`) ve model üretimi
+   metnin yüklem olmaya giden bir yolu yoktur. **Yetki değişmezi:** burada bir
+   `TRUE` üretmek hiçbir şeyi yetkilendirmez; onay, egress, faturalandırma ve
+   yaşam döngüsü sorularının tamamı Core'a aittir ve orada yeniden kanıtlanır.
+
+3. **Dayanıklı job/kuşak deposu** (faz 1B, SQLite şeması 7 → 8). Bir **Job**
+   dayanıklı bir *tanımdır*: Task değildir, onay değildir, grant değildir,
+   yürütme fırsatı değildir ve parasal yetki değildir. Job oluşturmak hiçbir
+   şey başlatmaz.
+
+**Job sözleşmesi.** Kapalı tür kümesi tam olarak `ONE_TIME`, `RECURRING`,
+`CONDITION_WATCH`'tir. Bir `JobSpec` tüm yürütmeyle ilgili tanımı tek nesnede
+taşır: operatörün kurduğu kök (`project_id` — açık, var olan ve etkin bir
+proje), tür, sınırlı ve sanitize edilmiş etiket, tipli program, ve türe göre
+**yapısal olarak dışlayıcı** biçimde ya bir bildirim (`steps`) ya da bir tipli
+yüklem + `on_true` bildirimi. Bildirim, zaten incelenmiş zincir adımı
+gramerinin **aynısıdır** (`ChainStep` + `chain_steps_refusal`): ikinci bir
+gramer yazılmamıştır. Kalıcılaştırılan tanım **güvenilmeyen spesifikasyondur**;
+aşama, grant, onay nesnesi, yürütme girişimi, connector seçimi, rezervasyon,
+çalışma zamanı sonucu, fingerprint ve ilerleme için burada bir yazım yoktur ve
+bilinmeyen anahtar filtrelenmez, adıyla reddedilir. Kodlanmış spesifikasyon
+64 KiB ile sınırlıdır (tabloda da `CHECK`'lidir); etiket tek kanonik tanılama
+hijyeni hattından (kimlik bilgisi + yerel yol redaksiyonu) geçer.
+
+**Saat dilimi.** Takvim kimliği yalnızca kanonik program kodlamasının içinde
+yaşar; ikinci bir kopya tutulmaz, çünkü ayrışabilen iki kopyadan yanlış saatte
+çalışan hep kopyadır. Yeniden yüklemede makine saat dilimi çıkarsanmaz;
+çözülemeyen bir zone satırı kapalı biçimde başarısız yapar.
+
+**Kuşak (JobRun) sözleşmesi.** Bir kuşak bir *oluştur*, bir yürütme değildir.
+Kuşak, kendisini üreten revizyondaki spesifikasyonun **değişmez anlık
+görüntüsünü** tam olarak taşır ve digest o görüntüden türetilir; sonraki bir
+düzenleme geçmişi yeniden yazmaz. `owner_token` / `fencing_epoch` /
+`claimed_at` alanları **atıldır**: bu fazda hiçbir şey yazmaz ve hiçbir karar
+bunlardan okunmaz; şemada bulunmalarının tek nedeni satır şeklinin parçası
+olmaları ve canlı veri altında sonradan eklenmek zorunda kalmamalarıdır.
+**Lease/bitiş zamanı alanı kasten yoktur:** hiçbir kısıt ona atıfta bulunmaz,
+nullable bir zaman damgası zaten en ucuz sonraki migration'dır ve depo
+genelinde "lease/heartbeat/orphan-reclaim makinesi yoktur" diyen mevcut S2B
+koruma testi hâlâ geçerlidir; henüz olmayan bir yeteneği şemanın iddia etmesi
+doğru olmazdı. **İkinci bir yürütme günlüğü yoktur**: yürütme
+geldiğinde mevcut H2 `execution_attempts` satırına `attempt_id` üzerinden
+bağlanacaktır — kuşak *oluş*, girişim *deneme*.
+
+**Değişmezler depoda, Python'da değil.** `jobs` ve `job_runs` tablolarında:
+
+- `UNIQUE (job_id, job_revision, nominal_due_at_utc)` — oluş kimliği;
+- `UNIQUE (job_id, generation)` — monoton sayaç bir anahtardır, bu yüzden
+  sonuçlanmış bir kuşağın numarası asla yeniden verilemez;
+- `settled_at IS NULL` üzerindeki **kısmi** benzersiz indeks — job başına en
+  fazla **bir** sonuçlanmamış kuşak;
+- durum/sonuçlanma `CHECK`'i — sonuçlanmış kuşağın hem sonuçlanma anı hem
+  sonuçlanmış durumu olur, sonuçlanmamışın ikisi de olmaz;
+- `archived_at IS NULL OR enabled = 0` ve
+  `next_due_at_utc IS NULL OR (enabled = 1 AND archived_at IS NULL)` —
+  imkânsız arşiv/etkin bileşimi reddedilir ve DEVRE DIŞI kalıcı olur, tavsiye
+  niteliğinde değil.
+
+Sonuçlanmamış küme kasten `UNKNOWN_OUTCOME`'ı da içerir: H2'nin bilinmeyen
+girişimi yeniden oynatmaması gibi, "ne olduğunu öğrenemedik" bir son değildir.
+
+**Revizyon (CAS).** Yürütmeyle ilgili her tanım alanı `JobSpec` içindedir, bu
+yüzden herhangi birinin değişmesi — program, bildirim, koşul, `on_true`,
+etiket, yürütme kapsamı — **yeni bir revizyon** üretir. Bayat revizyon sunan
+çağıran hiçbir şey yazmadan deterministik biçimde reddedilir. Eski kuşak
+anlık görüntüleri değişmezdir; yeni tanıma benzetilmek üzere yeniden
+yazılmaz.
+
+**Devre dışı / etkinleştir / arşivle.** DEVRE DIŞI, saklanan sonraki-oluş
+anını temizler (tablo da dolu olmasını reddeder) ve *çalışmakta olan bir iş
+hakkında hiçbir iddiada bulunmaz* — depo hiçbir şeyi iptal etmemiştir.
+ETKİNLEŞTİR, verilen **açık** andan ileriye doğru yeniden hesaplayan açık bir
+geçiştir; kapalıyken adı geçen oluşlar geri alınmaz ve sonuçlanmış bir kuşak
+asla diriltilmez (sayaç monotondur, oluş anahtarı tekrarı reddeder). ARŞİVLE
+yalnızca geleceği kapatır: hiçbir kuşak silinmez, hiçbir anlık görüntü
+yeniden yazılmaz, hiçbir kanıt kaldırılmaz; geri alma ve silme yoktur.
+
+**Görünürlük.** `JobSummary`/`JobRunSummary` diğer tüm projeksiyonlarla aynı
+yasaya tabidir: yalnızca operasyonel metadata. Hedefler, destination'lar,
+objective metni ve yüklem sınırı geçmez; yalnızca sınırlı sanitize etiket ve
+anlık görüntü digest'i geçer. Sınır **deponundur** (çağıranın değil), sıra
+toplam ve kararlıdır, yeniden kurulamayan satır atlanmaz — `readable=False`
+ile *raporlanır*: bozuk bir job asla sessizce çalıştırılabilir olmamalı, ama
+asla sessizce kaybolmamalıdır da.
+
+**Kapalı düşme.** Bilinmeyen tür, bozuk UUID, geçersiz revizyon/kuşak,
+çözülemeyen saat dilimi, bozuk program, kolonuyla çelişen kapsam/tür,
+tutmayan digest, imkânsız etkin/arşiv veya sonuçlanma şekli ve job'un hiç
+ulaşmadığı bir revizyonu iddia eden kuşak — hepsi `None` olarak yüklenir.
+Satır fiziksel olarak yerinde kalır (karantina), onarılmaz ve hiçbir işlem
+(düzenleme, aç/kapa, arşivleme, kuşak kaydı) ona dokunamaz.
+
+**Migration 7 → 8.** Kesinlikle ekleyicidir: iki yeni tablo ve indeksleri.
+Hiçbir mevcut tablo değiştirilmez, hiçbir mevcut satır okunmaz, yeniden
+yazılmaz veya silinmez; yükseltme **boş** tablolar oluşturur, dolayısıyla
+yükseltilmiş bir veritabanı bu yüzden zamanlanabilir hâle gelmez, onay
+kazanmaz ve parasal yetki edinmez. `OUTPUT_SCHEMA_VERSION` **6'da kalır** —
+SQLite şeması, çıktı zarfı ve `JOB_DEFINITION_VERSION` üç ayrı politika
+yüzeyidir ve hiçbiri diğerinin takma adı değildir.
+
+**Henüz uygulanmadı (bu fazın sınırı).**
+
+- Dağıtıcı: vadesi gelen job'da uyanan hiçbir üretim yolu yoktur.
+- Kuşak talebi, lease/fencing yürütmesi ve devralma.
+- AgentCore task materyalizasyonu ve zamanlanmış iş için onay oluşturma.
+- Arka plan servisi/çalışanı.
+- Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi.
+- Bilinmeyen sonucun otomatik yeniden denenmesi.
+
+Zamanlayıcı bu nedenle **uçtan uca kullanılabilir değildir**. Bu fazın
+tamamladığı şey depolama ve yönetim temelidir.

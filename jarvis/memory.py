@@ -7,6 +7,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
@@ -43,6 +44,17 @@ from jarvis.contracts import (
     DecisionRecord,
     ErrorCode,
     ExecutionAttempt,
+    JOB_SPEC_MAX_BYTES,
+    JobError,
+    JobKind,
+    JobRecord,
+    JobRun,
+    JobRunStatus,
+    JobRunSummary,
+    JobSpec,
+    JobSummary,
+    SETTLED_JOB_RUN_STATUSES,
+    UNSETTLED_JOB_RUN_STATUSES,
     ExecutionClaimOutcome,
     LedgerSnapshot,
     LoopCheckpoint,
@@ -118,12 +130,13 @@ from jarvis.contracts import (
     utc_now,
     validate_project_id,
 )
+from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.lifecycle import is_terminal
 from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -356,6 +369,133 @@ _USAGE_BILLING_COLUMNS = (
 )
 
 
+def _sql_values(values: Any) -> str:
+    """A closed vocabulary as a SQL literal list, derived from the enum.
+
+    The CHECK constraints below must agree with the Python vocabularies
+    exactly and forever. Writing the spellings out twice is how they stop
+    agreeing, so the SQL is generated from the same enums the loader uses and
+    a member added later cannot be forgotten in one of the two places.
+    """
+    return ", ".join(f"'{value}'" for value in sorted(values))
+
+
+#: Scheduler phase 1B tables. ONE definition, used by both the additive 7 -> 8
+#: migration and the current-schema creation, so a migrated database and a
+#: fresh one are structurally identical.
+#:
+#: The invariants are HERE rather than only in Python:
+#:
+#: * ``UNIQUE (job_id, job_revision, nominal_due_at_utc)`` is occurrence
+#:   identity - one generation per (job, revision, nominal instant);
+#:   ``UNIQUE (job_id, generation)`` makes the monotonic counter a key, so a
+#:   settled generation's number can never be reissued;
+#: * the PARTIAL unique index on ``settled_at IS NULL`` is the
+#:   one-unsettled-generation-per-job rule, enforced by the database rather
+#:   than by whoever remembers to check;
+#: * the status/settlement CHECK is the settled-shape rule, so a row cannot
+#:   be counted as open by one reader and closed by another;
+#: * ``next_due_at_utc IS NULL OR (enabled = 1 AND archived_at IS NULL)``
+#:   makes DISABLE and ARCHIVE durable rather than advisory, and
+#:   ``archived_at IS NULL OR enabled = 0`` refuses the impossible
+#:   archived-and-enabled combination outright.
+_SCHEDULER_SCHEMA_SQL = f"""
+    CREATE TABLE IF NOT EXISTS jobs (
+        -- Scheduler phase 1B: a durable DEFINITION, never task authority.
+        id TEXT PRIMARY KEY,
+        -- The operator-established root this job's future work belongs to.
+        project_id TEXT NOT NULL,
+        definition_version INTEGER NOT NULL,
+        -- Monotonic compare-and-set token for every definition change.
+        revision INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        -- The whole validated specification, canonically encoded. Bounded by
+        -- bytes, not characters, so a multi-byte payload cannot exceed the
+        -- stated ceiling by being spelled in one code point per character.
+        spec_json TEXT NOT NULL,
+        definition_digest TEXT NOT NULL,
+        next_due_at_utc TEXT,
+        enabled INTEGER NOT NULL,
+        archived_at TEXT,
+        last_run_id TEXT,
+        next_generation INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (kind IN ({_sql_values(kind.value for kind in JobKind)})),
+        CHECK (definition_version >= 1),
+        CHECK (revision >= 1),
+        CHECK (next_generation >= 1),
+        CHECK (enabled IN (0, 1)),
+        CHECK (archived_at IS NULL OR enabled = 0),
+        CHECK (
+            next_due_at_utc IS NULL
+            OR (enabled = 1 AND archived_at IS NULL)
+        ),
+        CHECK (length(CAST(spec_json AS BLOB)) <= {JOB_SPEC_MAX_BYTES}),
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_jobs_due
+        ON jobs(enabled, next_due_at_utc);
+
+    CREATE TABLE IF NOT EXISTS job_runs (
+        -- ONE occurrence of one job. NOT an execution journal: when execution
+        -- exists it binds to the existing H2 execution_attempts row through
+        -- attempt_id. There is no second attempt history here.
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        job_revision INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        nominal_due_at_utc TEXT NOT NULL,
+        -- Immutable snapshot of the definition at the recorded revision. A
+        -- later edit never rewrites it.
+        project_id TEXT NOT NULL,
+        spec_json TEXT NOT NULL,
+        snapshot_digest TEXT NOT NULL,
+        status TEXT NOT NULL,
+        -- Materialization associations; NULL until something materializes.
+        session_id TEXT,
+        task_id TEXT,
+        chain_id TEXT,
+        attempt_id TEXT,
+        -- Future dispatch ownership. INERT in this phase: nothing writes or
+        -- reads them, and they are here because they are part of the row
+        -- shape the constraints below are written against. There is
+        -- deliberately NO lease-expiry column: no constraint would refer to
+        -- it, and the repository still asserts that no lease / heartbeat /
+        -- orphan-reclaim machinery exists anywhere in this store.
+        owner_token TEXT,
+        fencing_epoch INTEGER NOT NULL DEFAULT 0,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        blocking_code TEXT,
+        condition_result TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        settled_at TEXT,
+        CHECK (job_revision >= 1),
+        CHECK (generation >= 1),
+        CHECK (fencing_epoch >= 0),
+        CHECK (cancel_requested IN (0, 1)),
+        CHECK (length(CAST(spec_json AS BLOB)) <= {JOB_SPEC_MAX_BYTES}),
+        CHECK (
+            (settled_at IS NULL
+             AND status IN (
+                 {_sql_values(s.value for s in UNSETTLED_JOB_RUN_STATUSES)}))
+            OR
+            (settled_at IS NOT NULL
+             AND status IN (
+                 {_sql_values(s.value for s in SETTLED_JOB_RUN_STATUSES)}))
+        ),
+        UNIQUE (job_id, generation),
+        UNIQUE (job_id, job_revision, nominal_due_at_utc),
+        FOREIGN KEY(job_id) REFERENCES jobs(id)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_unsettled
+        ON job_runs(job_id) WHERE settled_at IS NULL;
+"""
+
+
 class SQLiteMemoryStore:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -480,7 +620,28 @@ class SQLiteMemoryStore:
         if target_version == 7:
             self._migrate_typed_memory(connection)
             return
+        if target_version == 8:
+            self._migrate_scheduler_jobs(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
+
+    @staticmethod
+    def _migrate_scheduler_jobs(connection: sqlite3.Connection) -> None:
+        """Add the durable scheduler job/generation tables additively (1B).
+
+        Strictly additive and idempotent: two new tables and their indexes,
+        and nothing else. No existing table is altered, no existing row is
+        read, rewritten, reclassified or deleted, so every schema-7 database
+        keeps its full history byte-for-byte and every session, task, grant,
+        attempt, reservation and memory record behaves identically after the
+        upgrade.
+
+        No authority is invented either. The upgrade creates EMPTY tables: a
+        migrated database has no jobs, so nothing becomes schedulable, nothing
+        gains an approval and nothing gains a monetary authorization by having
+        been upgraded.
+        """
+        connection.executescript(_SCHEDULER_SCHEMA_SQL)
 
     @staticmethod
     def _migrate_typed_memory(connection: sqlite3.Connection) -> None:
@@ -926,6 +1087,10 @@ class SQLiteMemoryStore:
                 ON attempt_billing(ledger_month, state);
             """
         )
+        # Scheduler phase 1B tables, from the SAME definition the 7 -> 8
+        # migration applies, so a migrated database and a fresh one cannot
+        # diverge in a constraint.
+        connection.executescript(_SCHEDULER_SCHEMA_SQL)
 
     def schema_version(self) -> int:
         with self._connection() as connection:
@@ -4515,6 +4680,746 @@ class SQLiteMemoryStore:
             )
         return ApprovalSummary(
             request_id=request_id, fingerprint=fingerprint, expires_at=expires_at
+        )
+
+    # ----------------------------------------------------------------
+    # Scheduler phase 1B. DURABLE JOB / GENERATION PERSISTENCE.
+    #
+    # Storage and management ONLY. Nothing below wakes on a due job, claims a
+    # generation, materializes an AgentCore task, creates an approval, invokes
+    # a connector, evaluates a predicate, performs an on_true action, starts a
+    # worker, takes over a lease or retries an unknown outcome. Every method
+    # here runs because a caller called it, and the only caller in this build
+    # is a test.
+    #
+    # The invariants live in SQL, not in Python. Occurrence identity, the
+    # one-unsettled-generation rule and the impossible-state refusals are
+    # UNIQUE and CHECK constraints on the tables themselves, so a writer that
+    # bypassed these methods - a future dispatcher, a script, a hand-edited
+    # database - still cannot create a second live generation or a row whose
+    # settled status and settlement instant disagree. The Python checks below
+    # exist to produce a clear refusal, never as the guarantee.
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _job_flag(value: Any, field_name: str) -> bool:
+        """One persisted 0/1 flag as an exact bool, or ``JobError``.
+
+        Deliberately not ``bool(...)``: ``2``, ``-1`` and ``"yes"`` are each
+        tampered state that a coercion would turn into a confident ``True``.
+        """
+        if type(value) is not int or value not in (0, 1):
+            raise JobError(f"{field_name} is not an exact persisted flag")
+        return value == 1
+
+    @staticmethod
+    def _job_instant(value: Any, field_name: str) -> datetime:
+        """One canonical persisted UTC timestamp as a datetime, or ``JobError``."""
+        if canonical_utc_timestamp(value) is None:
+            raise JobError(f"{field_name} is not a canonical UTC timestamp")
+        return datetime.fromisoformat(value)
+
+    @staticmethod
+    def _job_moment(value: Any, field_name: str) -> datetime:
+        """One caller-supplied EXPLICIT instant, or ``JobError``.
+
+        There is no default and no ``utc_now()`` fallback here on purpose. The
+        pure schedule engine refuses a naive datetime rather than guessing a
+        zone, and scheduling arithmetic that quietly read the machine clock
+        would be untestable and, on a machine whose clock is wrong, silently
+        wrong too. The caller states the instant it is planning from.
+        """
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise JobError(f"{field_name} is not an aware datetime")
+        return value
+
+    @staticmethod
+    def _next_due(spec: JobSpec, after: datetime) -> str | None:
+        """The next instant this schedule names after ``after``, or ``None``.
+
+        Delegated in full to the reviewed pure kernel. No schedule arithmetic
+        is reimplemented in storage - a second implementation would be a
+        second answer, and the one that fires is always the wrong one.
+        """
+        occurrence = next_occurrence(spec.schedule, after)
+        return None if occurrence is None else occurrence.isoformat()
+
+    @staticmethod
+    def _named_occurrence(spec: JobSpec, moment: datetime) -> str | None:
+        """The occurrence this instant IS, in the kernel's own spelling.
+
+        Two jobs at once. First, whether the schedule really names the instant
+        at all: asked with the same pure kernel and no new arithmetic, an
+        instant is named iff the latest occurrence at or before it IS it. That
+        refuses an arbitrary caller-chosen moment becoming a durable
+        occurrence, and it refuses an instant past a schedule's end, without
+        storage ever enumerating anything.
+
+        Second, the SPELLING. The occurrence key is a string, so two different
+        renderings of the same instant - a trailing ``.000000``, a non-UTC
+        offset - would be two rows for one occurrence, and the uniqueness
+        index would never see them collide. So the value that gets persisted
+        is the ENGINE'S rendering of the occurrence, never the caller's, and
+        every occurrence therefore has exactly one durable spelling.
+        """
+        try:
+            occurrence = latest_occurrence(spec.schedule, moment)
+        except ScheduleError:
+            return None
+        if occurrence is None or occurrence != moment:
+            return None
+        return occurrence.isoformat()
+
+    @staticmethod
+    def _job_from_row(row: sqlite3.Row | None) -> JobRecord | None:
+        """Rebuild one persisted job defensively, fail-closed on bad shape.
+
+        A corrupt job is NEVER repaired into a runnable default. An unknown
+        kind, a malformed schedule, an unresolvable timezone, an invalid
+        revision or generation, an impossible enabled/archived combination, a
+        specification that no longer matches its digest, or a scope that
+        disagrees with the column the foreign key is on - each one makes the
+        row unusable and it loads as ``None``. The row stays physically stored
+        exactly as it is; it simply can never be scheduled.
+        """
+        if row is None:
+            return None
+        try:
+            document = json.loads(row["spec_json"])
+            spec = JobSpec.from_dict(document)
+            # Three cross-checks between the document and the COLUMNS that
+            # storage indexes and constrains on. A document that disagrees
+            # with them describes a different job than the one the foreign
+            # key, the kind constraint and the digest were written for.
+            if spec.project_id != row["project_id"]:
+                raise JobError("the persisted scope disagrees with its column")
+            if spec.kind.value != row["kind"]:
+                raise JobError("the persisted kind disagrees with its column")
+            if spec.digest != row["definition_digest"]:
+                raise JobError("the persisted specification digest does not match")
+            return JobRecord(
+                spec=spec,
+                id=row["id"],
+                definition_version=row["definition_version"],
+                revision=row["revision"],
+                enabled=SQLiteMemoryStore._job_flag(row["enabled"], "enabled"),
+                archived_at=row["archived_at"],
+                next_due_at_utc=row["next_due_at_utc"],
+                last_run_id=row["last_run_id"],
+                next_generation=row["next_generation"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError):
+            return None
+
+    @staticmethod
+    def _job_run_from_row(
+        row: sqlite3.Row | None, job_revision: Any = None
+    ) -> JobRun | None:
+        """Rebuild one persisted generation defensively, fail-closed.
+
+        ``job_revision`` is the OWNING job's current revision when the caller
+        read it in the same query. A run claiming a revision the job has never
+        reached is inconsistent durable state - the one revision relationship
+        a row cannot check about itself - and loads as ``None`` rather than as
+        a generation of a definition that does not exist. An OLDER revision is
+        ordinary history and is kept.
+        """
+        if row is None:
+            return None
+        try:
+            spec = JobSpec.from_dict(json.loads(row["spec_json"]))
+            if spec.digest != row["snapshot_digest"]:
+                raise JobError("the snapshot digest does not match its snapshot")
+            if spec.project_id != row["project_id"]:
+                raise JobError("the snapshot scope disagrees with its column")
+            revision = row["job_revision"]
+            if job_revision is not None and (
+                type(revision) is not int
+                or type(job_revision) is not int
+                or revision > job_revision
+            ):
+                raise JobError("the generation names a revision the job never had")
+            return JobRun(
+                job_id=row["job_id"],
+                job_revision=revision,
+                generation=row["generation"],
+                nominal_due_at_utc=row["nominal_due_at_utc"],
+                spec=spec,
+                id=row["id"],
+                status=JobRunStatus(row["status"]),
+                session_id=row["session_id"],
+                task_id=row["task_id"],
+                chain_id=row["chain_id"],
+                attempt_id=row["attempt_id"],
+                owner_token=row["owner_token"],
+                fencing_epoch=row["fencing_epoch"],
+                cancel_requested=SQLiteMemoryStore._job_flag(
+                    row["cancel_requested"], "cancel_requested"
+                ),
+                blocking_code=row["blocking_code"],
+                condition_result=row["condition_result"],
+                created_at=row["created_at"],
+                claimed_at=row["claimed_at"],
+                settled_at=row["settled_at"],
+            )
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError):
+            return None
+
+    #: Every job column a rebuild needs, named once so the four read paths
+    #: cannot drift into selecting different subsets.
+    _JOB_COLUMNS = (
+        "id, project_id, definition_version, revision, kind, spec_json, "
+        "definition_digest, next_due_at_utc, enabled, archived_at, "
+        "last_run_id, next_generation, created_at, updated_at"
+    )
+
+    _JOB_RUN_COLUMNS = (
+        "id, job_id, job_revision, generation, nominal_due_at_utc, project_id, "
+        "spec_json, snapshot_digest, status, session_id, task_id, chain_id, "
+        "attempt_id, owner_token, fencing_epoch, cancel_requested, "
+        "blocking_code, condition_result, created_at, claimed_at, settled_at"
+    )
+
+    @staticmethod
+    def _insert_job(connection: sqlite3.Connection, record: JobRecord) -> None:
+        """INSERT one new job row from a validated record.
+
+        The record has already passed its own contract, so every impossible
+        combination is gone before SQL sees it; the table's CHECK constraints
+        then hold the same line for any writer that did not come through here.
+        """
+        connection.execute(
+            """
+            INSERT INTO jobs
+                (id, project_id, definition_version, revision, kind, spec_json,
+                 definition_digest, next_due_at_utc, enabled, archived_at,
+                 last_run_id, next_generation, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                record.project_id,
+                record.definition_version,
+                record.revision,
+                record.spec.kind.value,
+                record.spec.encoded(),
+                record.spec.digest,
+                record.next_due_at_utc,
+                int(record.enabled),
+                record.archived_at,
+                record.last_run_id,
+                record.next_generation,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+
+    @staticmethod
+    def _update_job(
+        connection: sqlite3.Connection, record: JobRecord, *, expected_revision: int
+    ) -> None:
+        """UPDATE one existing job row, guarded on the revision it replaces.
+
+        An UPDATE and deliberately not an ``INSERT OR REPLACE``: replace is a
+        DELETE plus an INSERT, and deleting a job row that generations
+        reference would put a foreign key at the mercy of when SQLite happens
+        to check it. Nothing about editing a definition should be able to
+        touch its history.
+
+        The ``WHERE`` clause carries the compare-and-set a second time, in
+        SQL. The Python gate above has already re-read the row inside this
+        transaction, so this cannot normally fail - which is the point: if it
+        ever does, the write is refused rather than silently applied to a row
+        that moved.
+        """
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+               SET project_id = ?, definition_version = ?, revision = ?,
+                   kind = ?, spec_json = ?, definition_digest = ?,
+                   next_due_at_utc = ?, enabled = ?, archived_at = ?,
+                   last_run_id = ?, next_generation = ?, updated_at = ?
+             WHERE id = ? AND revision = ?
+            """,
+            (
+                record.project_id,
+                record.definition_version,
+                record.revision,
+                record.spec.kind.value,
+                record.spec.encoded(),
+                record.spec.digest,
+                record.next_due_at_utc,
+                int(record.enabled),
+                record.archived_at,
+                record.last_run_id,
+                record.next_generation,
+                record.updated_at,
+                record.id,
+                expected_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise JobError("stale job revision")
+
+    @staticmethod
+    def _require_active_project(
+        connection: sqlite3.Connection, project_id: str
+    ) -> None:
+        row = connection.execute(
+            "SELECT active FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if row is None or not row["active"]:
+            raise JobError(f"Unknown or inactive project: {project_id}")
+
+    def _job_for_update(
+        self, connection: sqlite3.Connection, job_id: str, expected_revision: Any
+    ) -> JobRecord:
+        """The job this operation may act on, or a deterministic refusal.
+
+        THE compare-and-set gate every definition and state change goes
+        through. A caller holds a job it read at some earlier instant; by the
+        time it writes, another caller may have edited the definition. Letting
+        a stale caller write would be a lost update on the one field that says
+        what the job DOES, so the revision it is presenting is re-proved
+        against the row inside this transaction, and a mismatch is refused
+        having written nothing.
+        """
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise JobError("expected_revision is not an exact positive integer")
+        row = connection.execute(
+            f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        record = self._job_from_row(row)
+        if record is None:
+            # One refusal for a missing job and for an unusable one alike: a
+            # corrupted row must not be reported as editable, and which of the
+            # two it is is not something this refusal needs to disclose.
+            raise JobError("no usable job with that identity")
+        if record.revision != expected_revision:
+            raise JobError("stale job revision")
+        return record
+
+    def create_job(self, spec: JobSpec, *, now: datetime) -> JobRecord:
+        """Create ONE durable job definition. Creation is not authority.
+
+        Creating a job materializes no task, requests no approval, consumes no
+        grant, selects no connector, reserves no money and starts nothing. It
+        records what someone would like done later, and every gate that work
+        must pass is still ahead of it, unchanged and re-proved on the trusted
+        path when it happens.
+
+        ``now`` is the EXPLICIT instant the first occurrence is calculated
+        from, through the pure schedule engine. A schedule that names nothing
+        after it - a one-time instant already past, a recurrence past its end
+        - yields no next due; the job is created and is simply never
+        eligible, which is the honest record of what was asked for.
+        """
+        if type(spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        moment = self._job_moment(now, "now")
+        record = JobRecord(spec=spec, next_due_at_utc=self._next_due(spec, moment))
+        with self._connection(write=True) as connection:
+            self._require_active_project(connection, spec.project_id)
+            try:
+                self._insert_job(connection, record)
+            except sqlite3.IntegrityError as exc:
+                raise JobError(f"Job already exists: {record.id}") from exc
+        return record
+
+    def load_job(self, job_id: str) -> JobRecord | None:
+        """One job, or ``None`` when it is missing OR unusable.
+
+        The two collapse deliberately. Everything that would act on a job must
+        treat a corrupted definition exactly as it treats an absent one -
+        there is nothing to run - and a loader that distinguished them would
+        invite a caller to "repair" the difference.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._job_from_row(row)
+
+    def edit_job(
+        self, job_id: str, expected_revision: int, spec: JobSpec, *, now: datetime
+    ) -> JobRecord:
+        """Replace a job's definition under compare-and-set. Revision advances.
+
+        Every execution-relevant field lives in the specification - scope,
+        kind, label, schedule, predicate, declaration - so any change to any
+        of them produces a new revision, and a caller presenting an older one
+        is refused deterministically having written nothing.
+
+        Generations already recorded are NOT touched. Their snapshots stay
+        byte-identical at the revision that produced them, because what an
+        open occurrence was for is a fact about the past; rewriting it to
+        resemble the new definition would make the durable record lie.
+        """
+        if type(spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        moment = self._job_moment(now, "now")
+        with self._connection(write=True) as connection:
+            record = self._job_for_update(connection, job_id, expected_revision)
+            if record.archived:
+                raise JobError("an archived job cannot be edited")
+            self._require_active_project(connection, spec.project_id)
+            updated = replace(
+                record,
+                spec=spec,
+                revision=record.revision + 1,
+                next_due_at_utc=(
+                    self._next_due(spec, moment) if record.enabled else None
+                ),
+                updated_at=utc_now(),
+            )
+            self._update_job(
+                connection, updated, expected_revision=record.revision
+            )
+        return updated
+
+    def set_job_enabled(
+        self, job_id: str, expected_revision: int, enabled: bool, *, now: datetime
+    ) -> JobRecord:
+        """Turn future scheduling eligibility on or off. State, not definition.
+
+        DISABLE clears the next due instant, which is what makes it durable
+        rather than advisory: a disabled job carries no eligible occurrence at
+        all, and the table's CHECK constraint refuses one. It says nothing
+        about work already in flight - storage has not cancelled anything and
+        does not claim to have.
+
+        ENABLE is an explicit transition that RECALCULATES the next occurrence
+        from ``now`` forward. Occurrences the schedule named while the job was
+        off are not recovered, and no settled generation is revived: the
+        generation counter is monotonic and never reissues a number, and the
+        occurrence uniqueness key refuses a second run at an instant this
+        revision already recorded.
+        """
+        if type(enabled) is not bool:
+            raise JobError("enabled is not an exact boolean")
+        moment = self._job_moment(now, "now")
+        with self._connection(write=True) as connection:
+            record = self._job_for_update(connection, job_id, expected_revision)
+            if record.archived:
+                raise JobError("an archived job cannot change enablement")
+            updated = replace(
+                record,
+                enabled=enabled,
+                next_due_at_utc=(
+                    self._next_due(record.spec, moment) if enabled else None
+                ),
+                updated_at=utc_now(),
+            )
+            self._update_job(
+                connection, updated, expected_revision=record.revision
+            )
+        return updated
+
+    def archive_job(self, job_id: str, expected_revision: int) -> JobRecord:
+        """Retire a job from future scheduling, keeping every trace of it.
+
+        Archiving disables future eligibility and nothing else. No generation
+        is deleted, no snapshot is rewritten, no history is compacted and no
+        evidence is removed - the job and all of its runs stay exactly where
+        they are and stay readable. There is deliberately no un-archive and no
+        delete: this is the end of a job's future, not the erasure of its
+        past.
+        """
+        with self._connection(write=True) as connection:
+            record = self._job_for_update(connection, job_id, expected_revision)
+            if record.archived:
+                raise JobError("the job is already archived")
+            updated = replace(
+                record,
+                enabled=False,
+                next_due_at_utc=None,
+                archived_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            self._update_job(
+                connection, updated, expected_revision=record.revision
+            )
+        return updated
+
+    def record_job_run(self, job_id: str, nominal_due_at_utc: str) -> JobRun:
+        """Record ONE durable generation of a job. Recording is not claiming.
+
+        This creates the occurrence row and nothing else: no ownership is
+        taken, no lease is written, no task is materialized, no approval
+        exists and no connector is reached. The generation is born
+        ``PENDING`` and stays there until something that does not exist yet
+        settles it.
+
+        Three things are proved in the one transaction before the row exists:
+        the job is usable and schedulable (a disabled or archived job records
+        nothing); the instant really is one the schedule NAMES, asked of the
+        pure kernel rather than trusted from the caller; and no unsettled
+        generation is already open. The last two are also UNIQUE indexes, so
+        the guarantee survives a writer that never came through here.
+        """
+        moment = self._job_instant(nominal_due_at_utc, "nominal_due_at_utc")
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            record = self._job_from_row(row)
+            if record is None:
+                raise JobError("no usable job with that identity")
+            if not record.schedulable:
+                raise JobError("a job that is not schedulable records no generation")
+            # The occurrence is stored in the ENGINE'S spelling, so one instant
+            # can never become two rows by being rendered two ways.
+            nominal = self._named_occurrence(record.spec, moment)
+            if nominal is None:
+                raise JobError("the schedule does not name that instant")
+            open_run = connection.execute(
+                "SELECT id FROM job_runs WHERE job_id = ? AND settled_at IS NULL",
+                (job_id,),
+            ).fetchone()
+            if open_run is not None:
+                raise JobError("an unsettled generation of this job is already open")
+            duplicate = connection.execute(
+                "SELECT id FROM job_runs WHERE job_id = ? AND job_revision = ? "
+                "AND nominal_due_at_utc = ?",
+                (job_id, record.revision, nominal),
+            ).fetchone()
+            if duplicate is not None:
+                raise JobError("that occurrence has already been recorded")
+            run = JobRun(
+                job_id=record.id,
+                job_revision=record.revision,
+                generation=record.next_generation,
+                nominal_due_at_utc=nominal,
+                spec=record.spec,
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO job_runs
+                        (id, job_id, job_revision, generation, nominal_due_at_utc,
+                         project_id, spec_json, snapshot_digest, status, session_id,
+                         task_id, chain_id, attempt_id, owner_token, fencing_epoch,
+                         cancel_requested, blocking_code, condition_result,
+                         created_at, claimed_at, settled_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                            NULL, ?, 0, NULL, NULL, ?, NULL, NULL)
+                    """,
+                    (
+                        run.id,
+                        run.job_id,
+                        run.job_revision,
+                        run.generation,
+                        run.nominal_due_at_utc,
+                        run.spec.project_id,
+                        run.spec.encoded(),
+                        run.snapshot_digest,
+                        run.status.value,
+                        run.fencing_epoch,
+                        run.created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise JobError("that generation could not be recorded") from exc
+            # Bookkeeping only: the monotonic counter advances, the last-run
+            # pointer moves, and the next due instant becomes the next one
+            # this schedule names AFTER the occurrence just recorded - all
+            # from the pure kernel, none of it a decision to run anything.
+            self._update_job(
+                connection,
+                replace(
+                    record,
+                    last_run_id=run.id,
+                    next_generation=record.next_generation + 1,
+                    next_due_at_utc=self._next_due(record.spec, moment),
+                    updated_at=utc_now(),
+                ),
+                expected_revision=record.revision,
+            )
+        return run
+
+    def settle_job_run(
+        self,
+        run_id: str,
+        status: JobRunStatus,
+        *,
+        blocking_code: str | None = None,
+        condition_result: str | None = None,
+    ) -> JobRun:
+        """Close ONE open generation with a settled outcome.
+
+        Settling is the storage transition that lets the NEXT generation
+        exist, and it is guarded on the row still being open, so two settlers
+        cannot both win. A settled generation is never reopened: there is no
+        transition back out of the settled half of the vocabulary, which is
+        what makes "one unsettled generation per job" a bound rather than a
+        hope.
+        """
+        if type(status) is not JobRunStatus:
+            raise JobError("status is not an exact JobRunStatus")
+        if status not in SETTLED_JOB_RUN_STATUSES:
+            raise JobError("a generation settles only into a settled status")
+        with self._connection(write=True) as connection:
+            # Joined to the owning job for exactly the reason the loader is:
+            # a generation naming a revision its job never had is inconsistent
+            # durable state, and settling it would be writing an outcome for
+            # something that was never a real occurrence.
+            row = connection.execute(
+                "SELECT r.*, j.revision AS owner_revision "
+                "FROM job_runs AS r JOIN jobs AS j ON j.id = r.job_id "
+                "WHERE r.id = ?",
+                (run_id,),
+            ).fetchone()
+            run = (
+                None
+                if row is None
+                else self._job_run_from_row(row, row["owner_revision"])
+            )
+            if run is None:
+                raise JobError("no usable generation with that identity")
+            if run.settled:
+                raise JobError("the generation is already settled")
+            settled = replace(
+                run,
+                status=status,
+                blocking_code=blocking_code,
+                condition_result=condition_result,
+                settled_at=utc_now(),
+            )
+            connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, blocking_code = ?, condition_result = ?,
+                       settled_at = ?
+                 WHERE id = ? AND settled_at IS NULL
+                """,
+                (
+                    settled.status.value,
+                    settled.blocking_code,
+                    settled.condition_result,
+                    settled.settled_at,
+                    run_id,
+                ),
+            )
+        return settled
+
+    def load_job_run(self, run_id: str) -> JobRun | None:
+        """One generation, or ``None`` when it is missing OR unusable."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT r.*, j.revision AS owner_revision "
+                "FROM job_runs AS r JOIN jobs AS j ON j.id = r.job_id "
+                "WHERE r.id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._job_run_from_row(row, row["owner_revision"])
+
+    def list_jobs(
+        self, limit: int, *, include_archived: bool = False
+    ) -> list[JobSummary]:
+        """The durable job catalogue as BOUNDED operational metadata.
+
+        Ordered by creation with an ascending id tie-break, so the listing is
+        totally ordered and does not reshuffle itself when a job is toggled.
+        The row bound is the STORE'S, applied to the query, so no caller -
+        including a future command or script - can turn a listing into an
+        export.
+
+        A row that cannot be rebuilt is reported with ``readable`` false and
+        every derived field absent. It is neither hidden nor guessed at: a
+        corrupted job must stay visible to an operator and must stay
+        unrunnable to everything else.
+        """
+        bound = self._visibility_rows(limit)
+        if bound == 0:
+            return []
+        sql = f"SELECT {self._JOB_COLUMNS} FROM jobs"
+        if not include_archived:
+            sql += " WHERE archived_at IS NULL"
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        with self._connection() as connection:
+            rows = connection.execute(sql, (bound,)).fetchall()
+        return [self._job_summary(row) for row in rows]
+
+    def job_summary(self, job_id: str) -> JobSummary | None:
+        """ONE job as the same validated projection a listing returns."""
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return None if row is None else self._job_summary(row)
+
+    @classmethod
+    def _job_summary(cls, row: sqlite3.Row) -> JobSummary:
+        record = cls._job_from_row(row)
+        identity = row["id"] if isinstance(row["id"], str) else ""
+        updated = canonical_utc_timestamp(row["updated_at"]) or ""
+        if record is None:
+            return JobSummary(id=identity, updated_at=updated, readable=False)
+        return JobSummary(
+            id=record.id,
+            updated_at=record.updated_at,
+            kind=record.spec.kind.value,
+            # Already through the canonical credential/local-path redaction
+            # pipeline at construction; the declaration itself never crosses.
+            label=record.spec.label,
+            project_id=record.project_id,
+            enabled=record.enabled,
+            archived=record.archived,
+            revision=record.revision,
+            timezone=record.spec.timezone,
+            next_due_at_utc=record.next_due_at_utc,
+            last_run_id=record.last_run_id,
+        )
+
+    def list_job_runs(self, job_id: str, limit: int) -> list[JobRunSummary]:
+        """The generations of EXACTLY this job, newest generation first.
+
+        Totally ordered by the generation counter, which is unique per job, so
+        repeated calls agree without a tie-break. Same store-side bound and
+        the same honest treatment of a row that cannot be rebuilt.
+        """
+        bound = self._visibility_rows(limit)
+        if bound == 0:
+            return []
+        with self._connection() as connection:
+            revision_row = connection.execute(
+                "SELECT revision FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            rows = connection.execute(
+                f"SELECT {self._JOB_RUN_COLUMNS} FROM job_runs WHERE job_id = ? "
+                "ORDER BY generation DESC LIMIT ?",
+                (job_id, bound),
+            ).fetchall()
+        owner_revision = None if revision_row is None else revision_row["revision"]
+        return [self._job_run_summary(row, owner_revision) for row in rows]
+
+    @classmethod
+    def _job_run_summary(
+        cls, row: sqlite3.Row, owner_revision: Any
+    ) -> JobRunSummary:
+        run = cls._job_run_from_row(row, owner_revision)
+        identity = row["id"] if isinstance(row["id"], str) else ""
+        owner = row["job_id"] if isinstance(row["job_id"], str) else ""
+        if run is None:
+            return JobRunSummary(id=identity, job_id=owner, readable=False)
+        return JobRunSummary(
+            id=run.id,
+            job_id=run.job_id,
+            job_revision=run.job_revision,
+            generation=run.generation,
+            nominal_due_at_utc=run.nominal_due_at_utc,
+            status=run.status.value,
+            settled=run.settled,
+            snapshot_digest=run.snapshot_digest,
+            session_id=run.session_id,
+            task_id=run.task_id,
+            attempt_id=run.attempt_id,
+            blocking_code=run.blocking_code,
+            condition_result=run.condition_result,
         )
 
     def list_events(self, session_id: str) -> list[dict[str, Any]]:

@@ -9,13 +9,35 @@ import os
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+# Scheduler phase 1A kernels. Both are PURE - stdlib only, no persistence, no
+# clock, no Core import - so depending on them here creates no cycle, and the
+# canonical persisted encodings below are the only place their typed objects
+# meet storage. Nothing in this module recomputes a schedule or evaluates a
+# predicate; it encodes, decodes and refuses.
+from jarvis.conditions import (
+    ConditionError,
+    ConditionKind,
+    ConditionResult,
+    LocalReadCondition,
+)
+from jarvis.schedules import (
+    Daily,
+    Interval,
+    OneTime,
+    Schedule,
+    ScheduleError,
+    ScheduleKind,
+    Weekday,
+    Weekly,
+)
 
 
 def utc_now() -> str:
@@ -6747,6 +6769,784 @@ class ApprovalSummary:
 
 
 
+# --------------------------------------------------------------------------
+# Scheduler phase 1B. DURABLE JOB DEFINITIONS AND GENERATIONS.
+#
+# A JOB is a durable DEFINITION of work someone may want repeated. It is not a
+# ``Task``, it is not an approval, it is not a grant, it is not an execution
+# opportunity and it is not a monetary authorization. Creating one causes
+# NOTHING to happen: no task is materialized, no approval is requested, no
+# connector is selected, no reservation exists. Every gate a future task must
+# pass stays exactly where it is today and is re-proved there, on the trusted
+# path, from rows that were never authored by a job.
+#
+# So a persisted job is UNTRUSTED SPECIFICATION. That is why none of the
+# fields below can carry task authority: there is no spelling here for a
+# stage, a grant, an approval, an execution attempt, a connector selection, a
+# billing reservation, a runtime result, a fingerprint or a progress record,
+# and unknown keys are refused by name rather than filtered, so a tampered row
+# cannot smuggle one in and then look well formed.
+#
+# The two pure kernels already reviewed in phase 1A own everything they own:
+# ``jarvis.schedules`` answers what instant a schedule names, and
+# ``jarvis.conditions`` answers what a typed predicate evaluates to. Nothing
+# here recomputes either. What this block adds is the CANONICAL PERSISTED
+# ENCODING of those typed objects plus the durable definition/generation
+# records that hold them - the storage foundation, and deliberately nothing
+# that wakes up, claims, dispatches or executes.
+# --------------------------------------------------------------------------
+
+#: The durable job definition contract version. It describes the SHAPE of a
+#: persisted specification, never the SQLite schema and never the output
+#: envelope; all three are separate policy surfaces and none may alias
+#: another.
+JOB_DEFINITION_VERSION = 1
+
+#: Hard ceiling on ONE encoded durable job specification. Every field inside
+#: is already individually bounded by the declaration grammar, so this can
+#: only be reached by a future widening - which is exactly when a stated
+#: whole-document ceiling is worth having.
+JOB_SPEC_MAX_BYTES = 64 * 1024
+
+#: Hard ceiling on a job's bounded display label. Its own policy surface,
+#: deliberately not an alias of ``VISIBILITY_TEXT_MAX_CHARS`` (machine
+#: metadata) or ``PROGRESS_TEXT_MAX_CHARS`` (task prose): a job label is
+#: operator-authored prose that must stay free to diverge from both.
+JOB_LABEL_MAX_CHARS = 120
+
+
+class JobError(ValueError):
+    """A malformed durable job definition or run, or a refused job operation.
+
+    Raised at CONSTRUCTION, so an invalid job or generation cannot exist to be
+    scheduled later, and by the storage boundary for an operation it refuses.
+    Deliberately its own family rather than a bare ``ValueError``: a future
+    dispatcher must be able to tell "this durable state is not usable" from
+    every other value error a call might raise.
+    """
+
+
+class JobKind(str, Enum):
+    """The closed set of durable job kinds. There is no other.
+
+    ``ONE_TIME`` fires at one absolute instant. ``RECURRING`` fires on a
+    repeating schedule. ``CONDITION_WATCH`` polls a typed predicate on a
+    repeating schedule and declares what it would do when that predicate is
+    TRUE - declares, because nothing in this phase evaluates a predicate or
+    performs an action.
+    """
+
+    ONE_TIME = "one_time"
+    RECURRING = "recurring"
+    CONDITION_WATCH = "condition_watch"
+
+
+class JobRunStatus(str, Enum):
+    """The closed durable status of ONE job generation.
+
+    The split that matters is SETTLED versus UNSETTLED, and it is a property
+    of the vocabulary rather than of any caller's judgement. An unsettled
+    generation is one whose outcome is still open in ANY sense - not yet
+    claimed, claimed, waiting for an approval a human has not answered,
+    running, or finished with an outcome nobody could establish. A settled
+    generation is one whose story is over.
+
+    ``UNKNOWN_OUTCOME`` is deliberately UNSETTLED, exactly as H2 keeps an
+    unknown execution attempt non-replayable: "we could not find out what
+    happened" is not an ending, and letting the next generation start on top
+    of it would be the scheduler asserting something no evidence supports.
+
+    Only ``PENDING`` is produced in this phase. The rest exist because the
+    settled/unsettled boundary is enforced by a storage CHECK constraint, and
+    a vocabulary that grew later would mean a constraint that had to be
+    rewritten under live data.
+    """
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    AWAITING_APPROVAL = "awaiting_approval"
+    RUNNING = "running"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+
+#: Generation statuses whose outcome is still open. At most ONE generation per
+#: job may be in one of these at a time, and storage - not Python - is what
+#: enforces it.
+UNSETTLED_JOB_RUN_STATUSES = frozenset(
+    {
+        JobRunStatus.PENDING,
+        JobRunStatus.CLAIMED,
+        JobRunStatus.AWAITING_APPROVAL,
+        JobRunStatus.RUNNING,
+        JobRunStatus.UNKNOWN_OUTCOME,
+    }
+)
+
+#: The complement, derived from the enum itself so the two sets can never
+#: drift apart or leave a member unclassified.
+SETTLED_JOB_RUN_STATUSES = frozenset(JobRunStatus) - UNSETTLED_JOB_RUN_STATUSES
+
+
+def job_identifier_refusal(value: Any, label: str = "identifier") -> str | None:
+    """Why this is not a canonical UUID identifier, or ``None``.
+
+    Exact canonical spelling, not merely "parses as a UUID": ``UUID`` accepts
+    braces, urn prefixes, uppercase and stray hyphens, and each of those would
+    be a DIFFERENT string naming the same job. A durable key that has several
+    spellings is a durable key whose uniqueness index can be walked around.
+    """
+    if type(value) is not str:
+        return f"{label} is not a string"
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        return f"{label} is not a UUID"
+    if str(parsed) != value:
+        return f"{label} is not the canonical UUID spelling"
+    return None
+
+
+def _exact_index(value: Any, field_name: str, *, minimum: int) -> int:
+    """One exact persistable integer at or above a floor, or ``JobError``.
+
+    ``type() is int`` and not ``isinstance``, because ``True`` is an ``int``
+    and a boolean must never be read as a revision or a generation.
+    """
+    if type(value) is not int or value < minimum or value > MAX_SQLITE_INTEGER:
+        raise JobError(f"{field_name} is not an exact integer at or above {minimum}")
+    return value
+
+
+def _persisted_instant(value: Any, field_name: str) -> datetime:
+    """One persisted ISO-8601 instant as a datetime, or ``ScheduleError``.
+
+    Nothing is coerced and no timezone is assumed: a naive value is refused by
+    the schedule contracts themselves, so a reload can never quietly read a
+    stored instant as machine-local time.
+    """
+    if type(value) is not str or not value:
+        raise ScheduleError(f"{field_name} is not a string")
+    if len(value) > CANONICAL_TIMESTAMP_MAX_CHARS:
+        raise ScheduleError(f"{field_name} exceeds its character ceiling")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise ScheduleError(f"{field_name} is not an ISO-8601 instant") from None
+
+
+#: The EXACT key set one encoded schedule of each kind carries. Equality, not
+#: containment: a missing key is as refused as an unknown one, so a fragment
+#: can never be completed with a default that nobody wrote.
+_SCHEDULE_KEYS: dict[ScheduleKind, frozenset[str]] = {
+    ScheduleKind.ONE_TIME: frozenset({"kind", "at"}),
+    ScheduleKind.INTERVAL: frozenset({"kind", "anchor", "every_seconds", "end"}),
+    ScheduleKind.DAILY: frozenset({"kind", "timezone", "at", "end"}),
+    ScheduleKind.WEEKLY: frozenset({"kind", "timezone", "at", "days", "end"}),
+}
+
+#: Schedule kinds a repeating job may declare. ``OneTime`` is excluded because
+#: a recurrence that names exactly one instant is not a recurrence.
+_REPEATING_SCHEDULES = (Interval, Daily, Weekly)
+
+
+def schedule_to_dict(schedule: Schedule) -> dict[str, Any]:
+    """THE canonical persisted encoding of one typed schedule.
+
+    Normalized and complete: enough to reconstruct the exact typed object, and
+    nothing else. Calendar kinds carry their EXPLICIT IANA identifier, so a
+    reload resolves the zone the operator named rather than whatever the
+    machine happens to be set to. There is no cron string and no RRULE here -
+    the encoding has no room for one.
+    """
+    if type(schedule) is OneTime:
+        return {"kind": ScheduleKind.ONE_TIME.value, "at": schedule.at.isoformat()}
+    if type(schedule) is Interval:
+        seconds = schedule.every.total_seconds()
+        if seconds != int(seconds):
+            raise ScheduleError("the interval is not a whole number of seconds")
+        return {
+            "kind": ScheduleKind.INTERVAL.value,
+            "anchor": schedule.anchor.isoformat(),
+            "every_seconds": int(seconds),
+            "end": None if schedule.end is None else schedule.end.isoformat(),
+        }
+    if type(schedule) is Daily:
+        return {
+            "kind": ScheduleKind.DAILY.value,
+            "timezone": schedule.timezone,
+            "at": schedule.at.isoformat(timespec="minutes"),
+            "end": None if schedule.end is None else schedule.end.isoformat(),
+        }
+    if type(schedule) is Weekly:
+        return {
+            "kind": ScheduleKind.WEEKLY.value,
+            "timezone": schedule.timezone,
+            "at": schedule.at.isoformat(timespec="minutes"),
+            "days": sorted(int(day) for day in schedule.days),
+            "end": None if schedule.end is None else schedule.end.isoformat(),
+        }
+    raise ScheduleError("unknown schedule kind")
+
+
+def _persisted_clock(value: Any) -> time:
+    if type(value) is not str:
+        raise ScheduleError("the local time is not a string")
+    try:
+        return time.fromisoformat(value)
+    except ValueError:
+        raise ScheduleError("the local time is not a whole HH:MM") from None
+
+
+def _persisted_end(data: dict[str, Any]) -> datetime | None:
+    raw = data["end"]
+    return None if raw is None else _persisted_instant(raw, "end")
+
+
+def _persisted_weekdays(value: Any) -> frozenset[Weekday]:
+    if not isinstance(value, list) or not value:
+        raise ScheduleError("the weekday set is not a non-empty list")
+    days = []
+    for raw in value:
+        if type(raw) is not int:
+            raise ScheduleError("a weekday is not an exact integer")
+        try:
+            days.append(Weekday(raw))
+        except ValueError:
+            raise ScheduleError("a weekday is outside the vocabulary") from None
+    return frozenset(days)
+
+
+def schedule_from_dict(data: Any) -> Schedule:
+    """Rebuild one typed schedule from its persisted encoding, or refuse.
+
+    Fail closed with ``ScheduleError`` on ANY deviation - a wrong root shape,
+    an unknown kind, a missing or unexpected key, a wrong field type, a naive
+    instant, an unresolvable timezone, an interval below the approved floor. A
+    schedule that cannot be rebuilt EXACTLY is not repaired into a plausible
+    one: the job it belongs to fails closed instead, which is the only reading
+    under which a corrupted row can never fire.
+    """
+    if not isinstance(data, dict):
+        raise ScheduleError("the schedule is not an object")
+    raw_kind = data.get("kind")
+    if type(raw_kind) is not str:
+        raise ScheduleError("the schedule kind is not a string")
+    try:
+        kind = ScheduleKind(raw_kind)
+    except ValueError:
+        raise ScheduleError(f"unknown schedule kind {raw_kind!r}") from None
+    if set(data) != _SCHEDULE_KEYS[kind]:
+        raise ScheduleError("the schedule carries a missing or unsupported key")
+    if kind is ScheduleKind.ONE_TIME:
+        return OneTime(at=_persisted_instant(data["at"], "at"))
+    if kind is ScheduleKind.INTERVAL:
+        seconds = data["every_seconds"]
+        if type(seconds) is not int or seconds <= 0:
+            raise ScheduleError("every_seconds is not an exact positive integer")
+        return Interval(
+            anchor=_persisted_instant(data["anchor"], "anchor"),
+            every=timedelta(seconds=seconds),
+            end=_persisted_end(data),
+        )
+    if kind is ScheduleKind.DAILY:
+        return Daily(
+            timezone=data["timezone"],
+            at=_persisted_clock(data["at"]),
+            end=_persisted_end(data),
+        )
+    return Weekly(
+        timezone=data["timezone"],
+        at=_persisted_clock(data["at"]),
+        days=_persisted_weekdays(data["days"]),
+        end=_persisted_end(data),
+    )
+
+
+#: The EXACT key set one encoded condition carries.
+_CONDITION_KEYS = frozenset({"kind", "reference", "expected_sha256"})
+
+
+def condition_to_dict(condition: LocalReadCondition) -> dict[str, Any]:
+    """THE canonical persisted encoding of one typed predicate."""
+    if type(condition) is not LocalReadCondition:
+        raise ConditionError("condition is not an exact LocalReadCondition")
+    return {
+        "kind": condition.kind.value,
+        "reference": condition.reference,
+        "expected_sha256": condition.expected_sha256,
+    }
+
+
+def condition_from_dict(data: Any) -> LocalReadCondition:
+    """Rebuild one typed predicate from its persisted encoding, or refuse.
+
+    The vocabulary stays closed on the way back in: an unknown kind is a
+    ``ConditionError``, never a predicate this build does not understand being
+    carried along until something tries to evaluate it.
+    """
+    if not isinstance(data, dict):
+        raise ConditionError("the condition is not an object")
+    if set(data) != _CONDITION_KEYS:
+        raise ConditionError("the condition carries a missing or unsupported key")
+    raw_kind = data["kind"]
+    if type(raw_kind) is not str:
+        raise ConditionError("the condition kind is not a string")
+    try:
+        kind = ConditionKind(raw_kind)
+    except ValueError:
+        raise ConditionError(f"unknown condition kind {raw_kind!r}") from None
+    return LocalReadCondition(
+        kind=kind,
+        reference=data["reference"],
+        expected_sha256=data["expected_sha256"],
+    )
+
+
+#: The only keys one encoded job specification may carry. Equality again, and
+#: the ABSENCES are the contract: no task id, no session id, no grant, no
+#: approval, no attempt, no connector, no reservation, no result and no
+#: classification. A declaration names intent; policy and authority are
+#: derived later by the trusted core and can never be authored here.
+_JOB_SPEC_KEYS = frozenset(
+    {"project_id", "kind", "label", "schedule", "steps", "condition", "on_true"}
+)
+
+
+def _job_declaration(
+    value: Any, field_name: str, *, required: bool
+) -> tuple[ChainStep, ...]:
+    """One bounded step declaration from persisted state, judged ONCE.
+
+    Reuses the chain declaration grammar verbatim rather than growing a second
+    one: a job's work is described by exactly the same inert, authority-free,
+    per-field-bounded step vocabulary a chain declares, and a second grammar
+    would be a second set of rules to keep in agreement.
+    """
+    if not isinstance(value, list):
+        raise JobError(f"{field_name} is not a list")
+    if not required:
+        if value:
+            raise JobError(f"{field_name} declares a step this job kind does not use")
+        return ()
+    if not value:
+        raise JobError(f"{field_name} names no step")
+    steps, reason = _parsed_chain_declaration(value)
+    if reason is not None:
+        raise JobError(f"{field_name} is malformed: {reason}")
+    return steps
+
+
+@dataclass(frozen=True, slots=True)
+class JobSpec:
+    """The COMPLETE durable definition of one job. Untrusted specification.
+
+    Everything that decides what a job would do lives here and nowhere else,
+    which is what makes a revision a single comparable value and a generation
+    snapshot a single immutable object. ``project_id`` is part of the
+    definition rather than beside it because the operator-established root a
+    job runs under is an execution-relevant field: changing it changes what
+    the work is, so it must move the revision exactly as a schedule change
+    does.
+
+    The three kinds are structurally exclusive, and the exclusivity is the
+    contract:
+
+    * ``ONE_TIME`` / ``RECURRING`` declare ``steps`` and NO predicate;
+    * ``CONDITION_WATCH`` declares a predicate, an ``on_true`` declaration and
+      NO ``steps`` of its own - what it would do is what it would do when the
+      predicate holds, and there is no second unconditional path hiding in the
+      same record.
+
+    ``label`` passes through the ONE canonical diagnostic sanitization
+    pipeline (credential and local-path redaction included), because it is
+    operator prose a listing will print. The step declarations are NOT
+    sanitized: they are intent, bounded by their own grammar, and rewriting
+    them would change what the operator asked for. They also never reach a
+    projection, for exactly that reason.
+    """
+
+    project_id: str
+    kind: JobKind
+    label: str
+    schedule: Schedule
+    steps: tuple[ChainStep, ...] = ()
+    condition: LocalReadCondition | None = None
+    on_true: tuple[ChainStep, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.project_id)
+        if type(self.kind) is not JobKind:
+            raise JobError("kind is not an exact JobKind")
+        object.__setattr__(
+            self, "label", sanitize_diagnostic_text(self.label, JOB_LABEL_MAX_CHARS)
+        )
+        if not self.label or self.label == UNAVAILABLE_DIAGNOSTIC:
+            raise JobError("label is blank")
+        if type(self.steps) is not tuple or type(self.on_true) is not tuple:
+            raise JobError("a step declaration is not a tuple")
+        if self.kind is JobKind.ONE_TIME:
+            if type(self.schedule) is not OneTime:
+                raise JobError("a one-time job requires a one-time schedule")
+        elif type(self.schedule) not in _REPEATING_SCHEDULES:
+            raise JobError("a repeating job requires a repeating schedule")
+        if self.kind is JobKind.CONDITION_WATCH:
+            if type(self.condition) is not LocalReadCondition:
+                raise JobError("a condition watch requires a typed condition")
+            if self.steps:
+                raise JobError("a condition watch declares no unconditional step")
+            declared = self.on_true
+            if not declared:
+                raise JobError("a condition watch declares no on_true step")
+        else:
+            if self.condition is not None:
+                raise JobError("only a condition watch may declare a condition")
+            if self.on_true:
+                raise JobError("only a condition watch may declare an on_true step")
+            declared = self.steps
+            if not declared:
+                raise JobError("a job declares no step")
+        reason = chain_steps_refusal(declared)
+        if reason is not None:
+            raise JobError(f"the job declaration is malformed: {reason}")
+        # The whole-document ceiling, proved on the encoding that will really
+        # be persisted rather than on an estimate of it. A specification that
+        # cannot be encoded at all is refused here, so no job can exist whose
+        # snapshot digest is uncomputable.
+        if len(self.encoded().encode("utf-8")) > JOB_SPEC_MAX_BYTES:
+            raise JobError("the job specification exceeds its byte ceiling")
+
+    @property
+    def timezone(self) -> str:
+        """The EXPLICIT IANA zone this job's calendar semantics need, or ``""``.
+
+        Derived from the schedule, never stored beside it. A second copy could
+        disagree with the one the arithmetic actually uses, and the reading
+        that fires at the wrong hour is always the copy.
+        """
+        return getattr(self.schedule, "timezone", "")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "kind": self.kind.value,
+            "label": self.label,
+            "schedule": schedule_to_dict(self.schedule),
+            "steps": [step.to_dict() for step in self.steps],
+            "condition": (
+                None if self.condition is None else condition_to_dict(self.condition)
+            ),
+            "on_true": [step.to_dict() for step in self.on_true],
+        }
+
+    def encoded(self) -> str:
+        """The exact canonical JSON persistence holds and the digest covers."""
+        return json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+
+    @property
+    def digest(self) -> str:
+        """Deterministic SHA-256 over the canonical definition encoding.
+
+        Covers the WHOLE definition - scope, kind, label, schedule, predicate
+        and declaration - and nothing that moves while the job lives: not the
+        revision, not the next due instant, not the enabled flag, not the run
+        history. Two builds of the same definition therefore agree, and any
+        edit to any execution-relevant field changes it.
+        """
+        return hashlib.sha256(self.encoded().encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "JobSpec":
+        """Rebuild one specification from persisted state, or refuse.
+
+        Default-deny on keys, exact types, no coercion and no partial
+        acceptance. Everything a malformed row could become - a job of a
+        different kind, a job with an unconditional step it never had, a job
+        whose schedule silently lost its timezone - is a ``JobError`` instead.
+        """
+        if not isinstance(data, dict):
+            raise JobError("the job specification is not an object")
+        if set(data) != _JOB_SPEC_KEYS:
+            raise JobError(
+                "the job specification carries a missing or unsupported key"
+            )
+        raw_kind = data["kind"]
+        if type(raw_kind) is not str:
+            raise JobError("the job kind is not a string")
+        try:
+            kind = JobKind(raw_kind)
+        except ValueError:
+            raise JobError(f"unknown job kind {raw_kind!r}") from None
+        watch = kind is JobKind.CONDITION_WATCH
+        raw_condition = data["condition"]
+        if watch == (raw_condition is None):
+            raise JobError("the condition does not match the job kind")
+        return cls(
+            project_id=data["project_id"],
+            kind=kind,
+            label=data["label"],
+            schedule=schedule_from_dict(data["schedule"]),
+            steps=_job_declaration(data["steps"], "steps", required=not watch),
+            condition=(
+                None if raw_condition is None else condition_from_dict(raw_condition)
+            ),
+            on_true=_job_declaration(data["on_true"], "on_true", required=watch),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobRecord:
+    """One durable job definition plus the storage bookkeeping around it.
+
+    The bookkeeping fields are STORAGE-OWNED, never caller-supplied authority:
+    ``revision`` is the compare-and-set token an edit must present,
+    ``next_generation`` is the monotonic counter that makes a settled
+    generation unrevivable (a number is never reused, so re-enabling a job can
+    never resurrect a cancelled occurrence), and ``next_due_at_utc`` is the
+    single instant the pure schedule engine last named - recorded, not
+    recomputed at read time, so two readers agree.
+
+    Two impossible shapes are refused here and again by SQL CHECK constraints,
+    because a corrupted row must fail closed at BOTH boundaries: an archived
+    job that is still enabled, and a job carrying a next due instant while it
+    is disabled or archived. The second is what makes DISABLE mean something
+    durable rather than something every reader has to remember to honour.
+    """
+
+    spec: JobSpec
+    id: str = field(default_factory=lambda: str(uuid4()))
+    definition_version: int = JOB_DEFINITION_VERSION
+    revision: int = 1
+    enabled: bool = True
+    archived_at: str | None = None
+    next_due_at_utc: str | None = None
+    last_run_id: str | None = None
+    next_generation: int = 1
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if type(self.spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        reason = job_identifier_refusal(self.id, "job id")
+        if reason is not None:
+            raise JobError(reason)
+        _exact_index(self.definition_version, "definition_version", minimum=1)
+        _exact_index(self.revision, "revision", minimum=1)
+        _exact_index(self.next_generation, "next_generation", minimum=1)
+        if type(self.enabled) is not bool:
+            raise JobError("enabled is not an exact boolean")
+        for name in ("created_at", "updated_at"):
+            if canonical_utc_timestamp(getattr(self, name)) is None:
+                raise JobError(f"{name} is not a canonical UTC timestamp")
+        for name in ("archived_at", "next_due_at_utc"):
+            value = getattr(self, name)
+            if value is not None and canonical_utc_timestamp(value) is None:
+                raise JobError(f"{name} is not a canonical UTC timestamp")
+        if self.last_run_id is not None:
+            reason = job_identifier_refusal(self.last_run_id, "last_run_id")
+            if reason is not None:
+                raise JobError(reason)
+        if self.archived_at is not None and self.enabled:
+            raise JobError("an archived job cannot be enabled")
+        if self.next_due_at_utc is not None and not (
+            self.enabled and self.archived_at is None
+        ):
+            raise JobError("a job that is not schedulable cannot carry a next due")
+
+    @property
+    def project_id(self) -> str:
+        return self.spec.project_id
+
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+    @property
+    def schedulable(self) -> bool:
+        """Whether future occurrences of this job are ELIGIBLE to be recorded.
+
+        Eligibility, and deliberately not "will run": nothing in this phase
+        wakes up, so a schedulable job with no dispatcher does nothing at all.
+        """
+        return self.enabled and self.archived_at is None
+
+
+@dataclass(frozen=True, slots=True)
+class JobRun:
+    """ONE durable generation of one job. An occurrence, not an execution.
+
+    The specification is SNAPSHOT here, in full, at the revision that produced
+    the generation. That is what makes an edit safe: a later revision never
+    reaches back and rewrites what an earlier generation was for, so a run
+    already open keeps describing the job the operator actually scheduled. The
+    digest is derived from that snapshot rather than stored beside it, so the
+    two can never disagree.
+
+    The dispatch fields - ``owner_token``, ``fencing_epoch``,
+    ``claimed_at`` - exist and are INERT. Phase 1B writes none of them and no
+    code path reads one to decide anything. They are here because they are
+    part of the ROW SHAPE the storage constraints are written against
+    (``fencing_epoch`` is NOT NULL with its own CHECK), so a schema that
+    gained them later would have to be rewritten under live durable data.
+
+    There is deliberately NO lease-expiry field. The schema does not need one
+    - no constraint refers to it, and a nullable timestamp is the cheapest
+    later migration there is - and the repository already ships a guard
+    asserting that no lease/heartbeat/orphan-reclaim machinery exists yet.
+    Adding the column while that is true would be the schema claiming a
+    capability the product does not have.
+
+    There is deliberately NO second execution journal here. When execution
+    exists it will bind to the existing H2 ``execution_attempts`` row through
+    ``attempt_id``; a job run is the occurrence, an attempt is the try.
+    """
+
+    job_id: str
+    job_revision: int
+    generation: int
+    nominal_due_at_utc: str
+    spec: JobSpec
+    id: str = field(default_factory=lambda: str(uuid4()))
+    status: JobRunStatus = JobRunStatus.PENDING
+    session_id: str | None = None
+    task_id: str | None = None
+    chain_id: str | None = None
+    attempt_id: str | None = None
+    owner_token: str | None = None
+    fencing_epoch: int = 0
+    cancel_requested: bool = False
+    blocking_code: str | None = None
+    condition_result: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    claimed_at: str | None = None
+    settled_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.spec) is not JobSpec:
+            raise JobError("spec is not an exact JobSpec")
+        for value, label in ((self.id, "run id"), (self.job_id, "job id")):
+            reason = job_identifier_refusal(value, label)
+            if reason is not None:
+                raise JobError(reason)
+        _exact_index(self.job_revision, "job_revision", minimum=1)
+        _exact_index(self.generation, "generation", minimum=1)
+        _exact_index(self.fencing_epoch, "fencing_epoch", minimum=0)
+        if type(self.status) is not JobRunStatus:
+            raise JobError("status is not an exact JobRunStatus")
+        if type(self.cancel_requested) is not bool:
+            raise JobError("cancel_requested is not an exact boolean")
+        for name in ("nominal_due_at_utc", "created_at"):
+            if canonical_utc_timestamp(getattr(self, name)) is None:
+                raise JobError(f"{name} is not a canonical UTC timestamp")
+        for name in ("claimed_at", "settled_at"):
+            value = getattr(self, name)
+            if value is not None and canonical_utc_timestamp(value) is None:
+                raise JobError(f"{name} is not a canonical UTC timestamp")
+        if self.blocking_code is not None:
+            try:
+                ErrorCode(self.blocking_code)
+            except ValueError:
+                raise JobError("blocking_code is not an exact ErrorCode") from None
+        if self.condition_result is not None:
+            try:
+                ConditionResult(self.condition_result)
+            except ValueError:
+                raise JobError(
+                    "condition_result is not an exact ConditionResult"
+                ) from None
+        # The load-bearing shape rule, stated identically here and in SQL: a
+        # settled generation has a settlement instant and a settled status,
+        # and an unsettled one has neither. Anything else is a row one reader
+        # would count as open and another as closed.
+        if (self.settled_at is not None) != (self.status in SETTLED_JOB_RUN_STATUSES):
+            raise JobError("the settled status and settlement instant disagree")
+        for value, label in (
+            (self.session_id, "session_id"),
+            (self.task_id, "task_id"),
+            (self.chain_id, "chain_id"),
+            (self.attempt_id, "attempt_id"),
+            (self.owner_token, "owner_token"),
+        ):
+            if value is not None and chain_id_refusal(value) is not None:
+                raise JobError(f"{label} is not a usable identifier")
+
+    @property
+    def snapshot_digest(self) -> str:
+        """The digest of exactly the snapshot this generation carries."""
+        return self.spec.digest
+
+    @property
+    def settled(self) -> bool:
+        return self.status in SETTLED_JOB_RUN_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class JobSummary:
+    """One job, as an operator needs to see it. Never its content.
+
+    Same law as every other visibility projection: operational metadata only.
+    The step declarations - the objectives, the targets, the destinations -
+    are deliberately absent, because they are the user's own words and local
+    filesystem locators, and a listing must not become a second read path into
+    either. What crosses is the bounded sanitized label, which already went
+    through the canonical credential/path redaction pipeline at construction.
+
+    ``readable`` false is a durable row that could not be rebuilt. It is
+    REPORTED, never skipped: a corrupted job must never quietly become
+    runnable, and it must equally never quietly disappear from the one place
+    an operator would look for it.
+    """
+
+    id: str
+    updated_at: str
+    readable: bool = True
+    kind: str | None = None
+    label: str | None = None
+    project_id: str | None = None
+    enabled: bool | None = None
+    archived: bool | None = None
+    revision: int | None = None
+    timezone: str | None = None
+    next_due_at_utc: str | None = None
+    last_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JobRunSummary:
+    """One generation's durable position. Never its snapshot.
+
+    The specification snapshot is absent for the same reason the job's
+    declaration is: it is intent and locators, not lifecycle. The digest is
+    present because it identifies WHICH definition the generation was for
+    without disclosing any of it, exactly as the deliverable projection
+    reports a digest instead of an answer.
+    """
+
+    id: str
+    job_id: str
+    readable: bool = True
+    job_revision: int | None = None
+    generation: int | None = None
+    nominal_due_at_utc: str | None = None
+    status: str | None = None
+    settled: bool | None = None
+    snapshot_digest: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
+    attempt_id: str | None = None
+    blocking_code: str | None = None
+    condition_result: str | None = None
+
+
 class MemoryStore(Protocol):
     """Provider-independent persistence surface required by ``AgentCore``."""
 
@@ -6912,6 +7712,160 @@ class MemoryStore(Protocol):
         non-authoritative data. ``query_text`` is the current retrieval query
         text, used only to recompute deterministic relevance metadata.
         """
+        ...
+
+    # -- Scheduler phase 1B: durable job definitions and generations -------
+    #
+    # Declared HERE, on the provider-independent surface, for the same reason
+    # every other durable authority is: a future scheduler must depend on this
+    # contract and never on one storage implementation, and a conforming store
+    # must enforce the invariants ITSELF rather than trusting whoever calls it.
+    #
+    # NONE of these is an execution surface. A conforming store must not, from
+    # any of them, materialize a task, create an approval, consume a grant,
+    # open an execution attempt, create a reservation, reach a connector,
+    # evaluate a condition, perform an on_true action or start a worker.
+    # Creating a job is a record of intent; recording a generation is a record
+    # of an occurrence. Neither is permission for anything.
+    #
+    # Every mutating operation takes an EXPLICIT instant or an explicit
+    # revision, never a clock reading or a caller-held object, so the same
+    # inputs always produce the same durable result.
+
+    def create_job(self, spec: "JobSpec", *, now: datetime) -> "JobRecord":
+        """Persist ONE durable job definition atomically.
+
+        The identity is STORAGE-MINTED (a canonical UUID), the revision starts
+        at 1, and the first ``next_due_at_utc`` is calculated from ``now``
+        through the pure schedule engine - never from the machine clock and
+        never by arithmetic the store writes itself. A schedule that names
+        nothing after ``now`` yields no next due and the job is simply never
+        eligible.
+
+        Refuses with ``JobError`` for a specification that is not an exact
+        ``JobSpec``, a naive ``now``, or a scope that is not an existing
+        ACTIVE project.
+        """
+        ...
+
+    def load_job(self, job_id: str) -> "JobRecord | None":
+        """One job, or ``None`` when it is missing OR unusable.
+
+        A conforming store FAILS CLOSED: a row whose kind, schedule,
+        timezone, revision, generation counter, digest, scope or
+        enabled/archived combination cannot be re-proved loads as ``None``. It
+        is never repaired into a runnable default and never partially
+        accepted, because a corrupted definition that loads is a corrupted
+        definition that could fire.
+        """
+        ...
+
+    def edit_job(
+        self, job_id: str, expected_revision: int, spec: "JobSpec", *, now: datetime
+    ) -> "JobRecord":
+        """Replace a job's definition under compare-and-set; revision advances.
+
+        Every execution-relevant field is inside the specification, so any
+        change to any of them - schedule, declaration, condition, on_true,
+        label, execution scope - produces a NEW revision. A caller presenting a
+        stale revision is refused deterministically with ``JobError`` having
+        written nothing.
+
+        Snapshots of generations already recorded are IMMUTABLE. A conforming
+        store must not rewrite one to resemble the new definition: what an
+        occurrence was for is a fact about the past.
+        """
+        ...
+
+    def set_job_enabled(
+        self, job_id: str, expected_revision: int, enabled: bool, *, now: datetime
+    ) -> "JobRecord":
+        """Turn future scheduling eligibility on or off. State, not definition.
+
+        DISABLE must be DURABLE, not advisory: the stored next-due instant is
+        cleared, so a disabled job carries no eligible occurrence for any
+        reader to find. It says nothing about work already in flight - storage
+        has cancelled nothing and must not claim it has.
+
+        ENABLE is an explicit transition that RECALCULATES the next occurrence
+        from ``now`` forward. Occurrences named while the job was off are not
+        recovered, and no already-settled generation is ever revived.
+        """
+        ...
+
+    def archive_job(self, job_id: str, expected_revision: int) -> "JobRecord":
+        """Retire a job from future scheduling, preserving all of its history.
+
+        Archiving disables future eligibility and NOTHING else: no generation
+        is deleted, no snapshot is rewritten and no evidence is removed. There
+        is no un-archive and no delete.
+        """
+        ...
+
+    def record_job_run(self, job_id: str, nominal_due_at_utc: str) -> "JobRun":
+        """Record ONE durable generation. Recording is not claiming.
+
+        A conforming store creates the occurrence and nothing else: no
+        ownership, no lease, no task, no approval, no attempt, no connector.
+        The generation is born unsettled.
+
+        It must prove, in ONE transaction: the job is usable and schedulable;
+        the instant is one the SCHEDULE NAMES (asked of the pure kernel, never
+        trusted from the caller); no unsettled generation of that job is
+        already open; and this exact ``(job, revision, nominal instant)``
+        occurrence has not been recorded before. The last two must be enforced
+        by the storage layer itself, not only in application code, so a writer
+        that bypasses this method still cannot create a second live generation.
+        """
+        ...
+
+    def settle_job_run(
+        self,
+        run_id: str,
+        status: "JobRunStatus",
+        *,
+        blocking_code: str | None = None,
+        condition_result: str | None = None,
+    ) -> "JobRun":
+        """Close ONE open generation with a settled outcome.
+
+        Guarded on the generation still being open, so exactly one settler
+        wins. A settled generation is never reopened, and only a settled
+        status may be given - which is what makes "at most one unsettled
+        generation per job" a bound rather than a convention.
+        """
+        ...
+
+    def load_job_run(self, run_id: str) -> "JobRun | None":
+        """One generation, or ``None`` when it is missing OR unusable.
+
+        Fail-closed on the same terms as ``load_job``, including the one
+        relationship a row cannot check about itself: a generation claiming a
+        revision its job has never reached is inconsistent durable state and
+        loads as ``None``. An OLDER revision is ordinary history and is kept.
+        """
+        ...
+
+    def list_jobs(
+        self, limit: int, *, include_archived: bool = False
+    ) -> list["JobSummary"]:
+        """The job catalogue as BOUNDED provider-neutral metadata.
+
+        Same law as every other visibility listing: the bound is the STORE'S,
+        applied to its own query and capped at ``VISIBILITY_MAX_LIMIT``
+        whoever is calling; the order is total and stable; and a row that
+        cannot be rebuilt is REPORTED with ``readable`` false rather than
+        skipped. Objectives, targets, destinations and predicates never cross
+        - only the bounded sanitized label does.
+        """
+        ...
+
+    def job_summary(self, job_id: str) -> "JobSummary | None":
+        """ONE job as the same validated projection a listing returns."""
+        ...
+
+    def list_job_runs(self, job_id: str, limit: int) -> list["JobRunSummary"]:
+        """The generations of EXACTLY this job, under the same bound and law."""
         ...
 
     def save_project(self, project: ProjectRecord) -> None: ...
