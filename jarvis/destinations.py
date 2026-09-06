@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import AbstractSet, Any, Mapping
 
-from jarvis.contracts import normalize_destination
+from jarvis.contracts import REPOSITORY_DESTINATION_PREFIX, normalize_destination
+from jarvis.github import github_raw_destination_refusal
 
 
 class DestinationKind(str, Enum):
@@ -48,6 +49,13 @@ class DestinationKind(str, Enum):
     NONE = "none"
     #: A named external model/provider endpoint one connector reaches.
     PROVIDER_ENDPOINT = "provider_endpoint"
+    #: One remote source-code repository, spelled ``github/<owner>/<repo>``.
+    #: Unlike the two above it is not enumerable - there are millions of
+    #: repositories - so its VALIDITY comes from a closed grammar rather than
+    #: from a registry row. That changes nothing about AUTHORIZATION: a
+    #: perfectly well-formed repository is still refused unless an exact
+    #: ``DestinationGrant`` names it, and this build ships none.
+    REPOSITORY = "repository"
 
 
 #: The canonical destination the Claude Code connector is registered for, and
@@ -59,10 +67,16 @@ CLAUDE_CODE_DESTINATION = "anthropic/claude-code"
 #: second registered destination needs no change at any boundary.
 DEFAULT_TASK_DESTINATION = CLAUDE_CODE_DESTINATION
 
-#: THE closed registry. Adding Gmail, GitHub or a browser destination means
-#: adding a row HERE, in Core. No connector return value, no task input, no
-#: chain declaration and no model answer can add one, and there is no
-#: wildcard row: an unregistered destination is refused, always.
+#: THE closed registry of ENUMERABLE destinations. Adding Gmail or a browser
+#: destination means adding a row HERE, in Core. No connector return value, no
+#: task input, no chain declaration and no model answer can add one, and there
+#: is no wildcard row: an unregistered destination is refused, always.
+#:
+#: One family is deliberately NOT a row: a GitHub repository, of which there
+#: are millions. Its validity comes from the closed grammar in
+#: ``jarvis.github`` instead (see ``destination_refusal``). That is a
+#: statement about SPELLING, not about permission - the tuple policy below is
+#: still the only thing that authorizes anything, and it holds no GitHub row.
 DESTINATION_REGISTRY: Mapping[str, DestinationKind] = {
     #: A task with no outbound endpoint. Not "anything goes" - it is the
     #: explicit statement that nothing leaves, and it can never satisfy an
@@ -153,7 +167,9 @@ def canonical_destination(requested: Any) -> str | None:
     ``None`` for anything that is not a string. Deterministic and offline:
     exactly the normalizer ``ActionScope.normalized`` already applies, so the
     value Core decides with is the value persistence, the fingerprint and the
-    attestation all hold.
+    attestation all hold - including its refusal to REPAIR a noncanonical
+    repository spelling, which is enforced there, centrally, for every path
+    into Core rather than only for the ones that come through here.
     """
     if type(requested) is not str:
         return None
@@ -178,6 +194,19 @@ def destination_refusal(canonical: Any, *, egress: bool = False) -> str | None:
     if normalize_destination(canonical) != canonical:
         return "the destination is not in canonical form"
     kind = DESTINATION_REGISTRY.get(canonical)
+    if kind is None and canonical.startswith(REPOSITORY_DESTINATION_PREFIX):
+        # It asked for the repository namespace, so the closed GitHub grammar
+        # answers - and it answers on the spelling as written. ``normalize_
+        # destination`` deliberately hands a noncanonical repository spelling
+        # through UNREPAIRED, so this is where a laundering attempt lands and
+        # it is named as one rather than reported as "unregistered".
+        reason = github_raw_destination_refusal(canonical)
+        if reason is not None:
+            return f"the destination is not a canonical GitHub repository: {reason}"
+        # VALIDITY, and only validity. The grammar says this string names a
+        # repository Core can talk about; the tuple policy still has to say
+        # whether anyone may reach it, and for GitHub it says no.
+        kind = DestinationKind.REPOSITORY
     if kind is None:
         return "the destination is not registered with Core"
     if egress and kind is DestinationKind.NONE:

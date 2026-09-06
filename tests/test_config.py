@@ -1512,6 +1512,17 @@ RAW_TOKEN_FAMILIES = {
 #: repeat itself. Every family is still swept on the Settings path.
 ONE_PER_PROVIDER = ("github_pat", "glpat", "xoxb", "ya29")
 
+#: Families the CANONICAL ``credential_bearing`` policy recognizes on its
+#: own, so the anchored supplement is no longer what refuses them. GitHub
+#: moved here when its token shapes were added to the shared scanner, which
+#: is a widening of the shared defence and not a weakening of this one: the
+#: refusal below is still asserted for every family either way. The split is
+#: explicit so that a family silently CHANGING side - in either direction -
+#: is a failure rather than a shrug.
+SHARED_POLICY_FAMILIES = frozenset(
+    {"github_pat", "ghp", "gho", "ghu", "ghs", "ghr"}
+)
+
 #: Ordinary approval identifiers that merely CONTAIN a harmless word, or sit
 #: near a token family without being one. Refusing any of these would be a
 #: false positive on inert metadata.
@@ -1558,10 +1569,11 @@ class RawTokenRefusalTests(ConfigTestCase):
     def test_no_raw_token_family_survives_settings_construction(self) -> None:
         for family, value in RAW_TOKEN_FAMILIES.items():
             with self.subTest(family=family):
-                self.assertFalse(
+                self.assertEqual(
+                    family in SHARED_POLICY_FAMILIES,
                     credential_bearing(value),
-                    "the shared policy now covers this; the supplement may be "
-                    "narrowed deliberately, but not by accident",
+                    "a family changed which defence refuses it; that may be "
+                    "done deliberately, but not by accident",
                 )
                 with self.assertRaises(ValueError):
                     Settings(

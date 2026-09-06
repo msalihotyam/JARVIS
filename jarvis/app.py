@@ -108,6 +108,7 @@ from jarvis.destinations import (
     canonical_destination,
     destination_refusal,
 )
+from jarvis.github import GitHubIdentityBinding
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
@@ -721,6 +722,11 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(
         r"\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b"
     ),
+    # GitHub token families, kept byte-for-byte in step with the
+    # contracts policy so the presentation defence is never the weaker
+    # of the two.
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
 )
 
 
@@ -2307,6 +2313,7 @@ def create_app(
     connectors: Iterable[BaseConnector] = (),
     verifier: ResultVerifier | None = None,
     destination_policy: AbstractSet[DestinationGrant] | None = None,
+    github_identity: GitHubIdentityBinding | None = None,
 ) -> JarvisApp:
     """Assemble an application from injected parts. Tests use this.
 
@@ -2314,6 +2321,12 @@ def create_app(
     destination) authorization table this build runs under. It belongs to
     whoever composes the build; ``None`` means the shipped Core policy, which
     is what production uses.
+
+    ``github_identity`` is the expected GitHub identity Core will hold - the
+    other half of the same trusted composition boundary, and the ONLY way one
+    can be established. ``None`` means the shipped default, which owns no
+    identity at all and therefore refuses every repository destination rather
+    than believing a connector's account of itself.
     """
     settings = settings or Settings()
     memory = memory if memory is not None else SQLiteMemoryStore(settings.memory_database)
@@ -2327,6 +2340,7 @@ def create_app(
             settings,
             verifier,
             destination_policy=destination_policy,
+            github_identity=github_identity,
         ),
         memory,
         settings,

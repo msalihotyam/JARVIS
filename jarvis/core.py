@@ -103,7 +103,6 @@ from jarvis.contracts import (
     merge_side_effects,
     model_answer_refusal,
     nano_usd,
-    normalize_destination,
     require_billing_class,
     result_to_dict,
     require_monetary_state,
@@ -118,7 +117,15 @@ from jarvis.contracts import (
 from jarvis.destinations import (
     CONNECTOR_DESTINATION_POLICY,
     DestinationGrant,
+    canonical_destination,
     connector_destination_refusal,
+)
+from jarvis.github import (
+    GITHUB_IDENTITY_BINDING,
+    GitHubIdentityBinding,
+    github_identity_binding_refusal,
+    github_identity_refusal,
+    is_github_destination,
 )
 from jarvis.lifecycle import is_terminal, terminal_run_status
 from jarvis.planning import build_task_plan
@@ -561,6 +568,7 @@ class AgentCore:
         verifier: ResultVerifier | None = None,
         *,
         destination_policy: AbstractSet[DestinationGrant] | None = None,
+        github_identity: GitHubIdentityBinding | None = None,
     ) -> None:
         self.registry = registry
         self.memory = memory
@@ -577,6 +585,28 @@ class AgentCore:
             if destination_policy is None
             else destination_policy
         )
+        # THE expected GitHub identity, and Core's own. Composition state on
+        # exactly the same footing as ``destination_policy``: fixed here,
+        # validated here, and never reachable by a connector, a manifest, a
+        # ``can_handle``, a task, a model answer or anything a request
+        # carries. A connector may later report which account a local CLI
+        # session belongs to; Core compares that report against THIS and
+        # never against something the reporter also chose.
+        #
+        # The shipped default is ``None`` - this build establishes no account,
+        # and inventing a plausible login here would be Core asserting an
+        # identity nobody established. ``None`` is a REFUSAL, not a waiver:
+        # see ``_github_identity_refusal``.
+        if github_identity is None:
+            github_identity = GITHUB_IDENTITY_BINDING
+        if github_identity is not None:
+            reason = github_identity_binding_refusal(github_identity)
+            if reason is not None:
+                raise ValueError(
+                    f"AgentCore was composed with an unusable GitHub "
+                    f"identity binding: {reason}."
+                )
+        self.github_identity: GitHubIdentityBinding | None = github_identity
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)
@@ -2486,6 +2516,63 @@ class AgentCore:
         )
         if reason is not None:
             refuse(reason)
+        # Deliberately AFTER the tuple: the exact grant is necessary and it is
+        # not sufficient. A build authorized for this repository still has to
+        # be acting as the account Core expects.
+        reason = self._github_identity_refusal(connector, scope)
+        if reason is not None:
+            refuse(reason)
+
+    def _github_identity_refusal(
+        self, connector: BaseConnector, scope: ActionScope
+    ) -> str | None:
+        """Why the connector is not acting as the identity CORE expects.
+
+        Asked only of a repository destination, and asked of Core's own
+        composition state. The asymmetry is the whole point:
+
+        expected  ``self.github_identity`` - established at construction by
+                  the build, validated there, and unreachable from anything a
+                  connector, a manifest, a ``can_handle``, a task, a model
+                  answer or a request can influence.
+        observed  whatever the connector reports about the local CLI session
+                  it is about to use. It is an INPUT to a comparison. A
+                  connector that reports the wrong account, or the right
+                  account reached by a route Core does not recognize, is
+                  refused - and it has no way to change what it is compared
+                  against, so it cannot select the identity it is proving.
+
+        ``None`` expected is a REFUSAL, not a waiver. A build that has
+        established no GitHub identity must not fall back to believing
+        whatever the connector says about itself; that fallback would be the
+        self-attestation this exists to prevent. So this build - which ships
+        no binding - cannot reach a repository at all, even with an exact
+        destination grant.
+
+        Nothing here reads a credential. The route is a NON-SECRET NAME, and
+        the raw token never enters JARVIS.
+        """
+        if not is_github_destination(scope.destination):
+            return None
+        if self.github_identity is None:
+            return (
+                "this build owns no expected GitHub identity, so no "
+                "connector-reported identity can be accepted"
+            )
+        observe = getattr(connector, "observed_github_identity", None)
+        if not callable(observe):
+            return "the connector reports no observable GitHub identity"
+        try:
+            observed = observe()
+        except Exception:  # noqa: BLE001 - an unreportable identity is a refusal
+            return "the connector could not report an observable GitHub identity"
+        if type(observed) is not tuple or len(observed) != 2:
+            return "the connector's reported GitHub identity is not a (principal, route) pair"
+        return github_identity_refusal(
+            self.github_identity,
+            observed_principal=observed[0],
+            observed_credential_route=observed[1],
+        )
 
     def _authoritative_request(
         self,
@@ -2594,7 +2681,10 @@ class AgentCore:
         # -- preview: describes the same egress the request authorizes -------
         preview = request.outbound_preview
         if preview is not None:
-            if normalize_destination(preview.destination) != request.scope.destination:
+            # Core's canonicalizer, not the raw normalizer: a connector
+            # preview must not be able to reach the approved destination
+            # through a spelling normalization repairs into it.
+            if canonical_destination(preview.destination) != request.scope.destination:
                 refuse("preview destination")
             if preview.data_classification is not task.scope.data_classification:
                 refuse("preview data classification")

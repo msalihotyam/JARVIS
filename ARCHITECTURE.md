@@ -2596,7 +2596,7 @@ Aşağıdaki entegrasyonların kullanılması planlanmaktadır; ancak hiçbiri �
 Aşağıdakiler konuşmada değerlendirildi fakat çekirdeğin zorunlu bağımlılıkları olarak kesinleştirilmedi:
 
 - Electron + React + TypeScript masaüstü teknoloji yığını.
-- Playwright, GitHub MCP, Figma, Supabase, Sentry ve benzeri diğer connector'ların kesin kapsamı.
+- Playwright, Figma, Supabase, Sentry ve benzeri diğer connector'ların kesin kapsamı. (GitHub artık burada değildir: kapsamı §4.21'de kapalı olarak kesinleşmiştir.)
 - `agent-memory`, Context Mode, Headroom ve benzeri üçüncü taraf hafıza/bağlam projeleri.
 - Codex'in ikinci geliştirici veya kod inceleyici olarak eklenmesi.
 - Otomatik model yönlendirme, derin görev modeli ve yerel modeller.
@@ -2653,6 +2653,194 @@ baytlarını değiştirmez.
 kimlik bilgisi biçimli değerleri reddeder. Çıktı sınırlı ve redakte
 edilmiştir: onay kimliği yalnızca *var/yok* olarak, veritabanı yolu ev
 dizinine göreli ya da `[PATH]` olarak raporlanır.
+
+### 4.21 GitHub v1 çevrimdışı güvenlik/politika temeli (Faz 1, uygulandı)
+
+**ŞU AN UYGULANAN:** yalnızca çevrimdışı güvenlik/politika temeli — kanonik
+hedef dilbilgisi, kapalı yetenek ve kaynak sözlükleri, H1 istek çerçevesi,
+kimlik bilgisi/ortam kaldırma politikası ve kapalı işlem argüman sözlüğünün
+**saf veri** hâli.
+
+**HENÜZ UYGULANMAYAN:** canlı GitHub okuması ve canlı GitHub yazması. Bu
+yapıda `github-cli` connector'ı **yoktur**; `jarvis/github.py` hiçbir soket
+açmaz, hiçbir alan adı çözmez, hiçbir kimlik bilgisi deposuna bakmaz, hiçbir
+kimlik doğrulama oturumu incelemez ve hiçbir süreç başlatmaz — ve hiçbir şeyi
+**çalıştıran bir fonksiyon içermez**: süreç dikişi kapatılmış hâlde teslim
+edilmemiş, Faz 2'ye ertelenmiştir. JARVIS Faz 2'ye kadar GitHub'a
+**bağlanamaz**; buna güvenilir bir bağlantı denemez.
+
+**Kapalı yetenek sözlüğü.** Tam olarak dokuz tanımlayıcı vardır — altı okuma
+(`github_repository_read`, `github_file_read`, `github_issue_list`,
+`github_issue_read`, `github_pull_request_list`, `github_pull_request_read`)
+ve Faz 3'e ait üç yazma (`github_issue_create`,
+`github_issue_comment_create`, `github_pull_request_comment_create`).
+`github_read`, `github_api`, `rest`, `graphql`, `command` ya da joker
+benzeri bir yetenek yoktur; tanınmayan bir GitHub yeteneği kapalı düşer.
+`GITHUB_ENABLED_CAPABILITIES` boştur: bir adın sözlükte olması onu
+çalıştırılabilir yapmaz.
+
+**Kanonik hedef.** Tek yazım `github/<owner>/<repository>`, yalnızca
+github.com. Ayrıştırıcı saf, sözlüksel ve çevrimdışıdır: URL, şema/host,
+API/GraphQL yolu, sorgu, parça, `.git` soneki, kullanıcı bilgisi, yüzde
+kodlaması, ters bölü, kabuk sözdizimi, boşluk, kontrol karakteri, ASCII dışı
+girdi, boş segment ve traversal biçimleri reddedilir. Kimlik küçük harfe
+sabitlenir. `Path.resolve`/`os.path` normalizasyonu **kullanılmaz**: bir adı
+kanonikleştirmek, adlandırdığı şeyin incelenmesi olamaz.
+
+**Depo hedefi asla ONARILMAZ — ve bu kural merkezdedir.** Çekirdeğin genel
+`normalize_destination` fonksiyonu kırpar, küçük harfe indirir ve Unicode
+case folding uygular; üçü de kayıplıdır. `" github/acme/widgets "`,
+`github/acme/widGets` ve Kelvin işareti `U+212A` içeren bir yazım,
+normalizasyondan sonra kusursuz kanonik bir depo kimliği gibi görünür —
+hâlbuki istek bunların hiçbirini adlandırmamıştır; bir `DestinationGrant`
+kanonik depoyu adlandırıyorsa onarılmış yazım o yetkiye oturur.
+
+Düzeltme bu yüzden **merkezî sınırdadır**: `normalize_destination`'ın
+kendisinde. Çekirdeğin karar verdiği her hedef oradan geçer — programatik
+bir `Task` için `ActionScope.normalized`, görev çözücüsü, zincir adımı
+bildirimleri, `outbound_preview` — dolayısıyla oradaki bir düzeltme tüm
+ürünü kapsar; yalnızca JSON çözücüsünü ya da preview'i düzeltmek yetmez.
+Kural: normalizasyon `github/...` biçiminde, **yazılandan farklı** bir dize
+ÜRETECEKSE, ham metin olduğu gibi geri döner. Böylece hâlâ çekirdeğin
+tanımadığı bir şeyi adlandırır ve `destination_refusal` onu kapalı GitHub
+dilbilgisiyle (`github_raw_destination_refusal`) reddeder; fakat artık hiç
+sahip olmadığı bir kimliği giyerek gelemez. Fonksiyon idempotent kalır:
+onarılmayan bir değer ikinci çağrıda da onarılmaz, yani çekirdeğin kontrol
+ettiği dize kalıcılığın, parmak izinin ve attestation'ın tuttuğu dizedir.
+
+Bu kural yalnızca depo ad alanına uygulanır; URL'ler, sağlayıcı uç noktaları
+ve boş hedef eskisi gibi normalleşir.
+
+**Kaynak hedefi.** Kapalı ve tipli: `repository`, `file` (ref + harf
+durumu korunan tam yol), `issue-list`/`pull-request-list` (kapalı filtre +
+deterministik sınır), `issue`/`pull-request` (pozitif kanonik numara) ve üç
+yazma hedefi. Serbest URL, API/GraphQL uç noktası, kabuk parçası, `gh` argv
+veya keyfi sorgu nesnesinin burada yazımı yoktur. **Değişmez:** kaynağın
+owner/repository'si görevin kanonik hedefine tam olarak eşit olmalıdır; A
+deposu B deposu için onaylanmış bir görevin içine binemez ve issue yeteneği
+bir PR hedefi taşıyamaz.
+
+**Yetki çekirdeğindir.** Yetkilendiren tek şey, Core'a ait tam
+`DestinationGrant(connector, capability, destination)` satırıdır.
+`DestinationKind.REPOSITORY` yalnızca *geçerlilik* ifade eder — depo sayısı
+sayılamaz olduğu için geçerlilik kayıt satırından değil kapalı dilbilgisinden
+gelir — ve geçerlilik hiçbir zaman yetkilendirme değildir. **Bu yapıda
+varsayılan GitHub yetkisi boştur.** Joker GitHub satırı yoktur, örnek
+owner/repository satırı yoktur; manifest, `can_handle`, tercih edilen
+connector ve istenen hedef hiçbirini genişletemez. Mevcut dört Claude/yerel
+dosya satırı bit bit aynıdır. Bileşim dikişi zaten vardı
+(`AgentCore(destination_policy=...)`), bu yüzden yeni kalıcı yapılandırma
+alanı eklenmemiştir: SQLite şeması, config şeması ve çıktı şeması
+değişmemiştir.
+
+**Principal ve kimlik bilgisi rotası çekirdeğindir.** İki gizli olmayan
+tanımlayıcı: beklenen GitHub login'i ve kanonik rota
+`github_cli_os_credential_store` — yani GitHub CLI'nin OS kimlik bilgisi
+deposuyla desteklenen mevcut oturumu. JARVIS ham token'ı **hiçbir zaman**
+istemez, almaz, saklamaz ve göstermez.
+
+**Beklentiyi `AgentCore`'un kendisi tutar.** `GitHubIdentityBinding`
+yalnızca bir yardımcıya verilen tipli veri değildir; `AgentCore`, tıpkı
+`destination_policy` gibi, kendi **kompozisyon durumu** olarak bir
+`github_identity` alır, onu inşa anında doğrular (`ValueError` ile kapalı
+düşer) ve `self.github_identity` içinde tutar. Tek kuruluş yolu güvenilir
+kompozisyon sınırıdır: `AgentCore(...)` ve `create_app(...)`.
+
+Connector çıktısı, manifest, `can_handle`, model/görev metni, tercihler,
+hafıza, GitHub içeriği ve süreç ortamı bu değere **erişemez ve onu
+değiştiremez**. Connector yalnızca yerel CLI oturumunun hangi hesaba ait
+olduğunu **bildirebilir** (`observed_github_identity()` → `(principal,
+route)`); bu bir karşılaştırma girdisidir, bir seçim değil. Çekirdek
+`_github_identity_refusal` içinde kendi beklentisiyle karşılaştırır ve
+uyuşmazlık — yanlış hesap, ya da OS kimlik deposu yerine ortam
+değişkenindeki bir token — onaydan ve yürütmeden **önce** kapalı düşer.
+Kontrol kasıtlı olarak tam demet kontrolünden **sonra** yapılır: tam
+`DestinationGrant` gereklidir ve yeterli değildir.
+
+`None` bir muafiyet değil, bir **REDDETME**'dir. Hiçbir kimlik
+kurulmamış bir yapı, connector'ın kendisi hakkında söylediğine geri
+düşmez — bu geri düşüş, önlenmek istenen self-attestation'ın ta kendisi
+olurdu. Bu yapıda `GITHUB_IDENTITY_BINDING` **boştur** (`None`), dolayısıyla
+tam bir depo yetkisi verilmiş olsa bile hiçbir depoya ulaşılamaz. Burada
+makul bir login uydurmak, kimseyi bağlamayan bir kimliği çekirdeğin iddia
+etmesi olurdu. Ham token hiçbir aşamada JARVIS'e girmez; rota gizli olmayan
+bir **isimdir**.
+
+**H1 istek çerçevesi.** `jarvis.github_request.v1` başlıklı kanonik çerçeve
+connector, yetenek, kanonik hedef, owner, repository, kaynak türü,
+issue/PR numarası, ref, tam dosya yolu, normalleştirilmiş liste
+filtresi/sınırı, beklenen principal, kimlik bilgisi rotası, operasyon ve
+istek gövdesi özetini bağlar. Yeni bir mekanizma değildir: çerçevenin
+baytları bir connector'ın `canonical_outbound` değeri olur, özeti
+`EgressAttestation.outbound_digest` ve dolayısıyla
+`PermissionRequest.fingerprint` içine akar. Depo, kaynak türü, numara, ref,
+yolun tek bir harfi, principal, rota veya gövdenin tek bir baytı değişirse
+onay artık yapılacak iş için geçerli değildir. Issue oluşturma tam
+başlık/gövde baytlarını, yorum oluşturma tam yorum baytlarını bağlar.
+
+**Ortam ve kimlik bilgisi hijyeni.** Gelecekteki `gh` çocuğunun ortamından
+`GH_`, `GITHUB_` ve `GIT_` aileleri bütün olarak çıkarılır (`GH_TOKEN`,
+`GITHUB_TOKEN`, kurumsal token'lar, `GH_HOST`, `GH_REPO`, `GH_CONFIG_DIR`
+dahil), ayrıca `XDG_CONFIG_HOME`, editör/tarayıcı/pager devri ve proxy
+değişkenleri de kaldırılır — bir proxy, adı farklı olan bir hedef
+yönlendirmesidir. Bu kaldırma politikası **hiçbir invocation'a bağlı
+değildir**: Faz 1, gerçek bir ortamın bir çocuğa verilmeye uygun olduğuna
+karar vermez. Kanonik kimlik bilgisi tarayıcısı GitHub biçimlerini
+(`github_pat_*`, `ghp_*`, `gho_*`, `ghu_*`, `ghs_*`, `ghr_*`) tanır; ayrı
+bir GitHub redaksiyon sistemi yoktur, mevcut olan genişletilmiştir.
+
+**Yürütme dikişi Faz 1'de YOKTUR.** `run_gh` kaldırılmıştır; `GhOutcome`,
+`GhStatus` ve genel bir argv/ortam/stdin çalıştırma temeli de yoktur.
+Gerçek süreç dikişi, ancak Core yetkilendirmesi, kimlik gözlemi ve principal
+bağlaması ile **birlikte** tasarlanabileceği için Faz 2'ye **ertelenmiştir**
+— kapatılmış hâlde teslim edilip sonradan yalnızca açılması gereken bir şey
+olarak değil.
+
+Geriye bir **plan** kalır: doğrulanmış bir okuma işleminin kullanacağı
+kapalı, deterministik argüman vektörü. `GitHubOperationPlan` saf veridir ve
+`authorizes_execution` sınıf sabiti her zaman `False`'tur.
+
+Güvenlik sınırı **köken (provenance) değildir.** Python dataclass'ları
+herkes tarafından üretilebilir; "bu nesne üreticiden çıktı, o hâlde
+güvenlidir" bir sınır değildir ve burada öyle kullanılmaz. Bunun yerine plan
+**yeniden türetme** ile doğrulanır: `github_operation_plan_refusal`, planın
+kendi tipli kaynağından argümanları yeniden üretir ve öge öge eşitlik arar.
+Keyfi bir altkomut, enjekte edilmiş bir `--repo`/`--hostname`, ikinci bir
+depo, farklı bir host ya da token biçimli bir argüman bu eşitliği bozduğu
+için reddedilir — kim ürettiğine bakılmaksızın. Sahte (forged) bir
+`GitHubRequestFrame` de aynı şeyi verir: yalnızca veri. Çekirdeğin yetkisi
+tam `DestinationGrant` demeti ile `AgentCore`'un sahip olduğu kimlik
+beklentisidir; ikisi de ne bir çerçeveye ne bir plana bakar.
+
+Vektördeki her token ya bu modüldeki bir sabittir ya da doğrulanmış tipli
+hedefin bir alanıdır; depo yalnızca `_slug` üzerinden, kanonik dilbilgisinden
+geçerek girer. Hostname yalnızca `gh api` yolunda ve sabit bir literal
+olarak (`--hostname github.com`) belirtilir. Yazma sözlüğünün argv üreticisi
+**yoktur**. Planda `executable`, `environment`, `working_directory`, `stdin`
+ve `timeout` **alanları yoktur** — bunlar unutulmuş alanlar değil, Faz 1'in
+yapmadığı Faz 2 tasarımıdır; `APPDATA`/`HOME`/`USERPROFILE` güveni de o
+tasarıma aittir.
+
+**Dış içerik yetki değildir.** `ExternalReadSnapshot` sınırlı, göreve
+kapsamlı ve **güvenilmeyen** referans verisidir; `trusted` her zaman
+`False`'tur ve sınıf sabitidir. Yetenek, hedef politikası, onay, faturalama,
+connector seçimi, planlama, hafıza yetkisi veya araç izni için hiçbir alanı
+yoktur — yapısal olarak yoktur. Sınıflandırma varsayılanı SECRET'tir.
+
+**Snapshot metadata'sı türetilir, kabul edilmez.** Tek meşru üretim yolu
+`build_external_read_snapshot`'tır: connector, yetenek, depo, kaynak türü ve
+kanonik kaynak kimliği **doğrulanmış çerçeveden**, sha256 özeti ve
+`byte_size` ise **gerçekten taşınan içerikten** türetilir. `captured_at`
+deponun genel kuralına uyar (`canonical_utc_timestamp`): naif ya da
+UTC-dışı bir damga reddedilir. `external_read_refusal` özet/boyut/zaman
+tutarlılığını, `external_read_binding_refusal` ise snapshot'ın gerçekten *bu*
+isteği yanıtladığını doğrular; yanlış kaynak türü, yanlış kaynak kimliği,
+yanlış depo, yanlış özet veya yanlış boyut kapalı düşer. Metadata'yı dürüst
+kılmak içeriğe yetki vermez: snapshot güvenilmeyen veri olarak kalır.
+
+**Faturalama.** GitHub işlemleri `BillingClass.NO_ADDITIONAL_CHARGE` ve
+`MonetaryState.NOT_APPLICABLE`'dır. API hız sınırı para değildir; parasal
+deftere hiçbir kayıt eklenmez.
 
 Bu maddeler ihtiyaç doğduğunda güvenlik, lisans, bakım maliyeti ve gerçek fayda açısından ayrıca değerlendirilecektir.
 

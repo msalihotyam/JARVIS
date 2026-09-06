@@ -172,20 +172,56 @@ def normalize_locator(value: str | Path | None) -> str:
     return normalize_symbol(text)
 
 
+#: The namespace prefix of a REPOSITORY destination, spelled
+#: ``github/<owner>/<repository>``. Declared here, in the central normalizer,
+#: because that is where the repair below has to be refused; ``jarvis.github``
+#: re-exports this exact value rather than spelling it a second time.
+REPOSITORY_DESTINATION_PREFIX = "github/"
+
+
 def normalize_destination(value: str | Path | None) -> str:
     """Normalize an outbound destination endpoint.
 
     A destination is a real URL or a symbolic provider/connector endpoint such
     as ``anthropic/claude-code``. It is never resolved against the working
     directory; a filesystem location belongs in ``ActionScope.target``.
+
+    THE CENTRAL BOUNDARY. Every destination Core decides with arrives through
+    here - ``ActionScope.normalized`` for a programmatic ``Task``, the task
+    decoder, chain-step declarations, the outbound preview - so a repair made
+    here is a repair the whole product inherits.
+
+    Normalization is LOSSY: it strips, it case-folds and it applies Unicode
+    case folding, and each of those can turn a spelling nobody is authorized
+    for into one somebody is. ``" github/acme/widgets "``,
+    ``github/acme/widGets`` and ``github/acme/wid\u212aets`` (Kelvin sign)
+    all repair into a canonical repository identity a ``DestinationGrant``
+    may name.
+
+    So a REPOSITORY destination is never repaired. If normalizing would
+    PRODUCE a ``github/...`` spelling that is not what the caller actually
+    wrote, the raw text is returned unchanged instead: it still names nothing
+    Core knows, and ``jarvis.destinations.destination_refusal`` refuses it,
+    but it can no longer arrive wearing an identity it never had. Returning
+    the raw text keeps the function idempotent - a value that was not
+    repaired is not repaired the second time either - so the string Core
+    checks stays the string persistence, the fingerprint and the attestation
+    hold.
+
+    Only the repository namespace is treated this way. URLs, provider
+    endpoints and the empty destination normalize exactly as before.
     """
     if value is None:
         return ""
-    text = str(value).strip()
+    raw = str(value)
+    text = raw.strip()
     if not text:
         return ""
     url = normalize_url(text)
-    return url if url is not None else normalize_symbol(text)
+    normalized = url if url is not None else normalize_symbol(text)
+    if normalized.startswith(REPOSITORY_DESTINATION_PREFIX) and normalized != raw:
+        return raw
+    return normalized
 
 
 class RiskLevel(IntEnum):
@@ -4960,6 +4996,16 @@ _CREDENTIAL_VALUE_PATTERNS = (
     re.compile(
         r"\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b"
     ),
+    # GitHub tokens carry their own documented prefixes, so like an AWS
+    # key id they are recognizable with no label beside them - which is
+    # what matters for a token pasted into an error message or a captured
+    # stream. The classic families (``ghp_`` personal, ``gho_`` OAuth,
+    # ``ghu_`` user, ``ghs_`` server, ``ghr_`` refresh) carry 36 characters
+    # after the prefix and the fine-grained ``github_pat_`` form is longer;
+    # both are matched with a LOWER BOUND rather than an exact length, so a
+    # future length change cannot silently stop matching.
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
 )
 
 
