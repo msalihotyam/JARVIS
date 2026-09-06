@@ -500,7 +500,11 @@ Check 'finish real lock: leftover folder kept' (Test-Path -LiteralPath $wt)
 Check 'finish real lock: locked file byte-for-byte' ((Get-Content -LiteralPath (Join-Path $wt 'README.md') -Raw).Trim() -eq 'task version')
 $r = Run-Dev $canon @('cleanup', 'glm', 'fix10')
 Check 'cleanup real lock leftover: exit 1' ($r.Code -eq 1)
-Check 'cleanup real lock leftover: refused' ($r.Out -match 'refused')
+# Goal C: the deregistered-but-non-empty leftover is reported as a recovery
+# state naming the real reason, never as "worktree removal failed".
+Check 'cleanup real lock leftover: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED: WORKTREE NOT REGISTERED')
+Check 'cleanup real lock leftover: names the retained content' ($r.Out -match 'still holds content')
+Check 'cleanup real lock leftover: not misreported as removal failure' ($r.Out -notmatch 'worktree removal failed')
 Check 'cleanup real lock leftover: folder still kept' (Test-Path -LiteralPath $wt)
 Check 'cleanup real lock leftover: file still intact' ((Get-Content -LiteralPath (Join-Path $wt 'README.md') -Raw).Trim() -eq 'task version')
 $branchKept = $false
@@ -1902,6 +1906,623 @@ Check 'B5 post-abort proof failure: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY 
 Check 'B5 post-abort proof failure: observed state preserved' (Test-Path -LiteralPath (Join-Path $canon '.git\sequencer'))
 Check 'B5 post-abort proof failure: main unchanged' ((GitOut $canon @('rev-parse', 'refs/heads/main')) -eq (GitOut $canon @('rev-parse', 'HEAD')))
 Check 'B5 post-abort proof failure: task preserved' ((GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/cr5')) -ne '')
+
+# ============================================================================
+Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W1-W20) =='
+# ============================================================================
+# Reproduces the observed Windows failure: `git worktree remove` deregisters
+# the worktree and deletes .git/worktrees/<name> (and with it the private
+# ownership marker), while the final directory unlink does not happen.
+
+function New-PartialRemovalResidue {
+    # EXACT observed residue: git-owned removal completed in Git terms, only
+    # the final rmdir did not - the folder stands empty and unregistered and
+    # the private admin dir (with the ownership marker) is gone.
+    param([string]$Canon, [string]$Wt)
+    GitRun $Canon @('worktree', 'remove', $Wt)
+    $null = New-Item -ItemType Directory -Path $Wt
+}
+
+function New-IntegratedTask {
+    # ACTIVE task -> one commit -> integration with cleanup deferred, so the
+    # worktree is still registered and the task is INTEGRATED.
+    param([string]$Canon, [string]$Root, [string]$Worker, [string]$Task, [string]$WtName)
+    $wt = Join-Path $Root $WtName
+    $null = Run-Dev $Canon @('new', $Worker, $Task)
+    CommitFile $wt 'task.txt' @("$Task work") "$Task work"
+    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
+    $null = Run-Dev $Canon @('finish', $Worker, $Task)
+    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
+    return $wt
+}
+
+function Test-BranchExists {
+    param([string]$Canon, [string]$Branch)
+    try { $null = GitOut $Canon @('rev-parse', '--verify', "refs/heads/$Branch"); return $true } catch { return $false }
+}
+
+# --- W1/W2/W3: finish-current from INSIDE the worktree relocates first ------
+# The helper must move its own process out of the target before removal, and
+# the ordinary Windows removal path must then complete.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = Join-Path $root 'JARVIS-GLM-w1'
+$null = Run-Dev $canon @('new', 'glm', 'w1')
+CommitFile $wt 'task.txt' @('w1 change') 'w1 work'
+$driverPath = Join-Path $root 'driver-w1.ps1'
+@'
+. '__DEVPS__'
+function Invoke-PreDeleteTestHook {
+    param($ctx, $identity, $meta)
+    # fires AFTER the relocation and BEFORE anything destructive
+    $wt = $identity.WorktreePath
+    $ps = (Get-Location).ProviderPath
+    $net = [System.Environment]::CurrentDirectory
+    $inside = ($ps -eq $wt) -or $ps.StartsWith("$wt\") -or ($net -eq $wt) -or $net.StartsWith("$wt\")
+    Write-Host "RELOC-INSIDE=$inside"
+    Write-Host "RELOC-SAFE=$([bool]($ps -eq $ctx.MainPath -and $net -eq $ctx.MainPath))"
+}
+Invoke-FinishCurrent
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'w1'
+$r = Run-Driver $driverPath $wt
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
+Check 'W1 finish-current from inside: exit 0' ($r.Code -eq 0)
+Check 'W2 relocated out of the target before removal' ($r.Out -match 'RELOC-INSIDE=False')
+Check 'W2 relocated to the canonical repository' ($r.Out -match 'RELOC-SAFE=True')
+Check 'W3 windows removal path: CLEANED' ($r.Out -match 'CLEANED')
+Check 'W3 windows removal path: worktree gone' (-not (Test-Path -LiteralPath $wt))
+Check 'W3 windows removal path: branch gone' (-not (Test-BranchExists $canon 'glm/w1'))
+Check 'W3 windows removal path: metadata gone' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w1')))
+
+# --- W4/W20: simulated final directory unlink failure ------------------------
+# Git deregisters and empties the worktree; only the empty folder survives.
+# The Git-visible cleanup completes in the SAME invocation and the outcome is
+# reported as its own status - never "removal failed", never CLEANED.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w4' 'JARVIS-GLM-w4'
+$driverPath = Join-Path $root 'driver-w4.ps1'
+@'
+. '__DEVPS__'
+function Remove-WorktreeDir {
+    param($ctx, [string]$WorktreePath)
+    # genuine git-owned removal, then the Windows final-unlink failure
+    $null = Invoke-GitCapture -RepoPath $ctx.MainPath -GitArgs @('worktree', 'remove', $WorktreePath)
+    if (-not (Test-Path -LiteralPath $WorktreePath)) { $null = New-Item -ItemType Directory -Path $WorktreePath }
+    return 'LEFTOVER'
+}
+Invoke-CleanupTask -Worker 'glm' -Task 'w4'
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'w4'
+$r = Run-Driver $driverPath $canon
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
+Check 'W4 unlink failure: exit 1' ($r.Code -eq 1)
+Check 'W4 unlink failure: CLEANUP INCOMPLETE' ($r.Out -match 'CLEANUP INCOMPLETE: LEFTOVER DIRECTORY')
+Check 'W4 unlink failure: not reported as removal failure' ($r.Out -notmatch 'worktree removal failed')
+Check 'W20 unlink failure: CLEANED not claimed' ($r.Out -notmatch 'CLEANED')
+Check 'W4 unlink failure: branch removed in the same invocation' (-not (Test-BranchExists $canon 'glm/w4'))
+Check 'W4 unlink failure: metadata removed' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w4')))
+Check 'W4 unlink failure: only an empty folder remains' ((Test-Path -LiteralPath $wt) -and (@(Get-ChildItem -LiteralPath $wt -Force).Count -eq 0))
+
+# --- W5/W8: deregistered + empty directory -> RECOVERY REQUIRED -------------
+# The exact observed leftover state: no admin dir, no ownership marker, empty
+# folder, INTEGRATED metadata, branch still at the recorded source tip. There
+# is no automatic recovery for it: once the marker is gone the helper can no
+# longer prove it created the worktree, so nothing is deleted.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w5' 'JARVIS-GLM-w5'
+New-PartialRemovalResidue $canon $wt
+Check 'W5 residue: worktree deregistered' ((GitOut $canon @('worktree', 'list', '--porcelain')) -notmatch 'JARVIS-GLM-w5')
+Check 'W5 residue: directory empty' ((Test-Path -LiteralPath $wt) -and (@(Get-ChildItem -LiteralPath $wt -Force).Count -eq 0))
+Check 'W8 residue: ownership marker gone with the admin dir' (-not (Test-Path -LiteralPath (Join-Path $canon '.git\worktrees\JARVIS-GLM-w5')))
+$r = Run-Dev $canon @('cleanup', 'glm', 'w5')
+Check 'W8 markerless residue: exit 1' ($r.Code -eq 1)
+Check 'W8 markerless residue: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED: PARTIAL REMOVAL')
+Check 'W8 markerless residue: human checkpoint demanded' ($r.Out -match 'explicit human recovery checkpoint')
+Check 'W8 markerless residue: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W8 markerless residue: CLEANED never claimed' ($r.Out -notmatch 'CLEANED')
+Check 'W8 markerless residue: leftover directory preserved' (Test-Path -LiteralPath $wt)
+Check 'W8 markerless residue: branch preserved' (Test-BranchExists $canon 'glm/w5')
+Check 'W8 markerless residue: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w5'))
+Check 'W8 markerless residue: integrated work still on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'w5 work')
+
+# --- W5b: Remove-WorktreeDir classifies from observable state ---------------
+# The removal outcome must never be read off git's exit code: a Windows
+# removal can be complete in Git terms and still fail its final unlink.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wtOk = New-IntegratedTask $canon $root 'glm' 'wr1' 'JARVIS-GLM-wr1'
+$wtEmpty = New-IntegratedTask $canon $root 'glm' 'wr2' 'JARVIS-GLM-wr2'
+New-PartialRemovalResidue $canon $wtEmpty
+$wtFull = New-IntegratedTask $canon $root 'glm' 'wr3' 'JARVIS-GLM-wr3'
+New-PartialRemovalResidue $canon $wtFull
+Set-Content -LiteralPath (Join-Path $wtFull 'keep.txt') -Value 'user content'
+$driverPath = Join-Path $root 'driver-wr.ps1'
+@'
+. '__DEVPS__'
+$ctx = Get-CanonicalContext
+foreach ($n in @('wr1', 'wr2', 'wr3')) {
+    $id = Get-DerivedTaskIdentity -ctx $ctx -Worker 'glm' -Task $n
+    Write-Host "REMOVE-$n=$(Remove-WorktreeDir -ctx $ctx -WorktreePath $id.WorktreePath)"
+}
+# the relocation guard must refuse a safe directory inside the target
+$id = Get-DerivedTaskIdentity -ctx $ctx -Worker 'glm' -Task 'wr3'
+try { Set-SafeWorkingDirectory -SafePath $id.WorktreePath -WorktreePath $id.WorktreePath; Write-Host 'RELOC-GUARD=accepted' }
+catch { Write-Host "RELOC-GUARD=$($_.Exception.Message)" }
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$r = Run-Driver $driverPath $canon
+Check 'W5b registered clean worktree: REMOVED' ($r.Out -match 'REMOVE-wr1=REMOVED')
+Check 'W5b registered clean worktree: directory gone' (-not (Test-Path -LiteralPath $wtOk))
+Check 'W5b deregistered empty leftover: REMOVED' ($r.Out -match 'REMOVE-wr2=REMOVED')
+Check 'W5b deregistered empty leftover: directory unlinked' (-not (Test-Path -LiteralPath $wtEmpty))
+Check 'W5b deregistered non-empty leftover: FAILED' ($r.Out -match 'REMOVE-wr3=FAILED')
+Check 'W5b deregistered non-empty leftover: content intact' ((Get-Content -LiteralPath (Join-Path $wtFull 'keep.txt') -Raw).Trim() -eq 'user content')
+Check 'W5b relocation guard refuses a safe dir inside the target' ($r.Out -match 'RELOC-GUARD=CLEANUP DEFERRED: the safe directory is inside the worktree being removed')
+
+# --- W6: deregistered but directory NOT empty -> refuse ---------------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w6' 'JARVIS-GLM-w6'
+New-PartialRemovalResidue $canon $wt
+Set-Content -LiteralPath (Join-Path $wt 'leftover.txt') -Value 'not helper content'
+$r = Run-Dev $canon @('cleanup', 'glm', 'w6')
+Check 'W6 non-empty residue: exit 1' ($r.Code -eq 1)
+Check 'W6 non-empty residue: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED: WORKTREE NOT REGISTERED')
+Check 'W6 non-empty residue: names the retained content' ($r.Out -match 'still holds content')
+Check 'W6 non-empty residue: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W6 non-empty residue: content untouched' ((Get-Content -LiteralPath (Join-Path $wt 'leftover.txt') -Raw).Trim() -eq 'not helper content')
+Check 'W6 non-empty residue: branch preserved' (Test-BranchExists $canon 'glm/w6')
+Check 'W6 non-empty residue: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w6'))
+
+# --- W7: missing marker BEFORE integration is still a hard refusal ----------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = Join-Path $root 'JARVIS-GLM-w7'
+$null = Run-Dev $canon @('new', 'glm', 'w7')
+CommitFile $wt 'task.txt' @('w7 work') 'w7 work'
+Remove-Item -LiteralPath (Get-MarkerPathLocal $wt) -Force
+$r = Run-Dev $canon @('finish', 'glm', 'w7')
+Check 'W7 marker missing pre-integration: exit 1' ($r.Code -eq 1)
+Check 'W7 marker missing pre-integration: ownership refusal' ($r.Out -match 'ownership evidence refused')
+Check 'W7 marker missing pre-integration: nothing integrated' (-not (Test-Path -LiteralPath (Join-Path $canon 'task.txt')))
+Check 'W7 marker missing pre-integration: worktree kept' (Test-Path -LiteralPath $wt)
+Check 'W7 marker missing pre-integration: branch kept' (Test-BranchExists $canon 'glm/w7')
+# a registered worktree whose marker was deleted never reaches the recovery
+# path either - recovery is only for DEREGISTERED residue
+$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
+$r2 = Run-Dev $canon @('cleanup', 'glm', 'w7')
+$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
+Check 'W7 registered worktree without marker: cleanup refused' ($r2.Code -eq 1)
+Check 'W7 registered worktree without marker: RECOVERED never claimed' ($r2.Out -notmatch 'RECOVERED')
+Check 'W7 registered worktree without marker: branch kept' (Test-BranchExists $canon 'glm/w7')
+Check 'W7 registered worktree without marker: metadata kept' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w7'))
+
+# --- W9: task branch moved after integration -> refuse ----------------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w9' 'JARVIS-GLM-w9'
+New-PartialRemovalResidue $canon $wt
+$tree = GitOut $canon @('rev-parse', 'HEAD^{tree}')
+$moved = (('moved after integration' | & git -C $canon commit-tree $tree) | Out-String).Trim()
+GitRun $canon @('update-ref', 'refs/heads/glm/w9', $moved)
+$r = Run-Dev $canon @('cleanup', 'glm', 'w9')
+Check 'W9 branch moved: exit 1' ($r.Code -eq 1)
+Check 'W9 branch moved: refused/deferred, never cleaned' ($r.Out -notmatch 'RECOVERED')
+Check 'W9 branch moved: branch preserved' ((GitOut $canon @('rev-parse', 'refs/heads/glm/w9')) -eq $moved)
+Check 'W9 branch moved: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w9'))
+Check 'W9 branch moved: leftover folder untouched' (Test-Path -LiteralPath $wt)
+
+# --- W10: recorded integration commit missing / unreachable -> refuse -------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w10' 'JARVIS-GLM-w10'
+New-PartialRemovalResidue $canon $wt
+Edit-RawMeta $canon 'glm' 'w10' { param($m) $m.integratedHead = ('b' * 40) }
+$r = Run-Dev $canon @('cleanup', 'glm', 'w10')
+Check 'W10 integrated commit missing: exit 1' ($r.Code -eq 1)
+Check 'W10 integrated commit missing: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED')
+Check 'W10 integrated commit missing: branch preserved' (Test-BranchExists $canon 'glm/w10')
+Check 'W10 integrated commit missing: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w10'))
+# an integration commit that exists but is no longer reachable from main
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w10b' 'JARVIS-GLM-w10b'
+New-PartialRemovalResidue $canon $wt
+$meta = Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w10b') -Raw | ConvertFrom-Json
+GitRun $canon @('reset', '--hard', $meta.mainHeadAtFinish)
+$r = Run-Dev $canon @('cleanup', 'glm', 'w10b')
+Check 'W10b integrated commit unreachable: exit 1' ($r.Code -eq 1)
+Check 'W10b integrated commit unreachable: not recovered' ($r.Out -notmatch 'RECOVERED')
+Check 'W10b integrated commit unreachable: branch preserved' (Test-BranchExists $canon 'glm/w10b')
+Check 'W10b integrated commit unreachable: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w10b'))
+
+# --- W11: canonical main legitimately advanced after integration ------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w11' 'JARVIS-GLM-w11'
+New-PartialRemovalResidue $canon $wt
+CommitFile $canon 'other.txt' @('unrelated later work') 'unrelated main commit'
+$mainAfter = GitOut $canon @('rev-parse', 'HEAD')
+$r = Run-Dev $canon @('cleanup', 'glm', 'w11')
+Check 'W11 main advanced: exit 1' ($r.Code -eq 1)
+Check 'W11 main advanced: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED')
+Check 'W11 main advanced: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W11 main advanced: branch preserved' (Test-BranchExists $canon 'glm/w11')
+Check 'W11 main advanced: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w11'))
+Check 'W11 main advanced: later main commit untouched' ((GitOut $canon @('rev-parse', 'HEAD')) -eq $mainAfter)
+
+# --- W12: markerless residue never reaches the destructive seams ------------
+# The post-removal seam and the ref transaction sit downstream of the final
+# destructive gate; markerless residue must stop long before either, so seams
+# planted there never fire. (Normal-path exact-OID CAS is covered by H4/H15.)
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w12' 'JARVIS-GLM-w12'
+New-PartialRemovalResidue $canon $wt
+$driverPath = Join-Path $root 'driver-w12.ps1'
+@'
+. '__DEVPS__'
+function Invoke-PostRemovalTestHook {
+    param($ctx, $identity, [string]$CapturedT, [string]$CapturedM)
+    Write-Host 'SEAM-REACHED=post-removal'
+}
+function Invoke-AtomicCleanupRefTransaction {
+    param([string]$RepoPath, [string]$TaskRef, [string]$ExpectedT, [string]$ExpectedM)
+    Write-Host 'SEAM-REACHED=ref-transaction'
+    return [pscustomobject]@{ Ok = $true; Reason = '' }
+}
+Invoke-CleanupTask -Worker 'glm' -Task 'w12'
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'w12'
+$r = Run-Driver $driverPath $canon
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
+Check 'W12 markerless residue: exit 1' ($r.Code -eq 1)
+Check 'W12 markerless residue: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED')
+Check 'W12 markerless residue: no destructive seam reached' ($r.Out -notmatch 'SEAM-REACHED')
+Check 'W12 markerless residue: branch survives' (Test-BranchExists $canon 'glm/w12')
+Check 'W12 markerless residue: metadata survives' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w12'))
+
+# --- W13: no-force / no-recursive-delete policy preserved -------------------
+# executable lines only - the prose in the header and comments explains the
+# policy and must not be mistaken for a violation of it
+$devCode = (@(Get-Content -LiteralPath $DevPs) | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+Check 'W13 worktree removal is never forced' ($devCode -notmatch "'worktree'\s*,\s*'remove'\s*,\s*'-")
+Check 'W13 no --force anywhere in code' ($devCode -notmatch '--force')
+Check 'W13 no recursive delete in code' ($devCode -notmatch '-Recurse')
+Check 'W13 no recursive Directory.Delete' ($devCode -notmatch 'Directory\]::Delete\([^)]*,')
+
+# --- W14: dirty / ignored content refusal preserved -------------------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w14' 'JARVIS-GLM-w14'
+Set-Content -LiteralPath (Join-Path $wt 'precious.txt') -Value 'uncommitted work'
+$r = Run-Dev $canon @('cleanup', 'glm', 'w14')
+Check 'W14 dirty worktree: exit 1' ($r.Code -eq 1)
+Check 'W14 dirty worktree: deferred' ($r.Out -match 'CLEANUP DEFERRED')
+Check 'W14 dirty worktree: content preserved' ((Get-Content -LiteralPath (Join-Path $wt 'precious.txt') -Raw).Trim() -eq 'uncommitted work')
+Check 'W14 dirty worktree: branch preserved' (Test-BranchExists $canon 'glm/w14')
+Set-Content -LiteralPath (Join-Path $wt '.gitignore') -Value 'cache/'
+GitRun $wt @('add', '.gitignore')
+GitRun $wt @('commit', '-m', 'ignore cache')
+Remove-Item -LiteralPath (Join-Path $wt 'precious.txt') -Force
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $wt 'cache')
+Set-Content -LiteralPath (Join-Path $wt 'cache\blob.bin') -Value 'ignored cache'
+$r = Run-Dev $canon @('cleanup', 'glm', 'w14')
+Check 'W14 ignored content: exit 1' ($r.Code -eq 1)
+Check 'W14 ignored content: never silently deleted' ((Get-Content -LiteralPath (Join-Path $wt 'cache\blob.bin') -Raw).Trim() -eq 'ignored cache')
+
+# --- W15: unfinished Git operation refusal preserved ------------------------
+# canonical repository mid-operation: recovery must refuse too
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w15' 'JARVIS-GLM-w15'
+New-PartialRemovalResidue $canon $wt
+Set-Content -LiteralPath (Join-Path $canon '.git\CHERRY_PICK_HEAD') -Value (GitOut $canon @('rev-parse', 'HEAD'))
+$r = Run-Dev $canon @('cleanup', 'glm', 'w15')
+Remove-Item -LiteralPath (Join-Path $canon '.git\CHERRY_PICK_HEAD') -Force
+Check 'W15 canonical mid-operation: exit 1' ($r.Code -eq 1)
+Check 'W15 canonical mid-operation: not recovered' ($r.Out -notmatch 'RECOVERED')
+Check 'W15 canonical mid-operation: branch preserved' (Test-BranchExists $canon 'glm/w15')
+Check 'W15 canonical mid-operation: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w15'))
+# clearing the operation state does NOT unlock the markerless residue: only
+# the reason changes, from the canonical-operation one to the policy one
+$r = Run-Dev $canon @('cleanup', 'glm', 'w15')
+Check 'W15 after clearing: still RECOVERY REQUIRED' (($r.Code -eq 1) -and ($r.Out -match 'RECOVERY REQUIRED: PARTIAL REMOVAL'))
+Check 'W15 after clearing: branch preserved' (Test-BranchExists $canon 'glm/w15')
+
+# --- W16: corrupted metadata still fails closed -----------------------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w16' 'JARVIS-GLM-w16'
+New-PartialRemovalResidue $canon $wt
+Edit-RawMeta $canon 'glm' 'w16' { param($m) $m | Add-Member -NotePropertyName 'injected' -NotePropertyValue 'x' }
+$r = Run-Dev $canon @('cleanup', 'glm', 'w16')
+Check 'W16 unknown metadata field: exit 1' ($r.Code -eq 1)
+Check 'W16 unknown metadata field: schema refusal' ($r.Out -match 'metadata schema')
+Check 'W16 unknown metadata field: branch preserved' (Test-BranchExists $canon 'glm/w16')
+Check 'W16 unknown metadata field: leftover folder untouched' (Test-Path -LiteralPath $wt)
+# audit-sequence corruption on the same residue
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w16b' 'JARVIS-GLM-w16b'
+New-PartialRemovalResidue $canon $wt
+Edit-RawMeta $canon 'glm' 'w16b' { param($m) $m.sourceCommitShas = @(('c' * 40)) }
+$r = Run-Dev $canon @('cleanup', 'glm', 'w16b')
+Check 'W16b corrupt audit sequence: exit 1' ($r.Code -eq 1)
+Check 'W16b corrupt audit sequence: not recovered' ($r.Out -notmatch 'RECOVERED')
+Check 'W16b corrupt audit sequence: branch preserved' (Test-BranchExists $canon 'glm/w16b')
+
+# --- W17/W18: ordinary finish and cleanup paths remain intact ---------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = Join-Path $root 'JARVIS-GLM-w17'
+$null = Run-Dev $canon @('new', 'glm', 'w17')
+CommitFile $wt 'task.txt' @('w17 change') 'w17 work'
+$r = Run-Dev $canon @('finish', 'glm', 'w17')
+Check 'W17 normal finish: exit 0' ($r.Code -eq 0)
+Check 'W17 normal finish: INTEGRATED then CLEANED' (($r.Out -match 'INTEGRATED') -and ($r.Out -match 'CLEANED'))
+Check 'W17 normal finish: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'w17 change')
+Check 'W17 normal finish: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/w17')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w17'))))
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w18' 'JARVIS-GLM-w18'
+$r = Run-Dev $canon @('cleanup', 'glm', 'w18')
+Check 'W18 normal cleanup: exit 0' ($r.Code -eq 0)
+Check 'W18 normal cleanup: CLEANED' ($r.Out -match 'CLEANED')
+Check 'W18 normal cleanup: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/w18')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w18'))))
+
+# --- W19: status distinguishes the partial-removal state --------------------
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wtA = New-IntegratedTask $canon $root 'glm' 'w19a' 'JARVIS-GLM-w19a'
+$null = Run-Dev $canon @('new', 'claude', 'w19b')
+$wtB = New-IntegratedTask $canon $root 'glm' 'w19c' 'JARVIS-GLM-w19c'
+New-PartialRemovalResidue $canon $wtB
+$null = New-IntegratedTask $canon $root 'glm' 'w19d' 'JARVIS-GLM-w19d'
+$null = Run-Dev $canon @('cleanup', 'glm', 'w19d')
+$r = Run-Dev $canon @('status')
+Check 'W19 status: exit 0' ($r.Code -eq 0)
+Check 'W19 status: ACTIVE task listed' ($r.Out -match 'ACTIVE\s+claude/w19b')
+Check 'W19 status: integrated task marked cleanup pending' (($r.Out -split "`n" | Where-Object { $_ -match 'glm/w19a' }) -match 'CLEANUP PENDING')
+Check 'W19 status: residue marked recovery required' (($r.Out -split "`n" | Where-Object { $_ -match 'glm/w19c' }) -match 'PARTIAL REMOVAL - RECOVERY REQUIRED')
+Check 'W19 status: read-only, residue untouched' ((Test-Path -LiteralPath $wtB) -and (Test-BranchExists $canon 'glm/w19c'))
+Check 'W19 status: cleaned tasks are simply absent' ($r.Out -notmatch 'w19d')
+
+# --- W19b: an absent directory is NOT recovered (two-evidence preserved) ----
+# Without the stranded folder, retained metadata is the only witness that a
+# helper worktree ever existed there - the missing-worktree policy still holds.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w19e' 'JARVIS-GLM-w19e'
+GitRun $canon @('worktree', 'remove', $wt)
+Check 'W19b precondition: directory absent' (-not (Test-Path -LiteralPath $wt))
+$r = Run-Dev $canon @('cleanup', 'glm', 'w19e')
+Check 'W19b absent directory: exit 1' ($r.Code -eq 1)
+Check 'W19b absent directory: RECOVERY REQUIRED: WORKTREE MISSING' ($r.Out -match 'RECOVERY REQUIRED: WORKTREE MISSING')
+Check 'W19b absent directory: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W19b absent directory: CLEANED never claimed' ($r.Out -notmatch 'CLEANED')
+Check 'W19b absent directory: branch preserved' (Test-BranchExists $canon 'glm/w19e')
+Check 'W19b absent directory: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w19e'))
+
+# --- W21: INCOMPLETE private worktree admin residue fails closed ------------
+# `git worktree list` OMITS an admin entry whose representation is incomplete,
+# and an unreadable or stale pointer proves nothing either. The admin
+# inspection is kept as DIAGNOSIS only - it never authorises a deletion - and
+# every uncertain shape must surface in the refusal with the task branch,
+# metadata and residue all preserved.
+
+function New-IncompleteAdminResidue {
+    # The exact attack shape: the git-owned removal completes and the worktree
+    # is deregistered, but an INCOMPLETE admin entry for it survives in
+    # .git/worktrees. $EntryName decides whether the residue keeps the
+    # target's basename; $Pointer selects the incomplete representation.
+    param([string]$Canon, [string]$Wt, [string]$WtName, [string]$EntryName,
+        [string]$Pointer, [string]$Elsewhere = 'C:\some\other\worktree')
+    $bak = Join-Path $Canon '.git\admin-residue-backup'
+    Copy-Item -LiteralPath (Join-Path $Canon ".git\worktrees\$WtName") -Destination $bak -Recurse -Force
+    New-PartialRemovalResidue $Canon $Wt
+    $null = New-Item -ItemType Directory -Force -Path (Join-Path $Canon '.git\worktrees')
+    $dest = Join-Path $Canon ".git\worktrees\$EntryName"
+    Move-Item -LiteralPath $bak -Destination $dest
+    $gitdir = Join-Path $dest 'gitdir'
+    switch ($Pointer) {
+        'missing' { Remove-Item -LiteralPath $gitdir -Force }
+        'empty' { [System.IO.File]::WriteAllText($gitdir, '') }
+        'blank' { [System.IO.File]::WriteAllText($gitdir, "  `r`n `r`n") }
+        'malformed' { [System.IO.File]::WriteAllText($gitdir, "not-a-path/.git`n") }
+        'ambiguous' { [System.IO.File]::WriteAllText($gitdir, "$Elsewhere\.git`n$Elsewhere-2\.git`n") }
+        'elsewhere' { [System.IO.File]::WriteAllText($gitdir, "$Elsewhere\.git`n") }
+        'target' { }
+        default { throw "unknown pointer shape $Pointer" }
+    }
+    return $dest
+}
+
+# Every incomplete/uncertain pointer shape must fail closed, preserving the
+# branch, the metadata, the leftover folder and the admin residue itself.
+$uncertain = @(
+    @{ Task = 'w21a'; Pointer = 'missing'; Entry = 'resid-a'; Reason = 'has no gitdir pointer' },
+    @{ Task = 'w21b'; Pointer = 'empty'; Entry = 'resid-b'; Reason = 'is empty' },
+    @{ Task = 'w21c'; Pointer = 'blank'; Entry = 'resid-c'; Reason = 'is empty' },
+    @{ Task = 'w21d'; Pointer = 'malformed'; Entry = 'resid-d'; Reason = 'is malformed' },
+    @{ Task = 'w21e'; Pointer = 'ambiguous'; Entry = 'resid-e'; Reason = 'resolves ambiguously' },
+    @{ Task = 'w21n'; Pointer = 'elsewhere'; Entry = 'resid-n'; Reason = 'resolves to a worktree that does not exist' },
+    @{ Task = 'w21g'; Pointer = 'elsewhere'; Entry = 'JARVIS-GLM-w21g'; Reason = 'carries the task worktree name' }
+)
+foreach ($case in $uncertain) {
+    $t = $case.Task
+    $root = New-TempRoot
+    $canon = New-CanonicalRepo $root
+    $name = "JARVIS-GLM-$t"
+    $wt = New-IntegratedTask $canon $root 'glm' $t $name
+    $entry = New-IncompleteAdminResidue $canon $wt $name $case.Entry $case.Pointer
+    Check "W21 $t ($($case.Pointer)): git worktree list omits the target" ((GitOut $canon @('worktree', 'list', '--porcelain')) -notmatch [regex]::Escape($name))
+    Check "W21 $t ($($case.Pointer)): admin residue present" (Test-Path -LiteralPath $entry)
+    $r = Run-Dev $canon @('cleanup', 'glm', $t)
+    Check "W21 $t ($($case.Pointer)): exit 1" ($r.Code -eq 1)
+    Check "W21 $t ($($case.Pointer)): RECOVERY REQUIRED" ($r.Out -match 'RECOVERY REQUIRED: PARTIAL REMOVAL')
+    Check "W21 $t ($($case.Pointer)): names the uncertainty" ($r.Out -match [regex]::Escape($case.Reason))
+    Check "W21 $t ($($case.Pointer)): RECOVERED never claimed" ($r.Out -notmatch 'RECOVERED')
+    Check "W21 $t ($($case.Pointer)): CLEANED never claimed" ($r.Out -notmatch 'CLEANED')
+    Check "W21 $t ($($case.Pointer)): task branch preserved" (Test-BranchExists $canon "glm/$t")
+    Check "W21 $t ($($case.Pointer)): metadata preserved" (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' $t))
+    Check "W21 $t ($($case.Pointer)): leftover folder preserved" (Test-Path -LiteralPath $wt)
+    Check "W21 $t ($($case.Pointer)): admin residue untouched" (Test-Path -LiteralPath $entry)
+}
+
+# --- W21f: an admin entry that still refers to the target is never absence --
+# With an intact pointer git DOES still list the worktree (as prunable), so
+# this shape is refused on the registered path; the admin diagnosis reports it
+# as residue regardless, so neither route can mistake it for absence.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w21f' 'JARVIS-GLM-w21f'
+$entry = New-IncompleteAdminResidue $canon $wt 'JARVIS-GLM-w21f' 'resid-f' 'target'
+$driverPath = Join-Path $root 'driver-w21f.ps1'
+@'
+. '__DEVPS__'
+$ctx = Get-CanonicalContext
+$id = Get-DerivedTaskIdentity -ctx $ctx -Worker 'glm' -Task 'w21f'
+Write-Host "RESIDUE-REASON=$(Get-WorktreeAdminResidueReason -ctx $ctx -WorktreePath $id.WorktreePath)"
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$r = Run-Driver $driverPath $canon
+Check 'W21f pointer at target: reported as residue, not absence' ($r.Out -match 'RESIDUE-REASON=.*still refers to the task worktree')
+$r = Run-Dev $canon @('cleanup', 'glm', 'w21f')
+Check 'W21f pointer at target: exit 1' ($r.Code -eq 1)
+Check 'W21f pointer at target: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W21f pointer at target: CLEANED never claimed' ($r.Out -notmatch 'CLEANED')
+Check 'W21f pointer at target: branch preserved' (Test-BranchExists $canon 'glm/w21f')
+Check 'W21f pointer at target: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w21f'))
+Check 'W21f pointer at target: admin residue untouched' (Test-Path -LiteralPath $entry)
+
+# --- W21h: an UNREADABLE gitdir pointer is uncertainty, not absence ---------
+# The pointer is intact and points elsewhere, but is held open exclusively, so
+# its identity cannot be established. git still omits the target from its
+# listing; the helper must refuse rather than skip the entry.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w21h' 'JARVIS-GLM-w21h'
+$entry = New-IncompleteAdminResidue $canon $wt 'JARVIS-GLM-w21h' 'resid-h' 'elsewhere'
+$lock = [System.IO.File]::Open((Join-Path $entry 'gitdir'), 'Open', 'Read', 'None')
+try {
+    Check 'W21h unreadable pointer: git worktree list omits the target' ((GitOut $canon @('worktree', 'list', '--porcelain')) -notmatch 'JARVIS-GLM-w21h')
+    $r = Run-Dev $canon @('cleanup', 'glm', 'w21h')
+}
+finally { $lock.Dispose() }
+Check 'W21h unreadable pointer: exit 1' ($r.Code -eq 1)
+Check 'W21h unreadable pointer: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUIRED: PARTIAL REMOVAL')
+Check 'W21h unreadable pointer: reported as unreadable' ($r.Out -match 'could not be read')
+Check 'W21h unreadable pointer: not recovered' ($r.Out -notmatch 'RECOVERED')
+Check 'W21h unreadable pointer: branch preserved' (Test-BranchExists $canon 'glm/w21h')
+Check 'W21h unreadable pointer: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w21h'))
+# a readable pointer changes only the DIAGNOSIS, never the outcome: markerless
+# partial-removal state is refused either way and nothing is ever deleted
+$r = Run-Dev $canon @('cleanup', 'glm', 'w21h')
+Check 'W21h readable again: still RECOVERY REQUIRED' (($r.Code -eq 1) -and ($r.Out -match 'RECOVERY REQUIRED: PARTIAL REMOVAL'))
+Check 'W21h readable again: RECOVERED never claimed' ($r.Out -notmatch 'RECOVERED')
+Check 'W21h readable again: branch preserved' (Test-BranchExists $canon 'glm/w21h')
+Check 'W21h readable again: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w21h'))
+Check 'W21h readable again: residue untouched' (Test-Path -LiteralPath $entry)
+
+# --- W21i: an unrelated HEALTHY admin entry never blocks normal cleanup -----
+# A second, live, fully registered task keeps its own admin entry in the same
+# store; the post-removal absence proof must dismiss it as conclusively
+# unrelated so ordinary marker-backed cleanup still reaches CLEANED.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$other = New-IntegratedTask $canon $root 'claude' 'w21i-live' 'JARVIS-Claude-w21i-live'
+$wt = New-IntegratedTask $canon $root 'glm' 'w21i' 'JARVIS-GLM-w21i'
+Check 'W21i precondition: unrelated healthy admin entry exists' (Test-Path -LiteralPath (Join-Path $canon '.git\worktrees\JARVIS-Claude-w21i-live'))
+$r = Run-Dev $canon @('cleanup', 'glm', 'w21i')
+Check 'W21i unrelated healthy entry: exit 0' ($r.Code -eq 0)
+Check 'W21i unrelated healthy entry: CLEANED' ($r.Out -match 'CLEANED')
+Check 'W21i unrelated healthy entry: target worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/w21i')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w21i'))))
+Check 'W21i unrelated healthy entry: other task untouched' ((Test-Path -LiteralPath $other) -and (Test-BranchExists $canon 'claude/w21i-live'))
+
+# --- W21j: CLEANED is never emitted while admin residue remains -------------
+# Normal (registered) cleanup path: git removes the worktree but incomplete
+# admin residue for the same path survives. The branch and metadata must NOT
+# be deleted, and CLEANED must not be claimed.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IntegratedTask $canon $root 'glm' 'w21j' 'JARVIS-GLM-w21j'
+$driverPath = Join-Path $root 'driver-w21j.ps1'
+@'
+. '__DEVPS__'
+function Remove-WorktreeDir {
+    param($ctx, [string]$WorktreePath)
+    # genuine git-owned removal, but the private admin entry survives with an
+    # unreadable identity (the Windows partial-teardown shape)
+    $admin = Get-WorktreeAdminDir -WorktreePath $WorktreePath
+    $bak = Join-Path $ctx.CommonDir 'admin-residue-backup'
+    Copy-Item -LiteralPath $admin -Destination $bak -Recurse -Force
+    $null = Invoke-GitCapture -RepoPath $ctx.MainPath -GitArgs @('worktree', 'remove', $WorktreePath)
+    $null = New-Item -ItemType Directory -Force -Path (Join-Path $ctx.CommonDir 'worktrees')
+    Move-Item -LiteralPath $bak -Destination (Join-Path $ctx.CommonDir 'worktrees\resid-j')
+    Remove-Item -LiteralPath (Join-Path $ctx.CommonDir 'worktrees\resid-j\gitdir') -Force
+    return 'REMOVED'
+}
+Invoke-CleanupTask -Worker 'glm' -Task 'w21j'
+'@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'w21j'
+$r = Run-Driver $driverPath $canon
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
+Check 'W21j admin residue after removal: exit 1' ($r.Code -eq 1)
+Check 'W21j admin residue after removal: CLEANUP DEFERRED' ($r.Out -match 'CLEANUP DEFERRED')
+Check 'W21j admin residue after removal: CLEANED never claimed' ($r.Out -notmatch 'CLEANED')
+Check 'W21j admin residue after removal: branch preserved' (Test-BranchExists $canon 'glm/w21j')
+Check 'W21j admin residue after removal: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w21j'))
+
+# --- W22: source-level guard - no automatic markerless recovery path --------
+# The destructive markerless-recovery authority is REMOVED, not merely
+# unreachable: no function, command or alternate path may delete a task ref or
+# its metadata outside the single marker-backed lifecycle.
+$devSrc = Get-Content -LiteralPath $DevPs -Raw
+$devExec = (@(Get-Content -LiteralPath $DevPs) | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+Check 'W22 no partial-removal recovery function' ($devSrc -cnotmatch 'Invoke-PartialRemovalRecovery')
+Check 'W22 no partial-removal classification' ($devSrc -cnotmatch 'Get-PartialRemovalClassification')
+Check 'W22 helper can never emit RECOVERED' ($devSrc -cnotmatch 'RECOVERED')
+Check 'W22 single task-ref deletion call site' (@([regex]::Matches($devExec, 'Invoke-AtomicCleanupRefTransaction\s+-RepoPath')).Count -eq 1)
+Check 'W22 single metadata deletion call site' (@([regex]::Matches($devExec, 'Remove-Item -LiteralPath \$MetaPath')).Count -eq 1)
+Check 'W22 single final destructive gate call site' (@([regex]::Matches($devExec, 'Assert-FinalDestructivePreconditions -ctx')).Count -eq 1)
+Check 'W22 markerless refusal is consulted before the gate' ($devExec -match 'Get-MarkerlessCleanupRefusal')
+Check 'W22 markerless diagnosis can only refuse' ($devExec -cnotmatch "Get-MarkerlessCleanupRefusal[\s\S]{0,400}?'RECOVER'")
+Check 'W22 no recover/repair/prune command exposed' ($devExec -cnotmatch "(?i)'(recover|repair|prune|force-clean)'")
+# the ONE metadata deletion and the ONE ref transaction must both sit inside
+# Invoke-CleanupCore, after the final gate - never in any other function
+$cleanupCore = [regex]::Match($devExec, 'function Invoke-CleanupCore \{[\s\S]*?\n\}').Value
+Check 'W22 ref transaction lives in Invoke-CleanupCore' ($cleanupCore -match 'Invoke-AtomicCleanupRefTransaction\s+-RepoPath')
+Check 'W22 metadata deletion lives in Invoke-CleanupCore' ($cleanupCore -match 'Remove-Item -LiteralPath \$MetaPath')
+Check 'W22 the gate precedes both in the same function' ($cleanupCore.IndexOf('Assert-FinalDestructivePreconditions') -lt $cleanupCore.IndexOf('Invoke-AtomicCleanupRefTransaction -RepoPath'))
+Check 'W22 the markerless refusal precedes the gate' ($cleanupCore.IndexOf('Get-MarkerlessCleanupRefusal') -lt $cleanupCore.IndexOf('Assert-FinalDestructivePreconditions'))
+
+# --- W23: every markerless shape preserves branch AND metadata --------------
+# One sweep over the shapes the policy enumerates, asserting the same
+# invariants for each: refusal, no RECOVERED, no CLEANED, branch + metadata
+# intact.
+$shapes = @(
+    @{ Name = 'deregistered-empty-dir'; Task = 'w23a'; Setup = { param($c, $w) New-PartialRemovalResidue $c $w } },
+    @{ Name = 'deregistered-absent-dir'; Task = 'w23b'; Setup = { param($c, $w) GitRun $c @('worktree', 'remove', $w) } },
+    @{ Name = 'deregistered-non-empty-dir'; Task = 'w23c'; Setup = { param($c, $w) New-PartialRemovalResidue $c $w; Set-Content -LiteralPath (Join-Path $w 'stray.txt') -Value 'stray' } },
+    @{ Name = 'registered-marker-deleted'; Task = 'w23d'; Setup = { param($c, $w) Remove-Item -LiteralPath (Get-MarkerPathLocal $w) -Force } },
+    @{ Name = 'registered-dir-emptied'; Task = 'w23e'; Setup = { param($c, $w) Remove-Item -LiteralPath (Join-Path $w '.git') -Force } }
+)
+foreach ($shape in $shapes) {
+    $t = $shape.Task
+    $root = New-TempRoot
+    $canon = New-CanonicalRepo $root
+    $wt = New-IntegratedTask $canon $root 'glm' $t "JARVIS-GLM-$t"
+    & $shape.Setup $canon $wt
+    $r = Run-Dev $canon @('cleanup', 'glm', $t)
+    Check "W23 $($shape.Name): exit 1" ($r.Code -eq 1)
+    Check "W23 $($shape.Name): RECOVERY REQUIRED" ($r.Out -match 'RECOVERY REQUIRED')
+    Check "W23 $($shape.Name): RECOVERED never claimed" ($r.Out -notmatch 'RECOVERED')
+    Check "W23 $($shape.Name): CLEANED never claimed" ($r.Out -notmatch 'CLEANED')
+    Check "W23 $($shape.Name): task branch preserved" (Test-BranchExists $canon "glm/$t")
+    Check "W23 $($shape.Name): metadata preserved" (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' $t))
+}
 
 # ---- summary ---------------------------------------------------------------
 

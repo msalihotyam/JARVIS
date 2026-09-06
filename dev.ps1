@@ -48,6 +48,39 @@
 
   Metadata lives under the shared git dir (dev-helper/tasks/<worker>/<task>.json)
   and is never a tracked repository file.
+
+.WINDOWS REMOVAL / POST-INTEGRATION PARTIAL REMOVAL
+  Windows will not unlink a directory that is any process's current directory.
+  `git worktree remove` therefore can empty the worktree and delete its private
+  admin directory .git/worktrees/<name> (and with it the ownership marker that
+  lived there) and still fail on the final rmdir. Two consequences are handled
+  explicitly:
+    * BEFORE any removal the helper moves ITS OWN process working directory to
+      the canonical repository and PROVES the result is outside the target
+      worktree; an unprovable relocation defers instead of removing. A parent
+      shell's working directory is outside the helper's control - it is
+      reported, never repaired.
+    * Removal outcome is classified from observable state, never from an exit
+      code: REMOVED / LEFTOVER (deregistered and emptied, only an empty folder
+      could not be unlinked) / FAILED (still registered, or content remains).
+      LEFTOVER continues to branch deletion in the SAME invocation, so the
+      Git-visible end state is complete and only an empty folder remains.
+
+  ABSOLUTE MISSING-MARKER / PARTIAL-REMOVAL POLICY (adjudicated). Automatic
+  cleanup deletes a task branch or its metadata ONLY for a marker-backed,
+  registered worktree the helper can still fully prove it created. Once the
+  private ownership marker or the private admin directory is gone - a
+  deregistered worktree, an absent or empty former directory, incomplete /
+  corrupt / unreadable admin state, or any unprovable registration or
+  ownership state - the situation is reported as RECOVERY REQUIRED and
+  NOTHING is deleted: not the task branch, not the metadata. There is
+  deliberately no automatic markerless recovery path and no alternate command
+  or internal function that performs one; such a state is resolved by an
+  explicit human recovery checkpoint outside this helper's automatic
+  lifecycle. An earlier narrowed exception that recovered "proven" partial-
+  removal residue was REMOVED: its absence proof was inherently racy (admin
+  state could change between the check and the ref transaction) and
+  semantically incomplete. Correctness over cleanup convenience.
 #>
 [CmdletBinding()]
 param(
@@ -493,15 +526,75 @@ function Assert-LinearTaskHistory {
 
 # ---------- deletion stage (git-owned only) ----------------------------------
 
+function Test-DirectoryEmpty {
+    # Complete enumeration including hidden/system entries. Fail-closed:
+    # inspection uncertainty is never reported as emptiness.
+    param([string]$Path)
+    try { return (@([System.IO.Directory]::EnumerateFileSystemEntries($Path)).Count -eq 0) }
+    catch { return $false }
+}
+
+function Set-SafeWorkingDirectory {
+    # Windows refuses to unlink a directory that is any process's current
+    # directory, so `git worktree remove` can deregister and empty a worktree
+    # and still fail its final rmdir when the invoking shell sits inside it.
+    # Before ANY operation that can remove the worktree, the helper moves its
+    # OWN process out and PROVES the result: the destination must not be the
+    # target worktree nor below it, and both the PowerShell location and the
+    # native process working directory are re-read and re-checked afterwards.
+    # Fail-closed - an unprovable relocation refuses instead of starting a
+    # removal already known to strand a leftover directory. All task identity
+    # is derived before this call; nothing afterwards depends on caller CWD.
+    param([string]$SafePath, [string]$WorktreePath)
+    $target = ConvertTo-NormalPath -Value $WorktreePath -Base $SafePath
+    if (-not (Test-Path -LiteralPath $SafePath -PathType Container)) {
+        throw "CLEANUP DEFERRED: safe directory '$SafePath' does not exist; nothing will be deleted"
+    }
+    $safe = ConvertTo-NormalPath -Value (Resolve-Path -LiteralPath $SafePath).ProviderPath -Base $SafePath
+    if ((Test-SamePath $safe $target) -or $safe.StartsWith("$target\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CLEANUP DEFERRED: the safe directory is inside the worktree being removed; nothing will be deleted'
+    }
+    try {
+        Set-Location -LiteralPath $safe -ErrorAction Stop
+        [System.Environment]::CurrentDirectory = $safe
+    }
+    catch {
+        throw "CLEANUP DEFERRED: could not move the helper process out of the task worktree; nothing will be deleted"
+    }
+    foreach ($observed in @((Get-Location).ProviderPath, [System.Environment]::CurrentDirectory)) {
+        $now = ConvertTo-NormalPath -Value $observed -Base $safe
+        if ((Test-SamePath $now $target) -or $now.StartsWith("$target\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'CLEANUP DEFERRED: the helper process working directory is still inside the worktree being removed; nothing will be deleted'
+        }
+    }
+}
+
 function Remove-WorktreeDir {
-    # Narrow deterministic seam: forcing this to $false only ever makes the
+    # Narrow deterministic seam: forcing this to FAILED only ever makes the
     # helper MORE conservative (defers cleanup); it can never force a deletion.
     # The ONLY mechanism is `git worktree remove` WITHOUT force - never manual
-    # recursion, never -f/--force.
+    # recursion, never -f/--force. The single exception is a NON-recursive
+    # rmdir of a directory proven completely empty, which by construction
+    # cannot delete content.
+    #
+    # The outcome is classified from OBSERVABLE state, never from git's exit
+    # code, because a Windows removal can succeed in Git terms and still fail
+    # its final unlink:
+    #   REMOVED  - deregistered and the directory is gone
+    #   LEFTOVER - deregistered and emptied by git, but the now-empty
+    #              directory could not be unlinked (a process is inside it)
+    #   FAILED   - still registered, or the directory still holds content
     param($ctx, [string]$WorktreePath)
-    if ($env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED -eq '1') { return $false }
-    $r = Invoke-GitCapture -RepoPath $ctx.MainPath -GitArgs @('worktree', 'remove', $WorktreePath)
-    return ($r.ExitCode -eq 0)
+    if ($env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED -eq '1') { return 'FAILED' }
+    $null = Invoke-GitCapture -RepoPath $ctx.MainPath -GitArgs @('worktree', 'remove', $WorktreePath)
+    $stillRegistered = @(Get-WorktreeList -RepoPath $ctx.MainPath | Where-Object { Test-SamePath $_.Path $WorktreePath })
+    if ($stillRegistered.Count -gt 0) { return 'FAILED' }
+    if (-not (Test-Path -LiteralPath $WorktreePath)) { return 'REMOVED' }
+    if (-not (Test-DirectoryEmpty -Path $WorktreePath)) { return 'FAILED' }
+    # git released its own handles; retry the unlink once, non-recursively.
+    try { [System.IO.Directory]::Delete($WorktreePath) } catch { }
+    if (-not (Test-Path -LiteralPath $WorktreePath)) { return 'REMOVED' }
+    return 'LEFTOVER'
 }
 
 function Invoke-AtomicCleanupRefTransaction {
@@ -540,12 +633,30 @@ function Invoke-AtomicCleanupRefTransaction {
     $psi.UseShellExecute = $false
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-    $process = [System.Diagnostics.Process]::Start($psi)
-    $process.StandardInput.Write((($lines -join "`n") + "`n"))
-    $process.StandardInput.Close()
-    $stdoutText = $process.StandardOutput.ReadToEnd()
-    $stderrText = $process.StandardError.ReadToEnd()
-    $null = $process.WaitForExit()
+    # .NET Framework builds StandardInput with the CONSOLE input encoding, and
+    # a StreamWriter emits that encoding's preamble on its first flush - so a
+    # UTF-8-with-BOM console makes git read a BOM before 'start' and reject
+    # the whole transaction. Reading .BaseStream flushes too, so the only
+    # reliable fix is a preamble-free console input encoding for the duration
+    # of the call; it is restored in finally. Fail-closed: if it cannot be
+    # made preamble-free the transaction is not attempted at all.
+    $previousInputEncoding = $null
+    try { $previousInputEncoding = [Console]::InputEncoding } catch { }
+    try {
+        try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+        if ([Console]::InputEncoding.GetPreamble().Length -ne 0) {
+            return [pscustomobject]@{ Ok = $false; Reason = 'TRANSACTION NOT ATTEMPTED (console input encoding writes a byte-order mark)'; Detail = '' }
+        }
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $process.StandardInput.Write((($lines -join "`n") + "`n"))
+        $process.StandardInput.Close()
+        $stdoutText = $process.StandardOutput.ReadToEnd()
+        $stderrText = $process.StandardError.ReadToEnd()
+        $null = $process.WaitForExit()
+    }
+    finally {
+        if ($null -ne $previousInputEncoding) { try { [Console]::InputEncoding = $previousInputEncoding } catch { } }
+    }
     if ($process.ExitCode -eq 0) { return [pscustomobject]@{ Ok = $true; Reason = '' } }
     # Diagnostics only - never substituted for the captured OIDs.
     $reasons = @()
@@ -724,6 +835,121 @@ function Assert-FinalDestructivePreconditions {
     }
 }
 
+# ---------- post-integration partial-removal recovery ------------------------
+
+function Get-WorktreeAdminResidueReason {
+    # DIAGNOSIS ONLY - this function never authorises a deletion. It answers
+    # one narrow question: can it be POSITIVELY proven that no private
+    # worktree admin entry of this repository represents the given path?
+    # `git worktree list` reads the same store but silently OMITS entries
+    # whose representation is incomplete, so absence is proven here rather
+    # than inferred from that listing.
+    #
+    # An entry may be dismissed only when it is positively healthy AND
+    # conclusively describes a DIFFERENT, EXISTING worktree: it must not carry
+    # the target's own basename, and its gitdir pointer must exist, be
+    # readable, non-empty, single-valued, fully qualified, resolvable, and
+    # resolve to another worktree that actually exists. Everything else - a
+    # missing, empty, unreadable, malformed, ambiguous, contradictory or stale
+    # representation, or an admin store that cannot be enumerated - is
+    # INSPECTION UNCERTAINTY, never proof of absence. Unknown must remain
+    # unknown; an existing entry is never skipped just because its pointer
+    # cannot be read.
+    #
+    # Returns $null when absence is positively proven, otherwise the reason.
+    param($ctx, [string]$WorktreePath)
+    $dir = Join-Path $ctx.CommonDir 'worktrees'
+    try { if (-not (Test-Path -LiteralPath $dir)) { return $null } }
+    catch { return "the private worktree admin store '$dir' could not be inspected" }
+    try { $entries = @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction Stop) }
+    catch { return "the private worktree admin store '$dir' could not be enumerated" }
+    $leaf = [System.IO.Path]::GetFileName($WorktreePath.TrimEnd('\'))
+    foreach ($e in $entries) {
+        $what = "private worktree admin entry '$($e.Name)'"
+        # The basename is not accepted as identity proof in EITHER direction:
+        # an entry carrying the target's own name is never dismissed on the
+        # strength of its pointer contents alone.
+        if ($leaf -and (Test-SamePath $e.Name $leaf)) {
+            return "a $what carries the task worktree name and cannot be shown unrelated to it"
+        }
+        $gitdirFile = Join-Path $e.FullName 'gitdir'
+        try { $present = Test-Path -LiteralPath $gitdirFile -PathType Leaf }
+        catch { return "a $what could not be inspected" }
+        if (-not $present) { return "a $what has no gitdir pointer - its identity cannot be established" }
+        try { $raw = [System.IO.File]::ReadAllText($gitdirFile) }
+        catch { return "the gitdir pointer of a $what could not be read" }
+        $values = @(($raw -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        if ($values.Count -eq 0) { return "the gitdir pointer of a $what is empty - its identity cannot be established" }
+        if ($values.Count -gt 1) { return "the gitdir pointer of a $what resolves ambiguously (multiple values)" }
+        if ($values[0] -notmatch '^([A-Za-z]:[\\/]|\\\\)') {
+            return "the gitdir pointer of a $what is malformed (not a fully qualified path)"
+        }
+        try { $recorded = ConvertTo-NormalPath -Value $values[0] -Base $ctx.MainPath }
+        catch { return "the gitdir pointer of a $what is malformed and cannot be resolved" }
+        # the file records "<worktree>/.git"; the worktree is its parent
+        $owner = $null
+        try { $owner = [System.IO.Path]::GetDirectoryName($recorded) } catch { $owner = $null }
+        if (-not $owner) { return "the gitdir pointer of a $what does not resolve to a worktree" }
+        if (Test-SamePath $owner $WorktreePath) { return "a $what still refers to the task worktree" }
+        # A pointer resolving to a worktree that does not exist is NOT healthy
+        # unrelated state - the entry is stale or rewritten and its real
+        # identity is unproven. Uncertainty, never dismissal.
+        try { $ownerExists = Test-Path -LiteralPath $owner } catch { return "a $what could not be inspected" }
+        if (-not $ownerExists) {
+            return "the gitdir pointer of a $what resolves to a worktree that does not exist ('$owner') - its identity is unproven"
+        }
+    }
+    return $null
+}
+
+function Get-MarkerlessCleanupRefusal {
+    # READ-ONLY diagnosis of MARKERLESS / PARTIAL-REMOVAL state. It can only
+    # ever REFUSE: there is deliberately no "recoverable" outcome here, this
+    # function deletes nothing, and nothing it returns authorises a deletion.
+    #
+    # Automatic cleanup deletes a task branch or its metadata ONLY for a
+    # marker-backed worktree the helper can still fully prove it created.
+    # Once the private ownership marker or the private admin directory is
+    # gone the two-artifact ownership proof is unavailable, and no amount of
+    # metadata plus Git history reconstructs it: an earlier narrowed
+    # "proven residue" recovery was removed because the proof was inherently
+    # racy (admin state could change between the check and the ref
+    # transaction) and semantically incomplete. Such states are reported and
+    # left alone for an explicit human recovery checkpoint.
+    #
+    # Returns $null when the ordinary marker-backed lifecycle may proceed
+    # (the final destructive gate then re-proves everything independently),
+    # otherwise the precise RECOVERY REQUIRED diagnosis.
+    param($ctx, $identity)
+    $wt = $identity.WorktreePath
+    $registered = @(Get-WorktreeList -RepoPath $ctx.MainPath | Where-Object { Test-SamePath $_.Path $wt })
+    $exists = Test-Path -LiteralPath $wt
+    if ($registered.Count -eq 0) {
+        # Deregistered: whatever the directory looks like, the marker's home
+        # is gone or unprovable. Report what is observable; delete nothing.
+        $admin = Get-WorktreeAdminResidueReason -ctx $ctx -WorktreePath $wt
+        $detail = ''
+        if ($admin) { $detail = "; $admin" }
+        if (-not $exists) {
+            return "WORKTREE MISSING - the managed worktree is not registered and '$wt' is absent$detail"
+        }
+        if (Test-DirectoryEmpty -Path $wt) {
+            return "PARTIAL REMOVAL - the managed worktree is not registered and only an empty directory remains at '$wt'$detail"
+        }
+        return "WORKTREE NOT REGISTERED - '$wt' is not a registered worktree of this repository and still holds content$detail"
+    }
+    if (-not $exists) {
+        return "WORKTREE MISSING - the worktree is registered but '$wt' is absent"
+    }
+    # Registered and present: the private ownership marker must still be
+    # provable HERE, so a markerless state is reported as recovery required
+    # instead of continuing into the destructive gate.
+    $meta = Read-TaskMeta -ctx $ctx -identity $identity
+    try { Assert-OwnershipMarker -ctx $ctx -identity $identity -meta $meta -WorktreePath $wt }
+    catch { return "OWNERSHIP EVIDENCE UNPROVEN - $($_.Exception.Message)" }
+    return $null
+}
+
 function Invoke-CleanupCore {
     # Deletion stage; both finish's automatic cleanup and explicit cleanup
     # reach it. Throws 'CLEANUP DEFERRED: ...' / 'RECOVERY REQUIRED: ...' /
@@ -731,32 +957,43 @@ function Invoke-CleanupCore {
     # manual recursive-delete path, no force removal, and no unconditional
     # branch deletion anywhere.
     param($ctx, $identity, [string]$MetaPath)
-    # Move our own process working directory out of the worktree first, or a
-    # finish-current invoked from inside it would hold the folder open and
-    # always defer its own cleanup.
-    try {
-        [System.Environment]::CurrentDirectory = $ctx.MainPath
-        Set-Location -LiteralPath $ctx.MainPath
-    }
-    catch { }
     $wt = $identity.WorktreePath
     if (Test-SamePath $wt $ctx.MainPath) { throw 'cleanup refused: derived worktree path is the canonical repository' }
+    # Windows will not unlink a directory that is any process's current
+    # directory. Relocate THIS process out of the target and prove the result
+    # before anything that can remove the worktree; failure defers and deletes
+    # nothing. Task identity was derived before this point.
+    Set-SafeWorkingDirectory -SafePath $ctx.MainPath -WorktreePath $wt
     # F2 seam: fires after every earlier proof and before the final gate.
     Invoke-PreDeleteTestHook -ctx $ctx -identity $identity -meta $null
-    # ABSOLUTE missing-worktree policy: a cleanup that STARTS without the
-    # managed worktree never deletes the task branch or metadata, no matter
-    # what metadata or history says. This also covers an interruption between
-    # a previous worktree removal and its branch deletion: only the SAME
-    # uninterrupted invocation that removed the worktree may continue.
-    if (-not (Test-Path -LiteralPath $wt)) {
-        throw 'RECOVERY REQUIRED: WORKTREE MISSING - the managed worktree is absent; the helper will not delete the task branch or metadata reconstructed from metadata/history alone'
+
+    # ABSOLUTE missing-marker / partial-removal policy: automatic cleanup may
+    # only continue for a marker-backed, registered worktree. Every markerless
+    # or partially-removed state - deregistered, directory absent or empty,
+    # admin state incomplete or unreadable, marker unprovable - stops here
+    # with a precise diagnosis and NOTHING deleted. This also covers an
+    # interruption between a previous worktree removal and its branch
+    # deletion: only the SAME uninterrupted invocation that removed the
+    # worktree may continue to the branch deletion below.
+    $refusal = Get-MarkerlessCleanupRefusal -ctx $ctx -identity $identity
+    if ($refusal) {
+        throw "RECOVERY REQUIRED: $refusal; task branch and metadata are preserved and require an explicit human recovery checkpoint"
     }
     # THE final destructive precondition gate - nothing is deleted unless it
     # returns PROCEED with the captured Mclean snapshot.
     $proof = Assert-FinalDestructivePreconditions -ctx $ctx -identity $identity
     # git-owned removal, WITHOUT force; the exclusive handoff is held.
-    if (-not (Remove-WorktreeDir -ctx $ctx -WorktreePath $wt)) {
+    $removal = Remove-WorktreeDir -ctx $ctx -WorktreePath $wt
+    if ($removal -ceq 'FAILED') {
         throw 'CLEANUP DEFERRED: git worktree removal failed (locked or partial); branch and metadata preserved'
+    }
+    # CLEANED means the ENTIRE cleanup is observably complete, so the same
+    # positive absence proof runs here too - BEFORE the branch and metadata
+    # deletions, so remaining or uninspectable admin residue preserves
+    # everything instead of leaving a half-cleaned task behind.
+    $adminResidue = Get-WorktreeAdminResidueReason -ctx $ctx -WorktreePath $wt
+    if ($adminResidue) {
+        throw "CLEANUP DEFERRED: $adminResidue; task branch and metadata preserved"
     }
     # Seam for post-removal CAS regressions (production no-op).
     Invoke-PostRemovalTestHook -ctx $ctx -identity $identity -CapturedT $proof.ExpectedT -CapturedM $proof.Mclean
@@ -773,6 +1010,12 @@ function Invoke-CleanupCore {
     # Only after the confirmed conditional ref deletion: remove the single
     # derived metadata file (non-recursive, derived path).
     Remove-Item -LiteralPath $MetaPath -Force
+    if ($removal -ceq 'LEFTOVER') {
+        # Git deregistered and emptied the worktree and the whole Git-visible
+        # cleanup completed; only the empty folder could not be unlinked.
+        # Reported as its own outcome - never "removal failed", never CLEANED.
+        throw "CLEANUP INCOMPLETE: LEFTOVER DIRECTORY - git deregistered and emptied the worktree and the task branch and metadata were removed, but the empty directory '$wt' could not be unlinked (a process still has it open); delete the empty folder manually"
+    }
 }
 
 # ---------- commands --------------------------------------------------------
@@ -990,6 +1233,11 @@ function Invoke-FinishTask {
             Write-Host '  note  : your previous working directory was inside the removed worktree - move your session to the canonical repo or a new task worktree'
         }
     }
+    elseif ($cleanupOutcome -like 'CLEANUP INCOMPLETE*') {
+        # Git-visible cleanup completed; only an empty folder remains. There
+        # is nothing left for `cleanup` to do, so no retry hint is printed.
+        Write-Host $cleanupOutcome
+    }
     elseif ($cleanupOutcome -like 'CLEANUP DEFERRED*' -or $cleanupOutcome -like 'RECOVERY REQUIRED*') {
         Write-Host $cleanupOutcome
         Write-Host "  later : .\dev.ps1 cleanup $Worker $Task"
@@ -1083,7 +1331,7 @@ function Invoke-CleanupTask {
     }
     catch {
         $msg = $_.Exception.Message
-        if ($msg -like 'CLEANUP DEFERRED*' -or $msg -like 'RECOVERY REQUIRED*') {
+        if ($msg -like 'CLEANUP DEFERRED*' -or $msg -like 'RECOVERY REQUIRED*' -or $msg -like 'CLEANUP INCOMPLETE*') {
             Write-Host $msg
             # deterministic non-success: only CLEANED exits 0
             exit 1
@@ -1103,12 +1351,22 @@ function Invoke-Status {
     $ctx = Get-CanonicalContext
     if (-not (Test-Path -LiteralPath $ctx.TasksDir)) { Write-Host 'no helper tasks'; return }
     $rows = @()
+    # CLEANED tasks have no metadata left, so they are not listed; the states
+    # a listing can show are ACTIVE, INTEGRATED (cleanup pending) and
+    # INTEGRATED with a partial-removal note (recovery required).
+    $worktrees = @(Get-WorktreeList -RepoPath $ctx.MainPath)
     foreach ($w in @(Get-ChildItem -LiteralPath $ctx.TasksDir -Directory -ErrorAction SilentlyContinue)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $w.FullName -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
                 $m = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json
                 $note = ''
+                $wtPath = ConvertTo-NormalPath -Value $m.worktreePath -Base $ctx.MainPath
+                $isRegistered = (@($worktrees | Where-Object { Test-SamePath $_.Path $wtPath }).Count -gt 0)
                 if (-not (Test-Path -LiteralPath $m.worktreePath)) { $note += ' [WORKTREE MISSING]' }
+                if ($m.state -ceq 'INTEGRATED') {
+                    if ($isRegistered) { $note += ' [CLEANUP PENDING]' }
+                    else { $note += ' [PARTIAL REMOVAL - RECOVERY REQUIRED]' }
+                }
                 if ($m.state -ceq 'INTEGRATED' -and (Test-Sha1Hex $m.sourceTipSha)) {
                     $tip = Invoke-GitCapture -RepoPath $ctx.MainPath -GitArgs @('rev-parse', '--verify', '--quiet', "refs/heads/$($m.branch)")
                     if ($tip.ExitCode -ne 0 -or $tip.Lines[0] -cne $m.sourceTipSha) { $note += ' [REF CHANGED]' }
