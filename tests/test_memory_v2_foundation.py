@@ -781,17 +781,18 @@ class CompatibilityTests(unittest.TestCase):
     def test_migration_does_not_require_reset(self) -> None:
         self._build_v6_database()
         store = SQLiteMemoryStore(self.database)
-        # Memory V2 is migration 7; the scheduler foundation added 8 on top,
-        # and a v6 database still reaches the CURRENT schema in one open.
-        self.assertEqual(8, SCHEMA_VERSION)
-        self.assertEqual(8, store.schema_version())
+        # Memory V2 is migration 7; the scheduler foundation added 8 and
+        # its claim/lease coordination added 9 on top, and a v6 database
+        # still reaches the CURRENT schema in one open.
+        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(9, store.schema_version())
         # Reopen is idempotent and every migration step is recorded.
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, again.schema_version())
+        self.assertEqual(9, again.schema_version())
         connection = sqlite3.connect(self.database)
         try:
             self.assertEqual(
-                [(5,), (6,), (7,), (8,)],
+                [(5,), (6,), (7,), (8,), (9,)],
                 connection.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 ).fetchall(),
@@ -849,12 +850,13 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(MemoryOrigin.INFERRED, result.items[0].origin)
 
     def test_schema_versions_are_pinned(self) -> None:
-        # Memory V2 advanced the SQLITE storage schema to 7 and the
-        # scheduler foundation to 8; the output envelope contract is
-        # untouched by both and remains at version 6.
+        # Memory V2 advanced the SQLITE storage schema to 7, the scheduler
+        # foundation to 8 and scheduler claim/lease coordination to 9; the
+        # output envelope contract is untouched by all three and remains
+        # at version 6.
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
-        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(9, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
 
     def test_legacy_non_default_lifecycle_data_survives(self) -> None:

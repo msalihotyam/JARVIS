@@ -1674,7 +1674,16 @@ class ConservativeCancelTests(RecoveryTestCase):
         self.assertIn("NO CONNECTOR IS SIGNALLED", source)
 
     def test_no_deferred_s2b_machinery_was_smuggled_in(self) -> None:
-        """None of the S2B design space is implemented here."""
+        """None of the S2B design space is implemented here.
+
+        S2B is about the EXECUTION boundary: an attempt that crossed into a
+        connector and whose outcome is in doubt. Scheduler phase 2A added a
+        bounded lease, but it leases a job GENERATION - a place in a queue -
+        and never an execution attempt, so the two must not be confused. The
+        needles below therefore name attempt machinery specifically, and
+        ``test_no_execution_attempt_is_ever_leased_or_reclaimed`` proves the
+        separation from the durable schema rather than from a substring.
+        """
         for module in (SQLiteMemoryStore, AgentCore):
             source = inspect.getsource(module)
             # Named machinery, not prose: "orphan" appears in unrelated
@@ -1683,7 +1692,7 @@ class ConservativeCancelTests(RecoveryTestCase):
             for forbidden in (
                 "def heartbeat",
                 "heartbeat_at",
-                "lease_expires",
+                "attempt_lease",
                 "declare_attempt_unknown",
                 "def _detect_orphan",
                 "orphan_recovery",
@@ -1694,6 +1703,36 @@ class ConservativeCancelTests(RecoveryTestCase):
             ):
                 with self.subTest(module=module.__name__, symbol=forbidden):
                     self.assertNotIn(forbidden, source)
+
+    def test_no_execution_attempt_is_ever_leased_or_reclaimed(self) -> None:
+        """The one lease this build has belongs to a generation, not an attempt.
+
+        Proved from the durable schema, so a future edit that gave attempts an
+        expiry - the exact S2B capability that is deferred - fails here even
+        if it invented a brand-new column name for it.
+        """
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            attempt_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(execution_attempts)")
+            }
+            run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(job_runs)")
+            }
+        for column in attempt_columns:
+            for banned in ("lease", "heartbeat", "reclaim", "expires"):
+                self.assertNotIn(banned, column, f"execution_attempts.{column}")
+        # And the scheduler side really does own the only one.
+        self.assertIn("lease_expires_at_utc", run_columns)
+        # An in-doubt attempt is still non-replayable: nothing times it out.
+        task, attempt_id = self.signalling_task(AttemptState.IN_FLIGHT)
+        self.memory.mark_execution_unknown(attempt_id)
+        before = self.database_content()
+        self.assertEqual(
+            AttemptState.UNKNOWN_OUTCOME,
+            self.memory.latest_execution_attempt(task.id).state,
+        )
+        self.assertUntouched(before, "reading an in-doubt attempt")
 
 
 class RowAuthorityTests(RecoveryTestCase):

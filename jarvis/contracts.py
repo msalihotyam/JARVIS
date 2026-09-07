@@ -6936,6 +6936,41 @@ UNSETTLED_JOB_RUN_STATUSES = frozenset(
 #: drift apart or leave a member unclassified.
 SETTLED_JOB_RUN_STATUSES = frozenset(JobRunStatus) - UNSETTLED_JOB_RUN_STATUSES
 
+#: Scheduler phase 2A. The NARROWEST set of coordination states from which a
+#: worker may take ownership of a generation, and deliberately not "everything
+#: unsettled".
+#:
+#: ``PENDING`` is unowned. ``CLAIMED`` is owned but has started NO external
+#: action, so once its lease has expired another worker may take over with a
+#: strictly newer fencing epoch and nothing outside this database can have
+#: been affected.
+#:
+#: Every other unsettled state is refused, because a lease expiring is not
+#: evidence that the previous owner's external action did not happen:
+#: ``RUNNING`` may have crossed a connector boundary, ``UNKNOWN_OUTCOME`` is
+#: the explicit record that nobody could establish whether it did, and
+#: ``AWAITING_APPROVAL`` belongs to an approval a human answered for one
+#: specific attempt. Reclaiming any of them would risk a duplicate external
+#: effect, so they FAIL CLOSED and the generation stays blocked - which also
+#: blocks every later generation, by the one-unsettled-generation rule. That
+#: is the intended outcome: a human resolves it, no timer does.
+CLAIMABLE_JOB_RUN_STATUSES = frozenset(
+    {JobRunStatus.PENDING, JobRunStatus.CLAIMED}
+)
+
+#: The approved bounded lease window. A lease is COORDINATION ONLY - it says
+#: which worker currently owns a generation, and it grants no approval, no
+#: connector authority and no permission to execute anything.
+#:
+#: Both ends are refused rather than clamped: a caller that asked for a lease
+#: the architecture does not offer has a bug, and silently substituting a
+#: different expiry would leave it believing it owns the run for a window it
+#: does not. The floor keeps an ownership window long enough to be renewable
+#: without a heartbeat thread; the ceiling bounds how long a crashed worker
+#: can block its job - the only thing an expiry ever unblocks.
+MIN_JOB_LEASE = timedelta(seconds=30)
+MAX_JOB_LEASE = timedelta(minutes=15)
+
 
 def job_identifier_refusal(value: Any, label: str = "identifier") -> str | None:
     """Why this is not a canonical UUID identifier, or ``None``.
@@ -7437,19 +7472,20 @@ class JobRun:
     digest is derived from that snapshot rather than stored beside it, so the
     two can never disagree.
 
-    The dispatch fields - ``owner_token``, ``fencing_epoch``,
-    ``claimed_at`` - exist and are INERT. Phase 1B writes none of them and no
-    code path reads one to decide anything. They are here because they are
-    part of the ROW SHAPE the storage constraints are written against
-    (``fencing_epoch`` is NOT NULL with its own CHECK), so a schema that
-    gained them later would have to be rewritten under live durable data.
+    The coordination fields - ``owner_token``, ``fencing_epoch``,
+    ``claimed_at``, ``lease_expires_at_utc`` - became live in phase 2A. They
+    answer exactly ONE question: which worker currently owns this generation.
+    They answer no other. A valid lease is not an approval, not a grant, not
+    a connector authority and not permission to execute anything; every gate
+    real work must pass is still ahead of it and is re-proved on the trusted
+    path.
 
-    There is deliberately NO lease-expiry field. The schema does not need one
-    - no constraint refers to it, and a nullable timestamp is the cheapest
-    later migration there is - and the repository already ships a guard
-    asserting that no lease/heartbeat/orphan-reclaim machinery exists yet.
-    Adding the column while that is true would be the schema claiming a
-    capability the product does not have.
+    ``owner_token`` and ``lease_expires_at_utc`` are one indivisible fact and
+    are refused apart: an owner without an expiry would be an unbounded lease,
+    and an expiry without an owner would be a lease nobody holds. The FENCING
+    epoch is the monotonic half - it advances on every acquisition and never
+    on a renewal, so a token alone is never sufficient fencing and an owner
+    displaced by a takeover becomes unusable rather than merely stale.
 
     There is deliberately NO second execution journal here. When execution
     exists it will bind to the existing H2 ``execution_attempts`` row through
@@ -7469,6 +7505,7 @@ class JobRun:
     attempt_id: str | None = None
     owner_token: str | None = None
     fencing_epoch: int = 0
+    lease_expires_at_utc: str | None = None
     cancel_requested: bool = False
     blocking_code: str | None = None
     condition_result: str | None = None
@@ -7493,10 +7530,16 @@ class JobRun:
         for name in ("nominal_due_at_utc", "created_at"):
             if canonical_utc_timestamp(getattr(self, name)) is None:
                 raise JobError(f"{name} is not a canonical UTC timestamp")
-        for name in ("claimed_at", "settled_at"):
+        for name in ("claimed_at", "settled_at", "lease_expires_at_utc"):
             value = getattr(self, name)
             if value is not None and canonical_utc_timestamp(value) is None:
                 raise JobError(f"{name} is not a canonical UTC timestamp")
+        # One indivisible fact, refused apart at BOTH boundaries: an owner
+        # with no expiry is an unbounded lease and an expiry with no owner is
+        # a lease nobody holds. Either shape would let a reader conclude
+        # ownership the other reader denies.
+        if (self.owner_token is None) != (self.lease_expires_at_utc is None):
+            raise JobError("the lease owner and its expiry disagree")
         if self.blocking_code is not None:
             try:
                 ErrorCode(self.blocking_code)
@@ -7533,6 +7576,81 @@ class JobRun:
     @property
     def settled(self) -> bool:
         return self.status in SETTLED_JOB_RUN_STATUSES
+
+    def lease_is_live(self, now: datetime) -> bool:
+        """Whether a lease this generation holds is still live AT ``now``.
+
+        THE one definition of lease expiry, so no store can hold a second
+        one: half-open, ``now < expiry``, so the instant of expiry is already
+        expired and two implementations asked the same question at the same
+        instant cannot disagree about who owns the run.
+
+        ``now`` is EXPLICIT. There is no clock here on purpose - an expiry
+        judged against a machine clock would be untestable, and on a machine
+        whose clock is wrong it would hand ownership to a second worker while
+        the first still believed it held the lease.
+        """
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        if self.lease_expires_at_utc is None:
+            return False
+        return now < datetime.fromisoformat(self.lease_expires_at_utc)
+
+    def claimable_at(self, now: datetime) -> bool:
+        """Whether a worker may take ownership of this generation at ``now``.
+
+        Two independent conditions, both required. The COORDINATION STATE must
+        be one of the narrow claimable ones - which is what makes an uncertain
+        external outcome fail closed rather than time out into a second
+        attempt - and no live lease may already own it.
+        """
+        return (
+            not self.settled
+            and self.status in CLAIMABLE_JOB_RUN_STATUSES
+            and not self.lease_is_live(now)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobRunLease:
+    """The immutable result of ONE successful claim, reclaim or renewal.
+
+    Everything a worker must present to act on the generation again, and
+    nothing it must not act on: the identity it owns, the fencing epoch that
+    makes it the CURRENT owner rather than a displaced one, and the instant
+    that ownership stops. The snapshot, the declaration and the predicate are
+    deliberately absent - a lease says who coordinates, never what to do.
+
+    Holding one authorizes NOTHING outside this database. It creates no
+    approval, consumes no grant, opens no execution attempt, reserves no money
+    and reaches no connector.
+    """
+
+    run_id: str
+    job_id: str
+    job_revision: int
+    generation: int
+    owner_token: str
+    fencing_epoch: int
+    lease_expires_at_utc: str
+    claimed_at: str
+
+    def __post_init__(self) -> None:
+        for value, label in ((self.run_id, "run id"), (self.job_id, "job id")):
+            reason = job_identifier_refusal(value, label)
+            if reason is not None:
+                raise JobError(reason)
+        _exact_index(self.job_revision, "job_revision", minimum=1)
+        _exact_index(self.generation, "generation", minimum=1)
+        # A lease is only ever handed back for an ACQUIRED ownership, so the
+        # epoch floor here is 1 rather than the row's 0: an epoch of 0 would
+        # mean this lease describes an ownership that never happened.
+        _exact_index(self.fencing_epoch, "fencing_epoch", minimum=1)
+        if chain_id_refusal(self.owner_token) is not None:
+            raise JobError("owner_token is not a usable identifier")
+        for name in ("lease_expires_at_utc", "claimed_at"):
+            if canonical_utc_timestamp(getattr(self, name)) is None:
+                raise JobError(f"{name} is not a canonical UTC timestamp")
 
 
 @dataclass(frozen=True, slots=True)
@@ -7575,6 +7693,14 @@ class JobRunSummary:
     present because it identifies WHICH definition the generation was for
     without disclosing any of it, exactly as the deliverable projection
     reports a digest instead of an answer.
+
+    The phase-2A coordination fields follow the same law. Whether a run is
+    CLAIMED, when its lease stops and which fencing epoch is current are
+    operational lifecycle an operator needs in order to understand why a job
+    is not progressing. The OWNER TOKEN is deliberately absent: it is an
+    opaque caller-supplied value this store never inspects, so it cannot be
+    asserted to be non-secret, and a listing must not become the one place a
+    worker's private identifier is printed.
     """
 
     id: str
@@ -7591,6 +7717,9 @@ class JobRunSummary:
     attempt_id: str | None = None
     blocking_code: str | None = None
     condition_result: str | None = None
+    claimed: bool | None = None
+    fencing_epoch: int | None = None
+    lease_expires_at_utc: str | None = None
 
 
 class MemoryStore(Protocol):
@@ -7862,6 +7991,116 @@ class MemoryStore(Protocol):
         occurrence has not been recorded before. The last two must be enforced
         by the storage layer itself, not only in application code, so a writer
         that bypasses this method still cannot create a second live generation.
+        """
+        ...
+
+    # -- Scheduler phase 2A: due generation + claim / lease / fencing ------
+    #
+    # COORDINATION ONLY, and the boundary is unchanged by it. A store may
+    # decide what is due, which durable generation exists and which worker
+    # owns a bounded lease on it. It may not, from any method below,
+    # materialize an AgentCore task, create an approval, consume a grant, open
+    # an execution attempt, create a reservation, reach a connector, evaluate
+    # a predicate, perform an on_true action, start a worker or retry an
+    # unknown outcome. A worker holding a valid lease has taken a place in a
+    # queue; it has been granted nothing.
+    #
+    # Every one of them takes an EXPLICIT ``now``. There is no clock in this
+    # contract, so due-ness, lease expiry and takeover eligibility are
+    # reproducible from arguments alone.
+
+    def materialize_due_job_run(
+        self, job_id: str, expected_revision: int, *, now: datetime
+    ) -> "JobRun | None":
+        """Create the next durable generation IF this job is due at ``now``.
+
+        ``None`` when there is simply nothing to create - the job is not
+        schedulable, its stored next due instant is absent or still in the
+        future, an unsettled generation is already open, or this occurrence
+        was already recorded. Not-due is an ordinary answer, not a failure.
+
+        ``JobError`` when the caller's own premise is wrong: an unusable job,
+        or a ``expected_revision`` the job has moved past. A definition that
+        changed under a planning caller must fail deterministically rather
+        than materialize an occurrence of a job that no longer exists in that
+        form.
+
+        MISSED OCCURRENCES ARE COALESCED, in bounded work. The occurrence
+        created is the LATEST one the schedule names at or before ``now``,
+        asked once of the pure kernel - so a machine offline for a year
+        creates exactly one generation, not a year of backlog, and costs what
+        a machine offline for a minute costs. A ``ONE_TIME`` job therefore
+        materializes at most once ever, and a condition watch materializes at
+        most one fresh check opportunity: nothing here evaluates a predicate.
+        """
+        ...
+
+    def claim_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        *,
+        now: datetime,
+        lease: timedelta,
+    ) -> "JobRunLease":
+        """Take exclusive coordination ownership of ONE generation, atomically.
+
+        Succeeds only for a generation in a claimable coordination state with
+        no live lease on it, and the two competing workers case must resolve
+        to exactly one winner: the loser is refused, it does not receive the
+        same fencing epoch.
+
+        On success the exact ``owner_token`` is stored verbatim, the fencing
+        epoch advances by one, the claim instant is recorded and the lease
+        expiry is stored as canonical UTC. ``lease`` must lie inside
+        ``[MIN_JOB_LEASE, MAX_JOB_LEASE]`` and is REFUSED outside it, never
+        clamped.
+
+        Claiming is not authority. It creates no approval, no task, no
+        attempt, no reservation and reaches no connector.
+        """
+        ...
+
+    def renew_job_run_lease(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+        lease: timedelta,
+    ) -> "JobRunLease":
+        """Extend a lease the caller can still PROVE it currently holds.
+
+        Requires the exact owner token AND the exact fencing epoch: a token
+        alone is never sufficient fencing, so an owner displaced by a takeover
+        is refused even though it still remembers its token. A renewal is also
+        refused once the lease has already expired - by then another worker
+        may legitimately own the run, and a store cannot un-expire it.
+
+        A renewal moves the expiry and NOTHING else: not the generation, not
+        the job revision, not the snapshot, not the nominal due instant, and
+        not the fencing epoch - the epoch marks ACQUISITION, and a renewal is
+        not one.
+        """
+        ...
+
+    def release_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> "JobRun":
+        """Voluntarily give up a lease the caller currently holds.
+
+        The same exact owner-plus-epoch proof as a renewal, and the same
+        narrow state gate: a generation whose external outcome could be in
+        doubt is not releasable, because releasing is a statement about
+        COORDINATION only. It returns the generation to unowned so the next
+        worker need not wait out the lease; it settles nothing, cancels
+        nothing and asserts nothing about the outside world.
         """
         ...
 

@@ -820,10 +820,10 @@ class PersistenceTests(ModelAnswerTestCase):
     def test_the_sqlite_schema_is_unchanged(self) -> None:
         from jarvis.memory import SCHEMA_VERSION
 
-        # Scheduler phase 1B owns the current SQLite schema version; this
+        # Scheduler phase 2A owns the current SQLite schema version; this
         # milestone adds no storage schema of its own.
-        self.assertEqual(8, SCHEMA_VERSION)
-        self.assertEqual(8, self.memory.schema_version())
+        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(9, self.memory.schema_version())
 
 
 # --------------------------------------------------------------------------

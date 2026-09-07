@@ -7,7 +7,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
@@ -45,10 +45,14 @@ from jarvis.contracts import (
     ErrorCode,
     ExecutionAttempt,
     JOB_SPEC_MAX_BYTES,
+    CLAIMABLE_JOB_RUN_STATUSES,
+    MAX_JOB_LEASE,
+    MIN_JOB_LEASE,
     JobError,
     JobKind,
     JobRecord,
     JobRun,
+    JobRunLease,
     JobRunStatus,
     JobRunSummary,
     JobSpec,
@@ -136,7 +140,7 @@ from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -458,12 +462,17 @@ _SCHEDULER_SCHEMA_SQL = f"""
         task_id TEXT,
         chain_id TEXT,
         attempt_id TEXT,
-        -- Future dispatch ownership. INERT in this phase: nothing writes or
-        -- reads them, and they are here because they are part of the row
-        -- shape the constraints below are written against. There is
-        -- deliberately NO lease-expiry column: no constraint would refer to
-        -- it, and the repository still asserts that no lease / heartbeat /
-        -- orphan-reclaim machinery exists anywhere in this store.
+        -- Coordination ownership, live since phase 2A. Which worker owns
+        -- this generation and until when - and nothing else: no approval, no
+        -- grant, no connector authority, no permission to execute. The
+        -- phase-2A ``lease_expires_at_utc`` column is added by
+        -- ``_SCHEDULER_LEASE_SQL`` below rather than declared here, so a
+        -- migrated database and a fresh one end up with the same job_runs
+        -- SHAPE - same columns in the same order, same constraints, same
+        -- indexes. Not the same stored DDL TEXT: SQLite keeps whatever
+        -- CREATE text the release that made the table wrote, comments and
+        -- all, so an older database's sqlite_master SQL still reads the way
+        -- that release wrote it.
         owner_token TEXT,
         fencing_epoch INTEGER NOT NULL DEFAULT 0,
         cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -494,6 +503,45 @@ _SCHEDULER_SCHEMA_SQL = f"""
     CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_unsettled
         ON job_runs(job_id) WHERE settled_at IS NULL;
 """
+
+#: Scheduler phase 2A. The ONE field a bounded lease needs that schema 8 did
+#: not have, applied by the additive 8 -> 9 migration and, identically, on
+#: every fresh creation.
+#:
+#: An ``ALTER TABLE`` on both paths rather than a column inside the ``CREATE``
+#: above, deliberately: SQLite appends an added column to the stored DDL text,
+#: so declaring it in place would put it in a different POSITION on the two
+#: paths - fresh databases would carry it mid-table, migrated ones last. The
+#: ALTER on both paths keeps the column order, and with it the whole job_runs
+#: shape, the same everywhere. Stored DDL text still differs between an old
+#: database and a fresh one, because SQLite preserves the CREATE text - including
+#: its comments - of whichever release built the table; structure is what is
+#: held identical, and structure is what every read and write depends on.
+#:
+#: There is no accompanying CHECK because ``ALTER TABLE ADD COLUMN`` cannot
+#: add a table constraint, and rebuilding ``job_runs`` under live durable data
+#: to gain one would be the most dangerous possible way to express it. The
+#: owner/expiry pairing is instead refused by ``JobRun`` at construction,
+#: which every read path goes through and which fails CLOSED: a row carrying
+#: half a lease loads as ``None`` and can never be claimed, renewed or
+#: reclaimed. The load-bearing atomicity - one winner per acquisition - is not
+#: a constraint at all; it is the compare-and-set in each ``UPDATE``'s
+#: ``WHERE`` clause under ``BEGIN IMMEDIATE``.
+_SCHEDULER_LEASE_SQL = "ALTER TABLE job_runs ADD COLUMN lease_expires_at_utc TEXT"
+
+
+def _add_scheduler_lease_column(connection: sqlite3.Connection) -> None:
+    """Add the phase-2A lease column if it is not already there.
+
+    Idempotent by inspection rather than by exception: ``ALTER TABLE`` has no
+    ``IF NOT EXISTS``, and catching ``OperationalError`` would also swallow a
+    genuinely broken table.
+    """
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(job_runs)").fetchall()
+    }
+    if "lease_expires_at_utc" not in columns:
+        connection.execute(_SCHEDULER_LEASE_SQL)
 
 
 class SQLiteMemoryStore:
@@ -623,6 +671,9 @@ class SQLiteMemoryStore:
         if target_version == 8:
             self._migrate_scheduler_jobs(connection)
             return
+        if target_version == 9:
+            self._migrate_scheduler_lease(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
 
     @staticmethod
@@ -642,6 +693,25 @@ class SQLiteMemoryStore:
         been upgraded.
         """
         connection.executescript(_SCHEDULER_SCHEMA_SQL)
+
+    @staticmethod
+    def _migrate_scheduler_lease(connection: sqlite3.Connection) -> None:
+        """Add the bounded-lease expiry column additively (2A).
+
+        ONE nullable column on ONE table. No existing table is altered
+        otherwise, no index is added or dropped, no existing row is read,
+        rewritten, reclassified or deleted - every schema-8 database keeps its
+        jobs, its generations and its full non-scheduler history byte-for-byte,
+        and every session, task, grant, attempt, reservation and memory record
+        behaves identically after the upgrade.
+
+        No authority is invented. Existing generations acquire the column with
+        the value NULL, which is precisely "no lease" - the upgrade hands no
+        run to any worker, and a schema-8 database that was blocked on an
+        uncertain outcome stays blocked, because expiry alone never unblocks
+        one.
+        """
+        _add_scheduler_lease_column(connection)
 
     @staticmethod
     def _migrate_typed_memory(connection: sqlite3.Connection) -> None:
@@ -1087,10 +1157,11 @@ class SQLiteMemoryStore:
                 ON attempt_billing(ledger_month, state);
             """
         )
-        # Scheduler phase 1B tables, from the SAME definition the 7 -> 8
-        # migration applies, so a migrated database and a fresh one cannot
-        # diverge in a constraint.
+        # Scheduler tables, from the SAME definitions the 7 -> 8 and 8 -> 9
+        # migrations apply and in the same order, so a migrated database and a
+        # fresh one cannot diverge in a constraint or in their stored DDL.
         connection.executescript(_SCHEDULER_SCHEMA_SQL)
+        _add_scheduler_lease_column(connection)
 
     def schema_version(self) -> int:
         with self._connection() as connection:
@@ -4855,6 +4926,7 @@ class SQLiteMemoryStore:
                 attempt_id=row["attempt_id"],
                 owner_token=row["owner_token"],
                 fencing_epoch=row["fencing_epoch"],
+                lease_expires_at_utc=row["lease_expires_at_utc"],
                 cancel_requested=SQLiteMemoryStore._job_flag(
                     row["cancel_requested"], "cancel_requested"
                 ),
@@ -4875,11 +4947,20 @@ class SQLiteMemoryStore:
         "last_run_id, next_generation, created_at, updated_at"
     )
 
+    #: A generation plus the ONE fact it cannot check about itself: its
+    #: owning job's current revision. Named once so the five paths that need
+    #: the fail-closed rebuild cannot drift into asking different questions.
+    _JOB_RUN_WITH_OWNER = (
+        "SELECT r.*, j.revision AS owner_revision "
+        "FROM job_runs AS r JOIN jobs AS j ON j.id = r.job_id WHERE r.id = ?"
+    )
+
     _JOB_RUN_COLUMNS = (
         "id, job_id, job_revision, generation, nominal_due_at_utc, project_id, "
         "spec_json, snapshot_digest, status, session_id, task_id, chain_id, "
-        "attempt_id, owner_token, fencing_epoch, cancel_requested, "
-        "blocking_code, condition_result, created_at, claimed_at, settled_at"
+        "attempt_id, owner_token, fencing_epoch, lease_expires_at_utc, "
+        "cancel_requested, blocking_code, condition_result, created_at, "
+        "claimed_at, settled_at"
     )
 
     @staticmethod
@@ -4915,6 +4996,45 @@ class SQLiteMemoryStore:
                 record.updated_at,
             ),
         )
+
+    @staticmethod
+    def _insert_job_run(connection: sqlite3.Connection, run: JobRun) -> None:
+        """INSERT one new generation row from a validated run.
+
+        Every association and every coordination field is written as an
+        explicit NULL / 0 rather than left to a column default: a generation
+        is born unowned, unleased and unmaterialized, and saying so in the
+        statement is what keeps a later default change from quietly handing a
+        new run an owner.
+        """
+        try:
+            connection.execute(
+                """
+                INSERT INTO job_runs
+                    (id, job_id, job_revision, generation, nominal_due_at_utc,
+                     project_id, spec_json, snapshot_digest, status, session_id,
+                     task_id, chain_id, attempt_id, owner_token, fencing_epoch,
+                     lease_expires_at_utc, cancel_requested, blocking_code,
+                     condition_result, created_at, claimed_at, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                        NULL, ?, NULL, 0, NULL, NULL, ?, NULL, NULL)
+                """,
+                (
+                    run.id,
+                    run.job_id,
+                    run.job_revision,
+                    run.generation,
+                    run.nominal_due_at_utc,
+                    run.spec.project_id,
+                    run.spec.encoded(),
+                    run.snapshot_digest,
+                    run.status.value,
+                    run.fencing_epoch,
+                    run.created_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise JobError("that generation could not be recorded") from exc
 
     @staticmethod
     def _update_job(
@@ -5194,34 +5314,7 @@ class SQLiteMemoryStore:
                 nominal_due_at_utc=nominal,
                 spec=record.spec,
             )
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO job_runs
-                        (id, job_id, job_revision, generation, nominal_due_at_utc,
-                         project_id, spec_json, snapshot_digest, status, session_id,
-                         task_id, chain_id, attempt_id, owner_token, fencing_epoch,
-                         cancel_requested, blocking_code, condition_result,
-                         created_at, claimed_at, settled_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
-                            NULL, ?, 0, NULL, NULL, ?, NULL, NULL)
-                    """,
-                    (
-                        run.id,
-                        run.job_id,
-                        run.job_revision,
-                        run.generation,
-                        run.nominal_due_at_utc,
-                        run.spec.project_id,
-                        run.spec.encoded(),
-                        run.snapshot_digest,
-                        run.status.value,
-                        run.fencing_epoch,
-                        run.created_at,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise JobError("that generation could not be recorded") from exc
+            self._insert_job_run(connection, run)
             # Bookkeeping only: the monotonic counter advances, the last-run
             # pointer moves, and the next due instant becomes the next one
             # this schedule names AFTER the occurrence just recorded - all
@@ -5238,6 +5331,349 @@ class SQLiteMemoryStore:
                 expected_revision=record.revision,
             )
         return run
+
+    # ----------------------------------------------------------------
+    # Scheduler phase 2A. DUE GENERATION + CLAIM / LEASE / FENCING.
+    #
+    # Coordination, and only coordination. Everything below decides what is
+    # due, which durable generation exists and which worker currently owns a
+    # bounded lease on it. NONE of it materializes an AgentCore task, creates
+    # an approval, consumes a grant, opens an execution attempt, creates a
+    # reservation, reaches a connector, evaluates a predicate, performs an
+    # on_true action, starts a thread or retries an unknown outcome. A worker
+    # holding a valid lease has taken a place in a queue; it has been granted
+    # nothing, and every authority gate real work must pass is still ahead of
+    # it, unchanged.
+    #
+    # Atomicity comes from two things together, not from either alone. Each
+    # method runs inside BEGIN IMMEDIATE, so writers serialize; and each
+    # UPDATE carries the state it read in its own WHERE clause, so a write
+    # applied to a row that moved is refused rather than silently landing.
+    # That is what makes two competing workers resolve to exactly one winner
+    # with exactly one fencing epoch.
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _lease_expiry(lease: Any, now: datetime) -> str:
+        """The canonical UTC instant a lease of this length would stop.
+
+        The bounds are REFUSED, never clamped. A caller that asked for a lease
+        the architecture does not offer has a bug, and quietly substituting a
+        different expiry would leave it believing it owns a generation for a
+        window it does not - which is exactly the belief a fencing epoch
+        exists to make unfalsifiable.
+        """
+        if type(lease) is not timedelta:
+            raise JobError("lease is not a timedelta")
+        if lease < MIN_JOB_LEASE or lease > MAX_JOB_LEASE:
+            raise JobError(
+                f"lease is outside the approved {MIN_JOB_LEASE} .. "
+                f"{MAX_JOB_LEASE} window"
+            )
+        return (now + lease).isoformat()
+
+    def _owned_run(self, connection: sqlite3.Connection, run_id: str) -> JobRun:
+        """One generation rebuilt fail-closed, or a deterministic refusal.
+
+        A corrupted generation - including one carrying half a lease - is
+        refused exactly as a missing one is. It stays physically stored and
+        stays unclaimable, which is the safe direction: an unreadable row is
+        one whose external history nobody can establish.
+        """
+        row = connection.execute(self._JOB_RUN_WITH_OWNER, (run_id,)).fetchone()
+        run = (
+            None if row is None else self._job_run_from_row(row, row["owner_revision"])
+        )
+        if run is None:
+            raise JobError("no usable generation with that identity")
+        return run
+
+    @staticmethod
+    def _held_lease(
+        run: JobRun, owner_token: Any, fencing_epoch: Any, now: datetime
+    ) -> None:
+        """Refuse unless the caller can PROVE it is the current owner NOW.
+
+        Three independent proofs, all required.
+
+        The TOKEN must match exactly - not a prefix, not a normalization. The
+        FENCING EPOCH must match too, which is the whole point of having one:
+        a worker displaced by a takeover still remembers its token, and a
+        token alone would let it write over its successor. And the lease must
+        still be LIVE, because once it has expired another worker may
+        legitimately have taken the run, and no store can un-expire it after
+        the fact.
+        """
+        if type(fencing_epoch) is not int or isinstance(fencing_epoch, bool):
+            raise JobError("fencing_epoch is not an exact integer")
+        if run.settled:
+            raise JobError("the generation is already settled")
+        if run.owner_token is None:
+            raise JobError("the generation carries no lease")
+        if run.owner_token != owner_token or run.fencing_epoch != fencing_epoch:
+            raise JobError("the caller does not hold this lease")
+        if not run.lease_is_live(now):
+            raise JobError("the lease has expired")
+
+    @staticmethod
+    def _lease_result(run: JobRun) -> JobRunLease:
+        """The immutable receipt for a run whose lease was just written."""
+        return JobRunLease(
+            run_id=run.id,
+            job_id=run.job_id,
+            job_revision=run.job_revision,
+            generation=run.generation,
+            owner_token=run.owner_token,
+            fencing_epoch=run.fencing_epoch,
+            lease_expires_at_utc=run.lease_expires_at_utc,
+            claimed_at=run.claimed_at,
+        )
+
+    def materialize_due_job_run(
+        self, job_id: str, expected_revision: int, *, now: datetime
+    ) -> JobRun | None:
+        """Create the next durable generation IF this job is due at ``now``.
+
+        MISSED OCCURRENCES ARE COALESCED, and the coalescing is what keeps the
+        work bounded. The occurrence created is ``latest_occurrence`` - the
+        single latest instant the schedule names at or before ``now`` - asked
+        ONCE of the pure kernel. A machine offline for a year therefore
+        creates exactly one generation and costs exactly what a machine
+        offline for a minute costs; nothing here enumerates a missed history,
+        so no backlog can exist to be unbounded.
+
+        The three kinds fall out of that one rule rather than needing three:
+
+        * ONE_TIME materializes at most once EVER - after its single instant
+          the schedule names nothing later, the stored next due becomes NULL,
+          and the occurrence key would refuse a repeat even if it did not;
+        * RECURRING skips straight to the newest due occurrence;
+        * CONDITION_WATCH gets at most one fresh CHECK OPPORTUNITY, and
+          nothing here evaluates its predicate, reads its target, produces a
+          TRUE/FALSE/UNKNOWN or performs its on_true declaration.
+
+        ``None`` is the ordinary "nothing to do" answer: not schedulable, not
+        yet due, a generation already open, or this occurrence already
+        recorded. ``JobError`` is reserved for a caller whose own premise is
+        wrong - an unusable job, or a revision the definition has moved past.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        with self._connection(write=True) as connection:
+            # The same compare-and-set gate every definition change goes
+            # through. A caller decided this job was due from a revision it
+            # read earlier; if the definition moved in between, materializing
+            # would record an occurrence of a job that no longer exists in
+            # that form.
+            record = self._job_for_update(connection, job_id, expected_revision)
+            if not record.schedulable or record.next_due_at_utc is None:
+                return None
+            due = datetime.fromisoformat(record.next_due_at_utc)
+            if moment < due:
+                return None
+            try:
+                occurrence = latest_occurrence(record.spec.schedule, moment)
+            except ScheduleError as exc:
+                # A schedule that cannot answer must not read as "not due".
+                raise JobError("the schedule could not name an occurrence") from exc
+            if occurrence is None or occurrence < due:
+                return None
+            # The engine own spelling, so one instant can never become two
+            # rows by being rendered two ways.
+            nominal = occurrence.isoformat()
+            open_run = connection.execute(
+                "SELECT id FROM job_runs WHERE job_id = ? AND settled_at IS NULL",
+                (job_id,),
+            ).fetchone()
+            if open_run is not None:
+                # The one-unsettled-generation rule stays authoritative, and
+                # it is not an error here: a job whose previous occurrence is
+                # still open simply has nothing new to materialize. An
+                # UNSETTLED uncertain outcome therefore blocks every later
+                # generation, which is the intended fail-closed behaviour.
+                return None
+            duplicate = connection.execute(
+                "SELECT id FROM job_runs WHERE job_id = ? AND job_revision = ? "
+                "AND nominal_due_at_utc = ?",
+                (job_id, record.revision, nominal),
+            ).fetchone()
+            if duplicate is not None:
+                return None
+            run = JobRun(
+                job_id=record.id,
+                job_revision=record.revision,
+                generation=record.next_generation,
+                nominal_due_at_utc=nominal,
+                spec=record.spec,
+            )
+            self._insert_job_run(connection, run)
+            # Advancing the anchor is TRANSACTIONAL with creating the
+            # generation - the same immediate transaction - so a crash can
+            # never leave a job whose occurrence exists but whose next due
+            # still points at it.
+            self._update_job(
+                connection,
+                replace(
+                    record,
+                    last_run_id=run.id,
+                    next_generation=record.next_generation + 1,
+                    next_due_at_utc=self._next_due(record.spec, occurrence),
+                    updated_at=utc_now(),
+                ),
+                expected_revision=record.revision,
+            )
+        return run
+
+    def claim_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        *,
+        now: datetime,
+        lease: timedelta,
+    ) -> JobRunLease:
+        """Take exclusive coordination ownership of ONE generation, atomically.
+
+        CLAIMING IS NOT AUTHORITY. It creates no task, no approval, no grant
+        consumption, no execution attempt and no reservation, and it reaches
+        no connector. It answers one question - which worker coordinates this
+        occurrence - and the answer expires.
+
+        Two competing workers cannot both win. The row is re-read inside the
+        immediate transaction and the UPDATE names the fencing epoch it
+        expects, so the second writer finds either a live lease or an epoch
+        that has already moved, and is refused. The winner epoch is strictly
+        greater than every epoch this run has ever had.
+
+        A generation whose external outcome could be in doubt is NOT claimable
+        - see ``CLAIMABLE_JOB_RUN_STATUSES``. An expired lease is evidence
+        about coordination, never evidence that the previous owner external
+        action did not happen.
+        """
+        if chain_id_refusal(owner_token) is not None:
+            raise JobError("owner_token is not a usable identifier")
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, moment)
+        claimed_at = moment.isoformat()
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            if not run.claimable_at(moment):
+                # ONE refusal for every unclaimable shape - settled, already
+                # live-leased, RUNNING, UNKNOWN_OUTCOME, AWAITING_APPROVAL -
+                # so a caller cannot probe a run coordination state through
+                # the differences between refusals.
+                raise JobError("the generation is not claimable")
+            claimed = replace(
+                run,
+                status=JobRunStatus.CLAIMED,
+                owner_token=owner_token,
+                fencing_epoch=run.fencing_epoch + 1,
+                lease_expires_at_utc=expires,
+                claimed_at=claimed_at,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, owner_token = ?, fencing_epoch = ?,
+                       lease_expires_at_utc = ?, claimed_at = ?
+                 WHERE id = ? AND fencing_epoch = ? AND settled_at IS NULL
+                """,
+                (
+                    claimed.status.value,
+                    claimed.owner_token,
+                    claimed.fencing_epoch,
+                    claimed.lease_expires_at_utc,
+                    claimed.claimed_at,
+                    run_id,
+                    run.fencing_epoch,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the generation is not claimable")
+        return self._lease_result(claimed)
+
+    def renew_job_run_lease(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+        lease: timedelta,
+    ) -> JobRunLease:
+        """Extend a lease the caller can still PROVE it currently holds.
+
+        The renewal moves the EXPIRY and nothing else. The generation, the job
+        revision, the immutable snapshot, the nominal due instant and the
+        fencing epoch are all left exactly as they are - the epoch marks an
+        ACQUISITION of ownership, and renewing is not acquiring, so an epoch
+        that advanced on renewal would fence out the very worker renewing it.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, moment)
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            renewed = replace(run, lease_expires_at_utc=expires)
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET lease_expires_at_utc = ?
+                 WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                   AND settled_at IS NULL
+                """,
+                (expires, run_id, owner_token, fencing_epoch),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the caller does not hold this lease")
+        return self._lease_result(renewed)
+
+    def release_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> JobRun:
+        """Voluntarily give up a lease, so the next worker need not wait it out.
+
+        RELEASING REWRITES NO EXTERNAL REALITY. It is not a cancellation, not
+        a settlement and not a claim that anything was undone; the generation
+        goes back to ``PENDING`` and stays exactly as unfinished as it was. It
+        is permitted only from the same narrow coordination states a claim is
+        permitted from, so a run that may have started something outside this
+        database can never be released into looking untouched.
+
+        The fencing epoch is DELIBERATELY not rolled back. It is the durable
+        record that an ownership happened, the released owner token is
+        unusable afterwards, and the next claimant epoch is strictly greater
+        than this one - a rollback would let a stale owner proof match again.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            if run.status not in CLAIMABLE_JOB_RUN_STATUSES:
+                raise JobError("the generation is not releasable")
+            released = replace(
+                run,
+                status=JobRunStatus.PENDING,
+                owner_token=None,
+                lease_expires_at_utc=None,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, owner_token = NULL,
+                       lease_expires_at_utc = NULL
+                 WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                   AND settled_at IS NULL
+                """,
+                (released.status.value, run_id, owner_token, fencing_epoch),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the caller does not hold this lease")
+        return released
 
     def settle_job_run(
         self,
@@ -5266,10 +5702,7 @@ class SQLiteMemoryStore:
             # durable state, and settling it would be writing an outcome for
             # something that was never a real occurrence.
             row = connection.execute(
-                "SELECT r.*, j.revision AS owner_revision "
-                "FROM job_runs AS r JOIN jobs AS j ON j.id = r.job_id "
-                "WHERE r.id = ?",
-                (run_id,),
+                self._JOB_RUN_WITH_OWNER, (run_id,)
             ).fetchone()
             run = (
                 None
@@ -5308,10 +5741,7 @@ class SQLiteMemoryStore:
         """One generation, or ``None`` when it is missing OR unusable."""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT r.*, j.revision AS owner_revision "
-                "FROM job_runs AS r JOIN jobs AS j ON j.id = r.job_id "
-                "WHERE r.id = ?",
-                (run_id,),
+                self._JOB_RUN_WITH_OWNER, (run_id,)
             ).fetchone()
         if row is None:
             return None
@@ -5420,6 +5850,12 @@ class SQLiteMemoryStore:
             attempt_id=run.attempt_id,
             blocking_code=run.blocking_code,
             condition_result=run.condition_result,
+            # Coordination lifecycle, and deliberately not the owner token:
+            # it is an opaque caller-supplied value this store never inspects,
+            # so it cannot be asserted non-secret and never crosses.
+            claimed=run.owner_token is not None,
+            fencing_epoch=run.fencing_epoch,
+            lease_expires_at_utc=run.lease_expires_at_utc,
         )
 
     def list_events(self, session_id: str) -> list[dict[str, Any]]:

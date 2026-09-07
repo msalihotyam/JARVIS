@@ -170,7 +170,7 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
 - Aylık 20 USD sert sınırı yapılandırılabilir değildir ve öyle bir anahtar
   belgeyi geçersiz kılar. Sır saklanmaz.
 
-## Zamanlayıcı durumu (Scheduler faz 1A + 1B)
+## Zamanlayıcı durumu (Scheduler faz 1A + 1B + 2A)
 
 **Uygulandı**
 
@@ -184,18 +184,45 @@ API anahtarı olmadan çalışan ilk çekirdek sürüm:
   CAS'ı, oluş kimliği, job başına en fazla bir sonuçlanmamış kuşak,
   değişmez kuşak anlık görüntüsü, kalıcı devre-dışı/arşiv, sınırlı
   projeksiyonlar ve kapalı düşen bozuk-satır davranışı.
+- **Vadesi gelen kuşak materyalizasyonu ve claim / lease / fencing
+  koordinasyonu (SQLite şeması 9):** açık `now` ile tek atomik
+  `materialize_due_job_run`, **sınırlı** kaçırılmış-çalışma birleştirmesi
+  (yalnız en son vadesi gelen oluş; bir yıllık kesinti bir dakikalık kesinti
+  kadar iş yapar ve biriken kuyruk oluşmaz), atomik `claim_job_run`, sınırlı
+  lease penceresi (`MIN_JOB_LEASE` 30 sn .. `MAX_JOB_LEASE` 15 dk; dışı
+  **reddedilir**, kırpılmaz), tam sahip + epoch kanıtı isteyen
+  `renew_job_run_lease`, gönüllü `release_job_run`, monoton fencing epoch'u
+  ve süresi dolmuş lease'in **güvenli** devralınması.
+
+**Koordinasyon yetki değildir.** Geçerli bir lease yalnız "bu oluşu şu an
+hangi çalışan koordine ediyor" sorusunu yanıtlar: onay vermez, grant
+tüketmez, yürütme girişimi açmaz, rezervasyon oluşturmaz, connector'a
+ulaşmaz. Gerçek işin geçmesi gereken her kapı hâlâ önündedir.
+
+**Kapalı düşme (2A'nın taşıyıcı güvenlik özelliği).** Devralınabilir durum
+kümesi kasten en dardır: yalnız `PENDING` ve `CLAIMED`. `RUNNING`,
+`AWAITING_APPROVAL` ve `UNKNOWN_OUTCOME` **asla** devralınmaz — lease'in
+süresinin dolması, önceki sahibin dış eyleminin gerçekleşmediğinin kanıtı
+değildir; devralmak yinelenen bir dış etki riski olurdu. Böyle bir kuşak
+süresiz bloke kalır ve tek sonuçlanmamış kuşak kuralı gereği sonraki
+kuşakları da bloke eder. Otomatik yeniden deneme yoktur; çözüm insandır.
 
 **Henüz uygulanmadı**
 
-- Dağıtıcı; vadesi gelen job'da uyanan üretim yolu yok.
-- Lease/fencing yürütmesi ve devralma.
+- Dağıtıcı; vadesi gelen job'da uyanan üretim yolu yok. Depo yüzeyini
+  çağıran tek şey testlerdir.
 - AgentCore task materyalizasyonu ve zamanlanmış iş için onay oluşturma.
-- Arka plan servisi/çalışanı.
-- Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi.
+- Arka plan servisi/çalışanı/döngüsü; hiçbir zamanlayıcı iş parçacığı yoktur
+  ve her vade/lease-süresi yargısı **çağıranın verdiği** anda verilir.
+- Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi. 2A bir
+  koşul-izleme kuşağını (kontrol fırsatını) materyalize eder, yüklemi
+  değerlendirmez.
+- Bilinmeyen sonucun otomatik yeniden denenmesi.
 
-Zamanlayıcı bu nedenle uçtan uca kullanılabilir değildir. Job oluşturmak
-hiçbir şey başlatmaz, onay vermez ve gelecekteki parasal harcamayı
-yetkilendirmez. Ayrıntılı sözleşme `ARCHITECTURE.md` §4.21'dedir.
+Zamanlayıcı bu nedenle **hâlâ uçtan uca kullanılabilir değildir**. Job
+oluşturmak ve bir kuşağı claim etmek hiçbir şey başlatmaz, onay vermez ve
+gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
+`ARCHITECTURE.md` §4.21'dedir.
 
 ## Maliyet ve onay sınırları
 

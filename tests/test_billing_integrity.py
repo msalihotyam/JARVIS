@@ -1376,7 +1376,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v4_upgrades_to_v5_additively(self) -> None:
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(9, SCHEMA_VERSION)
         self.assertEqual(SCHEMA_VERSION, store.schema_version())
         tables = {
             row[0]
@@ -1427,7 +1427,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual([("u1", 0.42)], self._rows("SELECT id, monetary_cost_usd FROM usage_ledger"))
         # Recorded exactly once, even after re-opening the database.
         self.assertEqual(
-            [(5,), (6,), (7,), (8,)],
+            [(5,), (6,), (7,), (8,), (9,)],
             self._rows("SELECT version FROM schema_migrations ORDER BY version"),
         )
 

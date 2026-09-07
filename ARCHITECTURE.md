@@ -2904,16 +2904,17 @@ yaşar; ikinci bir kopya tutulmaz, çünkü ayrışabilen iki kopyadan yanlış 
 Kuşak, kendisini üreten revizyondaki spesifikasyonun **değişmez anlık
 görüntüsünü** tam olarak taşır ve digest o görüntüden türetilir; sonraki bir
 düzenleme geçmişi yeniden yazmaz. `owner_token` / `fencing_epoch` /
-`claimed_at` alanları **atıldır**: bu fazda hiçbir şey yazmaz ve hiçbir karar
-bunlardan okunmaz; şemada bulunmalarının tek nedeni satır şeklinin parçası
-olmaları ve canlı veri altında sonradan eklenmek zorunda kalmamalarıdır.
-**Lease/bitiş zamanı alanı kasten yoktur:** hiçbir kısıt ona atıfta bulunmaz,
-nullable bir zaman damgası zaten en ucuz sonraki migration'dır ve depo
-genelinde "lease/heartbeat/orphan-reclaim makinesi yoktur" diyen mevcut S2B
-koruma testi hâlâ geçerlidir; henüz olmayan bir yeteneği şemanın iddia etmesi
-doğru olmazdı. **İkinci bir yürütme günlüğü yoktur**: yürütme
-geldiğinde mevcut H2 `execution_attempts` satırına `attempt_id` üzerinden
-bağlanacaktır — kuşak *oluş*, girişim *deneme*.
+`claimed_at` / `lease_expires_at_utc` alanları **faz 2A ile canlıdır** ve tek
+bir soruyu yanıtlar: bu kuşağı şu an hangi çalışan koordine ediyor. `owner_token`
+ile `lease_expires_at_utc` **bölünmez tek bir olgudur** ve ayrı ayrı reddedilir
+(sahipsiz bitiş zamanı kimsenin tutmadığı bir lease, bitişsiz sahip sınırsız bir
+lease olurdu); yarım lease taşıyan satır `None` olarak yüklenir ve asla claim
+edilemez. **İkinci bir yürütme günlüğü yoktur**: yürütme geldiğinde mevcut H2
+`execution_attempts` satırına `attempt_id` üzerinden bağlanacaktır — kuşak
+*oluş*, girişim *deneme*. S2B'nin ertelediği **girişim** lease/heartbeat/
+orphan-reclaim makinesi hâlâ yoktur ve koruma testi artık bunu şemadan
+kanıtlar: `execution_attempts` tablosunda lease/heartbeat/expiry kolonu yoktur,
+tek lease `job_runs` üzerindedir.
 
 **Değişmezler depoda, Python'da değil.** `jobs` ve `job_runs` tablolarında:
 
@@ -2971,14 +2972,106 @@ kazanmaz ve parasal yetki edinmez. `OUTPUT_SCHEMA_VERSION` **6'da kalır** —
 SQLite şeması, çıktı zarfı ve `JOB_DEFINITION_VERSION` üç ayrı politika
 yüzeyidir ve hiçbiri diğerinin takma adı değildir.
 
+### 4.21.1 Faz 2A — vade materyalizasyonu ve claim / lease / fencing
+
+**Migration 8 → 9.** Tek bir nullable kolon: `job_runs.lease_expires_at_utc`.
+Başka tablo, indeks veya satır dokunulmaz; mevcut kuşaklar kolonu `NULL`
+değeriyle — yani tam olarak "lease yok" — alır, dolayısıyla yükseltme hiçbir
+kuşağı hiçbir çalışana vermez ve bloke bir kuşağı serbest bırakmaz. Kolon
+**her iki yolda da `ALTER TABLE` ile** eklenir (hem migration hem taze
+oluşturma): SQLite eklenen kolonu saklanan DDL metninin sonuna iliştirdiği
+için, `CREATE` içinde bildirilseydi taze bir veritabanı ile yükseltilmiş bir
+veritabanı kendini farklı tanımlardı. Eşlik eden bir `CHECK` yoktur —
+`ALTER TABLE ADD COLUMN` tablo kısıtı ekleyemez ve canlı veri altında
+`job_runs`'ı yeniden inşa etmek bunu ifade etmenin en tehlikeli yolu olurdu;
+sahip/bitiş eşleşmesi bunun yerine `JobRun` kurucusunda reddedilir (her okuma
+yolu oradan geçer ve **kapalı düşer**). Taşıyıcı atomiklik zaten bir kısıt
+değildir: `BEGIN IMMEDIATE` altında her `UPDATE`'in `WHERE` cümlesindeki
+compare-and-set'tir.
+
+**Vade materyalizasyonu.** `materialize_due_job_run(job_id, expected_revision,
+now)` tek işlemdir ve gizli saati yoktur. Job kullanılabilir ve zamanlanabilir
+olmalı, sunulan revizyon güncel olmalı (CAS; bayat revizyon **deterministik
+reddedilir**), saklanan `next_due_at_utc` `now`'a gelmiş olmalıdır. Oluşturulan
+oluş, saf çekirdeğe **bir kez** sorulan `latest_occurrence`'tır.
+
+**Kaçırılmış çalışma birleştirmesi sınırlıdır.** Kaçırılan geçmiş asla
+sayılmaz: bir yıl kapalı kalan makine tek bir kuşak üretir ve bir dakika kapalı
+kalan makine kadar iş yapar. `ONE_TIME` en fazla **bir kez** materyalize olur
+(sonrasında program hiçbir şey adlandırmaz, `next_due` `NULL` olur ve oluş
+anahtarı tekrarı zaten reddederdi). `RECURRING` doğrudan en son vadesi gelen
+oluşa atlar. `CONDITION_WATCH` en fazla bir taze **kontrol fırsatı** alır —
+2A hiçbir yüklem değerlendirmez, hedef dosya okumaz, TRUE/FALSE/UNKNOWN
+üretmez ve `on_true` bildirimini yürütmez. Oluş kimliği, kuşak monotonluğu, tek
+sonuçlanmamış kuşak kuralı ve anlık görüntü değişmezliği aynen korunur;
+`next_due` ilerlemesi kuşak oluşturmayla **aynı işlemdedir**.
+
+**Atomik claim.** `claim_job_run(run_id, owner_token, now, lease)` yalnız
+devralınabilir bir koordinasyon durumundaki ve **canlı lease'i olmayan** bir
+kuşakta başarılı olur. Başarıda: tam token birebir saklanır, fencing epoch'u
+bir artar, claim anı ve kanonik UTC bitiş anı yazılır. İki yarışan çalışandan
+yalnız biri kazanır — satır işlem içinde yeniden okunur ve `UPDATE` beklediği
+epoch'u `WHERE` cümlesinde adlandırır.
+
+**Sınırlı lease.** `MIN_JOB_LEASE` 30 saniye, `MAX_JOB_LEASE` 15 dakika. Dışı
+**reddedilir, kırpılmaz**: sessizce farklı bir bitiş koymak, çağıranı sahip
+olmadığı bir pencerede sahip sandırırdı. Süre dolumu yarı-açıktır (`now <
+expiry`), böylece iki uygulama aynı anı aynı şekilde yanıtlar. Heartbeat iş
+parçacığı **yoktur**.
+
+**Yenileme.** `renew_job_run_lease` tam `owner_token` **ve** tam
+`fencing_epoch` ister ve lease hâlâ canlıyken çalışır. Yalnız bitiş anını
+oynatır: kuşak, revizyon, anlık görüntü, nominal vade **ve epoch** değişmez —
+epoch *edinimi* işaretler, yenileme edinim değildir ve artan bir epoch
+yenileyeni kendi lease'inden dışlardı. Süresi dolmuş lease yenilenemez: o anda
+başka bir çalışan meşru biçimde sahip olabilir ve hiçbir depo sonradan
+"süresi dolmamış" yapamaz.
+
+**Fencing.** Epoch her sahiplik ediniminde monoton artar, asla azalmaz ve
+yeniden başlatmadan sonra da azalmaz. Yalnız token **yeterli fencing değildir**:
+devralınan eski sahip token'ını hatırlar, bu yüzden her durum değiştiren
+koordinasyon işlemi `(run_id, owner_token, fencing_epoch)` üçlüsünü ister.
+Epoch bir **yürütme yetkisi değildir**.
+
+**Süre dolumu / devralma — kapalı düşme.** Devralınabilir küme kasten en
+dardır: `CLAIMABLE_JOB_RUN_STATUSES = {PENDING, CLAIMED}`. `RUNNING`,
+`AWAITING_APPROVAL` ve `UNKNOWN_OUTCOME` **asla** devralınmaz. Gerekçe tektir
+ve H2 ile aynıdır: **lease'in süresinin dolması, önceki sahibin dış eyleminin
+gerçekleşmediğinin kanıtı değildir.** Devralmak yinelenen bir dış etki riski
+olurdu. Böyle bir kuşak süresiz bloke kalır ve tek-sonuçlanmamış-kuşak kuralı
+gereği sonraki kuşakları da bloke eder; bu bir kusur değil, amaçlanan
+davranıştır. Otomatik yeniden deneme yoktur.
+
+**Serbest bırakma.** `release_job_run` yalnız tam sahip + epoch ile ve yalnız
+claim edilebilir durumlardan çalışır; kuşağı `PENDING`'e döndürür, sahibi ve
+bitişi temizler. Hiçbir şeyi sonuçlandırmaz, iptal etmez ve **dış gerçekliği
+yeniden yazmaz**. Epoch geri alınmaz — geri alınsaydı bırakan sahibin bayat
+kanıtı yeniden tutardı.
+
+**Yeniden başlatma güvenliği.** Bütün koordinasyon durumu veritabanındadır;
+yetkili hiçbir bellek-içi sahip kaydı yoktur. Yeniden açıldığında canlı lease
+canlı kalır, süresi dolmuş güvenli lease aynı kurallarla devralınabilir,
+güvensiz/bilinmeyen sonuç bloke kalır ve epoch asla gerilemez.
+
+**Revizyon bağlaması.** N revizyonundan doğan bir kuşak ömrü boyunca N'e
+bağlıdır. Sonraki düzenleme/devre-dışı/arşiv anlık görüntüyü yeniden yazmaz ve
+açık kuşağı iptal edilmiş gibi göstermez; DEVRE DIŞI yalnız gelecekteki
+uygunluğu kapatır. Lease **hiçbir zaman** başka bir revizyona veya kuşağa
+taşınmaz: yeni kuşak sahipsiz ve epoch sıfır doğar.
+
+**Güvenli projeksiyon.** `JobRunSummary` claim durumunu, fencing epoch'unu ve
+lease bitişini taşır; `owner_token` **taşımaz** — depo onu hiç incelemeyen opak
+bir çağıran değeridir, gizli olmadığı iddia edilemez.
+
 **Henüz uygulanmadı (bu fazın sınırı).**
 
-- Dağıtıcı: vadesi gelen job'da uyanan hiçbir üretim yolu yoktur.
-- Kuşak talebi, lease/fencing yürütmesi ve devralma.
+- Dağıtıcı: vadesi gelen job'da uyanan hiçbir üretim yolu yoktur; depo
+  yüzeyini çağıran tek şey testlerdir.
 - AgentCore task materyalizasyonu ve zamanlanmış iş için onay oluşturma.
-- Arka plan servisi/çalışanı.
+- Arka plan servisi/çalışanı/döngüsü; hiçbir zamanlayıcı iş parçacığı yoktur.
 - Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi.
 - Bilinmeyen sonucun otomatik yeniden denenmesi.
+- Connector/provider yürütmesi.
 
-Zamanlayıcı bu nedenle **uçtan uca kullanılabilir değildir**. Bu fazın
-tamamladığı şey depolama ve yönetim temelidir.
+Zamanlayıcı bu nedenle **hâlâ uçtan uca kullanılabilir değildir**. Bu fazın
+tamamladığı şey depolama, yönetim ve **koordinasyon** temelidir.

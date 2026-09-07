@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from jarvis.contracts import (
+    chain_id_refusal,
     LINEAR_LOOP_STAGES,
     MONTHLY_HARD_LIMIT_NANO_USD,
     OPEN_RESERVATION_STATES,
@@ -22,6 +23,9 @@ from jarvis.contracts import (
     BillingClass,
     BillingIntegrityError,
     BillingReconciliation,
+    CLAIMABLE_JOB_RUN_STATUSES,
+    MAX_JOB_LEASE,
+    MIN_JOB_LEASE,
     ChainStep,
     DataClassification,
     DecisionRecord,
@@ -31,6 +35,7 @@ from jarvis.contracts import (
     JobKind,
     JobRecord,
     JobRun,
+    JobRunLease,
     JobRunStatus,
     JobRunSummary,
     JobSpec,
@@ -79,6 +84,7 @@ from jarvis.memory import ledger_timestamp
 from jarvis.registry import ToolRegistry
 from jarvis.schedules import (
     Interval,
+    OneTime,
     ScheduleError,
     latest_occurrence,
     next_occurrence,
@@ -675,6 +681,152 @@ class InMemoryStore:
         )
         return run
 
+    # -- Scheduler phase 2A parity ----------------------------------------
+    #
+    # The same due-generation coalescing and the same claim / lease / fencing
+    # semantics with no SQL under them, written independently of the SQLite
+    # store rather than delegating to it: the invariants have to be the
+    # STORE'S. The shared halves are the ones that must not be reimplemented -
+    # the pure schedule kernel, and ``JobRun.lease_is_live`` /
+    # ``JobRun.claimable_at``, which are the single definition of expiry and
+    # claimability that two stores could otherwise disagree about.
+
+    @staticmethod
+    def _lease_expiry(lease, now) -> str:
+        if type(lease) is not timedelta:
+            raise JobError("lease is not a timedelta")
+        if lease < MIN_JOB_LEASE or lease > MAX_JOB_LEASE:
+            raise JobError("lease is outside the approved window")
+        return (now + lease).isoformat()
+
+    def _owned_run(self, run_id: str) -> JobRun:
+        run = self.load_job_run(run_id)
+        if run is None:
+            raise JobError("no usable generation with that identity")
+        return run
+
+    @staticmethod
+    def _held_lease(run: JobRun, owner_token, fencing_epoch, now) -> None:
+        if type(fencing_epoch) is not int or isinstance(fencing_epoch, bool):
+            raise JobError("fencing_epoch is not an exact integer")
+        if run.settled:
+            raise JobError("the generation is already settled")
+        if run.owner_token is None:
+            raise JobError("the generation carries no lease")
+        if run.owner_token != owner_token or run.fencing_epoch != fencing_epoch:
+            raise JobError("the caller does not hold this lease")
+        if not run.lease_is_live(now):
+            raise JobError("the lease has expired")
+
+    @staticmethod
+    def _lease_result(run: JobRun) -> JobRunLease:
+        return JobRunLease(
+            run_id=run.id,
+            job_id=run.job_id,
+            job_revision=run.job_revision,
+            generation=run.generation,
+            owner_token=run.owner_token,
+            fencing_epoch=run.fencing_epoch,
+            lease_expires_at_utc=run.lease_expires_at_utc,
+            claimed_at=run.claimed_at,
+        )
+
+    def materialize_due_job_run(
+        self, job_id: str, expected_revision: int, *, now
+    ) -> JobRun | None:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        record = self._job_for_update(job_id, expected_revision)
+        if not record.schedulable or record.next_due_at_utc is None:
+            return None
+        due = datetime.fromisoformat(record.next_due_at_utc)
+        if now < due:
+            return None
+        try:
+            occurrence = latest_occurrence(record.spec.schedule, now)
+        except ScheduleError as exc:
+            raise JobError("the schedule could not name an occurrence") from exc
+        if occurrence is None or occurrence < due:
+            return None
+        nominal = occurrence.isoformat()
+        mine = [run for run in self.job_runs.values() if run.job_id == job_id]
+        if any(not run.settled for run in mine):
+            return None
+        if any(
+            run.job_revision == record.revision
+            and run.nominal_due_at_utc == nominal
+            for run in mine
+        ):
+            return None
+        run = JobRun(
+            job_id=record.id,
+            job_revision=record.revision,
+            generation=record.next_generation,
+            nominal_due_at_utc=nominal,
+            spec=record.spec,
+        )
+        self.job_runs[run.id] = run
+        self.jobs[job_id] = dataclasses.replace(
+            record,
+            last_run_id=run.id,
+            next_generation=record.next_generation + 1,
+            next_due_at_utc=self._job_next_due(record.spec, occurrence),
+            updated_at=utc_now(),
+        )
+        return run
+
+    def claim_job_run(self, run_id, owner_token, *, now, lease) -> JobRunLease:
+        if chain_id_refusal(owner_token) is not None:
+            raise JobError("owner_token is not a usable identifier")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, now)
+        run = self._owned_run(run_id)
+        if not run.claimable_at(now):
+            raise JobError("the generation is not claimable")
+        claimed = dataclasses.replace(
+            run,
+            status=JobRunStatus.CLAIMED,
+            owner_token=owner_token,
+            fencing_epoch=run.fencing_epoch + 1,
+            lease_expires_at_utc=expires,
+            claimed_at=now.isoformat(),
+        )
+        self.job_runs[run_id] = claimed
+        return self._lease_result(claimed)
+
+    def renew_job_run_lease(
+        self, run_id, owner_token, fencing_epoch, *, now, lease
+    ) -> JobRunLease:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, now)
+        run = self._owned_run(run_id)
+        self._held_lease(run, owner_token, fencing_epoch, now)
+        renewed = dataclasses.replace(run, lease_expires_at_utc=expires)
+        self.job_runs[run_id] = renewed
+        return self._lease_result(renewed)
+
+    def release_job_run(self, run_id, owner_token, fencing_epoch, *, now) -> JobRun:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        run = self._owned_run(run_id)
+        self._held_lease(run, owner_token, fencing_epoch, now)
+        if run.status not in CLAIMABLE_JOB_RUN_STATUSES:
+            raise JobError("the generation is not releasable")
+        released = dataclasses.replace(
+            run,
+            status=JobRunStatus.PENDING,
+            owner_token=None,
+            lease_expires_at_utc=None,
+        )
+        self.job_runs[run_id] = released
+        return released
+
     def settle_job_run(
         self,
         run_id: str,
@@ -772,6 +924,9 @@ class InMemoryStore:
                 attempt_id=run.attempt_id,
                 blocking_code=run.blocking_code,
                 condition_result=run.condition_result,
+                claimed=run.owner_token is not None,
+                fencing_epoch=run.fencing_epoch,
+                lease_expires_at_utc=run.lease_expires_at_utc,
             )
             for run in runs[:bound]
         ]
@@ -1495,6 +1650,176 @@ class SchedulerStorageParityTests(unittest.TestCase):
         self.assertEqual(
             [record.id],
             [s.id for s in self.memory.list_jobs(10, include_archived=True)],
+        )
+
+    def test_claim_lease_and_fencing_match_the_sqlite_store_exactly(self) -> None:
+        """The SAME phase-2A script, run against both stores, agrees.
+
+        Written as one script over two stores rather than as two suites: a
+        semantic difference between the SQLite implementation and the double
+        can only be caught by asking them the same questions in the same order
+        and comparing the answers, not by asserting each one separately
+        against what its own author expected.
+
+        Every instant is EXPLICIT, so the comparison is deterministic and no
+        step sleeps.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "parity.db")
+        sqlite_store.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+        lease = timedelta(minutes=5)
+        # Two whole periods late: both stores must COALESCE to one generation
+        # at the latest due occurrence, not replay the one they missed.
+        late = self.NOW + timedelta(hours=2, minutes=30)
+
+        def script(store) -> list:
+            trace: list = []
+            record = store.create_job(self.spec(), now=self.NOW)
+            self.assertIsNone(
+                store.materialize_due_job_run(
+                    record.id, record.revision, now=self.NOW
+                )
+            )
+            run = store.materialize_due_job_run(
+                record.id, record.revision, now=late
+            )
+            trace.append(("generation", run.generation, run.nominal_due_at_utc))
+            trace.append(
+                ("next_due", store.load_job(record.id).next_due_at_utc)
+            )
+            first = store.claim_job_run(run.id, "worker-a", now=late, lease=lease)
+            trace.append(("claim", first.fencing_epoch, first.lease_expires_at_utc))
+            # A live lease cannot be stolen.
+            with self.assertRaises(JobError):
+                store.claim_job_run(run.id, "worker-b", now=late, lease=lease)
+            # A stale epoch cannot renew, the true owner can.
+            with self.assertRaises(JobError):
+                store.renew_job_run_lease(
+                    run.id, "worker-a", first.fencing_epoch - 1,
+                    now=late + timedelta(minutes=1), lease=lease,
+                )
+            renewed = store.renew_job_run_lease(
+                run.id, "worker-a", first.fencing_epoch,
+                now=late + timedelta(minutes=1), lease=lease,
+            )
+            trace.append(
+                ("renew", renewed.fencing_epoch, renewed.lease_expires_at_utc)
+            )
+            # Once expired, a different worker takes over with a NEWER epoch
+            # and the displaced owner is fenced out.
+            expired = late + timedelta(minutes=30)
+            taken = store.claim_job_run(
+                run.id, "worker-b", now=expired, lease=lease
+            )
+            trace.append(("takeover", taken.fencing_epoch, taken.owner_token))
+            with self.assertRaises(JobError):
+                store.renew_job_run_lease(
+                    run.id, "worker-a", first.fencing_epoch,
+                    now=expired, lease=lease,
+                )
+            released = store.release_job_run(
+                run.id, "worker-b", taken.fencing_epoch, now=expired
+            )
+            trace.append(
+                (
+                    "release",
+                    released.status.value,
+                    released.owner_token,
+                    released.lease_expires_at_utc,
+                    released.fencing_epoch,
+                )
+            )
+            reloaded = store.load_job_run(run.id)
+            trace.append(("reload", reloaded.status.value, reloaded.fencing_epoch))
+            summary = store.list_job_runs(record.id, 10)[0]
+            trace.append(
+                (
+                    "summary",
+                    summary.claimed,
+                    summary.fencing_epoch,
+                    summary.lease_expires_at_utc,
+                )
+            )
+            # An uncertain outcome fails CLOSED in both stores.
+            store.settle_job_run(run.id, JobRunStatus.CANCELLED)
+            blocked = store.materialize_due_job_run(
+                record.id, store.load_job(record.id).revision, now=expired
+            )
+            store.claim_job_run(blocked.id, "worker-c", now=expired, lease=lease)
+            store.settle_job_run(blocked.id, JobRunStatus.COMPLETED)
+            trace.append(("blocked_generation", blocked.generation))
+            return trace
+
+        self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_an_uncertain_outcome_is_never_reclaimed_by_either_store(self) -> None:
+        # The safety property, asked of the double directly: a lease expiring
+        # is a coordination fact and never evidence that the previous owner's
+        # external action did not happen.
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        due = self.NOW + timedelta(hours=1)
+        run = self.memory.materialize_due_job_run(
+            record.id, record.revision, now=due
+        )
+        self.memory.claim_job_run(
+            run.id, "worker-a", now=due, lease=timedelta(minutes=5)
+        )
+        for status in (JobRunStatus.RUNNING, JobRunStatus.UNKNOWN_OUTCOME):
+            self.memory.job_runs[run.id] = dataclasses.replace(
+                self.memory.job_runs[run.id], status=status
+            )
+            long_after = due + timedelta(days=365)
+            with self.assertRaises(JobError):
+                self.memory.claim_job_run(
+                    run.id, "worker-b", now=long_after, lease=timedelta(minutes=5)
+                )
+            # And it blocks every later generation, by the one-unsettled rule.
+            self.assertIsNone(
+                self.memory.materialize_due_job_run(
+                    record.id,
+                    self.memory.load_job(record.id).revision,
+                    now=long_after,
+                )
+            )
+
+    def test_a_one_time_job_materializes_at_most_once_in_the_double(self) -> None:
+        one_time = JobSpec(
+            project_id="proj-a",
+            kind=JobKind.ONE_TIME,
+            label="single shot",
+            schedule=OneTime(at=self.NOW + timedelta(hours=1)),
+            steps=(
+                ChainStep(
+                    objective="summarize the log",
+                    capability="echo",
+                    action="read",
+                    target="notes.txt",
+                ),
+            ),
+        )
+        record = self.memory.create_job(one_time, now=self.NOW)
+        later = self.NOW + timedelta(days=30)
+        run = self.memory.materialize_due_job_run(
+            record.id, record.revision, now=later
+        )
+        self.assertEqual((self.NOW + timedelta(hours=1)).isoformat(),
+                         run.nominal_due_at_utc)
+        self.memory.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        self.assertIsNone(self.memory.load_job(record.id).next_due_at_utc)
+        self.assertIsNone(
+            self.memory.materialize_due_job_run(
+                record.id,
+                self.memory.load_job(record.id).revision,
+                now=later + timedelta(days=365),
+            )
         )
 
     def test_projections_are_bounded_and_carry_no_declaration(self) -> None:

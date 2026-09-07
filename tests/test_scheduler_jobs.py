@@ -7,10 +7,12 @@ enable/disable/archive management semantics, occurrence identity, the
 one-unsettled-generation invariant, bounded provider-neutral projections and
 fail-closed corruption behaviour.
 
-The phase boundary is itself under test. There is no dispatcher, no background
-worker, no lease takeover, no AgentCore materialization, no approval creation
-and no condition evaluation in this build, and ``ExecutionBoundaryTests``
-proves it from the shipped source rather than from this paragraph.
+The phase boundary is itself under test. Claim / lease / fencing coordination
+arrived in phase 2A and is covered by ``tests/test_scheduler_claims.py``;
+what is still absent is a dispatcher, a background worker, AgentCore
+materialization, approval creation and condition evaluation, and
+``ExecutionBoundaryTests`` proves that from the shipped source rather than
+from this paragraph.
 
 No test performs a live model, auth or network call; every database is a
 disposable local temporary file.
@@ -257,8 +259,10 @@ INSERT INTO usage_ledger VALUES
      'no_additional_charge', 'not_applicable', NULL, NULL, 1, 'ev', 'r0');
 """
 
-#: Exactly the durable objects schema 8 introduces. Anything else appearing in
-#: ``sqlite_master`` after an upgrade would be an unrelated schema change.
+#: Exactly the durable objects schemas 8 and 9 introduce. Anything else
+#: appearing in ``sqlite_master`` after an upgrade would be an unrelated schema
+#: change. Schema 9 adds a COLUMN rather than an object, so this set is
+#: unchanged by it and the column is asserted separately.
 _SCHEDULER_OBJECTS = frozenset(
     {"jobs", "job_runs", "idx_jobs_due", "idx_job_runs_unsettled"}
 )
@@ -394,7 +398,12 @@ class JobStoreTestCase(unittest.TestCase):
 
 
 class SchemaMigrationTests(unittest.TestCase):
-    """The additive 7 -> 8 upgrade, on empty and populated databases alike."""
+    """The additive 7 -> 8 -> 9 upgrade, on empty and populated databases.
+
+    A schema-7 fixture now crosses TWO additive migrations in one open, so
+    these also prove that the chain composes: the tables schema 8 adds and the
+    lease column schema 9 adds appear together, and nothing else does.
+    """
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -429,8 +438,8 @@ class SchemaMigrationTests(unittest.TestCase):
         self.build_v7(populated=False)
         before = self.schema_objects()
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, SCHEMA_VERSION)
-        self.assertEqual(8, store.schema_version())
+        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(9, store.schema_version())
         after = self.schema_objects()
         self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
         # Every pre-existing object is byte-identical: the upgrade adds, and
@@ -442,7 +451,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.build_v7(populated=True)
         before = self.schema_objects()
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, store.schema_version())
+        self.assertEqual(9, store.schema_version())
         after = self.schema_objects()
         self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
         connection = raw(self.database)
@@ -490,7 +499,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 0, connection.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0]
             )
             self.assertEqual(
-                [6, 7, 8],
+                [6, 7, 8, 9],
                 [
                     row["version"]
                     for row in connection.execute(
@@ -506,12 +515,12 @@ class SchemaMigrationTests(unittest.TestCase):
         SQLiteMemoryStore(self.database)
         first = self.schema_objects()
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, again.schema_version())
+        self.assertEqual(9, again.schema_version())
         self.assertEqual(first, self.schema_objects())
         connection = raw(self.database)
         try:
             self.assertEqual(
-                [6, 7, 8],
+                [6, 7, 8, 9],
                 [
                     row["version"]
                     for row in connection.execute(
@@ -522,23 +531,24 @@ class SchemaMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_an_already_schema_eight_database_opens_unchanged(self) -> None:
+    def test_an_already_current_schema_database_opens_unchanged(self) -> None:
         store = SQLiteMemoryStore(self.database)
         store.save_project(ProjectRecord(id="proj-a", name="A"))
         record = store.create_job(spec(), now=NOW)
         objects = self.schema_objects()
         reopened = SQLiteMemoryStore(self.database)
-        self.assertEqual(8, reopened.schema_version())
+        self.assertEqual(9, reopened.schema_version())
         self.assertEqual(objects, self.schema_objects())
         self.assertEqual(record, reopened.load_job(record.id))
 
     def test_output_schema_version_is_unchanged(self) -> None:
-        # The SQLite storage schema advances to 8 and NOTHING else does: the
+        # The SQLite storage schema advances to 9 and NOTHING else does: the
         # user-facing output envelope contract stays at 6, and the durable job
-        # definition contract is its own separate surface at 1.
+        # definition contract is its own separate surface at 1. Three policy
+        # surfaces, none of them an alias of another.
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
-        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(9, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
         self.assertEqual(1, JOB_DEFINITION_VERSION)
 
@@ -1405,6 +1415,10 @@ class ExecutionBoundaryTests(unittest.TestCase):
             "set_job_enabled",
             "archive_job",
             "record_job_run",
+            "materialize_due_job_run",
+            "claim_job_run",
+            "renew_job_run_lease",
+            "release_job_run",
             "settle_job_run",
             "load_job",
             "load_job_run",
@@ -1463,21 +1477,23 @@ class ExecutionBoundaryTests(unittest.TestCase):
             for needle in forbidden:
                 self.assertNotIn(needle, body, f"{node.name} reaches {needle}")
 
-    def test_no_lease_heartbeat_or_reclaim_machinery_was_added(self) -> None:
-        # The same S2B boundary the execution suites already assert, restated
-        # for the scheduler: a generation records an occurrence and nothing
-        # takes ownership of it, so there is no lease to expire, no heartbeat
-        # to miss and nothing to reclaim.
+    def test_no_autonomous_reclaim_or_heartbeat_machinery_exists(self) -> None:
+        # Phase 2A MOVED this boundary rather than removing it. A bounded
+        # lease, an atomic claim and a fencing epoch now exist and are
+        # exercised by ``tests/test_scheduler_claims.py``. What still does not
+        # exist is anything that acts on them BY ITSELF: no heartbeat, no
+        # timer-driven reclaim, no orphan recovery sweep and no due-job
+        # scanner. Every expiry judgement in this build happens because a
+        # caller asked, at an instant the caller supplied.
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for forbidden in (
-                "lease_expires",
                 "def heartbeat",
                 "heartbeat_at",
                 "auto_reclaim",
                 "orphan_recovery",
-                "def claim_job_run",
                 "def due_jobs",
+                "def scan_due",
             ):
                 self.assertNotIn(forbidden, source, f"{module.name}: {forbidden}")
 

@@ -1529,10 +1529,18 @@ class S2BBoundaryTests(unittest.TestCase):
     """The deferred design space stayed deferred."""
 
     def test_no_lease_heartbeat_or_orphan_machinery_appeared(self) -> None:
+        """No S2B EXECUTION-ATTEMPT lease, heartbeat or orphan sweep exists.
+
+        Scheduler phase 2A added a bounded lease, but it leases a job
+        GENERATION rather than an execution attempt, so the needles below
+        name attempt machinery specifically. The separation is proved from
+        the durable schema in
+        ``test_recovery.test_no_execution_attempt_is_ever_leased_or_reclaimed``.
+        """
         for module in (SQLiteMemoryStore, AgentCore, _LiveStopWatcher):
             source = inspect.getsource(module)
             for forbidden in (
-                "def heartbeat", "heartbeat_at", "lease_expires",
+                "def heartbeat", "heartbeat_at", "attempt_lease",
                 "declare_attempt_unknown", "orphan_recovery", "auto_reclaim",
                 "runner_owner", "cancellation_claims",
             ):
