@@ -1,120 +1,54 @@
 {
   "updated": "2026-09-08",
   "phase": "scheduler-2b0",
-  "review_state": "Phase 2A landed after independent review; 2B0 not yet reviewed",
+  "review_state": "Faz 2A bağımsız incelemeden sonra kanonik oldu; 2B0 henüz incelenmedi.",
   "overall_percent": 60,
-  "overall_note": "Project estimate, not a measured figure.",
+  "overall_note": "Proje tahminidir, ölçülmüş bir değer değildir.",
   "milestone": {
-    "name": "Scheduler Phase 2B0 - fencing completion",
+    "name": "Scheduler Faz 2B0 — fencing tamamlama",
     "status": "yellow",
-    "status_label": "In progress",
-    "summary": "Prevent an old scheduler worker from changing a job result after a newer worker has taken ownership."
+    "status_label": "Devam ediyor",
+    "summary": "Eski bir scheduler çalışanının, sahiplik yeni bir çalışana geçtikten sonra iş sonucunu değiştirmesini engelliyoruz."
   },
-  "next_step": "Connect the scheduler safely to the real AgentCore execution path.",
+  "next_step": "Scheduler'ı gerçek AgentCore yürütme yoluna güvenli biçimde bağla.",
   "blockers": [
-    "Unfenced settle_job_run race: a stale worker can still settle a generation it no longer owns. Open until Scheduler 2B0 is completed and accepted."
+    "Fencing'siz settle_job_run yarışı: bayat bir çalışan, artık sahibi olmadığı bir JobRun'ı hâlâ sonuçlandırabiliyor. Scheduler 2B0 tamamlanıp kabul edilene kadar açık."
   ],
   "capabilities": [
-    {
-      "name": "Core / Authority",
-      "percent": 95,
-      "status": "green",
-      "note": "Agent loop, permissions, egress attestation, billing ledger, diagnostics hygiene, execution journal, kill switch."
-    },
-    {
-      "name": "Advanced Memory",
-      "percent": 90,
-      "status": "green",
-      "note": "Memory V2 foundation, project identity, bounded context retrieval."
-    },
-    {
-      "name": "Provider / Model Selection",
-      "percent": 75,
-      "status": "green",
-      "note": "Manual Claude model + effort selection. Claude Code is still the only connector."
-    },
-    {
-      "name": "Scheduler",
-      "percent": 45,
-      "status": "yellow",
-      "note": "Pure kernels, durable job store, claim/lease/fencing. No dispatcher, no worker, not usable end to end."
-    },
-    {
-      "name": "GitHub",
-      "percent": 20,
-      "status": "yellow",
-      "note": "Phase 1 offline security/policy foundation only. No live connector, no network seam."
-    },
-    {
-      "name": "Gmail",
-      "percent": 0,
-      "status": "red",
-      "note": "Not started."
-    },
-    {
-      "name": "Browser Automation",
-      "percent": 0,
-      "status": "red",
-      "note": "Not started. Playwright still a deferred candidate."
-    },
-    {
-      "name": "Desktop / App Automation",
-      "percent": 0,
-      "status": "red",
-      "note": "Not started."
-    },
-    {
-      "name": "Final UI",
-      "percent": 0,
-      "status": "red",
-      "note": "CLI only. Desktop UI deliberately deferred until the core flow is proven."
-    }
+    {"name": "Çekirdek / Yetki", "percent": 95, "status": "green", "note": "Agent döngüsü, izinler, egress attestation, faturalandırma defteri, tanılama hijyeni, yürütme günlüğü, kill switch."},
+    {"name": "Gelişmiş Hafıza", "percent": 90, "status": "green", "note": "Memory V2 temeli, proje kimliği, sınırlı bağlam getirme."},
+    {"name": "Sağlayıcı / Model Seçimi", "percent": 75, "status": "green", "note": "Elle Claude modeli ve efor seçimi. Tek connector hâlâ Claude Code."},
+    {"name": "Zamanlayıcı", "percent": 45, "status": "yellow", "note": "Saf çekirdekler, dayanıklı job deposu, claim/lease/fencing. Dağıtıcı ve çalışan yok; uçtan uca kullanılamaz."},
+    {"name": "GitHub", "percent": 20, "status": "yellow", "note": "Yalnızca Faz 1 çevrimdışı güvenlik/politika temeli. Canlı connector ve ağ dikişi yok."},
+    {"name": "Gmail", "percent": 0, "status": "red", "note": "Başlanmadı."},
+    {"name": "Tarayıcı Otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı. Playwright hâlâ ertelenmiş aday."},
+    {"name": "Masaüstü / Uygulama Otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı."},
+    {"name": "Nihai Arayüz", "percent": 0, "status": "red", "note": "Yalnızca CLI. Masaüstü arayüzü, çekirdek akış kanıtlanana kadar bilinçli olarak ertelendi."}
   ],
   "recent": [
-    "Scheduler Phase 2A - due materialization, atomic claim, bounded lease, monotonic fencing (SQLite 9)",
-    "GitHub Phase 1 - offline security and policy foundation",
-    "Windows worktree cleanup lifecycle hardening",
-    "Durable scheduler job/generation store (SQLite 8)",
-    "Pure scheduler timing and condition kernels"
+    "Scheduler Faz 2A — vade materyalizasyonu, atomik claim, sınırlı lease, monoton fencing (SQLite 9)",
+    "GitHub Faz 1 — çevrimdışı güvenlik ve politika temeli",
+    "Windows worktree temizleme yaşam döngüsü sağlamlaştırması",
+    "Dayanıklı scheduler job/kuşak deposu (SQLite 8)",
+    "Saf scheduler zamanlama ve koşul çekirdekleri"
   ],
   "health": [
-    {
-      "name": "Tests",
-      "status": "green",
-      "detail": "Last verified: 3038 tests OK, 1 skipped. Not re-run for this dashboard."
-    },
-    {
-      "name": "SQLite schema",
-      "status": "green",
-      "detail": "Version 9. Additive migrations only."
-    },
-    {
-      "name": "Output schema",
-      "status": "green",
-      "detail": "OUTPUT_SCHEMA_VERSION 6. Unchanged."
-    }
+    {"name": "Testler", "status": "green", "detail": "Son doğrulanan: 3038 test OK, 1 atlandı. Bu pano için yeniden çalıştırılmadı."},
+    {"name": "SQLite şeması", "status": "green", "detail": "Sürüm 9. Yalnızca ekleyici migration."},
+    {"name": "Çıktı şeması", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
   ],
+  "push_note": "Push bilinçli olarak bekletiliyor.",
   "parked": [
-    "Voice input",
+    "Sesli giriş",
     "Office / PDF / PowerPoint / Excel",
-    "Calendar",
+    "Takvim",
     "Drive",
     "Slack",
-    "Dev tooling backlog (pip-audit, uv.lock, Playwright MCP, Context7, CodeGraph vs Serena)"
+    "Geliştirme araçları biriktirmesi (pip-audit, uv.lock, Playwright MCP, Context7, CodeGraph / Serena)"
   ],
   "technical": [
-    [
-      "Scheduler phase 2A",
-      "Due materialization, atomic claim, bounded lease (30s-15m), monotonic fencing epoch, safe expiry reclaim (SQLite 9)."
-    ],
-    [
-      "Open 2B0 race",
-      "settle_job_run does not require (run_id, owner_token, fencing_epoch), so a stale owner can settle a reclaimed generation."
-    ],
-    [
-      "Phase boundary",
-      "A valid lease is coordination, never execution authority: no dispatcher, worker loop, approval or connector path exists yet."
-    ]
-  ],
-  "push_note": "Push intentionally pending."
+    ["Scheduler faz 2A", "Vade materyalizasyonu, atomik claim, sınırlı lease (30 sn – 15 dk), monoton fencing epoch'u, süresi dolan lease'in güvenli devralınması (SQLite 9)."],
+    ["Açık 2B0 yarışı", "settle_job_run (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat sahip devralınmış bir JobRun'ı sonuçlandırabiliyor."],
+    ["Faz sınırı", "Geçerli bir lease koordinasyondur, yürütme yetkisi değil: henüz dağıtıcı, çalışan döngüsü, onay veya connector yolu yok."]
+  ]
 }

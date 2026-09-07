@@ -1,41 +1,39 @@
-# Updating the JARVIS Development Dashboard
+# JARVIS Geliştirme Panosu — güncelleme
 
-Dev tooling only. No LLM, no network, no dependencies.
+Yalnızca geliştirme aracı. LLM yok, ağ yok, bağımlılık yok.
 
-## When to update
+## Ne zaman güncellenir
 
-Only when one of these changes:
+Yalnızca şunlardan biri değiştiğinde:
 
-- overall progress
-- active milestone
-- next step
-- capability status
-- blocker status
-- a major completion
-- a schema / system-health headline
+- genel ilerleme
+- aktif milestone
+- sonraki adım
+- yetenek durumu
+- engel durumu
+- büyük bir tamamlanma
+- şema / sistem sağlığı başlığı
 
-Normal bugfixes and test reruns do **not** require a dashboard update.
+Sıradan bugfix ve test tekrarları pano güncellemesi **gerektirmez**.
 
-## How
+## Nasıl
 
-1. Edit only the relevant fields in `status.json`. Keep summaries to one short sentence.
-2. Run:
+1. `status.json` içinde yalnızca ilgili alanları düzenle. Özetleri tek kısa cümle tut.
+2. Çalıştır:
 
    ```
    python dev/dashboard/render_dashboard.py
    ```
 
-3. Open `dashboard.html` and check the fields you changed.
-4. Do not rewrite historical sections (`recent`, completed capabilities) unless they became wrong.
+3. `dashboard.html` dosyasını aç ve değiştirdiğin alanları kontrol et.
+4. Geçmiş bölümleri (`recent`, tamamlanmış yetenekler) yanlış hâle gelmedikçe yeniden yazma.
 
-`status.json` is the source of truth. `dashboard.html` is generated; never edit it by hand.
+`status.json` doğruluk kaynağıdır. `dashboard.html` **üretilir**: bilinçli
+olarak `.gitignore` ile takip dışıdır, elle düzenlenmez ve commit edilmez.
+Yeniden render almak kanonik main'i kirletmez.
 
-## Git-derived fields
+## Git'ten türetilen alanlar
 
-Canonical HEAD, clean/dirty and ahead/behind origin/main are derived by the
-renderer from local git at render time (no fetch, no network). Do not put them
-in `status.json`. If git cannot answer, the dashboard shows `unknown`.
-
-The generated `dashboard.html` is excluded from the dirty count, since the
-renderer writes it on every run. It is a build artifact: re-run the renderer
-after a commit to refresh HEAD and tree state.
+Kanonik HEAD, temiz/kirli durumu ve `origin/main` karşısındaki önde/geride
+sayısı render anında yerel Git'ten türetilir (fetch yok, ağ yok). Bunları
+`status.json` içine yazma. Git yanıt veremezse pano `bilinmiyor` gösterir.
