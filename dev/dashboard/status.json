@@ -2,8 +2,8 @@
   "updated": "2026-09-08",
   "phase": "scheduler-2b0",
   "review_state": "Phase 2A bağımsız review sonrası canonical oldu; 2B0 henüz review edilmedi.",
-  "overall_percent": 60,
-  "overall_note": "Proje tahminidir, ölçülmüş bir değer değildir.",
+  "overall_note": "Yüzdeler ağırlıklı milestone roadmap'inden hesaplanır, elle yazılmaz. Ağırlıklar proje tahminidir.",
+  "refresh_seconds": 60,
   "milestone": {
     "name": "Scheduler Phase 2B0 — fencing completion",
     "status": "yellow",
@@ -15,15 +15,124 @@
     "Fencing'siz settle_job_run race'i: bayat bir worker, ownership'i artık kendisinde olmayan bir JobRun'ı hâlâ settle edebiliyor. Scheduler 2B0 tamamlanıp kabul edilene kadar blocking."
   ],
   "capabilities": [
-    {"name": "Core / Authority", "percent": 95, "status": "green", "note": "Agent loop, permission'lar, egress attestation, billing ledger, diagnostic hygiene, execution journal, kill switch."},
-    {"name": "Advanced Memory", "percent": 90, "status": "green", "note": "Memory V2 temeli, proje kimliği, bounded context retrieval."},
-    {"name": "Provider / Model seçimi", "percent": 75, "status": "green", "note": "Elle Claude model ve effort seçimi. Tek connector hâlâ Claude Code."},
-    {"name": "Scheduler", "percent": 45, "status": "yellow", "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing. Dispatch ve worker yok; uçtan uca kullanılamaz."},
-    {"name": "GitHub", "percent": 20, "status": "yellow", "note": "Yalnızca Phase 1 offline güvenlik/politika temeli. Canlı connector ve network seam yok."},
-    {"name": "Gmail", "percent": 0, "status": "red", "note": "Başlanmadı."},
-    {"name": "Browser automation", "percent": 0, "status": "red", "note": "Başlanmadı. Playwright hâlâ ertelenmiş aday."},
-    {"name": "Desktop / uygulama otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı."},
-    {"name": "Nihai arayüz", "percent": 0, "status": "red", "note": "Yalnızca CLI. Masaüstü arayüzü, çekirdek akış kanıtlanana kadar bilinçli olarak ertelendi."}
+    {
+      "name": "Core / Authority",
+      "weight": 26,
+      "note": "Agent loop, permission'lar, egress attestation, billing ledger, diagnostic hygiene, execution journal, kill switch.",
+      "milestones": [
+        {"name": "Sözleşmeler + Agent loop", "state": "completed"},
+        {"name": "Permission ve risk modeli", "state": "completed"},
+        {"name": "Egress attestation (H1)", "state": "completed"},
+        {"name": "Execution journal ve lifecycle (H2)", "state": "completed"},
+        {"name": "Billing / ledger bütünlüğü (H3)", "state": "completed"},
+        {"name": "Diagnostic hygiene (H4)", "state": "completed"},
+        {"name": "Kalıcı config + execution kill switch (M12 S4)", "state": "completed"},
+        {"name": "Core-owned destination policy", "state": "completed"},
+        {"name": "Bounded local file read / write scope'ları", "state": "completed"},
+        {"name": "Task chain + cancel yüzeyi", "state": "completed"},
+        {"name": "Canlı execution hardening review", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Advanced Memory",
+      "weight": 10,
+      "note": "Memory V2 temeli, proje kimliği, bounded context retrieval.",
+      "milestones": [
+        {"name": "Memory store + schema", "state": "completed"},
+        {"name": "Proje kimliği ve açık proje hafızası (M1)", "state": "completed"},
+        {"name": "Bounded context retrieval", "state": "completed"},
+        {"name": "Task-aware plan + progress enrichment", "state": "completed"},
+        {"name": "Memory V2 temeli", "state": "completed"},
+        {"name": "Memory V2 — temel ötesi retrieval yüzeyi", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Provider / Model Selection",
+      "weight": 8,
+      "note": "Elle Claude model ve effort seçimi. Tek connector hâlâ Claude Code.",
+      "milestones": [
+        {"name": "Provider-agnostic ModelAdapter sözleşmesi", "state": "completed"},
+        {"name": "Claude Code connector", "state": "completed"},
+        {"name": "Elle model + effort seçimi", "state": "completed"},
+        {"name": "Tipli model answer + handoff", "state": "completed"},
+        {"name": "İkinci provider (açık onay arkasında)", "state": "not_started"},
+        {"name": "Maliyet / kalite tabanlı otomatik routing", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Scheduler",
+      "weight": 16,
+      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing. Dispatch ve worker yok.",
+      "milestones": [
+        {"name": "Timing kernel", "state": "completed"},
+        {"name": "Condition kernel temeli", "state": "completed"},
+        {"name": "Durable persistence", "state": "completed"},
+        {"name": "Claim / lease / fencing (Phase 2A)", "state": "completed"},
+        {"name": "2B0 fenced completion", "state": "in_progress"},
+        {"name": "2B1 AgentCore dispatch", "state": "not_started"},
+        {"name": "2B2 cancellation / recovery yüzeyi", "state": "not_started"},
+        {"name": "2C condition execution", "state": "not_started"},
+        {"name": "2D background dispatcher", "state": "not_started"},
+        {"name": "Uçtan uca hardening", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "GitHub",
+      "weight": 10,
+      "note": "Yalnızca Phase 1 offline güvenlik/politika temeli. Canlı connector ve network seam yok.",
+      "milestones": [
+        {"name": "Phase 1 offline güvenlik / politika temeli", "state": "completed"},
+        {"name": "Phase 2 process seam + auth politikası", "state": "not_started"},
+        {"name": "Phase 2 canlı read", "state": "not_started"},
+        {"name": "Phase 3 write işlemleri", "state": "not_started"},
+        {"name": "Uçtan uca review + hardening", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Gmail",
+      "weight": 6,
+      "note": "Başlanmadı.",
+      "milestones": [
+        {"name": "Offline scope / politika temeli", "state": "not_started"},
+        {"name": "Read connector", "state": "not_started"},
+        {"name": "Onaylı gönderim", "state": "not_started"},
+        {"name": "Uçtan uca hardening", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Browser automation",
+      "weight": 6,
+      "note": "Başlanmadı. Playwright hâlâ ertelenmiş aday.",
+      "milestones": [
+        {"name": "Offline scope / politika temeli", "state": "not_started"},
+        {"name": "Read-only navigasyon", "state": "not_started"},
+        {"name": "Onaylı etkileşim / form", "state": "not_started"},
+        {"name": "Uçtan uca hardening", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Desktop / uygulama otomasyonu",
+      "weight": 5,
+      "note": "Başlanmadı.",
+      "milestones": [
+        {"name": "Offline scope / politika temeli", "state": "not_started"},
+        {"name": "Read-only gözlem", "state": "not_started"},
+        {"name": "Kontrollü girdi", "state": "not_started"},
+        {"name": "Uçtan uca hardening", "state": "not_started"}
+      ]
+    },
+    {
+      "name": "Nihai arayüz",
+      "weight": 13,
+      "note": "Yalnızca CLI. Masaüstü arayüzü, çekirdek akış kanıtlanana kadar bilinçli olarak ertelendi.",
+      "milestones": [
+        {"name": "Arayüz stack kararı", "state": "not_started"},
+        {"name": "Uygulama iskeleti", "state": "not_started"},
+        {"name": "Task + approval yüzeyi", "state": "not_started"},
+        {"name": "Memory / scheduler görünürlüğü", "state": "not_started"},
+        {"name": "Uçtan uca hardening", "state": "not_started"}
+      ]
+    }
   ],
   "recent": [
     "Scheduler Phase 2A — due materialization, atomic claim, bounded lease, monotonic fencing (SQLite 9)",
@@ -47,8 +156,9 @@
     "Dev tooling backlog (pip-audit, uv.lock, Playwright MCP, Context7, CodeGraph / Serena)"
   ],
   "technical": [
-    ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn – 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
+    ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn - 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
     ["Açık 2B0 race'i", "settle_job_run, (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat owner reclaim edilmiş bir JobRun'ı settle edebiliyor."],
-    ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."]
+    ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."],
+    ["İlerleme modeli", "completed = 1.0, in_progress = 0.5, not_started = 0.0; deferred milestone paydadan düşer. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
   ]
 }

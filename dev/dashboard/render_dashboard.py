@@ -91,6 +91,47 @@ def git_facts() -> dict:
     }
 
 
+MILESTONE_CREDIT = {"completed": 1.0, "in_progress": 0.5, "not_started": 0.0}
+
+
+def capability_progress(cap: dict) -> tuple[int, int, int, int]:
+    """(percent, completed, in_progress, counted) for one capability.
+
+    Credit comes only from milestone state, never from code volume, test count
+    or commits. A ``deferred`` milestone leaves the denominator entirely, so
+    work parked outside usable-v1 cannot drag the number down.
+    """
+    earned = total = 0.0
+    done = doing = counted = 0
+    for milestone in cap.get("milestones", []):
+        state = milestone.get("state", "not_started")
+        if state == "deferred":
+            continue
+        weight = float(milestone.get("weight", 1))
+        earned += weight * MILESTONE_CREDIT.get(state, 0.0)
+        total += weight
+        counted += 1
+        done += state == "completed"
+        doing += state == "in_progress"
+    percent = round(100 * earned / total) if total else 0
+    return percent, done, doing, counted
+
+
+def overall_progress(capabilities: list) -> int:
+    earned = total = 0.0
+    for cap in capabilities:
+        weight = float(cap.get("weight", 1))
+        earned += weight * capability_progress(cap)[0]
+        total += weight
+    return round(earned / total) if total else 0
+
+
+def percent_status(percent: int) -> str:
+    if percent >= 75:
+        return "green"
+    return "yellow" if percent >= 20 else "red"
+
+
 def esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
@@ -137,13 +178,17 @@ def render(data: dict) -> str:
         '<title>JARVIS Geliştirme Panosu</title>')
     add(f"<style>{CSS}</style></head><body><main>")
     add("<h1>JARVIS Geliştirme Panosu</h1>")
+    refresh = int(data.get("refresh_seconds", 0) or 0)
     add(f'<p class="sub">Güncelleme: {esc(data.get("updated", "bilinmiyor"))} '
-        f'&middot; phase {esc(data.get("phase", "bilinmiyor"))}</p>')
+        f'&middot; phase {esc(data.get("phase", "bilinmiyor"))}'
+        + (f' &middot; Otomatik yenileme: {refresh} sn' if refresh else "")
+        + "</p>")
 
     # 1. Overall progress
+    overall = overall_progress(data.get("capabilities", []))
     add('<section><h2>Kullanılabilir V1 ilerlemesi</h2><div class="card">')
-    add(f'<div class="big">{esc(data.get("overall_percent", 0))}%</div>')
-    add(bar(data.get("overall_percent", 0)))
+    add(f'<div class="big">{overall}%</div>')
+    add(bar(overall))
     add(f'<p class="muted">{esc(data.get("overall_note", ""))}</p></div></section>')
 
     # 2 + 3. Milestone and next step
@@ -170,13 +215,20 @@ def render(data: dict) -> str:
     # 5. Capabilities
     add('<section><h2>Yetenekler</h2><div class="grid">')
     for cap in data.get("capabilities", []):
+        pct, done, doing, counted = capability_progress(cap)
+        state = percent_status(pct)
+        tally = f"{done}/{counted} milestone"
+        if doing:
+            tally += f" · {doing} devam ediyor"
         add('<div class="card">'
-            f'<div class="row"><h3><span class="dot {cls(cap.get("status"))}"></span>'
+            f'<div class="row"><h3><span class="dot {state}"></span>'
             f'{esc(cap.get("name", ""))}</h3>'
-            f'<span class="muted">{esc(cap.get("percent", 0))}%</span></div>'
-            + bar(cap.get("percent", 0), cap.get("status", "green")) +
+            f'<span class="muted">{pct}%</span></div>'
+            + bar(pct, state) +
+            f'<p class="muted">{esc(tally)} &middot; ağırlık {esc(cap.get("weight", 1))}</p>'
             f'<p class="muted">{esc(cap.get("note", ""))}</p></div>')
-    add('</div><p class="muted">Yüzdeler proje tahminidir, ölçüm değildir.</p></section>')
+    add('</div><p class="muted">Yüzdeler milestone durumlarından hesaplanır; '
+        'ağırlıklar proje tahminidir.</p></section>')
 
     # 6 + 7. Recently completed and system health
     add('<section><div class="grid">')
@@ -210,11 +262,40 @@ def render(data: dict) -> str:
         )
         + "</dl></details></div></section>")
 
-    add("</main></body></html>")
+    add("</main>")
+    if refresh:
+        # Local-only reload of this file:// page. No fetch, no server, no timer
+        # while the tab is hidden; becoming visible again refreshes at once.
+        add("<script>(function(){var t=setTimeout(r," + str(refresh * 1000) + ");"
+            "function r(){location.reload()}"
+            "document.addEventListener('visibilitychange',function(){"
+            "document.hidden?clearTimeout(t):r()})})();</script>")
+    add("</body></html>")
     return "\n".join(out) + "\n"
 
 
+def selftest() -> int:
+    """Smallest check that fails if the weighted progress model breaks."""
+    cap = {"weight": 2, "milestones": [
+        {"name": "a", "state": "completed"},
+        {"name": "b", "state": "in_progress"},
+        {"name": "c", "state": "not_started"},
+        {"name": "d", "state": "deferred"},
+    ]}
+    assert capability_progress(cap) == (50, 1, 1, 3), capability_progress(cap)
+    empty = {"weight": 1, "milestones": [{"name": "x", "state": "not_started"}]}
+    assert overall_progress([cap, empty]) == 33, overall_progress([cap, empty])
+    assert (percent_status(75), percent_status(20), percent_status(19)) == (
+        "green", "yellow", "red")
+    real = json.loads(STATUS.read_text(encoding="utf-8"))
+    assert 0 <= overall_progress(real["capabilities"]) <= 100
+    print("selftest ok")
+    return 0
+
+
 def main() -> int:
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
     data = json.loads(STATUS.read_text(encoding="utf-8"))
     OUTPUT.write_text(render(data), encoding="utf-8", newline="\n")
     print(f"wrote {OUTPUT}")
