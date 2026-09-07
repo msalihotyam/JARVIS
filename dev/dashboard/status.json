@@ -159,6 +159,6 @@
     ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn - 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
     ["Açık 2B0 race'i", "settle_job_run, (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat owner reclaim edilmiş bir JobRun'ı settle edebiliyor."],
     ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."],
-    ["İlerleme modeli", "completed = 1.0, in_progress = 0.5, not_started = 0.0; deferred milestone paydadan düşer. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
+    ["İlerleme modeli", "completed = 1.0, in_progress = 0.0, not_started = 0.0; deferred milestone paydadan düşer. Yalnızca kapanmış milestone kredi kazanır. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
   ]
 }

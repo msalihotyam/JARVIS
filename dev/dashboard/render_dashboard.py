@@ -91,15 +91,16 @@ def git_facts() -> dict:
     }
 
 
-MILESTONE_CREDIT = {"completed": 1.0, "in_progress": 0.5, "not_started": 0.0}
+MILESTONE_CREDIT = {"completed": 1.0, "in_progress": 0.0, "not_started": 0.0}
 
 
 def capability_progress(cap: dict) -> tuple[int, int, int, int]:
     """(percent, completed, in_progress, counted) for one capability.
 
-    Credit comes only from milestone state, never from code volume, test count
-    or commits. A ``deferred`` milestone leaves the denominator entirely, so
-    work parked outside usable-v1 cannot drag the number down.
+    Only a closed milestone earns credit: progress answers "how much of the
+    usable-v1 roadmap is verified and closed", so started-but-unaccepted work
+    counts as zero. A ``deferred`` milestone leaves the denominator entirely,
+    so work parked outside usable-v1 cannot drag the number down.
     """
     earned = total = 0.0
     done = doing = counted = 0
@@ -282,9 +283,9 @@ def selftest() -> int:
         {"name": "c", "state": "not_started"},
         {"name": "d", "state": "deferred"},
     ]}
-    assert capability_progress(cap) == (50, 1, 1, 3), capability_progress(cap)
+    assert capability_progress(cap) == (33, 1, 1, 3), capability_progress(cap)
     empty = {"weight": 1, "milestones": [{"name": "x", "state": "not_started"}]}
-    assert overall_progress([cap, empty]) == 33, overall_progress([cap, empty])
+    assert overall_progress([cap, empty]) == 22, overall_progress([cap, empty])
     assert (percent_status(75), percent_status(20), percent_status(19)) == (
         "green", "yellow", "red")
     real = json.loads(STATUS.read_text(encoding="utf-8"))

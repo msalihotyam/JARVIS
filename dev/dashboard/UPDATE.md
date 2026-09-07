@@ -20,7 +20,10 @@ Sıradan bugfix ve test tekrarları pano güncellemesi **gerektirmez**.
 
 ## İlerleme modeli
 
-- `completed` = 1.0, `in_progress` = 0.5, `not_started` = 0.0
+- `completed` = 1.0, `in_progress` = 0.0, `not_started` = 0.0
+- **Kısmi kredi yoktur.** İlerleme "usable-v1 roadmap'inin ne kadarı doğrulanıp
+  kapandı" sorusunun cevabıdır; bir milestone'a başlanmış olması yüzdeyi
+  artırmaz, yalnızca kabul edilip kapanması artırır.
 - `deferred` milestone paydadan tamamen düşer (usable-v1 dışı iş, ilerlemeyi
   aşağı çekmez)
 - yetenek yüzdesi = kendi milestone ağırlıklarının kredisi
