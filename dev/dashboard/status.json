@@ -1,41 +1,41 @@
 {
   "updated": "2026-09-08",
   "phase": "scheduler-2b0",
-  "review_state": "Faz 2A bağımsız incelemeden sonra kanonik oldu; 2B0 henüz incelenmedi.",
+  "review_state": "Phase 2A bağımsız review sonrası canonical oldu; 2B0 henüz review edilmedi.",
   "overall_percent": 60,
   "overall_note": "Proje tahminidir, ölçülmüş bir değer değildir.",
   "milestone": {
-    "name": "Scheduler Faz 2B0 — fencing tamamlama",
+    "name": "Scheduler Phase 2B0 — fencing completion",
     "status": "yellow",
     "status_label": "Devam ediyor",
-    "summary": "Eski bir scheduler çalışanının, sahiplik yeni bir çalışana geçtikten sonra iş sonucunu değiştirmesini engelliyoruz."
+    "summary": "Eski bir worker'ın, ownership yeni worker'a geçtikten sonra JobRun sonucunu değiştirmesini engelliyoruz."
   },
-  "next_step": "Scheduler'ı gerçek AgentCore yürütme yoluna güvenli biçimde bağla.",
+  "next_step": "Scheduler'ı gerçek AgentCore execution yoluna güvenli biçimde bağla.",
   "blockers": [
-    "Fencing'siz settle_job_run yarışı: bayat bir çalışan, artık sahibi olmadığı bir JobRun'ı hâlâ sonuçlandırabiliyor. Scheduler 2B0 tamamlanıp kabul edilene kadar açık."
+    "Fencing'siz settle_job_run race'i: bayat bir worker, ownership'i artık kendisinde olmayan bir JobRun'ı hâlâ settle edebiliyor. Scheduler 2B0 tamamlanıp kabul edilene kadar blocking."
   ],
   "capabilities": [
-    {"name": "Çekirdek / Yetki", "percent": 95, "status": "green", "note": "Agent döngüsü, izinler, egress attestation, faturalandırma defteri, tanılama hijyeni, yürütme günlüğü, kill switch."},
-    {"name": "Gelişmiş Hafıza", "percent": 90, "status": "green", "note": "Memory V2 temeli, proje kimliği, sınırlı bağlam getirme."},
-    {"name": "Sağlayıcı / Model Seçimi", "percent": 75, "status": "green", "note": "Elle Claude modeli ve efor seçimi. Tek connector hâlâ Claude Code."},
-    {"name": "Zamanlayıcı", "percent": 45, "status": "yellow", "note": "Saf çekirdekler, dayanıklı job deposu, claim/lease/fencing. Dağıtıcı ve çalışan yok; uçtan uca kullanılamaz."},
-    {"name": "GitHub", "percent": 20, "status": "yellow", "note": "Yalnızca Faz 1 çevrimdışı güvenlik/politika temeli. Canlı connector ve ağ dikişi yok."},
+    {"name": "Core / Authority", "percent": 95, "status": "green", "note": "Agent loop, permission'lar, egress attestation, billing ledger, diagnostic hygiene, execution journal, kill switch."},
+    {"name": "Advanced Memory", "percent": 90, "status": "green", "note": "Memory V2 temeli, proje kimliği, bounded context retrieval."},
+    {"name": "Provider / Model seçimi", "percent": 75, "status": "green", "note": "Elle Claude model ve effort seçimi. Tek connector hâlâ Claude Code."},
+    {"name": "Scheduler", "percent": 45, "status": "yellow", "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing. Dispatch ve worker yok; uçtan uca kullanılamaz."},
+    {"name": "GitHub", "percent": 20, "status": "yellow", "note": "Yalnızca Phase 1 offline güvenlik/politika temeli. Canlı connector ve network seam yok."},
     {"name": "Gmail", "percent": 0, "status": "red", "note": "Başlanmadı."},
-    {"name": "Tarayıcı Otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı. Playwright hâlâ ertelenmiş aday."},
-    {"name": "Masaüstü / Uygulama Otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı."},
-    {"name": "Nihai Arayüz", "percent": 0, "status": "red", "note": "Yalnızca CLI. Masaüstü arayüzü, çekirdek akış kanıtlanana kadar bilinçli olarak ertelendi."}
+    {"name": "Browser automation", "percent": 0, "status": "red", "note": "Başlanmadı. Playwright hâlâ ertelenmiş aday."},
+    {"name": "Desktop / uygulama otomasyonu", "percent": 0, "status": "red", "note": "Başlanmadı."},
+    {"name": "Nihai arayüz", "percent": 0, "status": "red", "note": "Yalnızca CLI. Masaüstü arayüzü, çekirdek akış kanıtlanana kadar bilinçli olarak ertelendi."}
   ],
   "recent": [
-    "Scheduler Faz 2A — vade materyalizasyonu, atomik claim, sınırlı lease, monoton fencing (SQLite 9)",
-    "GitHub Faz 1 — çevrimdışı güvenlik ve politika temeli",
-    "Windows worktree temizleme yaşam döngüsü sağlamlaştırması",
-    "Dayanıklı scheduler job/kuşak deposu (SQLite 8)",
-    "Saf scheduler zamanlama ve koşul çekirdekleri"
+    "Scheduler Phase 2A — due materialization, atomic claim, bounded lease, monotonic fencing (SQLite 9)",
+    "GitHub Phase 1 — offline güvenlik ve politika temeli",
+    "Windows worktree cleanup lifecycle sağlamlaştırması",
+    "Dayanıklı scheduler job / JobRun store (SQLite 8)",
+    "Saf scheduler timing ve condition kernel'leri"
   ],
   "health": [
-    {"name": "Testler", "status": "green", "detail": "Son doğrulanan: 3038 test OK, 1 atlandı. Bu pano için yeniden çalıştırılmadı."},
-    {"name": "SQLite şeması", "status": "green", "detail": "Sürüm 9. Yalnızca ekleyici migration."},
-    {"name": "Çıktı şeması", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
+    {"name": "Testler", "status": "green", "detail": "Son doğrulanan: 3038 test OK, 1 skipped. Bu pano için yeniden çalıştırılmadı."},
+    {"name": "SQLite schema", "status": "green", "detail": "Sürüm 9. Yalnızca additive migration."},
+    {"name": "Output schema", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
   ],
   "push_note": "Push bilinçli olarak bekletiliyor.",
   "parked": [
@@ -44,11 +44,11 @@
     "Takvim",
     "Drive",
     "Slack",
-    "Geliştirme araçları biriktirmesi (pip-audit, uv.lock, Playwright MCP, Context7, CodeGraph / Serena)"
+    "Dev tooling backlog (pip-audit, uv.lock, Playwright MCP, Context7, CodeGraph / Serena)"
   ],
   "technical": [
-    ["Scheduler faz 2A", "Vade materyalizasyonu, atomik claim, sınırlı lease (30 sn – 15 dk), monoton fencing epoch'u, süresi dolan lease'in güvenli devralınması (SQLite 9)."],
-    ["Açık 2B0 yarışı", "settle_job_run (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat sahip devralınmış bir JobRun'ı sonuçlandırabiliyor."],
-    ["Faz sınırı", "Geçerli bir lease koordinasyondur, yürütme yetkisi değil: henüz dağıtıcı, çalışan döngüsü, onay veya connector yolu yok."]
+    ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn – 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
+    ["Açık 2B0 race'i", "settle_job_run, (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat owner reclaim edilmiş bir JobRun'ı settle edebiliyor."],
+    ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."]
   ]
 }

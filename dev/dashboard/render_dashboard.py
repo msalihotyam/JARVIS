@@ -138,7 +138,7 @@ def render(data: dict) -> str:
     add(f"<style>{CSS}</style></head><body><main>")
     add("<h1>JARVIS Geliştirme Panosu</h1>")
     add(f'<p class="sub">Güncelleme: {esc(data.get("updated", "bilinmiyor"))} '
-        f'&middot; faz {esc(data.get("phase", "bilinmiyor"))}</p>')
+        f'&middot; phase {esc(data.get("phase", "bilinmiyor"))}</p>')
 
     # 1. Overall progress
     add('<section><h2>Kullanılabilir V1 ilerlemesi</h2><div class="card">')
@@ -201,9 +201,9 @@ def render(data: dict) -> str:
     # 9. Technical details
     add('<section><div class="card"><details><summary>Teknik ayrıntılar</summary><dl>'
         f'<dt>Kanonik HEAD</dt><dd>{esc(facts["head"])}</dd>'
-        f'<dt>Aktif faz</dt><dd>{esc(data.get("phase", "bilinmiyor"))}</dd>'
+        f'<dt>Aktif phase</dt><dd>{esc(data.get("phase", "bilinmiyor"))}</dd>'
         f'<dt>Güncelleme</dt><dd>{esc(data.get("updated", "bilinmiyor"))}</dd>'
-        f'<dt>İnceleme durumu</dt><dd>{esc(data.get("review_state", "yok"))}</dd>'
+        f'<dt>Review durumu</dt><dd>{esc(data.get("review_state", "yok"))}</dd>'
         + "".join(
             f"<dt>{esc(term)}</dt><dd>{esc(detail)}</dd>"
             for term, detail in data.get("technical", [])
