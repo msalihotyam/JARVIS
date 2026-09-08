@@ -68,6 +68,7 @@ from tests.test_scheduler_jobs import (  # noqa: F401
     one_time_schedule,
     raw,
     rewrite_run,
+    settle,
     setUpModule,
     spec,
     step,
@@ -100,6 +101,8 @@ SCHEDULER_SURFACE = frozenset(
         "renew_job_run_lease",
         "release_job_run",
         "settle_job_run",
+        "mark_job_run_unknown",
+        "await_job_run_approval",
         "load_job",
         "load_job_run",
         "list_jobs",
@@ -468,7 +471,7 @@ class DueGenerationTests(ClaimTestCase):
         run = self.store.materialize_due_job_run(
             record.id, record.revision, now=at
         )
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.store, run.id, JobRunStatus.COMPLETED, now=at)
         # Not now, not tomorrow, not in a decade.
         for later in (at, at + timedelta(days=1), at + timedelta(days=3650)):
             current = self.store.load_job(record.id)
@@ -551,7 +554,7 @@ class DueGenerationTests(ClaimTestCase):
         )
         self.assertEqual(1, run.generation)
         self.assertEqual(1, table_count(self.database, "job_runs"))
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.store, run.id, JobRunStatus.COMPLETED, now=year_later)
         # The anchor now points AFTER the coalesced occurrence, so the same
         # instant is no longer due and nothing further materializes.
         current = self.store.load_job(record.id)
@@ -630,7 +633,7 @@ class DueGenerationTests(ClaimTestCase):
             )
         )
         self.assertEqual(1, table_count(self.database, "job_runs"))
-        self.store.settle_job_run(first.id, JobRunStatus.COMPLETED)
+        settle(self.store, first.id, JobRunStatus.COMPLETED, now=NOW)
         second = self.store.materialize_due_job_run(
             record.id, current.revision, now=NOW + timedelta(hours=5)
         )
@@ -768,7 +771,7 @@ class ClaimTests(ClaimTestCase):
             self.store.claim_job_run(str(uuid4()), WORKER_A, now=self.at, lease=LEASE)
 
     def test_a_settled_generation_cannot_be_claimed(self) -> None:
-        self.store.settle_job_run(self.run.id, JobRunStatus.COMPLETED)
+        settle(self.store, self.run.id, JobRunStatus.COMPLETED, now=self.at)
         with self.assertRaisesRegex(JobError, "not claimable"):
             self.store.claim_job_run(self.run.id, WORKER_A, now=self.at, lease=LEASE)
 
@@ -849,7 +852,13 @@ class RenewalTests(ClaimTestCase):
         )
 
     def test_a_settled_generation_cannot_renew(self) -> None:
-        self.store.settle_job_run(self.run.id, JobRunStatus.FAILED)
+        self.store.settle_job_run(
+            self.run.id,
+            JobRunStatus.FAILED,
+            WORKER_A,
+            self.lease.fencing_epoch,
+            now=self.at,
+        )
         with self.assertRaisesRegex(JobError, "already settled"):
             self.store.renew_job_run_lease(
                 self.run.id, WORKER_A, self.lease.fencing_epoch,
@@ -1136,7 +1145,10 @@ class RevisionBindingTests(ClaimTestCase):
         at = NOW + timedelta(hours=1)
         first = self.due_run(at)
         lease = self.store.claim_job_run(first.id, WORKER_A, now=at, lease=LEASE)
-        self.store.settle_job_run(first.id, JobRunStatus.COMPLETED)
+        self.store.settle_job_run(
+            first.id, JobRunStatus.COMPLETED, WORKER_A, lease.fencing_epoch,
+            now=at,
+        )
         second = self.store.materialize_due_job_run(
             self.job.id,
             self.store.load_job(self.job.id).revision,
@@ -1183,7 +1195,10 @@ class RevisionBindingTests(ClaimTestCase):
         at = NOW + timedelta(hours=1)
         run = self.due_run(at)
         lease = self.store.claim_job_run(run.id, WORKER_A, now=at, lease=LEASE)
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        self.store.settle_job_run(
+            run.id, JobRunStatus.COMPLETED, WORKER_A, lease.fencing_epoch,
+            now=at,
+        )
         current = self.store.load_job(self.job.id)
         self.store.archive_job(self.job.id, current.revision)
         stored = self.store.load_job_run(run.id)
@@ -1270,10 +1285,13 @@ class AuthorityBoundaryTests(ClaimTestCase):
         self.store.release_job_run(
             run.id, WORKER_B, taken.fencing_epoch, now=at + timedelta(minutes=31)
         )
-        self.store.claim_job_run(
+        final = self.store.claim_job_run(
             run.id, "worker-c", now=at + timedelta(minutes=31), lease=LEASE
         )
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        self.store.settle_job_run(
+            run.id, JobRunStatus.COMPLETED, "worker-c", final.fencing_epoch,
+            now=at + timedelta(minutes=32),
+        )
 
     def test_a_full_lifecycle_creates_no_authority_row_of_any_kind(self) -> None:
         self.full_lifecycle()
@@ -1408,6 +1426,10 @@ class SourceBoundaryTests(unittest.TestCase):
             "_lease_expiry",
             "_owned_run",
             "_held_lease",
+            "settle_job_run",
+            "_fenced_transition",
+            "mark_job_run_unknown",
+            "await_job_run_approval",
             "_lease_result",
             "_insert_job_run",
         }

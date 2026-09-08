@@ -378,6 +378,23 @@ def rewrite_run(
         connection.close()
 
 
+#: Phase 2B0 fenced settlement. An outcome may only be written by the worker
+#: that can still PROVE it owns the generation, so a test that just wants a
+#: generation closed claims it first and settles under that exact proof. The
+#: helper exists so the suites that only care about "and then it was settled"
+#: do not each hand-roll the claim, and so the proof they pass is a real one.
+SETTLE_WORKER = "settler"
+SETTLE_LEASE = timedelta(minutes=5)
+
+
+def settle(store, run_id: str, status, *, now=NOW, **fields):
+    """Claim ``run_id`` and settle it under the exact lease just acquired."""
+    lease = store.claim_job_run(run_id, SETTLE_WORKER, now=now, lease=SETTLE_LEASE)
+    return store.settle_job_run(
+        run_id, status, lease.owner_token, lease.fencing_epoch, now=now, **fields
+    )
+
+
 class JobStoreTestCase(unittest.TestCase):
     """A fresh schema-8 store with one active project to hang jobs on."""
 
@@ -870,7 +887,7 @@ class StateTests(JobStoreTestCase):
     def test_enable_never_revives_a_settled_generation(self) -> None:
         record = self.create(schedule=interval_schedule(1))
         run = self.store.record_job_run(record.id, record.next_due_at_utc)
-        settled = self.store.settle_job_run(run.id, JobRunStatus.CANCELLED)
+        settled = settle(self.store, run.id, JobRunStatus.CANCELLED)
         current = self.store.load_job(record.id)
         disabled = self.store.set_job_enabled(record.id, current.revision, False, now=NOW)
         enabled = self.store.set_job_enabled(
@@ -887,7 +904,7 @@ class StateTests(JobStoreTestCase):
     def test_archive_disables_scheduling_and_preserves_history(self) -> None:
         record = self.create()
         run = self.store.record_job_run(record.id, record.next_due_at_utc)
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.store, run.id, JobRunStatus.COMPLETED)
         current = self.store.load_job(record.id)
         archived = self.store.archive_job(record.id, current.revision)
         self.assertTrue(archived.archived)
@@ -986,14 +1003,14 @@ class JobRunTests(JobStoreTestCase):
     def test_a_duplicate_occurrence_is_refused(self) -> None:
         record = self.create(schedule=interval_schedule(1))
         first = self.store.record_job_run(record.id, record.next_due_at_utc)
-        self.store.settle_job_run(first.id, JobRunStatus.COMPLETED)
+        settle(self.store, first.id, JobRunStatus.COMPLETED)
         with self.assertRaisesRegex(JobError, "already been recorded"):
             self.store.record_job_run(record.id, first.nominal_due_at_utc)
 
     def test_occurrence_identity_is_enforced_by_storage(self) -> None:
         record = self.create(schedule=interval_schedule(1))
         run = self.store.record_job_run(record.id, record.next_due_at_utc)
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.store, run.id, JobRunStatus.COMPLETED)
         columns = (
             "id, job_id, job_revision, generation, nominal_due_at_utc, "
             "project_id, spec_json, snapshot_digest, status, fencing_epoch, "
@@ -1077,7 +1094,8 @@ class JobRunTests(JobStoreTestCase):
     def test_settling_allows_the_next_generation(self) -> None:
         record = self.create(schedule=interval_schedule(1))
         first = self.store.record_job_run(record.id, record.next_due_at_utc)
-        settled = self.store.settle_job_run(
+        settled = settle(
+            self.store,
             first.id,
             JobRunStatus.FAILED,
             blocking_code=ErrorCode.CONNECTOR_FAILED.value,
@@ -1090,17 +1108,23 @@ class JobRunTests(JobStoreTestCase):
         )
         self.assertEqual(2, second.generation)
         with self.assertRaisesRegex(JobError, "already settled"):
-            self.store.settle_job_run(first.id, JobRunStatus.COMPLETED)
+            self.store.settle_job_run(
+                first.id, JobRunStatus.COMPLETED, SETTLE_WORKER, 1, now=NOW
+            )
         with self.assertRaisesRegex(JobError, "settled status"):
-            self.store.settle_job_run(second.id, JobRunStatus.RUNNING)
+            self.store.settle_job_run(
+                second.id, JobRunStatus.RUNNING, SETTLE_WORKER, 1, now=NOW
+            )
         with self.assertRaises(JobError):
-            self.store.settle_job_run(second.id, "completed")  # type: ignore[arg-type]
+            self.store.settle_job_run(
+                second.id, "completed", SETTLE_WORKER, 1, now=NOW  # type: ignore[arg-type]
+            )
 
     def test_a_condition_watch_generation_records_its_typed_outcome(self) -> None:
         record = self.create(kind=JobKind.CONDITION_WATCH)
         run = self.store.record_job_run(record.id, record.next_due_at_utc)
-        settled = self.store.settle_job_run(
-            run.id, JobRunStatus.SKIPPED, condition_result="unknown"
+        settled = settle(
+            self.store, run.id, JobRunStatus.SKIPPED, condition_result="unknown"
         )
         self.assertEqual("unknown", settled.condition_result)
         self.assertEqual("unknown", self.store.load_job_run(run.id).condition_result)
@@ -1138,7 +1162,7 @@ class JobRunTests(JobStoreTestCase):
             record.id, due.isoformat(timespec="microseconds")
         )
         self.assertEqual(record.next_due_at_utc, run.nominal_due_at_utc)
-        self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.store, run.id, JobRunStatus.COMPLETED)
         with self.assertRaisesRegex(JobError, "already been recorded"):
             self.store.record_job_run(
                 record.id, due.isoformat(timespec="microseconds")
@@ -1153,9 +1177,18 @@ class JobRunTests(JobStoreTestCase):
     def test_a_revision_inconsistent_generation_cannot_be_settled(self) -> None:
         record = self.create()
         run = self.store.record_job_run(record.id, record.next_due_at_utc)
+        lease = self.store.claim_job_run(
+            run.id, SETTLE_WORKER, now=NOW, lease=SETTLE_LEASE
+        )
         rewrite_run(self.store, run.id, job_revision=99)
         with self.assertRaises(JobError):
-            self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+            self.store.settle_job_run(
+                run.id,
+                JobRunStatus.COMPLETED,
+                lease.owner_token,
+                lease.fencing_epoch,
+                now=NOW,
+            )
         connection = raw(self.database)
         try:
             self.assertIsNone(
@@ -1214,7 +1247,7 @@ class VisibilityTests(JobStoreTestCase):
         for _ in range(3):
             current = self.store.load_job(active.id)
             run = self.store.record_job_run(active.id, current.next_due_at_utc)
-            self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+            settle(self.store, run.id, JobRunStatus.COMPLETED)
             generations.append(run.generation)
         listed = [summary.generation for summary in self.store.list_job_runs(active.id, 10)]
         self.assertEqual(sorted(generations, reverse=True), listed)
@@ -1373,7 +1406,9 @@ class CorruptionTests(JobStoreTestCase):
         )
         self.assertIsNone(self.store.load_job_run(run.id))
         with self.assertRaises(JobError):
-            self.store.settle_job_run(run.id, JobRunStatus.COMPLETED)
+            self.store.settle_job_run(
+                run.id, JobRunStatus.COMPLETED, SETTLE_WORKER, 1, now=NOW
+            )
 
     def test_a_corrupt_row_can_never_become_eligible_or_runnable(self) -> None:
         record = self.create()
@@ -1420,6 +1455,8 @@ class ExecutionBoundaryTests(unittest.TestCase):
             "renew_job_run_lease",
             "release_job_run",
             "settle_job_run",
+            "mark_job_run_unknown",
+            "await_job_run_approval",
             "load_job",
             "load_job_run",
             "list_jobs",

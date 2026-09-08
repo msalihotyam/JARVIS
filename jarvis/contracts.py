@@ -6958,6 +6958,46 @@ CLAIMABLE_JOB_RUN_STATUSES = frozenset(
     {JobRunStatus.PENDING, JobRunStatus.CLAIMED}
 )
 
+#: Scheduler phase 2B0. The NARROWEST set of coordination states from which
+#: the fenced current owner may CONCLUDE a generation, and deliberately not
+#: "anything unsettled".
+#:
+#: ``CLAIMED`` is owned with no external action started, and ``RUNNING`` is
+#: the owner's own attempt - both are outcomes the holder of the live lease is
+#: the one party entitled to state. Every other unsettled state is refused
+#: from this path on purpose. ``PENDING`` is unowned, so nobody holds the
+#: lease a settlement must be proved with. ``AWAITING_APPROVAL`` belongs to an
+#: approval a human has not answered, and ``UNKNOWN_OUTCOME`` is the explicit
+#: record that nobody could establish what happened - letting a worker write
+#: an ending over either would be the scheduler asserting something no
+#: evidence supports. Both therefore stay BLOCKED until a later phase gives a
+#: human an explicit gate; no timer and no worker resolves them.
+SETTLEABLE_JOB_RUN_STATUSES = frozenset(
+    {JobRunStatus.CLAIMED, JobRunStatus.RUNNING}
+)
+
+#: The only state an unknown outcome can be recorded FROM. "We could not find
+#: out what happened" is a statement about an attempt that was under way, so
+#: it requires one to have been under way: a ``CLAIMED`` generation has
+#: started no external action, and recording uncertainty about it would
+#: manufacture doubt where the coordination state already proves there is
+#: none - and would block the job, and every later generation of it, forever.
+UNKNOWNABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.RUNNING})
+
+#: The only state from which a generation may be parked awaiting a human
+#: answer. It is ``RUNNING``, because an approval requirement is DISCOVERED
+#: from inside an attempt rather than decided before one: the chain runs,
+#: reaches the step that needs a person, and returns awaiting-approval. By the
+#: time anyone knows an approval is needed, the generation is already
+#: executing, so ``RUNNING`` is the state the transition has to start from.
+#:
+#: ``CLAIMED`` is deliberately NOT a source. A claimed generation has started
+#: no external action and is bound to no attempt, so parking one would record
+#: "waiting for approval" with nothing yet identified to approve - and that
+#: row, being unsettled and unclaimable, would block the job and every later
+#: generation of it behind a request that names nothing.
+APPROVAL_PENDABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.RUNNING})
+
 #: The approved bounded lease window. A lease is COORDINATION ONLY - it says
 #: which worker currently owns a generation, and it grants no approval, no
 #: connector authority and no permission to execute anything.
@@ -8108,16 +8148,96 @@ class MemoryStore(Protocol):
         self,
         run_id: str,
         status: "JobRunStatus",
+        owner_token: str,
+        fencing_epoch: int,
         *,
+        now: datetime,
         blocking_code: str | None = None,
         condition_result: str | None = None,
     ) -> "JobRun":
-        """Close ONE open generation with a settled outcome.
+        """Close ONE open generation with a settled outcome, FENCED.
 
-        Guarded on the generation still being open, so exactly one settler
-        wins. A settled generation is never reopened, and only a settled
-        status may be given - which is what makes "at most one unsettled
-        generation per job" a bound rather than a convention.
+        Settling is the one transition that lets the next generation of a job
+        exist, so it takes exactly the proof every other ownership mutation
+        takes: the exact ``owner_token``, the exact ``fencing_epoch``, and a
+        lease still LIVE at the explicit ``now``. A worker whose lease expired,
+        who released it, who was displaced by a takeover, or who remembers an
+        older epoch is refused - it can no longer state this generation's
+        outcome, because by then another worker may legitimately own it.
+
+        There is deliberately NO unfenced path. An outcome written by a
+        displaced worker would settle a run its successor is still working,
+        unblock the next generation on evidence nobody holds, and do it under
+        the one status vocabulary the rest of the scheduler trusts.
+
+        The source state is narrow - see ``SETTLEABLE_JOB_RUN_STATUSES`` - and
+        the mutation is compare-and-set on the owner, the epoch and the run
+        still being open, so exactly one settler wins and a settled generation
+        is never reopened. Only a settled status may be given.
+        """
+        ...
+
+    def mark_job_run_unknown(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> "JobRun":
+        """Record that this generation's external outcome is UNESTABLISHABLE.
+
+        The same exact owner-plus-epoch-plus-live-lease proof as a settlement,
+        and permitted only from ``UNKNOWNABLE_JOB_RUN_STATUSES``: uncertainty
+        is a statement about an attempt that was under way.
+
+        ``UNKNOWN_OUTCOME`` is UNSETTLED and stays that way. It is not an
+        ending, so it does not release the job: the one-unsettled-generation
+        rule keeps every later generation blocked behind it, which is the
+        intended outcome rather than a side effect. It is not in the claimable
+        set either, so no worker reclaims it and no expiry retries it - a
+        lease timing out is never evidence that an external action did not
+        happen. The lease is cleared because coordination ownership of a run
+        only a human can resolve means nothing; the fencing epoch and the
+        claim instant are KEPT, as the durable evidence of who was running.
+
+        Resolution belongs to a human, through an explicit authority gate that
+        does not exist yet. Nothing here settles, retries or resumes it.
+        """
+        ...
+
+    def await_job_run_approval(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> "JobRun":
+        """Park this generation pending a human answer, releasing the lease.
+
+        The same exact owner-plus-epoch-plus-live-lease proof, from
+        ``APPROVAL_PENDABLE_JOB_RUN_STATUSES`` only - a RUNNING generation,
+        because the need for an approval is what an attempt DISCOVERS, not
+        something decided before it starts. The lease is cleared because the
+        worker is no longer coordinating anything - the wait is for a person,
+        and holding an expiring lease across it would either expire
+        meaninglessly or have to be renewed forever. The fencing epoch is kept
+        and never rolled back, so the parking worker's own proof cannot be
+        replayed afterwards.
+
+        The ``now`` a caller passes must be read AFTER the work that produced
+        the awaiting-approval answer returned, never captured before it: a
+        timestamp taken pre-dispatch would judge lease liveness against an
+        instant that has since passed, and could accept a proof whose lease
+        expired while the attempt was running.
+
+        THIS CREATES NO APPROVAL. It requests nothing, approves nothing,
+        consumes no grant, reserves no money and reaches no connector; it
+        writes one coordination state and clears one lease. ``AWAITING_APPROVAL``
+        is unsettled and is not claimable, so the generation - and every later
+        generation of the job - stays blocked until the approval surface a
+        later phase builds answers it.
         """
         ...
 

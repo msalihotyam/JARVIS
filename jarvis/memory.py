@@ -45,6 +45,7 @@ from jarvis.contracts import (
     ErrorCode,
     ExecutionAttempt,
     JOB_SPEC_MAX_BYTES,
+    APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
@@ -57,7 +58,9 @@ from jarvis.contracts import (
     JobRunSummary,
     JobSpec,
     JobSummary,
+    SETTLEABLE_JOB_RUN_STATUSES,
     SETTLED_JOB_RUN_STATUSES,
+    UNKNOWNABLE_JOB_RUN_STATUSES,
     UNSETTLED_JOB_RUN_STATUSES,
     ExecutionClaimOutcome,
     LedgerSnapshot,
@@ -5679,53 +5682,56 @@ class SQLiteMemoryStore:
         self,
         run_id: str,
         status: JobRunStatus,
+        owner_token: str,
+        fencing_epoch: int,
         *,
+        now: datetime,
         blocking_code: str | None = None,
         condition_result: str | None = None,
     ) -> JobRun:
-        """Close ONE open generation with a settled outcome.
+        """Close ONE open generation with a settled outcome, FENCED.
 
         Settling is the storage transition that lets the NEXT generation
-        exist, and it is guarded on the row still being open, so two settlers
-        cannot both win. A settled generation is never reopened: there is no
-        transition back out of the settled half of the vocabulary, which is
-        what makes "one unsettled generation per job" a bound rather than a
-        hope.
+        exist, so it is the last place an unfenced write could do damage: a
+        worker whose lease expired while its successor took over would, with
+        no proof required, write an ending over a run somebody else is working
+        and unblock the job on evidence nobody holds. It therefore demands
+        exactly what every other ownership mutation demands - the exact token,
+        the exact fencing epoch, and a lease still LIVE at the caller's
+        explicit ``now`` - and there is deliberately no path around it.
+
+        A settled generation is never reopened: the compare-and-set names the
+        owner, the epoch and ``settled_at IS NULL``, so two settlers cannot
+        both win and the settled half of the vocabulary has no way back out.
         """
         if type(status) is not JobRunStatus:
             raise JobError("status is not an exact JobRunStatus")
         if status not in SETTLED_JOB_RUN_STATUSES:
             raise JobError("a generation settles only into a settled status")
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
         with self._connection(write=True) as connection:
-            # Joined to the owning job for exactly the reason the loader is:
-            # a generation naming a revision its job never had is inconsistent
-            # durable state, and settling it would be writing an outcome for
-            # something that was never a real occurrence.
-            row = connection.execute(
-                self._JOB_RUN_WITH_OWNER, (run_id,)
-            ).fetchone()
-            run = (
-                None
-                if row is None
-                else self._job_run_from_row(row, row["owner_revision"])
-            )
-            if run is None:
-                raise JobError("no usable generation with that identity")
-            if run.settled:
-                raise JobError("the generation is already settled")
+            # ``_owned_run`` joins to the owning job for exactly the reason the
+            # loader does: a generation naming a revision its job never had is
+            # inconsistent durable state, and settling it would be writing an
+            # outcome for something that was never a real occurrence.
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            if run.status not in SETTLEABLE_JOB_RUN_STATUSES:
+                raise JobError("the generation is not settleable from its state")
             settled = replace(
                 run,
                 status=status,
                 blocking_code=blocking_code,
                 condition_result=condition_result,
-                settled_at=utc_now(),
+                settled_at=moment.isoformat(),
             )
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE job_runs
                    SET status = ?, blocking_code = ?, condition_result = ?,
                        settled_at = ?
-                 WHERE id = ? AND settled_at IS NULL
+                 WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                   AND settled_at IS NULL
                 """,
                 (
                     settled.status.value,
@@ -5733,9 +5739,137 @@ class SQLiteMemoryStore:
                     settled.condition_result,
                     settled.settled_at,
                     run_id,
+                    owner_token,
+                    fencing_epoch,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise JobError("the caller does not hold this lease")
         return settled
+
+    def _fenced_transition(
+        self,
+        run_id: str,
+        owner_token: Any,
+        fencing_epoch: Any,
+        now: datetime,
+        *,
+        sources: frozenset,
+        target: JobRunStatus,
+        refusal: str,
+    ) -> JobRun:
+        """ONE fenced UNSETTLED state change that also drops the lease.
+
+        Shared by the two phase-2B0 transitions because they differ only in
+        their source set and their target, and a second hand-written copy of
+        the proof-plus-CAS would be a second place for the fencing to drift.
+
+        Both leave the generation UNSETTLED, so the one-unsettled-generation
+        rule keeps every later generation of the job blocked behind it, and
+        both leave the fencing epoch and the claim instant exactly as they
+        are: the epoch is the durable evidence that an ownership happened, and
+        rolling it back would let the very proof this call just consumed match
+        again.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            if run.status not in sources:
+                raise JobError(refusal)
+            moved = replace(
+                run,
+                status=target,
+                owner_token=None,
+                lease_expires_at_utc=None,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, owner_token = NULL,
+                       lease_expires_at_utc = NULL
+                 WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                   AND status = ? AND settled_at IS NULL
+                """,
+                (
+                    target.value,
+                    run_id,
+                    owner_token,
+                    fencing_epoch,
+                    run.status.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the caller does not hold this lease")
+        return moved
+
+    def mark_job_run_unknown(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> JobRun:
+        """Record that this generation's external outcome is UNESTABLISHABLE.
+
+        UNKNOWN_OUTCOME IS NOT AN ENDING. It stays unsettled, so this job's
+        every later generation stays blocked behind it; it is not claimable,
+        so no worker reclaims it and no expiry turns it into a second attempt.
+        That is the whole point - a lease running out is evidence about
+        coordination, never evidence that the external action did not happen,
+        and retrying on it is exactly how a duplicate real-world effect gets
+        made.
+
+        Resolving one is a human authority gate that does not exist in this
+        build. Nothing here settles, retries or resumes it.
+        """
+        return self._fenced_transition(
+            run_id,
+            owner_token,
+            fencing_epoch,
+            now,
+            sources=UNKNOWNABLE_JOB_RUN_STATUSES,
+            target=JobRunStatus.UNKNOWN_OUTCOME,
+            refusal="the generation has no attempt whose outcome could be unknown",
+        )
+
+    def await_job_run_approval(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> JobRun:
+        """Park this generation pending a human answer, releasing the lease.
+
+        THIS CREATES NO APPROVAL AND CONSUMES NO GRANT. It writes one
+        coordination state and clears one lease; it requests nothing, answers
+        nothing, reserves nothing and reaches no connector. The waiting is for
+        a person, so holding an expiring lease across it would mean either an
+        expiry that means nothing or a renewal loop that never ends.
+
+        The source is ``RUNNING``: an attempt DISCOVERS that it needs a human,
+        it does not know beforehand. A future caller therefore reaches this
+        after its chain has already returned an awaiting-approval answer, and
+        the ``now`` it passes must be read at THAT point - never a timestamp
+        captured before dispatch, which would judge lease liveness against an
+        instant that has since passed.
+
+        ``AWAITING_APPROVAL`` is unsettled and unclaimable, so the generation
+        stays blocked - as does every later generation of the job - until the
+        approval surface a later phase builds answers it.
+        """
+        return self._fenced_transition(
+            run_id,
+            owner_token,
+            fencing_epoch,
+            now,
+            sources=APPROVAL_PENDABLE_JOB_RUN_STATUSES,
+            target=JobRunStatus.AWAITING_APPROVAL,
+            refusal="the generation is not awaiting-approval from its state",
+        )
 
     def load_job_run(self, run_id: str) -> JobRun | None:
         """One generation, or ``None`` when it is missing OR unusable."""

@@ -23,6 +23,7 @@ from jarvis.contracts import (
     BillingClass,
     BillingIntegrityError,
     BillingReconciliation,
+    APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
@@ -54,7 +55,9 @@ from jarvis.contracts import (
     ReconciliationOutcome,
     ReconciliationResult,
     ReservationState,
+    SETTLEABLE_JOB_RUN_STATUSES,
     SETTLED_JOB_RUN_STATUSES,
+    UNKNOWNABLE_JOB_RUN_STATUSES,
     VISIBILITY_MAX_LIMIT,
     RetrievedContext,
     RetrievedMemoryItem,
@@ -193,6 +196,46 @@ def _authoritative_usage(
         # Same contract as the SQLite store: the monetary month is the one the
         # claim fixed, never the wall clock at reconciliation.
         recorded_at=ledger_timestamp(record["ledger_month"], record["created_at"]),
+    )
+
+
+def force_running(store, run_id) -> None:
+    """Place a generation in RUNNING - a state no phase in this build writes.
+
+    Both stores are driven through it so the two implementations are asked
+    exactly the same question. In the double it is a dict replace; in SQLite it
+    is one direct UPDATE, deliberately bypassing every method under test.
+    """
+    if isinstance(store, InMemoryStore):
+        store.job_runs[run_id] = dataclasses.replace(
+            store.job_runs[run_id], status=JobRunStatus.RUNNING
+        )
+        return
+    import sqlite3
+
+    connection = sqlite3.connect(store.database_path)
+    try:
+        connection.execute(
+            "UPDATE job_runs SET status = ? WHERE id = ?",
+            (JobRunStatus.RUNNING.value, run_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def settle(store, run_id, status, *, now, worker="settler"):
+    """Claim ``run_id`` and settle it under exactly the lease just acquired.
+
+    Phase 2B0 fenced ``settle_job_run``: an outcome may only be written by the
+    worker that can still prove it owns the generation, so a test that merely
+    wants a generation closed has to hold a real lease to close it. Both
+    stores are driven through this same helper, which is the point - a double
+    that let an unfenced settlement through would stop being a contract test.
+    """
+    held = store.claim_job_run(run_id, worker, now=now, lease=timedelta(minutes=5))
+    return store.settle_job_run(
+        run_id, status, held.owner_token, held.fencing_epoch, now=now
     )
 
 
@@ -831,7 +874,10 @@ class InMemoryStore:
         self,
         run_id: str,
         status: JobRunStatus,
+        owner_token: str,
+        fencing_epoch: int,
         *,
+        now,
         blocking_code: str | None = None,
         condition_result: str | None = None,
     ) -> JobRun:
@@ -839,20 +885,64 @@ class InMemoryStore:
             raise JobError("status is not an exact JobRunStatus")
         if status not in SETTLED_JOB_RUN_STATUSES:
             raise JobError("a generation settles only into a settled status")
-        run = self.job_runs.get(run_id)
-        if run is None:
-            raise JobError("no usable generation with that identity")
-        if run.settled:
-            raise JobError("the generation is already settled")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        run = self._owned_run(run_id)
+        self._held_lease(run, owner_token, fencing_epoch, now)
+        if run.status not in SETTLEABLE_JOB_RUN_STATUSES:
+            raise JobError("the generation is not settleable from its state")
         settled = dataclasses.replace(
             run,
             status=status,
             blocking_code=blocking_code,
             condition_result=condition_result,
-            settled_at=utc_now(),
+            settled_at=now.isoformat(),
         )
         self.job_runs[run_id] = settled
         return settled
+
+    def _fenced_transition(
+        self, run_id, owner_token, fencing_epoch, now, *, sources, target, refusal
+    ) -> JobRun:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        run = self._owned_run(run_id)
+        self._held_lease(run, owner_token, fencing_epoch, now)
+        if run.status not in sources:
+            raise JobError(refusal)
+        moved = dataclasses.replace(
+            run, status=target, owner_token=None, lease_expires_at_utc=None
+        )
+        self.job_runs[run_id] = moved
+        return moved
+
+    def mark_job_run_unknown(
+        self, run_id, owner_token, fencing_epoch, *, now
+    ) -> JobRun:
+        return self._fenced_transition(
+            run_id,
+            owner_token,
+            fencing_epoch,
+            now,
+            sources=UNKNOWNABLE_JOB_RUN_STATUSES,
+            target=JobRunStatus.UNKNOWN_OUTCOME,
+            refusal="the generation has no attempt whose outcome could be unknown",
+        )
+
+    def await_job_run_approval(
+        self, run_id, owner_token, fencing_epoch, *, now
+    ) -> JobRun:
+        return self._fenced_transition(
+            run_id,
+            owner_token,
+            fencing_epoch,
+            now,
+            sources=APPROVAL_PENDABLE_JOB_RUN_STATUSES,
+            target=JobRunStatus.AWAITING_APPROVAL,
+            refusal="the generation is not awaiting-approval from its state",
+        )
 
     def load_job_run(self, run_id: str) -> JobRun | None:
         run = self.job_runs.get(run_id)
@@ -1600,7 +1690,7 @@ class SchedulerStorageParityTests(unittest.TestCase):
         current = self.memory.load_job(record.id)
         with self.assertRaisesRegex(JobError, "already open"):
             self.memory.record_job_run(record.id, current.next_due_at_utc)
-        self.memory.settle_job_run(first.id, JobRunStatus.COMPLETED)
+        settle(self.memory, first.id, JobRunStatus.COMPLETED, now=self.NOW)
         with self.assertRaisesRegex(JobError, "already been recorded"):
             self.memory.record_job_run(record.id, first.nominal_due_at_utc)
         second = self.memory.record_job_run(record.id, current.next_due_at_utc)
@@ -1748,14 +1838,236 @@ class SchedulerStorageParityTests(unittest.TestCase):
                     summary.lease_expires_at_utc,
                 )
             )
-            # An uncertain outcome fails CLOSED in both stores.
-            store.settle_job_run(run.id, JobRunStatus.CANCELLED)
+            # An uncertain outcome fails CLOSED in both stores. Closing a
+            # generation is FENCED in both too, so each settlement here is
+            # made by a worker holding the lease it settles under.
+            settle(store, run.id, JobRunStatus.CANCELLED, now=expired)
             blocked = store.materialize_due_job_run(
                 record.id, store.load_job(record.id).revision, now=expired
             )
-            store.claim_job_run(blocked.id, "worker-c", now=expired, lease=lease)
-            store.settle_job_run(blocked.id, JobRunStatus.COMPLETED)
+            settle(store, blocked.id, JobRunStatus.COMPLETED, now=expired)
             trace.append(("blocked_generation", blocked.generation))
+            return trace
+
+        self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_concluding_a_generation_is_fenced_identically_in_both_stores(
+        self,
+    ) -> None:
+        # Phase 2B0. The double is a CONTRACT test, so a double that let an
+        # unfenced settlement - or an unfenced unknown/await transition -
+        # through would quietly certify the very hole this phase closed. The
+        # same adversarial script runs against both stores and the refusals
+        # themselves are part of the compared trace.
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "fencing.db")
+        sqlite_store.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+        lease = timedelta(minutes=5)
+        at = self.NOW + timedelta(hours=1)
+        during = at + timedelta(minutes=1)
+        after = at + lease + timedelta(minutes=1)
+
+        def refusal(call) -> str:
+            try:
+                call()
+            except JobError:
+                return "refused"
+            return "ALLOWED"
+
+        def script(store) -> list:
+            trace: list = []
+            record = store.create_job(self.spec(), now=self.NOW)
+            run = store.materialize_due_job_run(record.id, record.revision, now=at)
+            held = store.claim_job_run(run.id, "worker-a", now=at, lease=lease)
+            # Every shape of stale proof, refused the same way by both.
+            for owner, epoch, when in (
+                ("worker-b", held.fencing_epoch, during),
+                ("worker-a", held.fencing_epoch - 1, during),
+                ("worker-a", held.fencing_epoch + 1, during),
+                ("worker-a", held.fencing_epoch, after),
+            ):
+                trace.append(
+                    (
+                        "settle_refused",
+                        refusal(
+                            lambda o=owner, e=epoch, w=when: store.settle_job_run(
+                                run.id, JobRunStatus.COMPLETED, o, e, now=w
+                            )
+                        ),
+                    )
+                )
+            # A CLAIMED generation is bound to no attempt, so both stores
+            # refuse to call its outcome uncertain AND refuse to park it for an
+            # approval: there is nothing yet to be uncertain about or to
+            # approve.
+            trace.append(
+                (
+                    "unknown_from_claimed",
+                    refusal(
+                        lambda: store.mark_job_run_unknown(
+                            run.id, "worker-a", held.fencing_epoch, now=during
+                        )
+                    ),
+                )
+            )
+            trace.append(
+                (
+                    "park_from_claimed",
+                    refusal(
+                        lambda: store.await_job_run_approval(
+                            run.id, "worker-a", held.fencing_epoch, now=during
+                        )
+                    ),
+                )
+            )
+            # An approval requirement is DISCOVERED by an attempt that is
+            # already under way, so parking starts from RUNNING in both stores.
+            force_running(store, run.id)
+            parked = store.await_job_run_approval(
+                run.id, "worker-a", held.fencing_epoch, now=during
+            )
+            trace.append(
+                (
+                    "parked",
+                    parked.status.value,
+                    parked.owner_token,
+                    parked.lease_expires_at_utc,
+                    parked.fencing_epoch,
+                    parked.settled,
+                    parked.settled_at,
+                )
+            )
+            # Parked: unclaimable, unsettleable, and it blocks the job.
+            trace.append(
+                (
+                    "parked_claim",
+                    refusal(
+                        lambda: store.claim_job_run(
+                            run.id, "worker-b", now=after, lease=lease
+                        )
+                    ),
+                )
+            )
+            trace.append(
+                (
+                    "parked_settle",
+                    refusal(
+                        lambda: store.settle_job_run(
+                            run.id,
+                            JobRunStatus.COMPLETED,
+                            "worker-a",
+                            held.fencing_epoch,
+                            now=during,
+                        )
+                    ),
+                )
+            )
+            trace.append(
+                (
+                    "parked_blocks",
+                    store.materialize_due_job_run(
+                        record.id,
+                        store.load_job(record.id).revision,
+                        now=at + timedelta(days=365),
+                    ),
+                )
+            )
+            return trace
+
+        self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_an_unknown_outcome_is_terminal_in_both_stores(self) -> None:
+        # RUNNING is a state no phase-2B0 transition can reach, so both stores
+        # are placed in it directly - exactly as a future dispatch, or a crash
+        # mid-transition, would leave the durable row.
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "unknown.db")
+        sqlite_store.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+        lease = timedelta(minutes=5)
+        at = self.NOW + timedelta(hours=1)
+        during = at + timedelta(minutes=1)
+
+        def script(store) -> list:
+            trace: list = []
+            record = store.create_job(self.spec(), now=self.NOW)
+            run = store.materialize_due_job_run(record.id, record.revision, now=at)
+            held = store.claim_job_run(run.id, "worker-a", now=at, lease=lease)
+            force_running(store, run.id)
+            marked = store.mark_job_run_unknown(
+                run.id, "worker-a", held.fencing_epoch, now=during
+            )
+            trace.append(
+                (
+                    "marked",
+                    marked.status.value,
+                    marked.owner_token,
+                    marked.lease_expires_at_utc,
+                    marked.fencing_epoch,
+                    marked.settled,
+                    marked.settled_at,
+                )
+            )
+            long_after = at + timedelta(days=365)
+            for label, call in (
+                (
+                    "reclaim",
+                    lambda: store.claim_job_run(
+                        run.id, "worker-b", now=long_after, lease=lease
+                    ),
+                ),
+                (
+                    "settle",
+                    lambda: store.settle_job_run(
+                        run.id,
+                        JobRunStatus.COMPLETED,
+                        "worker-a",
+                        held.fencing_epoch,
+                        now=during,
+                    ),
+                ),
+                (
+                    "remark",
+                    lambda: store.mark_job_run_unknown(
+                        run.id, "worker-a", held.fencing_epoch, now=during
+                    ),
+                ),
+                (
+                    "release",
+                    lambda: store.release_job_run(
+                        run.id, "worker-a", held.fencing_epoch, now=during
+                    ),
+                ),
+            ):
+                try:
+                    call()
+                    trace.append((label, "ALLOWED"))
+                except JobError:
+                    trace.append((label, "refused"))
+            trace.append(
+                (
+                    "blocks_forever",
+                    store.materialize_due_job_run(
+                        record.id, store.load_job(record.id).revision, now=long_after
+                    ),
+                )
+            )
+            trace.append(("status", store.load_job_run(run.id).status.value))
             return trace
 
         self.assertEqual(script(self.memory), script(sqlite_store))
@@ -1812,7 +2124,7 @@ class SchedulerStorageParityTests(unittest.TestCase):
         )
         self.assertEqual((self.NOW + timedelta(hours=1)).isoformat(),
                          run.nominal_due_at_utc)
-        self.memory.settle_job_run(run.id, JobRunStatus.COMPLETED)
+        settle(self.memory, run.id, JobRunStatus.COMPLETED, now=later)
         self.assertIsNone(self.memory.load_job(record.id).next_due_at_utc)
         self.assertIsNone(
             self.memory.materialize_due_job_run(
