@@ -1,16 +1,16 @@
 {
   "updated": "2026-09-08",
-  "phase": "scheduler-2b2",
-  "review_state": "Scheduler Phase 2B1 bağımsız review sonrası kabul edildi ve canonical oldu; 2B2 henüz başlamadı.",
+  "phase": "scheduler-2b2b",
+  "review_state": "Scheduler Phase 2B2a - fenced same-session recovery / approval resume - bağımsız güvenlik review'ından (F1 bulgusu düzeltildi, dar re-gate CLEAN) sonra kabul edildi ve canonical oldu; 2B2b (iptal / HUMAN_GATE / dead-owner IN_FLIGHT politikası) henüz başlamadı.",
   "overall_note": "Yüzdeler ağırlıklı milestone roadmap'inden hesaplanır, elle yazılmaz. Ağırlıklar proje tahminidir.",
   "refresh_seconds": 60,
   "milestone": {
-    "name": "Scheduler Phase 2B2 — recovery / cancel / HUMAN_GATE",
+    "name": "Scheduler Phase 2B2b — cancellation / HUMAN_GATE",
     "status": "yellow",
     "status_label": "Sırada",
-    "summary": "Bloklu kalan generation'lar için insan yetkili çözüm yüzeyi: RUNNING kurtarma, iptal ve UNKNOWN_OUTCOME için açık HUMAN_GATE."
+    "summary": "2B2a kapsam dışı bırakılan dead-owner IN_FLIGHT ve UNKNOWN_OUTCOME için H2/Core sahipli, açık ve denetlenebilir insan yetki politikası; ardından iptal semantiği."
   },
-  "next_step": "2B2: bloklu kalan generation'lar için insan yetkili kurtarma/iptal yüzeyini tasarla. RUNNING reclaim ve UNKNOWN_OUTCOME çözümü açık bir HUMAN_GATE gerektirir; hiçbir timer bunları çözmez.",
+  "next_step": "2B2b: dead-owner IN_FLIGHT için H2/Core sahipli, açık ve denetlenebilir insan yetki politikasını tasarla (Scheduler'a mark_execution_unknown yetkisi VERİLMEYECEK), ardından iptal / HUMAN_GATE semantiğini kur.",
   "blockers": [],
   "capabilities": [
     {
@@ -60,7 +60,7 @@
     {
       "name": "Scheduler",
       "weight": 16,
-      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing, fenced completion ve tek atışlık AgentCore dispatch. Arka plan worker ve kurtarma hâlâ yok.",
+      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing, fenced completion, tek atışlık AgentCore dispatch ve bağlı RUNNING/AWAITING_APPROVAL generation'lar için fenced same-session recovery. İptal ve dead-owner IN_FLIGHT için HUMAN_GATE hâlâ yok.",
       "milestones": [
         {"name": "Timing kernel", "state": "completed"},
         {"name": "Condition kernel temeli", "state": "completed"},
@@ -68,7 +68,8 @@
         {"name": "Claim / lease / fencing (Phase 2A)", "state": "completed"},
         {"name": "2B0 fenced completion", "state": "completed"},
         {"name": "2B1 AgentCore dispatch", "state": "completed"},
-        {"name": "2B2 cancellation / recovery yüzeyi", "state": "in_progress"},
+        {"name": "2B2a fenced same-session recovery / approval resume", "state": "completed"},
+        {"name": "2B2b cancellation / HUMAN_GATE / dead-owner IN_FLIGHT", "state": "in_progress"},
         {"name": "2C condition execution", "state": "not_started"},
         {"name": "2D background dispatcher", "state": "not_started"},
         {"name": "Uçtan uca hardening", "state": "not_started"}
@@ -133,6 +134,7 @@
     }
   ],
   "recent": [
+    "Scheduler Phase 2B2a — bağlı RUNNING/AWAITING_APPROVAL generation'lar için fenced same-session recovery: dar reacquire_job_run sınırı (expected_fencing_epoch zorunlu, session_id/chain_id değişmez), onay çözüm crash penceresi kurtarma, atomik recovery audit event, kalıcı session/document/proje kimliği yeniden kanıtlama (F1 bulgusu); IN_FLIGHT ve UNKNOWN_OUTCOME asla replay edilmez (SQLite 10)",
     "Scheduler Phase 2B1 — tek atışlık JobRun -> AgentCore dispatch: atomik session/chain binding, dayanıklı RUNNING, fenced sonuç yansıtma (SQLite 10)",
     "Scheduler Phase 2B0 — fenced settle / mark-unknown / await-approval (owner + fencing epoch + canlı lease, CAS)",
     "Scheduler Phase 2A — due materialization, atomic claim, bounded lease, monotonic fencing (SQLite 9)",
@@ -142,8 +144,8 @@
     "Saf scheduler timing ve condition kernel'leri"
   ],
   "health": [
-    {"name": "Testler", "status": "green", "detail": "Son doğrulanan canonical doğrulama: 2B1 dispatch 75, scheduler+storage 181, task chain 464, execution journal 56, permissions 19, chain cancel 26 - tamamı OK."},
-    {"name": "SQLite schema", "status": "green", "detail": "Sürüm 10. Yalnızca additive migration; 2B1 tek bir partial unique session index ekledi."},
+    {"name": "Testler", "status": "green", "detail": "Son doğrulanan canonical doğrulama: 3.222 test OK, 1 skipped, 0 fail, 0 error (2B2a recovery 68, dispatch 76, fencing 36, storage 20, jobs 64, claims 62, task chain 464, execution journal 56, permissions 19, chain cancel 26 dahil, tam suite)."},
+    {"name": "SQLite schema", "status": "green", "detail": "Sürüm 10. Yalnızca additive migration; 2B1 tek bir partial unique session index ekledi. 2B2a şema eklemedi."},
     {"name": "Output schema", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
   ],
   "push_note": "Push bilinçli olarak bekletiliyor.",
@@ -158,9 +160,10 @@
   "technical": [
     ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn - 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
     ["Scheduler Phase 2B0", "settle_job_run artık (run_id, owner_token, fencing_epoch) ve açık `now` istiyor; canlı lease kanıtı ve owner + epoch + settled_at IS NULL üzerinde CAS var. Bayat, süresi dolmuş, bırakılmış veya yerinden edilmiş worker settle edemiyor. mark_job_run_unknown ve await_job_run_approval aynı kanıtla RUNNING'den çalışıyor; ikisi de lease'i temizliyor, fencing epoch'u delil olarak koruyor ve run'ı unsettled bırakıyor."],
-    ["UNKNOWN_OUTCOME", "Unsettled kalır, claim edilemez, settle edilemez ve retry edilmez; sonraki tüm generation'ları bloklar. Çözümü açık bir insan yetki kapısıdır ve sonraki bir faza ertelendi - recover_job_run yok."],
+    ["UNKNOWN_OUTCOME", "Unsettled kalır, settle edilemez ve retry edilmez; sonraki tüm generation'ları bloklar. reacquire_job_run REACQUIRABLE_JOB_RUN_STATUSES'a dahil değildir - hiçbir yol AgentCore.run_chain'e giremez. Çözümü açık bir insan yetki kapısıdır ve 2B2b'ye ertelendi: dead-owner IN_FLIGHT'ın hâlâ güvenli çıkışı yok, çünkü mark_execution_unknown'ı yalnızca yürüten owner çağırabilir (core.py) ve abandon_unknown_attempt IN_FLIGHT'ı reddeder."],
     ["Scheduler Phase 2B1", "Claimed bir generation tek bir storage transaction'ında pristine session + chain'e bağlanır ve CLAIMED -> RUNNING olur; binding değişmezdir ve idx_job_runs_session bir session'ı iki generation'a bağlanamaz kılar. RUNNING, AgentCore.run_chain çağrılmadan ÖNCE dayanıklıdır ve generic claim edilemez - çöken bir worker'ın run'ı bloklu kalır. Sonuç yansıtma yalnızca okur: routing, tam H2 attempt geçmişi, chain'e özgü lifecycle tutarlılığı ve onay için kanonik PermissionRequest fingerprint'i kanıtlanır; kanıtlanmayan her şey RUNNING bırakılır."],
-    ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."],
+    ["Scheduler Phase 2B2a", "reacquire_job_run yalnızca bağlı (session_id + chain_id dolu) RUNNING/AWAITING_APPROVAL generation'lar için tek bir BEGIN IMMEDIATE transaction'ında çalışır: expected_fencing_epoch yükü taşır (bayat gözlemci N+1'i asla ele geçiremez), owner_token/lease/claimed_at yeniler, session_id/chain_id'i HİÇ yazmaz. Onay için bekleyen exact request varsa reddeder; yoksa bunu onay olarak YORUMLAMAZ - Core'un kendi resume'u karar verir (güvenli yeniden sorma kabul edilir). Aynı transaction'da session row key == document id == run.session_id ve document project_id == authoritative sessions.project_id kanıtlanır (F1); mutation ve audit event atomiktir. IN_FLIGHT ve UNKNOWN_OUTCOME için run_chain hiç çağrılmaz. Scheduler'a approval/grant/H2/HUMAN_GATE yetkisi verilmedi."],
+    ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz worker loop veya arka plan dispatch döngüsü yok."],
     ["İlerleme modeli", "completed = 1.0, in_progress = 0.0, not_started = 0.0; deferred milestone paydadan düşer. Yalnızca kapanmış milestone kredi kazanır. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
   ]
 }
