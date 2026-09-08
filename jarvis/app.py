@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Iterable
@@ -50,6 +51,7 @@ from jarvis.contracts import (
     AttemptRecovery,
     AttemptRecoveryOutcome,
     AttemptState,
+    JobError,
     AttemptSummary,
     BillingClass,
     BillingIntegrityError,
@@ -1708,6 +1710,186 @@ _RECOVERY_REFUSALS: dict[AttemptRecoveryOutcome, tuple[ErrorCode, str, int]] = {
         EXIT_INVALID_INPUT,
     ),
 }
+
+
+#: Phase 2B2b1. One message per refusal the orphan declaration can return.
+#: Deliberately separate from ``_RECOVERY_REFUSALS``: abandoning an UNKNOWN
+#: attempt and declaring an IN_FLIGHT one orphaned are different acts with
+#: different preconditions, and one shared message would have to be vague
+#: about both.
+_ORPHAN_REFUSALS: dict[AttemptRecoveryOutcome, tuple[ErrorCode, str, int]] = {
+    AttemptRecoveryOutcome.UNKNOWN: (
+        ErrorCode.TASK_NOT_FOUND,
+        "No such execution attempt for this session and task.",
+        EXIT_NOT_FOUND,
+    ),
+    AttemptRecoveryOutcome.NOT_RECOVERABLE: (
+        ErrorCode.INVALID_TASK,
+        (
+            "Only an attempt that is still IN_FLIGHT may be declared orphaned; "
+            "this one is in another state and nothing was changed."
+        ),
+        EXIT_INVALID_INPUT,
+    ),
+    AttemptRecoveryOutcome.TERMINAL: (
+        ErrorCode.INVALID_TASK,
+        "The task already reached a terminal state; nothing was changed.",
+        EXIT_INVALID_INPUT,
+    ),
+    AttemptRecoveryOutcome.TOO_RECENT: (
+        ErrorCode.INVALID_TASK,
+        (
+            "This attempt started too recently to be declared orphaned. The "
+            "wait proves nothing about the worker - it only makes a mistyped "
+            "attempt id unlikely. Nothing was changed."
+        ),
+        EXIT_INVALID_INPUT,
+    ),
+}
+
+
+def task_orphan_result(
+    memory: MemoryStore,
+    settings: Settings,
+    session_id: str,
+    task_id: str,
+    attempt_id: str,
+    actor_label: str,
+    reason: str,
+) -> CommandResult:
+    """Declare that an IN_FLIGHT execution will never be concluded by its owner.
+
+    Local and deterministic like the other recovery verbs: it builds no
+    registry, no connector and no ``AgentCore``, so it is structurally
+    incapable of executing, replaying or resuming anything. The only authority
+    it exercises is the single storage transaction, which decides everything.
+
+    The response states the bounded facts an operator needs in order NOT to
+    misread what they just did: the attempt is now recorded as unresolved, that
+    is a statement about knowledge and not about the world, the task and the
+    money are untouched, and the next step is a separate explicit decision.
+    """
+    command = "task-orphan"
+    try:
+        outcome = memory.declare_attempt_orphaned(
+            session_id,
+            task_id,
+            attempt_id,
+            now=datetime.now(timezone.utc),
+            actor_label=actor_label,
+            reason=reason,
+        )
+    except JobError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    if outcome is not AttemptRecoveryOutcome.RECOVERED:
+        code, message, exit_code = _ORPHAN_REFUSALS[outcome]
+        return failure_result(
+            command, settings.permission_mode, code, message, exit_code
+        )
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "session_id": session_id,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "outcome": outcome.value,
+                # The bounded facts, stated rather than implied.
+                "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                "worker_death_proved": False,
+                "external_effect_established": False,
+                "retry_authorized": False,
+                "connector_replay": False,
+                "task_modified": False,
+                "chain_modified": False,
+                "monetary_exposure_released": False,
+                "actor_authenticated": False,
+                "next_step": (
+                    "The attempt is now recorded as UNKNOWN_OUTCOME and will "
+                    "never be replayed. This records that nobody will "
+                    "establish the outcome - it does NOT establish that the "
+                    "external effect did or did not happen. The task is "
+                    "unchanged and still blocks its chain; abandon the attempt "
+                    "with 'jarvis task resolve' to fail the task, then resolve "
+                    "the scheduled generation if one owns it."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def job_run_resolve_result(
+    memory: MemoryStore,
+    settings: Settings,
+    run_id: str,
+    attempt_id: str,
+    actor_label: str,
+    reason: str,
+) -> CommandResult:
+    """Close a scheduled generation whose one uncertain attempt was abandoned.
+
+    The last step of the only path out of an unresolved external outcome, and
+    like every other recovery verb it constructs a store and nothing else - no
+    registry, no connector, no ``AgentCore``.
+
+    It ends the generation; it does not end the uncertainty. Everything that
+    records the doubt stays exactly where it is, and the response says so
+    plainly so that a settled generation is never mistaken for a settled
+    question.
+    """
+    command = "job-resolve"
+    try:
+        run = memory.resolve_unknown_job_run(
+            run_id,
+            attempt_id,
+            now=datetime.now(timezone.utc),
+            actor_label=actor_label,
+            reason=reason,
+        )
+    except JobError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "run_id": run.id,
+                "job_id": run.job_id,
+                "generation": run.generation,
+                "attempt_id": attempt_id,
+                "run_status": run.status.value,
+                "blocking_code": run.blocking_code,
+                # The bounded facts. Every one of them is what the operator
+                # must not assume the opposite of.
+                "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                "external_effect_established": False,
+                "retry_authorized": False,
+                "connector_replay": False,
+                "monetary_exposure_released": False,
+                "actor_authenticated": False,
+                "next_step": (
+                    "The generation is FAILED and its job is unblocked. The "
+                    "attempt stays UNKNOWN_OUTCOME, the task stays failed with "
+                    "the same typed uncertainty, and any monetary exposure "
+                    "stays recorded: none of that is resolved by this, and "
+                    "this generation will never run again."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
 
 
 def task_resolve_result(

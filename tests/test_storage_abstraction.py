@@ -30,6 +30,7 @@ from jarvis.contracts import (
     JOB_RECOVERY_ACTOR_MAX_CHARS,
     JOB_RECOVERY_REASON_MAX_CHARS,
     MAX_JOB_LEASE,
+    ORPHAN_MIN_AGE,
     MIN_JOB_LEASE,
     REACQUIRABLE_JOB_RUN_STATUSES,
     ChainState,
@@ -78,6 +79,16 @@ from jarvis.contracts import (
     build_retrieved_context,
     canonical_usd,
     canonical_utc_timestamp,
+    AttemptRecoveryOutcome,
+    ChainStatus,
+    ChainTaskMode,
+    ErrorCode,
+    HistoryFinding,
+    OutcomeStatus,
+    chain_lifecycle_coherent,
+    chain_state_refusal,
+    chain_task_refusal,
+    execution_history_verdict,
     is_expired,
     job_recovery_note,
     ledger_month,
@@ -1160,7 +1171,13 @@ class InMemoryStore:
         return self._lease_result(recovered)
 
     def _append_job_run_event(
-        self, session_id: str, event_type: str, payload: dict, created_at: str
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        created_at: str,
+        *,
+        task_id: str | None = None,
     ) -> None:
         """The double's equivalent of the private connection-scoped writer.
 
@@ -1175,7 +1192,7 @@ class InMemoryStore:
         self.events.append(
             {
                 "session_id": session_id,
-                "task_id": None,
+                "task_id": task_id,
                 "event_type": event_type,
                 "payload": copy.deepcopy(payload),
                 "created_at": created_at,
@@ -1188,6 +1205,217 @@ class InMemoryStore:
             for event in self.events
             if event["session_id"] == session_id
         ]
+
+    def declare_attempt_orphaned(
+        self,
+        session_id,
+        task_id,
+        attempt_id,
+        *,
+        now,
+        actor_label,
+        reason,
+    ) -> AttemptRecoveryOutcome:
+        """The same explicit human declaration, on the same terms.
+
+        The double must refuse everything SQLite refuses, in the same order,
+        and must be just as unable to infer death from elapsed time.
+        """
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        moment = now.astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._lock:
+            found = None
+            for attempts in self.attempts.values():
+                for attempt in attempts:
+                    if attempt.id == attempt_id:
+                        found = attempt
+                        break
+            if (
+                found is None
+                or found.session_id != session_id
+                or found.task_id != task_id
+            ):
+                return AttemptRecoveryOutcome.UNKNOWN
+            task = self.tasks.get(task_id)
+            if task is None or self.task_sessions.get(task_id) != session_id:
+                return AttemptRecoveryOutcome.UNKNOWN
+            session = self.sessions.get(session_id)
+            if session is None:
+                return AttemptRecoveryOutcome.UNKNOWN
+            if found.state is not AttemptState.IN_FLIGHT:
+                return AttemptRecoveryOutcome.NOT_RECOVERABLE
+            if task.status in _TERMINAL_STATUSES:
+                return AttemptRecoveryOutcome.TERMINAL
+            canonical = canonical_utc_timestamp(found.updated_at)
+            if (
+                canonical is None
+                or moment - datetime.fromisoformat(canonical) < ORPHAN_MIN_AGE
+            ):
+                return AttemptRecoveryOutcome.TOO_RECENT
+            rows = self.attempts[found.task_id]
+            rows[rows.index(found)] = dataclasses.replace(
+                found, state=AttemptState.UNKNOWN_OUTCOME, updated_at=stamp
+            )
+            self._append_job_run_event(
+                session_id,
+                "execution_declared_orphaned",
+                {
+                    "attempt_id": attempt_id,
+                    "connector": found.connector,
+                    "previous_state": AttemptState.IN_FLIGHT.value,
+                    "resulting_state": AttemptState.UNKNOWN_OUTCOME.value,
+                    "previous_updated_at": found.updated_at,
+                    "actor_label": actor,
+                    "actor_authenticated": False,
+                    "reason": why,
+                    "declared_at": stamp,
+                    "worker_death_proved": False,
+                    "external_effect_established": False,
+                    "retry_authorized": False,
+                },
+                stamp,
+                task_id=task_id,
+            )
+        return AttemptRecoveryOutcome.RECOVERED
+
+    def resolve_unknown_job_run(
+        self, run_id, attempt_id, *, now, actor_label, reason
+    ) -> JobRun:
+        """The same terminal resolution, proved the same way, in one section."""
+        if chain_id_refusal(attempt_id) is not None:
+            raise JobError("attempt_id is not a usable identifier")
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        moment = now.astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._lock:
+            run = self._owned_run(run_id)
+            if run.status is not JobRunStatus.UNKNOWN_OUTCOME or run.settled:
+                raise JobError("the generation has no unresolved unknown outcome")
+            if run.session_id is None or run.chain_id is None:
+                raise JobError("the generation is not bound to a session")
+            if run.attempt_id is not None:
+                raise JobError("the generation already names an attempt")
+            session = self._recovery_session(run)
+            chain = session.chain
+            if chain is None or chain.id != run.chain_id:
+                raise JobError("the bound chain does not match the generation")
+            if chain_state_refusal(chain) is not None:
+                raise JobError("the bound chain is unusable")
+            if tuple(chain.steps) != tuple(run.spec.steps):
+                raise JobError("the bound chain is no longer the declaration")
+            cursor = chain.cursor
+            if type(cursor) is not int or not 0 <= cursor < len(chain.step_task_ids):
+                raise JobError("the bound chain has no usable cursor")
+            routed = []
+            for index, step_task_id in enumerate(chain.step_task_ids):
+                if not step_task_id:
+                    continue
+                task = self.tasks.get(step_task_id)
+                if task is None:
+                    raise JobError("the chain routes to a task that cannot be read")
+                if self.task_sessions.get(step_task_id) != run.session_id:
+                    raise JobError("the chain routes to another session's task")
+                if (
+                    chain_task_refusal(task, chain, index, mode=ChainTaskMode.STORED)
+                    is not None
+                ):
+                    raise JobError("the chain routes to a task it no longer owns")
+                routed.append((index, task))
+            history = {
+                task.id: list(self.attempts.get(task.id, [])) for _index, task in routed
+            }
+            verdict = execution_history_verdict(
+                run.session_id, routed, cursor, history
+            )
+            if verdict.finding is not HistoryFinding.UNKNOWN_AT_CURSOR:
+                raise JobError(
+                    "the execution history is not one unresolved outcome at the "
+                    "current step"
+                )
+            if verdict.attempt_id != attempt_id:
+                raise JobError(
+                    "that attempt is not this generation's unresolved outcome"
+                )
+            cursor_task_id = chain.step_task_ids[cursor]
+            cursor_task = self.tasks.get(cursor_task_id)
+            if cursor_task is None:
+                raise JobError("the current step's task cannot be read")
+            if cursor_task.status is not TaskStatus.FAILED:
+                raise JobError("the current step's task was not abandoned")
+            snapshot = cursor_task.result_snapshot
+            error = snapshot.get("error") if isinstance(snapshot, dict) else None
+            if (
+                not isinstance(snapshot, dict)
+                or snapshot.get("outcome") != OutcomeStatus.ERROR.value
+                or not isinstance(error, dict)
+                or error.get("code") != ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value
+                or error.get("retryable") is not False
+            ):
+                raise JobError("the current step carries no abandonment result")
+            abandonments = [
+                event
+                for event in self.events
+                if event["session_id"] == run.session_id
+                and event["task_id"] == cursor_task_id
+                and event["event_type"] == "execution_abandoned"
+            ]
+            if len(abandonments) != 1:
+                raise JobError("the current step has no single abandonment record")
+            if abandonments[0]["payload"].get("attempt_id") != attempt_id:
+                raise JobError("the abandonment record names another attempt")
+            if chain.status not in (ChainStatus.CANCELLED, ChainStatus.FAILED):
+                raise JobError("the chain has not been terminalized")
+            if not chain_lifecycle_coherent(chain, routed):
+                raise JobError("the chain status disagrees with its own steps")
+            resolved = dataclasses.replace(
+                run,
+                status=JobRunStatus.FAILED,
+                attempt_id=attempt_id,
+                blocking_code=ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+                owner_token=None,
+                lease_expires_at_utc=None,
+                settled_at=stamp,
+            )
+            self._append_job_run_event(
+                run.session_id,
+                "job_run_unknown_resolved",
+                {
+                    "run_id": run.id,
+                    "job_id": run.job_id,
+                    "generation": run.generation,
+                    "chain_id": run.chain_id,
+                    "cursor_task_id": cursor_task_id,
+                    "attempt_id": attempt_id,
+                    "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                    "task_status": cursor_task.status.value,
+                    "task_error_code": ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+                    "task_retryable": False,
+                    "chain_status": chain.status.value,
+                    "previous_status": run.status.value,
+                    "resulting_status": resolved.status.value,
+                    "blocking_code": resolved.blocking_code,
+                    "actor_label": actor,
+                    "actor_authenticated": False,
+                    "reason": why,
+                    "resolved_at": stamp,
+                    "external_effect_established": False,
+                    "retry_authorized": False,
+                },
+                stamp,
+            )
+            self.job_runs[run_id] = resolved
+        return resolved
 
     def load_job_run(self, run_id: str) -> JobRun | None:
         run = self.job_runs.get(run_id)

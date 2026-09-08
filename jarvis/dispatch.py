@@ -48,6 +48,7 @@ from jarvis.contracts import (
     ChainStatus,
     ChainTaskMode,
     ErrorCode,
+    HistoryFinding,
     JobError,
     JobKind,
     JobRun,
@@ -55,7 +56,9 @@ from jarvis.contracts import (
     RunStatus,
     SessionState,
     TaskStatus,
+    chain_lifecycle_coherent,
     chain_task_refusal,
+    execution_history_verdict,
 )
 
 #: Attempt states that mean the connector boundary was crossed and nobody has
@@ -141,119 +144,56 @@ def _routed_tasks(store: Any, run: JobRun, chain: Any) -> list | None:
     return routed
 
 
-def _execution_established(store: Any, session_id: str, routed: list) -> bool:
-    """Whether every routed task's execution reality is known AND is its own.
+def _attempt_history(store: Any, routed: list) -> dict | None:
+    """The COMPLETE attempt history of every routed task, or ``None``.
 
-    Two independent things have to hold for an attempt row to count as
-    evidence about a task, and both are checked here.
-
-    IT MUST BELONG TO THIS EXECUTION CONTEXT. ``execution_attempts`` is keyed
-    by task id, but the row itself carries its own ``task_id`` and
-    ``session_id``, and those are the authoritative statement of what the
-    attempt was for. A row whose identity names a different task or a
-    different session is not this task's history, so reading it as "finished,
-    nothing in doubt" would be clearing a task on somebody else's evidence.
-    Malformed identity - anything that is not an exact non-empty string, or a
-    state that is not an exact ``AttemptState`` - is refused for the same
-    reason: it cannot be proved to be about this task at all.
-
-    AND THE COMPLETE HISTORY MUST BE CLEAN. Not the newest row: there is no
-    one-row-per-task rule, so an unresolved UNKNOWN_OUTCOME or IN_FLIGHT can
-    sit under a later clean FINISHED, and reading only the top would report a
-    settled effect for a connector call nobody ever resolved. Every attempt of
-    every routed task is examined, and ANY in doubt blocks the generation.
-
-    AND ZERO HISTORY IS NOT A FREE PASS. Whether no attempt is legitimate
-    depends on what the task's own status says it did, and Core leaves exactly
-    one authoritative statement about that: ``TaskStatus.COMPLETED`` is
-    reachable through a single path, the PERSIST stage, which is reached only
-    after EXECUTE - and EXECUTE durably opens an attempt BEFORE the connector
-    boundary is crossed. A completed task therefore always left H2 evidence
-    behind, so finding none means the evidence is missing or was misassigned to
-    another task, not that none was ever required. That is refused.
-
-    A task that ended FAILED, CANCELLED or REJECTED may legitimately have no
-    attempt at all - it can stop at an approval, a gate or a cancellation long
-    before any connector is reached - so no blanket "every task must have an
-    attempt" rule is imposed. The rule is exactly as wide as what Core
-    guarantees and no wider.
-
-    Asked of the H2 journal, which owns the answer. Nothing here writes to it.
+    Read through the store's own accessor, which returns every row for a task
+    in creation order - never the newest one. An unreadable journal yields
+    ``None``, and every caller treats that exactly as it treats doubt: as a
+    refusal, because a history that cannot be read is not a clean one.
     """
+    history: dict = {}
     for _index, task in routed:
         try:
             attempts = store.execution_attempts(task.id)
         except Exception:  # noqa: BLE001 - an unreadable journal is not a clearance
-            return False
+            return None
         if attempts is None:
-            return False
-        if not attempts and task.status is TaskStatus.COMPLETED:
-            # Completed means it executed, and executing means an attempt was
-            # opened first. No rows is a visibility hole - a reassigned or lost
-            # row - and absence of evidence is never evidence of absence.
-            return False
-        for attempt in attempts:
-            state = getattr(attempt, "state", None)
-            if type(state) is not AttemptState:
-                return False
-            owner_task = getattr(attempt, "task_id", None)
-            owner_session = getattr(attempt, "session_id", None)
-            if type(owner_task) is not str or not owner_task:
-                return False
-            if type(owner_session) is not str or not owner_session:
-                return False
-            if owner_task != task.id or owner_session != session_id:
-                return False
-            if state in _IN_DOUBT_ATTEMPT_STATES:
-                return False
-    return True
+            return None
+        history[task.id] = attempts
+    return history
+
+
+def _execution_established(store: Any, session_id: str, routed: list) -> bool:
+    """Whether every routed task's execution reality is known AND is its own.
+
+    Phase 2B2b1 moved the reading itself into ``execution_history_verdict``,
+    which storage also runs inside its own write transactions. This is the
+    same question it always was - "is there anything in doubt anywhere under
+    this chain, and is every row provably about the task it was filed under" -
+    asked of the one shared definition instead of a second local copy.
+
+    The cursor is deliberately NOT supplied. "Established" is a
+    cursor-independent question: ANY attempt in doubt, wherever it sits,
+    refuses, and passing no cursor is what makes every unresolved outcome read
+    as ``NON_CURSOR_UNKNOWN`` rather than as the one reflectable shape. Only
+    recovery asks the cursor-aware version, and only to reflect uncertainty -
+    never to settle or resume on it.
+    """
+    history = _attempt_history(store, routed)
+    if history is None:
+        return False
+    return execution_history_verdict(session_id, routed, None, history).established
 
 
 def _lifecycle_coherent(chain: Any, routed: list) -> bool:
     """Whether the routed task states could really have produced this status.
 
-    MIRRORS ``advance_chain_step`` AND ``cancel_chain``, which are the only
-    writers of a terminal chain status, rather than inventing a scheduler
-    reading of its own. What each one requires:
-
-    * the cursor only ever moves forward off a COMPLETED task, so every step
-      BEFORE the cursor must be completed whatever the final status is;
-    * ``COMPLETED`` is written only at the last step, off a COMPLETED task,
-      with every step created - so all of that must hold;
-    * ``FAILED`` is written only when the task AT THE CURSOR is FAILED. A
-      chain reporting failure over a set of completed tasks did not come from
-      that transition, and settling it would record a failure nothing
-      produced;
-    * ``CANCELLED`` has TWO legitimate producers - the cursor task being
-      CANCELLED or REJECTED, and an operator ``cancel_chain`` that preserves
-      the cursor and every binding exactly as they were. The second accepts a
-      cursor task in ANY state, including one an executing owner finalizes
-      afterwards, so no cursor-state rule is imposed here. Requiring every
-      task to be cancelled would refuse the ordinary case of a cancellation
-      that arrives after earlier steps legitimately completed.
+    The rule itself is ``chain_lifecycle_coherent``, shared with storage so
+    that settling a generation here and terminalizing one there cannot come to
+    disagree about which chain shapes a canonical writer could have produced.
     """
-    by_index = dict(routed)
-    cursor = chain.cursor
-    if type(cursor) is not int:
-        return False
-    # Universal: the cursor advanced off completed steps, so they are completed.
-    for index, task in routed:
-        if index < cursor and task.status is not TaskStatus.COMPLETED:
-            return False
-    if chain.status is ChainStatus.COMPLETED:
-        if cursor != len(chain.steps) - 1:
-            return False
-        if len(routed) != len(chain.steps):
-            return False
-        return all(task.status is TaskStatus.COMPLETED for _index, task in routed)
-    if chain.status is ChainStatus.FAILED:
-        task = by_index.get(cursor)
-        return task is not None and task.status is TaskStatus.FAILED
-    if chain.status is ChainStatus.CANCELLED:
-        # Both canonical producers are admissible; the prior-step rule above is
-        # the whole of what cancellation can be held to.
-        return True
-    return False
+    return chain_lifecycle_coherent(chain, routed)
 
 
 def _terminal_evidence(store: Any, run: JobRun, chain: Any) -> bool:
@@ -766,9 +706,41 @@ def recover_job_run(
     routed = _routed_tasks(store, run, chain)
     if routed is None:
         return _recovery_blocked("routing_unprovable", run)
-    if not _execution_established(store, run.session_id, routed):
-        # IN_FLIGHT, UNKNOWN_OUTCOME, foreign or malformed attempt identity, or
-        # a completed task whose evidence is missing. ONE refusal for all of
+    history = _attempt_history(store, routed)
+    if history is None:
+        return _recovery_blocked("execution_not_established", run)
+    verdict = execution_history_verdict(run.session_id, routed, chain.cursor, history)
+
+    if verdict.finding is HistoryFinding.UNKNOWN_AT_CURSOR:
+        # (3a) REFLECTION, NOT RESOLUTION, and never Core. A person has
+        # already declared this attempt's outcome unestablishable - or its own
+        # owner did, on a raise - and that is durable H2 truth this generation
+        # is entitled to READ. Reflecting it moves the coordination state to
+        # match what H2 already says; it decides nothing about the world,
+        # touches no attempt, and gives nobody permission to run anything.
+        #
+        # Safe to write on a read taken a moment ago because UNKNOWN_OUTCOME
+        # is a SINK: no production writer names it as a source, so nothing can
+        # make this reading false between here and the fenced mutation - which
+        # still proves this caller's own owner token, epoch and live lease.
+        try:
+            reflected = store.mark_job_run_unknown(
+                run_id, owner_token, epoch, now=clock()
+            )
+        except JobError as exc:
+            return _recovery_blocked(f"refused: {exc}", store.load_job_run(run_id))
+        return DispatchOutcome(
+            verdict=DISPATCH_UNKNOWN,
+            reason="execution_unknown_at_cursor",
+            run=reflected,
+            session_id=run.session_id,
+            chain_id=run.chain_id,
+        )
+
+    if not verdict.established:
+        # IN_FLIGHT anywhere, an unresolved outcome under another step, more
+        # than one attempt under one task, foreign or malformed identity, or a
+        # completed task whose evidence is missing. ONE refusal for all of
         # them: every one means the same thing here - what really happened is
         # not established, so nothing may be resumed on top of it.
         return _recovery_blocked("execution_not_established", run)

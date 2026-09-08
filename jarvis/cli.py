@@ -26,6 +26,7 @@ from jarvis.app import (
     config_mutation_result,
     config_show_result,
     failure_result,
+    job_run_resolve_result,
     memory_add_result,
     memory_list_result,
     memory_retire_result,
@@ -33,6 +34,7 @@ from jarvis.app import (
     sessions_result,
     show_result,
     status_payload,
+    task_orphan_result,
     task_resolve_result,
     tasks_result,
 )
@@ -145,6 +147,44 @@ def _build_parser() -> _ArgumentParser:
         required=True,
         choices=[recovery.value for recovery in AttemptRecovery],
     )
+
+    # M12 S2B2b1: the explicit human declaration that an execution still
+    # marked IN_FLIGHT will never be concluded by whoever started it. A
+    # SEPARATE verb from `resolve` on purpose - it acts on a different attempt
+    # state, changes only the attempt, and states nothing about the world.
+    task_orphan = task_actions.add_parser(
+        "orphan",
+        help=(
+            "Declare an IN_FLIGHT attempt orphaned: nobody will establish its "
+            "outcome. Proves nothing about whether the effect happened."
+        ),
+    )
+    task_orphan.add_argument("--session-id", required=True)
+    task_orphan.add_argument("--task-id", required=True)
+    task_orphan.add_argument("--attempt-id", required=True)
+    # Attribution, never authorization: there is no authenticated operator
+    # identity in this build, and the record says so.
+    task_orphan.add_argument("--actor", required=True)
+    task_orphan.add_argument("--reason", required=True)
+
+    # M12 S2B2b1: close a scheduled generation whose single uncertain attempt
+    # has already been declared orphaned and abandoned. Local-only, like every
+    # other recovery verb.
+    job_command = commands.add_parser(
+        "job", help="Operator resolution for a blocked scheduled generation."
+    )
+    job_actions = job_command.add_subparsers(dest="job_action")
+    job_resolve = job_actions.add_parser(
+        "resolve",
+        help=(
+            "Fail a generation whose abandoned attempt will never be "
+            "established. Ends the generation, never the uncertainty."
+        ),
+    )
+    job_resolve.add_argument("--run-id", required=True)
+    job_resolve.add_argument("--attempt-id", required=True)
+    job_resolve.add_argument("--actor", required=True)
+    job_resolve.add_argument("--reason", required=True)
 
     run_command = commands.add_parser("run", help="Start a task from task JSON.")
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
@@ -325,7 +365,8 @@ def _dispatch_task_command(
 ) -> CommandResult:
     """Operator recovery. Constructs a store and nothing else."""
     memory = SQLiteMemoryStore(settings.memory_database)
-    if getattr(args, "task_action", None) == "resolve":
+    action = getattr(args, "task_action", None)
+    if action == "resolve":
         return task_resolve_result(
             memory,
             settings,
@@ -334,11 +375,44 @@ def _dispatch_task_command(
             args.attempt_id,
             args.resolution,
         )
+    if action == "orphan":
+        return task_orphan_result(
+            memory,
+            settings,
+            args.session_id,
+            args.task_id,
+            args.attempt_id,
+            args.actor,
+            args.reason,
+        )
     return failure_result(
         "task",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'task' requires the 'resolve' sub-command.",
+        "'task' requires the 'resolve' or 'orphan' sub-command.",
+        EXIT_INVALID_INPUT,
+    )
+
+
+def _dispatch_job_command(
+    settings: Settings, args: argparse.Namespace
+) -> CommandResult:
+    """Operator resolution for a generation. Constructs a store and nothing else."""
+    memory = SQLiteMemoryStore(settings.memory_database)
+    if getattr(args, "job_action", None) == "resolve":
+        return job_run_resolve_result(
+            memory,
+            settings,
+            args.run_id,
+            args.attempt_id,
+            args.actor,
+            args.reason,
+        )
+    return failure_result(
+        "job",
+        settings.permission_mode,
+        ErrorCode.INVALID_TASK,
+        "'job' requires the 'resolve' sub-command.",
         EXIT_INVALID_INPUT,
     )
 
@@ -664,6 +738,14 @@ def main(
         recovery = _dispatch_task_command(effective, args)
         print(recovery.render())
         return recovery.exit_code
+
+    if command == "job":
+        # The same structural guarantee, for the same reason: resolving a
+        # blocked generation is an operator decision about durable state and
+        # must be incapable of running anything.
+        resolution = _dispatch_job_command(effective, args)
+        print(resolution.render())
+        return resolution.exit_code
 
     if command in ("sessions", "tasks", "show"):
         # Read-only, and routed here so that stays STRUCTURAL: no application,

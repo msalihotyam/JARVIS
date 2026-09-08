@@ -22,11 +22,14 @@ a live model, auth or network call.
 from __future__ import annotations
 
 import ast
+import inspect
+import pathlib
 import unittest
 from datetime import timedelta
 from pathlib import Path
 
 from jarvis.contracts import (
+    AttemptState,
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     SETTLEABLE_JOB_RUN_STATUSES,
@@ -565,28 +568,27 @@ class BoundaryTests(FenceTestCase):
         self.assertEqual(2, table_count(self.database, "jobs"))
         self.assertEqual(2, table_count(self.database, "job_runs"))
 
-    def test_no_resolve_or_retry_operation_exists_anywhere(self) -> None:
-        # Human resolution of UNKNOWN_OUTCOME is a separate authority gate and
-        # is STILL DEFERRED. If it ever appears it must arrive with an explicit
-        # design, not as a convenience method that quietly unblocks a job
-        # nobody established the outcome of.
+    def test_no_forced_or_retrying_operation_exists_anywhere(self) -> None:
+        # Human resolution of UNKNOWN_OUTCOME arrived in phase 2B2b1, with the
+        # explicit design this guard always demanded of it - so
+        # ``resolve_unknown`` left the list, exactly as ``recover_job_run`` did
+        # in 2B2a, and for the same reason. What stays forbidden is everything
+        # that would unblock a job WITHOUT that design: a settle that forces an
+        # outcome, a clear that erases the doubt, a retry that replays it.
         #
-        # ``recover_job_run`` left this list when phase 2B2a arrived with
-        # exactly that explicit design - and the rest of the list is why the
-        # two were never the same question. Recovery moves a COORDINATION lease
-        # on a generation whose outcome is still open; resolving an unknown
-        # outcome would be a statement about the world. The assertions below
-        # keep them apart: the recovery that exists cannot reach
-        # UNKNOWN_OUTCOME at all, and nothing that would settle, clear or retry
-        # one has been added anywhere.
+        # The distinction the list protects is unchanged. The resolution that
+        # exists ends a GENERATION whose attempt was explicitly declared
+        # orphaned and explicitly abandoned; it never touches the attempt,
+        # never says what happened, and never makes anything runnable again.
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for absent in (
                 "resolve_job_run",
-                "resolve_unknown",
                 "force_settle",
+                "force_resolve",
                 "clear_unknown_outcome",
                 "retry_job_run",
+                "retry_attempt",
             ):
                 self.assertNotIn(absent, source, f"{module.name}: {absent}")
         from jarvis.contracts import REACQUIRABLE_JOB_RUN_STATUSES
@@ -594,8 +596,58 @@ class BoundaryTests(FenceTestCase):
 
         for absent in ("resolve_job_run", "retry_job_run", "abandon_job_run"):
             self.assertFalse(hasattr(SQLiteMemoryStore, absent), absent)
+        # An unknown-outcome generation is still not recoverable by anyone, and
+        # the resolution added in 2B2b1 does not change that: it SETTLES the
+        # generation rather than returning it to anybody's ownership.
         self.assertNotIn(
             JobRunStatus.UNKNOWN_OUTCOME, REACQUIRABLE_JOB_RUN_STATUSES
+        )
+
+    def test_no_production_writer_ever_leaves_unknown_outcome(self) -> None:
+        # THE SINK PROPERTY, on which the whole 2B2b1 read-then-fenced-write
+        # reasoning rests: once an attempt is UNKNOWN_OUTCOME, NO writer may
+        # move it anywhere else. That is what lets the scheduler read the
+        # history and then perform a fenced JobRun mutation without the reading
+        # going stale underneath it.
+        #
+        # Every attempt-state writer in the production store is found and its
+        # compare-and-set SOURCE state is read out of the parameters bound to
+        # it. The source is what the statement is allowed to overwrite, so the
+        # property is exactly "no writer names UNKNOWN_OUTCOME as a source".
+        import re
+
+        from jarvis.memory import SQLiteMemoryStore
+
+        source = pathlib.Path(inspect.getfile(SQLiteMemoryStore)).read_text(
+            encoding="utf-8"
+        )
+        # Flattened so that implicit string concatenation across lines - which
+        # every one of these statements uses - cannot hide a writer from the
+        # scan. A regex over the raw text found only one of the four.
+        flat = " ".join(re.sub(r"[\"']", " ", source).split())
+        writers = list(re.finditer(r"UPDATE execution_attempts", flat))
+        self.assertEqual(
+            4,
+            len(writers),
+            "an attempt-state writer was added or removed; the sink property "
+            "must be re-proved for it deliberately",
+        )
+        sources = []
+        for writer in writers:
+            window = flat[writer.start() : writer.start() + 280]
+            self.assertIn("state = ?", window)
+            states = re.findall(r"AttemptState\.([A-Z_]+)", window)
+            self.assertGreaterEqual(len(states), 2, window)
+            sources.append(states[-1])
+        self.assertNotIn(
+            AttemptState.UNKNOWN_OUTCOME.name,
+            sources,
+            "a writer accepts UNKNOWN_OUTCOME as a source state",
+        )
+        # And the four are exactly the transitions the design accounts for.
+        self.assertEqual(
+            {AttemptState.PREPARED.name, AttemptState.IN_FLIGHT.name},
+            set(sources),
         )
 
     def test_an_unknown_outcome_generation_is_still_recoverable_by_nobody(

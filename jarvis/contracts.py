@@ -6432,12 +6432,279 @@ class AttemptRecoveryOutcome(str, Enum):
     NOT_RECOVERABLE = "not_recoverable"
     #: The task already reached a terminal state; nothing was rewritten.
     TERMINAL = "terminal"
+    #: Scheduler phase 2B2b1. The attempt is IN_FLIGHT, but so recently that
+    #: an orphan declaration is far more likely to be a slip than a decision.
+    #: A REFUSAL OF A GESTURE, never a statement about liveness - see
+    #: ``ORPHAN_MIN_AGE``.
+    TOO_RECENT = "too_recent"
 
 
 #: Attempt states that must never trigger an automatic re-execution.
 ATTEMPT_NON_REPLAYABLE = frozenset(
     {AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED}
 )
+
+
+#: Scheduler phase 2B2b1. How long an attempt must have been IN_FLIGHT before
+#: a person may declare it orphaned.
+#:
+#: THIS IS NOT EVIDENCE OF DEATH, and nothing may treat it as any. Storage
+#: cannot tell a dead worker from a slow one, and no amount of elapsed time
+#: changes that: an attempt older than this is exactly as unresolved as one a
+#: second old. What the bound does is refuse a declaration made so soon after
+#: the connector boundary was crossed that it is far likelier to be a slip -
+#: the wrong attempt id pasted, the wrong window - than a decision.
+#:
+#: It therefore has no automatic effect whatsoever. No timer reads it, nothing
+#: sweeps on it, and an attempt that passes it is not orphaned, not orphanable
+#: by anything but an explicit human act, and not one step closer to being
+#: retried. It is chosen as ``MAX_JOB_LEASE``: past it, every coordination
+#: lease a worker could have held has certainly expired, so the gesture is at
+#: least plausible.
+ORPHAN_MIN_AGE = timedelta(minutes=15)
+
+
+class HistoryFinding(str, Enum):
+    """What the COMPLETE execution history of one chain's routed tasks says.
+
+    One vocabulary, so that the three questions the scheduler asks of H2 -
+    may this generation settle, may it be resumed, may its uncertainty be
+    reflected - are answered from ONE reading of the same rows. Two readings
+    would be two definitions of "established", and the weaker one would
+    become the way in.
+    """
+
+    #: Every routed task's history is its own, complete and free of doubt.
+    ESTABLISHED = "established"
+    #: Exactly one attempt exists under the cursor task and its outcome is
+    #: UNKNOWN. The ONLY shape a JobRun may reflect uncertainty from.
+    UNKNOWN_AT_CURSOR = "unknown_at_cursor"
+    #: An attempt somewhere under this chain crossed the connector boundary
+    #: and nobody has said what happened. Never hidden, never resolved here.
+    IN_FLIGHT_PRESENT = "in_flight_present"
+    #: An unresolved outcome under a step that is not the current one.
+    NON_CURSOR_UNKNOWN = "non_cursor_unknown"
+    #: An attempt row that cannot be proved to be about the task it was read
+    #: under, or whose identity or state is not a usable value.
+    MALFORMED_OR_FOREIGN = "malformed_or_foreign"
+    #: A task whose own status says it executed, with no attempt to show for
+    #: it. Absence of evidence is never evidence of absence.
+    EVIDENCE_MISSING = "evidence_missing"
+    #: Doubt that no single human decision can be about - two unresolved
+    #: outcomes, an unresolved one beside other rows, an unreadable journal.
+    UNPROVABLE = "unprovable"
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryVerdict:
+    """One reading of a chain's complete H2 history.
+
+    ``attempt_id`` is carried ONLY by ``UNKNOWN_AT_CURSOR``, and it is the
+    exact row the finding is about - never "the latest", because the caller
+    that acts on it has to name the same attempt a person named.
+    """
+
+    finding: HistoryFinding
+    attempt_id: str | None = None
+
+    @property
+    def established(self) -> bool:
+        return self.finding is HistoryFinding.ESTABLISHED
+
+
+def execution_history_verdict(
+    session_id: str,
+    routed: Any,
+    cursor_index: Any,
+    attempts_by_task: Any,
+) -> HistoryVerdict:
+    """Classify the COMPLETE attempt history of every routed task.
+
+    THE ONE DEFINITION, and the reason it is pure and lives here: the
+    scheduler asks it over a store's public reads, and storage asks it again
+    inside the write transaction that acts on the answer. A second
+    implementation would be a second definition of what H2 has established,
+    and the difference between them would be the hole.
+
+    NOT THE LATEST ROW. ``execution_attempts`` is keyed by task with no
+    uniqueness, so an unresolved attempt can sit UNDER a later clean one and a
+    top-of-stack read would report a settled effect for a connector call
+    nobody ever concluded. Every row of every routed task is examined, and the
+    order of the rules below is itself load-bearing: identity is proved before
+    any row is believed, an in-flight attempt outranks everything that could
+    hide it, and uncertainty away from the current step is refused before the
+    current step is even looked at.
+
+    ``routed`` is the already-proved ``(step_index, task)`` mapping;
+    ``attempts_by_task`` must hold the COMPLETE history of every one of them,
+    with ``None`` meaning the journal could not be read - which is a refusal,
+    never a clearance.
+
+    ONE ATTEMPT PER TASK IS WHAT THE WRITERS PRODUCE, and more than one is
+    refused OUTRIGHT. ``open_execution_attempt`` inserts only when the task has
+    no row at all and returns the existing one otherwise, so a second row under
+    one task is a shape no production path can create. Every such task is
+    therefore unprovable history rather than a stack to pick from - whatever
+    the states involved, and whether it is the current step or one the chain
+    has already passed. Two FINISHED rows are two claims about one execution
+    opportunity; choosing between them, or waving them through because neither
+    looks alarming, is the same latest-row reasoning that would let an
+    unresolved effect hide under a clean one.
+    """
+    if type(cursor_index) is not int or isinstance(cursor_index, bool):
+        # Not a usable cursor. Nothing is inferred from that here: it only
+        # means no row can qualify as "at the cursor", so any doubt below is
+        # refused rather than reflected.
+        cursor_index = None
+
+    history: list[tuple[int, Any, list]] = []
+    for index, task in routed:
+        attempts = attempts_by_task.get(task.id)
+        if attempts is None:
+            # An unreadable journal is not an empty one.
+            return HistoryVerdict(HistoryFinding.UNPROVABLE)
+        rows = list(attempts)
+        for attempt in rows:
+            state = getattr(attempt, "state", None)
+            if type(state) is not AttemptState:
+                return HistoryVerdict(HistoryFinding.MALFORMED_OR_FOREIGN)
+            identity = getattr(attempt, "id", None)
+            owner_task = getattr(attempt, "task_id", None)
+            owner_session = getattr(attempt, "session_id", None)
+            for value in (identity, owner_task, owner_session):
+                if type(value) is not str or not value:
+                    return HistoryVerdict(HistoryFinding.MALFORMED_OR_FOREIGN)
+            # The row's OWN identity is the authoritative statement of what
+            # the attempt was for; being filed under a task proves nothing.
+            if owner_task != task.id or owner_session != session_id:
+                return HistoryVerdict(HistoryFinding.MALFORMED_OR_FOREIGN)
+        history.append((index, task, rows))
+
+    for _index, task, rows in history:
+        if not rows and task.status is TaskStatus.COMPLETED:
+            # COMPLETED is reachable only through EXECUTE, which durably opens
+            # an attempt BEFORE the connector boundary. No rows therefore means
+            # the evidence is missing or was misfiled, not that none was owed.
+            return HistoryVerdict(HistoryFinding.EVIDENCE_MISSING)
+
+    for _index, _task, rows in history:
+        for attempt in rows:
+            if attempt.state is AttemptState.IN_FLIGHT:
+                # Outranks everything. An attempt that crossed the boundary
+                # and was never concluded may still be running or may already
+                # have had its effect; no newer row and no terminal status
+                # anywhere may hide it.
+                return HistoryVerdict(HistoryFinding.IN_FLIGHT_PRESENT)
+
+    for _index, _task, rows in history:
+        if len(rows) > 1:
+            # MORE THAN ONE ROW UNDER ONE TASK, in ANY state combination and
+            # under ANY routed step - the cursor's or a completed predecessor's.
+            #
+            # ``open_execution_attempt`` inserts only when a task has no row at
+            # all and returns the existing one otherwise, so a second row is a
+            # shape no production writer can create. That makes it corrupted or
+            # forged history, and there is no honest reading of it: two
+            # FINISHED rows are two claims about one execution opportunity, and
+            # PREPARED beside FINISHED says the same attempt both did and did
+            # not cross the boundary. Picking the newest, the cleanest or the
+            # "obviously duplicated" one would be exactly the latest-row
+            # reasoning this predicate exists to refuse - and a duplicate under
+            # a PRIOR step would otherwise be waved through entirely, because
+            # nothing below this point looks at a non-cursor task's clean rows.
+            #
+            # Refused HERE, after identity and in-flight - which outrank it and
+            # name the danger more precisely - and before anything may be
+            # classified as established or as the one reflectable uncertainty.
+            return HistoryVerdict(HistoryFinding.UNPROVABLE)
+
+    for index, _task, rows in history:
+        if index == cursor_index:
+            continue
+        for attempt in rows:
+            if attempt.state is AttemptState.UNKNOWN_OUTCOME:
+                # A previous step's unresolved effect. The chain moving past it
+                # is not a resolution of it, and this generation cannot end
+                # while it stands.
+                return HistoryVerdict(HistoryFinding.NON_CURSOR_UNKNOWN)
+
+    cursor_rows: list = []
+    for index, _task, rows in history:
+        if index == cursor_index:
+            cursor_rows = rows
+            break
+    unresolved = [
+        attempt
+        for attempt in cursor_rows
+        if attempt.state is AttemptState.UNKNOWN_OUTCOME
+    ]
+    if not unresolved:
+        # Every in-doubt state has now been refused above, so nothing is left
+        # that could be in doubt anywhere.
+        return HistoryVerdict(HistoryFinding.ESTABLISHED)
+    if len(cursor_rows) == 1 and len(unresolved) == 1:
+        # The multiplicity rule above already guarantees at most one row here.
+        # Re-stated rather than assumed: this is the ONE branch that hands back
+        # an attempt id for a caller to act on, and it must remain provably
+        # about a task with a single, unambiguous execution record even if the
+        # rule above is ever moved.
+        return HistoryVerdict(
+            HistoryFinding.UNKNOWN_AT_CURSOR, unresolved[0].id
+        )
+    # An unresolved outcome beside other rows, or more than one of them. No
+    # single decision can honestly be about that.
+    return HistoryVerdict(HistoryFinding.UNPROVABLE)
+
+
+def chain_lifecycle_coherent(chain: Any, routed: Any) -> bool:
+    """Whether the routed task states could really have produced this status.
+
+    MIRRORS ``advance_chain_step`` AND ``cancel_chain``, which are the only
+    writers of a terminal chain status, rather than inventing a second reading
+    of one. Pure and here for the same reason the history verdict is: the
+    scheduler asks it before settling a generation, and storage asks it again
+    inside the transaction that terminalizes one.
+
+    What each canonical writer requires:
+
+    * the cursor only ever moves forward off a COMPLETED task, so every step
+      BEFORE the cursor must be completed whatever the final status is;
+    * ``COMPLETED`` is written only at the last step, off a COMPLETED task,
+      with every step created - so all of that must hold;
+    * ``FAILED`` is written only when the task AT THE CURSOR is FAILED. A
+      chain reporting failure over a set of completed tasks did not come from
+      that transition, and settling it would record a failure nothing
+      produced;
+    * ``CANCELLED`` has TWO legitimate producers - the cursor task being
+      CANCELLED or REJECTED, and an operator ``cancel_chain`` that preserves
+      the cursor and every binding exactly as they were. The second accepts a
+      cursor task in ANY state, including one an executing owner finalizes
+      afterwards, so no cursor-state rule is imposed here. Requiring every
+      task to be cancelled would refuse the ordinary case of a cancellation
+      that arrives after earlier steps legitimately completed.
+    """
+    by_index = dict((index, task) for index, task in routed)
+    cursor = chain.cursor
+    if type(cursor) is not int:
+        return False
+    # Universal: the cursor advanced off completed steps, so they are completed.
+    for index, task in routed:
+        if index < cursor and task.status is not TaskStatus.COMPLETED:
+            return False
+    if chain.status is ChainStatus.COMPLETED:
+        if cursor != len(chain.steps) - 1:
+            return False
+        if len(by_index) != len(chain.steps):
+            return False
+        return all(task.status is TaskStatus.COMPLETED for task in by_index.values())
+    if chain.status is ChainStatus.FAILED:
+        task = by_index.get(cursor)
+        return task is not None and task.status is TaskStatus.FAILED
+    if chain.status is ChainStatus.CANCELLED:
+        # Both canonical producers are admissible; the prior-step rule above is
+        # the whole of what cancellation can be held to.
+        return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -8699,6 +8966,111 @@ class MemoryStore(Protocol):
         Inserts ``attempt`` (PREPARED) only when the task has no attempt yet;
         otherwise returns the existing latest attempt unchanged. The caller
         proceeds only when the returned attempt is still PREPARED.
+        """
+        ...
+
+    def declare_attempt_orphaned(
+        self,
+        session_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> "AttemptRecoveryOutcome":
+        """Record that a person believes an IN_FLIGHT execution is orphaned.
+
+        Scheduler phase 2B2b1, and the ONE exit from the single H2 state that
+        had none. An attempt goes IN_FLIGHT durably before the connector
+        boundary and leaves it only when its owner concludes it; a process
+        that died holding one therefore blocks its task, its chain and every
+        later generation of its job forever, because nothing may replay it and
+        nothing may pretend it ended.
+
+        WHAT THIS IS. A human, looking at a run that has not moved, states
+        that its outcome will never be established by the party that started
+        it. That statement is recorded as ``UNKNOWN_OUTCOME`` - the state H2
+        already has for exactly this meaning - and NOTHING ELSE happens.
+
+        WHAT IT IS NOT, and no caller may read it as: it is not proof the
+        worker died, not proof the external effect happened, not proof it did
+        not, and not permission to retry anything. It moves one attempt from
+        "nobody has said" to "nobody ever will", which is strictly a loss of
+        hope, never a gain of knowledge.
+
+        A conforming store must, in ONE transaction: prove the attempt exists
+        and belongs to exactly this session and task, prove the task belongs
+        to the session and is not terminal, require the attempt to be exactly
+        ``IN_FLIGHT``, refuse a declaration younger than ``ORPHAN_MIN_AGE``,
+        compare-and-set ``IN_FLIGHT -> UNKNOWN_OUTCOME`` naming that source
+        state, and write ONE audit record - all of it or none of it.
+
+        The state CAS is the whole concurrency story and it is enough: every
+        writer that can end an attempt names ``IN_FLIGHT`` as its source, so a
+        live owner that concludes first makes this refuse, and this committing
+        first makes that owner's conclusion lose. There is no owner token, no
+        fencing epoch, no lease and no heartbeat in H2, and none is added -
+        inferring death from a timer is precisely what this operation exists
+        to avoid.
+
+        The task, its result, its chain, its reservation and its generation
+        are ALL left exactly as they are. Terminalizing the task is a separate
+        human act with its own vocabulary - ``abandon_unknown_attempt`` - and
+        settling the generation is a third.
+        """
+        ...
+
+    def resolve_unknown_job_run(
+        self,
+        run_id: str,
+        attempt_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> "JobRun":
+        """Close a generation whose one uncertain attempt was abandoned.
+
+        Scheduler phase 2B2b1, and the LAST step of the only path out of an
+        unresolved external outcome: a person declared the attempt orphaned, a
+        person abandoned it, a person cancelled or the chain failed, and this
+        records that the occurrence is over. ``UNKNOWN_OUTCOME -> FAILED``,
+        with ``blocking_code`` naming the uncertainty and ``attempt_id``
+        naming the attempt it was about.
+
+        IT ESTABLISHES NOTHING ABOUT THE WORLD. The external effect is exactly
+        as unknown afterwards as before; what changes is only that this job
+        stops being blocked behind a question nobody can answer. Every piece
+        of the uncertainty stays readable - the attempt is still
+        ``UNKNOWN_OUTCOME``, the task is still the typed
+        ``EXECUTION_UNKNOWN_OUTCOME`` failure, the money is still exposed -
+        and no path anywhere retries this generation.
+
+        The proof is the point, and ALL of it must hold inside the SAME
+        transaction as the mutation, because every fact it rests on has an
+        authoritative writer that could invalidate it a moment later:
+
+        * the generation is exactly ``UNKNOWN_OUTCOME``, unsettled, bound, and
+          names no attempt yet;
+        * the persisted session IS the bound session - row key, decoded
+          identity and project record all agreeing - and the chain is the
+          exact chain and the exact frozen declaration;
+        * every routed task is rebuilt from its own row and re-proved to be
+          this chain's task for its own step;
+        * the COMPLETE attempt history of EVERY routed task reads as
+          ``UNKNOWN_AT_CURSOR``, and the attempt it names is the one the
+          caller named - so an in-flight attempt anywhere, an unresolved one
+          under another step, more than one row, or a foreign row all refuse;
+        * the cursor task carries the durable abandonment: FAILED, with the
+          canonical typed ``EXECUTION_UNKNOWN_OUTCOME`` result marked
+          non-retryable, and the ``execution_abandoned`` audit naming that
+          same attempt. FAILED alone proves nothing - an ordinary connector
+          failure is FAILED too;
+        * the chain is CANCELLED or FAILED in a form its canonical writers
+          could really have produced.
+
+        Anything unproved refuses, writes nothing and records nothing.
         """
         ...
 

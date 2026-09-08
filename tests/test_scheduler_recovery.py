@@ -59,6 +59,7 @@ from jarvis.dispatch import (
     DISPATCH_PARKED,
     DISPATCH_REFUSED,
     DISPATCH_SETTLED,
+    DISPATCH_UNKNOWN,
     _bound_state,
     dispatch_job_run,
     recover_job_run,
@@ -1006,22 +1007,40 @@ class RecoveryResumeTests(RecoveryTestCase):
         self.assertFalse(stored.settled)
         self.assertEqual(dispatch.session_id, stored.session_id)
 
-    def test_an_unknown_outcome_attempt_blocks_before_core_is_entered(self) -> None:
-        # The owner itself recorded that nobody could establish what happened -
-        # the one production caller of that transition. Recovery reads it and
-        # stops; it does not resolve, abandon or retry it.
+    def test_an_unknown_outcome_attempt_is_reflected_without_entering_core(
+        self,
+    ) -> None:
+        # PHASE 2B2b1 CHANGED THIS, and only this. The owner itself recorded
+        # that nobody could establish what happened - the one production caller
+        # of that transition - so the uncertainty is durable H2 truth this
+        # generation is entitled to READ. Recovery now reflects it onto the
+        # coordination state instead of leaving the run looking merely stuck.
+        #
+        # Everything that made the old expectation safe still holds: Core is
+        # never entered, the connector is never reached again, and the attempt
+        # is left exactly as the owner left it. Reflecting is not resolving.
         run, dispatch = self.in_flight()
         attempt = self.attempt_rows()[0]
         self.memory.mark_execution_unknown(attempt["id"])
         self.assertEqual([AttemptState.UNKNOWN_OUTCOME.value], self.attempt_states())
         scripted = ScriptedCore(self.memory, None)
         outcome = self.recover(run.id, WORKER_B, run.fencing_epoch, core=scripted)
-        self.assertEqual(DISPATCH_BLOCKED, outcome.verdict)
-        self.assertEqual("execution_not_established", outcome.reason)
+        self.assertEqual(DISPATCH_UNKNOWN, outcome.verdict, outcome.reason)
+        self.assertEqual("execution_unknown_at_cursor", outcome.reason)
         self.assertEqual([], scripted.calls)
         self.assertEqual(1, len(self.reader.calls))
         self.assertEqual([AttemptState.UNKNOWN_OUTCOME.value], self.attempt_states())
-        self.assertEqual(JobRunStatus.RUNNING, self.reload(run.id).status)
+        stored = self.reload(run.id)
+        self.assertEqual(JobRunStatus.UNKNOWN_OUTCOME, stored.status)
+        # Unsettled, unclaimable and unrecoverable: the generation - and every
+        # later one of its job - stays blocked for a person.
+        self.assertFalse(stored.settled)
+        self.assertIsNone(stored.owner_token)
+        self.assertEqual(dispatch.session_id, stored.session_id)
+        with self.assertRaises(JobError):
+            self.memory.claim_job_run(run.id, WORKER_C, now=self.after, lease=LEASE)
+        with self.assertRaises(JobError):
+            self.reacquire(run.id, WORKER_C, stored.fencing_epoch)
 
     def test_an_older_in_doubt_attempt_is_not_hidden_by_a_newer_clean_one(
         self,

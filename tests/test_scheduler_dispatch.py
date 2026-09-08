@@ -2038,6 +2038,8 @@ class DispatchBoundaryTests(DispatchTestCase):
             "resolve_job_run",
             "retry_job_run",
             "abandon_unknown_attempt",
+            "declare_attempt_orphaned",
+            "resolve_unknown_job_run",
             "mark_execution_unknown",
             "resolve_approval",
             "reject_task",
@@ -2045,6 +2047,9 @@ class DispatchBoundaryTests(DispatchTestCase):
             "has_approved_grant",
             "claim_job_run",
             "renew_job_run_lease",
+            # Phase 2B2b2 cancellation is NOT in this build.
+            "request_job_run_cancel",
+            "cancel_requested",
         ):
             self.assertNotIn(absent, source, absent)
         # It never takes GENERIC ownership either: dispatch is handed a proof
@@ -2061,10 +2066,16 @@ class DispatchBoundaryTests(DispatchTestCase):
         }
         self.assertEqual({"dispatch_job_run", "recover_job_run"}, public)
 
-    def test_recovery_touches_exactly_one_new_storage_operation(self) -> None:
-        # The only store call recovery adds is the fenced recovery boundary.
-        # Anything else appearing on this list later - an approval read, a
-        # grant read, an attempt mutation - is a scope change, not a fix.
+    def test_recovery_touches_only_fenced_jobrun_operations(self) -> None:
+        # Recovery reads H2 truth and moves JobRun COORDINATION; it never
+        # mutates execution reality. The list is exhaustive on purpose:
+        # anything appearing on it later - an approval read, a grant read, an
+        # attempt mutation, a human gate - is a scope change, not a fix.
+        #
+        # ``mark_job_run_unknown`` joined it in phase 2B2b1. It is the EXISTING
+        # 2B0 fenced JobRun transition, proved by owner token, fencing epoch
+        # and a live lease, and it writes one coordination status - it is not
+        # an H2 write and confers no authority over an attempt.
         tree = ast.parse(self.source())
         recover = next(
             node
@@ -2079,7 +2090,26 @@ class DispatchBoundaryTests(DispatchTestCase):
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "store"
         }
-        self.assertEqual({"reacquire_job_run", "load_job_run"}, store_calls)
+        self.assertEqual(
+            {
+                "reacquire_job_run",
+                "load_job_run",
+                "mark_job_run_unknown",
+            },
+            store_calls,
+        )
+        # And the H2 / human-gate authorities stay absent from the whole
+        # module, not merely from this function.
+        for forbidden in (
+            "declare_attempt_orphaned",
+            "abandon_unknown_attempt",
+            "resolve_unknown_job_run",
+            "mark_execution_unknown",
+            "begin_execution",
+            "conclude_execution",
+            "open_execution_attempt",
+        ):
+            self.assertNotIn(forbidden, self.source(), forbidden)
         core_calls = {
             node.func.attr
             for node in ast.walk(recover)

@@ -47,6 +47,7 @@ from jarvis.contracts import (
     JOB_RECOVERY_ACTOR_MAX_CHARS,
     JOB_RECOVERY_REASON_MAX_CHARS,
     JOB_SPEC_MAX_BYTES,
+    ORPHAN_MIN_AGE,
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     DISPATCHABLE_JOB_RUN_STATUSES,
@@ -63,6 +64,9 @@ from jarvis.contracts import (
     JobRunSummary,
     JobSpec,
     JobSummary,
+    HistoryFinding,
+    chain_lifecycle_coherent,
+    execution_history_verdict,
     job_recovery_note,
     SETTLEABLE_JOB_RUN_STATUSES,
     SETTLED_JOB_RUN_STATUSES,
@@ -74,6 +78,7 @@ from jarvis.contracts import (
     LoopStage,
     MemoryLifecycle,
     MemoryRetrievalQuery,
+    OutcomeStatus,
     MemoryOrigin,
     MonetaryState,
     PermissionGrant,
@@ -3105,6 +3110,374 @@ class SQLiteMemoryStore:
         if session.id != session_id:
             return None
         return session
+
+    @staticmethod
+    def _attempt_rows(
+        connection: sqlite3.Connection, task_id: str
+    ) -> list[ExecutionAttempt]:
+        """EVERY attempt of one task, in creation order, read in-transaction.
+
+        The complete history, never the newest row: an unresolved attempt can
+        sit under a later clean one, and a top-of-stack read would report a
+        settled effect for a connector call nobody concluded.
+        """
+        rows = connection.execute(
+            """
+            SELECT id, session_id, task_id, connector, fingerprint, state,
+                   created_at, updated_at
+            FROM execution_attempts WHERE task_id = ? ORDER BY rowid
+            """,
+            (task_id,),
+        ).fetchall()
+        return [SQLiteMemoryStore._attempt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _orphan_age_reached(updated_at: Any, moment: datetime) -> bool:
+        """Whether this attempt has been IN_FLIGHT long enough to be declared.
+
+        A GESTURE GUARD, not evidence: see ``ORPHAN_MIN_AGE``. An unreadable
+        or future-dated stamp fails closed, because a bound that cannot be
+        evaluated has not been satisfied.
+        """
+        canonical = canonical_utc_timestamp(updated_at)
+        if canonical is None:
+            return False
+        return moment - datetime.fromisoformat(canonical) >= ORPHAN_MIN_AGE
+
+    def declare_attempt_orphaned(
+        self,
+        session_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> AttemptRecoveryOutcome:
+        """Record that a person believes an IN_FLIGHT execution is orphaned.
+
+        Phase 2B2b1, and the ONE exit from the single H2 state that had none.
+        An attempt becomes IN_FLIGHT durably before the connector boundary and
+        leaves it only when its owner concludes it, so a process that died
+        holding one blocks its task, its chain and every later generation of
+        its job forever - nothing may replay it and nothing may pretend it
+        ended.
+
+        WHAT THIS RECORDS is a person's statement that the outcome will never
+        be established by the party that started it. It is NOT proof the
+        worker died, NOT proof the effect happened, NOT proof it did not, and
+        NOT permission to retry: the attempt moves from "nobody has said yet"
+        to "nobody ever will", which is a loss of hope rather than a gain of
+        knowledge. Everything else - the task, its result, its chain, its
+        reservation, its generation - is left exactly as it stands, because
+        each of those has its own explicit authority elsewhere.
+
+        THE STATE CAS IS THE WHOLE CONCURRENCY STORY, and it is enough. Every
+        writer that can end an attempt names ``IN_FLIGHT`` as its source, so a
+        live owner concluding first makes this refuse and this committing
+        first makes that owner's conclusion lose - ``conclude_execution``
+        returns "lost" and never writes the task. No owner token, epoch, lease
+        or heartbeat exists in H2 and none is added here: inferring death from
+        a timer is exactly what an explicit human declaration replaces.
+        """
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._connection(write=True) as connection:
+            attempt = connection.execute(
+                "SELECT id, session_id, task_id, connector, state, updated_at "
+                "FROM execution_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            # Identity first, and ONE verdict for every way it can fail: which
+            # other session or task owns an attempt is not something a refusal
+            # may disclose.
+            if (
+                attempt is None
+                or attempt["session_id"] != session_id
+                or attempt["task_id"] != task_id
+            ):
+                return AttemptRecoveryOutcome.UNKNOWN
+            task = self._authoritative_task_row(connection, session_id, task_id)
+            if task is None:
+                return AttemptRecoveryOutcome.UNKNOWN
+            session = self._authoritative_session_row(connection, session_id)
+            if session is None:
+                return AttemptRecoveryOutcome.UNKNOWN
+            if attempt["state"] != AttemptState.IN_FLIGHT.value:
+                # PREPARED never crossed the boundary and is still legitimately
+                # claimable; FINISHED already has its answer; UNKNOWN_OUTCOME
+                # has already been declared - by its owner or by this gate -
+                # and saying it twice changes nothing.
+                return AttemptRecoveryOutcome.NOT_RECOVERABLE
+            if task.status.value in _TERMINAL_STATUS_VALUES:
+                return AttemptRecoveryOutcome.TERMINAL
+            if not self._orphan_age_reached(attempt["updated_at"], moment):
+                # A gesture guard only. Waiting longer proves nothing about
+                # the worker; it just makes a slip less likely than a decision.
+                return AttemptRecoveryOutcome.TOO_RECENT
+            cas = connection.execute(
+                """
+                UPDATE execution_attempts SET state = ?, updated_at = ?
+                 WHERE id = ? AND session_id = ? AND task_id = ? AND state = ?
+                """,
+                (
+                    AttemptState.UNKNOWN_OUTCOME.value,
+                    stamp,
+                    attempt_id,
+                    session_id,
+                    task_id,
+                    AttemptState.IN_FLIGHT.value,
+                ),
+            )
+            if cas.rowcount != 1:
+                # The owner concluded it inside this window. Its answer stands.
+                return AttemptRecoveryOutcome.NOT_RECOVERABLE
+            # SAME TRANSACTION. The declaration and the record of who made it
+            # become durable together or neither does.
+            self._write_checkpoint_and_event(
+                connection,
+                session,
+                task,
+                "execution_declared_orphaned",
+                {
+                    "attempt_id": attempt_id,
+                    "connector": attempt["connector"],
+                    "previous_state": AttemptState.IN_FLIGHT.value,
+                    "resulting_state": AttemptState.UNKNOWN_OUTCOME.value,
+                    "previous_updated_at": attempt["updated_at"],
+                    # UNAUTHENTICATED, and named so IN the record: local
+                    # operator invocation is the authorization boundary, and a
+                    # caller-supplied string is attribution, never a principal.
+                    "actor_label": actor,
+                    "actor_authenticated": False,
+                    "reason": why,
+                    "declared_at": stamp,
+                    # Stated so the record cannot be misread later as a finding
+                    # about the world or as a licence to run anything again.
+                    "worker_death_proved": False,
+                    "external_effect_established": False,
+                    "retry_authorized": False,
+                },
+                created_at=stamp,
+            )
+        return AttemptRecoveryOutcome.RECOVERED
+
+    def resolve_unknown_job_run(
+        self,
+        run_id: str,
+        attempt_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> JobRun:
+        """Close a generation whose one uncertain attempt was abandoned.
+
+        Phase 2B2b1, and the LAST step of the only path out of an unresolved
+        external outcome: a person declared the attempt orphaned (or its owner
+        raised), a person abandoned it, the chain was cancelled or failed, and
+        this records that the occurrence is over.
+
+        IT ESTABLISHES NOTHING ABOUT THE WORLD. The effect is exactly as
+        unknown afterwards as before; what changes is that the job stops being
+        blocked behind a question nobody can answer. Every artefact of the
+        uncertainty stays readable - the attempt is still UNKNOWN_OUTCOME, the
+        task is still the typed non-retryable failure, the reservation is
+        still exposed, and ``blocking_code`` says why this generation ended -
+        and no path anywhere retries it.
+
+        THE PROOF IS THE OPERATION, and all of it runs in THIS transaction,
+        because every fact it rests on has an authoritative writer that could
+        invalidate it a moment later. Reading the history, proving the
+        abandonment and settling the generation in three separate transactions
+        would leave three windows in which the thing being terminalized stops
+        being the thing that was proved.
+        """
+        if chain_id_refusal(attempt_id) is not None:
+            raise JobError("attempt_id is not a usable identifier")
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            if run.status is not JobRunStatus.UNKNOWN_OUTCOME or run.settled:
+                raise JobError("the generation has no unresolved unknown outcome")
+            if run.session_id is None or run.chain_id is None:
+                raise JobError("the generation is not bound to a session")
+            if run.attempt_id is not None:
+                # The binding is written exactly once, by this operation.
+                raise JobError("the generation already names an attempt")
+            # The bound session, proved to BE the bound session (2B2a): row
+            # key, decoded identity and project record must all agree before
+            # anything decoded from it is believed.
+            session = self._recovery_session(connection, run)
+            chain = session.chain
+            if chain is None or chain.id != run.chain_id:
+                raise JobError("the bound chain does not match the generation")
+            if chain_state_refusal(chain) is not None:
+                raise JobError("the bound chain is unusable")
+            if tuple(chain.steps) != tuple(run.spec.steps):
+                # The DECLARATION itself: still the exact ordered steps the
+                # snapshot froze when the generation was recorded.
+                raise JobError("the bound chain is no longer the declaration")
+            cursor = chain.cursor
+            if type(cursor) is not int or not 0 <= cursor < len(chain.step_task_ids):
+                raise JobError("the bound chain has no usable cursor")
+            # Every routed task, rebuilt from its OWN row and re-proved to be
+            # this chain's task for its own step.
+            routed: list = []
+            for index, step_task_id in enumerate(chain.step_task_ids):
+                if not step_task_id:
+                    continue
+                found = self._stored_task(connection, step_task_id)
+                if found is None:
+                    raise JobError("the chain routes to a task that cannot be read")
+                owner, task = found
+                if owner != run.session_id:
+                    raise JobError("the chain routes to another session's task")
+                if (
+                    chain_task_refusal(
+                        task, chain, index, mode=ChainTaskMode.STORED
+                    )
+                    is not None
+                ):
+                    raise JobError("the chain routes to a task it no longer owns")
+                routed.append((index, task))
+            # THE COMPLETE HISTORY of every routed task, through the one
+            # shared definition the scheduler also reads.
+            history = {task.id: self._attempt_rows(connection, task.id) for _index, task in routed}
+            verdict = execution_history_verdict(
+                run.session_id, routed, cursor, history
+            )
+            if verdict.finding is not HistoryFinding.UNKNOWN_AT_CURSOR:
+                # An in-flight attempt anywhere, an unresolved one under
+                # another step, more than one row under one task, a foreign or
+                # malformed row, or nothing in doubt at all. ONE refusal: none
+                # of them is a generation a single human decision may close.
+                raise JobError(
+                    "the execution history is not one unresolved outcome at the "
+                    "current step"
+                )
+            if verdict.attempt_id != attempt_id:
+                # The operator named a different attempt than the one this
+                # chain is actually unresolved on. Never substituted.
+                raise JobError("that attempt is not this generation's unresolved outcome")
+            cursor_task_id = chain.step_task_ids[cursor]
+            cursor_task = self._authoritative_task_row(
+                connection, run.session_id, cursor_task_id
+            )
+            if cursor_task is None:
+                raise JobError("the current step's task cannot be read")
+            # THE ABANDONMENT, proved by three durable facts rather than
+            # inferred from one. FAILED alone is what an ordinary connector
+            # failure also writes, so it proves nothing by itself.
+            if cursor_task.status is not TaskStatus.FAILED:
+                raise JobError("the current step's task was not abandoned")
+            snapshot = cursor_task.result_snapshot
+            error = snapshot.get("error") if isinstance(snapshot, dict) else None
+            if (
+                not isinstance(snapshot, dict)
+                or snapshot.get("outcome") != OutcomeStatus.ERROR.value
+                or not isinstance(error, dict)
+                or error.get("code") != ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value
+                or error.get("retryable") is not False
+            ):
+                raise JobError("the current step carries no abandonment result")
+            events = connection.execute(
+                """
+                SELECT payload_json FROM event_log
+                 WHERE session_id = ? AND task_id = ? AND event_type = ?
+                """,
+                (run.session_id, cursor_task_id, "execution_abandoned"),
+            ).fetchall()
+            if len(events) != 1:
+                raise JobError("the current step has no single abandonment record")
+            try:
+                recorded = json.loads(events[0]["payload_json"])
+            except (TypeError, ValueError) as exc:
+                raise JobError("the abandonment record is unreadable") from exc
+            if (
+                not isinstance(recorded, dict)
+                or recorded.get("attempt_id") != attempt_id
+            ):
+                raise JobError("the abandonment record names another attempt")
+            # THE CHAIN, in a form its canonical writers could have produced.
+            # "Not ACTIVE" is not enough: COMPLETED over an abandoned step is
+            # corruption, and INVALID was already refused above.
+            if chain.status not in (ChainStatus.CANCELLED, ChainStatus.FAILED):
+                raise JobError("the chain has not been terminalized")
+            if not chain_lifecycle_coherent(chain, routed):
+                raise JobError("the chain status disagrees with its own steps")
+            resolved = replace(
+                run,
+                status=JobRunStatus.FAILED,
+                attempt_id=attempt_id,
+                blocking_code=ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+                owner_token=None,
+                lease_expires_at_utc=None,
+                settled_at=stamp,
+            )
+            cas = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, settled_at = ?, blocking_code = ?,
+                       attempt_id = ?
+                 WHERE id = ? AND status = ? AND settled_at IS NULL
+                   AND session_id = ? AND chain_id = ? AND attempt_id IS NULL
+                """,
+                (
+                    resolved.status.value,
+                    resolved.settled_at,
+                    resolved.blocking_code,
+                    attempt_id,
+                    run_id,
+                    JobRunStatus.UNKNOWN_OUTCOME.value,
+                    run.session_id,
+                    run.chain_id,
+                ),
+            )
+            if cas.rowcount != 1:
+                raise JobError("the generation is not resolvable")
+            # SAME TRANSACTION. The settlement and the evidence for it become
+            # durable together or neither does.
+            self._insert_job_run_event(
+                connection,
+                run.session_id,
+                "job_run_unknown_resolved",
+                {
+                    "run_id": run.id,
+                    "job_id": run.job_id,
+                    "generation": run.generation,
+                    "chain_id": run.chain_id,
+                    "cursor_task_id": cursor_task_id,
+                    "attempt_id": attempt_id,
+                    # The attempt KEEPS this state; it is recorded so the trail
+                    # says what was closed over, not what it became.
+                    "attempt_state": AttemptState.UNKNOWN_OUTCOME.value,
+                    "task_status": cursor_task.status.value,
+                    "task_error_code": ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value,
+                    "task_retryable": False,
+                    "chain_status": chain.status.value,
+                    "previous_status": run.status.value,
+                    "resulting_status": resolved.status.value,
+                    "blocking_code": resolved.blocking_code,
+                    "actor_label": actor,
+                    "actor_authenticated": False,
+                    "reason": why,
+                    "resolved_at": stamp,
+                    "external_effect_established": False,
+                    "retry_authorized": False,
+                },
+                stamp,
+            )
+        return resolved
 
     def abandon_unknown_attempt(
         self,
