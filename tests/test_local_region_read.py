@@ -1384,7 +1384,7 @@ class HeadCompatibilityTests(RegionReadBase):
 
         # Scheduler phase 2A owns the current SQLite schema (9); the
         # output envelope contract is untouched by it and remains at 6.
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
 
 

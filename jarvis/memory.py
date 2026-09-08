@@ -47,12 +47,14 @@ from jarvis.contracts import (
     JOB_SPEC_MAX_BYTES,
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
+    DISPATCHABLE_JOB_RUN_STATUSES,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
     JobError,
     JobKind,
     JobRecord,
     JobRun,
+    JobRunDispatch,
     JobRunLease,
     JobRunStatus,
     JobRunSummary,
@@ -143,7 +145,7 @@ from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
@@ -532,6 +534,53 @@ _SCHEDULER_SCHEMA_SQL = f"""
 #: ``WHERE`` clause under ``BEGIN IMMEDIATE``.
 _SCHEDULER_LEASE_SQL = "ALTER TABLE job_runs ADD COLUMN lease_expires_at_utc TEXT"
 
+#: Scheduler phase 2B1. The ONE structural fact a dispatch binding needs that
+#: application code cannot hold: an AgentCore session belongs to at most one
+#: generation. PARTIAL, because the overwhelming majority of generations never
+#: get a session and NULLs must stay free to repeat.
+#:
+#: This index is not what makes a binding immutable - that is the
+#: compare-and-set on ``session_id IS NULL AND chain_id IS NULL``. It is what
+#: makes the binding EXCLUSIVE: even a writer that bypassed the method could
+#: not point two occurrences at one session and have both believe they own its
+#: chain.
+_SCHEDULER_SESSION_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_session "
+    "ON job_runs(session_id) WHERE session_id IS NOT NULL"
+)
+
+
+def _add_scheduler_session_index(connection: sqlite3.Connection) -> None:
+    """Add the phase-2B1 unique session index, or FAIL CLOSED.
+
+    A database that already contains two generations naming one session is a
+    database whose dispatch history is ambiguous: one AgentCore session, two
+    occurrences that each believe they own its chain and its outcome. There is
+    no honest automatic answer to which one is real, so the upgrade REFUSES.
+
+    Deliberately no repair. Deleting a binding would strand a session nobody
+    owns; keeping one and clearing the other would pick a winner on no
+    evidence, and the loser's generation would then look free to dispatch a
+    second time - a second connector crossing for one occurrence, which is the
+    exact duplicate-effect this phase exists to prevent. A human resolves it.
+    """
+    duplicates = connection.execute(
+        """
+        SELECT session_id, COUNT(*) AS bound FROM job_runs
+         WHERE session_id IS NOT NULL
+         GROUP BY session_id HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    if duplicates:
+        shared = ", ".join(sorted(str(row[0]) for row in duplicates))
+        raise RuntimeError(
+            "Refusing to upgrade to schema 10: these AgentCore sessions are "
+            f"bound to more than one job run: {shared}. Two generations "
+            "claiming one session is ambiguous dispatch history; resolve it "
+            "explicitly rather than letting the upgrade choose a winner."
+        )
+    connection.execute(_SCHEDULER_SESSION_INDEX_SQL)
+
 
 def _add_scheduler_lease_column(connection: sqlite3.Connection) -> None:
     """Add the phase-2A lease column if it is not already there.
@@ -677,6 +726,9 @@ class SQLiteMemoryStore:
         if target_version == 9:
             self._migrate_scheduler_lease(connection)
             return
+        if target_version == 10:
+            self._migrate_scheduler_dispatch(connection)
+            return
         raise RuntimeError(f"No migration is defined for schema {target_version}")
 
     @staticmethod
@@ -715,6 +767,22 @@ class SQLiteMemoryStore:
         one.
         """
         _add_scheduler_lease_column(connection)
+
+    @staticmethod
+    def _migrate_scheduler_dispatch(connection: sqlite3.Connection) -> None:
+        """Add the unique partial session index additively (2B1).
+
+        ONE index on ONE existing table. No table is created, altered or
+        rebuilt, no column is added, and no existing row is read for repair,
+        rewritten, reclassified or deleted - every schema-9 database keeps its
+        jobs, its generations and its whole non-scheduler history
+        byte-for-byte.
+
+        No authority is invented: an index grants nothing. It refuses instead,
+        and it fails the upgrade closed on legacy ambiguity rather than
+        inventing an answer.
+        """
+        _add_scheduler_session_index(connection)
 
     @staticmethod
     def _migrate_typed_memory(connection: sqlite3.Connection) -> None:
@@ -1165,6 +1233,7 @@ class SQLiteMemoryStore:
         # fresh one cannot diverge in a constraint or in their stored DDL.
         connection.executescript(_SCHEDULER_SCHEMA_SQL)
         _add_scheduler_lease_column(connection)
+        _add_scheduler_session_index(connection)
 
     def schema_version(self) -> int:
         with self._connection() as connection:
@@ -5869,6 +5938,135 @@ class SQLiteMemoryStore:
             sources=APPROVAL_PENDABLE_JOB_RUN_STATUSES,
             target=JobRunStatus.AWAITING_APPROVAL,
             refusal="the generation is not awaiting-approval from its state",
+        )
+
+    def bind_job_run_dispatch(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> JobRunDispatch:
+        """Bind ONE claimed generation to a fresh session/chain, atomically.
+
+        The FIRST and ONLY binding this generation ever gets, and the whole of
+        it is one transaction: the pristine session, the chain declared from the
+        immutable snapshot, both binding columns and the ``CLAIMED -> RUNNING``
+        transition either all become durable together or none of them does. A
+        crash anywhere inside leaves no orphan session, no orphan chain, no half
+        binding and no generation that says RUNNING with nothing to run.
+
+        THE BINDING IS IMMUTABLE. The compare-and-set names both slots as NULL,
+        so a second binder finds them filled and is refused - it never replaces
+        either identity, and it never gets a second session for one occurrence.
+        The unique partial index on ``session_id`` holds the other direction:
+        no two generations can name one session even if a writer skipped this
+        method.
+
+        The session row is a STRICT INSERT. An upsert would silently adopt an
+        existing session and hand this generation someone else's chain, which
+        is the one way a scheduler could reach into a conversation it has no
+        business in; a colliding id therefore raises rather than merges.
+
+        A ``CONDITION_WATCH`` is refused. Its declaration is what it would do IF
+        its predicate held, nothing in this phase evaluates one, and dispatching
+        it would run unconditionally what the operator declared conditionally.
+
+        Binding is NOT authority. It creates no approval, consumes no grant,
+        opens no execution attempt, reserves no money and reaches no connector.
+        Everything real still has to pass Core's own gates afterwards.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
+                raise JobError("the generation is not dispatchable from its state")
+            if run.session_id is not None or run.chain_id is not None:
+                # Already bound. Refused rather than re-bound: a second session
+                # for one occurrence would be a second crossing of a connector
+                # boundary whose first crossing nobody has disproved.
+                raise JobError("the generation is already bound to a session")
+            if run.spec.kind is JobKind.CONDITION_WATCH:
+                raise JobError(
+                    "a condition watch is not dispatchable in this phase"
+                )
+            # The project is re-proved HERE, inside the write transaction: a
+            # snapshot names the project the operator scheduled under, and a
+            # project archived since then must not gain a fresh session.
+            self._require_active_project(connection, run.spec.project_id)
+            chain = ChainState.declared(run.spec.steps)
+            if chain is None:
+                # Unreachable through JobSpec, which already refuses a
+                # malformed declaration. Fail closed anyway rather than bind a
+                # session to a chain no authority stage would accept.
+                raise JobError("the snapshot declaration cannot form a chain")
+            session = SessionState(
+                objective=run.spec.label,
+                project_id=run.spec.project_id,
+                chain=chain,
+            )
+            payload = session.to_dict()
+            try:
+                # STRICT INSERT, no ON CONFLICT: a colliding session id is a
+                # session that already exists and is not ours to write into.
+                connection.execute(
+                    """
+                    INSERT INTO sessions (id, state_json, updated_at, project_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        session.id,
+                        self._json(payload),
+                        session.updated_at,
+                        session.project_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise JobError("the session identity is already taken") from exc
+            bound = replace(
+                run,
+                status=JobRunStatus.RUNNING,
+                session_id=session.id,
+                chain_id=chain.id,
+            )
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE job_runs
+                       SET status = ?, session_id = ?, chain_id = ?
+                     WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                       AND status = ? AND settled_at IS NULL
+                       AND session_id IS NULL AND chain_id IS NULL
+                    """,
+                    (
+                        bound.status.value,
+                        session.id,
+                        chain.id,
+                        run_id,
+                        owner_token,
+                        fencing_epoch,
+                        run.status.value,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # The unique partial index: this session already belongs to
+                # another generation. The whole transaction unwinds, so the
+                # session row inserted above never becomes durable.
+                raise JobError("that session is already bound to a generation") from exc
+            if cursor.rowcount != 1:
+                raise JobError("the caller does not hold this lease")
+        return JobRunDispatch(
+            run_id=bound.id,
+            job_id=bound.job_id,
+            generation=bound.generation,
+            project_id=bound.spec.project_id,
+            session_id=session.id,
+            chain_id=chain.id,
+            owner_token=owner_token,
+            fencing_epoch=fencing_epoch,
+            lease_expires_at_utc=bound.lease_expires_at_utc,
         )
 
     def load_job_run(self, run_id: str) -> JobRun | None:

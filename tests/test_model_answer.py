@@ -822,8 +822,8 @@ class PersistenceTests(ModelAnswerTestCase):
 
         # Scheduler phase 2A owns the current SQLite schema version; this
         # milestone adds no storage schema of its own.
-        self.assertEqual(9, SCHEMA_VERSION)
-        self.assertEqual(9, self.memory.schema_version())
+        self.assertEqual(10, SCHEMA_VERSION)
+        self.assertEqual(10, self.memory.schema_version())
 
 
 # --------------------------------------------------------------------------

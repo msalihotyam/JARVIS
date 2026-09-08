@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -25,8 +26,10 @@ from jarvis.contracts import (
     BillingReconciliation,
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
+    DISPATCHABLE_JOB_RUN_STATUSES,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
+    ChainState,
     ChainStep,
     DataClassification,
     DecisionRecord,
@@ -36,6 +39,7 @@ from jarvis.contracts import (
     JobKind,
     JobRecord,
     JobRun,
+    JobRunDispatch,
     JobRunLease,
     JobRunStatus,
     JobRunSummary,
@@ -243,6 +247,11 @@ class InMemoryStore:
     """Small non-SQLite MemoryStore implementation used as a contract test."""
 
     def __init__(self) -> None:
+        # ONE critical section for the operations SQLite makes atomic with
+        # BEGIN IMMEDIATE. Without it the double would admit two winners
+        # where the real store admits one, and a contract test that is
+        # weaker than production certifies a hole instead of closing it.
+        self._lock = threading.RLock()
         self.sessions: dict[str, SessionState] = {}
         self.tasks: dict[str, Task] = {}
         self.task_sessions: dict[str, str] = {}
@@ -944,6 +953,74 @@ class InMemoryStore:
             refusal="the generation is not awaiting-approval from its state",
         )
 
+    def bind_job_run_dispatch(
+        self, run_id, owner_token, fencing_epoch, *, now
+    ) -> JobRunDispatch:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        # EVERYTHING below is one atomic operation, exactly as it is in SQLite:
+        # validate the fenced claim, mint the session and chain, bind both ids
+        # and move CLAIMED -> RUNNING. A loser must leave no second session and
+        # no replacement binding behind, so it must not be able to interleave
+        # between the check and the writes.
+        with self._lock:
+            return self._bind_job_run_dispatch_locked(
+                run_id, owner_token, fencing_epoch, now
+            )
+
+    def _bind_job_run_dispatch_locked(
+        self, run_id, owner_token, fencing_epoch, now
+    ) -> JobRunDispatch:
+        run = self._owned_run(run_id)
+        self._held_lease(run, owner_token, fencing_epoch, now)
+        if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
+            raise JobError("the generation is not dispatchable from its state")
+        if run.session_id is not None or run.chain_id is not None:
+            raise JobError("the generation is already bound to a session")
+        if run.spec.kind is JobKind.CONDITION_WATCH:
+            raise JobError("a condition watch is not dispatchable in this phase")
+        project = self.projects.get(run.spec.project_id)
+        if project is None or not project.active:
+            raise JobError(f"Unknown or inactive project: {run.spec.project_id}")
+        chain = ChainState.declared(run.spec.steps)
+        if chain is None:
+            raise JobError("the snapshot declaration cannot form a chain")
+        session = SessionState(
+            objective=run.spec.label,
+            project_id=run.spec.project_id,
+            chain=chain,
+        )
+        # Strict insert, and the unique-session rule the SQLite partial index
+        # enforces - both stated here so the double refuses exactly what
+        # SQLite refuses rather than quietly accepting more.
+        if session.id in self.sessions:
+            raise JobError("the session identity is already taken")
+        if any(
+            other.session_id == session.id
+            for other in self.job_runs.values()
+            if other.id != run_id
+        ):
+            raise JobError("that session is already bound to a generation")
+        self.sessions[session.id] = copy.deepcopy(session)
+        self.job_runs[run_id] = dataclasses.replace(
+            run,
+            status=JobRunStatus.RUNNING,
+            session_id=session.id,
+            chain_id=chain.id,
+        )
+        return JobRunDispatch(
+            run_id=run.id,
+            job_id=run.job_id,
+            generation=run.generation,
+            project_id=run.spec.project_id,
+            session_id=session.id,
+            chain_id=chain.id,
+            owner_token=owner_token,
+            fencing_epoch=fencing_epoch,
+            lease_expires_at_utc=run.lease_expires_at_utc,
+        )
+
     def load_job_run(self, run_id: str) -> JobRun | None:
         run = self.job_runs.get(run_id)
         if run is None:
@@ -1150,6 +1227,15 @@ class InMemoryStore:
     def latest_execution_attempt(self, task_id: str) -> ExecutionAttempt | None:
         history = self.attempts.get(task_id)
         return history[-1] if history else None
+
+    def execution_attempts(self, task_id: str) -> list[ExecutionAttempt]:
+        """The COMPLETE history, oldest first - never just the newest row.
+
+        The double keeps the same shape SQLite does, so a reader deciding
+        whether an effect is established sees an older unresolved attempt even
+        when a clean one was written above it.
+        """
+        return list(self.attempts.get(task_id, ()))
 
     def open_execution_attempt(self, attempt: ExecutionAttempt) -> ExecutionAttempt:
         history = self.attempts.setdefault(attempt.task_id, [])
@@ -1983,6 +2069,155 @@ class SchedulerStorageParityTests(unittest.TestCase):
             return trace
 
         self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_dispatch_binding_is_refused_identically_in_both_stores(self) -> None:
+        # Phase 2B1. The double is a CONTRACT test, so it must refuse exactly
+        # what SQLite refuses: the same fencing proof, the same CLAIMED-only
+        # source state, the same immutable binding, the same condition-watch
+        # refusal. A double that bound more freely would certify a hole.
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "binding.db")
+        sqlite_store.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+        lease = timedelta(minutes=5)
+        at = self.NOW + timedelta(hours=1)
+        during = at + timedelta(minutes=1)
+        expired = at + lease + timedelta(minutes=1)
+
+        def refusal(call) -> str:
+            try:
+                call()
+            except JobError:
+                return "refused"
+            return "ALLOWED"
+
+        def script(store) -> list:
+            trace: list = []
+            record = store.create_job(self.spec(), now=self.NOW)
+            run = store.materialize_due_job_run(record.id, record.revision, now=at)
+            held = store.claim_job_run(run.id, "worker-a", now=at, lease=lease)
+            for label, owner, epoch, when in (
+                ("wrong_owner", "worker-b", held.fencing_epoch, during),
+                ("stale_epoch", "worker-a", held.fencing_epoch - 1, during),
+                ("expired", "worker-a", held.fencing_epoch, expired),
+            ):
+                trace.append(
+                    (
+                        f"bind_{label}",
+                        refusal(
+                            lambda o=owner, e=epoch, w=when: store.bind_job_run_dispatch(
+                                run.id, o, e, now=w
+                            )
+                        ),
+                    )
+                )
+            bound = store.bind_job_run_dispatch(
+                run.id, "worker-a", held.fencing_epoch, now=during
+            )
+            after = store.load_job_run(run.id)
+            trace.append(
+                (
+                    "bound",
+                    after.status.value,
+                    after.session_id == bound.session_id,
+                    after.chain_id == bound.chain_id,
+                    after.settled,
+                )
+            )
+            session = store.load_session(bound.session_id)
+            trace.append(
+                (
+                    "session",
+                    session.project_id,
+                    session.chain.id == bound.chain_id,
+                    session.chain.status.value,
+                    tuple(session.chain.steps) == tuple(run.spec.steps),
+                )
+            )
+            # The binding is immutable and RUNNING is not claimable.
+            trace.append(
+                (
+                    "rebind",
+                    refusal(
+                        lambda: store.bind_job_run_dispatch(
+                            run.id, "worker-a", held.fencing_epoch, now=during
+                        )
+                    ),
+                )
+            )
+            trace.append(
+                (
+                    "reclaim_running",
+                    refusal(
+                        lambda: store.claim_job_run(
+                            run.id, "worker-b", now=expired, lease=lease
+                        )
+                    ),
+                )
+            )
+            return trace
+
+        self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_synchronized_concurrent_binders_produce_one_winner_in_the_double(
+        self,
+    ) -> None:
+        # F4. DETERMINISTIC, not timing luck: every binder is held at a barrier
+        # until all of them have arrived, so they really do contend. The double
+        # must then behave like SQLite - one winner, one session, no orphan,
+        # and the winner's binding is the one that stuck.
+        import threading
+
+        record = self.memory.create_job(self.spec(), now=self.NOW)
+        at = self.NOW + timedelta(hours=1)
+        run = self.memory.materialize_due_job_run(record.id, record.revision, now=at)
+        held = self.memory.claim_job_run(
+            run.id, "worker-a", now=at, lease=timedelta(minutes=5)
+        )
+        during = at + timedelta(minutes=1)
+
+        binders = 4
+        barrier = threading.Barrier(binders)
+        results: list = []
+        guard = threading.Lock()
+
+        def bind() -> None:
+            barrier.wait()
+            try:
+                outcome = self.memory.bind_job_run_dispatch(
+                    run.id, "worker-a", held.fencing_epoch, now=during
+                )
+            except JobError as exc:
+                outcome = exc
+            with guard:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=bind) for _ in range(binders)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        winners = [r for r in results if isinstance(r, JobRunDispatch)]
+        self.assertEqual(1, len(winners), results)
+        self.assertEqual(binders - 1, len([r for r in results if isinstance(r, JobError)]))
+        # EXACTLY ONE session exists, and it is the winner's - no orphan was
+        # created by a loser that got as far as minting one.
+        self.assertEqual(1, len(self.memory.sessions))
+        self.assertIn(winners[0].session_id, self.memory.sessions)
+        stored = self.memory.load_job_run(run.id)
+        self.assertEqual(JobRunStatus.RUNNING, stored.status)
+        self.assertEqual(winners[0].session_id, stored.session_id)
+        self.assertEqual(winners[0].chain_id, stored.chain_id)
+        session = self.memory.load_session(winners[0].session_id)
+        self.assertEqual(winners[0].chain_id, session.chain.id)
 
     def test_an_unknown_outcome_is_terminal_in_both_stores(self) -> None:
         # RUNNING is a state no phase-2B0 transition can reach, so both stores

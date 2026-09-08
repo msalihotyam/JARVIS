@@ -21,6 +21,7 @@ a live model, auth or network call.
 
 from __future__ import annotations
 
+import ast
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -585,28 +586,40 @@ class BoundaryTests(FenceTestCase):
         for absent in ("recover_job_run", "resolve_job_run", "retry_job_run"):
             self.assertFalse(hasattr(SQLiteMemoryStore, absent), absent)
 
-    def test_no_dispatch_or_execution_path_reaches_a_generation(self) -> None:
-        # Nothing materializes a generation into AgentCore, runs a chain,
-        # opens a session for one or binds it to a chain for dispatch.
+    def test_no_autonomous_dispatch_path_reaches_a_generation(self) -> None:
+        # Phase 2B1 added ONE callable bridge, ``dispatch.py``. What stays
+        # absent is anything that would drive it by itself, and any second
+        # execution path around it.
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for absent in (
-                "dispatch_job_run",
                 "run_job_run",
                 "execute_job_run",
                 "job_run_to_task",
                 "materialize_job_run_task",
             ):
                 self.assertNotIn(absent, source, f"{module.name}: {absent}")
+            if module.name != "dispatch.py":
+                self.assertNotIn("dispatch_job_run", source, module.name)
         names = {module.name for module in self.production_modules()}
-        for absent in ("dispatcher.py", "scheduler_dispatch.py", "worker.py"):
+        for absent in ("dispatcher.py", "scheduler_dispatch.py", "worker.py", "daemon.py"):
             self.assertNotIn(absent, names)
+        # And nothing wires the bridge into the app or the CLI in this phase.
+        # ``cli.py`` has its own unrelated ``_dispatch_*`` command helpers, so
+        # the check names the module and the entry point, not the word.
+        for module in self.production_modules():
+            if module.name in ("app.py", "cli.py"):
+                source = module.read_text(encoding="utf-8")
+                for absent in ("jarvis.dispatch", "dispatch_job_run"):
+                    self.assertNotIn(absent, source, f"{module.name}: {absent}")
 
-    def test_no_production_module_calls_the_new_fenced_operations(self) -> None:
-        # ``memory.py`` defines them and ``contracts.py`` declares them on the
-        # provider-independent protocol. Nothing else may even mention them,
-        # so there is no production caller that could conclude a generation.
-        allowed = {"memory.py", "contracts.py"}
+    def test_only_the_one_shot_bridge_calls_the_fenced_operations(self) -> None:
+        # ``memory.py`` defines them, ``contracts.py`` declares them on the
+        # provider-independent protocol, and from phase 2B1 ``dispatch.py``
+        # calls them - it is the ONE production caller, and it is a callable
+        # boundary rather than anything that runs by itself. Nothing else may
+        # even mention them.
+        allowed = {"memory.py", "contracts.py", "dispatch.py"}
         for module in self.production_modules():
             if module.name in allowed:
                 continue
@@ -615,8 +628,47 @@ class BoundaryTests(FenceTestCase):
                 "settle_job_run",
                 "mark_job_run_unknown",
                 "await_job_run_approval",
+                "bind_job_run_dispatch",
             ):
                 self.assertNotIn(name, source, f"{module.name} mentions {name}")
+
+    def test_the_one_shot_bridge_holds_no_execution_authority(self) -> None:
+        # The permission dispatch.py gains is narrow and is proved narrow: it
+        # may ask Core to run and then READ what Core wrote, and it may not
+        # reach past Core into anything that authorizes an effect.
+        source = (
+            Path(__file__).resolve().parent.parent / "jarvis" / "dispatch.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        for forbidden in (
+            "execute",
+            "open_execution_attempt",
+            "begin_execution",
+            "conclude_execution",
+            "mark_execution_unknown",
+            "finalize_task",
+            "resolve_approval",
+            "record_permission_grant",
+            "reserve",
+            "record_usage",
+            "evaluate",
+            "materialize_chain_step",
+            "advance_chain_step",
+            "declare_chain_if_absent",
+            "save_session",
+            "save_task",
+        ):
+            self.assertNotIn(forbidden, called, f"dispatch.py calls {forbidden}")
+        # The ONLY Core entry point it uses.
+        self.assertIn("run_chain", called)
+        for absent in ("threading", "Thread", "time.sleep", "asyncio", "schedule("):
+            self.assertNotIn(absent, source, f"dispatch.py reaches {absent}")
 
     def test_no_background_loop_thread_or_service_was_added(self) -> None:
         for module in self.production_modules():
@@ -634,7 +686,7 @@ class BoundaryTests(FenceTestCase):
         from jarvis.app import OUTPUT_SCHEMA_VERSION
         from jarvis.memory import SCHEMA_VERSION
 
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
 
 

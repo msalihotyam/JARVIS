@@ -259,12 +259,19 @@ INSERT INTO usage_ledger VALUES
      'no_additional_charge', 'not_applicable', NULL, NULL, 1, 'ev', 'r0');
 """
 
-#: Exactly the durable objects schemas 8 and 9 introduce. Anything else
+#: Exactly the durable objects schemas 8, 9 and 10 introduce. Anything else
 #: appearing in ``sqlite_master`` after an upgrade would be an unrelated schema
-#: change. Schema 9 adds a COLUMN rather than an object, so this set is
-#: unchanged by it and the column is asserted separately.
+#: change. Schema 9 adds a COLUMN rather than an object, so it does not appear
+#: here and the column is asserted separately; schema 10 adds exactly ONE
+#: object, the partial unique session index.
 _SCHEDULER_OBJECTS = frozenset(
-    {"jobs", "job_runs", "idx_jobs_due", "idx_job_runs_unsettled"}
+    {
+        "jobs",
+        "job_runs",
+        "idx_jobs_due",
+        "idx_job_runs_unsettled",
+        "idx_job_runs_session",
+    }
 )
 
 
@@ -455,8 +462,8 @@ class SchemaMigrationTests(unittest.TestCase):
         self.build_v7(populated=False)
         before = self.schema_objects()
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, SCHEMA_VERSION)
-        self.assertEqual(9, store.schema_version())
+        self.assertEqual(10, SCHEMA_VERSION)
+        self.assertEqual(10, store.schema_version())
         after = self.schema_objects()
         self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
         # Every pre-existing object is byte-identical: the upgrade adds, and
@@ -468,7 +475,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.build_v7(populated=True)
         before = self.schema_objects()
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, store.schema_version())
+        self.assertEqual(10, store.schema_version())
         after = self.schema_objects()
         self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
         connection = raw(self.database)
@@ -516,7 +523,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 0, connection.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0]
             )
             self.assertEqual(
-                [6, 7, 8, 9],
+                [6, 7, 8, 9, 10],
                 [
                     row["version"]
                     for row in connection.execute(
@@ -532,12 +539,12 @@ class SchemaMigrationTests(unittest.TestCase):
         SQLiteMemoryStore(self.database)
         first = self.schema_objects()
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, again.schema_version())
+        self.assertEqual(10, again.schema_version())
         self.assertEqual(first, self.schema_objects())
         connection = raw(self.database)
         try:
             self.assertEqual(
-                [6, 7, 8, 9],
+                [6, 7, 8, 9, 10],
                 [
                     row["version"]
                     for row in connection.execute(
@@ -554,7 +561,7 @@ class SchemaMigrationTests(unittest.TestCase):
         record = store.create_job(spec(), now=NOW)
         objects = self.schema_objects()
         reopened = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, reopened.schema_version())
+        self.assertEqual(10, reopened.schema_version())
         self.assertEqual(objects, self.schema_objects())
         self.assertEqual(record, reopened.load_job(record.id))
 
@@ -565,7 +572,7 @@ class SchemaMigrationTests(unittest.TestCase):
         # surfaces, none of them an alias of another.
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
         self.assertEqual(1, JOB_DEFINITION_VERSION)
 
@@ -1470,11 +1477,13 @@ class ExecutionBoundaryTests(unittest.TestCase):
         return sorted(root.rglob("*.py"))
 
     def test_no_production_module_calls_the_scheduler_storage_surface(self) -> None:
-        # ``memory.py`` DEFINES the surface and ``contracts.py`` declares it on
-        # the provider-independent protocol; nothing else may even mention it,
-        # so no production path can wake on a due job, claim a generation,
-        # materialize a task, create an approval or start a worker through it.
-        allowed = {"memory.py", "contracts.py"}
+        # Phase 2B1 adds exactly ONE production caller: ``dispatch.py``, the
+        # one-shot bridge. It is allowed to name the storage surface and is
+        # separately proved - below and in the 2B1 suite - to reach no
+        # approval, grant, billing, connector, attempt or condition authority.
+        # Nothing else may even mention it, so there is still no path that
+        # wakes on a due job or starts a worker on its own.
+        allowed = {"memory.py", "contracts.py", "dispatch.py"}
         for module in self.production_modules():
             if module.name in allowed:
                 continue

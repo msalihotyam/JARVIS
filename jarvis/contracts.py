@@ -6998,6 +6998,19 @@ UNKNOWNABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.RUNNING})
 #: generation of it behind a request that names nothing.
 APPROVAL_PENDABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.RUNNING})
 
+#: Scheduler phase 2B1. The ONLY state from which a generation may be bound to
+#: a fresh AgentCore session and dispatched. ``CLAIMED`` is owned, unsettled
+#: and has started no external action, which is exactly the precondition a
+#: FIRST dispatch needs.
+#:
+#: ``RUNNING`` is deliberately absent, and its absence is the phase boundary.
+#: A generation that is already RUNNING has been bound and handed to Core once;
+#: binding it again would mean a second session for one occurrence and a second
+#: crossing of a connector boundary whose first crossing nobody has disproved.
+#: A RUNNING generation whose worker died therefore stays RUNNING and BLOCKED -
+#: resume, recovery and the human gate belong to a later phase.
+DISPATCHABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.CLAIMED})
+
 #: The approved bounded lease window. A lease is COORDINATION ONLY - it says
 #: which worker currently owns a generation, and it grants no approval, no
 #: connector authority and no permission to execute anything.
@@ -7694,6 +7707,57 @@ class JobRunLease:
 
 
 @dataclass(frozen=True, slots=True)
+class JobRunDispatch:
+    """The immutable receipt of ONE successful first binding (phase 2B1).
+
+    A generation is bound to exactly one pristine AgentCore session and the one
+    chain that session owns, and the binding is made ONCE. Everything a caller
+    needs to hand that session to ``AgentCore.run_chain`` and to re-prove
+    afterwards that it is still acting on the same occurrence is here, and
+    nothing it must not act on is.
+
+    BOTH identities are carried on purpose. ``session_id`` is the resume handle
+    Core takes; ``chain_id`` is what makes the binding checkable, because a
+    session id alone cannot show that the chain inside it is still the one
+    derived from this generation's immutable snapshot. The pair, re-proved
+    against the snapshot before dispatch, is the integrity proof.
+
+    Holding one AUTHORIZES NOTHING. It is not an approval, not a grant, not a
+    reservation, not an execution attempt and not permission to reach a
+    connector; every gate real work must pass is still ahead of it and is
+    re-proved by Core on the trusted path.
+    """
+
+    run_id: str
+    job_id: str
+    generation: int
+    project_id: str
+    session_id: str
+    chain_id: str
+    owner_token: str
+    fencing_epoch: int
+    lease_expires_at_utc: str
+
+    def __post_init__(self) -> None:
+        for value, label in ((self.run_id, "run id"), (self.job_id, "job id")):
+            reason = job_identifier_refusal(value, label)
+            if reason is not None:
+                raise JobError(reason)
+        _exact_index(self.generation, "generation", minimum=1)
+        _exact_index(self.fencing_epoch, "fencing_epoch", minimum=1)
+        validate_project_id(self.project_id)
+        for value, label in (
+            (self.session_id, "session_id"),
+            (self.chain_id, "chain_id"),
+            (self.owner_token, "owner_token"),
+        ):
+            if chain_id_refusal(value) is not None:
+                raise JobError(f"{label} is not a usable identifier")
+        if canonical_utc_timestamp(self.lease_expires_at_utc) is None:
+            raise JobError("lease_expires_at_utc is not a canonical UTC timestamp")
+
+
+@dataclass(frozen=True, slots=True)
 class JobSummary:
     """One job, as an operator needs to see it. Never its content.
 
@@ -7887,6 +7951,20 @@ class MemoryStore(Protocol):
     def load_task(self, task_id: str) -> Task | None: ...
 
     def task_session_id(self, task_id: str) -> str | None: ...
+
+    def execution_attempts(self, task_id: str) -> list["ExecutionAttempt"]:
+        """EVERY attempt this task ever opened, oldest first. Read-only.
+
+        The COMPLETE history, not the newest row. ``execution_attempts`` does
+        not hold one row per task, so the latest attempt can be a clean
+        FINISHED sitting on top of an older IN_FLIGHT or UNKNOWN_OUTCOME - and
+        reading only the newest would report "not in doubt" about a task whose
+        connector boundary was crossed and never resolved. Any reader deciding
+        whether an effect is established must see all of them.
+
+        A conforming store writes nothing here and repairs nothing.
+        """
+        ...
 
     def persist_checkpoint(
         self,
@@ -8238,6 +8316,50 @@ class MemoryStore(Protocol):
         is unsettled and is not claimable, so the generation - and every later
         generation of the job - stays blocked until the approval surface a
         later phase builds answers it.
+        """
+        ...
+
+    def bind_job_run_dispatch(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> "JobRunDispatch":
+        """Bind ONE claimed generation to a fresh session/chain, atomically.
+
+        The FIRST and ONLY binding a generation ever gets. It takes the same
+        proof every ownership mutation takes - the exact ``owner_token``, the
+        exact ``fencing_epoch`` and a lease still live at the explicit ``now`` -
+        and additionally requires a ``CLAIMED`` source state with both binding
+        slots still empty.
+
+        A conforming store must, in ONE transaction: create a PRISTINE session
+        carrying the generation's own project and a chain declared from the
+        immutable snapshot's exact steps, bind ``session_id`` and ``chain_id``
+        onto the generation, and move it ``CLAIMED -> RUNNING``. Either all of
+        that is durable or none of it is: a failure leaves no orphan session, no
+        orphan chain, no half binding and no RUNNING transition.
+
+        Session and chain creation must be STRICT INSERT. An upsert here could
+        adopt or overwrite a session that already exists and belongs to someone
+        else, which is the one way a scheduler could reach into another
+        session's chain.
+
+        THE BINDING IS IMMUTABLE. The compare-and-set requires
+        ``session_id IS NULL AND chain_id IS NULL``, so a second binder is
+        refused rather than allowed to replace either identity; the uniqueness
+        of ``session_id`` across generations is separately enforced by storage,
+        so one session can never be shared by two occurrences.
+
+        A ``CONDITION_WATCH`` generation is refused: its declaration is what it
+        would do IF a predicate held, and nothing in this phase evaluates one,
+        so dispatching it would run an unconditional chain the operator never
+        asked for unconditionally.
+
+        Binding is not authority. It creates no approval, consumes no grant,
+        opens no execution attempt, reserves no money and reaches no connector.
         """
         ...
 

@@ -207,13 +207,13 @@ class CliTestCase(unittest.TestCase):
     def test_status_output_is_backward_compatible(self) -> None:
         expected = {
             "mode": "local",
-            "schema_version": 9,
+            "schema_version": 10,
             "permission_mode": "session",
             "monthly_hard_limit_usd": 20.0,
             "paid_api_enabled": False,
         }
         self.assertEqual(SCHEMA_VERSION, self.memory.schema_version())
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         for argv in ([], ["status"]):
             with self.subTest(argv=argv):
                 code, output, errors = self.invoke(argv, app_factory=_must_not_build)

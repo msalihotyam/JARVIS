@@ -318,8 +318,8 @@ class Schema9MigrationTests(unittest.TestCase):
         before = table_names(self.database)
         self.assertNotIn("lease_expires_at_utc", run_columns(self.database))
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, SCHEMA_VERSION)
-        self.assertEqual(9, store.schema_version())
+        self.assertEqual(10, SCHEMA_VERSION)
+        self.assertEqual(10, store.schema_version())
         # ONE column. No new table, no dropped table, no new index.
         self.assertEqual(before, table_names(self.database))
         self.assertIn("lease_expires_at_utc", run_columns(self.database))
@@ -327,7 +327,7 @@ class Schema9MigrationTests(unittest.TestCase):
     def test_populated_schema_eight_database_upgrades_without_data_loss(self) -> None:
         self.build_v8(populated=True)
         store = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, store.schema_version())
+        self.assertEqual(10, store.schema_version())
         connection = raw(self.database)
         try:
             # Every legacy authority row survives untouched.
@@ -361,7 +361,7 @@ class Schema9MigrationTests(unittest.TestCase):
             # worker and unblocks nothing.
             self.assertIsNone(legacy["lease_expires_at_utc"])
             self.assertEqual(
-                [6, 7, 8, 9],
+                [6, 7, 8, 9, 10],
                 [
                     row["version"]
                     for row in connection.execute(
@@ -385,7 +385,7 @@ class Schema9MigrationTests(unittest.TestCase):
             self.database
         )
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, again.schema_version())
+        self.assertEqual(10, again.schema_version())
         self.assertEqual(first_tables, table_names(self.database))
         # The column is added once, not once per open.
         self.assertEqual(first_columns, run_columns(self.database))
@@ -403,7 +403,7 @@ class Schema9MigrationTests(unittest.TestCase):
         )
         columns = run_columns(self.database)
         reopened = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, reopened.schema_version())
+        self.assertEqual(10, reopened.schema_version())
         self.assertEqual(columns, run_columns(self.database))
         reloaded = reopened.load_job_run(run.id)
         self.assertEqual(lease.fencing_epoch, reloaded.fencing_epoch)
@@ -426,7 +426,7 @@ class Schema9MigrationTests(unittest.TestCase):
         from jarvis.app import OUTPUT_SCHEMA_VERSION
         from jarvis.contracts import JOB_DEFINITION_VERSION
 
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
         self.assertEqual(1, JOB_DEFINITION_VERSION)
 
@@ -1382,12 +1382,13 @@ class SourceBoundaryTests(unittest.TestCase):
         return sorted(root.rglob("*.py"))
 
     def test_no_production_module_calls_the_scheduler_storage_surface(self) -> None:
-        # ``memory.py`` DEFINES the surface and ``contracts.py`` declares it on
-        # the provider-independent protocol; nothing else may even mention it.
-        # There is therefore no production path that wakes on a due job,
-        # claims a generation, materializes a task, creates an approval or
-        # starts a worker through any of it - the only callers are tests.
-        allowed = {"memory.py", "contracts.py"}
+        # Phase 2B1 adds exactly ONE production caller: ``dispatch.py``, the
+        # one-shot bridge. It is allowed to name the storage surface and is
+        # separately proved - below and in the 2B1 suite - to reach no
+        # approval, grant, billing, connector, attempt or condition authority.
+        # Nothing else may even mention it, so there is still no path that
+        # wakes on a due job or starts a worker on its own.
+        allowed = {"memory.py", "contracts.py", "dispatch.py"}
         for module in self.production_modules():
             if module.name in allowed:
                 continue

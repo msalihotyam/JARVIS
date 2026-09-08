@@ -784,15 +784,15 @@ class CompatibilityTests(unittest.TestCase):
         # Memory V2 is migration 7; the scheduler foundation added 8 and
         # its claim/lease coordination added 9 on top, and a v6 database
         # still reaches the CURRENT schema in one open.
-        self.assertEqual(9, SCHEMA_VERSION)
-        self.assertEqual(9, store.schema_version())
+        self.assertEqual(10, SCHEMA_VERSION)
+        self.assertEqual(10, store.schema_version())
         # Reopen is idempotent and every migration step is recorded.
         again = SQLiteMemoryStore(self.database)
-        self.assertEqual(9, again.schema_version())
+        self.assertEqual(10, again.schema_version())
         connection = sqlite3.connect(self.database)
         try:
             self.assertEqual(
-                [(5,), (6,), (7,), (8,), (9,)],
+                [(5,), (6,), (7,), (8,), (9,), (10,)],
                 connection.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 ).fetchall(),
@@ -856,7 +856,7 @@ class CompatibilityTests(unittest.TestCase):
         # at version 6.
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
 
     def test_legacy_non_default_lifecycle_data_survives(self) -> None:
