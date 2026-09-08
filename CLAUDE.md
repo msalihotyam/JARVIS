@@ -30,3 +30,15 @@ ağ yok, bağımlılık yok. Ayrıntılı sözleşme `dev/dashboard/UPDATE.md`'d
   `dev/dashboard/status.json` değişikliğini küçük bir dev-tooling commit'ine
   dahil et; böylece canonical main temiz duruma döner.
 - `dashboard.html` üretilen ve yok sayılan bir dosyadır; asla commit etme.
+
+## Kod Erişimi
+
+- JARVIS kod yapısı sorularında önce Serena sembolik erişimini kullan
+  (semboller, referanslar, çağıran/çağrılan, ilgili dosya keşfi).
+- Güvenlik açısından hassas veya davranış-kritik iddialarda bulunmadan önce
+  gerçek kaynağı oku.
+- Serena hafızasını doğruluk kaynağı sayma.
+- Sembolik erişim soruyu yanıtlayabiliyorken geniş tam-dosya okumalarından ve
+  tekrarlayan Grep/Glob taramalarından kaçın.
+- Serena yetersiz veya erişilemez olduğunda yerel Read/Grep/Glob'a düş.
+- Kaynak kod her zaman nihai otoritedir.
