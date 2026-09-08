@@ -25,12 +25,22 @@ expired while Core was working, a chain waiting on a human for anything other
 than an approval Core actually persisted. A blocked generation blocks its job,
 which is the intended outcome - a stuck occurrence is a thing a person resolves,
 not a thing a timer retries. Nothing here ever hands back retry permission.
+
+PHASE 2B2a ADDS RECOVERY, AND RECOVERY IS NOT A RETRY. ``recover_job_run``
+takes coordination ownership of a generation that is ALREADY bound - a worker
+died holding it, or it was parked for a person who has since been asked - and
+hands Core back THE SAME session it was always bound to. It creates no session,
+replaces no chain, and gives one occurrence no second anything. What makes that
+safe is not this module: it is that Core's own re-entry is non-replaying, and
+that this module refuses to enter Core at all while any execution attempt under
+the chain is still in doubt. An in-flight or unknown attempt is where recovery
+STOPS - the generation stays blocked for a person, exactly as before.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from jarvis.contracts import (
@@ -43,6 +53,7 @@ from jarvis.contracts import (
     JobRun,
     JobRunStatus,
     RunStatus,
+    SessionState,
     TaskStatus,
     chain_task_refusal,
 )
@@ -61,6 +72,13 @@ DISPATCH_SETTLED = "settled"
 DISPATCH_PARKED = "parked"
 DISPATCH_UNKNOWN = "unknown"
 DISPATCH_BLOCKED = "blocked"
+
+#: The default recovery lease. Long enough that an ordinary chain step is not
+#: racing its own expiry, short enough that a worker which dies again does not
+#: hold the generation for long. A caller states its own; this is only what it
+#: gets for not stating one, and the storage boundary still refuses anything
+#: outside the approved window.
+DEFAULT_RECOVERY_LEASE = timedelta(minutes=5)
 
 
 def _utc_now() -> datetime:
@@ -331,11 +349,29 @@ def _bound_state(store: Any, run: JobRun) -> tuple[Any, Any] | None:
     could have been replaced, the session could have drifted to another
     project, or the row could simply be gone. A single mismatch returns
     ``None``, and every caller treats that as "leave it RUNNING".
+
+    THE DOCUMENT MUST BE THE SESSION IT WAS ASKED FOR. Storage is asked for the
+    session bound to this generation and answers with a DOCUMENT that carries
+    its own identity; those are two different facts, and nothing outside the
+    ordinary write path forces them to agree. Core then works from the DECODED
+    object, so a document stored under this generation's session but claiming
+    to be another one would send every task, attempt and connector call into a
+    session this generation was never bound to - while the generation itself
+    still read as bound here, leaving the executed work invisible from it.
+    The decoded identity is therefore proved against the binding BEFORE the
+    project, the chain, the declaration or any routing derived from it is
+    trusted, and a disagreement is refused rather than followed: this never
+    loads the identity the document names, never rewrites either identity, and
+    never substitutes a session of its own.
     """
     if run.session_id is None or run.chain_id is None:
         return None
     session = store.load_session(run.session_id)
-    if session is None or session.chain is None:
+    if type(session) is not SessionState:
+        return None
+    if session.id != run.session_id:
+        return None
+    if session.chain is None:
         return None
     chain = session.chain
     if chain.id != run.chain_id:
@@ -349,6 +385,18 @@ def _bound_state(store: Any, run: JobRun) -> tuple[Any, Any] | None:
     return session, chain
 
 
+def _recovery_blocked(
+    reason: str, run: JobRun | None, verdict: Any = None
+) -> DispatchOutcome:
+    """A blocked recovery, reported against the generation's OWN binding.
+
+    A first dispatch reports the session and chain from the receipt storage
+    handed it. A recovery has no receipt - it never created either identity -
+    so the generation itself is the only honest source for them.
+    """
+    return _blocked(reason, run, run, verdict)
+
+
 def _blocked(reason: str, run: JobRun | None, dispatch: Any, verdict: Any) -> DispatchOutcome:
     return DispatchOutcome(
         verdict=DISPATCH_BLOCKED,
@@ -358,6 +406,123 @@ def _blocked(reason: str, run: JobRun | None, dispatch: Any, verdict: Any) -> Di
         chain_id=None if dispatch is None else dispatch.chain_id,
         core_verdict=verdict,
     )
+
+
+def _reflect_outcome(
+    store: Any,
+    run_id: str,
+    owner_token: str,
+    fencing_epoch: int,
+    *,
+    binding: Any,
+    run: JobRun,
+    chain: Any,
+    agent_run: Any,
+    core_verdict: Any,
+    settled_at: datetime,
+) -> DispatchOutcome:
+    """Read authoritative storage and perform AT MOST ONE fenced mutation.
+
+    The whole of what a generation's lifecycle may be moved to on the strength
+    of a completed Core call, and deliberately ONE implementation of it. A
+    first dispatch and a recovery differ in how they came to own the run and in
+    nothing at all about how its outcome may be read, so a second copy of this
+    would be a second place for the reading to drift - which is exactly the
+    argument that gave the store one ``_fenced_transition`` instead of two.
+
+    ``binding`` is whatever carries the session and chain identity this call
+    ran under - the dispatch receipt on the first path, the recovered
+    generation itself on the second. Every mutation below still proves the
+    owner, the epoch and a live lease through the fenced storage boundary; this
+    function holds no authority of its own and writes nothing directly.
+    """
+    def _reflect(call: Callable[[], JobRun], verdict: str, reason: str) -> DispatchOutcome:
+        try:
+            reflected = call()
+        except JobError as exc:
+            # The fenced storage boundary refused. It is the authority on that,
+            # and its refusal leaves the generation exactly as it was.
+            return _blocked(f"refused: {exc}", store.load_job_run(run_id), binding, core_verdict)
+        return DispatchOutcome(
+            verdict=verdict,
+            reason=reason,
+            run=reflected,
+            session_id=binding.session_id,
+            chain_id=binding.chain_id,
+            core_verdict=core_verdict,
+        )
+
+    # (E) EXPLICIT UNKNOWN OUTRANKS EVERYTHING. Core says an execution attempt
+    # is in doubt; that is a stronger statement than any chain status sitting
+    # above it, and mapping it to FAILED would turn "we cannot know" into a
+    # clean ending the next generation could start on top of.
+    error = agent_run.error if agent_run is not None else None
+    if error is not None and error.code == ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value:
+        return _reflect(
+            lambda: store.mark_job_run_unknown(
+                run_id, owner_token, fencing_epoch, now=settled_at
+            ),
+            DISPATCH_UNKNOWN,
+            "execution_unknown_outcome",
+        )
+
+    # (D) AWAITING APPROVAL. Three independent agreements required: Core's
+    # verdict, the run it handed back, and an approval row Core has ALREADY
+    # persisted. The scheduler creates none of it and resolves none of it.
+    if core_verdict == "awaiting_approval":
+        if agent_run is None or agent_run.status is not RunStatus.AWAITING_APPROVAL:
+            return _blocked("approval_disagreement", run, binding, core_verdict)
+        if _approval_task(store, run, chain, agent_run) is None:
+            # Either no durable approval, or one that does not belong to this
+            # chain's CURRENT step. Parking on either would block the job
+            # behind an answer that cannot move it.
+            return _blocked("approval_not_bound_to_step", run, binding, core_verdict)
+        return _reflect(
+            lambda: store.await_job_run_approval(
+                run_id, owner_token, fencing_epoch, now=settled_at
+            ),
+            DISPATCH_PARKED,
+            "awaiting_approval",
+        )
+
+    # (A/B/C) The DURABLE chain status, never the run object's status - and
+    # never over an attempt still in doubt.
+    if chain.status in (
+        ChainStatus.COMPLETED,
+        ChainStatus.FAILED,
+        ChainStatus.CANCELLED,
+    ):
+        if not _terminal_evidence(store, run, chain):
+            # Routing that does not resolve, a task that is not this chain's,
+            # a lifecycle that disagrees with the claimed outcome, or an
+            # attempt still in doubt. Missing evidence is never a clearance.
+            return _blocked("terminal_evidence_missing", run, binding, core_verdict)
+        outcome = {
+            ChainStatus.COMPLETED: JobRunStatus.COMPLETED,
+            ChainStatus.FAILED: JobRunStatus.FAILED,
+            ChainStatus.CANCELLED: JobRunStatus.CANCELLED,
+        }[chain.status]
+        blocking = None
+        if outcome is JobRunStatus.FAILED and error is not None:
+            blocking = error.code
+        return _reflect(
+            lambda: store.settle_job_run(
+                run_id,
+                outcome,
+                owner_token,
+                fencing_epoch,
+                now=settled_at,
+                blocking_code=blocking,
+            ),
+            DISPATCH_SETTLED,
+            f"chain_{chain.status.value}",
+        )
+
+    # Everything else - an ACTIVE chain that stopped, a clarification, a cost
+    # override, a cancellation still in flight, INVALID, a conflict, a refusal -
+    # is left RUNNING on purpose. None of them is an outcome, and inventing one
+    # is how a scheduler manufactures a second attempt.
+    return _blocked(f"unmapped: {core_verdict}", run, binding, core_verdict)
 
 
 def dispatch_job_run(
@@ -474,90 +639,183 @@ def dispatch_job_run(
         return _blocked("bound_state_mismatch", after, dispatch, core_verdict)
     _session, chain = bound
 
-    def _reflect(call: Callable[[], JobRun], verdict: str, reason: str) -> DispatchOutcome:
-        try:
-            reflected = call()
-        except JobError as exc:
-            # The fenced storage boundary refused. It is the authority on that,
-            # and its refusal leaves the generation exactly as it was.
-            return _blocked(f"refused: {exc}", store.load_job_run(run_id), dispatch, core_verdict)
-        return DispatchOutcome(
-            verdict=verdict,
+    return _reflect_outcome(
+        store,
+        run_id,
+        owner_token,
+        fencing_epoch,
+        binding=dispatch,
+        run=after,
+        chain=chain,
+        agent_run=agent_run,
+        core_verdict=core_verdict,
+        settled_at=settled_at,
+    )
+
+
+def recover_job_run(
+    core: Any,
+    run_id: str,
+    owner_token: str,
+    expected_fencing_epoch: int,
+    *,
+    lease: timedelta = DEFAULT_RECOVERY_LEASE,
+    actor_label: str,
+    reason: str,
+    clock: Callable[[], datetime] = _utc_now,
+) -> DispatchOutcome:
+    """Recover ONE bound generation, re-prove everything, and only then resume.
+
+    The phase-2B2a boundary. Where ``dispatch_job_run`` binds a fresh session
+    and runs it once, this takes back a session that already exists - after a
+    worker died holding it, or after it was parked for an approval a person has
+    since been asked about - and continues THE SAME one.
+
+    The ORDER is the safety property, so it is fixed:
+
+    1. recover coordination ownership through the fenced storage boundary,
+       which is where the observed-epoch fence, the binding immutability and
+       the still-pending-approval wait rule are enforced, and which writes its
+       own audit record inside its own transaction;
+    2. re-prove the whole world under the NEW ownership: the generation is
+       RUNNING and bound to the same session and chain, the caller is now the
+       owner at the new epoch with a live lease, the chain is still the exact
+       declaration the snapshot froze, and every routed task is still this
+       session's own;
+    3. ask the H2 journal what actually happened, over the COMPLETE history of
+       every routed task, and stop here unless it is established;
+    4. call ``AgentCore.run_chain`` on the BOUND session id - never a new one;
+    5. sample a FRESH instant the moment it returns or raises;
+    6. reflect through exactly the same fenced paths a first dispatch uses.
+
+    OWNING IT DOES NOT AUTHORIZE RUNNING IT. Step 1 succeeding proves only that
+    nobody else coordinates this occurrence; every proof in steps 2 and 3 still
+    has to pass, and each one that does not leaves the generation RUNNING,
+    owned and blocked - which is a strictly better place to be blocked than
+    before, because now a person can see it and a later phase can act on it.
+
+    WHAT STOPS A DUPLICATE EFFECT is step 3 plus Core. An attempt still
+    ``IN_FLIGHT`` or ``UNKNOWN_OUTCOME`` means the connector boundary was
+    crossed and nobody established what happened on the other side; this
+    function will not enter Core at all in that state, and Core's own journal
+    precheck refuses it independently. A crashed executor's in-flight attempt
+    therefore stays exactly where it is - nothing here marks it, abandons it,
+    resolves it or infers an outcome for it, and nothing here may: that gate
+    belongs to a human authority a later phase builds.
+
+    NOTHING HERE INTERPRETS AN APPROVAL. The storage boundary refused to
+    recover a generation whose person is still being asked; past that point
+    what the approval came to - a valid grant, an expired one, a rejection, or
+    a fresh question - is Core's answer and only Core's, given when the session
+    is re-entered. Being asked again is a correct outcome.
+    """
+    store = core.memory
+    try:
+        recovered = store.reacquire_job_run(
+            run_id,
+            owner_token,
+            expected_fencing_epoch,
+            now=clock(),
+            lease=lease,
+            actor_label=actor_label,
             reason=reason,
-            run=reflected,
-            session_id=dispatch.session_id,
-            chain_id=dispatch.chain_id,
-            core_verdict=core_verdict,
+        )
+    except JobError as exc:
+        # The fenced boundary refused - a stale epoch, a live owner, an unbound
+        # or unrecoverable state, a pending approval, unusable metadata. It is
+        # the authority on all of that, and its refusal changed nothing.
+        return DispatchOutcome(
+            DISPATCH_REFUSED,
+            f"not_recoverable: {exc}",
+            run=store.load_job_run(run_id),
         )
 
-    # (E) EXPLICIT UNKNOWN OUTRANKS EVERYTHING. Core says an execution attempt
-    # is in doubt; that is a stronger statement than any chain status sitting
-    # above it, and mapping it to FAILED would turn "we cannot know" into a
-    # clean ending the next generation could start on top of.
-    error = agent_run.error if agent_run is not None else None
-    if error is not None and error.code == ErrorCode.EXECUTION_UNKNOWN_OUTCOME.value:
-        return _reflect(
-            lambda: store.mark_job_run_unknown(
-                run_id, owner_token, fencing_epoch, now=settled_at
-            ),
-            DISPATCH_UNKNOWN,
-            "execution_unknown_outcome",
-        )
+    epoch = recovered.fencing_epoch
 
-    # (D) AWAITING APPROVAL. Three independent agreements required: Core's
-    # verdict, the run it handed back, and an approval row Core has ALREADY
-    # persisted. The scheduler creates none of it and resolves none of it.
-    if core_verdict == "awaiting_approval":
-        if agent_run is None or agent_run.status is not RunStatus.AWAITING_APPROVAL:
-            return _blocked("approval_disagreement", after, dispatch, core_verdict)
-        if _approval_task(store, after, chain, agent_run) is None:
-            # Either no durable approval, or one that does not belong to this
-            # chain's CURRENT step. Parking on either would block the job
-            # behind an answer that cannot move it.
-            return _blocked("approval_not_bound_to_step", after, dispatch, core_verdict)
-        return _reflect(
-            lambda: store.await_job_run_approval(
-                run_id, owner_token, fencing_epoch, now=settled_at
-            ),
-            DISPATCH_PARKED,
-            "awaiting_approval",
-        )
-
-    # (A/B/C) The DURABLE chain status, never the run object's status - and
-    # never over an attempt still in doubt.
-    if chain.status in (
-        ChainStatus.COMPLETED,
-        ChainStatus.FAILED,
-        ChainStatus.CANCELLED,
+    # From here the generation is durably RUNNING under the NEW ownership, and
+    # every exit leaves it that way unless a reflection is positively proved.
+    run = store.load_job_run(run_id)
+    if run is None or run.status is not JobRunStatus.RUNNING:
+        return _recovery_blocked("recovered_state_unreadable", run)
+    if run.session_id is None or run.chain_id is None:
+        # Unreachable: the storage CAS required both. Proved again rather than
+        # trusted, because everything below is about to be run on them.
+        return _recovery_blocked("binding_missing", run)
+    if run.spec.kind is JobKind.CONDITION_WATCH:
+        # Also unreachable, since a watch can never have been bound. A watch
+        # declares what it would do IF its predicate held, and nothing in this
+        # phase evaluates one, so it fails closed here too.
+        return _recovery_blocked("condition_watch", run)
+    if (
+        run.owner_token != owner_token
+        or run.fencing_epoch != epoch
+        or not run.lease_is_live(clock())
     ):
-        if not _terminal_evidence(store, after, chain):
-            # Routing that does not resolve, a task that is not this chain's,
-            # a lifecycle that disagrees with the claimed outcome, or an
-            # attempt still in doubt. Missing evidence is never a clearance.
-            return _blocked("terminal_evidence_missing", after, dispatch, core_verdict)
-        outcome = {
-            ChainStatus.COMPLETED: JobRunStatus.COMPLETED,
-            ChainStatus.FAILED: JobRunStatus.FAILED,
-            ChainStatus.CANCELLED: JobRunStatus.CANCELLED,
-        }[chain.status]
-        blocking = None
-        if outcome is JobRunStatus.FAILED and error is not None:
-            blocking = error.code
-        return _reflect(
-            lambda: store.settle_job_run(
-                run_id,
-                outcome,
-                owner_token,
-                fencing_epoch,
-                now=settled_at,
-                blocking_code=blocking,
-            ),
-            DISPATCH_SETTLED,
-            f"chain_{chain.status.value}",
-        )
+        return _recovery_blocked("lease_lost_before_resume", run)
+    bound = _bound_state(store, run)
+    if bound is None:
+        # The session vanished, the chain was replaced, the project drifted, or
+        # the declaration is no longer the one the snapshot froze.
+        return _recovery_blocked("bound_state_mismatch", run)
+    _session, chain = bound
 
-    # Everything else - an ACTIVE chain that stopped, a clarification, a cost
-    # override, a cancellation still in flight, INVALID, a conflict, a refusal -
-    # is left RUNNING on purpose. None of them is an outcome, and inventing one
-    # is how a scheduler manufactures a second attempt.
-    return _blocked(f"unmapped: {core_verdict}", after, dispatch, core_verdict)
+    # (3) AUTHORITATIVE H2 REALITY, BEFORE CORE IS ENTERED. The complete
+    # attempt history of every routed task, not the newest row: an unresolved
+    # in-flight or unknown attempt can sit under a later clean one, and reading
+    # only the top would resume over a connector call nobody ever resolved.
+    routed = _routed_tasks(store, run, chain)
+    if routed is None:
+        return _recovery_blocked("routing_unprovable", run)
+    if not _execution_established(store, run.session_id, routed):
+        # IN_FLIGHT, UNKNOWN_OUTCOME, foreign or malformed attempt identity, or
+        # a completed task whose evidence is missing. ONE refusal for all of
+        # them: every one means the same thing here - what really happened is
+        # not established, so nothing may be resumed on top of it.
+        return _recovery_blocked("execution_not_established", run)
+
+    # (4) THE ONE CALL, on the session this generation has always been bound
+    # to. No new session exists to pass, and none is created to pass.
+    try:
+        agent_run, core_verdict = core.run_chain(run.session_id)
+    except Exception:  # noqa: BLE001 - an unclassified failure is not a verdict
+        # THE FRESH INSTANT IS SAMPLED HERE TOO, for the same reason and with
+        # the same absence of any write: an exception says the driver stopped,
+        # never that the work did not happen.
+        clock()
+        return _recovery_blocked("run_chain_raised", store.load_job_run(run_id))
+
+    # (5) FRESH NOW, sampled only now that Core has returned.
+    settled_at = clock()
+
+    after = store.load_job_run(run_id)
+    if after is None or after.status is not JobRunStatus.RUNNING:
+        return _recovery_blocked("generation_moved", after, core_verdict)
+    if (
+        after.session_id != run.session_id
+        or after.chain_id != run.chain_id
+        or after.owner_token != owner_token
+        or after.fencing_epoch != epoch
+    ):
+        return _recovery_blocked("binding_or_owner_changed", after, core_verdict)
+    if not after.lease_is_live(settled_at):
+        # The recovery lease died while Core worked. A third worker may
+        # legitimately own this generation by now, so this one writes NOTHING.
+        return _recovery_blocked("lease_expired", after, core_verdict)
+    rebound = _bound_state(store, after)
+    if rebound is None:
+        return _recovery_blocked("bound_state_mismatch", after, core_verdict)
+    _session, chain = rebound
+
+    # (6) The same reflection a first dispatch uses, under the new fencing.
+    return _reflect_outcome(
+        store,
+        run_id,
+        owner_token,
+        epoch,
+        binding=after,
+        run=after,
+        chain=chain,
+        agent_run=agent_run,
+        core_verdict=core_verdict,
+        settled_at=settled_at,
+    )

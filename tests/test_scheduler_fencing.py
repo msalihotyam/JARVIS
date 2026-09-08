@@ -565,15 +565,23 @@ class BoundaryTests(FenceTestCase):
         self.assertEqual(2, table_count(self.database, "jobs"))
         self.assertEqual(2, table_count(self.database, "job_runs"))
 
-    def test_no_recover_or_resolve_operation_exists_anywhere(self) -> None:
+    def test_no_resolve_or_retry_operation_exists_anywhere(self) -> None:
         # Human resolution of UNKNOWN_OUTCOME is a separate authority gate and
-        # is DEFERRED. If it ever appears it must arrive with an explicit
+        # is STILL DEFERRED. If it ever appears it must arrive with an explicit
         # design, not as a convenience method that quietly unblocks a job
         # nobody established the outcome of.
+        #
+        # ``recover_job_run`` left this list when phase 2B2a arrived with
+        # exactly that explicit design - and the rest of the list is why the
+        # two were never the same question. Recovery moves a COORDINATION lease
+        # on a generation whose outcome is still open; resolving an unknown
+        # outcome would be a statement about the world. The assertions below
+        # keep them apart: the recovery that exists cannot reach
+        # UNKNOWN_OUTCOME at all, and nothing that would settle, clear or retry
+        # one has been added anywhere.
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for absent in (
-                "recover_job_run",
                 "resolve_job_run",
                 "resolve_unknown",
                 "force_settle",
@@ -581,10 +589,46 @@ class BoundaryTests(FenceTestCase):
                 "retry_job_run",
             ):
                 self.assertNotIn(absent, source, f"{module.name}: {absent}")
+        from jarvis.contracts import REACQUIRABLE_JOB_RUN_STATUSES
         from jarvis.memory import SQLiteMemoryStore
 
-        for absent in ("recover_job_run", "resolve_job_run", "retry_job_run"):
+        for absent in ("resolve_job_run", "retry_job_run", "abandon_job_run"):
             self.assertFalse(hasattr(SQLiteMemoryStore, absent), absent)
+        self.assertNotIn(
+            JobRunStatus.UNKNOWN_OUTCOME, REACQUIRABLE_JOB_RUN_STATUSES
+        )
+
+    def test_an_unknown_outcome_generation_is_still_recoverable_by_nobody(
+        self,
+    ) -> None:
+        # The deferred gate, asked of the real store. A generation whose
+        # external outcome nobody could establish is refused by BOTH ownership
+        # paths - the generic claim and the phase-2B2a recovery - so no timer,
+        # worker or lease expiry resolves it. A person does, through an
+        # authority gate that still does not exist.
+        self.running()
+        self.store.mark_job_run_unknown(
+            self.run.id, WORKER_A, self.lease.fencing_epoch, now=self.during
+        )
+        stored = self.store.load_job_run(self.run.id)
+        self.assertEqual(JobRunStatus.UNKNOWN_OUTCOME, stored.status)
+        with self.assertRaises(JobError):
+            self.store.claim_job_run(
+                self.run.id, WORKER_B, now=self.after, lease=LEASE
+            )
+        with self.assertRaises(JobError):
+            self.store.reacquire_job_run(
+                self.run.id,
+                WORKER_B,
+                stored.fencing_epoch,
+                now=self.after,
+                lease=LEASE,
+                actor_label="operator",
+                reason="trying to unstick it",
+            )
+        self.assertEqual(
+            JobRunStatus.UNKNOWN_OUTCOME, self.store.load_job_run(self.run.id).status
+        )
 
     def test_no_autonomous_dispatch_path_reaches_a_generation(self) -> None:
         # Phase 2B1 added ONE callable bridge, ``dispatch.py``. What stays

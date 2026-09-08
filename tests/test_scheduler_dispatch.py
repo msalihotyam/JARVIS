@@ -2025,19 +2025,70 @@ class DispatchBoundaryTests(DispatchTestCase):
         # scheduler may not do is touch them, which the source guards prove.
         self.assertEqual(1, self.table_count("execution_attempts"))
 
-    def test_the_module_declares_no_recovery_surface(self) -> None:
+    def test_the_module_declares_no_surface_beyond_dispatch_and_recovery(
+        self,
+    ) -> None:
+        # PHASE BOUNDARY, restated for 2B2a. ``recover_job_run`` was forbidden
+        # here while 2B1 was the whole module and recovery did not exist; it is
+        # now the ONE thing 2B2a added, and the guard's job is to keep the list
+        # at exactly two. Everything it forbade that is still forbidden is
+        # still checked, unchanged.
         source = self.source()
         for absent in (
-            "recover_job_run",
             "resolve_job_run",
             "retry_job_run",
+            "abandon_unknown_attempt",
+            "mark_execution_unknown",
+            "resolve_approval",
+            "reject_task",
+            "permission_grants",
+            "has_approved_grant",
             "claim_job_run",
             "renew_job_run_lease",
         ):
             self.assertNotIn(absent, source, absent)
-        # It never takes ownership either: it is handed a proof, never one it
-        # acquired for itself.
+        # It never takes GENERIC ownership either: dispatch is handed a proof
+        # it did not acquire, and recovery acquires only through the fenced
+        # recovery boundary - never through the claim path, which still cannot
+        # reach a bound generation at all.
         self.assertNotIn("claim", self.code())
+        # The public callables are exactly the two phase entry points.
+        tree = ast.parse(source)
+        public = {
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+        }
+        self.assertEqual({"dispatch_job_run", "recover_job_run"}, public)
+
+    def test_recovery_touches_exactly_one_new_storage_operation(self) -> None:
+        # The only store call recovery adds is the fenced recovery boundary.
+        # Anything else appearing on this list later - an approval read, a
+        # grant read, an attempt mutation - is a scope change, not a fix.
+        tree = ast.parse(self.source())
+        recover = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "recover_job_run"
+        )
+        store_calls = {
+            node.func.attr
+            for node in ast.walk(recover)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "store"
+        }
+        self.assertEqual({"reacquire_job_run", "load_job_run"}, store_calls)
+        core_calls = {
+            node.func.attr
+            for node in ast.walk(recover)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "core"
+        }
+        self.assertEqual({"run_chain"}, core_calls)
 
 
 if __name__ == "__main__":

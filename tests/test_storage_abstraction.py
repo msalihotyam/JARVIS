@@ -27,8 +27,11 @@ from jarvis.contracts import (
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     DISPATCHABLE_JOB_RUN_STATUSES,
+    JOB_RECOVERY_ACTOR_MAX_CHARS,
+    JOB_RECOVERY_REASON_MAX_CHARS,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
+    REACQUIRABLE_JOB_RUN_STATUSES,
     ChainState,
     ChainStep,
     DataClassification,
@@ -76,6 +79,7 @@ from jarvis.contracts import (
     canonical_usd,
     canonical_utc_timestamp,
     is_expired,
+    job_recovery_note,
     ledger_month,
     nano_usd,
     normalize_retrieved_text,
@@ -272,9 +276,22 @@ class InMemoryStore:
         #: Scheduler phase 1B: durable job definitions and their generations.
         self.jobs: dict[str, JobRecord] = {}
         self.job_runs: dict[str, JobRun] = {}
+        #: The session-scoped audit log. Scheduler phase 2B2a writes into it
+        #: from inside the recovery mutation, so the double has to hold one to
+        #: be able to fail the same way SQLite does.
+        self.events: list[dict] = []
+        #: The authoritative per-session project, mirroring the SQLite
+        #: ``sessions.project_id`` column: a value stored BESIDE the document
+        #: rather than inside it, so the two can be made to disagree.
+        self.session_projects: dict[str, str | None] = {}
 
     def save_session(self, session: SessionState) -> None:
         self.sessions[session.id] = copy.deepcopy(session)
+        # The AUTHORITATIVE project, held beside the document exactly as the
+        # SQLite ``sessions.project_id`` column is, so the double can disagree
+        # with itself the same way a corrupted row can - and refuse it the
+        # same way.
+        self.session_projects[session.id] = session.project_id
 
     def load_session(self, session_id: str) -> SessionState | None:
         return copy.deepcopy(self.sessions.get(session_id))
@@ -1003,6 +1020,7 @@ class InMemoryStore:
         ):
             raise JobError("that session is already bound to a generation")
         self.sessions[session.id] = copy.deepcopy(session)
+        self.session_projects[session.id] = session.project_id
         self.job_runs[run_id] = dataclasses.replace(
             run,
             status=JobRunStatus.RUNNING,
@@ -1020,6 +1038,156 @@ class InMemoryStore:
             fencing_epoch=fencing_epoch,
             lease_expires_at_utc=run.lease_expires_at_utc,
         )
+
+    def _recovery_session(self, run: JobRun) -> SessionState:
+        """The bound session, proved to BE the bound session - or raise.
+
+        The same three-way identity proof SQLite makes. Here the dict KEY is
+        the authoritative row identity and ``session_projects`` is the
+        authoritative project held beside the document, so the double can be
+        corrupted - and must refuse - in exactly the ways a real row can.
+        """
+        session = self.sessions.get(run.session_id)
+        if type(session) is not SessionState:
+            raise JobError("the bound session is unreadable")
+        if session.id != run.session_id:
+            raise JobError("the persisted session is not the bound session")
+        if session.project_id != self.session_projects.get(run.session_id):
+            raise JobError("the persisted session and its project record disagree")
+        return session
+
+    def _recovery_cursor_task(self, session: SessionState, run: JobRun) -> str:
+        """The task the bound chain is currently on, proved - or raise.
+
+        Same chain of custody the SQLite store proves inside its transaction,
+        over a session whose identity ``_recovery_session`` has already proved:
+        chain identity, cursor range, routed id, and the task really belonging
+        to THIS session.
+        """
+        chain = session.chain
+        if chain is None or chain.id != run.chain_id:
+            raise JobError("the bound chain does not match the generation")
+        cursor = chain.cursor
+        if type(cursor) is not int or not 0 <= cursor < len(chain.step_task_ids):
+            raise JobError("the bound chain has no usable cursor")
+        task_id = chain.step_task_ids[cursor]
+        if not isinstance(task_id, str) or not task_id:
+            raise JobError("the chain's current step routes to no task")
+        if self.task_sessions.get(task_id) != run.session_id:
+            raise JobError("the chain's current step is not this session's task")
+        return task_id
+
+    def reacquire_job_run(
+        self,
+        run_id,
+        owner_token,
+        expected_fencing_epoch,
+        *,
+        now,
+        lease,
+        actor_label,
+        reason,
+    ) -> JobRunLease:
+        if chain_id_refusal(owner_token) is not None:
+            raise JobError("owner_token is not a usable identifier")
+        if (
+            type(expected_fencing_epoch) is not int
+            or isinstance(expected_fencing_epoch, bool)
+        ):
+            raise JobError("fencing_epoch is not an exact integer")
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, now)
+        # ONE critical section, exactly as SQLite makes it one transaction: the
+        # proof, the ownership move and the audit row are indivisible, so two
+        # recoverers resolve to one winner and one event here too.
+        with self._lock:
+            run = self._owned_run(run_id)
+            if run.settled:
+                raise JobError("the generation is already settled")
+            if run.status not in REACQUIRABLE_JOB_RUN_STATUSES:
+                raise JobError("the generation is not recoverable from its state")
+            if run.session_id is None or run.chain_id is None:
+                raise JobError("the generation is not bound to a session")
+            if run.fencing_epoch != expected_fencing_epoch:
+                # THE STALE-OBSERVER FENCE. Stated as its own refusal because
+                # in the double there is no CAS to carry it implicitly.
+                raise JobError("the generation is not recoverable")
+            if run.lease_is_live(now):
+                raise JobError("the generation still has a live owner")
+            session = self._recovery_session(run)
+            cursor_task_id = None
+            if run.status is JobRunStatus.AWAITING_APPROVAL:
+                cursor_task_id = self._recovery_cursor_task(session, run)
+                if self.pending.get((cursor_task_id, run.session_id)) is not None:
+                    raise JobError("an approval for this generation is pending")
+            recovered = dataclasses.replace(
+                run,
+                status=JobRunStatus.RUNNING,
+                owner_token=owner_token,
+                fencing_epoch=run.fencing_epoch + 1,
+                lease_expires_at_utc=expires,
+                claimed_at=now.isoformat(),
+            )
+            payload = {
+                "run_id": run.id,
+                "job_id": run.job_id,
+                "generation": run.generation,
+                "chain_id": run.chain_id,
+                "previous_status": run.status.value,
+                "resulting_status": recovered.status.value,
+                "previous_fencing_epoch": run.fencing_epoch,
+                "fencing_epoch": recovered.fencing_epoch,
+                "previous_claimed_at": run.claimed_at,
+                "claimed_at": recovered.claimed_at,
+                "lease_expires_at_utc": recovered.lease_expires_at_utc,
+                "previous_owner_present": run.owner_token is not None,
+                "actor_label": actor,
+                "actor_authenticated": False,
+                "reason": why,
+                "cursor_task_id": cursor_task_id,
+                "recovered_at": recovered.claimed_at,
+            }
+            self._append_job_run_event(
+                run.session_id, "job_run_reacquired", payload, recovered.claimed_at
+            )
+            self.job_runs[run_id] = recovered
+        return self._lease_result(recovered)
+
+    def _append_job_run_event(
+        self, session_id: str, event_type: str, payload: dict, created_at: str
+    ) -> None:
+        """The double's equivalent of the private connection-scoped writer.
+
+        Deliberately private for the same reason: there is no public
+        record-an-event operation on either store, so a caller cannot write a
+        success record without the mutation that earned it.
+        """
+        if session_id not in self.sessions:
+            # The SQLite foreign key states this; the double states it too, so
+            # a test that plants a broken binding fails identically here.
+            raise JobError("the bound session is unreadable")
+        self.events.append(
+            {
+                "session_id": session_id,
+                "task_id": None,
+                "event_type": event_type,
+                "payload": copy.deepcopy(payload),
+                "created_at": created_at,
+            }
+        )
+
+    def list_events(self, session_id: str) -> list[dict]:
+        return [
+            {k: v for k, v in event.items() if k != "session_id"}
+            for event in self.events
+            if event["session_id"] == session_id
+        ]
 
     def load_job_run(self, run_id: str) -> JobRun | None:
         run = self.job_runs.get(run_id)

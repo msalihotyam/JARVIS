@@ -44,10 +44,13 @@ from jarvis.contracts import (
     DecisionRecord,
     ErrorCode,
     ExecutionAttempt,
+    JOB_RECOVERY_ACTOR_MAX_CHARS,
+    JOB_RECOVERY_REASON_MAX_CHARS,
     JOB_SPEC_MAX_BYTES,
     APPROVAL_PENDABLE_JOB_RUN_STATUSES,
     CLAIMABLE_JOB_RUN_STATUSES,
     DISPATCHABLE_JOB_RUN_STATUSES,
+    REACQUIRABLE_JOB_RUN_STATUSES,
     MAX_JOB_LEASE,
     MIN_JOB_LEASE,
     JobError,
@@ -60,6 +63,7 @@ from jarvis.contracts import (
     JobRunSummary,
     JobSpec,
     JobSummary,
+    job_recovery_note,
     SETTLEABLE_JOB_RUN_STATUSES,
     SETTLED_JOB_RUN_STATUSES,
     UNKNOWNABLE_JOB_RUN_STATUSES,
@@ -6068,6 +6072,318 @@ class SQLiteMemoryStore:
             fencing_epoch=fencing_epoch,
             lease_expires_at_utc=bound.lease_expires_at_utc,
         )
+
+    @staticmethod
+    def _insert_job_run_event(
+        connection: sqlite3.Connection,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        created_at: str,
+    ) -> None:
+        """One generation-scoped audit row, on the CALLER'S transaction.
+
+        PRIVATE, and deliberately so. It takes an already-open connection
+        rather than opening one, which is what lets it write inside the very
+        transaction performing the mutation it describes - and which is also
+        why it is not, and must not become, a public "record an event"
+        operation. A public one would be an audit authority callable without
+        the mutation, or worse, after it.
+
+        There is no loop checkpoint here, unlike the task-scoped writer: a
+        generation has no ``LoopStage``, and inventing one would put a stage
+        that never happened into the task journal. ``task_id`` is NULL because
+        the subject is the occurrence itself; the schema has always allowed it.
+        """
+        connection.execute(
+            """
+            INSERT INTO event_log
+                (session_id, task_id, event_type, payload_json, created_at)
+            VALUES (?, NULL, ?, ?, ?)
+            """,
+            (session_id, event_type, SQLiteMemoryStore._json(payload), created_at),
+        )
+
+    @staticmethod
+    def _recovery_session(
+        connection: sqlite3.Connection, run: JobRun
+    ) -> SessionState:
+        """The bound session, proved to BE the bound session - or raise.
+
+        Three separate things have to name one session before anything decoded
+        from it may be believed, and only the first is what the lookup already
+        guarantees:
+
+        * the GENERATION says which session it is bound to;
+        * the sessions ROW KEY is what the row was found under;
+        * the DOCUMENT inside that row asserts its own identity.
+
+        A row written by the ordinary path always agrees with itself - every
+        writer keys the row by ``session.id`` and stores the project alongside
+        it - so a disagreement is corrupted or forged durable state, and it is
+        the dangerous direction: Core works from the DECODED object, so a
+        document stored under this generation's session but claiming to be
+        another one would materialize tasks, open attempts and cross connector
+        boundaries inside a session this generation was never bound to, while
+        the generation still read as bound here.
+
+        The PROJECT is proved the same way and for the same reason. The column
+        is what every project-scoped query answers from; the document carries
+        its own copy; a generation whose two answers differ has no provable
+        project, and this boundary is already re-proving project identity.
+
+        Nothing is repaired, substituted or followed. The identity the document
+        names is never loaded, neither identity is ever rewritten, and a
+        mismatch refuses the whole recovery before any mutation - so no
+        ownership moves and no success is recorded.
+        """
+        row = connection.execute(
+            "SELECT id, state_json, project_id FROM sessions WHERE id = ?",
+            (run.session_id,),
+        ).fetchone()
+        if row is None:
+            raise JobError("the bound session is unreadable")
+        try:
+            session = SessionState.from_dict(json.loads(row["state_json"]))
+        except Exception as exc:  # noqa: BLE001 - unparseable is unusable
+            raise JobError("the bound session is unreadable") from exc
+        if type(session) is not SessionState:
+            raise JobError("the bound session is unreadable")
+        # The row key is what it was found under; the document says what it is.
+        if session.id != row["id"] or session.id != run.session_id:
+            raise JobError("the persisted session is not the bound session")
+        if session.project_id != row["project_id"]:
+            raise JobError(
+                "the persisted session and its project record disagree"
+            )
+        return session
+
+    @staticmethod
+    def _recovery_cursor_task(
+        connection: sqlite3.Connection, session: SessionState, run: JobRun
+    ) -> str:
+        """The task this generation's chain is CURRENTLY on, proved - or raise.
+
+        Takes the session ``_recovery_session`` has ALREADY proved to be the
+        bound one, so nothing here is derived from an identity that was merely
+        asserted. Every remaining link is checked rather than assumed: the
+        chain is the exact chain this generation is bound to, its cursor is a
+        real index into its own routing, that step routes to a task id, and
+        that task row exists and belongs to THIS session. A break anywhere
+        raises, which fails the recovery closed.
+
+        Nothing here reads a task's status, a grant, or an approval outcome. It
+        answers one question - which task is the chain on - so that the
+        approval WAIT rule has something exact to ask about.
+        """
+        chain = session.chain
+        if chain is None or chain.id != run.chain_id:
+            raise JobError("the bound chain does not match the generation")
+        cursor = chain.cursor
+        if type(cursor) is not int or not 0 <= cursor < len(chain.step_task_ids):
+            raise JobError("the bound chain has no usable cursor")
+        task_id = chain.step_task_ids[cursor]
+        if not isinstance(task_id, str) or not task_id:
+            raise JobError("the chain's current step routes to no task")
+        owner = connection.execute(
+            "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if owner is None or owner[0] != run.session_id:
+            raise JobError("the chain's current step is not this session's task")
+        return task_id
+
+    def reacquire_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        expected_fencing_epoch: int,
+        *,
+        now: datetime,
+        lease: timedelta,
+        actor_label: str,
+        reason: str,
+    ) -> JobRunLease:
+        """Recover coordination ownership of an ALREADY-BOUND generation.
+
+        Phase 2B2a, and the narrowest thing that unsticks a crashed or parked
+        occurrence without ever becoming a retry. ONE transaction: prove, move
+        the lease, record why, commit.
+
+        THE OBSERVED EPOCH IS THE FENCE. ``expected_fencing_epoch`` is what the
+        caller actually looked at, and the compare-and-set names it, so the
+        stale-observer race closes: A reads epoch N; B recovers to N+1 and then
+        expires; A - whose lease check would now pass, because the lease it
+        would be taking over really is expired - is refused anyway, because the
+        run it holds evidence about is not the run in front of it. An expiry
+        can never be that fence; only the epoch can.
+
+        THE BINDING IS UNTOUCHABLE. Both binding columns must already be set,
+        and the UPDATE both requires and re-states their exact values, so no
+        path through here creates a session, creates a chain, replaces either
+        identity, or gives one occurrence a second session. Recovery hands the
+        SAME session back; that is the whole reason it is safe where a claim
+        would not be, and why ``CLAIMABLE_JOB_RUN_STATUSES`` is untouched and
+        this has a source set of its own.
+
+        THE PARKED CASE WAITS, IT DOES NOT INTERPRET. For an
+        ``AWAITING_APPROVAL`` generation the chain's current routed task is
+        resolved and its pending request is looked for. Still pending means a
+        person is mid-answer, and recovery is REFUSED. Not pending means only
+        that nobody is being asked right now - it is NOT an approval, it is not
+        read as one, no grant is consulted, and the task is deliberately NOT
+        required to have left ``AWAITING_APPROVAL``: Core resolves an approval
+        and checkpoints the task in two steps, so a worker that died between
+        them legitimately leaves exactly that shape. What the approval came to
+        is Core's answer, given when the session is re-entered, and Core asking
+        again is a correct outcome rather than a degraded one.
+
+        THE RECORD IS PART OF THE MOVE. The audit row is inserted on this same
+        transaction, so ownership and the evidence for it commit together: a
+        failed insert rolls the recovery back, and a failed compare-and-set
+        never reaches it. Two racing recoverers produce one winner and exactly
+        one event, because ``BEGIN IMMEDIATE`` serializes them and the loser's
+        expected epoch has moved.
+
+        Recovering is NOT authority. It creates no approval and answers none,
+        mints and consumes no grant, opens, advances, abandons or concludes no
+        execution attempt, reserves no money, reaches no connector and starts
+        nothing. It writes one lease and one audit row.
+        """
+        if chain_id_refusal(owner_token) is not None:
+            raise JobError("owner_token is not a usable identifier")
+        if (
+            type(expected_fencing_epoch) is not int
+            or isinstance(expected_fencing_epoch, bool)
+        ):
+            raise JobError("fencing_epoch is not an exact integer")
+        # Bounded, sanitized and credential-redacted BEFORE anything is
+        # written, and refused when blank: an authority action whose record
+        # says nothing about who asked or why is not worth committing.
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        expires = self._lease_expiry(lease, moment)
+        claimed_at = moment.isoformat()
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            if run.settled:
+                raise JobError("the generation is already settled")
+            if run.status not in REACQUIRABLE_JOB_RUN_STATUSES:
+                raise JobError("the generation is not recoverable from its state")
+            if run.session_id is None or run.chain_id is None:
+                # Unbound. Recovery exists only because the session already
+                # does; an unbound generation is the generic claim path's
+                # business, and taking it here would be a dispatch in disguise.
+                raise JobError("the generation is not bound to a session")
+            if run.lease_is_live(moment):
+                # Half-open, the house's one definition: the instant of expiry
+                # is already expired, and a live owner is never displaced.
+                raise JobError("the generation still has a live owner")
+            # THE BOUND SESSION IS PROVED FIRST, and on EVERY recovery
+            # rather than only the parked one: the identity question is not a
+            # side effect of the approval rule, and a RUNNING generation is
+            # handed to Core through exactly the same decoded document.
+            session = self._recovery_session(connection, run)
+            cursor_task_id: str | None = None
+            if run.status is JobRunStatus.AWAITING_APPROVAL:
+                cursor_task_id = self._recovery_cursor_task(
+                    connection, session, run
+                )
+                pending = connection.execute(
+                    """
+                    SELECT 1 FROM pending_approvals
+                     WHERE task_id = ? AND session_id = ? AND status = 'pending'
+                     LIMIT 1
+                    """,
+                    (cursor_task_id, run.session_id),
+                ).fetchone()
+                if pending is not None:
+                    # A person is being asked RIGHT NOW. Taking the generation
+                    # back mid-question would be the scheduler answering it.
+                    raise JobError("an approval for this generation is pending")
+            recovered = replace(
+                run,
+                status=JobRunStatus.RUNNING,
+                owner_token=owner_token,
+                fencing_epoch=run.fencing_epoch + 1,
+                lease_expires_at_utc=expires,
+                claimed_at=claimed_at,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, owner_token = ?, fencing_epoch = ?,
+                       lease_expires_at_utc = ?, claimed_at = ?
+                 WHERE id = ? AND fencing_epoch = ? AND settled_at IS NULL
+                   AND status = ?
+                   AND session_id IS NOT NULL AND chain_id IS NOT NULL
+                   AND session_id = ? AND chain_id = ?
+                   AND owner_token IS ? AND lease_expires_at_utc IS ?
+                """,
+                (
+                    recovered.status.value,
+                    recovered.owner_token,
+                    recovered.fencing_epoch,
+                    recovered.lease_expires_at_utc,
+                    recovered.claimed_at,
+                    run_id,
+                    # F1: the epoch the CALLER observed, not the one just read.
+                    # The two are equal here only because nothing moved between
+                    # the read and the write; naming the caller's value is what
+                    # refuses a stale observer whose run has since advanced.
+                    expected_fencing_epoch,
+                    run.status.value,
+                    # The binding, re-stated so it is provably not rewritten.
+                    run.session_id,
+                    run.chain_id,
+                    # The exact ownership observed to be absent or expired,
+                    # PINNED rather than re-derived: a second definition of
+                    # expiry written in SQL is a second place for it to drift
+                    # from ``lease_is_live``.
+                    run.owner_token,
+                    run.lease_expires_at_utc,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the generation is not recoverable")
+            # SAME TRANSACTION. Authority moved above; the evidence for it is
+            # written here, and either both become durable or neither does.
+            self._insert_job_run_event(
+                connection,
+                run.session_id,
+                "job_run_reacquired",
+                {
+                    "run_id": run.id,
+                    "job_id": run.job_id,
+                    "generation": run.generation,
+                    "chain_id": run.chain_id,
+                    "previous_status": run.status.value,
+                    "resulting_status": recovered.status.value,
+                    "previous_fencing_epoch": run.fencing_epoch,
+                    "fencing_epoch": recovered.fencing_epoch,
+                    "previous_claimed_at": run.claimed_at,
+                    "claimed_at": recovered.claimed_at,
+                    "lease_expires_at_utc": recovered.lease_expires_at_utc,
+                    # A BOOLEAN, never the token. Whether somebody held an
+                    # expired lease is the operational fact; which token it
+                    # was is a credential-shaped value with no audit value.
+                    "previous_owner_present": run.owner_token is not None,
+                    # UNAUTHENTICATED, and named so IN the record, because a
+                    # later reader must not mistake it for a proven principal.
+                    "actor_label": actor,
+                    "actor_authenticated": False,
+                    "reason": why,
+                    # Present only where it was actually PROVED - the parked
+                    # case. An unproved guess in an audit trail is worse than
+                    # an absent field.
+                    "cursor_task_id": cursor_task_id,
+                    "recovered_at": claimed_at,
+                },
+                claimed_at,
+            )
+        return self._lease_result(recovered)
 
     def load_job_run(self, run_id: str) -> JobRun | None:
         """One generation, or ``None`` when it is missing OR unusable."""

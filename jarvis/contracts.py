@@ -6860,6 +6860,14 @@ JOB_SPEC_MAX_BYTES = 64 * 1024
 #: operator-authored prose that must stay free to diverge from both.
 JOB_LABEL_MAX_CHARS = 120
 
+#: Hard ceilings on the two pieces of caller-supplied metadata a phase-2B2a
+#: recovery records about itself. Both are UNAUTHENTICATED: nothing in this
+#: build proves who an operator is, so they are evidence of what a caller
+#: SAID, never of who it was, and they are bounded and sanitized exactly like
+#: every other persisted free-form string.
+JOB_RECOVERY_ACTOR_MAX_CHARS = 120
+JOB_RECOVERY_REASON_MAX_CHARS = 500
+
 
 class JobError(ValueError):
     """A malformed durable job definition or run, or a refused job operation.
@@ -7011,6 +7019,30 @@ APPROVAL_PENDABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.RUNNING})
 #: resume, recovery and the human gate belong to a later phase.
 DISPATCHABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.CLAIMED})
 
+#: Scheduler phase 2B2a. The NARROW set of coordination states from which an
+#: ALREADY-BOUND generation may have its coordination ownership recovered, and
+#: deliberately a set of its own rather than an addition to
+#: ``CLAIMABLE_JOB_RUN_STATUSES``. The generic claim path stays exactly
+#: ``{PENDING, CLAIMED}``: those are the states with no session, and a claim
+#: that could reach a bound one would be a second dispatch of one occurrence.
+#:
+#: Recovery is the opposite shape. It operates ONLY where a session and a
+#: chain already exist, keeps both exactly as they are, and hands the SAME
+#: session back to Core - so the thing being taken over is the coordination
+#: lease, never the execution. ``RUNNING`` is the crashed-owner case and
+#: ``AWAITING_APPROVAL`` is the parked-for-a-person case; both are bound, both
+#: are unsettled, and both have a Core-side re-entry that is non-replaying.
+#:
+#: ``UNKNOWN_OUTCOME`` is deliberately absent and stays absent. It is the
+#: explicit record that nobody could establish what happened, resolving it is
+#: a human authority gate this phase does not build, and recovering it would
+#: be a timer deciding what only evidence can. ``PENDING`` and ``CLAIMED`` are
+#: absent because they are the generic claim path's business, and a settled
+#: generation has nothing to recover.
+REACQUIRABLE_JOB_RUN_STATUSES = frozenset(
+    {JobRunStatus.RUNNING, JobRunStatus.AWAITING_APPROVAL}
+)
+
 #: The approved bounded lease window. A lease is COORDINATION ONLY - it says
 #: which worker currently owns a generation, and it grants no approval, no
 #: connector authority and no permission to execute anything.
@@ -7023,6 +7055,29 @@ DISPATCHABLE_JOB_RUN_STATUSES = frozenset({JobRunStatus.CLAIMED})
 #: can block its job - the only thing an expiry ever unblocks.
 MIN_JOB_LEASE = timedelta(seconds=30)
 MAX_JOB_LEASE = timedelta(minutes=15)
+
+
+def job_recovery_note(value: Any, field_name: str, cap: int) -> str:
+    """One bounded, sanitized piece of recovery metadata, or ``JobError``.
+
+    The same canonical pipeline a job label goes through - type check, NFKC,
+    newline flattening, credential redaction, local-path redaction, hard cap -
+    because this text is PERSISTED into the audit trail and an operator's
+    typed reason is exactly the kind of free-form string a secret gets pasted
+    into by accident.
+
+    Blank is refused rather than defaulted. A recovery is an authority action
+    and the record of one that says nothing about who asked for it or why is
+    worth less than no record at all.
+
+    WHAT THIS IS NOT is authentication. There is no operator identity model in
+    this build; an actor label is a caller-supplied claim, and nothing
+    anywhere may treat it as a proven principal.
+    """
+    text = sanitize_diagnostic_text(value, cap)
+    if not text or text == UNAVAILABLE_DIAGNOSTIC:
+        raise JobError(f"{field_name} is blank")
+    return text
 
 
 def job_identifier_refusal(value: Any, label: str = "identifier") -> str | None:
@@ -8360,6 +8415,78 @@ class MemoryStore(Protocol):
 
         Binding is not authority. It creates no approval, consumes no grant,
         opens no execution attempt, reserves no money and reaches no connector.
+        """
+        ...
+
+    def reacquire_job_run(
+        self,
+        run_id: str,
+        owner_token: str,
+        expected_fencing_epoch: int,
+        *,
+        now: datetime,
+        lease: timedelta,
+        actor_label: str,
+        reason: str,
+    ) -> "JobRunLease":
+        """Recover coordination ownership of an ALREADY-BOUND generation.
+
+        Scheduler phase 2B2a, and the whole of what this phase adds. A worker
+        died, or a generation was parked for a person; the occurrence is still
+        bound to the one session it was ever bound to, and somebody has to be
+        able to own it again. This is that, and ONLY that.
+
+        WHAT IT IS NOT is a claim. ``CLAIMABLE_JOB_RUN_STATUSES`` is untouched,
+        so nothing here widens the generic path; the source states are
+        ``REACQUIRABLE_JOB_RUN_STATUSES`` and both of them are BOUND, which is
+        the difference that makes recovery safe where a claim would not be. The
+        session and the chain are preserved EXACTLY - a conforming store must
+        never write either column here, never create a session, never create a
+        chain and never move the binding to another one. There is no second
+        session for one occurrence, in this phase or any other.
+
+        THE OBSERVED EPOCH IS LOAD-BEARING. ``expected_fencing_epoch`` is the
+        generation the caller actually saw, and the compare-and-set names it,
+        so an observer that read epoch N is refused once ANY owner has reached
+        N+1 - including after that successor's own lease has expired. A lease
+        check alone would accept it, which is precisely the hole: the run it
+        would then take over is not the run it looked at. On success the epoch
+        advances by exactly one and the previous owner's proof, still naming
+        the old pair, can no longer settle, park or mark anything.
+
+        The lease must be ABSENT or EXPIRED at the explicit ``now``, on the
+        house's one half-open definition - ``now == lease_expires_at_utc`` is
+        expired - so a live owner is never displaced. ``claimed_at`` becomes
+        this acquisition's instant, because that field means the most recent
+        successful ownership acquisition and this is one; a renewal still moves
+        neither it nor the epoch.
+
+        A generation parked ``AWAITING_APPROVAL`` carries one extra rule, and
+        it is a WAIT rule rather than an interpretation. If an approval request
+        for the chain's current routed task is still pending, recovery is
+        refused: a person is being asked, and taking the run back mid-question
+        would be the scheduler answering it. If none is pending, coordination
+        may be recovered and the generation returns to ``RUNNING`` - but the
+        ABSENCE OF A PENDING REQUEST IS NOT AN APPROVAL, and a conforming store
+        must not read it as one, must not consult grants as authority, and must
+        not require the task to have left ``AWAITING_APPROVAL`` already: a
+        resolution that committed before its owner died legitimately leaves it
+        there. What actually happened to that approval is Core's to determine
+        when the session is re-entered, and Core asking a person again is a
+        correct outcome, not a degraded one.
+
+        THE AUDIT RECORD IS PART OF THE MUTATION. A successful recovery and its
+        one durable event become visible together or not at all; a store that
+        commits the ownership change and then writes the event separately has a
+        window in which authority moved with no record, and that is refused as
+        a design. A refused recovery writes NO success event. ``actor_label``
+        and ``reason`` are bounded, sanitized and UNAUTHENTICATED metadata -
+        evidence of what a caller said, never proof of who it was.
+
+        Recovering is not authority. It creates no approval, resolves none,
+        consumes no grant, opens, advances or concludes no execution attempt,
+        reserves no money, reaches no connector, and authorizes nothing to run:
+        every gate real work must pass is still ahead of it, unchanged.
         """
         ...
 
