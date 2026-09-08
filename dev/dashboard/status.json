@@ -1,19 +1,17 @@
 {
   "updated": "2026-09-08",
-  "phase": "scheduler-2b0",
-  "review_state": "Phase 2A bağımsız review sonrası canonical oldu; 2B0 henüz review edilmedi.",
+  "phase": "scheduler-2b1",
+  "review_state": "Scheduler Phase 2B0 bağımsız review sonrası kabul edildi ve canonical oldu; 2B1 henüz başlamadı.",
   "overall_note": "Yüzdeler ağırlıklı milestone roadmap'inden hesaplanır, elle yazılmaz. Ağırlıklar proje tahminidir.",
   "refresh_seconds": 60,
   "milestone": {
-    "name": "Scheduler Phase 2B0 — fencing completion",
+    "name": "Scheduler Phase 2B1 — AgentCore dispatch binding",
     "status": "yellow",
-    "status_label": "Devam ediyor",
-    "summary": "Eski bir worker'ın, ownership yeni worker'a geçtikten sonra JobRun sonucunu değiştirmesini engelliyoruz."
+    "status_label": "Sırada",
+    "summary": "Bir JobRun'ı AgentCore execution yoluna güvenli biçimde bağla: dayanıklı dispatch binding, RUNNING geçişi ve dönen sonucun fenced biçimde yazılması."
   },
-  "next_step": "Scheduler'ı gerçek AgentCore execution yoluna güvenli biçimde bağla.",
-  "blockers": [
-    "Fencing'siz settle_job_run race'i: bayat bir worker, ownership'i artık kendisinde olmayan bir JobRun'ı hâlâ settle edebiliyor. Scheduler 2B0 tamamlanıp kabul edilene kadar blocking."
-  ],
+  "next_step": "2B1: JobRun -> AgentCore dispatch binding'ini kur. Dispatch sonrası fenced storage yazımında `now` connector/Core dönüşünden SONRA okunmalı; dispatch öncesi alınmış timestamp yeniden kullanılmamalı.",
+  "blockers": [],
   "capabilities": [
     {
       "name": "Core / Authority",
@@ -62,14 +60,14 @@
     {
       "name": "Scheduler",
       "weight": 16,
-      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing. Dispatch ve worker yok.",
+      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing ve fenced completion. Dispatch ve worker hâlâ yok.",
       "milestones": [
         {"name": "Timing kernel", "state": "completed"},
         {"name": "Condition kernel temeli", "state": "completed"},
         {"name": "Durable persistence", "state": "completed"},
         {"name": "Claim / lease / fencing (Phase 2A)", "state": "completed"},
-        {"name": "2B0 fenced completion", "state": "in_progress"},
-        {"name": "2B1 AgentCore dispatch", "state": "not_started"},
+        {"name": "2B0 fenced completion", "state": "completed"},
+        {"name": "2B1 AgentCore dispatch", "state": "in_progress"},
         {"name": "2B2 cancellation / recovery yüzeyi", "state": "not_started"},
         {"name": "2C condition execution", "state": "not_started"},
         {"name": "2D background dispatcher", "state": "not_started"},
@@ -135,6 +133,7 @@
     }
   ],
   "recent": [
+    "Scheduler Phase 2B0 — fenced settle / mark-unknown / await-approval (owner + fencing epoch + canlı lease, CAS)",
     "Scheduler Phase 2A — due materialization, atomic claim, bounded lease, monotonic fencing (SQLite 9)",
     "GitHub Phase 1 — offline güvenlik ve politika temeli",
     "Windows worktree cleanup lifecycle sağlamlaştırması",
@@ -142,7 +141,7 @@
     "Saf scheduler timing ve condition kernel'leri"
   ],
   "health": [
-    {"name": "Testler", "status": "green", "detail": "Son doğrulanan: 3038 test OK, 1 skipped. Bu pano için yeniden çalıştırılmadı."},
+    {"name": "Testler", "status": "green", "detail": "Son doğrulanan canonical regression: 38 test modülünün tamamı yeşil, yaklaşık 3074 test OK, 1 skipped."},
     {"name": "SQLite schema", "status": "green", "detail": "Sürüm 9. Yalnızca additive migration."},
     {"name": "Output schema", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
   ],
@@ -157,7 +156,8 @@
   ],
   "technical": [
     ["Scheduler Phase 2A", "Due materialization, atomic claim, bounded lease (30 sn - 15 dk), monotonic fencing epoch, süresi dolan lease'in güvenli reclaim'i (SQLite 9)."],
-    ["Açık 2B0 race'i", "settle_job_run, (run_id, owner_token, fencing_epoch) üçlüsünü istemiyor; bayat owner reclaim edilmiş bir JobRun'ı settle edebiliyor."],
+    ["Scheduler Phase 2B0", "settle_job_run artık (run_id, owner_token, fencing_epoch) ve açık `now` istiyor; canlı lease kanıtı ve owner + epoch + settled_at IS NULL üzerinde CAS var. Bayat, süresi dolmuş, bırakılmış veya yerinden edilmiş worker settle edemiyor. mark_job_run_unknown ve await_job_run_approval aynı kanıtla RUNNING'den çalışıyor; ikisi de lease'i temizliyor, fencing epoch'u delil olarak koruyor ve run'ı unsettled bırakıyor."],
+    ["UNKNOWN_OUTCOME", "Unsettled kalır, claim edilemez, settle edilemez ve retry edilmez; sonraki tüm generation'ları bloklar. Çözümü açık bir insan yetki kapısıdır ve sonraki bir faza ertelendi - recover_job_run yok."],
     ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz dispatch, worker loop, approval veya connector yolu yok."],
     ["İlerleme modeli", "completed = 1.0, in_progress = 0.0, not_started = 0.0; deferred milestone paydadan düşer. Yalnızca kapanmış milestone kredi kazanır. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
   ]
