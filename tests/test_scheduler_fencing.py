@@ -700,13 +700,20 @@ class BoundaryTests(FenceTestCase):
         names = {module.name for module in self.production_modules()}
         for absent in ("dispatcher.py", "scheduler_dispatch.py", "worker.py", "daemon.py"):
             self.assertNotIn(absent, names)
-        # And nothing wires the bridge into the app or the CLI in this phase.
+        # And nothing wires the EXECUTION bridge into the app or the CLI.
         # ``cli.py`` has its own unrelated ``_dispatch_*`` command helpers, so
-        # the check names the module and the entry point, not the word.
+        # the check names the entry points, not the word.
+        #
+        # Phase 2B2b2 gave the operator surface a reason to import the module
+        # at all - cancelling a generation is an operator act - so the module
+        # name left this list. What did NOT change is the property it was
+        # protecting: the app and the CLI may ask for a generation to STOP, and
+        # they still have no way to make one RUN. Only the non-executing entry
+        # points may be named there.
         for module in self.production_modules():
             if module.name in ("app.py", "cli.py"):
                 source = module.read_text(encoding="utf-8")
-                for absent in ("jarvis.dispatch", "dispatch_job_run"):
+                for absent in ("dispatch_job_run", "recover_job_run"):
                     self.assertNotIn(absent, source, f"{module.name}: {absent}")
 
     def test_only_the_one_shot_bridge_calls_the_fenced_operations(self) -> None:

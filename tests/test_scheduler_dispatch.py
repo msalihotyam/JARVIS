@@ -2047,9 +2047,6 @@ class DispatchBoundaryTests(DispatchTestCase):
             "has_approved_grant",
             "claim_job_run",
             "renew_job_run_lease",
-            # Phase 2B2b2 cancellation is NOT in this build.
-            "request_job_run_cancel",
-            "cancel_requested",
         ):
             self.assertNotIn(absent, source, absent)
         # It never takes GENERIC ownership either: dispatch is handed a proof
@@ -2064,7 +2061,52 @@ class DispatchBoundaryTests(DispatchTestCase):
             for node in tree.body
             if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
         }
-        self.assertEqual({"dispatch_job_run", "recover_job_run"}, public)
+        self.assertEqual(
+            {"dispatch_job_run", "recover_job_run", "cancel_job_run"}, public
+        )
+
+    def test_cancellation_touches_only_authorities_that_already_exist(self) -> None:
+        # Phase 2B2b2. ``cancel_job_run`` ORCHESTRATES; it owns nothing. Every
+        # store call it makes belongs to a component that already had that
+        # authority, and this pins the list so a later edit cannot quietly give
+        # the scheduler a task status, an attempt state or a settlement of its
+        # own. ``_reflect_outcome`` performs the settlement, through exactly
+        # the fenced path a first dispatch uses.
+        tree = ast.parse(self.source())
+        cancel = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "cancel_job_run"
+        )
+        store_calls = {
+            node.func.attr
+            for node in ast.walk(cancel)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "store"
+        }
+        self.assertEqual(
+            {
+                "request_job_run_cancel",
+                "cancel_chain",
+                "cancel_task",
+                "load_session",
+                "load_job_run",
+                "reacquire_job_run",
+            },
+            store_calls,
+        )
+        # It never enters Core, and it never writes an execution attempt.
+        core_calls = {
+            node.func.attr
+            for node in ast.walk(cancel)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "core"
+        }
+        self.assertEqual(set(), core_calls)
 
     def test_recovery_touches_only_fenced_jobrun_operations(self) -> None:
         # Recovery reads H2 truth and moves JobRun COORDINATION; it never

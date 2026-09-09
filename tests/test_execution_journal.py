@@ -43,6 +43,7 @@ from jarvis.destinations import (
     DestinationGrant,
 )
 from jarvis.core import AgentCore
+from jarvis.lifecycle import is_terminal
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
@@ -383,6 +384,429 @@ class RestartTests(ExecutionJournalTestCase):
 
         run = self.core(connector, self.store()).resume(session.id, task.id)
         self.assertEqual(RunStatus.COMPLETED, run.status)
+        self.assertEqual(1, connector.execute_calls)
+
+
+class HiddenUnresolvedAttemptTests(ExecutionJournalTestCase):
+    """A later PREPARED row must never hide an older unresolved attempt.
+
+    The pre-connector journal consult is the LAST thing between a task and a
+    second connector call. It asks whether any execution of this task went
+    unconcluded, and that is a question about the COMPLETE history: an
+    UNKNOWN_OUTCOME or IN_FLIGHT attempt with a PREPARED one written above it
+    still means a connector call nobody resolved, and replaying it would be a
+    second external effect over an unestablished first.
+
+    ``open_execution_attempt`` is create-or-observe, so an ordinary task has
+    exactly ONE attempt row and the newest-row and whole-history readings
+    agree. A multi-row history is corrupted or migrated state - which is
+    precisely when this rule has to hold, because a defence that only works
+    while nothing has gone wrong is not a defence. The extra row is therefore
+    planted directly, the one way such a history can exist at all.
+    """
+
+    def plant_prepared_above(self, session_id: str, task_id: str) -> None:
+        """Write a PREPARED row ABOVE whatever history the task already has."""
+        connection = sqlite3.connect(self.database)
+        try:
+            row = connection.execute(
+                "SELECT connector, fingerprint, created_at, updated_at "
+                "FROM execution_attempts WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO execution_attempts (id, session_id, task_id, "
+                "connector, fingerprint, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"attempt-later-{task_id}",
+                    session_id,
+                    task_id,
+                    row[0],
+                    row[1],
+                    AttemptState.PREPARED.value,
+                    row[2],
+                    row[3],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def staged_unknown(self):
+        """A real UNKNOWN_OUTCOME attempt, with a PREPARED row written above."""
+        memory = self.store()
+        session = self.core(JournalConnector(), memory).start_session("hidden")
+        connector = JournalConnector()
+        task = self.egress_task(memory, connector, session.id)
+        attempt = memory.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
+        )
+        memory.begin_execution(
+            attempt.id, session.id, task.id, [], free_claim(memory)
+        )
+        memory.mark_execution_unknown(attempt.id)
+        self.plant_prepared_above(session.id, task.id)
+        # THE TRAP IS SET: the newest row says PREPARED.
+        self.assertIs(
+            AttemptState.PREPARED, memory.latest_execution_attempt(task.id).state
+        )
+        self.assertEqual(
+            [AttemptState.UNKNOWN_OUTCOME, AttemptState.PREPARED],
+            [a.state for a in memory.execution_attempts(task.id)],
+        )
+        return session, task
+
+    def staged_in_flight(self):
+        """A real IN_FLIGHT attempt, with a PREPARED row written above."""
+        memory = self.store()
+        session = self.core(JournalConnector(), memory).start_session("hidden")
+        connector = JournalConnector()
+        task = self.egress_task(memory, connector, session.id)
+        attempt = memory.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
+        )
+        self.assertIs(
+            ExecutionClaimOutcome.CLAIMED,
+            memory.begin_execution(
+                attempt.id, session.id, task.id, [], free_claim(memory)
+            ),
+        )
+        self.plant_prepared_above(session.id, task.id)
+        self.assertIs(
+            AttemptState.PREPARED, memory.latest_execution_attempt(task.id).state
+        )
+        return session, task
+
+    def test_an_older_unknown_under_a_newer_prepared_executes_zero_times(
+        self,
+    ) -> None:
+        session, task = self.staged_unknown()
+        fresh = JournalConnector()
+        run = self.core(fresh, self.store()).resume(session.id, task.id)
+        # CONNECTOR ZERO. The unresolved attempt still decides.
+        self.assertEqual(0, fresh.execute_calls)
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, run.error.code)
+        # And it is the UNRESOLVED attempt that is reported, not the clean row
+        # above it - that is the handle a person needs to resolve it.
+        self.assertEqual(
+            AttemptState.UNKNOWN_OUTCOME.value,
+            run.error.details["attempt_state"],
+        )
+
+    def test_an_older_in_flight_under_a_newer_prepared_executes_zero_times(
+        self,
+    ) -> None:
+        session, task = self.staged_in_flight()
+        fresh = JournalConnector()
+        run = self.core(fresh, self.store()).resume(session.id, task.id)
+        self.assertEqual(0, fresh.execute_calls)
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, run.error.code)
+        self.assertEqual(
+            AttemptState.IN_FLIGHT.value, run.error.details["attempt_state"]
+        )
+
+    def test_a_wholly_established_history_still_executes_exactly_once(
+        self,
+    ) -> None:
+        # THE CONTROL. Nothing unresolved anywhere and the newest row is a
+        # reclaimable PREPARED, so the ordinary path is unchanged: the
+        # connector runs exactly once.
+        memory = self.store()
+        connector = JournalConnector(store=memory)
+        session = self.core(connector, memory).start_session("established")
+        task = self.egress_task(memory, connector, session.id)
+        memory.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
+        )
+        run = self.core(connector, self.store()).resume(session.id, task.id)
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+        self.assertEqual(1, connector.execute_calls)
+
+    def test_a_finished_attempt_under_a_newer_prepared_still_never_replays(
+        self,
+    ) -> None:
+        # A FINISHED execution with a PREPARED row above it. Nothing is
+        # unresolved, so this is NOT the in-doubt path - but the connector
+        # already ran, and the newest PREPARED row must not license a second
+        # call. The task advances from the persisted result instead.
+        memory = self.store()
+        connector = JournalConnector(store=memory)
+        session = self.core(connector, memory).start_session("finished-under")
+        task = self.egress_task(memory, connector, session.id)
+        self.assertEqual(
+            RunStatus.COMPLETED,
+            self.core(connector, memory).resume(session.id, task.id).status,
+        )
+        self.assertEqual(1, connector.execute_calls)
+        self.plant_prepared_above(session.id, task.id)
+
+        fresh = JournalConnector(store=memory)
+        run = self.core(fresh, self.store()).resume(session.id, task.id)
+        self.assertEqual(0, fresh.execute_calls)
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+
+    def test_execution_disabled_never_hides_an_unresolved_attempt(self) -> None:
+        # H2 PRECEDENCE OVER THE SWITCH, asked of the complete history. With
+        # execution off and an UNKNOWN_OUTCOME hidden under a PREPARED row,
+        # the honest answer is "in doubt", never "disabled" - the switch is a
+        # configuration fact, the unresolved execution is a real one.
+        session, task = self.staged_unknown()
+        registry = ToolRegistry()
+        connector = JournalConnector()
+        registry.register(connector)
+        core = open_core(
+            registry,
+            self.store(),
+            Settings(
+                memory_database=self.database,
+                permission_mode=PermissionMode.SESSION,
+                execution_enabled=False,
+            ),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
+        run = core.resume(session.id, task.id)
+        self.assertEqual(0, connector.execute_calls)
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, run.error.code)
+        self.assertNotEqual(ErrorCode.EXECUTION_DISABLED, run.error.code)
+        self.assertEqual(
+            AttemptState.UNKNOWN_OUTCOME.value,
+            run.error.details["attempt_state"],
+        )
+
+    def test_execution_disabled_is_still_reported_with_a_clean_history(
+        self,
+    ) -> None:
+        # THE CONTROL for the barrier: nothing unresolved, so the switch is
+        # the true answer and still the one reported.
+        memory = self.store()
+        connector = JournalConnector()
+        session = self.core(connector, memory).start_session("disabled-clean")
+        task = self.egress_task(memory, connector, session.id)
+        registry = ToolRegistry()
+        registry.register(connector)
+        core = open_core(
+            registry,
+            self.store(),
+            Settings(
+                memory_database=self.database,
+                permission_mode=PermissionMode.SESSION,
+                execution_enabled=False,
+            ),
+            destination_policy=frozenset(
+                {
+                    DestinationGrant(
+                        connector.manifest.name,
+                        DUMMY_CAPABILITY,
+                        CLAUDE_CODE_DESTINATION,
+                    )
+                }
+            ),
+        )
+        run = core.resume(session.id, task.id)
+        self.assertEqual(0, connector.execute_calls)
+        self.assertEqual(ErrorCode.EXECUTION_DISABLED, run.error.code)
+
+
+class MultiAttemptHistoryTests(ExecutionJournalTestCase):
+    """Normal execution may trust only a PROVABLE single-attempt history.
+
+    ``open_execution_attempt`` is create-or-observe, so one task has exactly
+    ONE attempt row. A second row means the journal's own invariant has already
+    failed - and once it has, NO row is canonical. Reading the newest one is
+    then not a shortcut but a guess, and the guess that matters is a later
+    PREPARED sitting above an older FINISHED: trusting it authorizes a second
+    connector call on top of an external effect that already happened.
+
+    So a multi-row history refuses, regardless of ordering, and refuses without
+    naming an attempt - because naming one would be picking the canonical row
+    out of a history that has none. This is the judgement
+    ``execution_history_verdict`` already makes for the scheduler, where more
+    than one row under a routed task is UNPROVABLE.
+    """
+
+    def plant(self, session_id: str, task_id: str, *states) -> None:
+        """Force this task's history to be exactly ``states``, oldest first.
+
+        The row the store opened for itself is rewritten to the first state and
+        the rest are inserted above it, so ``rowid`` order really is history
+        order. Planted directly because no production writer can produce a
+        second row - which is the whole point of the rule being tested.
+        """
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.row_factory = sqlite3.Row
+            rows = list(
+                connection.execute(
+                    "SELECT id, connector, fingerprint, created_at, updated_at "
+                    "FROM execution_attempts WHERE task_id = ? ORDER BY rowid",
+                    (task_id,),
+                )
+            )
+            self.assertEqual(1, len(rows), "fixture must start with one row")
+            row = rows[0]
+            connection.execute(
+                "UPDATE execution_attempts SET state = ? WHERE id = ?",
+                (states[0].value, row["id"]),
+            )
+            for index, state in enumerate(states[1:], start=1):
+                connection.execute(
+                    "INSERT INTO execution_attempts (id, session_id, task_id, "
+                    "connector, fingerprint, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"{row['id']}-planted-{index}",
+                        session_id,
+                        task_id,
+                        row["connector"],
+                        row["fingerprint"],
+                        state.value,
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def staged(self, *states):
+        """A NON-TERMINAL task at EXECUTE whose history is exactly ``states``."""
+        memory = self.store()
+        connector = JournalConnector(store=memory)
+        session = self.core(connector, memory).start_session("multi")
+        task = self.egress_task(memory, connector, session.id)
+        memory.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
+        )
+        self.plant(session.id, task.id, *states)
+        stored = memory.load_task(task.id)
+        # THE TASK IS STILL LIVE: the precheck really is what decides.
+        self.assertIs(LoopStage.EXECUTE, stored.stage)
+        self.assertFalse(is_terminal(stored))
+        return session, task
+
+    def refuses(self, session, task):
+        fresh = JournalConnector()
+        run = self.core(fresh, self.store()).resume(session.id, task.id)
+        self.assertEqual(0, fresh.execute_calls, "the connector was reached")
+        self.assertEqual(RunStatus.FAILED, run.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, run.error.code)
+        return run
+
+    # -- THE BLOCKER, on a genuinely non-terminal task ---------------------
+
+    def test_a_real_finished_execution_under_a_newer_prepared_never_replays(
+        self,
+    ) -> None:
+        # THE BLOCKER SHAPE: a live EXECUTE task whose history holds a
+        # FINISHED execution with a PREPARED row above it. Trusting the newest
+        # row here calls the connector a SECOND time over an external effect
+        # that already happened.
+        #
+        # Reaching this shape takes real corruption, and it is worth being
+        # exact about why: ``conclude_execution`` moves the attempt to FINISHED
+        # and advances the task past EXECUTE in ONE write, so no crash window
+        # leaves a live EXECUTE task holding a finished execution - and
+        # ``open_execution_attempt`` never writes a second row. BOTH invariants
+        # have to have failed already. That is precisely the state this rule
+        # exists for: it is the last check before the connector, and a last
+        # check that only holds while the journal is intact is not a check.
+        session, task = self.staged(
+            AttemptState.FINISHED, AttemptState.PREPARED
+        )
+        run = self.refuses(session, task)
+        # NO ATTEMPT IS NAMED: there is no canonical row to name.
+        self.assertNotIn("attempt_state", run.error.details)
+
+    # -- every other multi-row ordering -----------------------------------
+
+    def test_prepared_then_finished_refuses(self) -> None:
+        run = self.refuses(
+            *self.staged(AttemptState.PREPARED, AttemptState.FINISHED)
+        )
+        self.assertNotIn("attempt_state", run.error.details)
+
+    def test_finished_then_finished_refuses(self) -> None:
+        run = self.refuses(
+            *self.staged(AttemptState.FINISHED, AttemptState.FINISHED)
+        )
+        self.assertNotIn("attempt_state", run.error.details)
+
+    def test_unknown_then_prepared_refuses(self) -> None:
+        # Unresolved history is reported as such: here an attempt IS named,
+        # because the unresolved one is the handle a person must act on.
+        run = self.refuses(
+            *self.staged(AttemptState.UNKNOWN_OUTCOME, AttemptState.PREPARED)
+        )
+        self.assertEqual(
+            AttemptState.UNKNOWN_OUTCOME.value, run.error.details["attempt_state"]
+        )
+
+    def test_in_flight_then_prepared_refuses(self) -> None:
+        run = self.refuses(
+            *self.staged(AttemptState.IN_FLIGHT, AttemptState.PREPARED)
+        )
+        self.assertEqual(
+            AttemptState.IN_FLIGHT.value, run.error.details["attempt_state"]
+        )
+
+    def test_prepared_then_prepared_refuses(self) -> None:
+        # Two clean rows are still two rows: neither is provably the one this
+        # task's execution belongs to.
+        run = self.refuses(
+            *self.staged(AttemptState.PREPARED, AttemptState.PREPARED)
+        )
+        self.assertNotIn("attempt_state", run.error.details)
+
+    # -- the single-row controls, unchanged -------------------------------
+
+    def test_a_single_prepared_still_executes_exactly_once(self) -> None:
+        memory = self.store()
+        connector = JournalConnector(store=memory)
+        session = self.core(connector, memory).start_session("single-prepared")
+        task = self.egress_task(memory, connector, session.id)
+        memory.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, connector.manifest.name, "fp")
+        )
+        self.assertEqual(1, len(memory.execution_attempts(task.id)))
+        run = self.core(connector, self.store()).resume(session.id, task.id)
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+        self.assertEqual(1, connector.execute_calls)
+
+    def test_a_single_finished_takes_the_single_attempt_branch(
+        self,
+    ) -> None:
+        # THE CONTROL that proves the refusal above comes from the second ROW
+        # and not from the fixture: the same planted task with ONE FINISHED
+        # attempt takes the single-attempt FINISHED branch instead. It still
+        # never replays - but it fails for its own reason, naming the missing
+        # persisted result rather than the unprovable history.
+        session, task = self.staged(AttemptState.FINISHED)
+        fresh = JournalConnector()
+        run = self.core(fresh, self.store()).resume(session.id, task.id)
+        self.assertEqual(0, fresh.execute_calls)
+        self.assertIn("no persisted result", run.error.message)
+        self.assertNotIn("must not be replayed", run.error.message)
+
+    def test_no_attempt_at_all_still_takes_the_ordinary_path(self) -> None:
+        memory = self.store()
+        connector = JournalConnector(store=memory)
+        session = self.core(connector, memory).start_session("no-attempt")
+        task = self.egress_task(memory, connector, session.id)
+        self.assertEqual([], memory.execution_attempts(task.id))
+        run = self.core(connector, self.store()).resume(session.id, task.id)
+        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
         self.assertEqual(1, connector.execute_calls)
 
 

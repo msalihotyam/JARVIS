@@ -2922,6 +2922,42 @@ class AgentCore:
             ),
         )
 
+    def _unresolved_attempt(self, task_id: str) -> ExecutionAttempt | None:
+        """The attempt whose outcome nobody established, from the WHOLE history.
+
+        H2 asks one question before a connector is ever reached again: did any
+        execution of this task cross the boundary without being concluded? That
+        is a question about EVERY attempt the task ever had, not about the
+        newest row. ``open_execution_attempt`` is create-or-observe, so an
+        ordinary task has exactly one attempt and the two readings agree - but
+        once that invariant has failed, a newest-row read is how an unresolved
+        execution gets hidden under a later clean one and replayed.
+
+        ``execution_attempts`` is the store's existing COMPLETE-history API,
+        declared on ``MemoryStore`` and implemented by every store, so this
+        introduces no second history model.
+
+        UNKNOWN_OUTCOME is preferred over IN_FLIGHT when both are present:
+        both refuse equally, but the unknown one is what a person must resolve
+        through the 2B2b1 gate, so it is the handle worth reporting.
+        """
+        history = self.memory.execution_attempts(task_id)
+        return next(
+            (
+                attempt
+                for attempt in history
+                if attempt.state is AttemptState.UNKNOWN_OUTCOME
+            ),
+            None,
+        ) or next(
+            (
+                attempt
+                for attempt in history
+                if attempt.state is AttemptState.IN_FLIGHT
+            ),
+            None,
+        )
+
     def _execution_barrier(
         self, session: SessionState, task: Task
     ) -> AgentRun | None:
@@ -2948,12 +2984,13 @@ class AgentCore:
             # H2 keeps precedence over the switch: an attempt whose outcome is
             # unknown is in doubt whether or not execution is enabled, and
             # saying "disabled" instead would hide the thing that matters.
-            attempt = self.memory.latest_execution_attempt(task.id)
-            if attempt is not None and attempt.state in (
-                AttemptState.IN_FLIGHT,
-                AttemptState.UNKNOWN_OUTCOME,
-            ):
-                return self._execution_in_doubt(session, task, attempt)
+            #
+            # Asked of the COMPLETE history, so a later clean attempt cannot
+            # hide the unresolved one and turn the honest "in doubt" into a
+            # report about a configuration switch.
+            unresolved = self._unresolved_attempt(task.id)
+            if unresolved is not None:
+                return self._execution_in_doubt(session, task, unresolved)
         return AgentRun(
             RunStatus.FAILED,
             session,
@@ -2975,13 +3012,38 @@ class AgentCore:
         Returns an ``AgentRun`` to block (in doubt), the sentinel ``"advanced"``
         when a FINISHED attempt let the task move past EXECUTE without a second
         call, or ``None`` (no attempt or a reclaimable PREPARED one) to proceed.
+
+        THE COMPLETE HISTORY DECIDES, and it decides FIRST. This is the last
+        thing standing between a task and a second connector call, so the
+        question it asks is whether ANY execution of this task went
+        unconcluded - not what the newest row happens to say. An
+        UNKNOWN_OUTCOME or IN_FLIGHT attempt under a later PREPARED one is
+        exactly the shape that would otherwise be replayed over an effect
+        nobody established.
+
+        AND ONLY A PROVABLE HISTORY MAY PROCEED. ``open_execution_attempt`` is
+        create-or-observe, so a task has exactly ONE attempt row and any second
+        row means the journal's own invariant has already failed. Once it has,
+        no row is canonical: reading the newest one would let a later PREPARED
+        authorize a replay over an older FINISHED - a second external effect on
+        top of an established first. There is nothing to work out here, because
+        the evidence needed to work it out is exactly what is missing, so a
+        multi-row history refuses regardless of ordering. This is the same
+        judgement ``execution_history_verdict`` already makes for the scheduler,
+        where more than one row under a routed task is UNPROVABLE.
         """
-        attempt = self.memory.latest_execution_attempt(task.id)
+        unresolved = self._unresolved_attempt(task.id)
+        if unresolved is not None:
+            # IN_FLIGHT after restart, or an unresolved outcome: never replay.
+            return self._execution_in_doubt(session, task, unresolved)
+        history = self.memory.execution_attempts(task.id)
+        if len(history) > 1:
+            # UNPROVABLE. No attempt is named, because naming one would be
+            # picking a canonical row out of a history that has none.
+            return self._execution_in_doubt(session, task, None)
+        attempt = history[0] if history else None
         if attempt is None or attempt.state is AttemptState.PREPARED:
             return None
-        if attempt.state in (AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME):
-            # IN_FLIGHT after restart, or an unresolved outcome: never replay.
-            return self._execution_in_doubt(session, task, attempt)
         # FINISHED: the connector already ran. Advance from the persisted
         # result instead of executing again.
         result = self._result_from_dict(task.result_snapshot)

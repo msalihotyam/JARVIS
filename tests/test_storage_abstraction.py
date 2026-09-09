@@ -1004,6 +1004,8 @@ class InMemoryStore:
         self._held_lease(run, owner_token, fencing_epoch, now)
         if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
             raise JobError("the generation is not dispatchable from its state")
+        if run.cancel_requested:
+            raise JobError("the generation has been asked to cancel")
         if run.session_id is not None or run.chain_id is not None:
             raise JobError("the generation is already bound to a session")
         if run.spec.kind is JobKind.CONDITION_WATCH:
@@ -1205,6 +1207,71 @@ class InMemoryStore:
             for event in self.events
             if event["session_id"] == session_id
         ]
+
+    def request_job_run_cancel(
+        self, run_id, *, now, actor_label, reason
+    ) -> JobRun:
+        """The same sticky intent, refused and settled on the same terms."""
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        moment = now.astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._lock:
+            run = self._owned_run(run_id)
+            if run.settled:
+                raise JobError("the generation is already settled")
+            if run.status is JobRunStatus.UNKNOWN_OUTCOME:
+                raise JobError(
+                    "the generation's outcome is in doubt and cannot be cancelled"
+                )
+            if run.cancel_requested:
+                return run
+            # THE COMPLETE UNBOUND SHAPE (F3): every binding column, not one.
+            if (
+                run.session_id is None
+                and run.chain_id is None
+                and run.task_id is None
+                and run.attempt_id is None
+                and not run.lease_is_live(moment)
+            ):
+                cancelled = dataclasses.replace(
+                    run,
+                    status=JobRunStatus.CANCELLED,
+                    cancel_requested=True,
+                    owner_token=None,
+                    lease_expires_at_utc=None,
+                    settled_at=stamp,
+                )
+                self.job_runs[run_id] = cancelled
+                return cancelled
+            flagged = dataclasses.replace(run, cancel_requested=True)
+            self.job_runs[run_id] = flagged
+            if run.session_id is not None:
+                self._append_job_run_event(
+                    run.session_id,
+                    "job_run_cancel_requested",
+                    {
+                        "run_id": run.id,
+                        "job_id": run.job_id,
+                        "generation": run.generation,
+                        "chain_id": run.chain_id,
+                        "previous_status": run.status.value,
+                        "settled_immediately": False,
+                        "connector_stopped": False,
+                        "external_effect_established": False,
+                        "retry_authorized": False,
+                        "actor_label": actor,
+                        "actor_authenticated": False,
+                        "reason": why,
+                        "requested_at": stamp,
+                    },
+                    stamp,
+                )
+        return flagged
 
     def declare_attempt_orphaned(
         self,
@@ -1513,6 +1580,21 @@ class InMemoryStore:
         grant: PermissionGrant,
         status: str,
     ) -> bool:
+        # THE SAME LOCK ``cancel_task`` takes, held across the decision AND the
+        # writes it authorizes. SQLite makes this one CAS inside one
+        # transaction, so there is no instant where a cancellation has read
+        # "still pending" and an approver is meanwhile creating the grant.
+        # Exactly one of the two wins, and the loser writes nothing.
+        with self._lock:
+            return self._resolve_approval_locked(request, grant, status)
+
+    def _resolve_approval_locked(
+        self,
+        request: PermissionRequest,
+        grant: PermissionGrant,
+        status: str,
+    ) -> bool:
+        """Called ONLY with ``self._lock`` already held."""
         key = (request.task_id, request.session_id)
         existing = self.pending.get(key)
         if existing is None or existing.id != request.id:
@@ -1542,17 +1624,21 @@ class InMemoryStore:
         task: Task,
         payload: dict,
     ) -> bool:
-        key = (request.task_id, request.session_id)
-        existing = self.pending.get(key)
-        if existing is None or existing.id != request.id:
-            return False
-        persisted = self.tasks.get(task.id)
-        if persisted is None or persisted.status in _TERMINAL_STATUSES:
-            return False
-        self.pending.pop(key, None)
-        self.save_session(session)
-        self._save_task_guarded(session.id, task)
-        return True
+        # The THIRD writer of the same pending question, on the same lock: a
+        # rejection and a cancellation resolve one request between them, so
+        # leaving this one out would make the serialization claim false.
+        with self._lock:
+            key = (request.task_id, request.session_id)
+            existing = self.pending.get(key)
+            if existing is None or existing.id != request.id:
+                return False
+            persisted = self.tasks.get(task.id)
+            if persisted is None or persisted.status in _TERMINAL_STATUSES:
+                return False
+            self.pending.pop(key, None)
+            self.save_session(session)
+            self._save_task_guarded(session.id, task)
+            return True
 
     def execution_cancellation_requested(
         self, session_id: str, task_id: str
@@ -1569,11 +1655,27 @@ class InMemoryStore:
     def cancel_task(
         self, session_id: str, task_id: str
     ) -> CancellationOutcome:
-        # Two ids in, rebound rows out: the caller supplies no Task and no
-        # SessionState, so nothing it decoded can select or redefine a row.
-        # The protocol also takes no "the connector confirmed the stop"
-        # argument - nothing can hold that evidence, because nothing signals
-        # a connector.
+        # ONE CRITICAL SECTION over the decision AND every write it implies -
+        # the task, the session pointer and the pending question all move
+        # together or not at all, exactly as SQLite's single transaction makes
+        # them. ``resolve_approval`` and ``reject_task`` take this same lock,
+        # so an approver can neither slip a grant in after this cancellation
+        # decided the task is terminal, nor have its own decision retroactively
+        # rewritten by one.
+        with self._lock:
+            return self._cancel_task_locked(session_id, task_id)
+
+    def _cancel_task_locked(
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
+        """Called ONLY with ``self._lock`` already held.
+
+        Two ids in, rebound rows out: the caller supplies no Task and no
+        SessionState, so nothing it decoded can select or redefine a row.
+        The protocol also takes no "the connector confirmed the stop"
+        argument - nothing can hold that evidence, because nothing signals
+        a connector.
+        """
         session = self.load_session(session_id)
         if session is None:
             return CancellationOutcome("unknown_session")
@@ -1583,14 +1685,17 @@ class InMemoryStore:
             return CancellationOutcome("not_found")
         if task.status in _TERMINAL_STATUSES:
             return CancellationOutcome("terminal", session, task)
-        history = self.attempts.get(task_id, [])
-        latest = history[-1] if history else None
-        if latest is not None and latest.state is AttemptState.UNKNOWN_OUTCOME:
-            # No cancellation verdict is truthful about an unknown outcome.
+        # THE COMPLETE HISTORY, exactly as SQLite reads it: an older
+        # unresolved attempt under a newer clean one is still an execution
+        # nobody concluded, and the top-of-stack row must never hide it.
+        states = {attempt.state for attempt in self.attempts.get(task_id, [])}
+        if AttemptState.UNKNOWN_OUTCOME in states:
+            # No cancellation verdict is truthful about an unknown outcome,
+            # wherever in the history that uncertainty sits.
             return CancellationOutcome("in_doubt", session, task)
         task.cancellation_requested = True
         session.latest_task_id = task_id
-        if latest is not None and latest.state is AttemptState.IN_FLIGHT:
+        if AttemptState.IN_FLIGHT in states:
             # Never terminal: the execution owner concludes a live attempt.
             task.status = TaskStatus.CANCEL_REQUESTED
             verdict = "cancelling"
@@ -1602,6 +1707,13 @@ class InMemoryStore:
             verdict = "cancelled"
         self.save_session(session)
         self._save_task_guarded(session_id, task)
+        if verdict == "cancelled":
+            # THE TASK'S OWN QUESTION, superseded by its own terminal write.
+            # SQLite keeps the row and moves its status to 'superseded'; the
+            # double has no status column, so it models the same OBSERVABLE
+            # contract - the question is no longer loadable, and an approver
+            # arriving late resolves nothing and creates no grant.
+            self.pending.pop((task_id, session_id), None)
         return CancellationOutcome(verdict, session, task)
 
     def has_remembered_scope_grant(
@@ -1641,6 +1753,30 @@ class InMemoryStore:
         history.append(prepared)
         return prepared
 
+    def _scheduled_claim_refused(self, session_id: str) -> bool:
+        """Whether a bound generation forbids this execution claim (2B2b2 F1).
+
+        The same rule SQLite arbitrates inside its claim transaction. A session
+        with no generation is ordinary interactive work and is never refused.
+        """
+        run = next(
+            (
+                candidate
+                for candidate in self.job_runs.values()
+                if candidate.session_id == session_id
+            ),
+            None,
+        )
+        if run is None:
+            return False
+        if run.settled or run.cancel_requested:
+            return True
+        if not run.chain_id:
+            return True
+        session = self.sessions.get(session_id)
+        chain = None if session is None else session.chain
+        return chain is None or chain.id != run.chain_id
+
     def begin_execution(
         self,
         attempt_id: str,
@@ -1658,10 +1794,41 @@ class InMemoryStore:
             raise BillingIntegrityError(
                 "billing claim: hard limit is not the canonical policy value"
             )
-        # Window A: an authoritative cancellation/terminal decision forbids start.
-        task = self.tasks.get(task_id)
-        if task is None or task.status in _BLOCKING_STATUSES:
-            return ExecutionClaimOutcome.LOST
+        # ONE CRITICAL SECTION, from the first authority question to the
+        # PREPARED -> IN_FLIGHT write. SQLite settles all of this inside a
+        # single BEGIN IMMEDIATE transaction, so the double has to hold its
+        # lock across the same span: a cancellation that commits between the
+        # check and the claim is precisely the window F1 exists to close, and a
+        # double that leaves it open certifies a hole instead of closing it.
+        # ``request_job_run_cancel`` takes this same RLock, so it cannot
+        # interleave here.
+        with self._lock:
+            # Window A: an authoritative cancellation or terminal decision
+            # forbids start.
+            task = self.tasks.get(task_id)
+            if task is None or task.status in _BLOCKING_STATUSES:
+                return ExecutionClaimOutcome.LOST
+            # Window A3 (2B2b2 F1): the SCHEDULED generation's own authority,
+            # arbitrated in this same claim rather than before it. Interactive
+            # work is untouched - a session no generation names takes the path
+            # it always did - but a generation that IS bound here must still be
+            # a live reason to run: unsettled, not asked to stop, and naming
+            # the very chain this session holds.
+            if self._scheduled_claim_refused(session_id):
+                return ExecutionClaimOutcome.LOST
+            return self._claim_prepared_attempt(
+                attempt_id, session_id, task_id, one_shot_fingerprints, billing
+            )
+
+    def _claim_prepared_attempt(
+        self,
+        attempt_id: str,
+        session_id: str,
+        task_id: str,
+        one_shot_fingerprints,
+        billing: BillingClaim,
+    ) -> ExecutionClaimOutcome:
+        """The claim itself. Called ONLY with ``self._lock`` already held."""
         history = self.attempts.get(task_id, [])
         for index, attempt in enumerate(history):
             if attempt.id != attempt_id:
@@ -2793,6 +2960,625 @@ class SchedulerStorageParityTests(unittest.TestCase):
         for bad in (0, -1, True, "5", None):
             self.assertEqual([], self.memory.list_jobs(bad))
             self.assertEqual([], self.memory.list_job_runs(record.id, bad))
+
+
+class CancellationHistoryParityTests(unittest.TestCase):
+    """Cancellation reads the COMPLETE attempt history in BOTH stores.
+
+    ``cancel_task`` decides whether a task may be written TERMINAL. A
+    newest-row reader would let an older IN_FLIGHT or UNKNOWN_OUTCOME hide
+    under a newer FINISHED one and write CANCELLED over an execution nobody
+    concluded - "nothing happened" asserted about a connector call that did.
+
+    Each case runs the IDENTICAL script against SQLite and the double and
+    compares the traces, so the two can only agree by actually implementing
+    the same rule rather than by two tests that happen to pass.
+    """
+
+    def stores(self):
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "cancel.db")
+        return sqlite_store, InMemoryStore()
+
+    def trace(self, store, *states):
+        """Cancel one task whose history is exactly ``states``, oldest first.
+
+        The attempt the store opens for itself is rewritten to the first
+        state; the rest are appended above it through each store's own
+        storage, so ``rowid`` order and list order really do make the
+        uncertain attempt the OLDER one.
+        """
+        session = SessionState(objective="cancel")
+        store.save_session(session)
+        task = make_task()
+        store.save_task(session.id, task)
+        opened = store.open_execution_attempt(
+            ExecutionAttempt(session.id, task.id, "metered", "fp")
+        )
+        self._force_history(store, session, task, opened, states)
+        self.assertEqual(
+            [state.value for state in states],
+            [a.state.value for a in store.execution_attempts(task.id)],
+        )
+        outcome = store.cancel_task(session.id, task.id)
+        stored = store.load_task(task.id)
+        return (
+            outcome.verdict,
+            stored.status.value,
+            stored.cancellation_requested,
+            tuple(a.state.value for a in store.execution_attempts(task.id)),
+        )
+
+    @staticmethod
+    def _force_history(store, session, task, opened, states):
+        """Plant the exact history directly, past every state machine.
+
+        Production writes ONE attempt row per task, so a multi-row history is
+        corrupted or migrated state rather than an ordinary shape. That is
+        precisely why the rule has to hold: it is what the store falls back on
+        once its one-row invariant has already failed.
+        """
+        rows = [
+            dataclasses.replace(opened, id=f"{opened.id}-{index}", state=state)
+            if index
+            else dataclasses.replace(opened, state=state)
+            for index, state in enumerate(states)
+        ]
+        if isinstance(store, InMemoryStore):
+            store.attempts[task.id] = [copy.deepcopy(row) for row in rows]
+            return
+        import contextlib
+        import sqlite3
+
+        with contextlib.closing(sqlite3.connect(store.database_path)) as connection:
+            connection.execute("DELETE FROM execution_attempts")
+            connection.executemany(
+                "INSERT INTO execution_attempts (id, session_id, task_id, "
+                "connector, fingerprint, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        row.id,
+                        row.session_id,
+                        row.task_id,
+                        row.connector,
+                        row.fingerprint,
+                        row.state.value,
+                        row.created_at,
+                        row.updated_at,
+                    )
+                    for row in rows
+                ],
+            )
+            connection.commit()
+
+    def both(self, *states):
+        sqlite_store, double = self.stores()
+        return self.trace(sqlite_store, *states), self.trace(double, *states)
+
+    def test_an_older_in_flight_is_not_hidden_by_a_newer_finished(self) -> None:
+        # THE BLOCKER, in both stores. Top-of-stack says FINISHED; an
+        # execution below it is still in flight and nobody concluded it.
+        sqlite_trace, double_trace = self.both(
+            AttemptState.IN_FLIGHT, AttemptState.FINISHED
+        )
+        self.assertEqual(sqlite_trace, double_trace)
+        verdict, status, requested, history = sqlite_trace
+        self.assertEqual("cancelling", verdict)
+        self.assertEqual(TaskStatus.CANCEL_REQUESTED.value, status)
+        self.assertNotEqual(TaskStatus.CANCELLED.value, status)
+        self.assertTrue(requested)
+        # Cancellation concluded nothing: the history is exactly as it was.
+        self.assertEqual(
+            (AttemptState.IN_FLIGHT.value, AttemptState.FINISHED.value), history
+        )
+
+    def test_an_older_unknown_outcome_is_not_hidden_by_a_newer_finished(
+        self,
+    ) -> None:
+        sqlite_trace, double_trace = self.both(
+            AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED
+        )
+        self.assertEqual(sqlite_trace, double_trace)
+        verdict, status, requested, history = sqlite_trace
+        self.assertEqual("in_doubt", verdict)
+        # REFUSED BEFORE ANY WRITE, in both stores.
+        self.assertNotEqual(TaskStatus.CANCELLED.value, status)
+        self.assertFalse(requested)
+        self.assertEqual(
+            (AttemptState.UNKNOWN_OUTCOME.value, AttemptState.FINISHED.value),
+            history,
+        )
+
+    def test_a_wholly_finished_history_still_cancels_terminally(self) -> None:
+        # THE CONTROL. Nothing unresolved anywhere, so the existing semantics
+        # are unchanged in both stores.
+        sqlite_trace, double_trace = self.both(
+            AttemptState.FINISHED, AttemptState.FINISHED
+        )
+        self.assertEqual(sqlite_trace, double_trace)
+        self.assertEqual("cancelled", sqlite_trace[0])
+        self.assertEqual(TaskStatus.CANCELLED.value, sqlite_trace[1])
+
+    def test_a_live_attempt_alone_still_refuses_to_terminalize(self) -> None:
+        sqlite_trace, double_trace = self.both(AttemptState.IN_FLIGHT)
+        self.assertEqual(sqlite_trace, double_trace)
+        self.assertEqual("cancelling", sqlite_trace[0])
+
+    def test_an_uncertain_attempt_alone_is_still_refused(self) -> None:
+        sqlite_trace, double_trace = self.both(AttemptState.UNKNOWN_OUTCOME)
+        self.assertEqual(sqlite_trace, double_trace)
+        self.assertEqual("in_doubt", sqlite_trace[0])
+
+
+class DoubleCancellationParityTests(unittest.TestCase):
+    """The two 2B2b2 behaviours the double also has to carry."""
+
+    def setUp(self) -> None:
+        self.memory = InMemoryStore()
+        self.memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+        self.session = SessionState(objective="cancel")
+        self.memory.save_session(self.session)
+        self.task = make_task()
+        self.memory.save_task(self.session.id, self.task)
+
+    def request(self):
+        from jarvis.contracts import (
+            ActionScope,
+            PermissionRequest,
+            RiskLevel,
+            SideEffect,
+            SideEffectProfile,
+        )
+
+        return PermissionRequest(
+            task_id=self.task.id,
+            session_id=self.session.id,
+            scope=ActionScope(
+                action="write", target="notes.txt", connector="metered"
+            ),
+            risk_level=RiskLevel.MEDIUM,
+            side_effect=SideEffectProfile(effect=SideEffect.EXTERNAL_EGRESS),
+            reason="ask",
+        )
+
+    def test_a_terminal_cancellation_supersedes_the_pending_question(self) -> None:
+        # SQLite moves the row's status to 'superseded' and keeps it; the
+        # double has no status column, so it carries the same OBSERVABLE
+        # contract - the question stops being loadable, and an approver
+        # arriving late resolves nothing and creates NO grant.
+        request = self.request()
+        self.memory.save_pending_approval(request)
+        self.assertIsNotNone(
+            self.memory.load_pending_approval(self.task.id, self.session.id)
+        )
+        outcome = self.memory.cancel_task(self.session.id, self.task.id)
+        self.assertEqual("cancelled", outcome.verdict)
+        self.assertIsNone(
+            self.memory.load_pending_approval(self.task.id, self.session.id)
+        )
+        self.assertFalse(
+            self.memory.resolve_approval(
+                request, PermissionGrant.for_request(request), "approved"
+            )
+        )
+        self.assertEqual([], self.memory.grants)
+
+    def test_a_non_terminal_cancellation_leaves_the_question_standing(self) -> None:
+        # A live attempt means the cancellation is only REQUESTED, so the task
+        # is not terminal and its question is still answerable.
+        request = self.request()
+        self.memory.save_pending_approval(request)
+        self.memory.attempts[self.task.id] = [
+            dataclasses.replace(
+                self.memory.open_execution_attempt(
+                    ExecutionAttempt(
+                        self.session.id, self.task.id, "metered", "fp"
+                    )
+                ),
+                state=AttemptState.IN_FLIGHT,
+            )
+        ]
+        self.assertEqual(
+            "cancelling",
+            self.memory.cancel_task(self.session.id, self.task.id).verdict,
+        )
+        self.assertIsNotNone(
+            self.memory.load_pending_approval(self.task.id, self.session.id)
+        )
+
+    def test_a_flagged_generation_loses_the_execution_claim(self) -> None:
+        # F1 parity: the scheduled generation's own authority, arbitrated
+        # inside the claim rather than before it.
+        from jarvis.contracts import ChainState, ChainStatus
+
+        attempt = self.memory.open_execution_attempt(
+            ExecutionAttempt(self.session.id, self.task.id, "metered", "fp")
+        )
+        chain = ChainState(
+            id="chain-1",
+            steps=(),
+            step_task_ids=(self.task.id,),
+            cursor=0,
+            status=ChainStatus.ACTIVE,
+        )
+        session = dataclasses.replace(self.session, chain=chain)
+        self.memory.save_session(session)
+        record = self.memory.create_job(
+            _cancel_parity_spec(), now=_CANCEL_PARITY_NOW
+        )
+        run = self.memory.materialize_due_job_run(
+            record.id, record.revision, now=_CANCEL_PARITY_NOW + timedelta(hours=1)
+        )
+        self.assertIsNotNone(run)
+        self.memory.job_runs[run.id] = dataclasses.replace(
+            self.memory.job_runs[run.id],
+            session_id=session.id,
+            chain_id=chain.id,
+            cancel_requested=True,
+        )
+        claim = BillingClaim(
+            ledger_month=ledger_month(),
+            expected_exposure_nano_usd=0,
+            reservation_nano_usd=0,
+            limit_nano_usd=MONTHLY_HARD_LIMIT_NANO_USD,
+            billing_class=BillingClass.NO_ADDITIONAL_CHARGE,
+            gate_state="gate",
+        )
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            self.memory.begin_execution(
+                attempt.id, session.id, self.task.id, [], claim
+            ),
+        )
+        # The attempt never crossed: it is still PREPARED.
+        self.assertIs(
+            AttemptState.PREPARED,
+            self.memory.latest_execution_attempt(self.task.id).state,
+        )
+
+    def test_an_interactive_session_is_untouched_by_the_arbitration(self) -> None:
+        # No generation names this session, so nothing changed for it.
+        self.assertFalse(self.memory._scheduled_claim_refused(self.session.id))
+
+
+_CANCEL_PARITY_NOW = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+
+
+def _cancel_parity_spec():
+    return JobSpec(
+        project_id="proj-a",
+        kind=JobKind.RECURRING,
+        label="hourly digest",
+        schedule=Interval(anchor=_CANCEL_PARITY_NOW, every=timedelta(hours=1)),
+        steps=(
+            ChainStep(
+                objective="summarize the log",
+                capability="echo",
+                action="read",
+                target="notes.txt",
+            ),
+        ),
+    )
+
+
+class DoubleAtomicityTests(unittest.TestCase):
+    """The double serializes what SQLite serializes, on its ONE RLock.
+
+    SQLite settles each of these inside a single ``BEGIN IMMEDIATE``
+    transaction, so no competitor can act between the check and the write it
+    authorizes. A double that leaves that window open is worse than no double:
+    it CERTIFIES a hole instead of closing it, and every contract test written
+    against it inherits the false result.
+
+    The interleavings here are DETERMINISTIC. A second thread is released at
+    the exact instant the first is inside its critical section, and the test
+    then proves the second one could not get in - by the barrier it is still
+    waiting on, and by the state it failed to change. Nothing sleeps, and
+    nothing depends on which thread the scheduler happens to prefer.
+    """
+
+    def setUp(self) -> None:
+        self.memory = InMemoryStore()
+        self.memory.save_project(ProjectRecord(id="proj-a", name="Project A"))
+        self.session = SessionState(objective="race")
+        self.memory.save_session(self.session)
+        self.task = make_task()
+        self.memory.save_task(self.session.id, self.task)
+
+    def request(self):
+        from jarvis.contracts import (
+            ActionScope,
+            PermissionRequest,
+            RiskLevel,
+            SideEffect,
+            SideEffectProfile,
+        )
+
+        return PermissionRequest(
+            task_id=self.task.id,
+            session_id=self.session.id,
+            scope=ActionScope(
+                action="write", target="notes.txt", connector="metered"
+            ),
+            risk_level=RiskLevel.MEDIUM,
+            side_effect=SideEffectProfile(effect=SideEffect.EXTERNAL_EGRESS),
+            reason="ask",
+        )
+
+    def run_against_held_lock(self, call):
+        """Run ``call`` in a thread while THIS thread holds the store's lock.
+
+        Returns (thread, entered) where ``entered`` is an Event the thread sets
+        only once ``call`` has returned. While the lock is held the event must
+        stay clear - that is the proof the critical section is closed.
+        """
+        entered = threading.Event()
+        box = {}
+
+        def body():
+            box["result"] = call()
+            entered.set()
+
+        thread = threading.Thread(target=body, daemon=True)
+        return thread, entered, box
+
+    # -- A. begin_execution: the F1 check and the claim are one section ----
+
+    def test_a_cancellation_cannot_commit_between_the_check_and_the_claim(
+        self,
+    ) -> None:
+        # The scheduled generation is live and unflagged, so the F1 check would
+        # PASS. A cancellation is then attempted from another thread at the
+        # exact moment the claim is inside its critical section. If the two
+        # were not on one lock, the cancellation would land between the check
+        # and the PREPARED -> IN_FLIGHT write - the window F1 exists to close.
+        from jarvis.contracts import ChainState, ChainStatus
+
+        attempt = self.memory.open_execution_attempt(
+            ExecutionAttempt(self.session.id, self.task.id, "metered", "fp")
+        )
+        chain = ChainState(
+            id="chain-1",
+            steps=(),
+            step_task_ids=(self.task.id,),
+            cursor=0,
+            status=ChainStatus.ACTIVE,
+        )
+        session = dataclasses.replace(self.session, chain=chain)
+        self.memory.save_session(session)
+        record = self.memory.create_job(_race_spec(), now=_RACE_NOW)
+        run = self.memory.materialize_due_job_run(
+            record.id, record.revision, now=_RACE_NOW + timedelta(hours=1)
+        )
+        self.memory.job_runs[run.id] = dataclasses.replace(
+            self.memory.job_runs[run.id],
+            session_id=session.id,
+            chain_id=chain.id,
+        )
+
+        # The probe sits INSIDE begin_execution's critical section, between
+        # the F1 check that has just passed and the claim it authorizes. The
+        # cancellation is released there and must not be able to commit: if
+        # begin_execution did not hold the lock across this span, it would.
+        thread, cancelled, box = self.run_against_held_lock(
+            lambda: self.memory.request_job_run_cancel(
+                run.id,
+                now=_RACE_NOW + timedelta(hours=2),
+                actor_label="operator",
+                reason="stop",
+            )
+        )
+        original = self.memory._claim_prepared_attempt
+        observed = {}
+
+        def probe(*args, **kwargs):
+            thread.start()
+            # RUNNABLE, and still shut out for as long as we stay in here.
+            observed["escaped"] = cancelled.wait(timeout=0.5)
+            return original(*args, **kwargs)
+
+        self.memory._claim_prepared_attempt = probe
+        try:
+            outcome = self.memory.begin_execution(
+                attempt.id, self.session.id, self.task.id, [], _race_claim()
+            )
+        finally:
+            self.memory._claim_prepared_attempt = original
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(
+            observed["escaped"],
+            "a cancellation committed between the F1 check and the claim",
+        )
+        # The claim, taken with the generation still live, won.
+        self.assertIs(ExecutionClaimOutcome.CLAIMED, outcome)
+        self.assertIs(
+            AttemptState.IN_FLIGHT,
+            self.memory.latest_execution_attempt(self.task.id).state,
+        )
+        # The cancellation then ran, and is advisory over a claim it lost.
+        self.assertTrue(box["result"].cancel_requested)
+
+    def test_a_cancellation_that_wins_first_loses_the_claim_to_it(self) -> None:
+        # The mirror image, same lock: the cancellation commits first, so the
+        # claim that follows is refused and the attempt never crosses.
+        from jarvis.contracts import ChainState, ChainStatus
+
+        attempt = self.memory.open_execution_attempt(
+            ExecutionAttempt(self.session.id, self.task.id, "metered", "fp")
+        )
+        chain = ChainState(
+            id="chain-1",
+            steps=(),
+            step_task_ids=(self.task.id,),
+            cursor=0,
+            status=ChainStatus.ACTIVE,
+        )
+        session = dataclasses.replace(self.session, chain=chain)
+        self.memory.save_session(session)
+        record = self.memory.create_job(_race_spec(), now=_RACE_NOW)
+        run = self.memory.materialize_due_job_run(
+            record.id, record.revision, now=_RACE_NOW + timedelta(hours=1)
+        )
+        self.memory.job_runs[run.id] = dataclasses.replace(
+            self.memory.job_runs[run.id],
+            session_id=session.id,
+            chain_id=chain.id,
+        )
+        self.memory.request_job_run_cancel(
+            run.id,
+            now=_RACE_NOW + timedelta(hours=2),
+            actor_label="operator",
+            reason="stop",
+        )
+        self.assertIs(
+            ExecutionClaimOutcome.LOST,
+            self.memory.begin_execution(
+                attempt.id, self.session.id, self.task.id, [], _race_claim()
+            ),
+        )
+        self.assertIs(
+            AttemptState.PREPARED,
+            self.memory.latest_execution_attempt(self.task.id).state,
+        )
+
+    # -- B. cancel_task and resolve_approval share the one lock -----------
+
+    def test_an_approver_cannot_resolve_inside_a_cancellation(self) -> None:
+        # The approver is runnable and holds a request that is genuinely still
+        # pending. While the cancellation's critical section is held it cannot
+        # act; once released, the question it wanted is gone, so it resolves
+        # nothing and no grant appears.
+        request = self.request()
+        self.memory.save_pending_approval(request)
+        grant = PermissionGrant.for_request(request)
+
+        thread, resolved, box = self.run_against_held_lock(
+            lambda: self.memory.resolve_approval(request, grant, "approved")
+        )
+        with self.memory._lock:
+            thread.start()
+            self.assertFalse(
+                resolved.wait(timeout=0.5),
+                "resolve_approval entered while the lock was held",
+            )
+            outcome = self.memory.cancel_task(self.session.id, self.task.id)
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+        self.assertEqual("cancelled", outcome.verdict)
+        self.assertIs(
+            TaskStatus.CANCELLED, self.memory.load_task(self.task.id).status
+        )
+        # THE LATE APPROVER LOST, and made nothing.
+        self.assertFalse(box["result"])
+        self.assertEqual([], self.memory.grants)
+        self.assertIsNone(
+            self.memory.load_pending_approval(self.task.id, self.session.id)
+        )
+
+    def test_a_cancellation_cannot_rewrite_an_approval_that_won(self) -> None:
+        # The mirror image: the approver wins the lock first. Its decision and
+        # its grant stand, and the cancellation that follows does not
+        # retroactively undo either.
+        request = self.request()
+        self.memory.save_pending_approval(request)
+        grant = PermissionGrant.for_request(request)
+
+        thread, cancelled, box = self.run_against_held_lock(
+            lambda: self.memory.cancel_task(self.session.id, self.task.id)
+        )
+        with self.memory._lock:
+            thread.start()
+            self.assertFalse(
+                cancelled.wait(timeout=0.5),
+                "cancel_task entered while the lock was held",
+            )
+            self.assertTrue(
+                self.memory.resolve_approval(request, grant, "approved")
+            )
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+        # The approval stands: exactly one grant, made by the approver.
+        self.assertEqual(1, len(self.memory.grants))
+        self.assertEqual(self.task.id, self.memory.grants[0]["task_id"])
+        # The cancellation still did its own job on the task.
+        self.assertEqual("cancelled", box["result"].verdict)
+        self.assertIs(
+            TaskStatus.CANCELLED, self.memory.load_task(self.task.id).status
+        )
+        # And it did NOT invent a second grant or resurrect the question.
+        self.assertEqual(1, len(self.memory.grants))
+        self.assertIsNone(
+            self.memory.load_pending_approval(self.task.id, self.session.id)
+        )
+
+    def test_a_rejection_serializes_on_the_same_lock(self) -> None:
+        # ``reject_task`` is the THIRD writer of the same pending question, so
+        # it shares the lock too - otherwise the serialization claim would be
+        # false for one of the three.
+        request = self.request()
+        self.memory.save_pending_approval(request)
+        grant = PermissionGrant.for_request(request)
+        task = self.memory.load_task(self.task.id)
+
+        thread, rejected, box = self.run_against_held_lock(
+            lambda: self.memory.reject_task(
+                request, grant, self.session, task, {}
+            )
+        )
+        with self.memory._lock:
+            thread.start()
+            self.assertFalse(
+                rejected.wait(timeout=0.5),
+                "reject_task entered while the lock was held",
+            )
+            outcome = self.memory.cancel_task(self.session.id, self.task.id)
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual("cancelled", outcome.verdict)
+        # The cancellation superseded the question, so the rejection lost.
+        self.assertFalse(box["result"])
+
+
+_RACE_NOW = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+
+
+def _race_spec():
+    return JobSpec(
+        project_id="proj-a",
+        kind=JobKind.RECURRING,
+        label="hourly digest",
+        schedule=Interval(anchor=_RACE_NOW, every=timedelta(hours=1)),
+        steps=(
+            ChainStep(
+                objective="summarize the log",
+                capability="echo",
+                action="read",
+                target="notes.txt",
+            ),
+        ),
+    )
+
+
+def _race_claim():
+    return BillingClaim(
+        ledger_month=ledger_month(),
+        expected_exposure_nano_usd=0,
+        reservation_nano_usd=0,
+        limit_nano_usd=MONTHLY_HARD_LIMIT_NANO_USD,
+        billing_class=BillingClass.NO_ADDITIONAL_CHARGE,
+        gate_state="gate",
+    )
 
 
 if __name__ == "__main__":

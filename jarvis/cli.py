@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from uuid import uuid4
 import json
 import math
 import sys
@@ -26,6 +27,7 @@ from jarvis.app import (
     config_mutation_result,
     config_show_result,
     failure_result,
+    job_run_cancel_result,
     job_run_resolve_result,
     memory_add_result,
     memory_list_result,
@@ -185,6 +187,20 @@ def _build_parser() -> _ArgumentParser:
     job_resolve.add_argument("--attempt-id", required=True)
     job_resolve.add_argument("--actor", required=True)
     job_resolve.add_argument("--reason", required=True)
+
+    # M12 S2B2b2: ask for a scheduled generation to stop. It records ONE
+    # sticky intent and lets the chain and task authorities do their own work;
+    # it reverses nothing and re-runs nothing.
+    job_cancel = job_actions.add_parser(
+        "cancel",
+        help=(
+            "Cancel a scheduled generation. Stops FUTURE work only - an "
+            "effect that already happened stands."
+        ),
+    )
+    job_cancel.add_argument("--run-id", required=True)
+    job_cancel.add_argument("--actor", required=True)
+    job_cancel.add_argument("--reason", required=True)
 
     run_command = commands.add_parser("run", help="Start a task from task JSON.")
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
@@ -399,7 +415,8 @@ def _dispatch_job_command(
 ) -> CommandResult:
     """Operator resolution for a generation. Constructs a store and nothing else."""
     memory = SQLiteMemoryStore(settings.memory_database)
-    if getattr(args, "job_action", None) == "resolve":
+    action = getattr(args, "job_action", None)
+    if action == "resolve":
         return job_run_resolve_result(
             memory,
             settings,
@@ -408,11 +425,23 @@ def _dispatch_job_command(
             args.actor,
             args.reason,
         )
+    if action == "cancel":
+        # The coordination token this one invocation owns. Cancellation needs
+        # a lease only to REFLECT the durable outcome, and a fresh token per
+        # invocation is what keeps that reflection fenced like every other.
+        return job_run_cancel_result(
+            memory,
+            settings,
+            args.run_id,
+            f"cancel-{uuid4()}",
+            args.actor,
+            args.reason,
+        )
     return failure_result(
         "job",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'job' requires the 'resolve' sub-command.",
+        "'job' requires the 'resolve' or 'cancel' sub-command.",
         EXIT_INVALID_INPUT,
     )
 

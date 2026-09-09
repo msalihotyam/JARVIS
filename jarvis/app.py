@@ -104,6 +104,7 @@ from jarvis.contracts import (
     validate_project_id,
 )
 from jarvis.core import AgentCore
+from jarvis.dispatch import DISPATCH_REFUSED, cancel_job_run
 from jarvis.destinations import (
     DEFAULT_TASK_DESTINATION,
     DestinationGrant,
@@ -1818,6 +1819,86 @@ def task_orphan_result(
                     "unchanged and still blocks its chain; abandon the attempt "
                     "with 'jarvis task resolve' to fail the task, then resolve "
                     "the scheduled generation if one owns it."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def job_run_cancel_result(
+    memory: MemoryStore,
+    settings: Settings,
+    run_id: str,
+    owner_token: str,
+    actor_label: str,
+    reason: str,
+) -> CommandResult:
+    """Ask for a scheduled generation to stop.
+
+    Local and deterministic like every other operator verb: it builds a store
+    and nothing else - no registry, no connector, no ``AgentCore`` - so it is
+    structurally incapable of executing, replaying or resuming anything. What
+    it does is record one sticky intent and then let the authorities that
+    already own the chain and the task do their own work.
+
+    The response is written so that a cancelled generation is never mistaken
+    for an undone one: it says plainly whether anything was still running, that
+    no external effect was reversed, and that nothing will be retried.
+    """
+    command = "job-cancel"
+    try:
+        outcome = cancel_job_run(
+            memory,
+            run_id,
+            owner_token,
+            actor_label=actor_label,
+            reason=reason,
+        )
+    except JobError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    if outcome.verdict == DISPATCH_REFUSED:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            outcome.reason,
+            EXIT_INVALID_INPUT,
+        )
+    run = outcome.run
+    settled = run is not None and run.settled
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "run_id": run_id,
+                "outcome": outcome.verdict,
+                "detail": outcome.reason,
+                "run_status": None if run is None else run.status.value,
+                "cancel_requested": True,
+                "settled": settled,
+                # The bounded facts, stated rather than implied. Every one of
+                # them is what an operator must not assume the opposite of.
+                "external_effect_reversed": False,
+                "external_effect_established": False,
+                "connector_stopped": False,
+                "retry_authorized": False,
+                "actor_authenticated": False,
+                "next_step": (
+                    "The cancellation is recorded and this generation will "
+                    "never be claimed, bound or executed again. Cancelling "
+                    "stops FUTURE work only: any effect that already happened "
+                    "stands, and nothing here reverses or re-runs anything. If "
+                    "the generation is still running, an execution already in "
+                    "flight finishes under its own owner; if its outcome can "
+                    "never be established, resolve it with 'jarvis task "
+                    "orphan' and 'jarvis job resolve'."
                 ),
             }
         ),

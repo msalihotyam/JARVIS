@@ -1350,19 +1350,25 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _attempt_in_doubt(connection: sqlite3.Connection, task_id: str) -> bool:
-        """Whether this task's latest attempt has an unresolved outcome.
+        """Whether ANY attempt of this task has an unresolved outcome.
 
         Read inside the caller's transaction, and only once the task is
         already terminal, so an ordinary write pays nothing for it.
+
+        THE COMPLETE HISTORY, never the newest row. The bytes this guards are
+        the ones recovery may still need to re-attest for an attempt nobody
+        concluded, and that attempt does not stop existing because a later
+        clean one was written above it. ``_attempt_rows`` is the store's one
+        complete-history read - the same one the recovery verdict and the
+        cancellation verdict are built from - so there is a single history
+        model here and not three.
         """
-        row = connection.execute(
-            "SELECT state FROM execution_attempts WHERE task_id = ? "
-            "ORDER BY rowid DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        return row is not None and row[0] in (
-            AttemptState.IN_FLIGHT.value,
-            AttemptState.UNKNOWN_OUTCOME.value,
+        states = {
+            attempt.state
+            for attempt in SQLiteMemoryStore._attempt_rows(connection, task_id)
+        }
+        return bool(
+            states & {AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME}
         )
 
     @staticmethod
@@ -1510,17 +1516,19 @@ class SQLiteMemoryStore:
         IN_FLIGHT and UNKNOWN_OUTCOME are the two states the journal refuses
         to replay. A chain must not advance past either, and must never
         fabricate a status for one: the step stays where it is.
+
+        THE COMPLETE HISTORY, never the newest row. Advancing is a claim that
+        this step's execution is over; an older IN_FLIGHT or UNKNOWN_OUTCOME
+        under a newer FINISHED one is an execution nobody concluded, and a
+        chain that walked past it would carry that unresolved effect forward
+        as settled. Same ``_attempt_rows`` read as every other verdict.
         """
-        row = connection.execute(
-            "SELECT state FROM execution_attempts WHERE task_id = ? "
-            "ORDER BY rowid DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        return str(row[0]) in (
-            AttemptState.IN_FLIGHT.value,
-            AttemptState.UNKNOWN_OUTCOME.value,
+        states = {
+            attempt.state
+            for attempt in SQLiteMemoryStore._attempt_rows(connection, task_id)
+        }
+        return bool(
+            states & {AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME}
         )
 
     def _chain_claim_authority(
@@ -2424,17 +2432,27 @@ class SQLiteMemoryStore:
             # so a forged terminal document cannot short-circuit anything.
             if task.status.value in _TERMINAL_STATUS_VALUES:
                 return CancellationOutcome("terminal", session, task)
-            attempt = connection.execute(
-                "SELECT state FROM execution_attempts WHERE task_id = ? "
-                "ORDER BY rowid DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            if (
-                attempt is not None
-                and attempt[0] == AttemptState.UNKNOWN_OUTCOME.value
-            ):
+            # THE COMPLETE HISTORY, never the newest row. A cancellation
+            # decides whether a task may be written TERMINAL, and that question
+            # is about everything that ever crossed the connector boundary for
+            # it - not about whichever attempt happens to sit on top. An older
+            # IN_FLIGHT or UNKNOWN_OUTCOME under a newer FINISHED one is still
+            # an execution nobody concluded, and a top-of-stack read would
+            # write CANCELLED over it: "nothing happened" asserted about a call
+            # that did.
+            #
+            # ``_attempt_rows`` is the store's existing complete-history read,
+            # the same one the recovery verdict is built from, so there is one
+            # history model here and not two.
+            states = {
+                attempt.state
+                for attempt in self._attempt_rows(connection, task_id)
+            }
+            if AttemptState.UNKNOWN_OUTCOME in states:
                 # S2A: refused BEFORE any write. The task, the attempt, the
                 # reservation and the chain are all left exactly as they are.
+                # Uncertainty ANYWHERE in the history outranks everything
+                # after it; only the 2B2b1 human gate may end it.
                 return CancellationOutcome("in_doubt", session, task)
             # Only the rebound objects are mutated from here. A caller's stale
             # lifecycle and progress fields never reach a row, because the
@@ -2443,7 +2461,7 @@ class SQLiteMemoryStore:
             session.latest_task_id = task_id
             clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
             set_issue(task, ProgressIssueKind.CANCELLATION_PENDING)
-            if attempt is not None and attempt[0] == AttemptState.IN_FLIGHT.value:
+            if AttemptState.IN_FLIGHT in states:
                 # FINDING 2. An authoritative IN_FLIGHT attempt is never
                 # terminalized here, by anyone. Storage has no evidence the
                 # execution stopped - S2A signals no connector, so no such
@@ -2469,6 +2487,34 @@ class SQLiteMemoryStore:
                 # than leaving a session pointer and an event describing a
                 # cancellation that was never written to the task.
                 raise _CancellationLost(session, task)
+            if verdict == "cancelled":
+                # THE TASK'S OWN QUESTION, superseded by the task's own
+                # terminal write. A cancelled task can never execute, so a
+                # request still marked pending against it would be a question
+                # whose answer could not be acted on either way - and an
+                # approver resolving it would be granting permission to a task
+                # that no longer exists to use it.
+                #
+                # The word is the store's EXISTING one: this is exactly what
+                # ``_upsert_pending_approval`` already writes when a newer
+                # request displaces an older one - the question stopped being
+                # answerable, and nobody decided it. No new status value, and
+                # therefore no reader to teach and no schema to migrate.
+                #
+                # This is SUPERSESSION, not denial. Nothing here approves,
+                # rejects or judges the request: its row, its id, its
+                # ``request_json`` and the fingerprint derived from it are
+                # preserved exactly, and only its status leaves 'pending'. The
+                # CAS on that status is what makes a concurrent approver and
+                # this cancellation resolve to a single winner - an approval
+                # that already won keeps its own verdict, and this write
+                # touches nothing.
+                connection.execute(
+                    "UPDATE pending_approvals SET status = 'superseded', "
+                    "resolved_at = ? "
+                    "WHERE task_id = ? AND session_id = ? AND status = 'pending'",
+                    (utc_now(), task_id, session_id),
+                )
             self._write_checkpoint_and_event(
                 connection,
                 session,
@@ -2580,6 +2626,54 @@ class SQLiteMemoryStore:
             )
         return replace(attempt, state=AttemptState.PREPARED)
 
+    @staticmethod
+    def _scheduled_claim_refused(
+        connection: sqlite3.Connection, session_id: str
+    ) -> bool:
+        """Whether a bound generation forbids this execution claim (2B2b2 F1).
+
+        Asked inside the claim transaction, immediately before
+        ``PREPARED -> IN_FLIGHT``, so the answer cannot go stale between the
+        question and the crossing it authorizes.
+
+        INTERACTIVE WORK IS UNTOUCHED. A session with no generation is the
+        ordinary case - every hand-driven task, every chain declared by a
+        person - and it takes exactly the path it always did. Nothing here
+        invents a generation for a session that has none, and the lookup is by
+        the unique ``session_id`` index, so at most one row can ever answer.
+
+        A generation that DOES claim this session must still be a live reason
+        to run: unsettled, not asked to stop, and naming the very chain the
+        session holds. Anything else - a settled generation, a cancelled one,
+        a binding that names no chain or another chain - is refused rather than
+        reasoned about. A claim is the last moment before an external effect;
+        it is the wrong place to be generous about evidence.
+        """
+        row = connection.execute(
+            "SELECT settled_at, cancel_requested, chain_id FROM job_runs "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            # Not a scheduled session. Ordinary execution, unchanged.
+            return False
+        if row["settled_at"] is not None:
+            # The occurrence is over; it starts nothing further.
+            return True
+        if row["cancel_requested"] != 0:
+            # THE CANCELLATION, seen in the transaction that would otherwise
+            # have crossed the boundary. Anything that is not exactly 0 -
+            # including a corrupted value - reads as "stop".
+            return True
+        chain_id = row["chain_id"]
+        if not chain_id:
+            return True
+        stored = SQLiteMemoryStore._stored_chain(connection, session_id)
+        if stored is None or stored.id != chain_id:
+            # The generation's binding and the session's own chain disagree.
+            return True
+        return False
+
     def begin_execution(
         self,
         attempt_id: str,
@@ -2626,6 +2720,16 @@ class SQLiteMemoryStore:
                 # transaction that grants ownership, so a cancellation that
                 # commits before the claim can never be executed past.
                 if not self._chain_claim_authority(connection, session_id, task_id):
+                    return ExecutionClaimOutcome.LOST
+                # Window A3 (2B2b2 F1): the SCHEDULED generation's own
+                # authority, arbitrated in this same transaction and for
+                # exactly the same reason. A cancellation can commit after a
+                # dispatcher has bound, checked and materialized everything and
+                # still before this claim; without the question being asked
+                # HERE, that stale dispatcher would cross the connector
+                # boundary on a generation somebody already stopped. No
+                # pre-transaction check can close that window.
+                if self._scheduled_claim_refused(connection, session_id):
                     return ExecutionClaimOutcome.LOST
                 # P1-D: ownership before money. The attempt must exist, belong
                 # to this exact session/task and still be claimable.
@@ -3143,6 +3247,167 @@ class SQLiteMemoryStore:
         if canonical is None:
             return False
         return moment - datetime.fromisoformat(canonical) >= ORPHAN_MIN_AGE
+
+    def request_job_run_cancel(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> JobRun:
+        """Record that a person wants this generation stopped.
+
+        Phase 2B2b2, and deliberately the smallest thing that can be true:
+        ONE sticky bit meaning "somebody asked for this to stop". It is not a
+        statement that a connector stopped, that a task was cancelled, that an
+        external effect did not happen, or that no execution exists. Each of
+        those belongs to an authority that already owns it - the executing
+        owner, Core's task cancellation, the chain - and cancellation may not
+        borrow any of them.
+
+        WHAT THE BIT ACTUALLY DOES is close futures. ``claim_job_run``,
+        ``bind_job_run_dispatch`` and the execution claim itself all name
+        ``cancel_requested = 0`` inside their own transactions, so a request
+        that commits first can never be executed past, and one that commits
+        second is left as advisory over a reality it cannot rewrite. That is
+        the whole mechanism; there is no stop signal here and no orchestration.
+
+        IMMEDIATE SETTLEMENT IS THE NARROW CASE, and its proof is the complete
+        binding shape rather than any single column. A generation may be
+        settled CANCELLED in this same transaction only when ``session_id``,
+        ``chain_id``, ``task_id`` and ``attempt_id`` are ALL NULL and no live
+        owner holds it - that is a queue position and demonstrably nothing
+        else, because the only writer that creates a session for a generation
+        binds it in one transaction with the RUNNING transition. A partially
+        populated binding is corrupted or racing state and falls through to
+        intent: "no session" alone is never read as "nothing ran".
+
+        REFUSED OUTRIGHT: a settled generation, and one whose status is
+        UNKNOWN_OUTCOME. Uncertainty has exactly one exit - the human gate that
+        ends in FAILED - and letting a cancellation close it would turn "nobody
+        knows" into "nothing happened", which is the one sentence this whole
+        subsystem exists to refuse.
+
+        Idempotent: the first request flips the bit and writes one record; a
+        later one finds it set, writes nothing and reports the same row.
+        """
+        actor = job_recovery_note(
+            actor_label, "actor_label", JOB_RECOVERY_ACTOR_MAX_CHARS
+        )
+        why = job_recovery_note(reason, "reason", JOB_RECOVERY_REASON_MAX_CHARS)
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        stamp = moment.isoformat()
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            if run.settled:
+                raise JobError("the generation is already settled")
+            if run.status is JobRunStatus.UNKNOWN_OUTCOME:
+                # Its only exit is the human gate, and that gate ends FAILED.
+                raise JobError(
+                    "the generation's outcome is in doubt and cannot be cancelled"
+                )
+            if run.cancel_requested:
+                # Already asked for. Sticky, so there is nothing to write and
+                # nothing new to record.
+                return run
+
+            # THE COMPLETE UNBOUND SHAPE (F3). Every binding column, not one.
+            unbound = (
+                run.session_id is None
+                and run.chain_id is None
+                and run.task_id is None
+                and run.attempt_id is None
+                and not run.lease_is_live(moment)
+            )
+            if unbound:
+                cancelled = replace(
+                    run,
+                    status=JobRunStatus.CANCELLED,
+                    cancel_requested=True,
+                    owner_token=None,
+                    lease_expires_at_utc=None,
+                    settled_at=stamp,
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE job_runs
+                       SET status = ?, cancel_requested = 1, settled_at = ?,
+                           owner_token = NULL, lease_expires_at_utc = NULL
+                     WHERE id = ? AND settled_at IS NULL AND cancel_requested = 0
+                       AND status = ?
+                       AND session_id IS NULL AND chain_id IS NULL
+                       AND task_id IS NULL AND attempt_id IS NULL
+                       AND owner_token IS ? AND lease_expires_at_utc IS ?
+                    """,
+                    (
+                        cancelled.status.value,
+                        stamp,
+                        run_id,
+                        run.status.value,
+                        # The exact ownership observed to be absent or expired,
+                        # PINNED rather than re-derived - a second definition
+                        # of expiry in SQL is a second place for it to drift.
+                        run.owner_token,
+                        run.lease_expires_at_utc,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise JobError("the generation is not cancellable")
+                # No audit event: an unbound generation has no session, and
+                # event_log rows are session-scoped. The row itself - CANCELLED,
+                # settled, flagged - is the record, and nothing external can
+                # have happened for it to be incomplete about.
+                return cancelled
+
+            flagged = replace(run, cancel_requested=True)
+            cursor = connection.execute(
+                """
+                UPDATE job_runs SET cancel_requested = 1
+                 WHERE id = ? AND settled_at IS NULL AND cancel_requested = 0
+                """,
+                (run_id,),
+            )
+            if cursor.rowcount != 1:
+                raise JobError("the generation is not cancellable")
+            bound_session = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (run.session_id,)
+            ).fetchone() if run.session_id is not None else None
+            if bound_session is not None:
+                # Bound generations get the record; the event log is
+                # session-scoped and this one has a session to bind to.
+                #
+                # A generation naming a session that does not exist is
+                # corrupted binding state. The INTENT is still recorded - a
+                # person must always be able to stop a run, and the flag is
+                # what actually refuses the claim, the binding and the
+                # execution - but the audit is skipped rather than allowed to
+                # fail the whole write on a foreign key. The row itself is then
+                # the record, exactly as it is for an unbound cancellation.
+                self._insert_job_run_event(
+                    connection,
+                    run.session_id,
+                    "job_run_cancel_requested",
+                    {
+                        "run_id": run.id,
+                        "job_id": run.job_id,
+                        "generation": run.generation,
+                        "chain_id": run.chain_id,
+                        "previous_status": run.status.value,
+                        # Stated so the record cannot later be misread as a
+                        # finding about the world.
+                        "settled_immediately": False,
+                        "connector_stopped": False,
+                        "external_effect_established": False,
+                        "retry_authorized": False,
+                        "actor_label": actor,
+                        "actor_authenticated": False,
+                        "reason": why,
+                        "requested_at": stamp,
+                    },
+                    stamp,
+                )
+        return flagged
 
     def declare_attempt_orphaned(
         self,
@@ -6025,6 +6290,7 @@ class SQLiteMemoryStore:
                    SET status = ?, owner_token = ?, fencing_epoch = ?,
                        lease_expires_at_utc = ?, claimed_at = ?
                  WHERE id = ? AND fencing_epoch = ? AND settled_at IS NULL
+                   AND cancel_requested = 0
                 """,
                 (
                     claimed.status.value,
@@ -6360,6 +6626,11 @@ class SQLiteMemoryStore:
             self._held_lease(run, owner_token, fencing_epoch, moment)
             if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
                 raise JobError("the generation is not dispatchable from its state")
+            if run.cancel_requested:
+                # Somebody asked for this occurrence to stop. Binding it would
+                # create the session, the chain and the RUNNING state whose
+                # only purpose would be to be cancelled again.
+                raise JobError("the generation has been asked to cancel")
             if run.session_id is not None or run.chain_id is not None:
                 # Already bound. Refused rather than re-bound: a second session
                 # for one occurrence would be a second crossing of a connector
@@ -6416,6 +6687,7 @@ class SQLiteMemoryStore:
                      WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
                        AND status = ? AND settled_at IS NULL
                        AND session_id IS NULL AND chain_id IS NULL
+                       AND cancel_requested = 0
                     """,
                     (
                         bound.status.value,

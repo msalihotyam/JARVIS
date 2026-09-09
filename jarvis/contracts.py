@@ -7974,13 +7974,21 @@ class JobRun:
     def claimable_at(self, now: datetime) -> bool:
         """Whether a worker may take ownership of this generation at ``now``.
 
-        Two independent conditions, both required. The COORDINATION STATE must
+        Three independent conditions, all required. The COORDINATION STATE must
         be one of the narrow claimable ones - which is what makes an uncertain
         external outcome fail closed rather than time out into a second
-        attempt - and no live lease may already own it.
+        attempt - no live lease may already own it, and nobody may have asked
+        for it to be cancelled.
+
+        The cancellation bit is checked HERE, beside the other two, so that the
+        Python reading and the storage compare-and-set cannot disagree about
+        what is claimable. A generation somebody has asked to cancel must not
+        acquire a new owner: taking it would start coordinating work whose only
+        remaining job is to stop.
         """
         return (
             not self.settled
+            and not self.cancel_requested
             and self.status in CLAIMABLE_JOB_RUN_STATUSES
             and not self.lease_is_live(now)
         )
@@ -8966,6 +8974,52 @@ class MemoryStore(Protocol):
         Inserts ``attempt`` (PREPARED) only when the task has no attempt yet;
         otherwise returns the existing latest attempt unchanged. The caller
         proceeds only when the returned attempt is still PREPARED.
+        """
+        ...
+
+    def request_job_run_cancel(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+        actor_label: str,
+        reason: str,
+    ) -> "JobRun":
+        """Record that a person wants this generation stopped.
+
+        Scheduler phase 2B2b2. What is written is INTENT and nothing else. It
+        is never a claim that a connector stopped, that a task was cancelled,
+        that an external effect did not happen, or that no execution exists -
+        every one of those is somebody else's authority, and cancellation may
+        not borrow any of them.
+
+        THE FLAG IS STICKY. Once set it is never cleared: a request to stop is
+        a fact about what a person asked for, and unsetting it would let a
+        generation quietly become runnable again on no evidence. Settlement,
+        not clearing, is how a cancellation ends.
+
+        WHAT THE FLAG DOES is refuse futures. Every writer that could turn this
+        generation into execution - the claim, the binding, and the execution
+        claim itself - names ``cancel_requested = 0`` inside its own
+        transaction, so a request that commits first can never be executed past
+        and one that commits second is left as advisory over a reality it
+        cannot rewrite.
+
+        IMMEDIATE SETTLEMENT IS THE NARROW CASE. A generation may be settled
+        ``CANCELLED`` in this same transaction ONLY when it is provably a queue
+        position and nothing more: ``session_id``, ``chain_id``, ``task_id``
+        and ``attempt_id`` ALL NULL, and no live coordination owner. Any
+        partially populated binding is corrupted or racing state and fails
+        closed to intent - "no session" alone is never read as "nothing ran".
+
+        Refused outright: a settled generation, and one whose status is
+        ``UNKNOWN_OUTCOME``. Uncertainty has exactly one exit and it is the
+        human gate that ends in FAILED; letting a cancellation close it would
+        turn "nobody knows" into "nothing happened".
+
+        Idempotent by construction: the first request flips the flag and writes
+        one audit record; a later one finds it already set, writes nothing more
+        and reports the same generation.
         """
         ...
 

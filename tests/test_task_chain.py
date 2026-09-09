@@ -3041,6 +3041,71 @@ class ChainProgressCasTests(MaterializationTestCase):
         self.assertEqual(self.advance(0), "blocked")
         self.assertIs(self.chain_now().status, ChainStatus.ACTIVE)
 
+    # -- complete attempt history --------------------------------------------
+    #
+    # Advancing is a claim that this step's execution is OVER. That question
+    # is about every attempt the step ever had, not about whichever row sits
+    # on top: an older IN_FLIGHT or UNKNOWN_OUTCOME under a newer FINISHED one
+    # is still an execution nobody concluded, and a chain that walked past it
+    # would carry that unresolved effect forward as settled.
+    #
+    # Production writes ONE attempt row per task, so a multi-row history is
+    # corrupted or migrated state; it is planted directly for exactly that
+    # reason - this rule is what the store falls back on once its one-row
+    # invariant has already failed.
+
+    def plant_history(self, task_id: str, *states: AttemptState) -> None:
+        """Plant the exact history, oldest first, past every state machine."""
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            connection.executemany(
+                "INSERT INTO execution_attempts (id, session_id, task_id, "
+                "connector, fingerprint, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        f"attempt-{task_id}-{index}",
+                        self.session.id,
+                        task_id,
+                        "local",
+                        "f" * 64,
+                        state.value,
+                        "2026-08-28T00:00:00Z",
+                        "2026-08-28T00:00:00Z",
+                    )
+                    for index, state in enumerate(states)
+                ],
+            )
+            connection.commit()
+
+    def test_an_older_unknown_outcome_is_not_hidden_by_a_newer_finished(
+        self,
+    ) -> None:
+        _verdict, task_id = self.materialize(0)
+        self.complete_task(task_id, selected_connector="local")
+        self.plant_history(
+            task_id, AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED
+        )
+        self.assertEqual(self.advance(0), "blocked")
+        self.assertEqual(self.chain_now().cursor, 0)
+        self.assertIs(self.chain_now().status, ChainStatus.ACTIVE)
+
+    def test_an_older_in_flight_is_not_hidden_by_a_newer_finished(self) -> None:
+        _verdict, task_id = self.materialize(0)
+        self.complete_task(task_id, selected_connector="local")
+        self.plant_history(task_id, AttemptState.IN_FLIGHT, AttemptState.FINISHED)
+        self.assertEqual(self.advance(0), "blocked")
+        self.assertEqual(self.chain_now().cursor, 0)
+        self.assertIs(self.chain_now().status, ChainStatus.ACTIVE)
+
+    def test_a_wholly_established_history_still_advances(self) -> None:
+        # THE CONTROL: nothing unresolved anywhere, so the existing valid
+        # advance is unchanged.
+        _verdict, task_id = self.materialize(0)
+        self.complete_task(task_id, selected_connector="local")
+        self.plant_history(task_id, AttemptState.FINISHED, AttemptState.FINISHED)
+        self.assertEqual(self.advance(0), "advanced")
+        self.assertEqual(self.chain_now().cursor, 1)
+
     def test_a_failed_step_fails_the_chain(self) -> None:
         _verdict, task_id = self.materialize(0)
         task = self.memory.load_task(task_id)

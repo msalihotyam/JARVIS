@@ -2290,6 +2290,84 @@ class RetentionTests(LocalWriteTestCase):
         self.assertIs(AttemptState.UNKNOWN_OUTCOME, attempt.state)
         self.assertEqual(MARKER + "\n", app.memory.load_task(task.id).write_content)
 
+    # -- complete attempt history --------------------------------------------
+    #
+    # The bytes are kept for exactly one reason: recovery may still need to
+    # re-attest them for an attempt nobody concluded. That attempt does not
+    # stop existing because a later clean one was written above it, so the
+    # erasure decision must read EVERY attempt, not the newest row.
+    #
+    # Production writes ONE attempt row per task, so a multi-row history is
+    # corrupted or migrated state; it is planted directly for exactly that
+    # reason - this rule is what the store falls back on once its one-row
+    # invariant has already failed. The task is then written terminal through
+    # the ordinary guarded upsert, which is the single place erasure happens.
+
+    def plant_history(self, session_id: str, task_id: str, *states) -> None:
+        import contextlib
+        import sqlite3
+
+        with contextlib.closing(
+            sqlite3.connect(self.memory.database_path)
+        ) as connection:
+            connection.executemany(
+                "INSERT INTO execution_attempts (id, session_id, task_id, "
+                "connector, fingerprint, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        f"attempt-{task_id}-{index}",
+                        session_id,
+                        task_id,
+                        "local",
+                        "f" * 64,
+                        state.value,
+                        "2026-08-28T00:00:00Z",
+                        "2026-08-28T00:00:00Z",
+                    )
+                    for index, state in enumerate(states)
+                ],
+            )
+            connection.commit()
+
+    def terminal_write_with_history(self, *states) -> str:
+        """A task holding bytes, made terminal over exactly this history."""
+        from jarvis.contracts import LoopStage, TaskStatus
+
+        task = write_task(self.root / "notes.txt", MARKER + "\n")
+        run = self.request(task)
+        self.assertEqual(MARKER + "\n", self.persisted(task.id))
+        self.plant_history(run.session.id, task.id, *states)
+        stored = self.memory.load_task(task.id)
+        stored.status = TaskStatus.COMPLETED
+        stored.stage = LoopStage.COMPLETED
+        self.memory.save_task(run.session.id, stored)
+        return task.id
+
+    def test_an_older_in_flight_under_a_newer_finished_keeps_the_bytes(
+        self,
+    ) -> None:
+        task_id = self.terminal_write_with_history(
+            AttemptState.IN_FLIGHT, AttemptState.FINISHED
+        )
+        self.assertEqual(MARKER + "\n", self.persisted(task_id))
+
+    def test_an_older_unknown_under_a_newer_finished_keeps_the_bytes(
+        self,
+    ) -> None:
+        task_id = self.terminal_write_with_history(
+            AttemptState.UNKNOWN_OUTCOME, AttemptState.FINISHED
+        )
+        self.assertEqual(MARKER + "\n", self.persisted(task_id))
+
+    def test_a_wholly_established_history_still_erases_the_bytes(self) -> None:
+        # THE CONTROL: nothing unresolved anywhere, so the existing terminal
+        # cleanup is unchanged.
+        task_id = self.terminal_write_with_history(
+            AttemptState.FINISHED, AttemptState.FINISHED
+        )
+        self.assertEqual("", self.persisted(task_id))
+
     def test_the_bytes_are_erased_on_completion(self) -> None:
         task = write_task(self.root / "notes.txt", MARKER + "\n")
         run = self.request(task)

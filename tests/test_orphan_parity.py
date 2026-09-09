@@ -435,39 +435,127 @@ class OrphanSurfaceTests(unittest.TestCase):
         self.assertNotIn("abandon_unknown_attempt", attrs)
         self.assertNotIn("resolve_unknown_job_run", attrs)
 
-    def test_phase_2b2b2_cancellation_is_absent_from_this_build(self) -> None:
-        import jarvis.app as app
-        import jarvis.cli as cli
-        import jarvis.contracts as contracts
-        import jarvis.dispatch as dispatch
-        import jarvis.memory as memory
+    def test_phase_2b2b2_cancellation_added_exactly_one_intent_writer(self) -> None:
+        # Phase 2B2b2 arrived, so "absent" became "exactly this". What the
+        # guard protects is unchanged: cancellation may record ONE sticky
+        # intent and may never grow into a second settlement authority, a
+        # retry, or a way to reopen a generation.
         from jarvis.memory import SQLiteMemoryStore
         from tests.test_storage_abstraction import InMemoryStore as Double
 
         for store in (SQLiteMemoryStore, Double):
+            # The one operation that exists.
+            self.assertTrue(hasattr(store, "request_job_run_cancel"), store.__name__)
             for absent in (
-                "request_job_run_cancel",
-                "cancel_job_run",
+                "cancel_job_run",          # orchestration is NOT a store authority
                 "resolve_job_run",
                 "retry_job_run",
+                "uncancel_job_run",
+                "clear_cancel_requested",
             ):
                 with self.subTest(store=store.__name__, absent=absent):
                     self.assertFalse(hasattr(store, absent), absent)
-        for module in (app, cli, contracts, dispatch, memory):
-            with self.subTest(module=module.__name__):
-                self.assertNotIn(
-                    "request_job_run_cancel",
-                    self.identifiers(inspect.getsource(module)),
-                )
-        # The cancellation intent flag still has NO writer anywhere.
-        body = inspect.getsource(memory)
-        for writer in (
-            "SET cancel_requested",
-            "cancel_requested = 1",
-            "cancel_requested=1",
+
+        # THE FLAG IS STICKY: exactly one writer sets it, and nothing clears
+        # it. A statement that would return it to 0 is what this forbids.
+        import re
+
+        import jarvis.memory as memory
+
+        # Flattened so implicit string concatenation cannot hide a statement,
+        # and each occurrence judged by the clause it sits in: a ``0`` may only
+        # ever appear as a compare-and-set PREDICATE, never as an assignment.
+        # Docstrings and comments are stripped first: this module's own prose
+        # quotes the predicate it is describing, and a text scan would fail on
+        # documentation rather than on code.
+        tree = ast.parse(inspect.getsource(memory))
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body:
+                first = body[0]
+                if (
+                    isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)
+                ):
+                    body.pop(0)
+        flat = " ".join(re.sub(r"[\"']", " ", ast.unparse(tree)).split())
+        occurrences = list(re.finditer(r"cancel_requested\s*=\s*([01])", flat))
+        self.assertTrue(occurrences, "the intent flag is never referenced at all")
+        assignments = []
+        for match in occurrences:
+            prefix = flat[max(0, match.start() - 40) : match.start()]
+            predicate = "AND" in prefix or "WHERE" in prefix
+            if not predicate:
+                assignments.append(match.group(0))
+            if match.group(1) == "0":
+                # Every zero is a guard against a flagged generation, never a
+                # write that would return one to un-cancelled.
+                self.assertTrue(predicate, flat[match.start() - 60 : match.end()])
+        # Exactly one thing is ever assigned, and it is the flag going up.
+        self.assertTrue(assignments, "nothing ever sets the flag")
+        for assignment in assignments:
+            self.assertRegex(assignment, r"cancel_requested\s*=\s*1")
+
+    def test_every_gate_that_must_refuse_a_flagged_generation_names_it(
+        self,
+    ) -> None:
+        # DEFENCE IN DEPTH, PINNED. Each of these writes reads the run and then
+        # updates it inside ONE ``BEGIN IMMEDIATE`` transaction, so today the
+        # Python check alone already decides the answer and the ``WHERE``
+        # clause can never be the one that refuses. That is exactly why it
+        # needs a guard rather than a test: no behavioural test can reach it,
+        # and dropping it would be invisible until the day the transaction mode
+        # or the read/write ordering changes and the window reopens.
+        #
+        # The predicate is stated where the row is actually written, in every
+        # place that could hand a flagged generation a future.
+        import inspect
+
+        from jarvis.memory import SQLiteMemoryStore
+
+        for name in (
+            "claim_job_run",            # no new owner
+            "bind_job_run_dispatch",    # no session, no chain, no RUNNING
+            "request_job_run_cancel",   # the flag itself, set exactly once
         ):
-            with self.subTest(writer=writer):
-                self.assertNotIn(writer, body)
+            with self.subTest(gate=name):
+                self.assertIn(
+                    "cancel_requested = 0",
+                    inspect.getsource(getattr(SQLiteMemoryStore, name)),
+                    name,
+                )
+        # And the execution claim - the last instant before the connector
+        # boundary - asks the question in the transaction that crosses it.
+        claim = inspect.getsource(SQLiteMemoryStore.begin_execution)
+        self.assertIn("_scheduled_claim_refused", claim)
+        self.assertLess(
+            claim.index("_scheduled_claim_refused"),
+            claim.index("UPDATE execution_attempts"),
+            "the arbitration must precede the PREPARED -> IN_FLIGHT crossing",
+        )
+
+    def test_cancellation_reuses_the_existing_approval_vocabulary(self) -> None:
+        # The cancelled task's own question leaves 'pending' as SUPERSEDED -
+        # the word the store already writes when a newer request displaces an
+        # older one. A NEW durable status would be a schema change in all but
+        # name: every reader that enumerates approval outcomes would have to
+        # learn it, and none of them were taught.
+        import inspect
+        import re
+
+        from jarvis.memory import SQLiteMemoryStore
+
+        source = inspect.getsource(SQLiteMemoryStore._cancel_task_atomically)
+        self.assertIn("status = 'superseded'", source)
+        # Statuses this store may ever write, across every writer it has.
+        written = set(
+            re.findall(
+                r"pending_approvals SET status = '([a-z_]+)'",
+                inspect.getsource(SQLiteMemoryStore),
+            )
+        )
+        self.assertEqual({"superseded", "rejected"}, written, written)
 
     def test_the_schema_did_not_move(self) -> None:
         from jarvis.app import OUTPUT_SCHEMA_VERSION

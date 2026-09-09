@@ -75,6 +75,11 @@ DISPATCH_SETTLED = "settled"
 DISPATCH_PARKED = "parked"
 DISPATCH_UNKNOWN = "unknown"
 DISPATCH_BLOCKED = "blocked"
+#: A cancellation was recorded but the generation is not finished yet - a live
+#: owner still has to conclude it, or a person still has to resolve an
+#: uncertain execution. It is NOT a failure and NOT a settlement: the intent is
+#: durable and somebody else's authority owns the rest.
+DISPATCH_CANCEL_INTENT = "cancel_intent"
 
 #: The default recovery lease. Long enough that an ordinary chain step is not
 #: racing its own expiry, short enough that a worker which dies again does not
@@ -323,6 +328,11 @@ def _bound_state(store: Any, run: JobRun) -> tuple[Any, Any] | None:
     if tuple(chain.steps) != tuple(run.spec.steps):
         return None
     return session, chain
+
+
+def _cancel_blocked(reason: str, run: JobRun | None) -> DispatchOutcome:
+    """A cancellation that recorded its intent but could carry no further."""
+    return _blocked(reason, run, run, None)
 
 
 def _recovery_blocked(
@@ -745,6 +755,18 @@ def recover_job_run(
         # not established, so nothing may be resumed on top of it.
         return _recovery_blocked("execution_not_established", run)
 
+    if run.cancel_requested:
+        # (3b) ASKED TO STOP. Everything above proved this generation COULD be
+        # resumed; this proves it must not be. Recovery reflects durable truth
+        # and never decides policy, so it stops here rather than cancelling
+        # anything itself - ``cancel_job_run`` owns that, through the
+        # authorities that own the task and the chain.
+        #
+        # Deliberately AFTER the unknown reflection above: an uncertain
+        # execution is durable H2 truth and outranks a request to stop, which
+        # is only ever a wish about the future.
+        return _recovery_blocked("cancel_requested", run)
+
     # (4) THE ONE CALL, on the session this generation has always been bound
     # to. No new session exists to pass, and none is created to pass.
     try:
@@ -790,4 +812,172 @@ def recover_job_run(
         agent_run=agent_run,
         core_verdict=core_verdict,
         settled_at=settled_at,
+    )
+
+
+def cancel_job_run(
+    store: Any,
+    run_id: str,
+    owner_token: str,
+    *,
+    lease: timedelta = DEFAULT_RECOVERY_LEASE,
+    actor_label: str,
+    reason: str,
+    clock: Callable[[], datetime] = _utc_now,
+) -> DispatchOutcome:
+    """Ask for ONE generation to stop, and carry that as far as it safely goes.
+
+    The phase-2B2b2 boundary, and deliberately an ORCHESTRATOR rather than an
+    authority: every mutation below is performed by the component that already
+    owns it. This function decides only the ORDER, and the order is the safety
+    property:
+
+    1. record the sticky intent (and settle immediately if the generation is
+       provably nothing but a queue position);
+    2. cancel the CHAIN, so no further step can be materialized or claimed -
+       this is what makes a racing execution claim lose;
+    3. cancel the current TASK through storage's own arbitration, which decides
+       for itself whether that is final or merely requested;
+    4. reflect whatever durable truth resulted onto the generation, through the
+       same fenced settlement a first dispatch uses.
+
+    IT TAKES NO STORE AUTHORITY IT DOES NOT ALREADY HAVE. It never writes a
+    task status, never touches an execution attempt, never signals a connector
+    and never settles a generation except through the fenced reflection, which
+    refuses over any unresolved execution. A cancellation that arrives while
+    something is IN_FLIGHT therefore ends as recorded intent, not as a lie
+    about what happened.
+
+    IDEMPOTENT AND RESTART-SAFE. Every step tolerates having already been done
+    - an already-flagged run, an already-cancelled chain, an already-terminal
+    task - so a process that dies anywhere is recovered by running the whole
+    thing again. Nothing here is a point of no return except the operations
+    that were already safe to repeat.
+    """
+    try:
+        run = store.request_job_run_cancel(
+            run_id, now=clock(), actor_label=actor_label, reason=reason
+        )
+    except JobError as exc:
+        # Settled, in doubt, or unreadable. The storage boundary is the
+        # authority on all of it and its refusal changed nothing.
+        return DispatchOutcome(
+            DISPATCH_REFUSED,
+            f"not_cancellable: {exc}",
+            run=store.load_job_run(run_id),
+        )
+
+    if run.settled:
+        # The F3 case: provably a queue position, settled in that same
+        # transaction. There is no session, no chain and no task to stop.
+        return DispatchOutcome(
+            DISPATCH_SETTLED,
+            "cancelled_before_binding",
+            run=run,
+        )
+
+    if run.session_id is None or run.chain_id is None:
+        # Flagged but not bound: a CLAIMED generation whose holder still has a
+        # live lease. The intent is durable and the claim CAS now refuses to
+        # bind it, so it will be settled by the next request once the lease is
+        # gone. Nothing further is safe or necessary here.
+        return DispatchOutcome(
+            DISPATCH_CANCEL_INTENT,
+            "unbound_awaiting_release",
+            run=run,
+        )
+
+    # (2) THE CHAIN, first: once it is not ACTIVE, every later execution claim
+    # loses its chain authority check, so this is what actually stops work that
+    # has not started. "terminal" and "conflict" mean somebody already did it.
+    chain_verdict = store.cancel_chain(run.session_id, run.chain_id)
+    if chain_verdict == "unknown":
+        return _cancel_blocked("chain_unreadable", run)
+
+    # (3) THE TASK, through storage's own cancellation arbitration. It alone
+    # decides whether this is final or merely requested, and it refuses
+    # outright when an outcome is in doubt.
+    session = store.load_session(run.session_id)
+    if session is None or session.chain is None:
+        return _cancel_blocked("bound_state_mismatch", run)
+    chain = session.chain
+    cursor = chain.cursor
+    if isinstance(cursor, int) and 0 <= cursor < len(chain.step_task_ids):
+        cursor_task_id = chain.step_task_ids[cursor]
+        if cursor_task_id:
+            store.cancel_task(run.session_id, cursor_task_id)
+
+    # (4) REFLECT. Take the coordination lease only now, so the reflection is
+    # fenced exactly like every other settlement. A live owner still holding it
+    # is the ordinary case for an in-flight execution: it will reflect its own
+    # outcome, and this call leaves the intent durable.
+    try:
+        recovered = store.reacquire_job_run(
+            run_id,
+            owner_token,
+            run.fencing_epoch,
+            now=clock(),
+            lease=lease,
+            actor_label=actor_label,
+            reason=reason,
+        )
+    except JobError:
+        return DispatchOutcome(
+            DISPATCH_CANCEL_INTENT,
+            "intent_recorded",
+            run=store.load_job_run(run_id),
+            session_id=run.session_id,
+            chain_id=run.chain_id,
+        )
+
+    epoch = recovered.fencing_epoch
+    after = store.load_job_run(run_id)
+    if after is None or after.status is not JobRunStatus.RUNNING:
+        return _cancel_blocked("recovered_state_unreadable", after or run)
+    if (
+        after.owner_token != owner_token
+        or after.fencing_epoch != epoch
+        or not after.lease_is_live(clock())
+    ):
+        return _cancel_blocked("lease_lost_before_reflection", after)
+    bound = _bound_state(store, after)
+    if bound is None:
+        return _cancel_blocked("bound_state_mismatch", after)
+    _session, rebound = bound
+
+    routed = _routed_tasks(store, after, rebound)
+    if routed is None:
+        return _cancel_blocked("routing_unprovable", after)
+    history = _attempt_history(store, routed)
+    if history is None:
+        return _cancel_blocked("execution_not_established", after)
+    verdict = execution_history_verdict(
+        after.session_id, routed, rebound.cursor, history
+    )
+    if not verdict.established:
+        # An execution is still in flight or unresolved. The generation stays
+        # RUNNING with its intent recorded; settling CANCELLED over it would
+        # claim that nothing happened, and only the 2B2b1 human gate can end an
+        # uncertain execution.
+        return DispatchOutcome(
+            DISPATCH_CANCEL_INTENT,
+            "execution_not_established",
+            run=after,
+            session_id=after.session_id,
+            chain_id=after.chain_id,
+        )
+
+    # The SAME fenced reflection a first dispatch uses, with no Core call and
+    # no agent run to read: the chain's own durable status is the evidence.
+    return _reflect_outcome(
+        store,
+        run_id,
+        owner_token,
+        epoch,
+        binding=after,
+        run=after,
+        chain=rebound,
+        agent_run=None,
+        core_verdict="cancel_requested",
+        settled_at=clock(),
     )
