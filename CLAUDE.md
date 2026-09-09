@@ -4,6 +4,18 @@ Bu dosya, bu depoda çalışan Claude Code oturumları için kalıcı talimatlar
 Mimari karar kaynağı `ARCHITECTURE.md` ve `PROJECT_CONTEXT.md`'dir; bu dosya
 onların yerine geçmez.
 
+## Operating state
+
+Before starting any development work, or performing any worktree lifecycle
+operation (creating, finishing, or cleaning up a worktree), read:
+
+- `JARVIS_RUNBOOK.md` — canonical development rules (model policy, prompt
+  shape, testing discipline, the hard worktree lifecycle rule, push
+  authorization).
+- `JARVIS_ACTIVE_STATE.md` — current short-form state snapshot.
+
+Do not duplicate their content here; read them directly, every time.
+
 ## Development Dashboard
 
 Milestone panosu (`dev/dashboard/`) yalnızca bir geliştirme aracıdır: LLM yok,
