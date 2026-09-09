@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
+from jarvis.conditions import ConditionResult
 from jarvis.contracts import (
     APPLIED_EFFECT_LOCAL_WRITE,
     LOCAL_WRITE_APPLIED_STATUS,
@@ -184,6 +185,18 @@ _TERMINAL_STATUS_VALUES = frozenset(
         TaskStatus.CANCELLED.value,
     }
 )
+
+#: Phase 2C. ``settle_job_run``'s default for ``condition_result`` means
+#: PRESERVE the run's own existing value, never "set it to None" - ``None``
+#: is itself a legitimate value a caller might one day need to write, so it
+#: cannot double as "unspecified". A watch's ``condition_result`` is written
+#: exactly once, by the fenced TRUE binding or by this method's own FALSE/
+#: UNKNOWN settle of an unbound generation; every LATER settlement of a
+#: bound watch - COMPLETED, FAILED, CANCELLED, through the same shared
+#: reflection every job kind uses - must leave that record exactly as it
+#: found it, not silently null it back out because the caller settling a
+#: chain's durable status had no reason to know a predicate was ever asked.
+_PRESERVE_CONDITION_RESULT = object()
 
 
 def _exact_nano(value: Any, field: str) -> int:
@@ -6399,7 +6412,7 @@ class SQLiteMemoryStore:
         *,
         now: datetime,
         blocking_code: str | None = None,
-        condition_result: str | None = None,
+        condition_result: str | None = _PRESERVE_CONDITION_RESULT,
     ) -> JobRun:
         """Close ONE open generation with a settled outcome, FENCED.
 
@@ -6415,6 +6428,16 @@ class SQLiteMemoryStore:
         A settled generation is never reopened: the compare-and-set names the
         owner, the epoch and ``settled_at IS NULL``, so two settlers cannot
         both win and the settled half of the vocabulary has no way back out.
+
+        ``condition_result`` defaults to PRESERVING whatever the run already
+        holds - see ``_PRESERVE_CONDITION_RESULT`` - rather than to ``None``.
+        A phase-2C watch's TRUE record is written once, at bind time, and this
+        is the SAME method every job kind's later COMPLETED/FAILED/CANCELLED
+        settlement reaches through the shared reflection; a caller settling an
+        ordinary job's chain status has no reason to know a predicate was ever
+        asked, and must not silently erase the record of one by omission. Pass
+        an explicit value only to WRITE the result for the first time, from an
+        unbound FALSE/UNKNOWN watch.
         """
         if type(status) is not JobRunStatus:
             raise JobError("status is not an exact JobRunStatus")
@@ -6430,11 +6453,16 @@ class SQLiteMemoryStore:
             self._held_lease(run, owner_token, fencing_epoch, moment)
             if run.status not in SETTLEABLE_JOB_RUN_STATUSES:
                 raise JobError("the generation is not settleable from its state")
+            resolved_condition_result = (
+                run.condition_result
+                if condition_result is _PRESERVE_CONDITION_RESULT
+                else condition_result
+            )
             settled = replace(
                 run,
                 status=status,
                 blocking_code=blocking_code,
-                condition_result=condition_result,
+                condition_result=resolved_condition_result,
                 settled_at=moment.isoformat(),
             )
             cursor = connection.execute(
@@ -6613,8 +6641,10 @@ class SQLiteMemoryStore:
         business in; a colliding id therefore raises rather than merges.
 
         A ``CONDITION_WATCH`` is refused. Its declaration is what it would do IF
-        its predicate held, nothing in this phase evaluates one, and dispatching
-        it would run unconditionally what the operator declared conditionally.
+        its predicate held, nothing here evaluates one, and dispatching it would
+        run unconditionally what the operator declared conditionally.
+        ``bind_condition_true_dispatch`` is the one path that may bind a watch,
+        and only after its predicate was found TRUE outside this store.
 
         Binding is NOT authority. It creates no approval, consumes no grant,
         opens no execution attempt, reserves no money and reaches no connector.
@@ -6624,88 +6654,163 @@ class SQLiteMemoryStore:
         with self._connection(write=True) as connection:
             run = self._owned_run(connection, run_id)
             self._held_lease(run, owner_token, fencing_epoch, moment)
-            if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
-                raise JobError("the generation is not dispatchable from its state")
-            if run.cancel_requested:
-                # Somebody asked for this occurrence to stop. Binding it would
-                # create the session, the chain and the RUNNING state whose
-                # only purpose would be to be cancelled again.
-                raise JobError("the generation has been asked to cancel")
-            if run.session_id is not None or run.chain_id is not None:
-                # Already bound. Refused rather than re-bound: a second session
-                # for one occurrence would be a second crossing of a connector
-                # boundary whose first crossing nobody has disproved.
-                raise JobError("the generation is already bound to a session")
             if run.spec.kind is JobKind.CONDITION_WATCH:
                 raise JobError(
                     "a condition watch is not dispatchable in this phase"
                 )
-            # The project is re-proved HERE, inside the write transaction: a
-            # snapshot names the project the operator scheduled under, and a
-            # project archived since then must not gain a fresh session.
-            self._require_active_project(connection, run.spec.project_id)
-            chain = ChainState.declared(run.spec.steps)
-            if chain is None:
-                # Unreachable through JobSpec, which already refuses a
-                # malformed declaration. Fail closed anyway rather than bind a
-                # session to a chain no authority stage would accept.
-                raise JobError("the snapshot declaration cannot form a chain")
-            session = SessionState(
-                objective=run.spec.label,
-                project_id=run.spec.project_id,
-                chain=chain,
-            )
-            payload = session.to_dict()
-            try:
-                # STRICT INSERT, no ON CONFLICT: a colliding session id is a
-                # session that already exists and is not ours to write into.
-                connection.execute(
-                    """
-                    INSERT INTO sessions (id, state_json, updated_at, project_id)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        session.id,
-                        self._json(payload),
-                        session.updated_at,
-                        session.project_id,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise JobError("the session identity is already taken") from exc
-            bound = replace(
+            return self._bind_dispatch(
+                connection,
                 run,
-                status=JobRunStatus.RUNNING,
-                session_id=session.id,
-                chain_id=chain.id,
+                owner_token,
+                fencing_epoch,
+                moment,
+                declared=run.spec.steps,
+                condition_result=None,
             )
-            try:
-                cursor = connection.execute(
-                    """
-                    UPDATE job_runs
-                       SET status = ?, session_id = ?, chain_id = ?
-                     WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
-                       AND status = ? AND settled_at IS NULL
-                       AND session_id IS NULL AND chain_id IS NULL
-                       AND cancel_requested = 0
-                    """,
-                    (
-                        bound.status.value,
-                        session.id,
-                        chain.id,
-                        run_id,
-                        owner_token,
-                        fencing_epoch,
-                        run.status.value,
-                    ),
+
+    def bind_condition_true_dispatch(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> JobRunDispatch:
+        """Phase 2C. Bind ONE claimed watch to its ``on_true`` declaration.
+
+        The mirror image of ``bind_job_run_dispatch``: identical proof,
+        identical source-state and empty-slot requirements, identical one-
+        transaction session-plus-chain-plus-binding atomicity, built by the
+        SAME shared core - ``_bind_dispatch`` - so there is exactly one
+        implementation of what binding a generation means. The only two
+        differences are what it refuses and what it declares: this path
+        requires ``CONDITION_WATCH`` rather than refusing it, and the chain it
+        declares comes from ``JobSpec.on_true`` rather than ``JobSpec.steps``,
+        with ``condition_result = "true"`` persisted in the same write.
+
+        Whether the predicate really was TRUE is entirely the CALLER'S proof,
+        made before this is ever reached, over a hardened observation this
+        method never sees and never re-derives. Calling it is itself the only
+        authority a TRUE evaluation ever needed to carry.
+        """
+        moment = self._job_moment(now, "now").astimezone(timezone.utc)
+        with self._connection(write=True) as connection:
+            run = self._owned_run(connection, run_id)
+            self._held_lease(run, owner_token, fencing_epoch, moment)
+            if run.spec.kind is not JobKind.CONDITION_WATCH:
+                raise JobError(
+                    "only a condition watch may bind through this path"
                 )
-            except sqlite3.IntegrityError as exc:
-                # The unique partial index: this session already belongs to
-                # another generation. The whole transaction unwinds, so the
-                # session row inserted above never becomes durable.
-                raise JobError("that session is already bound to a generation") from exc
-            if cursor.rowcount != 1:
-                raise JobError("the caller does not hold this lease")
+            return self._bind_dispatch(
+                connection,
+                run,
+                owner_token,
+                fencing_epoch,
+                moment,
+                declared=run.spec.on_true,
+                condition_result=ConditionResult.TRUE.value,
+            )
+
+    def _bind_dispatch(
+        self,
+        connection: sqlite3.Connection,
+        run: JobRun,
+        owner_token: str,
+        fencing_epoch: int,
+        moment: datetime,
+        *,
+        declared: tuple,
+        condition_result: str | None,
+    ) -> JobRunDispatch:
+        """The one binding implementation both dispatch paths share.
+
+        Callers have already proved the lease and decided which declaration
+        and which ``condition_result`` this generation's kind permits; this
+        does the actual atomic create-session / declare-chain / bind / CAS,
+        identically either way.
+        """
+        run_id = run.id
+        if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
+            raise JobError("the generation is not dispatchable from its state")
+        if run.cancel_requested:
+            # Somebody asked for this occurrence to stop. Binding it would
+            # create the session, the chain and the RUNNING state whose
+            # only purpose would be to be cancelled again.
+            raise JobError("the generation has been asked to cancel")
+        if run.session_id is not None or run.chain_id is not None:
+            # Already bound. Refused rather than re-bound: a second session
+            # for one occurrence would be a second crossing of a connector
+            # boundary whose first crossing nobody has disproved.
+            raise JobError("the generation is already bound to a session")
+        # The project is re-proved HERE, inside the write transaction: a
+        # snapshot names the project the operator scheduled under, and a
+        # project archived since then must not gain a fresh session.
+        self._require_active_project(connection, run.spec.project_id)
+        chain = ChainState.declared(declared)
+        if chain is None:
+            # Unreachable through JobSpec, which already refuses a
+            # malformed declaration. Fail closed anyway rather than bind a
+            # session to a chain no authority stage would accept.
+            raise JobError("the snapshot declaration cannot form a chain")
+        session = SessionState(
+            objective=run.spec.label,
+            project_id=run.spec.project_id,
+            chain=chain,
+        )
+        payload = session.to_dict()
+        try:
+            # STRICT INSERT, no ON CONFLICT: a colliding session id is a
+            # session that already exists and is not ours to write into.
+            connection.execute(
+                """
+                INSERT INTO sessions (id, state_json, updated_at, project_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    session.id,
+                    self._json(payload),
+                    session.updated_at,
+                    session.project_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise JobError("the session identity is already taken") from exc
+        bound = replace(
+            run,
+            status=JobRunStatus.RUNNING,
+            session_id=session.id,
+            chain_id=chain.id,
+            condition_result=condition_result,
+        )
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                   SET status = ?, session_id = ?, chain_id = ?,
+                       condition_result = ?
+                 WHERE id = ? AND owner_token = ? AND fencing_epoch = ?
+                   AND status = ? AND settled_at IS NULL
+                   AND session_id IS NULL AND chain_id IS NULL
+                   AND cancel_requested = 0
+                """,
+                (
+                    bound.status.value,
+                    session.id,
+                    chain.id,
+                    condition_result,
+                    run_id,
+                    owner_token,
+                    fencing_epoch,
+                    run.status.value,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # The unique partial index: this session already belongs to
+            # another generation. The whole transaction unwinds, so the
+            # session row inserted above never becomes durable.
+            raise JobError("that session is already bound to a generation") from exc
+        if cursor.rowcount != 1:
+            raise JobError("the caller does not hold this lease")
         return JobRunDispatch(
             run_id=bound.id,
             job_id=bound.job_id,

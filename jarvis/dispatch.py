@@ -325,7 +325,13 @@ def _bound_state(store: Any, run: JobRun) -> tuple[Any, Any] | None:
         return None
     # The DECLARATION itself, not a digest of it: the chain must still be the
     # exact ordered steps the snapshot froze when the generation was recorded.
-    if tuple(chain.steps) != tuple(run.spec.steps):
+    # A ``CONDITION_WATCH`` was bound from its ``on_true`` declaration, never
+    # from ``steps`` - a watch's ``steps`` is always empty - so this asks the
+    # same question of the field that generation's kind actually declares.
+    declared = (
+        run.spec.on_true if run.spec.kind is JobKind.CONDITION_WATCH else run.spec.steps
+    )
+    if tuple(chain.steps) != tuple(declared):
         return None
     return session, chain
 
@@ -527,6 +533,76 @@ def dispatch_job_run(
         return DispatchOutcome(
             DISPATCH_REFUSED, f"not_bindable: {exc}", run=store.load_job_run(run_id)
         )
+    return _run_bound_dispatch(core, run_id, owner_token, fencing_epoch, dispatch, clock)
+
+
+def dispatch_condition_watch_true(
+    core: Any,
+    run_id: str,
+    owner_token: str,
+    fencing_epoch: int,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> DispatchOutcome:
+    """Bind a condition watch's TRUE declaration, run once, and reflect.
+
+    The phase-2C boundary, and the exact mirror of ``dispatch_job_run``: same
+    caller contract (a live fenced lease on a CLAIMED generation), same
+    binding-then-run-then-reflect order, same fail-closed tail - shared
+    outright as ``_run_bound_dispatch``, so a first ordinary dispatch and a
+    watch's TRUE dispatch cannot drift apart in anything but what they bind.
+
+    The one difference is the binding source: ``bind_condition_true_dispatch``
+    in place of ``bind_job_run_dispatch``, which binds ``JobSpec.on_true``
+    instead of ``JobSpec.steps`` and persists ``condition_result = "true"`` in
+    the same fenced transition.
+
+    THIS FUNCTION EVALUATES NOTHING. It must be called only after some other
+    caller has already asked the watch's predicate the question, over a
+    hardened observation this module never takes, and found it TRUE. A caller
+    that has not done that has no business calling this - binding is the
+    entire authority a TRUE answer ever carries, and it is spent exactly once,
+    because the underlying binding is immutable regardless of how many times
+    it is asked for.
+    """
+    store = core.memory
+    run = store.load_job_run(run_id)
+    if run is None:
+        return DispatchOutcome(DISPATCH_REFUSED, "unknown_generation")
+    if run.spec.kind is not JobKind.CONDITION_WATCH:
+        # The mirror refusal: an ordinary job's unconditional steps must never
+        # be bound through the watch's path, exactly as a watch's conditional
+        # declaration must never be bound through the ordinary one.
+        return DispatchOutcome(DISPATCH_REFUSED, "not_a_condition_watch", run=run)
+
+    try:
+        dispatch = store.bind_condition_true_dispatch(
+            run_id, owner_token, fencing_epoch, now=clock()
+        )
+    except JobError as exc:
+        return DispatchOutcome(
+            DISPATCH_REFUSED, f"not_bindable: {exc}", run=store.load_job_run(run_id)
+        )
+    return _run_bound_dispatch(core, run_id, owner_token, fencing_epoch, dispatch, clock)
+
+
+def _run_bound_dispatch(
+    core: Any,
+    run_id: str,
+    owner_token: str,
+    fencing_epoch: int,
+    dispatch: Any,
+    clock: Callable[[], datetime],
+) -> DispatchOutcome:
+    """Everything after a FRESH binding commits: re-prove, run once, reflect.
+
+    Shared by every caller that just bound a pristine session for the first
+    time. An ordinary dispatch and a condition watch's TRUE dispatch differ
+    only in what they bound and through which storage call; from the instant
+    the binding is committed the safety property - and every step of proving
+    it - is identical, so this is the ONE implementation of it.
+    """
+    store = core.memory
 
     # The binding is committed. From here the generation is durably RUNNING and
     # every exit leaves it that way unless a reflection is positively proved.
@@ -691,11 +767,13 @@ def recover_job_run(
         # Unreachable: the storage CAS required both. Proved again rather than
         # trusted, because everything below is about to be run on them.
         return _recovery_blocked("binding_missing", run)
-    if run.spec.kind is JobKind.CONDITION_WATCH:
-        # Also unreachable, since a watch can never have been bound. A watch
-        # declares what it would do IF its predicate held, and nothing in this
-        # phase evaluates one, so it fails closed here too.
-        return _recovery_blocked("condition_watch", run)
+    # PHASE 2C: a ``CONDITION_WATCH`` CAN be bound now - through
+    # ``bind_condition_true_dispatch``, after its predicate was found TRUE -
+    # so it is no longer refused here on sight. Nothing else about recovery
+    # changes for it: ``_bound_state`` re-proves an ``on_true``-declared
+    # binding by the same rule it always proved a ``steps``-declared one, and
+    # every check below - lease, routing, complete H2 history, cancellation -
+    # applies identically regardless of which declaration produced the chain.
     if (
         run.owner_token != owner_token
         or run.fencing_epoch != epoch

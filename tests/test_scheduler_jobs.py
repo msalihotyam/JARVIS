@@ -1481,14 +1481,25 @@ class ExecutionBoundaryTests(unittest.TestCase):
         # one-shot bridge. It is allowed to name the storage surface and is
         # separately proved - below and in the 2B1 suite - to reach no
         # approval, grant, billing, connector, attempt or condition authority.
-        # Nothing else may even mention it, so there is still no path that
-        # wakes on a due job or starts a worker on its own.
+        #
+        # Phase 2C adds a SECOND, narrower one: ``condition_watch.py`` may
+        # read a generation and settle an unbound watch - ``load_job_run`` and
+        # ``settle_job_run`` only (``load_job`` is allowed alongside it purely
+        # because it is a literal substring of ``load_job_run``, not a second
+        # name this module calls). Everything else in the surface stays
+        # forbidden to it, same as to everything but ``dispatch.py``.
         allowed = {"memory.py", "contracts.py", "dispatch.py"}
+        per_module_extra = {
+            "condition_watch.py": {"load_job", "load_job_run", "settle_job_run"}
+        }
         for module in self.production_modules():
             if module.name in allowed:
                 continue
             source = module.read_text(encoding="utf-8")
+            extra = per_module_extra.get(module.name, frozenset())
             for name in self.SURFACE:
+                if name in extra:
+                    continue
                 self.assertNotIn(name, source, f"{module.name} mentions {name}")
 
     def test_the_storage_surface_reaches_no_execution_authority(self) -> None:

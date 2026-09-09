@@ -1672,21 +1672,47 @@ class RecoveryAuthorityTests(unittest.TestCase):
         # A second copy of the outcome reading would be a second place for it
         # to drift, which is the same argument that gave storage exactly one
         # fenced transition helper.
+        #
+        # Phase 2C inserted ``_run_bound_dispatch`` between ``dispatch_job_run``
+        # and ``_reflect_outcome`` - shared with the new
+        # ``dispatch_condition_watch_true`` - so the reachability is now
+        # TRANSITIVE rather than a direct call. That is a STRONGER form of the
+        # same guarantee, not a weaker one: two entry points now share the
+        # whole post-binding tail, not merely its last step.
         import jarvis.dispatch as dispatch_module
 
         tree = ast.parse(inspect.getsource(dispatch_module))
-        for name in ("dispatch_job_run", "recover_job_run"):
-            node = next(
-                item
-                for item in tree.body
-                if isinstance(item, ast.FunctionDef) and item.name == name
-            )
-            calls = {
+        functions = {
+            item.name: item for item in tree.body if isinstance(item, ast.FunctionDef)
+        }
+
+        def called_names(node: ast.AST) -> set[str]:
+            return {
                 call.func.id
                 for call in ast.walk(node)
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
             }
-            self.assertIn("_reflect_outcome", calls, name)
+
+        def reaches_reflect_outcome(name: str, seen: set[str]) -> bool:
+            if name in seen or name not in functions:
+                return False
+            seen.add(name)
+            calls = called_names(functions[name])
+            return "_reflect_outcome" in calls or any(
+                reaches_reflect_outcome(callee, seen) for callee in calls
+            )
+
+        for name in (
+            "dispatch_job_run",
+            "recover_job_run",
+            "dispatch_condition_watch_true",
+        ):
+            self.assertTrue(reaches_reflect_outcome(name, set()), name)
+        # And the two DISPATCH entry points share the identical intermediate
+        # helper, not two that each happen to call ``_reflect_outcome`` on
+        # their own - the property this test is really guarding.
+        for name in ("dispatch_job_run", "dispatch_condition_watch_true"):
+            self.assertIn("_run_bound_dispatch", called_names(functions[name]), name)
 
     def test_the_recoverable_set_is_disjoint_from_the_claimable_one(self) -> None:
         self.assertEqual(

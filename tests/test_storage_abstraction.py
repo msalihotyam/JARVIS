@@ -136,6 +136,13 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 
+#: Mirrors ``jarvis.memory._PRESERVE_CONDITION_RESULT``: SQLite's own default
+#: for ``settle_job_run``'s ``condition_result`` preserves the run's existing
+#: value rather than nulling it, and the double must match that or a watch's
+#: TRUE record would survive in one store and vanish in the other the moment
+#: either settles it COMPLETED/FAILED/CANCELLED.
+_PRESERVE_CONDITION_RESULT = object()
+
 
 #: Ledger-relevant identity of a usage row; the storage-owned ``recorded_at``
 #: is excluded so an identical replay of the same attempt stays idempotent.
@@ -916,7 +923,7 @@ class InMemoryStore:
         *,
         now,
         blocking_code: str | None = None,
-        condition_result: str | None = None,
+        condition_result: str | None = _PRESERVE_CONDITION_RESULT,
     ) -> JobRun:
         if type(status) is not JobRunStatus:
             raise JobError("status is not an exact JobRunStatus")
@@ -929,11 +936,16 @@ class InMemoryStore:
         self._held_lease(run, owner_token, fencing_epoch, now)
         if run.status not in SETTLEABLE_JOB_RUN_STATUSES:
             raise JobError("the generation is not settleable from its state")
+        resolved_condition_result = (
+            run.condition_result
+            if condition_result is _PRESERVE_CONDITION_RESULT
+            else condition_result
+        )
         settled = dataclasses.replace(
             run,
             status=status,
             blocking_code=blocking_code,
-            condition_result=condition_result,
+            condition_result=resolved_condition_result,
             settled_at=now.isoformat(),
         )
         self.job_runs[run_id] = settled
@@ -993,27 +1005,55 @@ class InMemoryStore:
         # no replacement binding behind, so it must not be able to interleave
         # between the check and the writes.
         with self._lock:
-            return self._bind_job_run_dispatch_locked(
-                run_id, owner_token, fencing_epoch, now
+            run = self._owned_run(run_id)
+            self._held_lease(run, owner_token, fencing_epoch, now)
+            if run.spec.kind is JobKind.CONDITION_WATCH:
+                raise JobError("a condition watch is not dispatchable in this phase")
+            return self._bind_dispatch_locked(
+                run,
+                owner_token,
+                fencing_epoch,
+                declared=run.spec.steps,
+                condition_result=None,
             )
 
-    def _bind_job_run_dispatch_locked(
-        self, run_id, owner_token, fencing_epoch, now
+    def bind_condition_true_dispatch(
+        self, run_id, owner_token, fencing_epoch, *, now
     ) -> JobRunDispatch:
-        run = self._owned_run(run_id)
-        self._held_lease(run, owner_token, fencing_epoch, now)
+        """Phase 2C. The mirror of ``bind_job_run_dispatch`` for a watch's
+        TRUE declaration, sharing the same locked core and CAS discipline."""
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise JobError("now is not an aware datetime")
+        now = now.astimezone(timezone.utc)
+        with self._lock:
+            run = self._owned_run(run_id)
+            self._held_lease(run, owner_token, fencing_epoch, now)
+            if run.spec.kind is not JobKind.CONDITION_WATCH:
+                raise JobError("only a condition watch may bind through this path")
+            return self._bind_dispatch_locked(
+                run,
+                owner_token,
+                fencing_epoch,
+                declared=run.spec.on_true,
+                condition_result="true",
+            )
+
+    def _bind_dispatch_locked(
+        self, run, owner_token, fencing_epoch, *, declared, condition_result
+    ) -> JobRunDispatch:
+        """Called ONLY with ``self._lock`` already held. One binding
+        implementation, exactly as SQLite has one ``_bind_dispatch``."""
+        run_id = run.id
         if run.status not in DISPATCHABLE_JOB_RUN_STATUSES:
             raise JobError("the generation is not dispatchable from its state")
         if run.cancel_requested:
             raise JobError("the generation has been asked to cancel")
         if run.session_id is not None or run.chain_id is not None:
             raise JobError("the generation is already bound to a session")
-        if run.spec.kind is JobKind.CONDITION_WATCH:
-            raise JobError("a condition watch is not dispatchable in this phase")
         project = self.projects.get(run.spec.project_id)
         if project is None or not project.active:
             raise JobError(f"Unknown or inactive project: {run.spec.project_id}")
-        chain = ChainState.declared(run.spec.steps)
+        chain = ChainState.declared(declared)
         if chain is None:
             raise JobError("the snapshot declaration cannot form a chain")
         session = SessionState(
@@ -1039,6 +1079,7 @@ class InMemoryStore:
             status=JobRunStatus.RUNNING,
             session_id=session.id,
             chain_id=chain.id,
+            condition_result=condition_result,
         )
         return JobRunDispatch(
             run_id=run.id,
@@ -2302,6 +2343,30 @@ class SchedulerStorageParityTests(unittest.TestCase):
             ),
         )
 
+    def watch_spec(self, *, project_id: str = "proj-a") -> JobSpec:
+        """Phase 2C. A CONDITION_WATCH: a predicate and an on_true, no steps."""
+        from jarvis.conditions import ConditionKind, LocalReadCondition
+
+        return JobSpec(
+            project_id=project_id,
+            kind=JobKind.CONDITION_WATCH,
+            label="watch the notes",
+            schedule=Interval(anchor=self.NOW, every=timedelta(hours=1)),
+            condition=LocalReadCondition(
+                kind=ConditionKind.LOCAL_READ_SHA256_DIFFERS,
+                reference="notes.txt",
+                expected_sha256="a" * 64,
+            ),
+            on_true=(
+                ChainStep(
+                    objective="react",
+                    capability="echo",
+                    action="read",
+                    target="resource-a",
+                ),
+            ),
+        )
+
     def test_creation_is_a_record_of_intent_and_nothing_else(self) -> None:
         record = self.memory.create_job(self.spec(), now=self.NOW)
         self.assertEqual(1, record.revision)
@@ -2710,6 +2775,117 @@ class SchedulerStorageParityTests(unittest.TestCase):
                     "rebind",
                     refusal(
                         lambda: store.bind_job_run_dispatch(
+                            run.id, "worker-a", held.fencing_epoch, now=during
+                        )
+                    ),
+                )
+            )
+            trace.append(
+                (
+                    "reclaim_running",
+                    refusal(
+                        lambda: store.claim_job_run(
+                            run.id, "worker-b", now=expired, lease=lease
+                        )
+                    ),
+                )
+            )
+            return trace
+
+        self.assertEqual(script(self.memory), script(sqlite_store))
+
+    def test_condition_true_binding_matches_identically_in_both_stores(
+        self,
+    ) -> None:
+        # Phase 2C. The mirror of the test above, for ``bind_condition_true_
+        # dispatch``: the SAME fencing proof, the SAME CLAIMED-only source
+        # state, the SAME immutable single binding - built from ``on_true``
+        # rather than ``steps``, with ``condition_result = "true"`` persisted
+        # in the same transition. And the ordinary path still refuses a
+        # watch, exactly as the watch path refuses an ordinary job.
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.memory import SQLiteMemoryStore
+        from tests.helpers import safe_cleanup
+
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        sqlite_store = SQLiteMemoryStore(Path(temp.name) / "condition_binding.db")
+        sqlite_store.save_project(ProjectRecord(id="proj-a", name="Project A"))
+
+        lease = timedelta(minutes=5)
+        at = self.NOW + timedelta(hours=1)
+        during = at + timedelta(minutes=1)
+        expired = at + lease + timedelta(minutes=1)
+
+        def refusal(call) -> str:
+            try:
+                call()
+            except JobError:
+                return "refused"
+            return "ALLOWED"
+
+        def script(store) -> list:
+            trace: list = []
+            record = store.create_job(self.watch_spec(), now=self.NOW)
+            run = store.materialize_due_job_run(record.id, record.revision, now=at)
+            held = store.claim_job_run(run.id, "worker-a", now=at, lease=lease)
+            # The ordinary bind path refuses a watch outright.
+            trace.append(
+                (
+                    "ordinary_bind_refuses_watch",
+                    refusal(
+                        lambda: store.bind_job_run_dispatch(
+                            run.id, "worker-a", held.fencing_epoch, now=during
+                        )
+                    ),
+                )
+            )
+            for label, owner, epoch, when in (
+                ("wrong_owner", "worker-b", held.fencing_epoch, during),
+                ("stale_epoch", "worker-a", held.fencing_epoch - 1, during),
+                ("expired", "worker-a", held.fencing_epoch, expired),
+            ):
+                trace.append(
+                    (
+                        f"bind_{label}",
+                        refusal(
+                            lambda o=owner, e=epoch, w=when: store.bind_condition_true_dispatch(
+                                run.id, o, e, now=w
+                            )
+                        ),
+                    )
+                )
+            bound = store.bind_condition_true_dispatch(
+                run.id, "worker-a", held.fencing_epoch, now=during
+            )
+            after = store.load_job_run(run.id)
+            trace.append(
+                (
+                    "bound",
+                    after.status.value,
+                    after.session_id == bound.session_id,
+                    after.chain_id == bound.chain_id,
+                    after.condition_result,
+                    after.settled,
+                )
+            )
+            session = store.load_session(bound.session_id)
+            trace.append(
+                (
+                    "session",
+                    session.project_id,
+                    session.chain.id == bound.chain_id,
+                    session.chain.status.value,
+                    tuple(session.chain.steps) == tuple(run.spec.on_true),
+                )
+            )
+            trace.append(
+                (
+                    "rebind",
+                    refusal(
+                        lambda: store.bind_condition_true_dispatch(
                             run.id, "worker-a", held.fencing_epoch, now=during
                         )
                     ),

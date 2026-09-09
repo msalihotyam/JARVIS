@@ -8582,6 +8582,16 @@ class MemoryStore(Protocol):
         the mutation is compare-and-set on the owner, the epoch and the run
         still being open, so exactly one settler wins and a settled generation
         is never reopened. Only a settled status may be given.
+
+        A conforming store must PRESERVE the run's existing ``condition_result``
+        when a caller omits it, never default it to ``None``: a phase-2C
+        watch's TRUE record is written once, at bind time, and this same method
+        is what every job kind's later COMPLETED/FAILED/CANCELLED settlement
+        reaches through the shared reflection. A caller settling an ordinary
+        chain's durable status has no reason to know a predicate was ever
+        asked, and omitting the argument must not silently erase that record.
+        Pass an explicit value only to WRITE the result for the first time,
+        from an unbound FALSE/UNKNOWN watch.
         """
         ...
 
@@ -8684,12 +8694,51 @@ class MemoryStore(Protocol):
         so one session can never be shared by two occurrences.
 
         A ``CONDITION_WATCH`` generation is refused: its declaration is what it
-        would do IF a predicate held, and nothing in this phase evaluates one,
-        so dispatching it would run an unconditional chain the operator never
-        asked for unconditionally.
+        would do IF a predicate held, and nothing here evaluates one, so
+        dispatching it would run an unconditional chain the operator never
+        asked for unconditionally. ``bind_condition_true_dispatch`` is the
+        one path that may bind a watch, and only after its predicate was
+        found TRUE outside this store.
 
         Binding is not authority. It creates no approval, consumes no grant,
         opens no execution attempt, reserves no money and reaches no connector.
+        """
+        ...
+
+    def bind_condition_true_dispatch(
+        self,
+        run_id: str,
+        owner_token: str,
+        fencing_epoch: int,
+        *,
+        now: datetime,
+    ) -> "JobRunDispatch":
+        """Phase 2C. Bind ONE claimed watch to its ``on_true`` declaration.
+
+        The exact same contract as ``bind_job_run_dispatch`` - same proof,
+        same ``CLAIMED``-with-empty-slots source state, same one-transaction
+        session-plus-chain-plus-binding-plus-``CLAIMED -> RUNNING`` atomicity,
+        same immutable single binding - with two differences and nothing else.
+
+        First, the chain this store must declare is built from
+        ``JobSpec.on_true``, never ``JobSpec.steps``: a watch declares no
+        unconditional step, so there is nothing else a chain could be built
+        from. Second, this same transaction persists ``condition_result =
+        "true"`` alongside the binding - the durable record that a predicate
+        was asked and answered TRUE, made in the SAME atomic write as the one
+        opportunity that answer ever buys, so no observer can see one without
+        the other.
+
+        A conforming store must refuse any kind other than ``CONDITION_WATCH``
+        - the mirror image of ``bind_job_run_dispatch``'s own refusal, and for
+        the same reason: an ordinary job's unconditional steps must never be
+        bound through the watch's path, exactly as a watch's conditional
+        declaration must never be bound through the ordinary one.
+
+        THIS METHOD DOES NOT EVALUATE ANYTHING. Whether the predicate was
+        really TRUE is entirely the caller's proof, made before this is ever
+        called, over a hardened observation this store never sees. Calling it
+        is itself the only authority a TRUE evaluation ever needed to carry.
         """
         ...
 

@@ -719,12 +719,21 @@ class BoundaryTests(FenceTestCase):
     def test_only_the_one_shot_bridge_calls_the_fenced_operations(self) -> None:
         # ``memory.py`` defines them, ``contracts.py`` declares them on the
         # provider-independent protocol, and from phase 2B1 ``dispatch.py``
-        # calls them - it is the ONE production caller, and it is a callable
-        # boundary rather than anything that runs by itself. Nothing else may
-        # even mention them.
-        allowed = {"memory.py", "contracts.py", "dispatch.py"}
+        # calls them - it is a callable boundary rather than anything that
+        # runs by itself.
+        #
+        # Phase 2C added a SECOND, narrower caller for exactly ONE of the
+        # four: ``condition_watch.py`` may settle an unbound watch SKIPPED
+        # with its predicate's own FALSE/UNKNOWN result, because that
+        # generation was never bound and ``dispatch.py``'s bridge has nothing
+        # to bind. It gains none of the other three - binding a watch's TRUE
+        # declaration still runs through ``dispatch.py`` alone, via
+        # ``bind_condition_true_dispatch`` - so each is checked against its
+        # own allowed set rather than one set for all four.
+        universal = {"memory.py", "contracts.py", "dispatch.py"}
+        also_allowed = {"settle_job_run": {"condition_watch.py"}}
         for module in self.production_modules():
-            if module.name in allowed:
+            if module.name in universal:
                 continue
             source = module.read_text(encoding="utf-8")
             for name in (
@@ -733,6 +742,8 @@ class BoundaryTests(FenceTestCase):
                 "await_job_run_approval",
                 "bind_job_run_dispatch",
             ):
+                if module.name in also_allowed.get(name, frozenset()):
+                    continue
                 self.assertNotIn(name, source, f"{module.name} mentions {name}")
 
     def test_the_one_shot_bridge_holds_no_execution_authority(self) -> None:

@@ -510,21 +510,36 @@ class OrphanSurfaceTests(unittest.TestCase):
         #
         # The predicate is stated where the row is actually written, in every
         # place that could hand a flagged generation a future.
+        #
+        # Phase 2C's ``bind_job_run_dispatch`` and ``bind_condition_true_
+        # dispatch`` both delegate their actual CAS to ONE shared
+        # ``_bind_dispatch`` core rather than each stating it themselves - a
+        # consolidation, not a weakening: the predicate is enforced
+        # identically for both bind paths because there is exactly one
+        # implementation of it. A gate that delegates is therefore checked
+        # against the source it ACTUALLY runs, not merely its own body.
         import inspect
 
         from jarvis.memory import SQLiteMemoryStore
 
+        def names_the_predicate(name: str) -> bool:
+            source = inspect.getsource(getattr(SQLiteMemoryStore, name))
+            if "cancel_requested = 0" in source:
+                return True
+            if "self._bind_dispatch(" in source:
+                return "cancel_requested = 0" in inspect.getsource(
+                    SQLiteMemoryStore._bind_dispatch
+                )
+            return False
+
         for name in (
-            "claim_job_run",            # no new owner
-            "bind_job_run_dispatch",    # no session, no chain, no RUNNING
-            "request_job_run_cancel",   # the flag itself, set exactly once
+            "claim_job_run",              # no new owner
+            "bind_job_run_dispatch",      # no session, no chain, no RUNNING
+            "bind_condition_true_dispatch",  # the watch's mirror gate
+            "request_job_run_cancel",     # the flag itself, set exactly once
         ):
             with self.subTest(gate=name):
-                self.assertIn(
-                    "cancel_requested = 0",
-                    inspect.getsource(getattr(SQLiteMemoryStore, name)),
-                    name,
-                )
+                self.assertTrue(names_the_predicate(name), name)
         # And the execution claim - the last instant before the connector
         # boundary - asks the question in the transaction that crosses it.
         claim = inspect.getsource(SQLiteMemoryStore.begin_execution)

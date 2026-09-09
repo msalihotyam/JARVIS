@@ -2054,7 +2054,12 @@ class DispatchBoundaryTests(DispatchTestCase):
         # recovery boundary - never through the claim path, which still cannot
         # reach a bound generation at all.
         self.assertNotIn("claim", self.code())
-        # The public callables are exactly the two phase entry points.
+        # The public callables are exactly the phase entry points. Phase 2C
+        # added ONE: ``dispatch_condition_watch_true``, the mirror of
+        # ``dispatch_job_run`` for a watch's TRUE binding. It evaluates
+        # nothing - the forbidden-substring checks above and the module's own
+        # boundary tests still cover it, since they scan the whole module
+        # rather than any one function.
         tree = ast.parse(source)
         public = {
             node.name
@@ -2062,7 +2067,13 @@ class DispatchBoundaryTests(DispatchTestCase):
             if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
         }
         self.assertEqual(
-            {"dispatch_job_run", "recover_job_run", "cancel_job_run"}, public
+            {
+                "dispatch_job_run",
+                "recover_job_run",
+                "cancel_job_run",
+                "dispatch_condition_watch_true",
+            },
+            public,
         )
 
     def test_cancellation_touches_only_authorities_that_already_exist(self) -> None:
