@@ -5,12 +5,21 @@
 
 .USAGE
   .\dev.ps1 new <worker> <task>       create task worktree + branch from current canonical main HEAD
-  .\dev.ps1 finish <worker> <task>    cherry-pick committed task into canonical main, then cleanup
+  .\dev.ps1 finish <worker> <task>    cherry-pick committed task into canonical main (worktree/branch KEPT)
   .\dev.ps1 finish-current            finish from inside the current helper-managed task worktree
-  .\dev.ps1 cleanup <worker> <task>   remove an already INTEGRATED task worktree + branch
+  .\dev.ps1 cleanup <worker> <task>   SEPARATE explicit step: remove an already INTEGRATED task
+                                      worktree + branch - run only after rebinding the persistent
+                                      Claude development chat to the canonical repository
   .\dev.ps1 status                    list helper-managed tasks (read-only)
 
   workers: glm, claude.  task: lowercase slug such as gmail or scheduler-core.
+
+  HARD LIFECYCLE RULE (see JARVIS_RUNBOOK.md): finish / finish-current never
+  remove the worktree or delete the task branch - integration and destructive
+  cleanup are always two separate, explicit invocations. This script cannot
+  observe whether the persistent Claude development chat has been rebound to
+  the canonical repository; that rebind is a human/Claude step outside the
+  helper and is required, as policy, before running cleanup.
 
 .THREAT MODEL (adjudicated; do not reopen)
   IN SCOPE: stale/corrupt helper state, corruption of one helper artifact,
@@ -45,6 +54,10 @@
   uncommitted/dirty worktree content. Worktree removal and branch deletion are
   separate safety events; integration success and cleanup success are separate
   outcomes; CLEANED is printed only when the ENTIRE cleanup completed safely.
+  Integration and cleanup are additionally separate COMMANDS: `finish` /
+  `finish-current` never call the deletion stage, so a task cannot be
+  integrated and deleted in one invocation. `cleanup` is the only command
+  that removes anything, and it is always a fresh, explicit invocation.
 
   Metadata lives under the shared git dir (dev-helper/tasks/<worker>/<task>.json)
   and is never a tracked repository file.
@@ -951,11 +964,14 @@ function Get-MarkerlessCleanupRefusal {
 }
 
 function Invoke-CleanupCore {
-    # Deletion stage; both finish's automatic cleanup and explicit cleanup
-    # reach it. Throws 'CLEANUP DEFERRED: ...' / 'RECOVERY REQUIRED: ...' /
-    # plain refusals; returns only on full success. There is intentionally NO
-    # manual recursive-delete path, no force removal, and no unconditional
-    # branch deletion anywhere.
+    # Deletion stage. Reached ONLY by the explicit `cleanup` command - `finish`
+    # / `finish-current` integrate and stop, and never call this (the hard
+    # worktree lifecycle rule: integration and destructive cleanup are always
+    # two separate, explicit operations; see JARVIS_RUNBOOK.md). Throws
+    # 'CLEANUP DEFERRED: ...' / 'RECOVERY REQUIRED: ...' / plain refusals;
+    # returns only on full success. There is intentionally NO manual
+    # recursive-delete path, no force removal, and no unconditional branch
+    # deletion anywhere.
     param($ctx, $identity, [string]$MetaPath)
     $wt = $identity.WorktreePath
     if (Test-SamePath $wt $ctx.MainPath) { throw 'cleanup refused: derived worktree path is the canonical repository' }
@@ -1090,7 +1106,6 @@ function Invoke-FinishTask {
     Assert-Worker -Worker $Worker
     Assert-TaskSlug -Task $Task
     $ctx = Get-CanonicalContext
-    $invocationCwd = ConvertTo-NormalPath -Value (Get-Location).ProviderPath -Base (Get-Location).ProviderPath
     $identity = Get-DerivedTaskIdentity -ctx $ctx -Worker $Worker -Task $Task
     if (Test-SamePath $identity.WorktreePath $ctx.MainPath) { throw 'finish refused: derived worktree path is the canonical repository' }
     $meta = Read-TaskMeta -ctx $ctx -identity $identity
@@ -1218,34 +1233,19 @@ function Invoke-FinishTask {
     Write-Host 'INTEGRATED'
     Write-Host "  main  : $newHead"
 
-    # Integration success and cleanup success are separate outcomes.
-    $cleanupOutcome = ''
-    try {
-        Invoke-CleanupCore -ctx $ctx -identity $identity -MetaPath $identity.MetaPath
-        $cleanupOutcome = 'CLEANED'
-    }
-    catch {
-        $cleanupOutcome = $_.Exception.Message
-    }
-    if ($cleanupOutcome -eq 'CLEANED') {
-        Write-Host 'CLEANED'
-        if ($invocationCwd -and ($invocationCwd -eq $wt -or $invocationCwd.StartsWith("$wt\", [System.StringComparison]::OrdinalIgnoreCase))) {
-            Write-Host '  note  : your previous working directory was inside the removed worktree - move your session to the canonical repo or a new task worktree'
-        }
-    }
-    elseif ($cleanupOutcome -like 'CLEANUP INCOMPLETE*') {
-        # Git-visible cleanup completed; only an empty folder remains. There
-        # is nothing left for `cleanup` to do, so no retry hint is printed.
-        Write-Host $cleanupOutcome
-    }
-    elseif ($cleanupOutcome -like 'CLEANUP DEFERRED*' -or $cleanupOutcome -like 'RECOVERY REQUIRED*') {
-        Write-Host $cleanupOutcome
-        Write-Host "  later : .\dev.ps1 cleanup $Worker $Task"
-    }
-    else {
-        Write-Host "CLEANUP DEFERRED: $cleanupOutcome"
-        Write-Host "  later : .\dev.ps1 cleanup $Worker $Task"
-    }
+    # HARD LIFECYCLE RULE (see JARVIS_RUNBOOK.md): integration and destructive
+    # cleanup are separate, explicit operations. `finish` / `finish-current`
+    # NEVER remove the worktree or delete the task branch. Metadata is marked
+    # INTEGRATED above so the separate `cleanup` command can act on it, but
+    # nothing here calls the deletion stage - the worktree and branch are
+    # left exactly as integration left them, for a human/Claude to inspect
+    # and rebind their chat before anything is removed.
+    Write-Host 'WORKTREE KEPT - cleanup is a separate, explicit step; it does NOT run automatically.'
+    Write-Host '  gate  : before running cleanup, rebind the persistent Claude development chat to'
+    Write-Host "          $($ctx.MainPath)"
+    Write-Host '          (this script cannot observe or verify that rebind - it is a human/Claude'
+    Write-Host '          step outside the helper; see JARVIS_RUNBOOK.md)'
+    Write-Host "  next  : .\dev.ps1 cleanup $Worker $Task"
 }
 
 function Find-TaskMetaByDerivedWorktree {
@@ -1385,13 +1385,15 @@ function Invoke-Status {
 function Show-Usage {
     Write-Host 'usage:'
     Write-Host '  .\dev.ps1 new <worker> <task>       create task worktree from current main HEAD'
-    Write-Host '  .\dev.ps1 finish <worker> <task>    integrate committed task into main, then cleanup'
+    Write-Host '  .\dev.ps1 finish <worker> <task>    integrate committed task into main (worktree/branch KEPT)'
     Write-Host '  .\dev.ps1 finish-current            finish from inside the current helper task worktree'
-    Write-Host '  .\dev.ps1 cleanup <worker> <task>   remove an already integrated worktree + branch'
+    Write-Host '  .\dev.ps1 cleanup <worker> <task>   SEPARATE step: remove an already integrated worktree + branch'
     Write-Host '  .\dev.ps1 status                    list helper-managed tasks (read-only)'
     Write-Host 'workers: glm, claude'
     Write-Host "finish/finish-current/cleanup require $Script:HandoffEnvVar to equal the"
     Write-Host 'task handoff token printed by status (exclusive handoff precondition).'
+    Write-Host 'finish/finish-current never delete the worktree or branch; run cleanup as a'
+    Write-Host 'separate step, only after rebinding the persistent Claude chat to canonical main.'
 }
 
 function Invoke-DevMain {

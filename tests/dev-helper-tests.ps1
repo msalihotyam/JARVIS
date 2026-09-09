@@ -327,7 +327,8 @@ Check 'new non-main canonical: exit 1' ($r.Code -eq 1)
 Write-Host '== FINISH =='
 # ============================================================================
 
-# T8: clean committed task cherry-picks into main, cleanup succeeds
+# T8: clean committed task cherry-picks into main; finish KEEPS the worktree
+# and branch (hard lifecycle rule); a separate explicit cleanup removes them.
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-fix1'
@@ -336,16 +337,57 @@ CommitFile $wt 'task.txt' @('hello') 'add task file'
 $r = Run-Dev $canon @('finish', 'glm', 'fix1')
 Check 'finish happy: exit 0' ($r.Code -eq 0)
 Check 'finish happy: INTEGRATED' ($r.Out -match 'INTEGRATED')
-Check 'finish happy: CLEANED' ($r.Out -match 'CLEANED')
+Check 'finish happy: not CLEANED (separate step)' ($r.Out -notmatch 'CLEANED')
 Check 'finish happy: not deferred' ($r.Out -notmatch 'CLEANUP DEFERRED')
 Check 'finish happy: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'hello')
-Check 'finish happy: worktree removed' (-not (Test-Path -LiteralPath $wt))
-$branchGone = $true
-try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/fix1'); $branchGone = $false } catch { $branchGone = $true }
-Check 'finish happy: branch gone from refs' $branchGone
-Check 'finish happy: metadata removed' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix1')))
+Check 'finish happy: worktree kept' (Test-Path -LiteralPath $wt)
+$branchKept = $false
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/fix1'); $branchKept = $true } catch { }
+Check 'finish happy: branch kept in refs' $branchKept
+Check 'finish happy: metadata kept, INTEGRATED' ((Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix1') -Raw | ConvertFrom-Json).state -eq 'INTEGRATED')
 $st = GitOut $canon @('status', '--porcelain')
 Check 'finish happy: main clean' ([string]::IsNullOrWhiteSpace($st))
+
+# T8b: the separate, explicit cleanup step then removes worktree + branch.
+$r = Run-Dev $canon @('cleanup', 'glm', 'fix1')
+Check 'cleanup after finish happy: exit 0' ($r.Code -eq 0)
+Check 'cleanup after finish happy: CLEANED' ($r.Out -match 'CLEANED')
+Check 'cleanup after finish happy: worktree removed' (-not (Test-Path -LiteralPath $wt))
+$branchGone = $true
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/fix1'); $branchGone = $false } catch { $branchGone = $true }
+Check 'cleanup after finish happy: branch gone from refs' $branchGone
+Check 'cleanup after finish happy: metadata removed' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix1')))
+
+# T8c: HARDENING - the property this suite exists to prove. A worktree can
+# never be integrated and deleted in one forgotten step: `finish` integrates
+# and stops, states the required chat-rebind gate and the exact next
+# command, and only a genuinely separate, later `cleanup` invocation removes
+# anything.
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = Join-Path $root 'JARVIS-GLM-hard1'
+$null = Run-Dev $canon @('new', 'glm', 'hard1')
+CommitFile $wt 'task.txt' @('hardening') 'hardening task'
+$r = Run-Dev $canon @('finish', 'glm', 'hard1')
+Check 'hardening: finish exit 0' ($r.Code -eq 0)
+Check 'hardening: finish never prints CLEANED' ($r.Out -notmatch 'CLEANED')
+Check 'hardening: finish states cleanup is a separate step' ($r.Out -match 'separate, explicit step')
+Check 'hardening: finish states the chat-rebind gate' ($r.Out -match 'rebind the persistent Claude development chat')
+Check 'hardening: finish names the canonical repository path' ($r.Out -match [regex]::Escape($canon))
+Check 'hardening: finish names the exact next cleanup command' ($r.Out -match 'cleanup glm hard1')
+Check 'hardening: worktree exists after finish' (Test-Path -LiteralPath $wt)
+$branchKept = $false
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/hard1'); $branchKept = $true } catch { }
+Check 'hardening: branch exists after finish' $branchKept
+Check 'hardening: metadata is INTEGRATED after finish' ((Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'hard1') -Raw | ConvertFrom-Json).state -eq 'INTEGRATED')
+# cleanup is a genuinely separate, later command: only calling it removes
+# anything.
+$r = Run-Dev $canon @('cleanup', 'glm', 'hard1')
+Check 'hardening: explicit cleanup exit 0' ($r.Code -eq 0)
+Check 'hardening: explicit cleanup removes the worktree' (-not (Test-Path -LiteralPath $wt))
+$branchGone = $true
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/hard1'); $branchGone = $false } catch { $branchGone = $true }
+Check 'hardening: explicit cleanup removes the branch' $branchGone
 
 # T9: main may advance after task creation; task still integrates
 $root = New-TempRoot
@@ -442,18 +484,18 @@ Check 'finish conflict: branch kept' $branchKept
 $meta = Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix8') -Raw | ConvertFrom-Json
 Check 'finish conflict: metadata kept ACTIVE' ($meta.state -eq 'ACTIVE')
 
-# T16: deterministic lock seam - integration succeeds, cleanup deferred
+# T16: deterministic lock seam - integration succeeds; the SEPARATE explicit
+# cleanup step can defer, then a later explicit cleanup retry succeeds. The
+# force-deferred env var only affects Remove-WorktreeDir, which now runs
+# exclusively inside `cleanup` - finish no longer touches it at all.
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-fix9'
 $null = Run-Dev $canon @('new', 'glm', 'fix9')
 CommitFile $wt 'task.txt' @('deferred') 'deferred task'
-$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
 $r = Run-Dev $canon @('finish', 'glm', 'fix9')
-$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
 Check 'finish deferred: exit 0' ($r.Code -eq 0)
 Check 'finish deferred: INTEGRATED' ($r.Out -match 'INTEGRATED')
-Check 'finish deferred: CLEANUP DEFERRED' ($r.Out -match 'CLEANUP DEFERRED')
 Check 'finish deferred: hints cleanup command' ($r.Out -match 'cleanup glm fix9')
 Check 'finish deferred: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'deferred')
 Check 'finish deferred: worktree kept' (Test-Path -LiteralPath $wt)
@@ -465,6 +507,17 @@ Check 'finish deferred: state INTEGRATED' ($meta.state -eq 'INTEGRATED')
 $intHead = $meta.integratedHead
 Check 'finish deferred: integration HEAD recorded' ($intHead -ne $null -and $intHead -ne '')
 Check 'status deferred: shows INTEGRATED' ((Run-Dev $canon @('status')).Out -match 'INTEGRATED')
+
+$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
+$r = Run-Dev $canon @('cleanup', 'glm', 'fix9')
+$env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
+Check 'cleanup deferred: exit 1' ($r.Code -eq 1)
+Check 'cleanup deferred: CLEANUP DEFERRED' ($r.Out -match 'CLEANUP DEFERRED')
+Check 'cleanup deferred: worktree kept' (Test-Path -LiteralPath $wt)
+$branchKept = $false
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/fix9'); $branchKept = $true } catch { }
+Check 'cleanup deferred: branch kept' $branchKept
+
 $r = Run-Dev $canon @('cleanup', 'glm', 'fix9')
 Check 'cleanup after deferred: exit 0' ($r.Code -eq 0)
 Check 'cleanup after deferred: CLEANED' ($r.Out -match 'CLEANED')
@@ -475,29 +528,38 @@ Check 'cleanup after deferred: branch gone' $branchGone
 Check 'cleanup after deferred: metadata gone' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix9')))
 
 # T17: real Windows file lock held by another process
+# Finish no longer attempts cleanup (hard lifecycle rule: integration and
+# destructive cleanup are always separate, explicit invocations), so the
+# lock is now held during the SEPARATE, explicit `cleanup` call instead of
+# during `finish` - that is the step it can actually affect.
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-fix10'
 $null = Run-Dev $canon @('new', 'glm', 'fix10')
 CommitFile $wt 'README.md' @('task version') 'task edits readme'
+$r = Run-Dev $canon @('finish', 'glm', 'fix10')
+Check 'finish real lock: exit 0' ($r.Code -eq 0)
+Check 'finish real lock: INTEGRATED' ($r.Out -match 'INTEGRATED')
+Check 'finish real lock: worktree kept (cleanup is separate)' (Test-Path -LiteralPath $wt)
+Check 'finish real lock: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'README.md') -Raw).Trim() -eq 'task version')
+$meta = Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix10') -Raw | ConvertFrom-Json
+Check 'finish real lock: state INTEGRATED' ($meta.state -eq 'INTEGRATED')
+
 # Realistic lock: another process holds README.md open so it cannot be
 # DELETED, but git can still read it (e.g. an editor or ZCode session).
 $lock = [System.IO.File]::Open((Join-Path $wt 'README.md'), 'Open', 'Read', 'Read')
 try {
-    $r = Run-Dev $canon @('finish', 'glm', 'fix10')
+    $r = Run-Dev $canon @('cleanup', 'glm', 'fix10')
 } finally {
     $lock.Close()
 }
-Check 'finish real lock: exit 0' ($r.Code -eq 0)
-Check 'finish real lock: INTEGRATED' ($r.Out -match 'INTEGRATED')
-Check 'finish real lock: CLEANUP DEFERRED' ($r.Out -match 'CLEANUP DEFERRED')
-Check 'finish real lock: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'README.md') -Raw).Trim() -eq 'task version')
-$meta = Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix10') -Raw | ConvertFrom-Json
-Check 'finish real lock: state INTEGRATED' ($meta.state -eq 'INTEGRATED')
+Check 'cleanup real lock: exit 1' ($r.Code -eq 1)
+Check 'cleanup real lock: CLEANUP DEFERRED' ($r.Out -match 'CLEANUP DEFERRED')
 # git partially removed the worktree: dir remains but git deregistered it.
 # The helper never deletes that unregistered leftover itself.
-Check 'finish real lock: leftover folder kept' (Test-Path -LiteralPath $wt)
-Check 'finish real lock: locked file byte-for-byte' ((Get-Content -LiteralPath (Join-Path $wt 'README.md') -Raw).Trim() -eq 'task version')
+Check 'cleanup real lock: leftover folder kept' (Test-Path -LiteralPath $wt)
+Check 'cleanup real lock: locked file byte-for-byte' ((Get-Content -LiteralPath (Join-Path $wt 'README.md') -Raw).Trim() -eq 'task version')
+
 $r = Run-Dev $canon @('cleanup', 'glm', 'fix10')
 Check 'cleanup real lock leftover: exit 1' ($r.Code -eq 1)
 # Goal C: the deregistered-but-non-empty leftover is reported as a recovery
@@ -628,12 +690,19 @@ $r = Run-Dev $wt @('finish-current')
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
 Check 'finish-current happy: exit 0' ($r.Code -eq 0)
 Check 'finish-current happy: INTEGRATED' ($r.Out -match 'INTEGRATED')
-Check 'finish-current happy: CLEANED' ($r.Out -match 'CLEANED')
+Check 'finish-current happy: not CLEANED (separate step)' ($r.Out -notmatch 'CLEANED')
 Check 'finish-current happy: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'fc1 change')
-Check 'finish-current happy: worktree removed' (-not (Test-Path -LiteralPath $wt))
-Check 'finish-current happy: metadata gone' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fc1')))
+Check 'finish-current happy: worktree kept' (Test-Path -LiteralPath $wt)
+Check 'finish-current happy: metadata kept, INTEGRATED' ((Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fc1') -Raw | ConvertFrom-Json).state -eq 'INTEGRATED')
 $st = GitOut $canon @('status', '--porcelain')
 Check 'finish-current happy: main clean' ([string]::IsNullOrWhiteSpace($st))
+
+# T23b: the separate, explicit cleanup step then removes worktree + branch.
+$r = Run-Dev $canon @('cleanup', 'glm', 'fc1')
+Check 'cleanup after finish-current happy: exit 0' ($r.Code -eq 0)
+Check 'cleanup after finish-current happy: CLEANED' ($r.Out -match 'CLEANED')
+Check 'cleanup after finish-current happy: worktree removed' (-not (Test-Path -LiteralPath $wt))
+Check 'cleanup after finish-current happy: metadata gone' (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fc1')))
 
 # T24: finish-current refuses the canonical main worktree
 $root = New-TempRoot
@@ -693,7 +762,9 @@ $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker '
 $r = Run-Dev (Join-Path $wt 'src\deep') @('finish-current')
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
 Check 'finish-current subdir: exit 0' ($r.Code -eq 0)
-Check 'finish-current subdir: CLEANED' ($r.Out -match 'CLEANED')
+Check 'finish-current subdir: INTEGRATED' ($r.Out -match 'INTEGRATED')
+$r = Run-Dev $canon @('cleanup', 'glm', 'fc5')
+Check 'cleanup after finish-current subdir: CLEANED' ($r.Out -match 'CLEANED')
 
 # T29: deferred cleanup path is prompt-free (no y/n questions anywhere)
 $root = New-TempRoot
@@ -992,8 +1063,12 @@ Check 'B2 cleanup TOCTOU: gate noticed ref change' ($r.Out -match 'task branch r
 Check 'B2 cleanup TOCTOU: late commit survives' ((Get-Content -LiteralPath (Join-Path $wt 'late.txt') -Raw).Trim() -eq 'late work')
 Check 'B2 cleanup TOCTOU: worktree kept' (Test-Path -LiteralPath $wt)
 Check 'B2 cleanup TOCTOU: metadata kept' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'toc'))
-# finish automatic-cleanup path: integration succeeds, the gate refuses, so
-# finish reports the ref change truthfully and the late commit survives.
+# finish no longer HAS an automatic-cleanup path to race: the hard lifecycle
+# rule means Invoke-FinishTask never reaches Invoke-CleanupCore, so the TOCTOU
+# scenario above (which lives entirely inside the destructive gate) cannot
+# recur through finish at all. Proven directly - the pre-delete hook must
+# never fire from finish - rather than duplicating the cleanup-path TOCTOU
+# test above with an entry point that can no longer reach it.
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-tof'
@@ -1002,14 +1077,14 @@ CommitFile $wt 'task.txt' @('tof work') 'tof work'
 $driverPath = Join-Path $root 'driver-finish.ps1'
 @'
 . '__DEVPS__'
+$script:hookFired = $false
 function Invoke-PreDeleteTestHook {
     param($ctx, $identity, $meta)
-    Set-Content -LiteralPath (Join-Path $identity.WorktreePath 'late.txt') -Value 'late work'
-    & git -C $identity.WorktreePath add late.txt
-    & git -C $identity.WorktreePath commit -m 'late commit' | Out-Null
+    $script:hookFired = $true
 }
 try {
     Invoke-FinishTask -Worker 'glm' -Task 'tof'
+    if ($script:hookFired) { Write-Host 'HOOK-FIRED-UNEXPECTEDLY'; exit 1 }
     exit 0
 }
 catch {
@@ -1020,13 +1095,15 @@ catch {
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'tof'
 $r = Run-Driver $driverPath $canon
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
-Check 'B2 finish TOCTOU: integration still succeeded' ($r.Out -match 'INTEGRATED')
-Check 'B2 finish TOCTOU: deferred, not deleted' ($r.Out -match 'CLEANUP DEFERRED')
-Check 'B2 finish TOCTOU: gate noticed ref change' ($r.Out -match 'task branch ref changed since integration')
-Check 'B2 finish TOCTOU: late commit survives' ((Get-Content -LiteralPath (Join-Path $wt 'late.txt') -Raw).Trim() -eq 'late work')
-Check 'B2 finish TOCTOU: worktree kept' (Test-Path -LiteralPath $wt)
+Check 'B2 finish never reaches cleanup: exit 0' ($r.Code -eq 0)
+Check 'B2 finish never reaches cleanup: integration succeeded' ($r.Out -match 'INTEGRATED')
+Check 'B2 finish never reaches cleanup: pre-delete hook never fired' ($r.Out -notmatch 'HOOK-FIRED-UNEXPECTEDLY')
+Check 'B2 finish never reaches cleanup: worktree kept' (Test-Path -LiteralPath $wt)
+$branchKept = $false
+try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/tof'); $branchKept = $true } catch { }
+Check 'B2 finish never reaches cleanup: branch kept' $branchKept
 $meta = Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'tof') -Raw | ConvertFrom-Json
-Check 'B2 finish TOCTOU: metadata INTEGRATED' ($meta.state -eq 'INTEGRATED')
+Check 'B2 finish never reaches cleanup: metadata INTEGRATED' ($meta.state -eq 'INTEGRATED')
 
 # B3: exact-name unmanaged worktree with otherwise-valid forged metadata and
 # NO ownership marker is refused everywhere.
@@ -1941,9 +2018,13 @@ function Test-BranchExists {
     try { $null = GitOut $Canon @('rev-parse', '--verify', "refs/heads/$Branch"); return $true } catch { return $false }
 }
 
-# --- W1/W2/W3: finish-current from INSIDE the worktree relocates first ------
-# The helper must move its own process out of the target before removal, and
-# the ordinary Windows removal path must then complete.
+# --- W1/W2/W3: cleanup, run from INSIDE the worktree, relocates first -------
+# finish-current no longer reaches the destructive stage (hard lifecycle
+# rule), so the relocation-before-removal proof now belongs to `cleanup`
+# alone. The driver still calls Invoke-FinishCurrent first - from inside the
+# worktree, exactly as a real handoff would - then calls Invoke-CleanupTask
+# for the SAME task while still standing inside it, which is precisely the
+# scenario the relocation logic exists to handle.
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-w1'
@@ -1963,11 +2044,13 @@ function Invoke-PreDeleteTestHook {
     Write-Host "RELOC-SAFE=$([bool]($ps -eq $ctx.MainPath -and $net -eq $ctx.MainPath))"
 }
 Invoke-FinishCurrent
+Invoke-CleanupTask -Worker 'glm' -Task 'w1'
 '@ -replace '__DEVPS__', $DevPs | Set-Content -LiteralPath $driverPath -Encoding UTF8
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = Get-TaskHandoffToken -Canon $canon -Worker 'glm' -Task 'w1'
 $r = Run-Driver $driverPath $wt
 $env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
 Check 'W1 finish-current from inside: exit 0' ($r.Code -eq 0)
+Check 'W1 finish-current from inside: INTEGRATED' ($r.Out -match 'INTEGRATED')
 Check 'W2 relocated out of the target before removal' ($r.Out -match 'RELOC-INSIDE=False')
 Check 'W2 relocated to the canonical repository' ($r.Out -match 'RELOC-SAFE=True')
 Check 'W3 windows removal path: CLEANED' ($r.Out -match 'CLEANED')
@@ -2262,9 +2345,13 @@ $null = Run-Dev $canon @('new', 'glm', 'w17')
 CommitFile $wt 'task.txt' @('w17 change') 'w17 work'
 $r = Run-Dev $canon @('finish', 'glm', 'w17')
 Check 'W17 normal finish: exit 0' ($r.Code -eq 0)
-Check 'W17 normal finish: INTEGRATED then CLEANED' (($r.Out -match 'INTEGRATED') -and ($r.Out -match 'CLEANED'))
+Check 'W17 normal finish: INTEGRATED, not CLEANED (separate step)' (($r.Out -match 'INTEGRATED') -and ($r.Out -notmatch 'CLEANED'))
 Check 'W17 normal finish: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'w17 change')
-Check 'W17 normal finish: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/w17')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w17'))))
+Check 'W17 normal finish: worktree, branch, metadata kept' ((Test-Path -LiteralPath $wt) -and (Test-BranchExists $canon 'glm/w17') -and (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w17')))
+$r = Run-Dev $canon @('cleanup', 'glm', 'w17')
+Check 'W17b explicit cleanup: exit 0' ($r.Code -eq 0)
+Check 'W17b explicit cleanup: CLEANED' ($r.Out -match 'CLEANED')
+Check 'W17b explicit cleanup: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/w17')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w17'))))
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = New-IntegratedTask $canon $root 'glm' 'w18' 'JARVIS-GLM-w18'
