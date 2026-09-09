@@ -45,12 +45,30 @@ default.
 Reserve an independent Work gate for genuinely critical blockers only — not
 for routine changes. Most work does not need one.
 
-## Testing discipline
+## Testing discipline — TEST BUDGET
 
-- Run targeted tests while iterating.
-- Run the full suite once, after the final implementation is in place.
-- Do not run extra mutation batteries, broad sweeps, helper scripts, or
-  exhaustive self-review passes unless a concrete blocker requires them.
+**During implementation:**
+
+- Run only the smallest tests directly related to the code being changed.
+- Do not repeatedly rerun an entire targeted/module/helper suite after each
+  fix.
+
+**When code + required tests are frozen:**
+
+- Run the relevant targeted suite ONCE.
+- If it passes, do not add more tests, audits, hardening checks, refactors,
+  mutation probes, or self-review work.
+- Commit and STOP.
+
+**Full product suite:**
+
+- Run only when the task explicitly requires it.
+- Run it ONCE, at the end.
+
+If a new concrete blocker or uncovered acceptance criterion appears after the
+final green run, report it instead of silently expanding the task.
+
+**Canonical stop rule: GREEN MEANS STOP.**
 
 ## Acceptance and commit
 
