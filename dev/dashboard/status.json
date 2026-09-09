@@ -1,16 +1,16 @@
 {
-  "updated": "2026-09-08",
-  "phase": "scheduler-2b2b2",
-  "review_state": "Scheduler Phase 2B2b1 - dead-owner IN_FLIGHT insan yetki kapısı (declare orphaned -> UNKNOWN_OUTCOME reflection -> abandon -> resolve) - bağımsız güvenlik review'ından (F1 bulgusu düzeltildi, dar re-gate CLEAN) sonra kabul edildi ve canonical oldu; 2B2b2 (iptal semantiği) henüz başlamadı.",
+  "updated": "2026-09-09",
+  "phase": "scheduler-2c",
+  "review_state": "Scheduler Phase 2B2b2 - minimum-safe iptal semantiği (sticky job_runs.cancel_requested, begin_execution transaction'ı içinde F1 claim arbitrajı, tam NULL binding + canlı owner yokluğu kanıtlı F3 anlık settle, approval supersession, execution-attempt geçmişi için tam-history kuralı hem core.py hem InMemoryStore'da) - bağımsız güvenlik review'ından (üç ardışık re-gate turu: approval kelimesi düzeltmesi, iki tam-geçmiş bloker, InMemoryStore atomiklik bloker'ı - hepsi CLEAN) sonra kabul edildi ve canonical oldu; 2C (minimum condition-watch) henüz başlamadı.",
   "overall_note": "Yüzdeler ağırlıklı milestone roadmap'inden hesaplanır, elle yazılmaz. Ağırlıklar proje tahminidir.",
   "refresh_seconds": 60,
   "milestone": {
-    "name": "Scheduler Phase 2B2b2 — cancellation",
+    "name": "Scheduler Phase 2C — minimum condition-watch",
     "status": "yellow",
     "status_label": "Sırada",
-    "summary": "2B2b1 kapsam dışı bırakılan iptal semantiği: cancel_requested yazıcısı, execution claim transaction'ında cancel arbitrajı ve tam NULL binding kanıtı gerektiren anlık iptal."
+    "summary": "2B2b2 ile iptal semantiği tamamlandı. Sırada: koşullu (condition) job'ların minimum güvenli gözlem/tetikleme yüzeyi - henüz tasarlanmadı, implementasyon başlamadı."
   },
-  "next_step": "2B2b2: job_runs.cancel_requested için ilk yazıcıyı ekle; execution claim transaction'ı (begin_execution) bound JobRun'ın cancel_requested'ına karşı arbitraj yapmalı (F1); anlık 'hiçbir şey çalışmadı' iptali tam NULL binding şeklini kanıtlamalı, yalnızca session_id'yi değil (F3).",
+  "next_step": "2C: minimum condition-watch tasarımına başla. Condition kernel (mevcut, pure) ile durable JobRun/claim/fencing katmanı arasındaki arayüzü belirle; hangi minimum güvenli tetikleme yüzeyinin gerekli olduğuna karar ver. Henüz implementasyon yok.",
   "blockers": [],
   "capabilities": [
     {
@@ -60,7 +60,7 @@
     {
       "name": "Scheduler",
       "weight": 16,
-      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing, fenced completion, tek atışlık AgentCore dispatch, bağlı RUNNING/AWAITING_APPROVAL generation'lar için fenced same-session recovery ve dead-owner IN_FLIGHT için tam geçmiş kanıtlı insan yetki kapısı (orphan declare / UNKNOWN reflection / resolve). İptal semantiği hâlâ yok.",
+      "note": "Saf kernel'ler, dayanıklı job store, claim / lease / fencing, fenced completion, tek atışlık AgentCore dispatch, bağlı RUNNING/AWAITING_APPROVAL generation'lar için fenced same-session recovery, dead-owner IN_FLIGHT için tam geçmiş kanıtlı insan yetki kapısı (orphan declare / UNKNOWN reflection / resolve) ve minimum-safe iptal semantiği (sticky cancel_requested, F1 claim arbitrajı, F3 anlık settle, approval supersession, tam-geçmiş kuralı). Condition-watch hâlâ yok.",
       "milestones": [
         {"name": "Timing kernel", "state": "completed"},
         {"name": "Condition kernel temeli", "state": "completed"},
@@ -70,8 +70,8 @@
         {"name": "2B1 AgentCore dispatch", "state": "completed"},
         {"name": "2B2a fenced same-session recovery / approval resume", "state": "completed"},
         {"name": "2B2b1 dead-owner IN_FLIGHT insan yetki kapısı", "state": "completed"},
-        {"name": "2B2b2 cancellation", "state": "in_progress"},
-        {"name": "2C condition execution", "state": "not_started"},
+        {"name": "2B2b2 cancellation", "state": "completed"},
+        {"name": "2C minimum condition-watch", "state": "in_progress"},
         {"name": "2D background dispatcher", "state": "not_started"},
         {"name": "Uçtan uca hardening", "state": "not_started"}
       ]
@@ -135,6 +135,7 @@
     }
   ],
   "recent": [
+    "Scheduler Phase 2B2b2 — minimum-safe job run iptali: sticky job_runs.cancel_requested (tek yazıcı, hiçbir okuyucu temizlemiyor), begin_execution'ın kendi write transaction'ı içinde F1 cancel arbitrajı (stale dispatcher connector'a asla ulaşamıyor), tam NULL binding + canlı owner yokluğu kanıtlı F3 anlık settle, pending approval'ın mevcut 'superseded' kelimesiyle kapanması (yeni şema/kelime yok), execution-attempt geçmişi için newest-row yerine tam-history kuralı (hem core.py'nin pre-connector/execution-disabled yollarında hem SQLiteMemoryStore'un cancel/in-doubt/chain-advance predicate'lerinde hem InMemoryStore'da), InMemoryStore'da begin_execution F1 kontrolü ve cancel/approval çözümü artık tek RLock kritik bölgesi altında (SQLite'ın BEGIN IMMEDIATE'ıyla eşleşiyor); UNKNOWN/IN_FLIGHT hiçbir yerde retry izni haline gelmiyor (SQLite 10, output schema 6, core.py yalnızca bu iki tam-geçmiş bloker için açıldı)",
     "Scheduler Phase 2B2b1 — dead-owner IN_FLIGHT için insan yetki kapısı: declare_attempt_orphaned (yalnızca IN_FLIGHT -> UNKNOWN_OUTCOME, state CAS tek eşzamanlılık kanıtı, ORPHAN_MIN_AGE yalnızca öneri), paylaşılan tam-geçmiş predicate'i (execution_history_verdict - herhangi bir routed task altında >1 attempt satırı her zaman UNPROVABLE), UNKNOWN yansıtması Core'a hiç girmez, resolve_unknown_job_run üç kanıtla (FAILED durum + tipli sonuç + abandon audit) tek transaction'da UNKNOWN_OUTCOME -> FAILED kapatır; belirsizlik hep dayanıklı kalır, retry hiçbir yerde yok (SQLite 10)",
     "Scheduler Phase 2B2a — bağlı RUNNING/AWAITING_APPROVAL generation'lar için fenced same-session recovery: dar reacquire_job_run sınırı (expected_fencing_epoch zorunlu, session_id/chain_id değişmez), onay çözüm crash penceresi kurtarma, atomik recovery audit event, kalıcı session/document/proje kimliği yeniden kanıtlama (F1 bulgusu); IN_FLIGHT ve UNKNOWN_OUTCOME asla replay edilmez (SQLite 10)",
     "Scheduler Phase 2B1 — tek atışlık JobRun -> AgentCore dispatch: atomik session/chain binding, dayanıklı RUNNING, fenced sonuç yansıtma (SQLite 10)",
@@ -146,8 +147,8 @@
     "Saf scheduler timing ve condition kernel'leri"
   ],
   "health": [
-    {"name": "Testler", "status": "green", "detail": "Son doğrulanan canonical doğrulama: 3.311 test OK, 1 skipped, 0 fail, 0 error (2B2b1 orphan 69, orphan parity 19, dispatch 76, recovery 68, fencing 37, storage 20, jobs 64, claims 62, execution journal 56, recovery(H2) 122, task chain 464, app 60, cli 87 dahil, tam suite)."},
-    {"name": "SQLite schema", "status": "green", "detail": "Sürüm 10. Yalnızca additive migration; 2B1 tek bir partial unique session index ekledi. 2B2a şema eklemedi."},
+    {"name": "Testler", "status": "green", "detail": "Son doğrulanan canonical doğrulama: 3.390 test OK, 1 skipped, 0 fail, 0 error (2B2b2 cancel 41, storage abstraction 34, execution journal 71, orphan 69, orphan parity 21, recovery 68, dispatch 77, fencing 37, recovery(H2) 122, task chain 467, live-stop 50, permissions 19, app 60, cli 87 dahil, tam suite)."},
+    {"name": "SQLite schema", "status": "green", "detail": "Sürüm 10. Yalnızca additive migration; 2B1 tek bir partial unique session index ekledi. 2B2a, 2B2b1 ve 2B2b2 şema eklemedi."},
     {"name": "Output schema", "status": "green", "detail": "OUTPUT_SCHEMA_VERSION 6. Değişmedi."}
   ],
   "push_note": "Push bilinçli olarak bekletiliyor.",
@@ -166,6 +167,7 @@
     ["Scheduler Phase 2B1", "Claimed bir generation tek bir storage transaction'ında pristine session + chain'e bağlanır ve CLAIMED -> RUNNING olur; binding değişmezdir ve idx_job_runs_session bir session'ı iki generation'a bağlanamaz kılar. RUNNING, AgentCore.run_chain çağrılmadan ÖNCE dayanıklıdır ve generic claim edilemez - çöken bir worker'ın run'ı bloklu kalır. Sonuç yansıtma yalnızca okur: routing, tam H2 attempt geçmişi, chain'e özgü lifecycle tutarlılığı ve onay için kanonik PermissionRequest fingerprint'i kanıtlanır; kanıtlanmayan her şey RUNNING bırakılır."],
     ["Scheduler Phase 2B2a", "reacquire_job_run yalnızca bağlı (session_id + chain_id dolu) RUNNING/AWAITING_APPROVAL generation'lar için tek bir BEGIN IMMEDIATE transaction'ında çalışır: expected_fencing_epoch yükü taşır (bayat gözlemci N+1'i asla ele geçiremez), owner_token/lease/claimed_at yeniler, session_id/chain_id'i HİÇ yazmaz. Onay için bekleyen exact request varsa reddeder; yoksa bunu onay olarak YORUMLAMAZ - Core'un kendi resume'u karar verir (güvenli yeniden sorma kabul edilir). Aynı transaction'da session row key == document id == run.session_id ve document project_id == authoritative sessions.project_id kanıtlanır (F1); mutation ve audit event atomiktir. IN_FLIGHT ve UNKNOWN_OUTCOME için run_chain hiç çağrılmaz. Scheduler'a approval/grant/H2/HUMAN_GATE yetkisi verilmedi."],
     ["Scheduler Phase 2B2b1", "declare_attempt_orphaned tek bir transaction'da yalnızca IN_FLIGHT -> UNKNOWN_OUTCOME state CAS'i yapar (attempt.state = 'in_flight' eşleşmesi tek eşzamanlılık kanıtıdır - yeni owner token/epoch/lease YOK); task/result/reservation/JobRun'a dokunmaz; ORPHAN_MIN_AGE (15 dk) yalnızca öneri korumasıdır, ölüm kanıtı değildir. execution_history_verdict tek paylaşılan saf fonksiyondur (her iki store ve Scheduler tarafından çağrılır): kimlik -> IN_FLIGHT her yerde -> HERHANGİ bir routed task altında >1 attempt satırı (temiz olsalar bile) her zaman UNPROVABLE -> cursor dışı UNKNOWN -> yalnızca cursor'da tek UNKNOWN satırı UNKNOWN_AT_CURSOR döner. recover_job_run bu şekli mevcut fenced mark_job_run_unknown ile yansıtır, Core'a hiç girmeden. resolve_unknown_job_run tek transaction'da: session/proje/chain kimliğini (2B2a) yeniden kanıtlar, TÜM routed task'ların TAM geçmişini yeniden kurar, cursor task'ın FAILED + tipli EXECUTION_UNKNOWN_OUTCOME sonucu + tek execution_abandoned audit'i (aynı attempt_id) kanıtlar, chain'in CANCELLED/FAILED ve lifecycle-coherent olduğunu kanıtlar, sonra UNKNOWN_OUTCOME -> FAILED CAS'i ve audit'i atomik yazar (job_runs.attempt_id ilk kez burada yazılır). Scheduler'a approval/grant/H2/HUMAN_GATE yetkisi verilmedi; 2B2b2 iptal semantiği hâlâ yok."],
+    ["Scheduler Phase 2B2b2", "request_job_run_cancel tek BEGIN IMMEDIATE transaction'ında: settled veya UNKNOWN_OUTCOME generation'ı reddeder, sticky cancel_requested bayrağını idempotent yazar, session_id/chain_id/task_id/attempt_id'nin TAMAMI NULL ve canlı owner yokken generation'ı anlık CANCELLED settle eder (F3) - kısmi bir binding şekli hiçbir zaman 'hiçbir şey çalışmadı' olarak okunmaz. claim_job_run ve bind_job_run_dispatch CAS'leri cancel_requested = 0 gerektirir; begin_execution kendi write transaction'ı içinde bound JobRun'ın cancel_requested'ına karşı arbitraj yapar (F1) - bir dispatcher bind edip claim etmeden ÖNCE cancel commit olursa connector'a asla ulaşmaz. cancel_job_run yalnızca mevcut cancel_chain/cancel_task/reacquire_job_run yetkilerini orkestre eder; Core'a hiç girmez, attempt state hiç yazmaz. Cancel edilen bir task'ın pending approval'ı mevcut 'superseded' kelimesiyle kapanır (yeni durum yok, request kimliği/fingerprint korunur). execution_attempts COMPLETE history'si (newest-row değil) hem cancel/in-doubt/chain-advance predicate'lerinde hem core.py'nin pre-connector/execution-disabled yollarında zorunlu: birden fazla attempt satırı (hangi sırada olursa olsun) her zaman kanıtlanamaz sayılır ve replay'i reddeder. InMemoryStore SQLite ile üç sözleşmede eşlenir: F1 arbitrajı, terminal cancel-vs-approval atomikliği, tam-geçmiş cancel semantiği - begin_execution'ın F1 kontrolü ve cancel_task/resolve_approval/reject_task hepsi tek RLock kritik bölgesi altında. UNKNOWN_OUTCOME/IN_FLIGHT hiçbir cancel yolunda CANCELLED'a dönüşmez ve hiçbir retry izni yaratılmaz."],
     ["Phase sınırı", "Geçerli bir lease koordinasyondur, execution authority değil: henüz worker loop veya arka plan dispatch döngüsü yok."],
     ["İlerleme modeli", "completed = 1.0, in_progress = 0.0, not_started = 0.0; deferred milestone paydadan düşer. Yalnızca kapanmış milestone kredi kazanır. Yetenek yüzdesi kendi milestone ağırlıklarından, genel yüzde yetenek ağırlıklarından hesaplanır."]
   ]
