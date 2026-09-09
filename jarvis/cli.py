@@ -202,6 +202,28 @@ def _build_parser() -> _ArgumentParser:
     job_cancel.add_argument("--actor", required=True)
     job_cancel.add_argument("--reason", required=True)
 
+    # Scheduler phase 2D: the foreground runner. Unlike every other scheduler
+    # verb above it DOES execute, so - exactly like 'chain run' - it is built
+    # through the ordinary application path with a registry, connectors and an
+    # AgentCore, and reaches only the claim, dispatch, condition-watch,
+    # recovery and cancellation boundaries that already exist.
+    scheduler_command = commands.add_parser(
+        "scheduler", help="Drive scheduled work in the foreground."
+    )
+    scheduler_actions = scheduler_command.add_subparsers(dest="scheduler_action")
+    scheduler_run = scheduler_actions.add_parser(
+        "run",
+        help=(
+            "Sweep due and unsettled generations sequentially until stopped "
+            "with Ctrl+C. Retries nothing and resolves nothing."
+        ),
+    )
+    scheduler_run.add_argument(
+        "--once",
+        action="store_true",
+        help="Perform exactly one bounded sweep and exit.",
+    )
+
     run_command = commands.add_parser("run", help="Start a task from task JSON.")
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
     run_command.add_argument("--session-id")
@@ -654,6 +676,16 @@ def _dispatch_chain_command(
 
 
 def _dispatch(app: JarvisApp, command: str, args: argparse.Namespace) -> CommandResult:
+    if command == "scheduler":
+        if getattr(args, "scheduler_action", None) != "run":
+            return failure_result(
+                "scheduler",
+                app.permission_mode,
+                ErrorCode.INVALID_TASK,
+                "'scheduler' requires the 'run' sub-command.",
+                EXIT_INVALID_INPUT,
+            )
+        return app.run_scheduler(once=args.once)
     if command == "chain":
         return app.run_chain(args.session_id)
     if command == "run":

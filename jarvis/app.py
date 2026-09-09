@@ -115,6 +115,7 @@ from jarvis.github import GitHubIdentityBinding
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
+from jarvis.scheduler_runner import SchedulerRunner
 from jarvis.settings import (
     CONFIG_VERSION,
     MONTHLY_HARD_LIMIT_USD,
@@ -2448,6 +2449,65 @@ class JarvisApp:
                 chain_verdict=verdict,
             ),
             self._exit_code(run),
+        )
+
+    def run_scheduler(self, *, once: bool = False) -> CommandResult:
+        """Drive the foreground scheduler: one bounded sweep, or until Ctrl+C.
+
+        It adds no authority of its own. Every occurrence it touches goes
+        through the same claim, dispatch, condition-watch, recovery and
+        cancellation boundaries an operator command reaches, so this is a
+        DRIVER for the existing machinery and never a second copy of it.
+
+        The response states the bounded facts an operator must not have to
+        infer: how many sweeps ran, whether the kill switch stopped new claims,
+        and what each generation's own boundary answered.
+        """
+        runner = SchedulerRunner(self.core)
+        reports = (runner.run_once(),) if once else runner.run_until_stopped()
+        counts: dict[str, int] = {}
+        for report in reports:
+            for action in report.actions:
+                counts[action.action] = counts.get(action.action, 0) + 1
+        last = reports[-1] if reports else None
+        return CommandResult(
+            _redact(
+                {
+                    "command": "scheduler-run",
+                    "mode": "once" if once else "until_stopped",
+                    "sweeps": len(reports),
+                    "jobs_considered": 0 if last is None else last.jobs_considered,
+                    # Stated rather than implied: a sweep that did nothing
+                    # because execution is off must not read as "nothing due".
+                    "claims_suspended": (
+                        not self.settings.execution_enabled
+                        if last is None
+                        else last.claims_suspended
+                    ),
+                    "counts": counts,
+                    "actions": [
+                        {
+                            "job_id": action.job_id,
+                            "run_id": action.run_id,
+                            "action": action.action,
+                            "reason": action.reason,
+                            "verdict": action.verdict,
+                        }
+                        for action in (() if last is None else last.actions)
+                    ],
+                    # The runner retries nothing. A generation left blocked or
+                    # in doubt stays that way until a person resolves it.
+                    "retry_authorized": False,
+                    "next_step": (
+                        "Generations reported 'parked' are waiting for a human "
+                        "approval and 'skipped: unknown_outcome' ones for an "
+                        "operator resolution ('jarvis task orphan' then 'jarvis "
+                        "job resolve'). The scheduler never resumes, retries or "
+                        "settles either on its own."
+                    ),
+                }
+            ),
+            EXIT_OK,
         )
 
     def show_chain(self, session_id: str) -> CommandResult:

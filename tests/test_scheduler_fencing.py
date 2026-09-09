@@ -695,7 +695,11 @@ class BoundaryTests(FenceTestCase):
                 "materialize_job_run_task",
             ):
                 self.assertNotIn(absent, source, f"{module.name}: {absent}")
-            if module.name != "dispatch.py":
+            # Phase 2D: ``scheduler_runner.py`` is the ONE driver of the
+            # bridge, and it runs only when an operator starts it in the
+            # foreground - so the "nothing drives it" premise narrows to
+            # "nothing but the declared runner does".
+            if module.name not in ("dispatch.py", "scheduler_runner.py"):
                 self.assertNotIn("dispatch_job_run", source, module.name)
         names = {module.name for module in self.production_modules()}
         for absent in ("dispatcher.py", "scheduler_dispatch.py", "worker.py", "daemon.py"):
@@ -785,6 +789,13 @@ class BoundaryTests(FenceTestCase):
             self.assertNotIn(absent, source, f"dispatch.py reaches {absent}")
 
     def test_no_background_loop_thread_or_service_was_added(self) -> None:
+        # Phase 2D adds the FOREGROUND runner - ``scheduler_runner.py`` and
+        # the ``JarvisApp.run_scheduler`` facade that drives it - so the
+        # "no scheduler entry point anywhere" premise is narrowed to exactly
+        # those two files. What stays forbidden everywhere, including in
+        # them, is a background service: no thread, no timer, no daemon, no
+        # event loop and no automatic settlement or recovery.
+        foreground = {"scheduler_runner.py", "app.py"}
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for absent in (
@@ -794,7 +805,41 @@ class BoundaryTests(FenceTestCase):
                 "auto_settle",
                 "auto_recover",
             ):
+                if absent == "def run_scheduler" and module.name in foreground:
+                    continue
                 self.assertNotIn(absent, source, f"{module.name}: {absent}")
+        # Judged on the runner's CODE with its docstrings stripped: the prose
+        # names exactly the things it must not do, so a raw scan would fail
+        # on the guarantee rather than on a breach. ``ast.unparse`` also
+        # drops comments, leaving only what executes.
+        tree = ast.parse(
+            next(
+                module for module in self.production_modules()
+                if module.name == "scheduler_runner.py"
+            ).read_text(encoding="utf-8")
+        )
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if (
+                isinstance(body, list)
+                and body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                del body[0]
+        runner = ast.unparse(tree)
+        for absent in (
+            "threading",
+            "Thread",
+            "asyncio",
+            "Timer",
+            "daemon",
+            "subprocess",
+            "multiprocessing",
+            "concurrent",
+        ):
+            self.assertNotIn(absent, runner, f"scheduler_runner.py reaches {absent}")
 
     def test_the_schema_versions_did_not_move(self) -> None:
         from jarvis.app import OUTPUT_SCHEMA_VERSION

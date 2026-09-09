@@ -1394,9 +1394,22 @@ class SourceBoundaryTests(unittest.TestCase):
         # a second name this module calls. Every other scheduler storage
         # operation stays forbidden to it, same as to everything but
         # ``dispatch.py`` - binding still runs through that module alone.
+        #
+        # Phase 2D adds a THIRD, the foreground runner ``scheduler_runner.py``:
+        # it may list the catalogue, materialize a due occurrence, read a
+        # generation and take a claim - and nothing else. Every settlement,
+        # bind, park, unknown-mark and lease renewal still runs through
+        # ``dispatch.py`` and ``condition_watch.py`` alone.
         universal = {"memory.py", "contracts.py", "dispatch.py"}
         per_module_extra = {
-            "condition_watch.py": {"load_job", "load_job_run", "settle_job_run"}
+            "condition_watch.py": {"load_job", "load_job_run", "settle_job_run"},
+            "scheduler_runner.py": {
+                "list_jobs",
+                "materialize_due_job_run",
+                "load_job",
+                "load_job_run",
+                "claim_job_run",
+            },
         }
         for module in self.production_modules():
             if module.name in universal:
@@ -1473,6 +1486,12 @@ class SourceBoundaryTests(unittest.TestCase):
         # is no heartbeat, no timer-driven reclaim, no orphan sweep and no
         # due-job scanner. Every expiry judgement happens because a caller
         # asked, at an instant the caller supplied.
+        #
+        # Phase 2D adds the FOREGROUND runner and its ``JarvisApp``
+        # facade, both started by an operator and neither running by itself,
+        # so ``def run_scheduler`` is allowed in exactly those two files.
+        # Every other token stays forbidden everywhere, including in them.
+        foreground = {"scheduler_runner.py", "app.py"}
         for module in self.production_modules():
             source = module.read_text(encoding="utf-8")
             for forbidden in (
@@ -1484,6 +1503,8 @@ class SourceBoundaryTests(unittest.TestCase):
                 "def scan_due",
                 "def run_scheduler",
             ):
+                if forbidden == "def run_scheduler" and module.name in foreground:
+                    continue
                 self.assertNotIn(forbidden, source, f"{module.name}: {forbidden}")
 
     def test_no_background_scheduler_module_exists(self) -> None:

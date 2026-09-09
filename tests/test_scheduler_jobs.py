@@ -1488,9 +1488,22 @@ class ExecutionBoundaryTests(unittest.TestCase):
         # because it is a literal substring of ``load_job_run``, not a second
         # name this module calls). Everything else in the surface stays
         # forbidden to it, same as to everything but ``dispatch.py``.
+        #
+        # Phase 2D adds a THIRD, the foreground runner ``scheduler_runner.py``:
+        # it may list the catalogue, materialize a due occurrence, read a
+        # generation and take a claim - and nothing else. Every settlement,
+        # bind, park, unknown-mark and lease renewal still runs through
+        # ``dispatch.py`` and ``condition_watch.py`` alone.
         allowed = {"memory.py", "contracts.py", "dispatch.py"}
         per_module_extra = {
-            "condition_watch.py": {"load_job", "load_job_run", "settle_job_run"}
+            "condition_watch.py": {"load_job", "load_job_run", "settle_job_run"},
+            "scheduler_runner.py": {
+                "list_jobs",
+                "materialize_due_job_run",
+                "load_job",
+                "load_job_run",
+                "claim_job_run",
+            },
         }
         for module in self.production_modules():
             if module.name in allowed:
