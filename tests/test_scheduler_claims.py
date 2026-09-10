@@ -1410,6 +1410,17 @@ class SourceBoundaryTests(unittest.TestCase):
                 "load_job_run",
                 "claim_job_run",
             },
+            # The operator surface: app.py may DEFINE, LIST and RETIRE a job -
+            # the five verbs a person needs to keep scheduled work usable -
+            # and nothing else. Every coordination operation (materialize,
+            # claim, renew, release, settle, mark-unknown, park, bind) stays
+            # forbidden to it, so defining a job still cannot run one.
+            "app.py": {
+                "create_job",
+                "list_jobs",
+                "set_job_enabled",
+                "archive_job",
+            },
         }
         for module in self.production_modules():
             if module.name in universal:

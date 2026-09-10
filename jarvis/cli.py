@@ -27,6 +27,10 @@ from jarvis.app import (
     config_mutation_result,
     config_show_result,
     failure_result,
+    job_archive_result,
+    job_create_result,
+    job_enablement_result,
+    job_list_result,
     job_run_cancel_result,
     job_run_resolve_result,
     memory_add_result,
@@ -202,6 +206,46 @@ def _build_parser() -> _ArgumentParser:
     job_cancel.add_argument("--actor", required=True)
     job_cancel.add_argument("--reason", required=True)
 
+    # The minimum OPERATOR SURFACE for scheduled work. Local-only like every
+    # other 'job' verb: defining, listing and retiring a job builds no
+    # registry, connector or AgentCore and starts nothing.
+    #
+    # The specification is the job's OWN persisted JSON encoding, validated by
+    # JobSpec.from_dict - the same default-deny rebuild storage uses. That is
+    # deliberately the whole input surface: no wizard, no cron builder, no
+    # per-field flags to keep in agreement with the grammar, and a
+    # CONDITION_WATCH is created by the same command simply by declaring
+    # 'condition' and 'on_true' instead of 'steps'.
+    job_create = job_actions.add_parser(
+        "create",
+        help=(
+            "Create one job from a JSON specification "
+            "(project_id, kind, label, schedule, steps | condition+on_true)."
+        ),
+    )
+    job_create.add_argument("--spec-json", required=True, metavar="PATH|-")
+    job_list = job_actions.add_parser(
+        "list", help="List durable job definitions (read-only)."
+    )
+    job_list.add_argument("--limit", type=int, default=None)
+    job_list.add_argument(
+        "--all",
+        dest="include_archived",
+        action="store_true",
+        help="Include archived jobs (they have no future occurrences).",
+    )
+    # Enable / disable / archive all name the revision the operator just read
+    # in 'job list': storage compares and sets on it, so a definition that
+    # moved in between is refused instead of being acted on blindly.
+    for name, summary in (
+        ("enable", "Enable FUTURE scheduling; recalculates the next occurrence."),
+        ("disable", "Disable FUTURE scheduling; stops nothing already running."),
+        ("archive", "Retire a job from scheduling. Deletes nothing; no un-archive."),
+    ):
+        action = job_actions.add_parser(name, help=summary)
+        action.add_argument("--job-id", required=True)
+        action.add_argument("--revision", required=True, type=int)
+
     # Scheduler phase 2D: the foreground runner. Unlike every other scheduler
     # verb above it DOES execute, so - exactly like 'chain run' - it is built
     # through the ordinary application path with a registry, connectors and an
@@ -331,9 +375,13 @@ def _build_parser() -> _ArgumentParser:
     return parser
 
 
-def _read_task_json(source: str) -> bytes:
+def _read_task_json(source: str, *, label: str = "Task JSON") -> bytes:
     """Read at most one byte more than the limit, so an oversized input is
-    refused instead of being loaded into memory first."""
+    refused instead of being loaded into memory first.
+
+    ``label`` names the document in the refusal only; every caller gets the
+    same bounded read, so there is one reader rather than one per document
+    kind."""
     bounded = MAX_TASK_JSON_BYTES + 1
     if source == "-":
         stream = getattr(sys.stdin, "buffer", sys.stdin)
@@ -344,7 +392,7 @@ def _read_task_json(source: str) -> bytes:
                 payload = handle.read(bounded)
         except OSError as exc:
             raise TaskInputError(
-                f"Task JSON file could not be read: {source}"
+                f"{label} file could not be read: {source}"
             ) from exc
     if isinstance(payload, str):
         # A text stdin stream is bounded by characters, so the encoded form
@@ -352,7 +400,7 @@ def _read_task_json(source: str) -> bytes:
         payload = payload.encode("utf-8")
     if len(payload) > MAX_TASK_JSON_BYTES:
         raise TaskInputError(
-            f"Task JSON is larger than the {MAX_TASK_JSON_BYTES} byte limit."
+            f"{label} is larger than the {MAX_TASK_JSON_BYTES} byte limit."
         )
     return payload
 
@@ -438,6 +486,30 @@ def _dispatch_job_command(
     """Operator resolution for a generation. Constructs a store and nothing else."""
     memory = SQLiteMemoryStore(settings.memory_database)
     action = getattr(args, "job_action", None)
+    if action == "create":
+        try:
+            document = _read_task_json(args.spec_json, label="Job specification")
+        except TaskInputError as exc:
+            # The reader refused (unreadable path, oversized document). Fail
+            # closed through the ordinary envelope; nothing was created.
+            return failure_result(
+                "job-create",
+                settings.permission_mode,
+                ErrorCode.INVALID_TASK,
+                str(exc),
+                EXIT_INVALID_INPUT,
+            )
+        return job_create_result(memory, settings, document)
+    if action == "list":
+        return job_list_result(
+            memory, settings, args.limit, include_archived=args.include_archived
+        )
+    if action in ("enable", "disable"):
+        return job_enablement_result(
+            memory, settings, args.job_id, args.revision, action == "enable"
+        )
+    if action == "archive":
+        return job_archive_result(memory, settings, args.job_id, args.revision)
     if action == "resolve":
         return job_run_resolve_result(
             memory,
@@ -463,7 +535,8 @@ def _dispatch_job_command(
         "job",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'job' requires the 'resolve' or 'cancel' sub-command.",
+        "'job' requires one of: create, list, enable, disable, archive, "
+        "resolve, cancel.",
         EXIT_INVALID_INPUT,
     )
 

@@ -51,7 +51,11 @@ from jarvis.contracts import (
     AttemptRecovery,
     AttemptRecoveryOutcome,
     AttemptState,
+    ConditionError,
     JobError,
+    JobSpec,
+    JobSummary,
+    ScheduleError,
     AttemptSummary,
     BillingClass,
     BillingIntegrityError,
@@ -1967,6 +1971,264 @@ def job_run_resolve_result(
                     "the same typed uncertainty, and any monetary exposure "
                     "stays recorded: none of that is resolved by this, and "
                     "this generation will never run again."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+#: Everything a malformed job definition can raise on its way in. All three
+#: are the EXISTING validators refusing - the job grammar, the schedule engine
+#: and the condition vocabulary - and this surface adds no fourth one of its
+#: own. ``ValueError`` is here because ``validate_project_id`` raises it.
+_JOB_DEFINITION_ERRORS = (JobError, ScheduleError, ConditionError, ValueError)
+
+
+def _job_listing_payload(summary: JobSummary) -> dict[str, Any]:
+    """One job as the store already redacted it. Adds no field of its own.
+
+    Named for the LISTING rather than after its argument, unlike its session
+    and task neighbours: the phase-boundary guards scan this module's SOURCE
+    for the names of the scheduler storage operations app.py must never be
+    able to call, and the store's own single-job read is one of them. The name
+    stays out of the way of that proof on purpose - do not "fix" it back.
+
+    A row that could not be rebuilt arrives with ``readable`` false and every
+    derived field absent; it is printed exactly that way rather than hidden or
+    guessed at, because a corrupt definition must stay VISIBLE to an operator
+    while staying unrunnable to everything else.
+    """
+    return {
+        "id": summary.id,
+        "readable": summary.readable,
+        "kind": summary.kind,
+        "label": summary.label,
+        "project_id": summary.project_id,
+        "enabled": summary.enabled,
+        "archived": summary.archived,
+        # The revision an enable/disable/archive must name. It is printed
+        # because those verbs REQUIRE it: the operator acts on the definition
+        # they just read, never on whatever is latest.
+        "revision": summary.revision,
+        "timezone": summary.timezone,
+        "next_due_at_utc": summary.next_due_at_utc,
+        "last_run_id": summary.last_run_id,
+        "updated_at": summary.updated_at,
+    }
+
+
+def job_create_result(
+    memory: MemoryStore, settings: Settings, raw_spec_json: str | bytes
+) -> CommandResult:
+    """Create ONE durable job definition from an operator's JSON document.
+
+    The document is the job specification's OWN persisted encoding, decoded by
+    ``JobSpec.from_dict`` - the same default-deny rebuild storage uses when it
+    reads a row back. That is the whole validation story: unknown or missing
+    keys, an unknown kind, a naive instant, an interval under the floor, a
+    condition on a non-watch, a watch carrying unconditional steps, a
+    malformed step declaration and an oversized specification are all refused
+    by the EXISTING contracts, and this command adds no grammar, no wizard, no
+    schedule builder and no defaults of its own.
+
+    CREATING IS NOT AUTHORITY. It materializes no task, requests no approval,
+    consumes no grant, selects no connector, reserves no money and starts
+    nothing; the response says so rather than leaving it to be assumed.
+    """
+    command = "job-create"
+
+    def refused(message: str) -> CommandResult:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            message,
+            EXIT_INVALID_INPUT,
+        )
+
+    try:
+        document = json.loads(raw_spec_json)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        # The decoder's own message can echo the document; only the shape of
+        # the failure is reported.
+        return refused("The job specification is not valid JSON.")
+    try:
+        spec = JobSpec.from_dict(document)
+        record = memory.create_job(spec, now=datetime.now(timezone.utc))
+    except _JOB_DEFINITION_ERRORS as exc:
+        return refused(str(exc))
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "job_id": record.id,
+                "revision": record.revision,
+                "kind": record.spec.kind.value,
+                "label": record.spec.label,
+                "project_id": record.project_id,
+                "enabled": record.enabled,
+                "timezone": record.spec.timezone,
+                # NULL is an honest answer: a one-time instant already past,
+                # or a recurrence past its end, names no next occurrence.
+                "next_due_at_utc": record.next_due_at_utc,
+                "declared_steps": len(record.spec.steps),
+                "declared_on_true_steps": len(record.spec.on_true),
+                "condition_kind": (
+                    None if record.spec.condition is None
+                    else record.spec.condition.kind.value
+                ),
+                # The bounded facts, stated rather than implied.
+                "execution_authorized": False,
+                "approval_granted": False,
+                "money_reserved": False,
+                "next_step": (
+                    "The definition is recorded and nothing has run. A "
+                    "generation is created and executed only when the "
+                    "scheduler is run explicitly ('jarvis scheduler run'), "
+                    "and every permission, approval and billing gate still "
+                    "applies to it then, unchanged."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def job_list_result(
+    memory: MemoryStore,
+    settings: Settings,
+    limit: Any = None,
+    *,
+    include_archived: bool = False,
+) -> CommandResult:
+    """The durable job catalogue, oldest first. Reads only.
+
+    Bounded by the same visibility ceiling every other listing uses, and by
+    the store's own bound underneath it. Archived jobs are excluded unless
+    asked for: they have no future, and a default listing is about what will
+    happen next.
+    """
+    command = "jobs"
+    try:
+        bound = _bounded_limit(limit)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    summaries = memory.list_jobs(bound, include_archived=bool(include_archived))
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "limit": bound,
+                "include_archived": bool(include_archived),
+                "count": len(summaries),
+                "jobs": [_job_listing_payload(summary) for summary in summaries],
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def job_enablement_result(
+    memory: MemoryStore,
+    settings: Settings,
+    job_id: str,
+    revision: Any,
+    enabled: bool,
+) -> CommandResult:
+    """Turn a job's FUTURE scheduling eligibility on or off.
+
+    ``revision`` is the one the operator read in ``jarvis job list`` and is
+    passed straight to storage's compare-and-set: a definition that moved in
+    between is refused rather than acted on blindly. Enablement is STATE
+    rather than definition, so it does not move the revision - the number that
+    was read stays the number the next verb names.
+
+    IT STOPS NOTHING THAT IS ALREADY RUNNING. Disabling clears the next due
+    instant and nothing else - an open generation keeps its own lifecycle, and
+    cancelling one is 'jarvis job cancel'. Enabling recalculates the next
+    occurrence from now forward; occurrences missed while the job was off are
+    not recovered.
+    """
+    command = "job-enable" if enabled else "job-disable"
+    try:
+        record = memory.set_job_enabled(
+            job_id, revision, enabled, now=datetime.now(timezone.utc)
+        )
+    except _JOB_DEFINITION_ERRORS as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "job_id": record.id,
+                "revision": record.revision,
+                "enabled": record.enabled,
+                "archived": record.archived,
+                "next_due_at_utc": record.next_due_at_utc,
+                "open_generation_stopped": False,
+                "missed_occurrences_recovered": False,
+                "next_step": (
+                    "Future eligibility only. A generation that is already "
+                    "open keeps its own lifecycle - stop one with 'jarvis job "
+                    "cancel' - and occurrences the schedule named while the "
+                    "job was disabled are never replayed."
+                ),
+            }
+        ),
+        EXIT_OK,
+    )
+
+
+def job_archive_result(
+    memory: MemoryStore, settings: Settings, job_id: str, revision: Any
+) -> CommandResult:
+    """Retire a job from future scheduling, keeping every trace of it.
+
+    Same compare-and-set on the revision the operator read. Archiving deletes
+    nothing: no generation, no snapshot, no history. There is deliberately no
+    un-archive and no delete - this ends a job's future, not its past.
+    """
+    command = "job-archive"
+    try:
+        record = memory.archive_job(job_id, revision)
+    except _JOB_DEFINITION_ERRORS as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        _redact(
+            {
+                "command": command,
+                "job_id": record.id,
+                "revision": record.revision,
+                "archived": record.archived,
+                "enabled": record.enabled,
+                "next_due_at_utc": record.next_due_at_utc,
+                "history_deleted": False,
+                "open_generation_stopped": False,
+                "reversible": False,
+                "next_step": (
+                    "The job has no future occurrences. Its definition and "
+                    "every past generation stay readable, an already-open "
+                    "generation keeps its own lifecycle, and there is no "
+                    "un-archive."
                 ),
             }
         ),
