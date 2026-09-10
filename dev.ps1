@@ -62,6 +62,16 @@
   Metadata lives under the shared git dir (dev-helper/tasks/<worker>/<task>.json)
   and is never a tracked repository file.
 
+  ONE narrow exception, in the finish PREFLIGHT only: a fixed, explicit
+  allowlist of generated runtime artifacts that this repository ignores
+  (the test database and its SQLite sidecars, and the three named
+  __pycache__ directories) is removed automatically, each one only after
+  git itself confirms the path is untracked and ignored inside that exact
+  worktree, and only after every ownership proof has passed. Committed
+  work, tracked files, unfinished Git operations and every other
+  untracked/ignored path - including recovery residue - are still reported
+  and still refuse the finish. Strict cleanliness is re-checked afterwards.
+
 .WINDOWS REMOVAL / POST-INTEGRATION PARTIAL REMOVAL
   Windows will not unlink a directory that is any process's current directory.
   `git worktree remove` therefore can empty the worktree and delete its private
@@ -109,6 +119,25 @@ $Script:OwnershipMarkerSchema = 'jarvis-dev-helper-ownership-1'
 $Script:OwnershipMarkerName = 'dev-helper-ownership.json'
 $Script:HandoffEnvVar = 'JARVIS_DEV_EXCLUSIVE_HANDOFF'
 $Script:HandoffPrefix = 'jarvis-dev-handoff-v1'
+
+# THE ONLY content the finish preflight may delete: a fixed, explicit list of
+# repo-relative generated runtime artifacts that this repository already
+# ignores and that ordinary test runs leave behind - they used to refuse an
+# otherwise clean implementation worktree. No globs, no discovery, no
+# recursion into unknown names. Everything else stays fail-closed and is
+# REPORTED rather than removed: other ignored caches (including any
+# __pycache__ this list does not name), other databases, generated dashboard
+# output, logs, editor state, and recovery residue of any kind.
+# The two SQLite sidecars are named because they are created alongside the
+# database and leaving them would keep 'data/' dirty anyway.
+$Script:GeneratedArtifactAllowlist = @(
+    'data/jarvis.db',
+    'data/jarvis.db-wal',
+    'data/jarvis.db-shm',
+    'jarvis/__pycache__',
+    'jarvis/connectors/__pycache__',
+    'tests/__pycache__'
+)
 
 # Decode native git output as UTF-8 so non-ASCII paths (e.g. "Masaüstü")
 # survive; harmless no-op when no console is attached.
@@ -296,6 +325,75 @@ function Get-TaskWorktreeCleanlinessReason {
     $dirty = @($st.Lines | Where-Object { $_ -ne '' })
     if ($dirty.Count -gt 0) { return "worktree content changed: $($dirty[0])" }
     return $null
+}
+
+function Get-TaskWorktreeUnexpectedContentReason {
+    # The SAME strict cleanliness as above, except that the explicitly
+    # allowlisted generated artifacts do not count as content ($null = there
+    # is nothing here but those artifacts). Used ONLY to decide whether the
+    # finish preflight may proceed to its ownership proofs; it deletes
+    # nothing, and the strict check above stays the authority afterwards.
+    #
+    # GIT does the matching, through one ':(exclude)' pathspec per allowlist
+    # entry, so no path parsing or directory expansion is invented here. An
+    # ignored directory that still holds anything the allowlist does not name
+    # is reported by git as dirty - a stray file inside 'data/', a
+    # '__pycache__' elsewhere in the tree, a log, a stale database - so every
+    # such state refuses exactly as it did before. Absent allowlist entries
+    # are tolerated. Fail closed: an unreadable status is a reason, never
+    # cleanliness.
+    param([string]$WorktreePath)
+    $gitArgs = @('status', '--porcelain', '--ignored', '--', '.')
+    foreach ($rel in $Script:GeneratedArtifactAllowlist) { $gitArgs += ":(exclude)$rel" }
+    $st = Invoke-GitCapture -RepoPath $WorktreePath -GitArgs $gitArgs
+    if ($st.ExitCode -ne 0) { return 'worktree status could not be read (fail closed)' }
+    $dirty = @($st.Lines | Where-Object { $_ -ne '' })
+    if ($dirty.Count -gt 0) { return "worktree content changed: $($dirty[0])" }
+    return $null
+}
+
+function Remove-AllowlistedGeneratedArtifact {
+    # Remove ONE allowlisted generated artifact, and only after proving it is
+    # really generated content this repository ignores. ALL of the following
+    # must hold or the artifact is left exactly where it is:
+    #   * it is one of the fixed relative paths in the allowlist (the caller's
+    #     loop is the only source of candidates - nothing is discovered);
+    #   * it exists and resolves INSIDE the given task worktree;
+    #   * it is not a symlink/junction - a reparse point can point anywhere,
+    #     and deleting through one would reach outside the worktree entirely;
+    #   * git reports NO tracked file at that path;
+    #   * git check-ignore confirms this repository ignores the path.
+    # A removal failure (a locked database, a held cache file) is deliberately
+    # swallowed: the caller's strict cleanliness re-check is the authority, so
+    # an artifact that survives refuses the finish instead of being reported
+    # as cleaned.
+    #
+    # THE REMOVAL IS PER KIND, and the asymmetry is load-bearing rather than
+    # stylistic. A directory entry is removed by GIT itself, restricted to
+    # that exact pathspec and to ignored content only; measured behaviour is
+    # that this removes the named directory and never escalates to its parent.
+    # A FILE entry is removed directly, because `git clean` escalates the
+    # other way: given a path inside a wholly-ignored directory (such as
+    # 'data/'), it removes THE WHOLE DIRECTORY - with or without -d - which
+    # would delete content this allowlist never named. Do not "simplify" the
+    # file case into a git clean call.
+    param([string]$WorktreePath, [string]$RelativePath)
+    $root = (ConvertTo-NormalPath -Value $WorktreePath -Base $WorktreePath).TrimEnd('\')
+    $full = ConvertTo-NormalPath -Value $RelativePath -Base $root
+    if (-not $full.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+    $tracked = Invoke-GitCapture -RepoPath $WorktreePath -GitArgs @('ls-files', '--', $RelativePath)
+    if ($tracked.ExitCode -ne 0) { return }
+    if (@($tracked.Lines | Where-Object { $_ -ne '' }).Count -gt 0) { return }
+    $ignored = Invoke-GitCapture -RepoPath $WorktreePath -GitArgs @('check-ignore', '-q', '--', $RelativePath)
+    if ($ignored.ExitCode -ne 0) { return }
+    if ($item.PSIsContainer) {
+        $null = Invoke-GitCapture -RepoPath $WorktreePath -GitArgs @('clean', '-X', '-d', '-f', '--', $RelativePath)
+        return
+    }
+    Remove-Item -LiteralPath $full -ErrorAction SilentlyContinue
 }
 
 # ---------- input validation ------------------------------------------------
@@ -1143,8 +1241,14 @@ function Invoke-FinishTask {
     # Strict cleanliness FIRST: an unfinished Git operation (merge,
     # cherry-pick, revert, rebase, sequencer, bisect) is the most precise
     # diagnostic and must be reported before attachment/ownership details.
-    $cleanReason = Get-TaskWorktreeCleanlinessReason -WorktreePath $wt
-    if ($cleanReason) { throw "finish refused: $cleanReason (commit your work; clear untracked/ignored content and unfinished Git operations first)" }
+    $op = Get-UnfinishedGitOperationState -WorktreePath $wt
+    if ($op) { throw "finish refused: $op (commit your work; clear untracked/ignored content and unfinished Git operations first)" }
+    # Content that is not an allowlisted generated artifact refuses HERE, with
+    # the same diagnostic it always produced. The allowlisted artifacts are
+    # merely tolerated past this point - nothing has been deleted yet, and
+    # nothing will be until every ownership proof below has passed.
+    $unexpected = Get-TaskWorktreeUnexpectedContentReason -WorktreePath $wt
+    if ($unexpected) { throw "finish refused: $unexpected (commit your work; clear untracked/ignored content and unfinished Git operations first)" }
     $registered = @(Get-WorktreeList -RepoPath $ctx.MainPath | Where-Object { Test-SamePath $_.Path $wt })[0]
     if (-not $registered) { throw "finish refused: '$wt' is not registered as a worktree of this repository" }
     if ($registered.Branch -cne $identity.Branch) { throw "finish refused: worktree is on branch '$($registered.Branch)', expected '$($identity.Branch)'" }
@@ -1154,6 +1258,22 @@ function Invoke-FinishTask {
     }
     # Ownership evidence: marker + metadata must agree on the task generation.
     Assert-OwnershipMarker -ctx $ctx -identity $identity -meta $meta -WorktreePath $wt
+
+    # PREFLIGHT ARTIFACT CLEANUP - the only automatic deletion the finish path
+    # performs, and deliberately placed HERE: registration, repository
+    # membership, branch identity and the two-artifact ownership marker have
+    # all been proven for this exact worktree, so nothing is removed from a
+    # directory the helper has not established it created. It removes only the
+    # fixed allowlist, each entry re-proved untracked and ignored inside that
+    # worktree, and it touches no branch, ref, marker or metadata.
+    foreach ($rel in $Script:GeneratedArtifactAllowlist) {
+        Remove-AllowlistedGeneratedArtifact -WorktreePath $wt -RelativePath $rel
+    }
+    # STRICT cleanliness is re-checked afterwards, by the unchanged authority:
+    # anything the cleanup could not remove, and any content it was never
+    # allowed to touch, refuses the finish exactly as before.
+    $cleanReason = Get-TaskWorktreeCleanlinessReason -WorktreePath $wt
+    if ($cleanReason) { throw "finish refused: $cleanReason (commit your work; clear untracked/ignored content and unfinished Git operations first)" }
 
     $wtHead = (Invoke-Git -RepoPath $wt -GitArgs @('rev-parse', 'HEAD')).Lines[0]
     if ($capturedT -cne $wtHead) { throw 'finish refused: task branch tip does not match worktree HEAD' }

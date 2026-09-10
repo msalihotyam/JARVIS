@@ -2611,6 +2611,140 @@ foreach ($shape in $shapes) {
     Check "W23 $($shape.Name): metadata preserved" (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' $t))
 }
 
+# --- W24: finish preflight removes ONLY allowlisted generated artifacts -----
+# The UX fix: known ignored runtime artifacts (the test database and the three
+# named __pycache__ directories) no longer refuse an otherwise clean
+# implementation worktree. Everything about that is bounded: the allowlist is
+# exact, each entry is re-proved untracked and ignored, nothing is deleted
+# before the ownership proofs pass, and every other dirty shape still refuses.
+
+function New-GeneratedArtifacts {
+    # The exact artifact set a test run leaves behind, plus the ignore rules
+    # that make them ignored content in the first place.
+    param([string]$Worktree)
+    foreach ($rel in @('jarvis\__pycache__', 'jarvis\connectors\__pycache__', 'tests\__pycache__', 'data')) {
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $Worktree $rel)
+    }
+    Set-Content -LiteralPath (Join-Path $Worktree 'jarvis\__pycache__\core.cpython-313.pyc') -Value 'bytecode'
+    Set-Content -LiteralPath (Join-Path $Worktree 'jarvis\connectors\__pycache__\base.cpython-313.pyc') -Value 'bytecode'
+    Set-Content -LiteralPath (Join-Path $Worktree 'tests\__pycache__\t.cpython-313.pyc') -Value 'bytecode'
+    Set-Content -LiteralPath (Join-Path $Worktree 'data\jarvis.db') -Value 'sqlite'
+    Set-Content -LiteralPath (Join-Path $Worktree 'data\jarvis.db-wal') -Value 'wal'
+}
+
+function Test-AnyArtifactPresent {
+    param([string]$Worktree)
+    foreach ($rel in @('jarvis\__pycache__', 'jarvis\connectors\__pycache__', 'tests\__pycache__', 'data\jarvis.db', 'data\jarvis.db-wal')) {
+        if (Test-Path -LiteralPath (Join-Path $Worktree $rel)) { return $true }
+    }
+    return $false
+}
+
+function New-IgnoringTask {
+    # An ACTIVE task worktree with one real commit and committed ignore rules.
+    param([string]$Canon, [string]$Root, [string]$Task)
+    $wt = Join-Path $Root "JARVIS-GLM-$Task"
+    $null = Run-Dev $Canon @('new', 'glm', $Task)
+    CommitFile $wt '.gitignore' @('__pycache__/', 'data/', '*.log') 'ignore generated artifacts'
+    CommitFile $wt 'task.txt' @("$Task change") "$Task work"
+    return $wt
+}
+
+# W24a: allowlisted artifacts only -> finish proceeds and removes exactly them
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24a'
+New-GeneratedArtifacts $wt
+Set-Content -LiteralPath (Join-Path $wt 'jarvis\keep.py') -Value 'tracked-neighbour'
+GitRun $wt @('add', 'jarvis/keep.py')
+GitRun $wt @('commit', '-m', 'neighbour')
+$r = Run-Dev $canon @('finish', 'glm', 'w24a')
+Check 'W24a artifacts only: exit 0' ($r.Code -eq 0)
+Check 'W24a artifacts only: INTEGRATED' ($r.Out -match 'INTEGRATED')
+Check 'W24a artifacts only: every allowlisted artifact removed' (-not (Test-AnyArtifactPresent $wt))
+Check 'W24a artifacts only: tracked neighbour untouched' (Test-Path -LiteralPath (Join-Path $wt 'jarvis\keep.py'))
+Check 'W24a artifacts only: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'w24a change')
+# The integrate-only lifecycle is unchanged: still no removal, still a
+# separate explicit cleanup step.
+Check 'W24a artifacts only: worktree and branch kept' ((Test-Path -LiteralPath $wt) -and (Test-BranchExists $canon 'glm/w24a'))
+Check 'W24a artifacts only: not CLEANED' ($r.Out -notmatch 'CLEANED')
+
+# W24b: one ignored file OUTSIDE the allowlist -> refuse, and delete NOTHING
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24b'
+New-GeneratedArtifacts $wt
+Set-Content -LiteralPath (Join-Path $wt 'run.log') -Value 'ignored log'
+$r = Run-Dev $canon @('finish', 'glm', 'w24b')
+Check 'W24b stray ignored file: exit 1' ($r.Code -eq 1)
+Check 'W24b stray ignored file: refusal reported' ($r.Out -match 'finish refused')
+Check 'W24b stray ignored file: never deleted' ((Get-Content -LiteralPath (Join-Path $wt 'run.log') -Raw).Trim() -eq 'ignored log')
+Check 'W24b stray ignored file: allowlisted artifacts also untouched' (Test-AnyArtifactPresent $wt)
+Check 'W24b stray ignored file: nothing integrated' ((Get-Content -LiteralPath (Join-Path $canon 'shared.txt') -Raw).Trim() -eq 'base')
+
+# W24c: a stray file INSIDE a wholly-ignored allowlisted directory refuses -
+# the whole 'data/' directory is never removed on the strength of one named
+# database file (the git-clean escalation trap)
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24c'
+New-GeneratedArtifacts $wt
+Set-Content -LiteralPath (Join-Path $wt 'data\operator-notes.txt') -Value 'not mine to delete'
+$r = Run-Dev $canon @('finish', 'glm', 'w24c')
+Check 'W24c stray file in data/: exit 1' ($r.Code -eq 1)
+Check 'W24c stray file in data/: survives' ((Get-Content -LiteralPath (Join-Path $wt 'data\operator-notes.txt') -Raw).Trim() -eq 'not mine to delete')
+Check 'W24c stray file in data/: database not removed either' (Test-Path -LiteralPath (Join-Path $wt 'data\jarvis.db'))
+
+# W24d: a __pycache__ the allowlist does not name is NOT auto-removed
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24d'
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $wt 'dev\dashboard\__pycache__')
+Set-Content -LiteralPath (Join-Path $wt 'dev\dashboard\__pycache__\r.cpython-313.pyc') -Value 'bytecode'
+$r = Run-Dev $canon @('finish', 'glm', 'w24d')
+Check 'W24d unnamed __pycache__: exit 1' ($r.Code -eq 1)
+Check 'W24d unnamed __pycache__: survives' (Test-Path -LiteralPath (Join-Path $wt 'dev\dashboard\__pycache__\r.cpython-313.pyc'))
+
+# W24e: uncommitted work and untracked non-ignored content still refuse
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24e'
+New-GeneratedArtifacts $wt
+Set-Content -LiteralPath (Join-Path $wt 'precious.txt') -Value 'uncommitted work'
+$r = Run-Dev $canon @('finish', 'glm', 'w24e')
+Check 'W24e untracked file: exit 1' ($r.Code -eq 1)
+Check 'W24e untracked file: preserved' ((Get-Content -LiteralPath (Join-Path $wt 'precious.txt') -Raw).Trim() -eq 'uncommitted work')
+Remove-Item -LiteralPath (Join-Path $wt 'precious.txt') -Force
+Set-Content -LiteralPath (Join-Path $wt 'task.txt') -Value 'edited in place'
+$r = Run-Dev $canon @('finish', 'glm', 'w24e')
+Check 'W24e tracked modification: exit 1' ($r.Code -eq 1)
+Check 'W24e tracked modification: preserved' ((Get-Content -LiteralPath (Join-Path $wt 'task.txt') -Raw).Trim() -eq 'edited in place')
+
+# W24f: a TRACKED file at an allowlisted path is never removed
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24f'
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $wt 'data')
+Set-Content -LiteralPath (Join-Path $wt 'data\jarvis.db') -Value 'deliberately committed'
+GitRun $wt @('add', '-f', 'data/jarvis.db')
+GitRun $wt @('commit', '-m', 'track the database on purpose')
+$r = Run-Dev $canon @('finish', 'glm', 'w24f')
+Check 'W24f tracked allowlisted path: exit 0' ($r.Code -eq 0)
+Check 'W24f tracked allowlisted path: file kept in worktree' ((Get-Content -LiteralPath (Join-Path $wt 'data\jarvis.db') -Raw).Trim() -eq 'deliberately committed')
+Check 'W24f tracked allowlisted path: integrated onto main' ((Get-Content -LiteralPath (Join-Path $canon 'data\jarvis.db') -Raw).Trim() -eq 'deliberately committed')
+
+# W24g: ORDERING - nothing is deleted before the ownership proof passes
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = New-IgnoringTask $canon $root 'w24g'
+New-GeneratedArtifacts $wt
+Remove-Item -LiteralPath (Get-MarkerPathLocal $wt) -Force
+$r = Run-Dev $canon @('finish', 'glm', 'w24g')
+Check 'W24g missing marker: exit 1' ($r.Code -eq 1)
+Check 'W24g missing marker: ownership refusal' ($r.Out -match 'ownership evidence refused')
+Check 'W24g missing marker: artifacts untouched' (Test-AnyArtifactPresent $wt)
+Check 'W24g missing marker: nothing integrated' (-not (Test-Path -LiteralPath (Join-Path $canon 'task.txt')))
+
 # ---- summary ---------------------------------------------------------------
 
 foreach ($t in $script:tempRoots) {
