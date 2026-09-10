@@ -122,6 +122,7 @@ from jarvis.gmail import (
     GMAIL_CAPABILITIES,
     GMAIL_CONNECTOR,
     GMAIL_ENABLED_CAPABILITIES,
+    GmailCredentialAttestation,
     GmailExecutionUnavailable,
     GmailIdentityBinding,
     gmail_external_read_refusal,
@@ -3257,3 +3258,18 @@ def gmail_authority(
         ),
         frozenset(grants),
     )
+
+
+def gmail_login_result(
+    settings: Settings, attestation: GmailCredentialAttestation
+) -> CommandResult:
+    """Report the controlled login's attestation: non-secret identifiers of
+    the exact credential instance every Gmail operation will now bind to."""
+    payload = build_envelope("gmail-login", settings.permission_mode)
+    payload["gmail_credential"] = attestation.to_dict()
+    payload["next_step"] = (
+        "The dedicated authorized-user credential is attested. Every Gmail "
+        "operation binds to this exact credential instance; a replaced or "
+        "re-created credential is refused until 'jarvis gmail login' runs again."
+    )
+    return CommandResult(_redact(payload), EXIT_OK)

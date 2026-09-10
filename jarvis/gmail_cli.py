@@ -26,17 +26,29 @@ gws 0.22.5 on 2026-09-10:
 - ``gws auth status`` is run under that pinned environment before every
   operation and its JSON must describe exactly the allowed route
   (``jarvis.gmail.gmail_route_refusal``): a valid ``client_secret.json`` in
-  the dedicated directory (``credential_source`` names it and no
-  ``client_config_error``), encrypted storage with the keyring backend, no
-  plaintext file, and the AUTHORIZED-USER evidence - a refresh token, a
-  credential ``client_id`` equal to the configured client's, and the CLI's
-  own successful token check. A service account carries no refresh token
-  and a numeric client id that never equals the configured OAuth client's,
-  so it cannot pass even from the encrypted store. ADC is invisible to
-  ``auth status`` but is consulted only when the config directory holds no
-  credential, and its env route is stripped, so requiring the dedicated
-  credential is what excludes it. No secret is read to prove any of this:
-  the status report masks client ids and carries no token;
+  the dedicated directory, encrypted storage with the keyring backend, no
+  plaintext file, a refresh token, a credential ``client_id`` equal to the
+  configured client's, and the CLI's own successful token check. That is
+  the ROUTE, not the TYPE: the report never carries the stored ``type``,
+  and a service-account file dressed with those three fields passes it
+  while the CLI's own loader would select the service-account
+  authenticator. ADC is invisible to ``auth status`` but is consulted only
+  when the config directory holds no credential, and its env route is
+  stripped, so requiring the dedicated credential is what excludes it;
+- the TYPE is proved by PROVENANCE and the INSTANCE by a HOLD
+  (``attested_credential``). ``gws auth login`` is the only writer of
+  ``credentials.enc`` inside gws 0.22.5 and it always writes
+  ``type: authorized_user``; ``gmail_controlled_login`` runs that login
+  itself, into a directory it first proved held no credential and no token
+  cache, and records a non-secret attestation of the exact file it produced
+  (principal, directory, SHA-256 and size of the ciphertext). Before every
+  operation the file is opened with a Windows share mode that lets the
+  child READ it but denies every writer, deleter and renamer for as long as
+  the handle is open, its bytes are read through that very handle and
+  digested against the attestation, and the handle stays open until the
+  child has exited - so the credential the child decrypted is the attested
+  one, and no replacement (ABA included) can occur between the check and
+  the use. Nothing decrypts anything: the digest is of ciphertext;
 - a ``.env`` in the child's working directory or any ancestor is a refusal.
 
 ``users.getProfile`` then proves the EFFECTIVE ACCOUNT only.
@@ -72,30 +84,44 @@ owns the approval.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from jarvis.gmail import (
+    GMAIL_ATTESTATION_MAX_BYTES,
+    GMAIL_ATTESTATION_NAME,
     GMAIL_AUTH_STATUS_ARGS,
+    GMAIL_CREDENTIAL_MAX_BYTES,
     GMAIL_CREDENTIAL_ROUTE,
+    GMAIL_ENCRYPTED_CREDENTIALS_NAME,
+    GMAIL_LOGIN_ARGS,
+    GMAIL_LOGIN_PRECLUDING_FILES,
     GMAIL_UPLOAD_NAME,
     GWS_API_ARGS,
     GWS_ARGUMENT_MAX_CHARS,
     GWS_DRY_RUN_FLAG,
     GWS_MAX_ARGUMENTS,
+    GmailCredentialAttestation,
     GmailExecutionUnavailable,
     GmailOutcomeUnknown,
     gmail_address_refusal,
+    gmail_attestation_from_dict,
+    gmail_attestation_refusal,
     gmail_config_dir_refusal,
+    gmail_credential_attestation,
     gmail_dry_run_refusal,
+    gmail_login_refusal,
     gmail_operation_plan_refusal,
     gmail_outbound_message,
     gmail_principal_refusal,
@@ -110,6 +136,8 @@ GWS_EXECUTABLE_NAME = "gws"
 #: its bound is a refusal; a write that cannot is an UNKNOWN outcome.
 GWS_READ_TIMEOUT_SECONDS = 30
 GWS_WRITE_TIMEOUT_SECONDS = 60
+#: The controlled login waits for a person to finish the browser consent.
+GWS_LOGIN_TIMEOUT_SECONDS = 300
 #: How long a killed child is given to actually exit before it is abandoned.
 _KILL_WAIT_SECONDS = 5
 
@@ -250,6 +278,7 @@ def _run(
     path_lookup: Any = which,
     popen: Any = subprocess.Popen,
     timeout: int = GWS_READ_TIMEOUT_SECONDS,
+    inherit_stderr: bool = False,
 ) -> GmailCommandOutput:
     """Start ``gws`` once with exactly these arguments, or fail closed.
 
@@ -263,7 +292,8 @@ def _run(
 
     ``shell=False`` and a real argument LIST; stdin fed empty bytes and
     closed; output captured as bounded bytes and decoded with replacement.
-    Nothing from ``stderr`` is returned or re-raised.
+    Nothing from ``stderr`` is returned or re-raised; the controlled login
+    alone lets the child inherit it, so the operator sees the consent URL.
     """
     if type(arguments) is not tuple or not arguments:
         raise GmailCommandFailed("no argument vector was derived")
@@ -285,7 +315,7 @@ def _run(
             [executable, *arguments],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None if inherit_stderr else subprocess.PIPE,
             shell=False,
             env=environment,
             cwd=cwd,
@@ -336,6 +366,214 @@ def _one_json_object(stdout: Any) -> dict[str, Any] | None:
     return payload if type(payload) is dict else None
 
 
+# --------------------------------------------------------------------------
+# The credential instance: hold, attest, bind
+# --------------------------------------------------------------------------
+
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ = 0x00000001
+_OPEN_EXISTING = 3
+
+
+@contextlib.contextmanager
+def held_credential(config_dir: str) -> Iterator[bytes]:
+    """Hold the dedicated ``credentials.enc`` against replacement for the
+    block's duration and yield its exact bytes, read through the held handle.
+
+    Windows share semantics: the file is opened for reading with
+    ``FILE_SHARE_READ`` only, so while the handle is open any other open
+    for write or delete - a rewrite, an unlink, a rename over it, a rename
+    of it or of any ancestor directory - fails with a sharing violation,
+    while the child's own read (``GENERIC_READ`` with every share flag, as
+    Rust's ``std::fs::read`` opens) succeeds. The bytes are read through
+    THIS handle, never through the path, so they are the held instance's.
+    The ciphertext is digested by the caller and never decrypted here.
+
+    ponytail: Windows-only by construction - POSIX has no mandatory share
+    mode - and the seam fails closed elsewhere rather than pretend.
+    """
+    if sys.platform != "win32":
+        raise GmailCommandFailed(
+            "the credential instance cannot be held against replacement on this platform"
+        )
+    import ctypes  # noqa: PLC0415 - platform-conditional
+    import msvcrt  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    path = os.path.join(config_dir, GMAIL_ENCRYPTED_CREDENTIALS_NAME)
+    handle = create_file(path, _GENERIC_READ, _FILE_SHARE_READ, None, _OPEN_EXISTING, 0, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise GmailCommandFailed(
+            "the dedicated credential file cannot be held: it is absent or "
+            "another process holds it open for writing"
+        )
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError as exc:
+        kernel32.CloseHandle(handle)
+        raise GmailCommandFailed("the dedicated credential file cannot be held") from exc
+    with os.fdopen(descriptor, "rb") as held:
+        try:
+            content = held.read(GMAIL_CREDENTIAL_MAX_BYTES + 1)
+        except OSError as exc:
+            raise GmailCommandFailed("the dedicated credential file cannot be read") from exc
+        if not content or len(content) > GMAIL_CREDENTIAL_MAX_BYTES:
+            raise GmailCommandFailed("the dedicated credential file is empty or over its bound")
+        yield content
+
+
+def _attestation_path(config_dir: str) -> str:
+    return os.path.join(config_dir, GMAIL_ATTESTATION_NAME)
+
+
+def read_credential_attestation(config_dir: str) -> GmailCredentialAttestation:
+    """The stored attestation, or fail closed. Bounded read, closed record."""
+    try:
+        with open(_attestation_path(config_dir), "rb") as stored:
+            raw = stored.read(GMAIL_ATTESTATION_MAX_BYTES + 1)
+    except OSError as exc:
+        raise GmailCommandFailed(
+            "no credential attestation exists in the dedicated directory; "
+            "establish the credential with 'jarvis gmail login'"
+        ) from exc
+    if len(raw) > GMAIL_ATTESTATION_MAX_BYTES:
+        raise GmailCommandFailed("the credential attestation is over its bound")
+    try:
+        return gmail_attestation_from_dict(json.loads(raw.decode("utf-8")))
+    except (GmailExecutionUnavailable, ValueError) as exc:
+        raise GmailCommandFailed(f"the credential attestation is unusable: {exc}") from exc
+
+
+def write_credential_attestation(config_dir: str, attestation: GmailCredentialAttestation) -> None:
+    """Write the attestation atomically (sibling temp file, then replace)."""
+    path = _attestation_path(config_dir)
+    temp = path + ".tmp"
+    encoded = json.dumps(attestation.to_dict(), sort_keys=True, indent=2, ensure_ascii=True)
+    try:
+        with open(temp, "w", encoding="utf-8") as out:
+            out.write(encoded + "\n")
+        os.replace(temp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.remove(temp)
+        raise GmailCommandFailed("the credential attestation could not be written") from exc
+
+
+@contextlib.contextmanager
+def attested_credential(config_dir: str, principal: Any) -> Iterator[GmailCredentialAttestation]:
+    """THE instance bracket: for the block's duration the dedicated
+    credential file is held against replacement and is the exact instance
+    the attestation names for this principal - or the block never runs.
+
+    Order: the attestation is read first (a missing or malformed record is
+    a refusal before any file is touched), then the credential is held and
+    its bytes are digested against the record, then the block runs with the
+    hold still in place, then the hold is released.
+    """
+    attestation = read_credential_attestation(config_dir)
+    with held_credential(config_dir) as credentials:
+        reason = gmail_attestation_refusal(
+            attestation, principal=principal, config_dir=config_dir, credentials=credentials
+        )
+        if reason is not None:
+            raise GmailCommandFailed(
+                f"the credential instance is not the attested authorized-user credential: {reason}"
+            )
+        yield attestation
+
+
+def _utc_now_text() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def gmail_controlled_login(
+    config_dir: Any,
+    principal: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+    path_lookup: Any = which,
+    popen: Any = subprocess.Popen,
+    now: Any = _utc_now_text,
+) -> GmailCredentialAttestation:
+    """Run ``gws auth login`` into the dedicated directory and attest the
+    credential it created, or fail closed.
+
+    Provenance, step by step: the directory must hold NO credential and no
+    token cache (an existing one is refused, never removed - the operator
+    removes it with ``gws auth logout`` under the dedicated directory); any
+    stale attestation is removed first, so a failed login can never leave a
+    record for a file it did not produce; the login runs under the pinned
+    environment with the constant scope vector, stderr inherited so the
+    consent URL reaches the operator and stdout captured for the report;
+    the report must say success, name the bound principal as the account
+    and name the dedicated credential file; then the new file is held, its
+    ciphertext digested and the attestation written. The login's own JSON
+    carries no secret and none is kept.
+    """
+    reason = gmail_principal_refusal(principal)
+    if reason is not None:
+        raise GmailCommandFailed(f"no usable principal to log in as: {reason}")
+    reason = gmail_config_dir_refusal(config_dir)
+    if reason is not None:
+        raise GmailCommandFailed(f"the dedicated configuration directory is unusable: {reason}")
+    Path(config_dir).mkdir(parents=True, exist_ok=True)
+    present = [
+        name for name in GMAIL_LOGIN_PRECLUDING_FILES
+        if os.path.lexists(os.path.join(config_dir, name))
+    ]
+    if present:
+        raise GmailCommandFailed(
+            "the dedicated directory already holds a credential or token cache "
+            f"({', '.join(present)}); provenance needs an empty start, so remove it "
+            "with 'gws auth logout' run with GOOGLE_WORKSPACE_CLI_CONFIG_DIR set to "
+            "that directory, then run the login again"
+        )
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_attestation_path(config_dir))
+    except OSError as exc:
+        raise GmailCommandFailed("a stale credential attestation could not be removed") from exc
+    try:
+        output = _run(
+            GMAIL_LOGIN_ARGS,
+            config_dir=config_dir,
+            cwd=_run_directory(config_dir),
+            environ=environ,
+            path_lookup=path_lookup,
+            popen=popen,
+            timeout=GWS_LOGIN_TIMEOUT_SECONDS,
+            inherit_stderr=True,
+        )
+    except GmailCommandFailed as exc:
+        raise GmailCommandFailed(f"the controlled login did not complete: {exc}") from exc
+    reason = gmail_login_refusal(
+        _one_json_object(output.stdout), principal=principal, config_dir=config_dir
+    )
+    if reason is not None:
+        raise GmailCommandFailed(
+            f"the controlled login did not establish the expected credential: {reason}; "
+            "whatever it wrote is unattested and every Gmail operation stays refused - "
+            "remove it with 'gws auth logout' under the dedicated directory"
+        )
+    with held_credential(config_dir) as credentials:
+        try:
+            attestation = gmail_credential_attestation(
+                principal=principal, config_dir=config_dir,
+                credentials=credentials, established_at=now(),
+            )
+        except GmailExecutionUnavailable as exc:
+            raise GmailCommandFailed(f"the new credential could not be attested: {exc}") from exc
+        write_credential_attestation(config_dir, attestation)
+    return attestation
+
+
 def gmail_route_check(
     config_dir: str,
     *,
@@ -380,9 +618,11 @@ def observed_gmail_identity(
 ) -> tuple[str, str]:
     """The ``(principal, credential_route)`` the dedicated session acts as.
 
-    AN OBSERVATION, NEVER A DECISION, in two halves that must both pass: the
-    ROUTE (``gmail_route_check``) and then the EFFECTIVE ACCOUNT - the profile
-    of the bound account, asked for by name. The returned route is the one
+    AN OBSERVATION, NEVER A DECISION, in two halves that must both pass
+    inside the instance bracket (``attested_credential``: the attested
+    authorized-user credential, held for the whole observation): the ROUTE
+    (``gmail_route_check``) and then the EFFECTIVE ACCOUNT - the profile of
+    the bound account, asked for by name. The returned route is the one
     constant this build allows, returned only after the route check proved
     the CLI is on it; it is never inferred from the profile.
     """
@@ -390,21 +630,22 @@ def observed_gmail_identity(
     if reason is not None:
         raise GmailCommandFailed(f"the dedicated configuration directory is unusable: {reason}")
     arguments = gws_profile_arguments(principal)
-    gmail_route_check(config_dir, environ=environ, path_lookup=path_lookup, popen=popen)
-    try:
-        output = _run(
-            arguments,
-            config_dir=config_dir,
-            cwd=_run_directory(config_dir),
-            environ=environ,
-            path_lookup=path_lookup,
-            popen=popen,
-        )
-    except GmailCommandFailed as exc:
-        raise GmailCommandFailed(
-            "the Google Workspace CLI reports no usable authenticated session "
-            "for the expected account"
-        ) from exc
+    with attested_credential(config_dir, principal):
+        gmail_route_check(config_dir, environ=environ, path_lookup=path_lookup, popen=popen)
+        try:
+            output = _run(
+                arguments,
+                config_dir=config_dir,
+                cwd=_run_directory(config_dir),
+                environ=environ,
+                path_lookup=path_lookup,
+                popen=popen,
+            )
+        except GmailCommandFailed as exc:
+            raise GmailCommandFailed(
+                "the Google Workspace CLI reports no usable authenticated session "
+                "for the expected account"
+            ) from exc
     payload = _one_json_object(output.stdout)
     if payload is None or "error" in payload:
         raise GmailCommandFailed(
@@ -506,7 +747,9 @@ def run_operation_plan(
     Order, and what each step means:
 
     1. the plan is re-derived - refusal;
-    2. the credential route is proved - refusal;
+    2. the credential INSTANCE is proved and held for every later step
+       (``attested_credential``), then the credential route is proved -
+       refusal;
     3. a READ runs once in the run directory; every failure is a refusal;
     4. a WRITE first requires the transport directory to sweep clean (an
        earlier residue is a refusal before anything starts), gets a fresh
@@ -525,18 +768,33 @@ def run_operation_plan(
     reason = gmail_config_dir_refusal(config_dir)
     if reason is not None:
         raise GmailCommandFailed(f"the dedicated configuration directory is unusable: {reason}")
-    gmail_route_check(config_dir, environ=environ, path_lookup=path_lookup, popen=popen)
-    if not plan.is_write:
-        return _run(
-            plan.arguments,
-            config_dir=config_dir,
-            cwd=_run_directory(config_dir),
-            environ=environ,
-            path_lookup=path_lookup,
-            popen=popen,
-            timeout=GWS_READ_TIMEOUT_SECONDS,
+    # The frame already proved the resource account IS Core's principal.
+    with attested_credential(config_dir, plan.resource.account):
+        gmail_route_check(config_dir, environ=environ, path_lookup=path_lookup, popen=popen)
+        if not plan.is_write:
+            return _run(
+                plan.arguments,
+                config_dir=config_dir,
+                cwd=_run_directory(config_dir),
+                environ=environ,
+                path_lookup=path_lookup,
+                popen=popen,
+                timeout=GWS_READ_TIMEOUT_SECONDS,
+            )
+        return _write_under_hold(
+            plan, config_dir=config_dir, environ=environ, path_lookup=path_lookup, popen=popen
         )
 
+
+def _write_under_hold(
+    plan: Any,
+    *,
+    config_dir: str,
+    environ: Mapping[str, str] | None,
+    path_lookup: Any,
+    popen: Any,
+) -> GmailCommandOutput:
+    """Steps 4 and 5, unchanged, run while the credential hold is in place."""
     if transport_residue_present(config_dir):
         raise GmailCommandFailed(_RESIDUE_REFUSAL)
     message = gmail_outbound_message(plan.resource)
@@ -632,6 +890,7 @@ __all__ = [
     "GWS_OUTPUT_MAX_BYTES",
     "GWS_READ_TIMEOUT_SECONDS",
     "GWS_RUN_DIRNAME",
+    "GWS_LOGIN_TIMEOUT_SECONDS",
     "GWS_TRANSPORT_DIRNAME",
     "GWS_WRITE_TIMEOUT_SECONDS",
     "GmailCommandExited",
@@ -641,8 +900,13 @@ __all__ = [
     "GmailCommandStarted",
     "GmailCommandTimedOut",
     "GmailTransportResidue",
+    "attested_credential",
     "dotenv_refusal",
+    "gmail_controlled_login",
     "gmail_route_check",
+    "held_credential",
+    "read_credential_attestation",
+    "write_credential_attestation",
     "gws_executable",
     "gws_profile_arguments",
     "observed_gmail_identity",

@@ -1081,14 +1081,19 @@ def gmail_operation_plan(frame: Any) -> GmailOperationPlan:
 # * ``auth_method`` is ``oauth2`` for a stored authorized-user credential AND
 #   for a stored service-account credential alike, so it proves nothing about
 #   the type either.
-# * What differs between the two is the credential metadata the status
-#   report carries without any secret: an authorized-user credential has a
-#   REFRESH TOKEN (``has_refresh_token``) and was issued for an OAuth client,
-#   so its (masked) ``client_id`` equals the configured client's
-#   ``config_client_id``; a service-account credential has no refresh token
-#   and a numeric ``client_id`` that never equals an OAuth client id. The CLI
-#   also performs its own token check for a user credential and reports
-#   ``token_valid`` / ``token_error``.
+# * The status report NEVER carries the stored credential's ``type``. It
+#   reports metadata - ``has_refresh_token``, the masked ``client_id``, its
+#   own ``token_valid`` check - and a stored file whose real ``type`` is
+#   ``service_account`` can carry a ``client_id``, ``client_secret`` and
+#   ``refresh_token`` that satisfy all of it, while the CLI's execution path
+#   parses ``type`` itself and selects the service-account authenticator.
+#   So the metadata below is a necessary route check and NOT the type proof.
+#   The type proof is PROVENANCE (``GmailCredentialAttestation`` below): the
+#   CLI's one and only writer of ``credentials.enc`` is ``gws auth login``,
+#   whose payload is built as ``{"type": "authorized_user", ...}`` before
+#   ``save_encrypted`` (0.22.5, ``auth_commands.rs``), and the seam runs that
+#   login itself into a directory it proved held no credential, then binds
+#   the exact resulting file - by digest, under a hold - to every operation.
 # * ``storage`` is ``none`` / ``plaintext`` / ``encrypted`` and
 #   ``keyring_backend`` is ``keyring`` / ``file``; each credential file and
 #   the client configuration is reported with its path and an ``_exists``.
@@ -1096,9 +1101,11 @@ def gmail_operation_plan(frame: Any) -> GmailOperationPlan:
 #   dedicated credential is REQUIRED to exist: the CLI consults ADC only when
 #   its config directory holds none, and the env-named ADC route is stripped.
 #
-# ``gws auth export`` is deliberately NOT used as the type verifier: it
-# decrypts the stored credential to stdout. The status report above carries
-# the same type evidence with the secrets absent.
+# ``gws auth export`` is deliberately NOT used as the type verifier: even
+# masked it prints the decrypted credential with only ``client_secret`` and
+# ``refresh_token`` shortened to ``xxxx...xxxx``, and a service-account file's
+# ``private_key`` is not masked at all - on exactly the credential that must
+# be refused, it would hand the key to this process.
 
 GMAIL_ENCRYPTED_CREDENTIALS_NAME = "credentials.enc"
 GMAIL_CLIENT_CONFIG_NAME = "client_secret.json"
@@ -1134,11 +1141,12 @@ def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
     source, no ``client_config_error``, a masked client id present); the
     stored credential is OAuth2, stored ENCRYPTED with the OS-keyring backend,
     with no plaintext file beside it and its file in the dedicated directory;
-    and it is an AUTHORIZED-USER credential - it carries a refresh token, its
-    client id is the configured client's, and the CLI's own token check
-    passed. A service account fails the last three whether it sits in the
-    encrypted store or anywhere else; a token, client or file from the
-    environment fails the first; ADC has no stored credential to show.
+    and it carries authorized-user METADATA - a refresh token, a client id
+    equal to the configured client's, and the CLI's own token check passed.
+    A token, client or file from the environment fails the first clause; ADC
+    has no stored credential to show. The metadata is not the type proof: a
+    service-account file can be dressed with the same three fields. The type
+    is proved by provenance, ``gmail_attestation_refusal``.
     """
     if type(payload) is not dict:
         return "the authentication state is not one JSON object"
@@ -1190,6 +1198,172 @@ def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
         return "the stored credential is not usable"
     if payload.get("token_valid") is not True:
         return "the CLI's own token check did not pass for the stored credential"
+    return None
+
+
+# --------------------------------------------------------------------------
+# The credential INSTANCE: provenance attestation of the authorized user
+# --------------------------------------------------------------------------
+#
+# Why provenance. gws 0.22.5 exposes no sanitized signal of the stored
+# credential's ``type``: ``auth status`` omits it and ``auth export`` prints
+# secrets. What gws does guarantee is that ``credentials.enc`` has exactly
+# one writer inside it - ``gws auth login`` - and that writer serializes
+# ``{"type": "authorized_user", "client_id", "client_secret",
+# "refresh_token"}`` (``auth_commands.rs``, ``handle_login_inner``) before
+# ``credential_store::save_encrypted``. So a file that (a) did not exist,
+# (b) exists right after a login this build ran itself and (c) that login
+# reported as a success for the bound principal IS an authorized-user
+# credential. The attestation records that fact about that exact file - by
+# SHA-256 of its ciphertext, which contains no secret - and every operation
+# holds the file against replacement and checks the digest before and while
+# the CLI reads it. Non-secret, Core-owned data in the dedicated directory.
+
+#: The scopes the controlled login requests: the reads, and drafts + send.
+#: Fixed - not a parameter - so the login vector is a constant.
+GMAIL_LOGIN_SCOPES: tuple[str, ...] = (
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
+)
+#: The constant vector of the controlled login. ``--scopes`` also keeps the
+#: CLI off its interactive scope picker.
+GMAIL_LOGIN_ARGS: tuple[str, ...] = ("auth", "login", "--scopes", ",".join(GMAIL_LOGIN_SCOPES))
+#: The files whose presence means the dedicated directory already holds a
+#: credential or a token derived from one; the controlled login refuses to
+#: run over any of them, because provenance needs an empty starting point.
+GMAIL_LOGIN_PRECLUDING_FILES: tuple[str, ...] = (
+    GMAIL_ENCRYPTED_CREDENTIALS_NAME,
+    "credentials.json",
+    "credentials.tmp",
+    "token_cache.json",
+    "sa_token_cache.json",
+)
+GMAIL_ATTESTATION_NAME = "jarvis-credential-attestation.json"
+GMAIL_ATTESTATION_PROVENANCE = "gws auth login"
+GMAIL_ATTESTATION_MAX_BYTES = 4_096
+#: Ceiling on the credential file itself (a few hundred bytes in practice).
+GMAIL_CREDENTIAL_MAX_BYTES = 64 * 1024
+_SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
+_ATTESTATION_KEYS = frozenset(
+    {"principal", "config_dir", "credentials_sha256", "credentials_size", "established_at", "provenance"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class GmailCredentialAttestation:
+    """The non-secret record that ONE exact ``credentials.enc`` was created
+    by the controlled login for this principal in this directory. DATA."""
+
+    principal: str
+    config_dir: str
+    credentials_sha256: str
+    credentials_size: int
+    established_at: str
+    provenance: str = GMAIL_ATTESTATION_PROVENANCE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "principal": self.principal,
+            "config_dir": self.config_dir,
+            "credentials_sha256": self.credentials_sha256,
+            "credentials_size": self.credentials_size,
+            "established_at": self.established_at,
+            "provenance": self.provenance,
+        }
+
+
+def gmail_credential_attestation(
+    *, principal: str, config_dir: str, credentials: bytes, established_at: str
+) -> GmailCredentialAttestation:
+    """The attestation of these exact credential bytes. The bytes are the
+    CIPHERTEXT the CLI wrote; they are digested, never parsed or kept."""
+    if type(credentials) is not bytes or not credentials:
+        raise GmailExecutionUnavailable("the credential file is empty")
+    if len(credentials) > GMAIL_CREDENTIAL_MAX_BYTES:
+        raise GmailExecutionUnavailable("the credential file is over its bound")
+    attestation = GmailCredentialAttestation(
+        principal=principal,
+        config_dir=config_dir,
+        credentials_sha256=hashlib.sha256(credentials).hexdigest(),
+        credentials_size=len(credentials),
+        established_at=established_at,
+    )
+    reason = gmail_attestation_refusal(
+        attestation, principal=principal, config_dir=config_dir, credentials=credentials
+    )
+    if reason is not None:
+        raise GmailExecutionUnavailable(reason)
+    return attestation
+
+
+def gmail_attestation_from_dict(payload: Any) -> GmailCredentialAttestation:
+    """Parse a stored attestation, or fail closed. Closed key set."""
+    if type(payload) is not dict or set(payload) != _ATTESTATION_KEYS:
+        raise GmailExecutionUnavailable("the credential attestation is not the closed record")
+    for key in ("principal", "config_dir", "credentials_sha256", "established_at", "provenance"):
+        if type(payload[key]) is not str or not payload[key] or len(payload[key]) > 1_024:
+            raise GmailExecutionUnavailable(f"the credential attestation field '{key}' is not bounded text")
+    size = payload["credentials_size"]
+    if type(size) is not int or not 0 < size <= GMAIL_CREDENTIAL_MAX_BYTES:
+        raise GmailExecutionUnavailable("the credential attestation size is not in bounds")
+    if _SHA256_HEX.fullmatch(payload["credentials_sha256"]) is None:
+        raise GmailExecutionUnavailable("the credential attestation digest is not a SHA-256")
+    return GmailCredentialAttestation(
+        principal=payload["principal"],
+        config_dir=payload["config_dir"],
+        credentials_sha256=payload["credentials_sha256"],
+        credentials_size=size,
+        established_at=payload["established_at"],
+        provenance=payload["provenance"],
+    )
+
+
+def gmail_attestation_refusal(
+    attestation: Any, *, principal: Any, config_dir: Any, credentials: Any
+) -> str | None:
+    """Why these credential bytes are not the attested authorized-user
+    instance for this principal in this directory, or ``None``. Pure."""
+    if type(attestation) is not GmailCredentialAttestation:
+        return "no credential attestation"
+    if attestation.provenance != GMAIL_ATTESTATION_PROVENANCE:
+        return "the attested credential was not established by the controlled login"
+    if gmail_principal_refusal(principal) is not None:
+        return "the expected principal is unusable"
+    if attestation.principal != principal:
+        return "the attested credential belongs to another principal"
+    if gmail_config_dir_refusal(config_dir) is not None or not _same_path(
+        attestation.config_dir, config_dir
+    ):
+        return "the attested credential lives in another directory"
+    if type(credentials) is not bytes or not credentials:
+        return "the credential file is empty"
+    if len(credentials) > GMAIL_CREDENTIAL_MAX_BYTES:
+        return "the credential file is over its bound"
+    if attestation.credentials_size != len(credentials) or (
+        attestation.credentials_sha256 != hashlib.sha256(credentials).hexdigest()
+    ):
+        return "the credential instance is not the attested one"
+    return None
+
+
+def gmail_login_refusal(payload: Any, *, principal: Any, config_dir: str) -> str | None:
+    """Why the controlled login's report does not establish the dedicated
+    credential for the bound principal, or ``None``. The report (0.22.5)
+    carries ``status``, the ``account`` the flow authenticated, the
+    ``credentials_file`` it encrypted to, and the scopes - no secret."""
+    if type(payload) is not dict:
+        return "the login report is not one JSON object"
+    if payload.get("status") != "success":
+        return "the login did not report success"
+    account = payload.get("account")
+    if gmail_address_refusal(account) is not None:
+        return "the login did not identify the account it authenticated"
+    if gmail_principal_refusal(principal) is not None or account.lower() != principal:
+        return "the login authenticated another account than the bound principal"
+    if not _same_path(
+        payload.get("credentials_file"), os.path.join(config_dir, GMAIL_ENCRYPTED_CREDENTIALS_NAME)
+    ):
+        return "the login did not write the dedicated directory's credential file"
     return None
 
 
@@ -1523,7 +1697,18 @@ def build_gmail_read_snapshot(
 
 
 __all__ = [
+    "GMAIL_ATTESTATION_NAME",
+    "GMAIL_ATTESTATION_PROVENANCE",
     "GMAIL_AUTH_STATUS_ARGS",
+    "GMAIL_CREDENTIAL_MAX_BYTES",
+    "GMAIL_LOGIN_ARGS",
+    "GMAIL_LOGIN_PRECLUDING_FILES",
+    "GMAIL_LOGIN_SCOPES",
+    "GmailCredentialAttestation",
+    "gmail_attestation_from_dict",
+    "gmail_attestation_refusal",
+    "gmail_credential_attestation",
+    "gmail_login_refusal",
     "GMAIL_BILLING_CLASS",
     "GMAIL_BODY_MAX_BYTES",
     "GMAIL_CLIENT_CONFIG_NAME",

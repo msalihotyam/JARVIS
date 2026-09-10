@@ -27,6 +27,7 @@ from jarvis.app import (
     config_mutation_result,
     config_show_result,
     failure_result,
+    gmail_login_result,
     job_archive_result,
     job_create_result,
     job_enablement_result,
@@ -51,6 +52,8 @@ from jarvis.contracts import (
     PermissionMode,
     ProjectMemoryKind,
 )
+from jarvis.gmail import GmailExecutionUnavailable
+from jarvis.gmail_cli import gmail_controlled_login
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import (
     ConfigError,
@@ -130,6 +133,24 @@ def _build_parser() -> _ArgumentParser:
     )
     show_command.add_argument("--session-id", required=True)
     show_command.add_argument("--task-id", required=True)
+
+    # Gmail minimum: the controlled login that establishes and attests the
+    # JARVIS-dedicated authorized-user credential. It builds no registry,
+    # connector, AgentCore or model; it runs exactly one child,
+    # ``gws auth login``, into the dedicated directory and records what it
+    # produced. Provenance is the type proof, so the login must be this
+    # build's own - see ``jarvis.gmail_cli.gmail_controlled_login``.
+    gmail_command = commands.add_parser(
+        "gmail", help="Establish the JARVIS-dedicated Gmail credential."
+    )
+    gmail_actions = gmail_command.add_subparsers(dest="gmail_action")
+    gmail_actions.add_parser(
+        "login",
+        help=(
+            "Run the controlled Google Workspace CLI login into the dedicated "
+            "directory and attest the resulting authorized-user credential."
+        ),
+    )
 
     # M12 S2A: explicit operator recovery. Local-only like the visibility
     # verbs - it builds no registry, connector or AgentCore, so it is
@@ -444,6 +465,43 @@ def _dispatch_memory_command(
         "'memory' requires the 'add', 'list' or 'retire' sub-command.",
         EXIT_INVALID_INPUT,
     )
+
+
+def _dispatch_gmail_command(
+    settings: Settings,
+    args: argparse.Namespace,
+    *,
+    login: Callable[..., Any] = gmail_controlled_login,
+) -> CommandResult:
+    """The controlled Gmail login. Constructs nothing but the one child."""
+    if getattr(args, "gmail_action", None) != "login":
+        return failure_result(
+            "gmail",
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            "'gmail' requires an action: login.",
+            EXIT_INVALID_INPUT,
+        )
+    if settings.gmail_principal is None:
+        return failure_result(
+            "gmail-login",
+            settings.permission_mode,
+            ErrorCode.CONFIG_INVALID,
+            "No Gmail principal is configured; set it first with "
+            "'jarvis config set gmail_principal <address>'.",
+            EXIT_POLICY,
+        )
+    try:
+        attestation = login(str(settings.gmail_config_dir), settings.gmail_principal)
+    except GmailExecutionUnavailable as exc:
+        return failure_result(
+            "gmail-login",
+            settings.permission_mode,
+            ErrorCode.CONNECTOR_FAILED,
+            str(exc),
+            EXIT_POLICY,
+        )
+    return gmail_login_result(settings, attestation)
 
 
 def _dispatch_task_command(
@@ -899,6 +957,13 @@ def main(
         resolution = _dispatch_job_command(effective, args)
         print(resolution.render())
         return resolution.exit_code
+
+    if command == "gmail":
+        # The controlled login: one child process and one non-secret record,
+        # with no application, registry, connector or AgentCore built.
+        gmail_result = _dispatch_gmail_command(effective, args)
+        print(gmail_result.render())
+        return gmail_result.exit_code
 
     if command in ("sessions", "tasks", "show"):
         # Read-only, and routed here so that stays STRUCTURAL: no application,
