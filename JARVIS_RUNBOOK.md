@@ -116,13 +116,30 @@ following must be true, in order:
 
 1. The implementation has been accepted.
 2. The worktree is clean (`git status --porcelain` empty).
-3. The current handoff token has been verified.
-4. The persistent Claude development chat has been rebound to
+3. The persistent Claude development chat has been rebound to
    `C:\Users\realk\Masaüstü\JARVIS`.
+4. The handoff is confirmed **to the helper**: in an interactive console
+   `finish-current` / `cleanup` ask one explicit question and accept only the
+   typed answer `REBOUND`; the helper then resolves the exact task-generation
+   token itself. No `status` lookup, no token copying and no manual
+   `$env:JARVIS_DEV_EXCLUSIVE_HANDOFF` in normal use. Automation (captured
+   output, piped or closed stdin) never gets the question — it must set that
+   variable to the exact token or it fails closed.
 
-**No worktree removal may happen before step 4.** A worktree cleanup that
+The normal interactive sequence is therefore:
+
+```
+# 1. work accepted, worktree clean
+# 2. rebind the persistent Claude chat to C:\Users\realk\Masaüstü\JARVIS
+.\dev.ps1 finish-current            # answer REBOUND when asked
+# 3. from canonical main
+.\dev.ps1 cleanup <worker> <task>   # answer REBOUND when asked
+```
+
+**No worktree removal may happen before step 3.** A worktree cleanup that
 runs while the persistent chat is still pointed at the worktree being removed
-is a boundary violation, regardless of how clean or accepted the work is.
+is a boundary violation, regardless of how clean or accepted the work is —
+and answering `REBOUND` before it is true is exactly that violation, typed.
 
 ## Before proposing the next action
 

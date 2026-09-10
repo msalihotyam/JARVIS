@@ -162,7 +162,12 @@ function Get-TaskHandoffToken {
 }
 
 function Run-Dev {
-    param([string]$Cwd, [string[]]$DevArgs)
+    # -StdIn feeds one line to the helper's standard input, so a test can
+    # answer the interactive handoff confirmation. The helper's own terminal
+    # detection still sees captured output and therefore refuses to prompt
+    # unless DEV_HELPER_TEST_ASSUME_INTERACTIVE forces the branch - which is
+    # exactly what the H5 tests exercise from both sides.
+    param([string]$Cwd, [string[]]$DevArgs, [string]$StdIn = '')
     # Auto-provision the exclusive handoff for finish/cleanup calls from the
     # task's own metadata (the normal controller workflow). An explicitly set
     # env value (attack tests) is never clobbered; suppression is available
@@ -187,7 +192,11 @@ function Run-Dev {
     $ErrorActionPreference = 'Continue'
     try {
         Set-Location $Cwd
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DevPs @DevArgs 2>&1
+        if ($StdIn -ne '') {
+            $raw = $StdIn | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DevPs @DevArgs 2>&1
+        } else {
+            $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DevPs @DevArgs 2>&1
+        }
         $code = $LASTEXITCODE
     }
     finally {
@@ -1339,6 +1348,90 @@ $script:SuppressAutoHandoff = $false
 $r = Run-Dev $canon @('cleanup', 'glm', 'ho1')
 Check 'H1 valid handoff: cleanup succeeds' ($r.Code -eq 0)
 Check 'H1 valid handoff: CLEANED' ($r.Out -match 'CLEANED')
+
+# H5: INTERACTIVE HANDOFF CONFIRMATION. The gate is unchanged in what it
+# requires; a human at a console may now satisfy it by answering one explicit
+# question instead of copying a token. Every side is measured: automation
+# without a token, a piped answer with no interactive console, an explicit
+# refusal, a present-but-wrong token, the confirmation itself on finish and
+# on cleanup, the unchanged env-token path, and the two-artifact ownership
+# evidence that a confirmation must never bypass.
+function Test-BranchRef {
+    # Local to this block: the suite's Test-BranchExists is defined further
+    # down the file, after this point in a linear script.
+    param([string]$Repo, [string]$Branch)
+    & git -C $Repo rev-parse --verify --quiet "refs/heads/$Branch" *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+$root = New-TempRoot
+$canon = New-CanonicalRepo $root
+$wt = Join-Path $root 'JARVIS-GLM-h5'
+$null = Run-Dev $canon @('new', 'glm', 'h5')
+CommitFile $wt 'task.txt' @('h5 change') 'h5 work'
+$preHead = GitOut $canon @('rev-parse', 'HEAD')
+$script:SuppressAutoHandoff = $true
+# a. a piped answer with NO interactive console is automation: fail closed
+$r = Run-Dev $canon @('finish', 'glm', 'h5') -StdIn 'REBOUND'
+Check 'H5 non-interactive piped answer: exit 1' ($r.Code -eq 1)
+Check 'H5 non-interactive piped answer: HANDOFF REQUIRED' ($r.Out -match 'HANDOFF REQUIRED')
+Check 'H5 non-interactive piped answer: never prompted' ($r.Out -notmatch 'HANDOFF CONFIRMATION')
+Check 'H5 non-interactive piped answer: main not mutated' ((GitOut $canon @('rev-parse', 'HEAD')) -eq $preHead)
+# b. interactive console, explicit refusal
+$env:DEV_HELPER_TEST_ASSUME_INTERACTIVE = '1'
+$r = Run-Dev $canon @('finish', 'glm', 'h5') -StdIn 'no'
+Check 'H5 refusal: exit 1' ($r.Code -eq 1)
+Check 'H5 refusal: HANDOFF REFUSED' ($r.Out -match 'HANDOFF REFUSED')
+Check 'H5 refusal: the question was asked' ($r.Out -match 'HANDOFF CONFIRMATION')
+Check 'H5 refusal: main not mutated' ((GitOut $canon @('rev-parse', 'HEAD')) -eq $preHead)
+Check 'H5 refusal: worktree intact' (Test-Path -LiteralPath $wt)
+Check 'H5 refusal: task still ACTIVE' (((Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'h5') -Raw | ConvertFrom-Json).state) -ceq 'ACTIVE')
+# c. interactive console, but a WRONG token is present: refused, never asked
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = "jarvis-dev-handoff-v1:glm:h5:$('0' * 64)"
+$r = Run-Dev $canon @('finish', 'glm', 'h5') -StdIn 'REBOUND'
+$env:JARVIS_DEV_EXCLUSIVE_HANDOFF = $null
+Check 'H5 wrong token present: exit 1' ($r.Code -eq 1)
+Check 'H5 wrong token present: HANDOFF REQUIRED' ($r.Out -match 'HANDOFF REQUIRED')
+Check 'H5 wrong token present: never prompted' ($r.Out -notmatch 'HANDOFF CONFIRMATION')
+Check 'H5 wrong token present: main not mutated' ((GitOut $canon @('rev-parse', 'HEAD')) -eq $preHead)
+# d. interactive console, confirmed: finish integrates and keeps the worktree
+$r = Run-Dev $canon @('finish', 'glm', 'h5') -StdIn 'REBOUND'
+Check 'H5 confirmed finish: exit 0' ($r.Code -eq 0)
+Check 'H5 confirmed finish: the question was asked' ($r.Out -match 'HANDOFF CONFIRMATION')
+Check 'H5 confirmed finish: INTEGRATED, not CLEANED' (($r.Out -match 'INTEGRATED') -and ($r.Out -notmatch 'CLEANED'))
+Check 'H5 confirmed finish: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'h5 change')
+Check 'H5 confirmed finish: worktree and branch kept' ((Test-Path -LiteralPath $wt) -and (Test-BranchRef $canon 'glm/h5'))
+# e. interactive console, confirmed: cleanup from canonical main
+$r = Run-Dev $canon @('cleanup', 'glm', 'h5') -StdIn 'REBOUND'
+Check 'H5 confirmed cleanup: exit 0' ($r.Code -eq 0)
+Check 'H5 confirmed cleanup: CLEANED' ($r.Out -match 'CLEANED')
+Check 'H5 confirmed cleanup: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchRef $canon 'glm/h5')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'h5'))))
+# f. a valid env token never prompts, even on an interactive console
+$script:SuppressAutoHandoff = $false
+$wt = Join-Path $root 'JARVIS-GLM-h5b'
+$null = Run-Dev $canon @('new', 'glm', 'h5b')
+CommitFile $wt 'task2.txt' @('h5b change') 'h5b work'
+$r = Run-Dev $canon @('finish', 'glm', 'h5b')
+Check 'H5 valid token: exit 0' ($r.Code -eq 0)
+Check 'H5 valid token: INTEGRATED' ($r.Out -match 'INTEGRATED')
+Check 'H5 valid token: never prompted' ($r.Out -notmatch 'HANDOFF CONFIRMATION')
+$r = Run-Dev $canon @('cleanup', 'glm', 'h5b')
+Check 'H5 valid token cleanup: CLEANED without a prompt' (($r.Code -eq 0) -and ($r.Out -match 'CLEANED') -and ($r.Out -notmatch 'HANDOFF CONFIRMATION'))
+# g. a confirmation never bypasses the two-artifact ownership evidence: with
+#    metadata that disagrees with the worktree marker, REBOUND is accepted as
+#    an answer and the finish is still refused before anything is mutated
+$script:SuppressAutoHandoff = $true
+$wt = Join-Path $root 'JARVIS-GLM-h5c'
+$null = Run-Dev $canon @('new', 'glm', 'h5c')
+CommitFile $wt 'task3.txt' @('h5c change') 'h5c work'
+$preHead = GitOut $canon @('rev-parse', 'HEAD')
+Edit-RawMeta $canon 'glm' 'h5c' { param($m) $m.ownershipNonce = ('f' * 64) }
+$r = Run-Dev $canon @('finish', 'glm', 'h5c') -StdIn 'REBOUND'
+Check 'H5 mismatched generation: exit 1' ($r.Code -eq 1)
+Check 'H5 mismatched generation: ownership refusal' ($r.Out -match 'ownership evidence refused')
+Check 'H5 mismatched generation: main not mutated' ((GitOut $canon @('rev-parse', 'HEAD')) -eq $preHead)
+Check 'H5 mismatched generation: worktree intact' (Test-Path -LiteralPath $wt)
+$env:DEV_HELPER_TEST_ASSUME_INTERACTIVE = $null
+$script:SuppressAutoHandoff = $false
 
 # H2: CONTENT (B.6-B.9)
 # 6. tracked dirty content -> removal refused

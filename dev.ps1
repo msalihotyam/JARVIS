@@ -37,13 +37,23 @@
   exact-name worktrees that lack matching helper state.
 
 .EXCLUSIVE HANDOFF (workflow precondition, not a security proof)
-  finish / finish-current / cleanup require the environment variable
-  JARVIS_DEV_EXCLUSIVE_HANDOFF to exactly equal the task-generation handoff
-  token printed by `.\dev.ps1 status`:
+  finish / finish-current / cleanup require this process to hold the exact
+  task-generation handoff token:
       jarvis-dev-handoff-v1:<worker>:<task>:<ownershipNonce>
   Its meaning: "the external worker/controller asserts that task writers have
   been stopped and drained and that canonical mutation is serialized for this
   operation." Without it nothing canonical is mutated and nothing is removed.
+  Two ways to hold it:
+    * AUTOMATION sets JARVIS_DEV_EXCLUSIVE_HANDOFF explicitly (the token is
+      printed by `.\dev.ps1 status`). A present but wrong token is refused
+      outright and is never turned into a question.
+    * A HUMAN at an interactive console sets nothing. When the variable is
+      absent the helper asks one explicit question - has the persistent
+      Claude development chat been rebound to the canonical repository - and
+      only the typed answer REBOUND resolves the token from trusted helper
+      metadata into this process. Any other answer refuses. Captured output,
+      piped/closed stdin or a non-interactive session never prompt: they fail
+      closed exactly as automation without a token does.
   The ref transaction below is the second, final fence; CAS plus handoff do
   not eliminate every possible same-user concurrent history mutation (ABA) -
   they are the adjudicated fences for the accepted threat model.
@@ -435,13 +445,67 @@ function Get-HandoffToken {
     return "$($Script:HandoffPrefix):$Worker`:$Task`:$Nonce"
 }
 
+function Test-InteractiveTerminal {
+    # Whether a HUMAN is provably at this console: someone who can read a
+    # question and type an answer. Captured output, a piped or closed stdin
+    # and a non-interactive session are all automation, and automation gets
+    # the explicit token flow only.
+    #
+    # The test seam forces the interactive BRANCH and nothing else: the answer
+    # still has to arrive on stdin, so the seam cannot confirm anything by
+    # itself - with no answer available, the gate refuses exactly as it would
+    # for a person who typed nothing.
+    if ($env:DEV_HELPER_TEST_ASSUME_INTERACTIVE -eq '1') { return $true }
+    if (-not [System.Environment]::UserInteractive) { return $false }
+    if ([System.Console]::IsInputRedirected -or [System.Console]::IsOutputRedirected) { return $false }
+    return $true
+}
+
 function Assert-ExclusiveHandoff {
-    param($identity, $meta)
+    # THE handoff gate, unchanged in what it requires: this process must hold
+    # the exact task-generation token for this worker/task before anything
+    # canonical is mutated or removed. What changed is how a human supplies
+    # it. Automation still sets the env variable explicitly. A person at an
+    # interactive console is instead asked ONE explicit question - has the
+    # persistent Claude development chat been rebound to the canonical
+    # repository - and only an affirmative answer resolves the token from the
+    # helper's own trusted metadata into this process. Copying a token by
+    # hand never verified the rebind; the token was already readable from
+    # `status`. The question is the thing that was actually missing.
+    #
+    # Every later re-check (including the final destructive gate) still
+    # re-derives the expected token from freshly re-read metadata and compares
+    # it exactly, so a generation that moves after the confirmation refuses
+    # exactly as before. Nothing here weakens the CAS, the ownership marker,
+    # the ancestry proofs or the no-force policy - they all run after this.
+    param($identity, $meta, [string]$CanonicalPath = '')
     $expected = Get-HandoffToken -Worker $identity.Worker -Task $identity.Task -Nonce $meta.ownershipNonce
     $provided = [System.Environment]::GetEnvironmentVariable($Script:HandoffEnvVar)
-    if (-not ($provided -is [string]) -or $provided -cne $expected) {
-        throw "HANDOFF REQUIRED: set $Script:HandoffEnvVar to the exact task-generation handoff token for $($identity.Worker) $($identity.Task) (printed by .\dev.ps1 status)"
+    if (($provided -is [string]) -and ($provided -ceq $expected)) { return }
+    if (($provided -is [string]) -and ($provided -ne '')) {
+        # A token is PRESENT and wrong: a stale generation, another task, a
+        # generic value. That is an automation error and never a question for
+        # a human - asking would let a person confirm straight past the very
+        # mismatch the token exists to catch.
+        throw "HANDOFF REQUIRED: $Script:HandoffEnvVar does not equal the exact task-generation handoff token for $($identity.Worker) $($identity.Task) (printed by .\dev.ps1 status)"
     }
+    if (-not (Test-InteractiveTerminal)) {
+        throw "HANDOFF REQUIRED: no interactive console to confirm on; set $Script:HandoffEnvVar to the exact task-generation handoff token for $($identity.Worker) $($identity.Task) (printed by .\dev.ps1 status)"
+    }
+    Write-Host 'HANDOFF CONFIRMATION'
+    Write-Host "  task     : $($identity.Worker) $($identity.Task)  ($($identity.Branch))"
+    Write-Host '  requires : the persistent Claude development chat has been REBOUND to'
+    if ($CanonicalPath) { Write-Host "             $CanonicalPath" } else { Write-Host '             the canonical repository' }
+    Write-Host '             (this script cannot observe that rebind; you are attesting to it)'
+    $answer = Read-Host '  type REBOUND to confirm, anything else to refuse'
+    if (-not ($answer -is [string]) -or $answer -cne 'REBOUND') {
+        throw 'HANDOFF REFUSED: the rebind was not confirmed; nothing canonical was mutated and nothing was removed'
+    }
+    # The confirmation ESTABLISHES the process-local authorization, in the
+    # same variable automation would have set, so every later check in this
+    # invocation sees exactly what it always saw and re-derives exactly what
+    # it always re-derived.
+    [System.Environment]::SetEnvironmentVariable($Script:HandoffEnvVar, $expected, 'Process')
 }
 
 # ---------- derived task identity -------------------------------------------
@@ -858,7 +922,7 @@ function Assert-FinalDestructivePreconditions {
     if ($metaNow.state -cne 'INTEGRATED') { throw 'final gate refused: metadata state is not INTEGRATED' }
 
     # exclusive handoff must still hold at the destructive step.
-    Assert-ExclusiveHandoff -identity $derived -meta $metaNow
+    Assert-ExclusiveHandoff -identity $derived -meta $metaNow -CanonicalPath $ctx.MainPath
 
     # The captured immutable source tip T is the ONLY source tip this cleanup
     # may act on; a newly observed OID never silently replaces it.
@@ -1213,7 +1277,7 @@ function Invoke-FinishTask {
     # nothing is ever removed. This is the external worker/controller's
     # assertion that task writers are stopped and canonical mutation is
     # serialized - a workflow precondition, not a security proof.
-    Assert-ExclusiveHandoff -identity $identity -meta $meta
+    Assert-ExclusiveHandoff -identity $identity -meta $meta -CanonicalPath $ctx.MainPath
 
     Assert-CanonicalReady -ctx $ctx
     # Capture the immutable canonical snapshot M this integration is validated
@@ -1417,7 +1481,7 @@ function Invoke-CleanupTask {
     if ($meta.state -cne 'INTEGRATED') { throw "cleanup refused: task state is '$($meta.state)' - only INTEGRATED tasks can be cleaned up" }
 
     # EXCLUSIVE HANDOFF: without it the worktree and branch are never removed.
-    Assert-ExclusiveHandoff -identity $identity -meta $meta
+    Assert-ExclusiveHandoff -identity $identity -meta $meta -CanonicalPath $ctx.MainPath
     Assert-CanonicalReady -ctx $ctx
 
     # Independent git proofs (fast fail on captured immutable OIDs; the final
