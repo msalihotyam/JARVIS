@@ -14,6 +14,7 @@ content that comes back is bound to the request that asked for it.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import unittest
 
@@ -35,10 +36,14 @@ from jarvis.github import (
     GITHUB_CONNECTOR,
     GITHUB_CAPABILITY_RESOURCE,
     GITHUB_CREDENTIAL_ROUTE,
+    GITHUB_DEFERRED_READ_CAPABILITIES,
+    GITHUB_GRAPHQL_ARGS,
     GITHUB_READ_CAPABILITIES,
     GITHUB_READ_OPERATION,
     GITHUB_SEARCH_MAX_ITEMS,
+    GITHUB_VIEWER_SELECTION,
     GITHUB_WRITE_CAPABILITIES,
+    github_atomic_read_content,
     GitHubExecutionUnavailable,
     GitHubIdentityBinding,
     GitHubOperationPlan,
@@ -104,10 +109,23 @@ READ_RESOURCES = {
     "github_pull_request_files": resource(
         GitHubResourceKind.PULL_REQUEST_FILES, number=9, limit=5
     ),
+}
+
+#: The one read name that is DECLARED and not enabled. Its grammar still has
+#: to work - a deferred capability is a closed vocabulary row, not a hole -
+#: which is why the resource is built here rather than deleted.
+DEFERRED_RESOURCES = {
     "github_code_search": resource(
         GitHubResourceKind.CODE_SEARCH, query="parse_token", limit=3
     ),
 }
+
+
+def graphql_payload(data=None, login: str = PRINCIPAL) -> str:
+    """One GraphQL response body: the viewer and the data, as one request."""
+    body = {"viewer": {"login": login}}
+    body.update({"repository": {"name": REPOSITORY}} if data is None else data)
+    return json.dumps({"data": body})
 
 
 class FakeOutput:
@@ -169,25 +187,84 @@ def fake_path_lookup(name: str) -> str:
 
 class VocabularyTests(unittest.TestCase):
     def test_every_read_capability_derives_exactly_one_plan(self) -> None:
-        self.assertEqual(10, len(GITHUB_READ_CAPABILITIES))
+        self.assertEqual(9, len(GITHUB_READ_CAPABILITIES))
         for capability in GITHUB_READ_CAPABILITIES:
             res = READ_RESOURCES[capability]
             self.assertIsNone(github_resource_refusal(res), capability)
             self.assertIs(GITHUB_CAPABILITY_RESOURCE[capability], res.kind)
             plan = github_operation_plan(frame_for(capability, res))
             self.assertIsNone(github_operation_plan_refusal(plan), capability)
-            # Nothing a caller supplied ever becomes a subcommand or a flag.
-            self.assertIn(plan.arguments[0], ("api", "repo", "issue", "pr", "search"))
 
-    def test_the_repository_reaches_argv_only_as_the_validated_slug(self) -> None:
+    def test_every_read_runs_over_the_one_atomic_transport(self) -> None:
+        """No capability can choose a route, and none can skip the viewer.
+
+        This is what makes the principal binding structural rather than a
+        habit: there is one transport, the viewer selection is prepended by
+        the single builder, and a read that did not ask GitHub who was calling
+        cannot be derived at all.
+        """
         for capability in GITHUB_READ_CAPABILITIES:
             plan = github_operation_plan(
                 frame_for(capability, READ_RESOURCES[capability])
             )
+            self.assertEqual(
+                GITHUB_GRAPHQL_ARGS, plan.arguments[: len(GITHUB_GRAPHQL_ARGS)]
+            )
+            self.assertEqual("-f", plan.arguments[-2], capability)
+            query = plan.arguments[-1]
+            self.assertTrue(query.startswith("query={"), capability)
+            self.assertIn(GITHUB_VIEWER_SELECTION, query, capability)
+            # One request, and nothing after the query to make it two.
+            self.assertEqual(len(GITHUB_GRAPHQL_ARGS) + 2, len(plan.arguments))
+
+    def test_no_legacy_rest_or_subcommand_route_remains_reachable(self) -> None:
+        """The old transports are gone, not merely unused.
+
+        A second route is what an ABA switch needed: a read that could be
+        served without naming its own viewer. So the check is on every derived
+        vector rather than on the builder table - if any capability could
+        still spell one, the invariant would only be a convention.
+        """
+        for capability in GITHUB_READ_CAPABILITIES:
+            plan = github_operation_plan(
+                frame_for(capability, READ_RESOURCES[capability])
+            )
+            self.assertNotIn(plan.arguments[0], ("repo", "issue", "pr", "search"))
             joined = " ".join(plan.arguments)
-            self.assertIn(f"{OWNER}/{REPOSITORY}", joined, capability)
-            # One repository per vector, never a second one bolted on.
-            self.assertEqual(1, joined.count(f"{OWNER}/{REPOSITORY}"), capability)
+            for legacy in ("--json", "--repo", "--limit", "--state", "--method"):
+                self.assertNotIn(legacy, joined, f"{capability}/{legacy}")
+            # No REST path, and no second repository spelling to carry one.
+            self.assertNotIn(f"{OWNER}/{REPOSITORY}", joined, capability)
+            self.assertNotIn("repos/", joined, capability)
+
+    def test_the_repository_reaches_argv_only_as_validated_literals(self) -> None:
+        for capability in GITHUB_READ_CAPABILITIES:
+            query = github_operation_plan(
+                frame_for(capability, READ_RESOURCES[capability])
+            ).arguments[-1]
+            self.assertIn(f'owner:"{OWNER}",name:"{REPOSITORY}"', query, capability)
+            # One repository per query, never a second one bolted on.
+            self.assertEqual(1, query.count(f'owner:"{OWNER}"'), capability)
+            self.assertEqual(1, query.count("repository("), capability)
+
+    def test_the_deferred_capability_has_no_plan_at_all(self) -> None:
+        """usable-v1 does not ship a code search, and does not fall back to one.
+
+        GitHub's GraphQL schema has no code search, so a code search cannot be
+        carried in the same request as the viewer and cannot be bound to a
+        principal. The name stays declared; what it must not have is a way to
+        run over the transport the other nine left behind.
+        """
+        self.assertEqual(("github_code_search",), GITHUB_DEFERRED_READ_CAPABILITIES)
+        for capability in GITHUB_DEFERRED_READ_CAPABILITIES:
+            self.assertNotIn(capability, GITHUB_READ_CAPABILITIES)
+            self.assertNotIn(capability, GitHubCliConnector.manifest.capabilities)
+            res = DEFERRED_RESOURCES[capability]
+            # The grammar still holds - it is deferred, not deleted.
+            self.assertIsNone(github_resource_refusal(res), capability)
+            # And there is no plan, so there is no vector and no read.
+            with self.assertRaises(GitHubExecutionUnavailable):
+                github_operation_plan(frame_for(capability, res))
 
     def test_no_write_capability_has_an_argument_builder(self) -> None:
         for capability in GITHUB_WRITE_CAPABILITIES:
@@ -496,13 +573,16 @@ def github_task(capability: str = "github_file_read", **overrides) -> Task:
 
 class ConnectorTests(unittest.TestCase):
     def connector(
-        self, *, observed=(PRINCIPAL, GITHUB_CREDENTIAL_ROUTE), stdout="{}"
+        self,
+        *,
+        observed=(PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
+        stdout=None,
     ) -> GitHubCliConnector:
         self.ran: list[GitHubOperationPlan] = []
 
         def runner(plan, **kwargs):
             self.ran.append(plan)
-            return FakeOutput(stdout)
+            return FakeOutput(graphql_payload() if stdout is None else stdout)
 
         def observer():
             if isinstance(observed, Exception):
@@ -513,58 +593,20 @@ class ConnectorTests(unittest.TestCase):
             BINDING, identity_observer=observer, plan_runner=runner
         )
 
-    def sequence_connector(self, *identities) -> GitHubCliConnector:
-        """A connector whose identity answers CHANGE between observations."""
-        answers = list(identities)
-        self.ran = []
+    def test_an_account_that_moves_away_and_back_is_refused(self) -> None:
+        """The ABA sequence, and it no longer reaches a snapshot.
 
-        def runner(plan, **kwargs):
-            self.ran.append(plan)
-            return FakeOutput('{"name":"widgets"}')
+        The counterexample the bracket could not see:
+          (1) the account is the bound principal,
+          (2) it switches to another login,
+          (3) THE READ RUNS - under that other login,
+          (4) it switches back,
+          (5) any later observation answers with the bound principal again.
 
-        def observer():
-            return answers.pop(0) if answers else identities[-1]
-
-        return GitHubCliConnector(
-            BINDING, identity_observer=observer, plan_runner=runner
-        )
-
-    def test_an_account_switched_across_the_read_refuses_the_snapshot(self) -> None:
-        """The read straddled a switch, so its bytes are never attested.
-
-        The identity check and the read are separate processes and the CLI
-        chooses its credential when each one starts, so the read CAN run under
-        an account the pre-check did not see. What must never happen is the
-        content being bound to the principal the approval named.
-        """
-        connector = self.sequence_connector(
-            (PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
-            ("intruder", GITHUB_CREDENTIAL_ROUTE),
-        )
-        task = github_task()
-        result = connector.execute(task, SessionState(id="s-switch"))
-        self.assertIs(OutcomeStatus.ERROR, result.outcome)
-        self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
-        self.assertFalse(result.error.retryable)
-        self.assertEqual({}, result.data)
-        # The read did happen - that is the honest part - and its content is
-        # discarded rather than carried into an attested snapshot.
-        self.assertEqual(1, len(self.ran))
-
-    def test_an_account_that_moves_away_and_back_is_NOT_caught(self) -> None:
-        """The ABA hole, reproduced deterministically. THIS IS AN OPEN GAP.
-
-        This test asserts what the boundary does TODAY, not what it should do.
-        It exists so the gap is a recorded, executable fact instead of a
-        sentence in a review, and so that a future atomic binding has a case
-        that must flip: the assertions below say the wrong principal is bound,
-        and closing the hole means rewriting them.
-
-        The sequence is the counterexample itself. Both observations answer
-        with the bound principal, the read in between runs under another
-        account, and nothing the connector can see distinguishes it from a
-        clean read - because the identity and the result come from two
-        separate credential selections.
+        A before/after check passes this every time. This one cannot, because
+        nothing is asked before or after: the login is in the response the
+        read itself returned, so it is the login of the credential that served
+        these exact bytes. Step (4) has nothing left to undo.
         """
         active = [PRINCIPAL]
         executed_as: list[str] = []
@@ -573,41 +615,126 @@ class ConnectorTests(unittest.TestCase):
             return (active[0], GITHUB_CREDENTIAL_ROUTE)
 
         def runner(plan, **kwargs):
-            active[0] = "intruder"  # (2) the account switches
-            executed_as.append(active[0])  # (3) the READ runs as the intruder
+            active[0] = "intruder"  # (2)
+            executed_as.append(active[0])  # (3) the read runs as the intruder
+            payload = graphql_payload(
+                {"repository": {"name": "private-to-intruder"}},
+                login=active[0],
+            )
             active[0] = PRINCIPAL  # (4) and it switches back
-            return FakeOutput('{"name":"private-to-intruder"}')
+            return FakeOutput(payload)
 
         connector = GitHubCliConnector(
             BINDING, identity_observer=observer, plan_runner=runner
         )
-        task = github_task()
-        result = connector.execute(task, SessionState(id="s-aba"))
+        result = connector.execute(github_task(), SessionState(id="s-aba"))
 
         self.assertEqual(["intruder"], executed_as)
-        # (6) The bracket sees PRINCIPAL on both sides and accepts. The content
-        # the intruder's credential fetched is now bound to PRINCIPAL.
-        self.assertIs(OutcomeStatus.SUCCESS, result.outcome)
-        snapshot = result.data[EXTERNAL_READ_RESULT_KEY]
-        self.assertEqual(PRINCIPAL, connector.binding.principal)
-        self.assertIn("private-to-intruder", snapshot["content"])
-
-    def test_an_unreadable_identity_after_the_read_also_refuses(self) -> None:
-        answers = [(PRINCIPAL, GITHUB_CREDENTIAL_ROUTE)]
-
-        def observer():
-            if answers:
-                return answers.pop(0)
-            raise GitHubCommandFailed("the session vanished")
-
-        connector = GitHubCliConnector(
-            BINDING,
-            identity_observer=observer,
-            plan_runner=lambda plan, **kwargs: FakeOutput("{}"),
-        )
-        result = connector.execute(github_task(), SessionState(id="s-gone"))
+        # (5) The account looks clean again, and it does not help.
+        self.assertEqual((PRINCIPAL, GITHUB_CREDENTIAL_ROUTE), observer())
         self.assertIs(OutcomeStatus.ERROR, result.outcome)
         self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+        self.assertFalse(result.error.retryable)
+        self.assertEqual({}, result.data)
+        self.assertNotIn("private-to-intruder", result.summary)
+
+    def test_the_viewer_and_the_data_come_from_one_invocation(self) -> None:
+        """Every supported capability proves its principal from its own read.
+
+        Not a property of one lucky vector: each row derives a query carrying
+        the viewer selection, and each row's response is accepted only when
+        that viewer is the bound principal.
+        """
+        for capability in GITHUB_READ_CAPABILITIES:
+            with self.subTest(capability=capability):
+                ran: list[GitHubOperationPlan] = []
+
+                def runner(plan, **kwargs):
+                    ran.append(plan)
+                    return FakeOutput(graphql_payload())
+
+                connector = GitHubCliConnector(
+                    BINDING,
+                    identity_observer=lambda: (PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
+                    plan_runner=runner,
+                )
+                result = connector.execute(
+                    github_task(capability), SessionState(id="s-1")
+                )
+                self.assertIs(OutcomeStatus.SUCCESS, result.outcome, capability)
+                # ONE process, and its query asked who was calling.
+                self.assertEqual(1, len(ran), capability)
+                self.assertIn(GITHUB_VIEWER_SELECTION, ran[0].arguments[-1])
+                # The proof is consumed here and never handed on as content.
+                snapshot = result.data[EXTERNAL_READ_RESULT_KEY]
+                self.assertNotIn("viewer", snapshot["content"])
+                self.assertNotIn(PRINCIPAL, snapshot["content"])
+
+    def test_a_read_served_by_another_account_is_refused(self) -> None:
+        """Every supported capability fails closed on a principal mismatch."""
+        for capability in GITHUB_READ_CAPABILITIES:
+            with self.subTest(capability=capability):
+                connector = self.connector(
+                    stdout=graphql_payload(login="someone-else")
+                )
+                result = connector.execute(
+                    github_task(capability), SessionState(id="s-2")
+                )
+                self.assertIs(OutcomeStatus.ERROR, result.outcome, capability)
+                self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+                self.assertEqual({}, result.data)
+
+    def test_a_response_that_cannot_prove_its_viewer_is_refused(self) -> None:
+        for body in (
+            "",
+            "not json",
+            "[]",
+            json.dumps({"data": {"repository": {"name": REPOSITORY}}}),
+            json.dumps({"data": {"viewer": {}, "repository": {}}}),
+            json.dumps({"data": {"viewer": {"login": ""}, "repository": {}}}),
+            json.dumps({"data": {"viewer": {"login": "a b"}, "repository": {}}}),
+            json.dumps({"data": {"viewer": PRINCIPAL, "repository": {}}}),
+            # A partial answer is not an answer: errors beside data refuse.
+            json.dumps(
+                {
+                    "data": {"viewer": {"login": PRINCIPAL}, "repository": None},
+                    "errors": [{"type": "NOT_FOUND", "message": "gone"}],
+                }
+            ),
+            # Viewer proved, nothing read.
+            json.dumps({"data": {"viewer": {"login": PRINCIPAL}}}),
+            json.dumps({"data": {"viewer": {"login": PRINCIPAL}, "repository": None}}),
+        ):
+            with self.subTest(body=body[:40]):
+                connector = self.connector(stdout=body)
+                result = connector.execute(github_task(), SessionState(id="s-3"))
+                self.assertIs(OutcomeStatus.ERROR, result.outcome)
+                self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+                self.assertEqual({}, result.data)
+
+    def test_a_refusal_never_echoes_the_response_body(self) -> None:
+        connector = self.connector(
+            stdout=json.dumps(
+                {
+                    "data": {"viewer": {"login": PRINCIPAL}},
+                    "errors": [{"message": "no access to acme/secret-repo"}],
+                }
+            )
+        )
+        result = connector.execute(github_task(), SessionState(id="s-4"))
+        self.assertIs(OutcomeStatus.ERROR, result.outcome)
+        self.assertNotIn("secret-repo", result.summary)
+
+    def test_the_deferred_capability_never_reaches_the_cli(self) -> None:
+        """A code-search task fails closed instead of finding another route."""
+        connector = self.connector()
+        task = github_task("github_file_read")
+        task.capability = "github_code_search"
+        task.github = DEFERRED_RESOURCES["github_code_search"].to_dict()
+        result = connector.execute(task, SessionState(id="s-5"))
+        self.assertIs(OutcomeStatus.ERROR, result.outcome)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+        self.assertEqual([], self.ran)
 
     def test_the_manifest_is_read_only(self) -> None:
         self.assertEqual(
@@ -631,7 +758,9 @@ class ConnectorTests(unittest.TestCase):
         )
 
     def test_a_read_returns_a_snapshot_bound_to_its_request(self) -> None:
-        connector = self.connector(stdout='{"name":"widgets"}')
+        connector = self.connector(
+            stdout=graphql_payload({"repository": {"name": REPOSITORY}})
+        )
         task = github_task()
         result = connector.execute(task, SessionState(id="s-1"))
         self.assertIs(OutcomeStatus.SUCCESS, result.outcome)
@@ -639,30 +768,57 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(DESTINATION, snapshot["destination"])
         self.assertEqual("file", snapshot["resource_kind"])
         self.assertEqual(task.id, snapshot["source_task_id"])
-        self.assertEqual('{"name":"widgets"}', snapshot["content"])
+        # The data the request asked for, and only that: the viewer proved the
+        # principal here and does not travel on as reference material.
+        self.assertEqual(
+            '{"repository":{"name":"widgets"}}', snapshot["content"]
+        )
         self.assertFalse(snapshot["truncated"])
         # The unbilled route, reported exactly as the estimate classified it.
         self.assertIsNone(result.usage.monetary_cost_usd)
 
     def test_oversized_content_is_truncated_rather_than_refused(self) -> None:
-        connector = self.connector(stdout="x" * (EXTERNAL_READ_MAX_CHARS + 500))
+        connector = self.connector(
+            stdout=graphql_payload(
+                {"repository": {"body": "x" * (EXTERNAL_READ_MAX_CHARS + 500)}}
+            )
+        )
         result = connector.execute(github_task(), SessionState(id="s-1"))
         snapshot = result.data[EXTERNAL_READ_RESULT_KEY]
         self.assertTrue(snapshot["truncated"])
         self.assertEqual(EXTERNAL_READ_MAX_CHARS, len(snapshot["content"]))
 
-    def test_a_changed_account_refuses_before_the_call(self) -> None:
-        connector = self.connector(observed=("someone-else", GITHUB_CREDENTIAL_ROUTE))
-        result = connector.execute(github_task(), SessionState(id="s-1"))
-        self.assertIs(OutcomeStatus.ERROR, result.outcome)
-        self.assertFalse(result.error.retryable)
-        self.assertEqual([], self.ran)
+    def test_the_connector_still_reports_its_identity_to_core(self) -> None:
+        """Core's own gate is unchanged; the connector just answers it.
 
-    def test_an_unobservable_identity_refuses_before_the_call(self) -> None:
-        connector = self.connector(observed=GitHubCommandFailed("no session"))
+        The connector no longer observes an identity around its own read -
+        that observation described a different process and could not prove
+        which credential served the read. What it still does is report what
+        the local session says when CORE asks, and fail closed rather than
+        answer with something reassuring.
+        """
+        self.assertEqual(
+            (PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
+            self.connector().observed_github_identity(),
+        )
+        with self.assertRaises(GitHubCommandFailed):
+            self.connector(
+                observed=GitHubCommandFailed("no session")
+            ).observed_github_identity()
+
+    def test_a_wrong_local_session_cannot_produce_a_snapshot(self) -> None:
+        """A mismatch is caught by the read, not by trusting the observation.
+
+        The observer here reports the bound principal - the reassuring answer
+        - while the read is actually served by another account. The old
+        pre-check would have let this through; the response cannot.
+        """
+        connector = self.connector(stdout=graphql_payload(login="someone-else"))
         result = connector.execute(github_task(), SessionState(id="s-1"))
         self.assertIs(OutcomeStatus.ERROR, result.outcome)
-        self.assertEqual([], self.ran)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+        self.assertFalse(result.error.retryable)
+        self.assertEqual({}, result.data)
 
     def test_a_task_whose_resource_is_unusable_never_reaches_the_cli(self) -> None:
         connector = self.connector()
@@ -673,7 +829,7 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual([], self.ran)
 
     def test_verification_reads_the_bound_task_state(self) -> None:
-        connector = self.connector(stdout='{"name":"widgets"}')
+        connector = self.connector()
         task = github_task()
         result = connector.execute(task, SessionState(id="s-1"))
         # Nothing bound yet: AgentCore binds the snapshot, so VERIFY fails
@@ -800,7 +956,7 @@ class EnvelopeTests(unittest.TestCase):
         connector = GitHubCliConnector(
             BINDING,
             identity_observer=lambda: (PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
-            plan_runner=lambda plan, **kwargs: FakeOutput('{"name":"widgets"}'),
+            plan_runner=lambda plan, **kwargs: FakeOutput(graphql_payload()),
         )
         task = github_task()
         result = connector.execute(task, SessionState(id="s-1"))

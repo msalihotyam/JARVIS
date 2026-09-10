@@ -63,10 +63,10 @@ GITHUB_HOST = "github.com"
 #: one, and two copies of that prefix could drift apart.
 GITHUB_DESTINATION_PREFIX = REPOSITORY_DESTINATION_PREFIX
 
-#: THE closed read vocabulary. Nine identifiers exist in the approved v1
-#: architecture and not one more: there is no ``github_read``, no
-#: ``github_api``, no ``rest``, no ``graphql``, no ``command`` and no
-#: wildcard. An unknown GitHub capability is not a capability.
+#: THE closed read vocabulary. Nine identifiers and not one more: there is no
+#: ``github_read``, no ``github_api``, no ``rest``, no ``graphql``, no
+#: ``command`` and no wildcard. An unknown GitHub capability is not a
+#: capability.
 GITHUB_READ_CAPABILITIES: tuple[str, ...] = (
     "github_repository_read",
     "github_file_read",
@@ -74,13 +74,27 @@ GITHUB_READ_CAPABILITIES: tuple[str, ...] = (
     "github_issue_read",
     "github_pull_request_list",
     "github_pull_request_read",
-    # Phase 2 completes the usable-v1 READ surface. Each name is a row in the
-    # same closed table the six above are rows of - not a new mechanism.
     "github_commit_list",
     "github_commit_read",
     "github_pull_request_files",
-    "github_code_search",
 )
+
+#: DEFERRED PAST usable-v1, and deferred for a reason that is not schedule.
+#:
+#: Every read here must prove which credential served it, and the only way to
+#: prove that is to ask GitHub who the caller is inside the request that
+#: returns the data - one request, one credential selection. GitHub's GraphQL
+#: schema has no code search: its ``SearchType`` enum names ISSUE,
+#: REPOSITORY, USER and DISCUSSION and no ``CODE`` member, so a code search
+#: cannot be carried in the same request as the viewer and cannot be bound to
+#: a principal. Rather than run it over a second, unprovable transport, it is
+#: not a usable-v1 capability at all.
+#:
+#: The name, its resource kind and its whole grammar stay declared, exactly
+#: like the write half: a later phase must not be free to invent them again.
+#: Being declared is not being enabled - there is no argument builder for it,
+#: so a frame naming it produces no plan.
+GITHUB_DEFERRED_READ_CAPABILITIES: tuple[str, ...] = ("github_code_search",)
 
 #: The write half of the same closed vocabulary. Declared because the
 #: architecture is closed and a later phase must not be free to invent its
@@ -92,7 +106,9 @@ GITHUB_WRITE_CAPABILITIES: tuple[str, ...] = (
 )
 
 GITHUB_CAPABILITIES: tuple[str, ...] = (
-    GITHUB_READ_CAPABILITIES + GITHUB_WRITE_CAPABILITIES
+    GITHUB_READ_CAPABILITIES
+    + GITHUB_DEFERRED_READ_CAPABILITIES
+    + GITHUB_WRITE_CAPABILITIES
 )
 
 #: What this build can actually EXECUTE, and separately so: a name existing in
@@ -1053,126 +1069,153 @@ class GitHubExecutionUnavailable(RuntimeError):
     """Raised because live GitHub execution does not exist in this build."""
 
 
-def _slug(resource: GitHubResource) -> str:
-    """``owner/repository`` from the VALIDATED typed target, and only there.
+#: THE transport, and now the only one. Every read is ONE ``gh api graphql``
+#: request, so a capability chooses a QUERY and can no longer choose a route:
+#: there is no second subcommand left for a vector to reach, and no REST path
+#: for one to be spelled onto.
+#:
+#: The reason is not tidiness. A separate identity call and a separate read
+#: are two credential selections, and an account that moves between them - or
+#: away and back across them - cannot be seen by any number of before/after
+#: checks. One request is one credential selection, so asking GitHub who the
+#: caller is IN the request that returns the data is the only way the answer
+#: describes the credential that actually served it.
+GITHUB_GRAPHQL_ARGS: tuple[str, ...] = ("api", *GITHUB_HOSTNAME_ARGS, "graphql")
 
-    Every builder below reaches a repository through this function, so there
-    is exactly one way a repository can enter an argument vector and it has
-    passed the canonical grammar first.
+#: The selection every derived query opens with. Not optional, not a flag and
+#: not per-capability: it is prepended by the one builder below, so a query
+#: that does not carry it cannot be derived at all.
+GITHUB_VIEWER_SELECTION = "viewer{login}"
+
+
+def _literal(value: str) -> str:
+    """One already-validated scalar as a GraphQL string literal.
+
+    Every value that reaches this has passed a grammar that excludes the
+    quote and the backslash outright, so no escaping is needed - and if that
+    ever stops being true this REFUSES instead of escaping, because a value
+    that needs escaping is a value whose grammar moved underneath the query.
     """
-    return f"{resource.owner}/{resource.repository}"
+    if '"' in value or "\\" in value:
+        raise GitHubExecutionUnavailable(
+            "a resource value cannot be spelled into a GraphQL query"
+        )
+    return f'"{value}"'
 
 
-#: Capability -> the ONE argv builder that serves it. Read capabilities only:
-#: the write vocabulary is an inert declaration, so it has no row here and a
-#: write frame produces no plan at all. There is no default row, no fallback
-#: and no builder that takes a subcommand as data.
-_GH_ARGV_BUILDERS: Mapping[str, Any] = {
+def _states(mapping: Mapping[str, str], state: str) -> str:
+    """The state filter fragment for one closed filter value."""
+    selected = mapping[state]
+    return f"states:{selected}," if selected else ""
+
+
+#: The closed list filter translated into each schema's own enum, once. REST's
+#: ``closed`` folded merged pull requests in, so the pull request row names
+#: both: moving the transport must not quietly change what a filter MEANS.
+#: ``all`` is the absence of a filter rather than a third enum member.
+_ISSUE_STATES: Mapping[str, str] = {
+    "open": "[OPEN]",
+    "closed": "[CLOSED]",
+    "all": "",
+}
+_PULL_REQUEST_STATES: Mapping[str, str] = {
+    "open": "[OPEN]",
+    "closed": "[CLOSED,MERGED]",
+    "all": "",
+}
+
+#: Capability -> the ONE selection it may ask for inside ``repository``. This
+#: is the whole per-capability surface now: no subcommand, no flags, no path,
+#: no host and no method, because the transport above owns all of those. A
+#: capability with no row here has no query and therefore no plan.
+_GRAPHQL_SELECTIONS: Mapping[str, Any] = {
     "github_repository_read": lambda r: (
-        "repo",
-        "view",
-        _slug(r),
-        "--json",
-        "name,owner,description,defaultBranchRef,isPrivate,updatedAt",
+        "name owner{login} description defaultBranchRef{name} isPrivate "
+        "updatedAt"
     ),
-    # ``gh api`` is the only route that carries a path, so it is the only
-    # place the hostname is stateable in argv - and it is stated as a
-    # literal, never accepted. ``ref`` and ``path`` already passed grammars
-    # that exclude ``?``, ``#``, ``&`` and ``%``, so neither can bolt an
-    # extra parameter onto the query.
+    # ``ref:path`` is GitHub's own expression grammar. Both halves already
+    # passed grammars that exclude the quote, the backslash and - for the
+    # path - the colon, so neither can end the literal or add a second
+    # expression.
     "github_file_read": lambda r: (
-        "api",
-        *GITHUB_HOSTNAME_ARGS,
-        "--method",
-        "GET",
-        f"repos/{_slug(r)}/contents/{r.path}?ref={r.ref}",
+        f"object(expression:{_literal(f'{r.ref}:{r.path}')})"
+        "{... on Blob{text byteSize isTruncated}}"
     ),
     "github_issue_list": lambda r: (
-        "issue",
-        "list",
-        "--repo",
-        _slug(r),
-        "--state",
-        r.state,
-        "--limit",
-        str(r.limit),
-        "--json",
-        "number,title,state,updatedAt",
+        f"issues(first:{r.limit},{_states(_ISSUE_STATES, r.state)}"
+        "orderBy:{field:UPDATED_AT,direction:DESC})"
+        "{nodes{number title state updatedAt}}"
     ),
     "github_issue_read": lambda r: (
-        "issue",
-        "view",
-        str(r.number),
-        "--repo",
-        _slug(r),
-        "--json",
-        "number,title,state,body,updatedAt",
+        f"issue(number:{r.number}){{number title state body updatedAt}}"
     ),
     "github_pull_request_list": lambda r: (
-        "pr",
-        "list",
-        "--repo",
-        _slug(r),
-        "--state",
-        r.state,
-        "--limit",
-        str(r.limit),
-        "--json",
-        "number,title,state,updatedAt",
+        f"pullRequests(first:{r.limit},"
+        f"{_states(_PULL_REQUEST_STATES, r.state)}"
+        "orderBy:{field:UPDATED_AT,direction:DESC})"
+        "{nodes{number title state updatedAt}}"
     ),
     "github_pull_request_read": lambda r: (
-        "pr",
-        "view",
-        str(r.number),
-        "--repo",
-        _slug(r),
-        "--json",
-        "number,title,state,body,updatedAt",
+        f"pullRequest(number:{r.number}){{number title state body updatedAt}}"
     ),
-    # Phase 2. The same two shapes as above and no third one: a typed ``gh``
-    # subcommand where one exists, and ``gh api`` with a literal hostname
-    # where it does not. Every interpolated value has already passed its own
-    # grammar, and those grammars exclude ``?``, ``#``, ``&`` and ``%``, so
-    # none of them can bolt a second parameter onto a query string.
     "github_commit_list": lambda r: (
-        "api",
-        *GITHUB_HOSTNAME_ARGS,
-        "--method",
-        "GET",
-        f"repos/{_slug(r)}/commits?per_page={r.limit}",
+        "defaultBranchRef{target{... on Commit{"
+        f"history(first:{r.limit})"
+        "{nodes{oid messageHeadline committedDate author{name}}}}}}"
     ),
     "github_commit_read": lambda r: (
-        "api",
-        *GITHUB_HOSTNAME_ARGS,
-        "--method",
-        "GET",
-        f"repos/{_slug(r)}/commits/{r.ref}",
+        f"object(oid:{_literal(r.ref)})"
+        "{... on Commit{oid messageHeadline message committedDate "
+        "author{name}}}"
     ),
-    # The PR file list IS the diff surface: each entry carries the filename,
-    # the added/removed counts and the per-file patch, which is what "PR
-    # files/diff" needs and is bounded by the same per-page ceiling.
+    # The changed-file list, without the per-file patch the REST route
+    # carried: GraphQL does not expose one. The bounded read this capability
+    # is for - which files moved and by how much - is unchanged, and the
+    # patch was being cut by ``EXTERNAL_READ_MAX_CHARS`` in any case.
     "github_pull_request_files": lambda r: (
-        "api",
-        *GITHUB_HOSTNAME_ARGS,
-        "--method",
-        "GET",
-        f"repos/{_slug(r)}/pulls/{r.number}/files?per_page={r.limit}",
+        f"pullRequest(number:{r.number})"
+        f"{{files(first:{r.limit})"
+        "{nodes{path additions deletions changeType}}}"
     ),
-    # ``--repo`` is what keeps a search inside the repository the grant
-    # authorizes, and the query grammar is what keeps a qualifier from
-    # widening it back out. The term is last so it cannot be read as the
-    # value of a preceding flag.
-    "github_code_search": lambda r: (
-        "search",
-        "code",
-        "--repo",
-        _slug(r),
-        "--limit",
-        str(r.limit),
-        "--json",
-        "path,repository",
-        r.query,
-    ),
+}
+
+
+def _read_query(capability: str, resource: GitHubResource) -> str:
+    """The ONE query for one validated resource, viewer selection included.
+
+    The viewer and the data are selected in the same query on purpose: that
+    is the whole binding. There is no branch here that can build a query
+    without ``viewer{login}``, so there is no derived read whose result
+    cannot be checked against the principal Core bound.
+    """
+    return (
+        "{"
+        + GITHUB_VIEWER_SELECTION
+        + " repository(owner:"
+        + _literal(resource.owner)
+        + ",name:"
+        + _literal(resource.repository)
+        + "){"
+        + _GRAPHQL_SELECTIONS[capability](resource)
+        + "}}"
+    )
+
+
+#: Capability -> the ONE argv builder that serves it, derived from the table
+#: above rather than written out again. Read capabilities only: the write
+#: vocabulary is an inert declaration and the deferred one is not enabled, so
+#: neither has a row and neither produces a plan. There is no default row, no
+#: fallback and no builder that takes a subcommand as data - the subcommand is
+#: a constant.
+_GH_ARGV_BUILDERS: Mapping[str, Any] = {
+    capability: (
+        lambda r, _c=capability: (
+            *GITHUB_GRAPHQL_ARGS,
+            "-f",
+            f"query={_read_query(_c, r)}",
+        )
+    )
+    for capability in _GRAPHQL_SELECTIONS
 }
 
 
@@ -1235,8 +1278,16 @@ def github_operation_plan_refusal(plan: Any) -> str | None:
 
 
 def _derived_arguments(capability: str, resource: GitHubResource) -> tuple[str, ...] | str:
-    """The derived argument vector, or the reason there is none."""
-    arguments = _GH_ARGV_BUILDERS[capability](resource)
+    """The derived argument vector, or the reason there is none.
+
+    A builder that refuses - a value that cannot be spelled into a query -
+    becomes that reason rather than an exception, so every caller of this
+    keeps returning refusals instead of raising through a check.
+    """
+    try:
+        arguments = _GH_ARGV_BUILDERS[capability](resource)
+    except GitHubExecutionUnavailable as exc:
+        return str(exc)
     if len(arguments) > GH_MAX_ARGUMENTS:
         return "the argument list is over the bound"
     for argument in arguments:
@@ -1443,6 +1494,75 @@ def external_read_binding_refusal(snapshot: Any, *, frame: Any) -> str | None:
     return None
 
 
+def github_atomic_read_content(stdout: Any, *, frame: Any) -> str:
+    """The data half of ONE atomic read, or refuse - never a partial answer.
+
+    THIS IS THE PRINCIPAL BINDING, and it is the only one that describes the
+    credential that actually served the read. The viewer and the data were
+    selected in the same GraphQL request, so the login here was answered by
+    the very token that fetched these bytes: there is no interval for an
+    account to move in, and no second observation whose agreement could be
+    coincidence. An account that switches away and back around the read
+    changes THIS login, because the request either ran under the bound
+    principal or it did not.
+
+    Refuses on every uncertainty rather than reporting a best guess: a body
+    that is not one JSON object, any ``errors`` at all, a missing or
+    unparseable viewer, a viewer that is not the principal the frame binds,
+    or a payload with no data beside the viewer. The viewer is then REMOVED,
+    so the identity proof is never handed on as content - it did its work
+    here.
+
+    Nothing from the response reaches a refusal message. A GraphQL error can
+    carry paths, ids and repository names, so the shape of the failure is
+    stated and the body is not.
+    """
+    if type(frame) is not GitHubRequestFrame:
+        raise GitHubExecutionUnavailable("the read names no validated request")
+    if type(stdout) is not str or not stdout.strip():
+        raise GitHubExecutionUnavailable("the GitHub read returned no response")
+    try:
+        payload = json.loads(stdout)
+    except ValueError as exc:
+        raise GitHubExecutionUnavailable(
+            "the GitHub read did not return one JSON response"
+        ) from exc
+    if type(payload) is not dict:
+        raise GitHubExecutionUnavailable(
+            "the GitHub read did not return one JSON response"
+        )
+    if payload.get("errors"):
+        raise GitHubExecutionUnavailable(
+            "the GitHub API refused part of the request"
+        )
+    data = payload.get("data")
+    if type(data) is not dict or not data:
+        raise GitHubExecutionUnavailable("the GitHub read returned no data")
+    viewer = data.get("viewer")
+    if type(viewer) is not dict:
+        raise GitHubExecutionUnavailable(
+            "the GitHub read did not identify the account that served it"
+        )
+    login = viewer.get("login")
+    if github_principal_refusal(login) is not None:
+        raise GitHubExecutionUnavailable(
+            "the GitHub read did not identify the account that served it"
+        )
+    if login.lower() != frame.principal.lower():
+        raise GitHubExecutionUnavailable(
+            "the GitHub read was served by an account that is not the "
+            "principal this request is bound to"
+        )
+    rest = {name: value for name, value in data.items() if name != "viewer"}
+    if not rest or rest.get("repository") is None:
+        raise GitHubExecutionUnavailable(
+            "the GitHub read returned no content for this repository"
+        )
+    # Deterministic spelling, so the same response always produces the same
+    # digest for the snapshot that carries it.
+    return json.dumps(rest, sort_keys=True, separators=(",", ":"))
+
+
 def build_external_read_snapshot(
     *,
     source_task_id: str,
@@ -1528,12 +1648,14 @@ __all__ = [
     "GITHUB_CONNECTOR",
     "GITHUB_CREDENTIAL_ROUTE",
     "GITHUB_CREDENTIAL_ROUTES",
+    "GITHUB_DEFERRED_READ_CAPABILITIES",
     "GITHUB_DESTINATION_MAX_CHARS",
     "GITHUB_DESTINATION_PREFIX",
     "GITHUB_EMPTY_BODY_SHA256",
     "GITHUB_ENABLED_CAPABILITIES",
     "GITHUB_FORCED_ENVIRONMENT",
     "GITHUB_HOST",
+    "GITHUB_GRAPHQL_ARGS",
     "GITHUB_HOSTNAME_ARGS",
     "GITHUB_IDENTITY_BINDING",
     "GITHUB_LIST_MAX_ITEMS",
@@ -1550,6 +1672,7 @@ __all__ = [
     "GITHUB_REMOVED_ENVIRONMENT",
     "GITHUB_REMOVED_ENVIRONMENT_PREFIXES",
     "GITHUB_REQUEST_FRAME_HEADER",
+    "GITHUB_VIEWER_SELECTION",
     "GITHUB_WRITE_CAPABILITIES",
     "GitHubExecutionUnavailable",
     "GitHubOperationPlan",
@@ -1564,6 +1687,7 @@ __all__ = [
     "build_github_request_frame",
     "external_read_binding_refusal",
     "external_read_refusal",
+    "github_atomic_read_content",
     "github_comment_body",
     "github_credential_route_refusal",
     "github_destination",

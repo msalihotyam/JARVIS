@@ -34,13 +34,18 @@ user`` - the authenticated endpoint, answered by the token actually in use -
 and the two must agree before either is reported. Neither call can be pointed
 at a different account by a caller: both vectors are constants.
 
-WHAT IT CANNOT PROMISE, AND WHY - MEASURED, NOT ASSUMED. That the account an
-observation names is the account the NEXT process reads as. The CLI selects
-its credential when each process starts, so an identity and a result obtained
-from two processes are two selections, and an account that moves away and back
-between them is invisible to any number of before/after checks. Closing that
-needs one credential selection to yield both facts, which means one request.
-Against gh 2.98 on 2026-09-10:
+WHICH ACCOUNT A READ RAN AS IS NOT DECIDED HERE, AND NOT BY OBSERVATION.
+The CLI selects its credential when each process starts, so an identity and a
+result taken from two processes are two selections: an account that moves away
+and back between them is invisible to any number of before/after checks. Every
+read therefore runs as ONE ``gh api graphql`` request that selects
+``viewer{login}`` beside the data, and ``jarvis.github`` refuses any response
+whose viewer is not the principal Core bound. One request is one credential
+selection, so that login describes the credential that served those exact
+bytes. The observation below is Core's session gate and nothing more - it is
+not, and must not be presented as, the proof.
+
+WHAT THAT COST, MEASURED AGAINST gh 2.98 ON 2026-09-10:
 
 - No environment variable selects a stored account. ``GH_TOKEN`` would mean
   handling the raw token, which this build refuses.
@@ -50,16 +55,10 @@ Against gh 2.98 on 2026-09-10:
   exists on a normal installation, so it cannot be excluded.
 - No REST response header names the caller. ``X-OAuth-Client-Id`` names the
   OAuth application, which is identical for every account.
-- ONE GraphQL request can return both: ``{ viewer { login } repository(...) }``
-  answers with the login of the token that served the same request. But the
-  ten read capabilities run over five different subcommands (``repo``, ``api``,
-  ``issue``, ``pr``, ``search``), so using it would mean re-deriving the whole
-  closed vector table onto one transport and changing the shape of every
-  response - and it would still not cover ``github_code_search``, because
-  GitHub's GraphQL ``SearchType`` has no ``CODE`` member.
-
-So the exact-principal invariant is proved at the moment of each observation
-and is NOT proved across the read. The connector says where that lands.
+- So GraphQL is the only transport that can carry the proof, and it does not
+  carry everything: GitHub's GraphQL ``SearchType`` names ISSUE, REPOSITORY,
+  USER and DISCUSSION and no ``CODE``. ``github_code_search`` is therefore
+  deferred past usable-v1 rather than run over a second, unprovable route.
 
 WHAT IT DECIDES. Nothing. It observes an identity and returns bytes; Core
 compares that identity against its own binding, Core owns the destination
@@ -112,11 +111,10 @@ GH_AUTH_STATUS_ARGS: tuple[str, ...] = ("auth", "status", *GITHUB_HOSTNAME_ARGS)
 #: belongs to. Also a constant: there is no parameter here either, the path is
 #: the authenticated-user endpoint, and ``--jq`` reduces the answer to one
 #: non-secret field so no other part of the profile is ever captured.
-# ponytail: one network round trip per observation, and an observation happens
-# on both sides of every read. Cache it per (process, wall-clock window) only
-# if read latency ever measurably matters - a cached identity is exactly the
-# stale answer this call exists to replace, so the cache would have to expire
-# faster than an account can be switched, which is not obviously worth it.
+# ponytail: one network round trip, on Core's session gate only - the read
+# proves its own principal, so nothing observes around it any more. Cache this
+# only if that one gate ever measurably matters; a cached identity is the stale
+# answer the call exists to replace.
 GH_API_USER_ARGS: tuple[str, ...] = (
     "api",
     *GITHUB_HOSTNAME_ARGS,

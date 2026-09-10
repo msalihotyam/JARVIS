@@ -12,16 +12,13 @@ the safety property:
 2. build the canonical request frame from that resource and the identity
    CORE established, so the bytes an approval binds are the bytes this read
    is about;
-3. re-derive the closed argument vector from the frame;
-4. re-observe the local session's identity and compare it against Core's
-   binding AGAIN, immediately before the call - an approval granted minutes
-   ago must not execute under an account that changed since;
-5. run the one child process, then re-observe the identity once more - a
-   snapshot may only claim a principal that was still the credential's account
-   on BOTH sides of the read. This catches a one-way switch and NOT an account
-   that moves away and back across the read; step 5's comment says why that
-   remains open and what closing it would take;
-6. bind the returned content to the frame that asked for it, and hand back an
+3. re-derive the closed argument vector from the frame - ONE GraphQL request
+   that selects ``viewer{login}`` beside the data it asks for;
+4. run the one child process;
+5. require the viewer the response names to be the principal Core bound, and
+   discard the content if it is not - the login and the data came out of the
+   same request, so it names the credential that actually served THIS read;
+6. bind the remaining content to the frame that asked for it, and hand back an
    UNTRUSTED snapshot.
 
 WHAT IT CANNOT DO. It cannot write: the write capabilities have no argument
@@ -30,7 +27,12 @@ manifest does not name one. It cannot widen a repository: the only repository
 it can reach is the one inside the validated resource, which Core has already
 matched against an exact ``DestinationGrant``. It cannot choose its own
 identity: the expected principal is handed in at composition, and what this
-class observes is only ever an input to a comparison. It cannot read a
+class observes is only ever an input to a comparison. It cannot present one
+account's bytes as another's: the identity and the data arrive in the same
+authenticated request, so a snapshot exists only for a read GitHub itself
+attributed to the bound principal. It cannot search code: that capability is
+deferred past usable-v1 because no single request can carry both a code search
+and the viewer, and an unprovable read is not shipped. It cannot read a
 credential: nothing here has one, and the child environment has the whole
 token-bearing variable family stripped from it.
 """
@@ -71,8 +73,8 @@ from jarvis.github import (
     GitHubRequestFrame,
     build_external_read_snapshot,
     external_read_binding_refusal,
+    github_atomic_read_content,
     github_identity_binding_refusal,
-    github_identity_refusal,
     github_operation_plan,
     github_resource_from_dict,
     github_resource_refusal,
@@ -105,8 +107,7 @@ class GitHubCliConnector(BaseConnector):
         capabilities=GITHUB_READ_CAPABILITIES,
         description=(
             "Bounded read of one GitHub repository's metadata, files, issues, "
-            "pull requests, commits and code, through the authenticated "
-            "GitHub CLI."
+            "pull requests and commits, through the authenticated GitHub CLI."
         ),
         priority=50,
         default_risk=RiskLevel.MEDIUM,
@@ -243,32 +244,6 @@ class GitHubCliConnector(BaseConnector):
         except GitHubExecutionUnavailable as exc:
             return self._refusal(task, ErrorCode.EGRESS_REFUSED, str(exc))
 
-        # (4) THE IDENTITY, AGAIN, HERE. Core compared it before the approval
-        # gate; between that moment and this one the local session can be
-        # switched to another account, and an approval for one principal must
-        # never execute as a different one.
-        try:
-            observed = self._observe()
-        except Exception as exc:  # noqa: BLE001 - an unreportable identity refuses
-            return self._refusal(
-                task,
-                ErrorCode.EGRESS_REFUSED,
-                "the authenticated GitHub identity could not be observed",
-            )
-        if type(observed) is not tuple or len(observed) != 2:
-            return self._refusal(
-                task,
-                ErrorCode.EGRESS_REFUSED,
-                "the observed GitHub identity is not a (principal, route) pair",
-            )
-        reason = github_identity_refusal(
-            self.binding,
-            observed_principal=observed[0],
-            observed_credential_route=observed[1],
-        )
-        if reason is not None:
-            return self._refusal(task, ErrorCode.EGRESS_REFUSED, reason)
-
         try:
             output = self._run(plan)
         except GitHubCommandFailed as exc:
@@ -278,44 +253,22 @@ class GitHubCliConnector(BaseConnector):
                 task, ErrorCode.CONNECTOR_FAILED, "the GitHub read did not complete"
             )
 
-        # (5a) THE SAME IDENTITY, ON THE OTHER SIDE OF THE READ - AND THIS IS
-        # NOT A PROOF OF WHICH ACCOUNT THE READ RAN AS. State the limit before
-        # the reassurance, because the reassurance is partial.
+        # (5) THE PRINCIPAL, PROVED BY THE READ ITSELF. The query selected
+        # ``viewer{login}`` beside the data, so the account named in this
+        # response is the account whose credential fetched this response -
+        # one request, one credential selection. There is no interval for an
+        # account to move in, so there is nothing here for a switch to slip
+        # between, including one that moves away and comes back.
         #
-        # The check above, the read, and this check are three processes, and
-        # the CLI picks its credential when each one starts. A one-way switch
-        # is caught here. A switch that goes back is NOT: with the account
-        # moved to another login before the read and returned to this one
-        # after it, both observations answer identically and the bytes the
-        # other account fetched reach the snapshot as if this account had
-        # fetched them. That is an ordinary interleaving, not an attack that
-        # needs a hostile local user - two tools touching the same CLI session
-        # produce it by accident.
-        #
-        # Closing it needs the identity and the result to come out of ONE
-        # credential selection, which means one request. The CLI has no way to
-        # do that for these vectors and no way to pin a stored credential to a
-        # process without being handed the raw token, which this build will not
-        # accept - ``jarvis.github_cli`` records what was measured. So this
-        # check is a detector for the one-way case and nothing more, and the
-        # exact-principal invariant stays unproven for the interleaved one.
+        # No identity is observed around this call, deliberately. A separate
+        # observation proves what a DIFFERENT process saw, which is exactly
+        # the reassurance that could not be trusted; keeping one beside a
+        # proof would only invite it to be read as part of the proof.
         try:
-            after = self._observe()
-        except Exception:  # noqa: BLE001 - an unreportable identity refuses
-            return self._refusal(
-                task,
-                ErrorCode.EGRESS_REFUSED,
-                "the authenticated GitHub identity could not be re-observed "
-                "after the read",
-            )
-        if type(after) is not tuple or len(after) != 2 or after != observed:
-            return self._refusal(
-                task,
-                ErrorCode.EGRESS_REFUSED,
-                "the authenticated GitHub identity changed across the read",
-            )
+            content = github_atomic_read_content(output.stdout, frame=frame)
+        except GitHubExecutionUnavailable as exc:
+            return self._refusal(task, ErrorCode.EGRESS_REFUSED, str(exc))
 
-        content = output.stdout
         truncated = bool(output.truncated)
         if len(content) > EXTERNAL_READ_MAX_CHARS:
             content = content[:EXTERNAL_READ_MAX_CHARS]

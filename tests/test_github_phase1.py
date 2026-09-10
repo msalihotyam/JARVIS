@@ -630,10 +630,12 @@ class ResourceTargetTests(unittest.TestCase):
                 )
 
     def test_the_capability_vocabulary_is_exactly_the_approved_set(self) -> None:
-        # Phase 2 completed the usable-v1 READ surface, so the exact list this
-        # guard pins is the longer one. It stays an EXACT list: the property
-        # protected here was never "six names", it is that the vocabulary is
-        # closed and that no name appears without review.
+        # An EXACT list: the property protected here was never a count, it is
+        # that the vocabulary is closed and that no name appears - or leaves -
+        # without review. ``github_code_search`` left the ENABLED half when
+        # every read had to prove which credential served it and GraphQL, the
+        # only transport that can carry that proof, has no code search. It is
+        # still a declared name, so it is still pinned, one line down.
         self.assertEqual(
             (
                 "github_repository_read",
@@ -645,9 +647,11 @@ class ResourceTargetTests(unittest.TestCase):
                 "github_commit_list",
                 "github_commit_read",
                 "github_pull_request_files",
-                "github_code_search",
             ),
             GITHUB_READ_CAPABILITIES,
+        )
+        self.assertEqual(
+            ("github_code_search",), github.GITHUB_DEFERRED_READ_CAPABILITIES
         )
         self.assertEqual(
             (
@@ -1967,7 +1971,10 @@ class OperationPlanTests(unittest.TestCase):
     def test_the_repository_comes_only_from_the_validated_target(self) -> None:
         plan = github_operation_plan(frame())
         self.assertIsNone(github_operation_plan_refusal(plan))
-        self.assertIn(f"{OWNER}/{REPO}", plan.arguments)
+        # Owner and name are separate validated literals in the one query.
+        self.assertIn(
+            f'owner:"{OWNER}",name:"{REPO}"', " ".join(plan.arguments)
+        )
         self.assertEqual(GITHUB_HOST, plan.host)
         self.assertNotIn("evil/other", " ".join(plan.arguments))
 
@@ -2037,13 +2044,6 @@ class OperationPlanTests(unittest.TestCase):
                 number=7,
                 limit=5,
             ),
-            "github_code_search": GitHubResource(
-                kind=GitHubResourceKind.CODE_SEARCH,
-                owner=OWNER,
-                repository=REPO,
-                query="parse_token",
-                limit=3,
-            ),
         }
         self.assertEqual(set(GITHUB_READ_CAPABILITIES), set(targets))
         for capability, resource in targets.items():
@@ -2052,7 +2052,9 @@ class OperationPlanTests(unittest.TestCase):
                 self.assertIsNone(github_operation_plan_refusal(plan))
                 self.assertEqual(capability, plan.capability)
                 self.assertEqual(DEST, plan.destination)
-                self.assertIn(f"{OWNER}/{REPO}", " ".join(plan.arguments))
+                query = plan.arguments[-1]
+                self.assertIn(f'owner:"{OWNER}",name:"{REPO}"', query)
+                self.assertEqual(1, query.count("repository("))
                 for forbidden in ("--web", "--editor", "--browser", "--jq"):
                     self.assertNotIn(forbidden, plan.arguments)
 
