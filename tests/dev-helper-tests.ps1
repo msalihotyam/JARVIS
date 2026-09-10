@@ -65,19 +65,33 @@ function GitOut {
     return ((@($out) | ForEach-Object { $_.ToString() }) -join "`n")
 }
 
+$script:canonTemplate = $null
+
 function New-CanonicalRepo {
+    # The canonical fixture is built once (lazily, so the git env isolation
+    # below is already in place) and every test gets its own physical
+    # directory copy of it: same contents, config, history and refs as the
+    # former per-test build (fixed commit dates keep the init SHA identical),
+    # no shared mutable repo, no clone/remote semantics.
     param([string]$Root)
+    if (-not $script:canonTemplate) {
+        $tpl = Join-Path $isoRoot 'canonical-template'
+        $null = New-Item -ItemType Directory -Path $tpl
+        GitRun $tpl @('init')
+        GitRun $tpl @('symbolic-ref', 'HEAD', 'refs/heads/main')
+        GitRun $tpl @('config', 'user.email', 'test@example.local')
+        GitRun $tpl @('config', 'user.name', 'tester')
+        GitRun $tpl @('config', 'commit.gpgsign', 'false')
+        Set-Content -Path (Join-Path $tpl 'README.md') -Value 'base'
+        Set-Content -Path (Join-Path $tpl 'shared.txt') -Value 'base'
+        GitRun $tpl @('add', 'README.md', 'shared.txt')
+        GitRun $tpl @('commit', '-m', 'init')
+        $script:canonTemplate = $tpl
+    }
     $canon = Join-Path $Root 'JARVIS'
-    $null = New-Item -ItemType Directory -Path $canon
-    GitRun $canon @('init')
-    GitRun $canon @('symbolic-ref', 'HEAD', 'refs/heads/main')
-    GitRun $canon @('config', 'user.email', 'test@example.local')
-    GitRun $canon @('config', 'user.name', 'tester')
-    GitRun $canon @('config', 'commit.gpgsign', 'false')
-    Set-Content -Path (Join-Path $canon 'README.md') -Value 'base'
-    Set-Content -Path (Join-Path $canon 'shared.txt') -Value 'base'
-    GitRun $canon @('add', 'README.md', 'shared.txt')
-    GitRun $canon @('commit', '-m', 'init')
+    Copy-Item -LiteralPath $script:canonTemplate -Destination $canon -Recurse
+    # git init marks .git hidden on Windows; Copy-Item does not carry that over.
+    (Get-Item -Force -LiteralPath (Join-Path $canon '.git')).Attributes += 'Hidden'
     return $canon
 }
 
