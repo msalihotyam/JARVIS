@@ -11,11 +11,158 @@
 # The exclusive handoff env value is auto-provisioned from task metadata by
 # Run-Dev for finish/cleanup calls (the normal controller workflow); handoff
 # attacks suppress that with $script:SuppressAutoHandoff.
+#
+# Runs SHARDED by default: with no arguments the parent process starts one
+# child powershell.exe per entry in $Shards, each running its own sections
+# against its own temp base, and aggregates their results. -Serial runs every
+# section in this one process and -Section A,B runs just those: the same test
+# code on every path, only the selection differs.
+
+param(
+    [string[]]$Section,   # run only these sections, in this process
+    [switch]$Serial,      # run every section in this process
+    [string]$ResultFile,  # child shard: write the {pass, fail, failures} JSON here
+    [string]$TempBase     # child shard: parent directory for every temp root
+)
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $DevPs = Join-Path $RepoRoot 'dev.ps1'
+
+# ---- sharding --------------------------------------------------------------
+
+# Every section of this file, in file order. Test-Section refuses a name that
+# is not listed here, so a typo can never silently skip a block of tests.
+$AllSections = @('NEW', 'FINISH', 'CLEANUP', 'STATUS', 'CLI', 'FINISH-CURRENT',
+    'ADVERSARIAL', 'ADVERSARIAL-V2', 'ADVERSARIAL-V3', 'ADVERSARIAL-P1',
+    'WINDOWS-A', 'WINDOWS-B', 'WINDOWS-C', 'WINDOWS-D')
+
+# Fixed shard plan, balanced on measured SERIAL seconds per section (2026-09,
+# 12-core laptop): NEW 8, FINISH 31, CLEANUP 7, STATUS 4, CLI 1,
+# FINISH-CURRENT 17, ADVERSARIAL 21, -V2 41, -V3 53, -P1 34, WINDOWS-A 36,
+# -B 34, -C ~52, -D ~15; 355 in total, so ~90 per shard. The Windows finish /
+# partial-removal block alone is a third of the suite, which is why it is
+# split in four (W1-W12, W13-W19b, W21-W23, W24) instead of becoming the one
+# shard that decides the total. A shard is a serial run of whole sections:
+# tests inside a section share state with their neighbours. Rebalance here
+# when the numbers drift; never by moving tests between sections.
+$Shards = @(
+    @{ Name = 'shard-1'; Sections = @('ADVERSARIAL-V3', 'ADVERSARIAL-P1', 'CLI') },
+    @{ Name = 'shard-2'; Sections = @('WINDOWS-C', 'WINDOWS-B', 'STATUS') },
+    @{ Name = 'shard-3'; Sections = @('ADVERSARIAL-V2', 'WINDOWS-A', 'NEW') },
+    @{ Name = 'shard-4'; Sections = @('FINISH', 'ADVERSARIAL', 'FINISH-CURRENT', 'WINDOWS-D', 'CLEANUP') }
+)
+
+function Invoke-ShardedRun {
+    # Parent: one isolated child PROCESS per shard, nothing parallel inside a
+    # process. Isolation is the process boundary itself: every child owns its
+    # environment block (handoff and test-seam variables, git identity,
+    # GIT_CONFIG_GLOBAL), its own canonical template and temp roots under its
+    # own -TempBase, its own working directory and its own dev.ps1 children.
+    # The parent shares nothing mutable with them; it only reads each child's
+    # log and result file afterwards, in fixed shard order.
+    $planned = @($Shards | ForEach-Object { $_.Sections })
+    $twice = @($planned | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+    $missing = @($AllSections | Where-Object { $planned -notcontains $_ })
+    $unknown = @($planned | Where-Object { $AllSections -notcontains $_ })
+    if ($twice.Count -or $missing.Count -or $unknown.Count) {
+        throw "shard plan must cover every section exactly once (twice: $twice; missing: $missing; unknown: $unknown)"
+    }
+    $base = Join-Path ([System.IO.Path]::GetTempPath()) ('devhelper-shards-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $base
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $runs = @()
+    Write-Host "sharded run: $($Shards.Count) processes, temp base $base"
+    try {
+        foreach ($s in $Shards) {
+            $dir = Join-Path $base $s.Name
+            $null = New-Item -ItemType Directory -Path $dir
+            $sp = @{
+                FilePath               = 'powershell.exe'
+                ArgumentList           = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
+                    '-Section', ($s.Sections -join ','),
+                    '-ResultFile', "`"$(Join-Path $dir 'result.json')`"",
+                    '-TempBase', "`"$(Join-Path $dir 'tmp')`"")
+                WorkingDirectory       = $RepoRoot
+                RedirectStandardOutput = (Join-Path $dir 'stdout.log')
+                RedirectStandardError  = (Join-Path $dir 'stderr.log')
+                NoNewWindow            = $true
+                PassThru               = $true
+            }
+            $p = Start-Process @sp
+            $null = $p.Handle   # PS 5.1: cache the handle now, or ExitCode stays empty
+            $runs += [pscustomobject]@{ Name = $s.Name; Sections = $s.Sections; Dir = $dir; Process = $p; Started = $clock.Elapsed; Elapsed = $null; Result = $null; Status = 'RUNNING' }
+            Write-Host "  $($s.Name) (pid $($p.Id)): $($s.Sections -join ', ')"
+        }
+        $deadline = [DateTime]::UtcNow.AddMinutes(30)
+        while (@($runs | Where-Object { $_.Status -eq 'RUNNING' }).Count -gt 0) {
+            foreach ($r in @($runs | Where-Object { $_.Status -eq 'RUNNING' })) {
+                if (-not $r.Process.HasExited) { continue }
+                $r.Elapsed = $clock.Elapsed - $r.Started
+                $resultPath = Join-Path $r.Dir 'result.json'
+                if (Test-Path -LiteralPath $resultPath) {
+                    $r.Result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+                    $r.Status = if ($r.Process.ExitCode -eq 0 -and $r.Result.fail -eq 0 -and $r.Result.pass -gt 0) { 'OK' } else { 'FAILED' }
+                }
+                else { $r.Status = 'CRASHED' }
+                Write-Host ("  {0}: {1} after {2:mm\:ss} (exit {3}, {4} passed, {5} failed)" -f $r.Name, $r.Status, $r.Elapsed, $r.Process.ExitCode, [int]$r.Result.pass, [int]$r.Result.fail)
+            }
+            if ([DateTime]::UtcNow -gt $deadline) { break }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    finally {
+        # nothing may outlive the parent: a shard still running here (deadline
+        # or Ctrl+C) is killed together with its whole dev.ps1 / git tree
+        foreach ($r in $runs) {
+            if (-not $r.Process.HasExited) {
+                & taskkill.exe /PID $r.Process.Id /T /F *> $null
+                $r.Status = 'TIMEOUT'
+            }
+        }
+    }
+    foreach ($r in $runs) {
+        Write-Host ''
+        Write-Host "===== $($r.Name): $($r.Sections -join ', ') ====="
+        foreach ($f in @('stdout.log', 'stderr.log')) {
+            $log = Join-Path $r.Dir $f
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Encoding Oem | ForEach-Object { Write-Host $_ } }
+        }
+    }
+    $pass = 0; $fail = 0; $failures = @(); $ok = $true
+    Write-Host ''
+    foreach ($r in $runs) {
+        $pass += [int]$r.Result.pass; $fail += [int]$r.Result.fail
+        if ($r.Result -and $r.Result.failures) { $failures += @($r.Result.failures | ForEach-Object { "$($r.Name): $_" }) }
+        if ($r.Status -ne 'OK') { $ok = $false }
+        Write-Host ("  {0,-8} {1,-8} {2,4} passed {3,3} failed  {4:mm\:ss}  {5}" -f $r.Name, $r.Status, [int]$r.Result.pass, [int]$r.Result.fail, $r.Elapsed, ($r.Sections -join ', '))
+    }
+    try { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction Stop } catch { Write-Host "  (could not remove shard temp base: $base)" }
+    Write-Host ''
+    Write-Host ("RESULT: $pass passed, $fail failed  ($($runs.Count) shards, wall-clock {0:mm\:ss\.f})" -f $clock.Elapsed)
+    if (-not $ok) {
+        $failures | ForEach-Object { Write-Host "  FAILED: $_" -ForegroundColor Red }
+        foreach ($r in @($runs | Where-Object { $_.Status -ne 'OK' })) { Write-Host "  SHARD $($r.Name): $($r.Status)" -ForegroundColor Red }
+        exit 1
+    }
+    exit 0
+}
+
+if (-not $Serial -and -not $Section) { Invoke-ShardedRun }
+
+# The sections THIS process runs; both selections go through the same gate,
+# Test-Section, called once at the top of every section block.
+$script:selected = if ($Serial) { $AllSections } else { @($Section | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+foreach ($n in $script:selected) {
+    if ($AllSections -notcontains $n) { throw "unknown section '$n' (known: $($AllSections -join ', '))" }
+}
+
+function Test-Section {
+    param([string]$Name)
+    if ($AllSections -notcontains $Name) { throw "section '$Name' is not registered in `$AllSections" }
+    return [bool]($script:selected -contains $Name)
+}
 
 $script:pass = 0
 $script:fail = 0
@@ -39,7 +186,10 @@ function Check {
 # ---- helpers ---------------------------------------------------------------
 
 function New-TempRoot {
-    $root = Join-Path ([System.IO.Path]::GetTempPath()) ("devhelper-test-" + [guid]::NewGuid().ToString('N'))
+    # A child shard keeps every root inside its own -TempBase, so shards never
+    # see each other's state and the parent can drop the whole tree afterwards.
+    $base = if ($TempBase) { $TempBase } else { [System.IO.Path]::GetTempPath() }
+    $root = Join-Path $base ("devhelper-test-" + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $root
     $script:tempRoots += $root
     return $root
@@ -246,6 +396,35 @@ function Run-Driver {
     }
 }
 
+# Shared by the WINDOWS-* sections (one block, split four ways for the shard
+# plan) and by the H5 block.
+function New-PartialRemovalResidue {
+    # EXACT observed residue: git-owned removal completed in Git terms, only
+    # the final rmdir did not - the folder stands empty and unregistered and
+    # the private admin dir (with the ownership marker) is gone.
+    param([string]$Canon, [string]$Wt)
+    GitRun $Canon @('worktree', 'remove', $Wt)
+    $null = New-Item -ItemType Directory -Path $Wt
+}
+
+function New-IntegratedTask {
+    # ACTIVE task -> one commit -> integration with cleanup deferred, so the
+    # worktree is still registered and the task is INTEGRATED.
+    param([string]$Canon, [string]$Root, [string]$Worker, [string]$Task, [string]$WtName)
+    $wt = Join-Path $Root $WtName
+    $null = Run-Dev $Canon @('new', $Worker, $Task)
+    CommitFile $wt 'task.txt' @("$Task work") "$Task work"
+    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
+    $null = Run-Dev $Canon @('finish', $Worker, $Task)
+    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
+    return $wt
+}
+
+function Test-BranchExists {
+    param([string]$Canon, [string]$Branch)
+    try { $null = GitOut $Canon @('rev-parse', '--verify', "refs/heads/$Branch"); return $true } catch { return $false }
+}
+
 # ---- environment isolation -------------------------------------------------
 
 $isoRoot = New-TempRoot
@@ -264,6 +443,7 @@ $env:GIT_AUTHOR_DATE = '2026-01-01T12:00:00 +0000'
 $env:GIT_COMMITTER_DATE = '2026-01-01T12:00:00 +0000'
 Remove-Item Env:\DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED -ErrorAction SilentlyContinue
 
+if (Test-Section 'NEW') {
 # ============================================================================
 Write-Host '== NEW =='
 # ============================================================================
@@ -345,7 +525,9 @@ $canon = New-CanonicalRepo $root
 GitRun $canon @('checkout', '-b', 'notmain')
 $r = Run-Dev $canon @('new', 'glm', 'gmail')
 Check 'new non-main canonical: exit 1' ($r.Code -eq 1)
+}
 
+if (Test-Section 'FINISH') {
 # ============================================================================
 Write-Host '== FINISH =='
 # ============================================================================
@@ -607,7 +789,9 @@ $branchKept = $false
 try { $null = GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/fix10'); $branchKept = $true } catch { }
 Check 'cleanup missing worktree: branch preserved' $branchKept
 Check 'cleanup missing worktree: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'fix10'))
+}
 
+if (Test-Section 'CLEANUP') {
 # ============================================================================
 Write-Host '== CLEANUP =='
 # ============================================================================
@@ -654,7 +838,9 @@ Check 'cleanup arbitrary: exit 1' ($r.Code -eq 1)
 Check 'cleanup arbitrary: worktree untouched' (Test-Path -LiteralPath $otherWt)
 $r = Run-Dev $canon @('cleanup', 'glm', 'doesnotexist')
 Check 'cleanup unknown task: exit 1' ($r.Code -eq 1)
+}
 
+if (Test-Section 'STATUS') {
 # ============================================================================
 Write-Host '== STATUS =='
 # ============================================================================
@@ -682,7 +868,9 @@ Check 'status mixed: still shows both tasks' (($r.Out -match 'st1') -and ($r.Out
 Check 'status mixed: prints handoff tokens' ($r.Out -match 'handoff=jarvis-dev-handoff-v1:glm:st1:')
 # status never mutates: the deferred task is untouched by the listing
 Check 'status read-only: task still INTEGRATED after listing' (((Get-Content -LiteralPath (Get-MetaPathLocal $canon 'glm' 'st1') -Raw | ConvertFrom-Json).state) -eq 'INTEGRATED')
+}
 
+if (Test-Section 'CLI') {
 # ============================================================================
 Write-Host '== CLI =='
 # ============================================================================
@@ -697,7 +885,9 @@ $r = Run-Dev $canon @('new', 'glm')
 Check 'cli missing task: exit 1' ($r.Code -eq 1)
 $r = Run-Dev $canon @('bogus')
 Check 'cli unknown command: exit 1' ($r.Code -eq 1)
+}
 
+if (Test-Section 'FINISH-CURRENT') {
 # ============================================================================
 Write-Host '== FINISH-CURRENT =='
 # ============================================================================
@@ -803,7 +993,9 @@ Check 'deferred finish: deterministic exit 0' ($r.Code -eq 0)
 $r = Run-Dev $canon @('cleanup', 'glm', 'fc6')
 Check 'deferred cleanup: no prompt characters' (($r.Out -match '\?') -eq $false -and ($r.Out -match 'y/n') -eq $false)
 Check 'deferred cleanup: deterministic exit 0' ($r.Code -eq 0)
+}
 
+if (Test-Section 'ADVERSARIAL') {
 # ============================================================================
 Write-Host '== ADVERSARIAL (destructive-safety regressions) =='
 # ============================================================================
@@ -1002,7 +1194,9 @@ Check 'A9 cleanup rebased history: exit 1' ($r.Code -eq 1)
 Check 'A9 worktree survives' (Test-Path -LiteralPath $wt)
 $mainSubjects = @(& git -C $canon log --format=%s -1 | ForEach-Object { $_.ToString() })
 Check 'A9 main unchanged by refusal' ($mainSubjects[0] -eq 'mainline advance')
+}
 
+if (Test-Section 'ADVERSARIAL-V2') {
 # ============================================================================
 Write-Host '== ADVERSARIAL V2 (linear history, final gate, ownership) =='
 # ============================================================================
@@ -1303,7 +1497,9 @@ $r = Run-Dev $canon @('cleanup', 'glm', 'coh')
 Check 'B8 INTEGRATED missing mainHeadAtFinish: exit 1' ($r.Code -eq 1)
 Check 'B8 coherence: worktree kept throughout' (Test-Path -LiteralPath $wt)
 Check 'B8 coherence: branch kept throughout' ((GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/coh')) -ne '')
+}
 
+if (Test-Section 'ADVERSARIAL-V3') {
 # ============================================================================
 Write-Host '== ADVERSARIAL V3 (final architecture) =='
 # ============================================================================
@@ -1370,13 +1566,6 @@ Check 'H1 valid handoff: CLEANED' ($r.Out -match 'CLEANED')
 # refusal, a present-but-wrong token, the confirmation itself on finish and
 # on cleanup, the unchanged env-token path, and the two-artifact ownership
 # evidence that a confirmation must never bypass.
-function Test-BranchRef {
-    # Local to this block: the suite's Test-BranchExists is defined further
-    # down the file, after this point in a linear script.
-    param([string]$Repo, [string]$Branch)
-    & git -C $Repo rev-parse --verify --quiet "refs/heads/$Branch" *> $null
-    return ($LASTEXITCODE -eq 0)
-}
 $root = New-TempRoot
 $canon = New-CanonicalRepo $root
 $wt = Join-Path $root 'JARVIS-GLM-h5'
@@ -1413,12 +1602,12 @@ Check 'H5 confirmed finish: exit 0' ($r.Code -eq 0)
 Check 'H5 confirmed finish: the question was asked' ($r.Out -match 'HANDOFF CONFIRMATION')
 Check 'H5 confirmed finish: INTEGRATED, not CLEANED' (($r.Out -match 'INTEGRATED') -and ($r.Out -notmatch 'CLEANED'))
 Check 'H5 confirmed finish: change on main' ((Get-Content -LiteralPath (Join-Path $canon 'task.txt') -Raw).Trim() -eq 'h5 change')
-Check 'H5 confirmed finish: worktree and branch kept' ((Test-Path -LiteralPath $wt) -and (Test-BranchRef $canon 'glm/h5'))
+Check 'H5 confirmed finish: worktree and branch kept' ((Test-Path -LiteralPath $wt) -and (Test-BranchExists $canon 'glm/h5'))
 # e. interactive console, confirmed: cleanup from canonical main
 $r = Run-Dev $canon @('cleanup', 'glm', 'h5') -StdIn 'REBOUND'
 Check 'H5 confirmed cleanup: exit 0' ($r.Code -eq 0)
 Check 'H5 confirmed cleanup: CLEANED' ($r.Out -match 'CLEANED')
-Check 'H5 confirmed cleanup: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchRef $canon 'glm/h5')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'h5'))))
+Check 'H5 confirmed cleanup: worktree, branch, metadata gone' ((-not (Test-Path -LiteralPath $wt)) -and (-not (Test-BranchExists $canon 'glm/h5')) -and (-not (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'h5'))))
 # f. a valid env token never prompts, even on an interactive console
 $script:SuppressAutoHandoff = $false
 $wt = Join-Path $root 'JARVIS-GLM-h5b'
@@ -1733,7 +1922,9 @@ $r = Run-Dev $canon @('finish', 'glm', 'ir3')
 Check 'H6 interrupted integration: recovery wording' ($r.Out -match 'proven restored')
 Check 'H6 interrupted integration: worktree preserved' (Test-Path -LiteralPath $wt)
 Check 'H6 interrupted integration: branch preserved' ((GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/ir3')) -ne '')
+}
 
+if (Test-Section 'ADVERSARIAL-P1') {
 # ============================================================================
 Write-Host '== ADVERSARIAL P1 (unfinished ops + conflict recovery) =='
 # ============================================================================
@@ -2090,40 +2281,15 @@ Check 'B5 post-abort proof failure: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY 
 Check 'B5 post-abort proof failure: observed state preserved' (Test-Path -LiteralPath (Join-Path $canon '.git\sequencer'))
 Check 'B5 post-abort proof failure: main unchanged' ((GitOut $canon @('rev-parse', 'refs/heads/main')) -eq (GitOut $canon @('rev-parse', 'HEAD')))
 Check 'B5 post-abort proof failure: task preserved' ((GitOut $canon @('rev-parse', '--verify', 'refs/heads/glm/cr5')) -ne '')
+}
 
+if (Test-Section 'WINDOWS-A') {
 # ============================================================================
-Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W1-W20) =='
+Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W1-W12) =='
 # ============================================================================
 # Reproduces the observed Windows failure: `git worktree remove` deregisters
 # the worktree and deletes .git/worktrees/<name> (and with it the private
 # ownership marker), while the final directory unlink does not happen.
-
-function New-PartialRemovalResidue {
-    # EXACT observed residue: git-owned removal completed in Git terms, only
-    # the final rmdir did not - the folder stands empty and unregistered and
-    # the private admin dir (with the ownership marker) is gone.
-    param([string]$Canon, [string]$Wt)
-    GitRun $Canon @('worktree', 'remove', $Wt)
-    $null = New-Item -ItemType Directory -Path $Wt
-}
-
-function New-IntegratedTask {
-    # ACTIVE task -> one commit -> integration with cleanup deferred, so the
-    # worktree is still registered and the task is INTEGRATED.
-    param([string]$Canon, [string]$Root, [string]$Worker, [string]$Task, [string]$WtName)
-    $wt = Join-Path $Root $WtName
-    $null = Run-Dev $Canon @('new', $Worker, $Task)
-    CommitFile $wt 'task.txt' @("$Task work") "$Task work"
-    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = '1'
-    $null = Run-Dev $Canon @('finish', $Worker, $Task)
-    $env:DEV_HELPER_TEST_FORCE_CLEANUP_DEFERRED = $null
-    return $wt
-}
-
-function Test-BranchExists {
-    param([string]$Canon, [string]$Branch)
-    try { $null = GitOut $Canon @('rev-parse', '--verify', "refs/heads/$Branch"); return $true } catch { return $false }
-}
 
 # --- W1/W2/W3: cleanup, run from INSIDE the worktree, relocates first -------
 # finish-current no longer reaches the destructive stage (hard lifecycle
@@ -2373,6 +2539,12 @@ Check 'W12 markerless residue: RECOVERY REQUIRED' ($r.Out -match 'RECOVERY REQUI
 Check 'W12 markerless residue: no destructive seam reached' ($r.Out -notmatch 'SEAM-REACHED')
 Check 'W12 markerless residue: branch survives' (Test-BranchExists $canon 'glm/w12')
 Check 'W12 markerless residue: metadata survives' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w12'))
+}
+
+if (Test-Section 'WINDOWS-B') {
+# ============================================================================
+Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W13-W19b) =='
+# ============================================================================
 
 # --- W13: no-force / no-recursive-delete policy preserved -------------------
 # executable lines only - the prose in the header and comments explains the
@@ -2499,6 +2671,12 @@ Check 'W19b absent directory: RECOVERED never claimed' ($r.Out -notmatch 'RECOVE
 Check 'W19b absent directory: CLEANED never claimed' ($r.Out -notmatch 'CLEANED')
 Check 'W19b absent directory: branch preserved' (Test-BranchExists $canon 'glm/w19e')
 Check 'W19b absent directory: metadata preserved' (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' 'w19e'))
+}
+
+if (Test-Section 'WINDOWS-C') {
+# ============================================================================
+Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W21-W23) =='
+# ============================================================================
 
 # --- W21: INCOMPLETE private worktree admin residue fails closed ------------
 # `git worktree list` OMITS an admin entry whose representation is incomplete,
@@ -2717,6 +2895,12 @@ foreach ($shape in $shapes) {
     Check "W23 $($shape.Name): task branch preserved" (Test-BranchExists $canon "glm/$t")
     Check "W23 $($shape.Name): metadata preserved" (Test-Path -LiteralPath (Get-MetaPathLocal $canon 'glm' $t))
 }
+}
+
+if (Test-Section 'WINDOWS-D') {
+# ============================================================================
+Write-Host '== WINDOWS FINISH / PARTIAL-REMOVAL RECOVERY (W24) =='
+# ============================================================================
 
 # --- W24: finish preflight removes ONLY allowlisted generated artifacts -----
 # The UX fix: known ignored runtime artifacts (the test database and the three
@@ -2851,11 +3035,17 @@ Check 'W24g missing marker: exit 1' ($r.Code -eq 1)
 Check 'W24g missing marker: ownership refusal' ($r.Out -match 'ownership evidence refused')
 Check 'W24g missing marker: artifacts untouched' (Test-AnyArtifactPresent $wt)
 Check 'W24g missing marker: nothing integrated' (-not (Test-Path -LiteralPath (Join-Path $canon 'task.txt')))
+}
 
 # ---- summary ---------------------------------------------------------------
 
 foreach ($t in $script:tempRoots) {
     try { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction Stop } catch { Write-Host "  (could not remove temp root: $t)" }
+}
+
+if ($ResultFile) {
+    $report = [pscustomobject]@{ sections = @($script:selected); pass = $script:pass; fail = $script:fail; failures = @($script:failures) }
+    [System.IO.File]::WriteAllText($ResultFile, (ConvertTo-Json -InputObject $report), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 Write-Host ''
