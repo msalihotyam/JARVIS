@@ -45,6 +45,24 @@ default.
 Choose on **wall-clock time + correctness + turn count + Claude Max quota
 impact**, not token count alone.
 
+## Claude chat rotation
+
+Persistent Claude chats are **disposable working context**. Canonical
+continuity lives in this runbook, `JARVIS_ACTIVE_STATE.md` and Git — never in
+a chat's scrollback.
+
+- Let auto-compaction run normally; it is not a reason to rotate.
+- Rotate at **milestone boundaries**, when Messages/context is roughly
+  400–500k+ or the chat is noticeably slow.
+- Do **not** rotate mid-implementation unless the session is unusable.
+- Before retiring a chat: the accepted work must be canonical, and the chat
+  must be rebound to `C:\Users\realk\Masaüstü\JARVIS`.
+- Archive old chats; do not delete them.
+- Start the fresh chat with exactly:
+
+  > Read JARVIS_RUNBOOK.md and JARVIS_ACTIVE_STATE.md first. Continue from the
+  > current canonical state.
+
 ## Independent review (Work)
 
 Reserve an independent Work gate for genuinely critical blockers only — not
