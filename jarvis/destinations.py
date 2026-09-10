@@ -31,7 +31,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import AbstractSet, Any, Mapping
 
-from jarvis.contracts import MAILBOX_DESTINATION_PREFIX, REPOSITORY_DESTINATION_PREFIX, normalize_destination
+from jarvis.browser import browser_raw_destination_refusal
+from jarvis.contracts import (
+    MAILBOX_DESTINATION_PREFIX,
+    ORIGIN_DESTINATION_PREFIX,
+    REPOSITORY_DESTINATION_PREFIX,
+    normalize_destination,
+)
 from jarvis.github import github_raw_destination_refusal
 from jarvis.gmail import gmail_raw_destination_refusal
 
@@ -62,6 +68,11 @@ class DestinationKind(str, Enum):
     #: ``jarvis.gmail``; reaching it still needs an exact grant, which only
     #: a configured principal composes into.
     MAILBOX = "mailbox"
+    #: One web origin, spelled ``browser/<scheme>://<host>[:<port>]``. Like a
+    #: repository and a mailbox it is not enumerable, so its validity comes
+    #: from the closed grammar in ``jarvis.browser``; reaching it still needs
+    #: an exact grant, which only a configured origin composes into.
+    ORIGIN = "origin"
 
 
 #: The canonical destination the Claude Code connector is registered for, and
@@ -220,6 +231,13 @@ def destination_refusal(canonical: Any, *, egress: bool = False) -> str | None:
         if reason is not None:
             return f"the destination is not a canonical mailbox: {reason}"
         kind = DestinationKind.MAILBOX
+    if kind is None and canonical.startswith(ORIGIN_DESTINATION_PREFIX):
+        # The origin namespace, judged by the closed browser grammar on the
+        # spelling as written, for exactly the reason the other two are.
+        reason = browser_raw_destination_refusal(canonical)
+        if reason is not None:
+            return f"the destination is not a canonical origin: {reason}"
+        kind = DestinationKind.ORIGIN
     if kind is None:
         return "the destination is not registered with Core"
     if egress and kind is DestinationKind.NONE:

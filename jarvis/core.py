@@ -121,6 +121,12 @@ from jarvis.destinations import (
     canonical_destination,
     connector_destination_refusal,
 )
+from jarvis.browser import (
+    BROWSER_READ_CAPABILITIES,
+    browser_external_read_binding_refusal,
+    browser_resource_from_dict,
+    build_browser_request_frame,
+)
 from jarvis.gmail import (
     GMAIL_READ_CAPABILITIES,
     GmailIdentityBinding,
@@ -3652,6 +3658,9 @@ class AgentCore:
         if set(connector.manifest.capabilities) & set(GMAIL_READ_CAPABILITIES):
             self._bind_gmail_external_read(task, connector, result)
             return
+        if set(connector.manifest.capabilities) & set(BROWSER_READ_CAPABILITIES):
+            self._bind_browser_external_read(task, connector, result)
+            return
         if not set(connector.manifest.capabilities) & set(GITHUB_READ_CAPABILITIES):
             return
         raw = result.data if isinstance(result.data, dict) else {}
@@ -3733,6 +3742,48 @@ class AgentCore:
         if snapshot.source_task_id != task.id:
             return
         if gmail_external_read_binding_refusal(snapshot, frame=frame) is not None:
+            return
+        task.external_read = snapshot.to_dict()
+
+    def _bind_browser_external_read(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """The browser twin of the two bindings above, same gates, same
+        non-raising discard: the frame is rebuilt from the task's own
+        validated browser target and the snapshot must describe exactly that
+        request or it is dropped. There is no identity half - the browser
+        acts as nobody - so the origin and the target ARE the binding."""
+        raw = result.data if isinstance(result.data, dict) else {}
+        payload = raw.get(EXTERNAL_READ_RESULT_KEY)
+        if not isinstance(payload, dict):
+            return
+        try:
+            resource = browser_resource_from_dict(task.browser)
+            frame = build_browser_request_frame(
+                capability=task.capability,
+                destination=resource.destination,
+                resource=resource,
+                connector=connector.manifest.name,
+            )
+            snapshot = ExternalReadSnapshot(
+                source_task_id=str(payload.get("source_task_id", "")),
+                connector=str(payload.get("connector", "")),
+                capability=str(payload.get("capability", "")),
+                destination=str(payload.get("destination", "")),
+                resource_kind=str(payload.get("resource_kind", "")),
+                resource_id=str(payload.get("resource_id", "")),
+                content=str(payload.get("content", "")),
+                truncated=bool(payload.get("truncated", False)),
+                byte_size=int(payload.get("byte_size", 0)),
+                sha256=str(payload.get("sha256", "")),
+                classification=task.scope.data_classification,
+                captured_at=str(payload.get("captured_at", "")),
+            )
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return
+        if snapshot.source_task_id != task.id:
+            return
+        if browser_external_read_binding_refusal(snapshot, frame=frame) is not None:
             return
         task.external_read = snapshot.to_dict()
 

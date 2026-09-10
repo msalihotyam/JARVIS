@@ -28,6 +28,7 @@ from jarvis.connectors.base import BaseConnector
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.github_cli import GitHubCliConnector
+from jarvis.connectors.browser_cdp import BrowserCdpConnector
 from jarvis.connectors.gmail_cli import GmailCliConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
@@ -117,6 +118,15 @@ from jarvis.destinations import (
     DestinationGrant,
     canonical_destination,
     destination_refusal,
+)
+from jarvis.browser import (
+    BROWSER_CAPABILITIES,
+    BROWSER_CONNECTOR,
+    BROWSER_ENABLED_CAPABILITIES,
+    BrowserExecutionUnavailable,
+    browser_external_read_refusal,
+    browser_resource_binding_refusal,
+    browser_resource_from_dict,
 )
 from jarvis.gmail import (
     GMAIL_CAPABILITIES,
@@ -270,6 +280,9 @@ _TASK_KEYS = frozenset(
         # Gmail minimum. A TOP-LEVEL section for the same reason: recipients,
         # a subject and a body must never ride in ``context``.
         "gmail",
+        # Browser basic. A TOP-LEVEL section for the same reason: a URL, an
+        # element ref and typed text must never ride in ``context``.
+        "browser",
         # M9. The bounded LINE REGION of the read target. A top-level section
         # for the same reason ``write`` is: ``context`` egresses verbatim.
         LOCAL_READ_REGION_SECTION,
@@ -297,6 +310,14 @@ _GMAIL_KEYS = frozenset(
         "kind", "account", "query", "limit", "message_id", "thread_id",
         "attachment_id", "to", "cc", "bcc", "subject", "body",
     }
+)
+#: Browser basic. The typed target fields, and nothing else. Default-deny like
+#: every other section: a selector, a script, a coordinate, an argv and a
+#: header have no key here, so none of them is expressible. ``kind`` and
+#: ``origin`` are required; the rest are the optional fields whose presence
+#: each kind decides.
+_BROWSER_KEYS = frozenset(
+    {"kind", "origin", "url", "seconds", "tab_id", "ref", "page_digest", "text"}
 )
 #: M9. The only two read-window parameters. Default-deny like every other
 #: section: anything else is rejected, never ignored.
@@ -809,6 +830,43 @@ def decode_task_json(raw: str | bytes) -> Task:
     elif capability in GMAIL_CAPABILITIES:
         raise TaskInputError("a Gmail capability requires a 'gmail' section.")
 
+    # Browser basic. Judged by the browser contracts themselves and stored in
+    # the canonical serialization of the object that passed. The element ref
+    # and the page digest are typed fields here and nowhere else: page
+    # content, a model answer or a ``context`` value cannot become one.
+    browser_input = _section(document, "browser", _BROWSER_KEYS)
+    browser_resource: dict[str, Any] = {}
+    if browser_input:
+        if capability not in BROWSER_ENABLED_CAPABILITIES:
+            raise TaskInputError(
+                "'browser' may only be named by an enabled browser capability."
+            )
+        for key in ("kind", "origin"):
+            if key not in browser_input:
+                raise TaskInputError(f"'browser' requires '{key}'.")
+        candidate = {
+            "kind": browser_input["kind"],
+            "origin": browser_input["origin"],
+            "url": browser_input.get("url", ""),
+            "seconds": browser_input.get("seconds", 0),
+            "tab_id": browser_input.get("tab_id", ""),
+            "ref": browser_input.get("ref", ""),
+            "page_digest": browser_input.get("page_digest", ""),
+            "text": browser_input.get("text", ""),
+        }
+        try:
+            resource = browser_resource_from_dict(candidate)
+        except BrowserExecutionUnavailable as exc:
+            raise TaskInputError(f"'browser' is refused: {exc}.") from exc
+        reason = browser_resource_binding_refusal(
+            resource, capability=capability, destination=destination
+        )
+        if reason is not None:
+            raise TaskInputError(f"'browser' is refused: {reason}.")
+        browser_resource = resource.to_dict()
+    elif capability in BROWSER_CAPABILITIES:
+        raise TaskInputError("a browser capability requires a 'browser' section.")
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -825,6 +883,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         project_id=project_id,
         github=github_resource,
         gmail=gmail_resource,
+        browser=browser_resource,
         write_content=write_content,
         write_mode=write_mode,
         write_source=write_source,
@@ -1196,11 +1255,10 @@ def _external_read_payload(stored: Any) -> dict[str, Any] | None:
         return None
     # The producer decides which vocabulary judges it; both refuse anything
     # that is not self-consistent, and neither grants the block authority.
-    refusal = (
-        gmail_external_read_refusal
-        if snapshot.connector == GMAIL_CONNECTOR
-        else external_read_refusal
-    )
+    refusal = {
+        GMAIL_CONNECTOR: gmail_external_read_refusal,
+        BROWSER_CONNECTOR: browser_external_read_refusal,
+    }.get(snapshot.connector, external_read_refusal)
     if refusal(snapshot) is not None:
         return None
     return {
@@ -3195,7 +3253,14 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     gmail_identity, gmail_policy = gmail_authority(settings)
     if gmail_identity is not None:
         connectors += (GmailCliConnector(gmail_identity),)
-    configured = github_policy | gmail_policy
+    # Browser basic: the same rule from the same kind of statement, with one
+    # difference - there is no identity half, because JARVIS holds no browser
+    # credential. An installation that configured no origin composes with no
+    # browser connector and no browser grant, so no origin is reachable.
+    browser_policy = browser_authority(settings)
+    if browser_policy:
+        connectors += (BrowserCdpConnector(str(settings.browser_profile_dir)),)
+    configured = github_policy | gmail_policy | browser_policy
     return create_app(
         settings=settings,
         connectors=connectors,
@@ -3257,6 +3322,27 @@ def gmail_authority(
             principal=principal, config_dir=str(settings.gmail_config_dir)
         ),
         frozenset(grants),
+    )
+
+
+def browser_authority(settings: Settings) -> frozenset[DestinationGrant]:
+    """The exact browser grants this installation configured.
+
+    One row per enabled capability per configured origin - reads and
+    interactions alike, because every one of them is still behind mandatory
+    approval and an interaction additionally binds its exact target and page
+    state. An unconfigured installation returns an empty set, which is the
+    shipped default: no connector and no grant.
+
+    No identity half, deliberately. GitHub and Gmail each act AS somebody and
+    Core must own that binding; the browser acts as nobody - it drives a
+    dedicated profile JARVIS created, with no session of the operator's in
+    it - so there is no identity to bind and nothing here reads a credential.
+    """
+    return frozenset(
+        DestinationGrant(BROWSER_CONNECTOR, capability, destination)
+        for destination in settings.browser_origins
+        for capability in BROWSER_ENABLED_CAPABILITIES
     )
 
 

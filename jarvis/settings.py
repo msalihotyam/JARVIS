@@ -27,6 +27,7 @@ from jarvis.github import (
     github_principal_refusal,
     github_raw_destination_refusal,
 )
+from jarvis.browser import browser_raw_destination_refusal
 from jarvis.gmail import gmail_principal_refusal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,26 @@ class Settings:
     #: ``gmail/<account>``. A NON-SECRET address, never a token: there is no
     #: setting anywhere in this product that holds a Google credential.
     gmail_principal: str | None = None
+    #: Browser basic usable-v1 authority, configuration like the other two:
+    #: the canonical origin destinations, spelled exactly
+    #: ``browser/<scheme>://<host>[:<port>]``, this installation may drive a
+    #: browser inside. Each becomes one exact destination grant per enabled
+    #: browser capability, and an operation outside the list is refused by
+    #: Core's destination policy rather than by the connector. There is no
+    #: browser credential setting, because JARVIS holds no browser
+    #: credential: it drives a dedicated profile of its own.
+    browser_origins: tuple[str, ...] = ()
+
+    @property
+    def browser_profile_dir(self) -> Path:
+        """The JARVIS-dedicated browser profile directory.
+
+        DERIVED, never configured, and beside the memory database for the
+        same reason the Gmail config directory is: the browser JARVIS drives
+        must never be the operator's own logged-in one. Not a secret and not
+        a credential: a location.
+        """
+        return Path(self.memory_database).resolve().parent / "browser-profile"
 
     @property
     def gmail_config_dir(self) -> Path:
@@ -268,6 +289,16 @@ class Settings:
             reason = gmail_principal_refusal(self.gmail_principal)
             if reason is not None:
                 raise ValueError(f"gmail_principal is unusable: {reason}")
+        if type(self.browser_origins) is list:
+            object.__setattr__(self, "browser_origins", tuple(self.browser_origins))
+        if type(self.browser_origins) is not tuple:
+            raise ValueError(
+                "browser_origins must be a tuple of browser/<scheme>://<host>[:<port>]"
+            )
+        for entry in self.browser_origins:
+            reason = browser_raw_destination_refusal(entry)
+            if reason is not None:
+                raise ValueError(f"browser_origins entry is unusable: {reason}")
         if not MIN_APPROVAL_TTL_MINUTES <= self.approval_ttl_minutes <= (
             MAX_APPROVAL_TTL_MINUTES
         ):
@@ -346,12 +377,20 @@ CONFIG_KEYS = (
     # Gmail minimum. Authority as CONFIGURATION: the one mailbox the local
     # Google Workspace CLI session belongs to. Not a credential.
     "gmail_principal",
+    # Browser basic. Authority as CONFIGURATION: the exact origins a browser
+    # may be driven inside. Not a credential; there is no browser credential.
+    "browser_origins",
 )
+
+#: The pre-Browser key set: the document exactly as the Gmail build wrote it.
+#: Accepted whole, with no origin configured, for the same reason every older
+#: shape is: a second CLOSED shape, not an optional-keys hole.
+PRE_BROWSER_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"browser_origins"}
 
 #: The pre-Gmail key set: the document exactly as the GitHub v1 build wrote
 #: it. Accepted whole, with the Gmail setting unset, for the same reason the
 #: two older shapes are: a second CLOSED shape, not an optional-keys hole.
-PRE_GMAIL_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"gmail_principal"}
+PRE_GMAIL_CONFIG_KEYS = PRE_BROWSER_CONFIG_KEYS - {"gmail_principal"}
 
 #: The pre-GitHub key set: the document exactly as a build before GitHub v1
 #: wrote it. Accepted whole, with both GitHub settings unset, for the same
@@ -641,6 +680,21 @@ def _exact_github_repositories(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _exact_browser_origins(value: object) -> tuple[str, ...]:
+    """The configured canonical origin destinations, exactly as written.
+
+    A list of strings and nothing else, on exactly the footing of
+    ``github_repositories``: no coercion, no splitting, no de-duplication
+    that could hide a typo. Each entry's spelling is judged by the browser
+    destination grammar in the constructor.
+    """
+    if value is None:
+        return ()
+    if type(value) is not list or any(type(item) is not str for item in value):
+        _fail("'browser_origins' must be a list of strings.")
+    return tuple(value)
+
+
 def _exact_gmail_principal(value: object) -> str | None:
     """The configured mailbox address, or ``None``. Never coerced."""
     if value is None:
@@ -666,6 +720,7 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "github_principal": settings.github_principal,
         "github_repositories": list(settings.github_repositories),
         "gmail_principal": settings.gmail_principal,
+        "browser_origins": list(settings.browser_origins),
     }
 
 
@@ -682,6 +737,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     keys = set(document)
     if keys not in (
         set(CONFIG_KEYS),
+        set(PRE_BROWSER_CONFIG_KEYS),
         set(PRE_GMAIL_CONFIG_KEYS),
         set(PRE_GITHUB_CONFIG_KEYS),
         set(LEGACY_CONFIG_KEYS),
@@ -736,6 +792,9 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             # Absent means unset (a pre-Gmail document): no connector, no
             # grant and no expected identity.
             gmail_principal=_exact_gmail_principal(document.get("gmail_principal")),
+            # Absent means unset (a pre-Browser document): no connector and
+            # no grant, so no origin is reachable.
+            browser_origins=_exact_browser_origins(document.get("browser_origins")),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

@@ -626,6 +626,7 @@ CONFIG_SETTABLE_KEYS = (
     "github_principal",
     "github_repositories",
     "gmail_principal",
+    "browser_origins",
 )
 
 
@@ -713,6 +714,12 @@ def _config_change(key: str, raw: str):
     # Gmail grammar in ``settings`` is the only validator.
     if key == "gmail_principal":
         return lambda current: replace(current, gmail_principal=raw)
+    # browser_origins: comma-separated for the same reason the repository
+    # list is - a list is what the authority IS, one grant per origin - and
+    # an empty value clears it, which is how an operator revokes browsing.
+    if key == "browser_origins":
+        origins = tuple(part.strip() for part in raw.split(",") if part.strip())
+        return lambda current: replace(current, browser_origins=origins)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)

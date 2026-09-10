@@ -164,9 +164,10 @@ class ParsingTests(ConfigTestCase):
         self.assertEqual(result.settings.claude_call_budget_usd, 1.5)
 
     def test_the_key_set_is_exactly_closed(self) -> None:
-        # Still an EXACT set, now including the two GitHub authority keys
-        # that GitHub v1 added. Neither holds a credential: one is a login and
-        # the other is a list of canonical repository destinations.
+        # Still an EXACT set, now including the browser authority key that
+        # Browser basic added beside the GitHub and Gmail ones. None of them
+        # holds a credential: a login, a list of canonical repository
+        # destinations, a mailbox address and a list of canonical origins.
         self.assertEqual(
             set(CONFIG_KEYS),
             {
@@ -175,7 +176,7 @@ class ParsingTests(ConfigTestCase):
                 "claude_call_budget_usd", "approval_ttl_minutes",
                 "memory_database", "claude_model", "claude_effort",
                 "github_principal", "github_repositories",
-                "gmail_principal",
+                "gmail_principal", "browser_origins",
             },
         )
 

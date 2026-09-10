@@ -181,6 +181,20 @@ REPOSITORY_DESTINATION_PREFIX = "github/"
 #: Declared beside the repository prefix for the same reason: the central
 #: normalizer must refuse to repair it, and ``jarvis.gmail`` re-exports it.
 MAILBOX_DESTINATION_PREFIX = "gmail/"
+#: The namespace prefix of an ORIGIN destination, spelled
+#: ``browser/<scheme>://<host>[:<port>]``. Declared beside the other two for
+#: the same reason: the central normalizer must refuse to repair it, and
+#: ``jarvis.browser`` re-exports it.
+ORIGIN_DESTINATION_PREFIX = "browser/"
+
+#: The namespaces ``normalize_destination`` must never REPAIR. Each is an
+#: unenumerable family judged by its own closed grammar, so a lossy repair
+#: could turn a spelling nobody is authorized for into one somebody is.
+_UNREPAIRED_DESTINATION_PREFIXES = (
+    REPOSITORY_DESTINATION_PREFIX,
+    MAILBOX_DESTINATION_PREFIX,
+    ORIGIN_DESTINATION_PREFIX,
+)
 
 
 def normalize_destination(value: str | Path | None) -> str:
@@ -212,8 +226,9 @@ def normalize_destination(value: str | Path | None) -> str:
     checks stays the string persistence, the fingerprint and the attestation
     hold.
 
-    Only the repository and mailbox namespaces are treated this way. URLs,
-    provider endpoints and the empty destination normalize exactly as before.
+    Only the repository, mailbox and origin namespaces are treated this way.
+    URLs, provider endpoints and the empty destination normalize exactly as
+    before.
     """
     if value is None:
         return ""
@@ -224,7 +239,7 @@ def normalize_destination(value: str | Path | None) -> str:
     url = normalize_url(text)
     normalized = url if url is not None else normalize_symbol(text)
     if (
-        normalized.startswith((REPOSITORY_DESTINATION_PREFIX, MAILBOX_DESTINATION_PREFIX))
+        normalized.startswith(_UNREPAIRED_DESTINATION_PREFIXES)
         and normalized != raw
     ):
         return raw
@@ -5605,6 +5620,14 @@ class Task:
     #: still knows what it was approved to do after a reload. For a draft or
     #: a send it carries the recipients, subject and body the approval binds.
     gmail: dict[str, Any] = field(default_factory=dict)
+    #: Browser basic. The typed browser target this task names, in its own
+    #: canonical serialized form (``{}`` = none), on exactly the footing of
+    #: ``github`` and ``gmail``: accepted from untrusted input as THE
+    #: REQUEST, validated at the input boundary, re-judged by every consumer
+    #: through ``browser_resource_from_dict``, and persisted so an approved
+    #: interaction still knows which element on which page state it was
+    #: approved for after a reload.
+    browser: dict[str, Any] = field(default_factory=dict)
     write_content: str = ""
     #: M5. The declared write mode, part of the authority rather than a hint.
     #: Separate from ``local_write`` because the record is the post-execution
@@ -5714,6 +5737,7 @@ class Task:
             "github": dict(self.github),
             "external_read": dict(self.external_read),
             "gmail": dict(self.gmail),
+            "browser": dict(self.browser),
             "write_content": self.write_content,
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
@@ -5931,6 +5955,12 @@ class Task:
             gmail=(
                 dict(data["gmail"])
                 if isinstance(data.get("gmail"), dict)
+                else {}
+            ),
+            # Browser basic. Same rule again.
+            browser=(
+                dict(data["browser"])
+                if isinstance(data.get("browser"), dict)
                 else {}
             ),
             # M5. The same grammar the input boundary applies, so a row edited
