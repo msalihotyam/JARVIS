@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 from jarvis.app import TaskInputError, browser_authority, decode_task_json
 from jarvis.browser import (
     BROWSER_CAPABILITIES,
+    BROWSER_MAX_NAVIGATION_EVENTS,
     BROWSER_MAX_REDIRECT_HOPS,
     BROWSER_CAPABILITY_METHODS,
     BROWSER_CONNECTOR,
@@ -162,7 +163,6 @@ class FakeBrowser(threading.Thread):
         super().__init__(daemon=True)
         self.answers = answers
         self.navigator = navigator
-        self._pending_id = 0
         self.sent: list[tuple[str, dict]] = []
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
@@ -204,6 +204,20 @@ class FakeBrowser(threading.Thread):
         # One unrelated event first, so the command loop must skip it.
         _write_frame(connection, json.dumps({"method": "Page.frameResized", "params": {}}))
         _write_frame(connection, json.dumps(body))
+        if message["method"] == "Page.navigate" and self.navigator is None:
+            # No scripted chain: the navigation commits immediately, which
+            # still has to be SAID rather than assumed from the reply.
+            _write_frame(
+                connection,
+                json.dumps(
+                    {
+                        "method": "Page.frameNavigated",
+                        "params": {
+                            "frame": {"id": FRAME, "loaderId": LOADER, "url": URL}
+                        },
+                    }
+                ),
+            )
 
     def _navigation(self, connection: socket.socket, message: dict) -> bool:  # pragma: no cover
         """Behave like a browser under a document gate, or decline to.
@@ -218,26 +232,21 @@ class FakeBrowser(threading.Thread):
             return False
         method = message["method"]
         params = message.get("params", {})
+        # The navigator decides WHAT is written and IN WHICH ORDER, including
+        # when Page.navigate is answered. Nothing here forces the reply to
+        # come after the redirects, because a real browser does not promise
+        # that and the gate must not depend on it.
         if method == "Page.navigate":
-            self._pending_id = message["id"]
-            _write_frame(connection, json.dumps(navigator.pause(params["url"])))
-            return True
-        if method == "Fetch.failRequest":
-            navigator.fail()
-            _write_frame(connection, json.dumps({"id": message["id"], "result": {}}))
-            return True
-        if method == "Fetch.continueRequest":
-            following = navigator.follow()
-            _write_frame(connection, json.dumps({"id": message["id"], "result": {}}))
-            if following is None:
-                _write_frame(
-                    connection,
-                    json.dumps({"id": self._pending_id, "result": {"frameId": "f1"}}),
-                )
-            else:
-                _write_frame(connection, json.dumps(following))
-            return True
-        return False
+            outbound = navigator.navigate(params["url"], message["id"])
+        elif method == "Fetch.failRequest":
+            outbound = [{"id": message["id"], "result": {}}, *navigator.fail()]
+        elif method == "Fetch.continueRequest":
+            outbound = [{"id": message["id"], "result": {}}, *navigator.follow()]
+        else:
+            return False
+        for one in outbound:
+            _write_frame(connection, json.dumps(one))
+        return True
 
     def _handshake(self, connection: socket.socket) -> None:  # pragma: no cover
         request = b""
@@ -278,7 +287,7 @@ def page_answers(**overrides):
         "Accessibility.enable": {},
         "Page.getNavigationHistory": {"currentIndex": 0, "entries": [{"url": URL, "title": "Example"}]},
         "Accessibility.getFullAXTree": {"nodes": _AX_NODES},
-        "Page.navigate": {"frameId": "f1"},
+        "Page.navigate": {"frameId": FRAME, "loaderId": LOADER},
         "DOM.scrollIntoViewIfNeeded": {},
         "DOM.getBoxModel": {"model": {"content": [10, 10, 50, 10, 50, 30, 10, 30]}},
         "DOM.describeNode": lambda params: (
@@ -1125,6 +1134,11 @@ class _OriginHandler(BaseHTTPRequestHandler):
         pass
 
 
+#: The one top frame and the one loader a guarded navigation belongs to.
+FRAME = "F1"
+LOADER = "L1"
+
+
 class _GatedNavigator:
     """A browser's navigation behaviour under a document gate.
 
@@ -1134,15 +1148,48 @@ class _GatedNavigator:
     connection to that origin. The redirect chain itself is real: it comes
     from the local servers, over HTTP, one hop at a time, without the client
     library following anything on its own.
+
+    ``early_reply`` reproduces the ordering the protocol actually permits and
+    the previous test wrongly excluded: ``Page.navigate`` is answered
+    SUCCESSFULLY as soon as the first hop is on its way, and only afterwards
+    does that hop turn out to be a redirect. A gate that treated the reply as
+    completion would already have disarmed by the time the redirect appears.
+
+    ``noise`` additionally emits ``Page.frameNavigated`` for another frame and
+    for another loader of the same frame, so a gate that terminated on any
+    frame event rather than on ITS OWN would disarm early too.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        early_reply: bool = False,
+        noise: bool = False,
+        never_commits: bool = False,
+    ) -> None:
+        self.early_reply = early_reply
+        self.noise = noise
+        #: Acknowledge the navigation, then talk forever about OTHER frames
+        #: and never commit this loader.
+        self.never_commits = never_commits
         self.hop = ""
         self.fetched: list[str] = []
         self.failed: list[str] = []
         self.landed = ""
+        #: Whether the navigation had already been acknowledged when the last
+        #: redirect hop was announced - the property under test.
+        self.replied_before_redirect = False
+        self._reply_id = 0
+        self._replied = False
 
-    def pause(self, url: str) -> dict:
+    # -- what the browser writes ------------------------------------------
+
+    def navigate(self, url: str, reply_id: int) -> list[dict]:
+        self._reply_id = reply_id
+        self._replied = False
+        return [self._pause(url)]
+
+    def _pause(self, url: str) -> dict:
         self.hop = url
         return {
             "method": "Fetch.requestPaused",
@@ -1152,12 +1199,42 @@ class _GatedNavigator:
             },
         }
 
-    def fail(self) -> None:
+    def _reply(self) -> dict:
+        self._replied = True
+        return {
+            "id": self._reply_id,
+            "result": {"frameId": FRAME, "loaderId": LOADER},
+        }
+
+    def _navigated(self, *, frame: str = FRAME, loader: str = LOADER, url: str = "") -> dict:
+        return {
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {"id": frame, "loaderId": loader, "url": url or self.landed}
+            },
+        }
+
+    def _unrelated(self) -> list[dict]:
+        """Frame events that are not this navigation's, and must not end it."""
+        return [
+            self._navigated(frame="F2", loader="L9", url="about:blank"),
+            self._navigated(frame=FRAME, loader="L9", url="about:blank"),
+        ]
+
+    # -- what the client's decisions cause --------------------------------
+
+    def fail(self) -> list[dict]:
         self.failed.append(self.hop)
         self.hop = ""
+        return []
 
-    def follow(self) -> dict | None:
-        """Perform the hop the client continued; announce the next, if any."""
+    def follow(self) -> list[dict]:
+        """Perform the hop the client continued; announce whatever follows."""
+        outbound: list[dict] = []
+        if self.early_reply and not self._replied:
+            outbound.append(self._reply())
+            if self.noise:
+                outbound.extend(self._unrelated())
         url = self.hop
         self.fetched.append(url)
         parsed = urlsplit(url)
@@ -1172,9 +1249,19 @@ class _GatedNavigator:
         finally:
             connection.close()
         if location:
-            return self.pause(location)
+            self.replied_before_redirect = self._replied
+            outbound.append(self._pause(location))
+            return outbound
         self.landed = url
-        return None
+        if not self._replied:
+            outbound.append(self._reply())
+            if self.noise:
+                outbound.extend(self._unrelated())
+        if self.never_commits:
+            outbound.extend(self._unrelated() * BROWSER_MAX_NAVIGATION_EVENTS)
+            return outbound
+        outbound.append(self._navigated())
+        return outbound
 
 
 class RedirectAuthorityTests(unittest.TestCase):
@@ -1194,7 +1281,9 @@ class RedirectAuthorityTests(unittest.TestCase):
         )
         self.addCleanup(self.a.stop)
 
-    def drive(self, capability: str, path: str) -> BrowserCommandOutput:
+    def drive(
+        self, capability: str, path: str, *, early_reply: bool = False
+    ) -> BrowserCommandOutput:
         """One real operation of ``capability`` against origin A + ``path``."""
         origin = self.a.origin
         kind = (
@@ -1207,7 +1296,7 @@ class RedirectAuthorityTests(unittest.TestCase):
             destination=f"browser/{origin}",
             resource=BrowserResource(kind=kind, origin=origin, url=f"{origin}{path}"),
         )
-        self.navigator = _GatedNavigator()
+        self.navigator = _GatedNavigator(early_reply=early_reply, noise=early_reply)
         answers = page_answers(
             **{
                 "Target.getTargets": {
@@ -1323,6 +1412,110 @@ class RedirectAuthorityTests(unittest.TestCase):
                 self.assertEqual({}, memory.load_task(done.task.id).external_read)
                 self.assertEqual([], self.b.received)
 
+    # -- the ordering the protocol actually permits ------------------------
+
+    def test_a_redirect_after_an_early_navigate_reply_is_still_blocked(self) -> None:
+        """The reply is an acknowledgement, not the end of the chain.
+
+        Page.navigate is answered SUCCESSFULLY here before origin A's redirect
+        even exists, and unrelated frame events follow it. A gate that read
+        either as completion would be disarmed by the time the redirect to
+        origin B appears, and B would be contacted.
+        """
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                with self.assertRaises(BrowserOriginBlocked) as raised:
+                    self.drive(capability, "/offsite", early_reply=True)
+                # The dangerous ordering really happened.
+                self.assertTrue(self.navigator.replied_before_redirect)
+                methods = [method for method, _ in self.browser.sent]
+                self.assertLess(methods.index("Page.navigate"), methods.index("Fetch.failRequest"))
+                # ... and the gate was still armed for it.
+                self.assertEqual(["/offsite"], self.a.received)
+                self.assertEqual([], self.b.received)
+                self.assertEqual([f"{self.b.origin}/landing"], self.navigator.failed)
+                self.assertEqual(self.b.origin, raised.exception.blocked)
+                # Disarmed only after the refusal, never before it.
+                self.assertLess(methods.index("Fetch.failRequest"), methods.index("Fetch.disable"))
+                self.assertEqual(1, methods.count("Fetch.disable"))
+
+    def test_an_early_reply_does_not_end_a_same_origin_chain_either(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                output = self.drive(capability, "/local", early_reply=True)
+                self.assertTrue(self.navigator.replied_before_redirect)
+                self.assertEqual(f"{self.a.origin}/final", output.payload["url"])
+                self.assertEqual(["/local", "/final"], self.a.received)
+                self.assertEqual([], self.b.received)
+
+    def test_only_this_navigation_s_own_frame_and_loader_end_the_gate(self) -> None:
+        # The scripted browser emits frameNavigated for another frame and for
+        # another loader of the same frame before the real one; neither may
+        # be taken for completion.
+        self.a.received.clear()
+        output = self.drive("browser_navigate", "/local", early_reply=True)
+        self.assertEqual(f"{self.a.origin}/final", output.payload["url"])
+        self.assertEqual(["/local", "/final"], self.a.received)
+
+    def test_a_navigation_that_never_commits_is_uncertain_not_a_verdict(self) -> None:
+        # No frameNavigated is ever emitted for the guarded loader, so the
+        # terminal state cannot be established. That is neither a success nor
+        # a refusal; it is the existing uncertainty outcome.
+        origin = self.a.origin
+        frame = build_browser_request_frame(
+            capability="browser_navigate",
+            destination=f"browser/{origin}",
+            resource=BrowserResource(
+                kind=BrowserResourceKind.NAVIGATION, origin=origin, url=f"{origin}/final"
+            ),
+        )
+        self.navigator = _GatedNavigator(never_commits=True)
+        browser = FakeBrowser(
+            page_answers(
+                **{
+                    "Target.getTargets": {
+                        "targetInfos": [
+                            {"type": "page", "targetId": TAB, "url": f"{origin}/", "title": "A"}
+                        ]
+                    }
+                }
+            ),
+            navigator=self.navigator,
+        )
+        self.addCleanup(browser.stop)
+        with self.assertRaises(BrowserCommandStarted):
+            run_operation_plan(
+                browser_operation_plan(frame),
+                frame=frame,
+                profile_dir=self.profile,
+                attach=lambda **kwargs: browser.socket_url,
+                sleep=lambda seconds: None,
+            )
+        # Even on that path the gate is put away.
+        self.assertEqual(
+            1, [method for method, _ in browser.sent].count("Fetch.disable")
+        )
+
+    def test_the_gate_outlives_the_reply_on_every_capability(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.drive(capability, "/local", early_reply=True)
+                methods = [method for method, _ in self.browser.sent]
+                # Two hops were judged, and the second one was judged AFTER
+                # the navigation had already been acknowledged.
+                self.assertEqual(2, methods.count("Fetch.continueRequest"))
+                self.assertLess(
+                    methods.index("Page.navigate"),
+                    len(methods) - 1 - methods[::-1].index("Fetch.continueRequest"),
+                )
+                self.assertLess(
+                    len(methods) - 1 - methods[::-1].index("Fetch.continueRequest"),
+                    methods.index("Fetch.disable"),
+                )
+
     # -- what must keep working -------------------------------------------
 
     def test_a_same_origin_redirect_still_completes(self) -> None:
@@ -1377,11 +1570,13 @@ class RedirectAuthorityTests(unittest.TestCase):
                 )
 
     def test_the_gate_is_disarmed_even_when_a_hop_is_blocked(self) -> None:
-        with self.assertRaises(BrowserOriginBlocked):
-            self.drive("browser_navigate", "/offsite")
-        self.assertEqual(
-            1, [method for method, _ in self.browser.sent].count("Fetch.disable")
-        )
+        for early in (False, True):
+            with self.subTest(early_reply=early):
+                with self.assertRaises(BrowserOriginBlocked):
+                    self.drive("browser_navigate", "/offsite", early_reply=early)
+                methods = [method for method, _ in self.browser.sent]
+                self.assertEqual(1, methods.count("Fetch.disable"))
+                self.assertEqual(1, methods.count("Page.disable"))
 
     def test_the_gate_cannot_synthesize_a_response_or_answer_a_credential(self) -> None:
         for capability in ("browser_navigate", "browser_tab_open"):
@@ -1412,7 +1607,7 @@ class RedirectAuthorityTests(unittest.TestCase):
                 kind=BrowserResourceKind.NAVIGATION, origin=origin, url=f"{origin}/loop"
             ),
         )
-        self.navigator = _GatedNavigator()
+        self.navigator = _GatedNavigator(early_reply=True, noise=True)
         browser = FakeBrowser(
             page_answers(
                 **{

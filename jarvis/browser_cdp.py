@@ -48,6 +48,7 @@ from urllib.request import urlopen
 
 from jarvis.browser import (
     BROWSER_CAPABILITY_METHODS,
+    BROWSER_MAX_NAVIGATION_EVENTS,
     BROWSER_MAX_REDIRECT_HOPS,
     BROWSER_TEXT_ROLES,
     BrowserExecutionUnavailable,
@@ -297,27 +298,41 @@ class CdpConnection:
             return self._result(method, answer)
         raise BrowserCommandFailed(f"the browser did not answer '{method}'")
 
-    def exchange(self, identifier: int, method: str, event: str) -> tuple[str, dict[str, Any]]:
-        """The next frame that is either ``identifier``'s reply or ``event``.
+    def exchange(
+        self, identifier: int, method: str, events: tuple[str, ...]
+    ) -> tuple[str, dict[str, Any]]:
+        """The next frame that is either ``identifier``'s reply or one of ``events``.
 
         The one place the seam listens to the browser rather than asking it.
-        Bounded like every other read, and deliberately narrow: exactly one
-        awaited reply and exactly one named event, so nothing here becomes a
-        general event loop.
+        Bounded like every other read, and deliberately narrow: one awaited
+        reply and a fixed, caller-named handful of events, so nothing here
+        becomes a general event loop. Everything else is buffered, never acted
+        on.
         """
         for _ in range(_MAX_SKIPPED_EVENTS):
-            buffered = next((one for one in self._events if one.get("method") == event), None)
+            buffered = next((one for one in self._events if one.get("method") in events), None)
             if buffered is not None:
                 self._events.remove(buffered)
-                return (event, buffered.get("params") or {})
+                return (str(buffered.get("method")), buffered.get("params") or {})
             answer = self._frame()
             if answer.get("id") == identifier:
                 return ("reply", self._result(method, answer))
-            if answer.get("method") == event:
-                return (event, answer.get("params") or {})
+            if answer.get("method") in events:
+                return (str(answer.get("method")), answer.get("params") or {})
             if "id" not in answer:
                 self._events.append(answer)
         raise BrowserCommandFailed(f"the browser did not answer '{method}'")
+
+    def take_buffered(self, event: str) -> list[dict[str, Any]]:
+        """Every already-received ``event`` still sitting in the buffer.
+
+        Only used to settle requests the seam had not yet judged when a
+        navigation stopped being followable, so that disarming the gate cannot
+        release one of them onto the wire.
+        """
+        taken = [one for one in self._events if one.get("method") == event]
+        self._events = [one for one in self._events if one.get("method") != event]
+        return [one.get("params") or {} for one in taken]
 
     def close(self) -> None:
         self._socket.close()
@@ -606,12 +621,36 @@ def guarded_navigate(
     sends it a cookie and never receives a byte from it. Detection after
     landing would have been none of those things.
 
-    ``Page.navigate``'s own reply cannot be awaited first: with the gate armed
-    the navigation does not commit until its request is continued, so the
-    reply and the paused requests are read from the SAME stream, in whatever
-    order they arrive.
+    WHY ``Page.navigate``'S REPLY IS NOT THE END. It is an ACKNOWLEDGEMENT and
+    nothing more. The protocol does not promise that the redirect chain has
+    terminated when it arrives, and it can arrive before a later hop is even
+    requested - so treating it as completion and disarming there would leave
+    exactly the redirect this exists to stop free to go out unjudged. The
+    reply is therefore only read for two things: the ``errorText`` that says
+    the navigation definitively failed, and the ``frameId``/``loaderId`` that
+    say WHICH navigation is being guarded.
 
-    Returns the URL the navigation committed to.
+    THE TERMINAL SIGNAL is ``Page.frameNavigated`` for that exact frame AND
+    that exact loader. It fires when navigation of the frame has completed and
+    the frame is associated with the new loader, and a redirect never commits
+    a loader - only the response that ends the chain does. Both halves are
+    required: the frame id alone would accept a subframe's navigation, and the
+    loader id alone would accept a different navigation of the same frame.
+    Anything else on the stream - other frames, other loaders, unrelated
+    events - is buffered and never mistaken for completion.
+
+    A fragment-only navigation would commit no loader and fire no
+    ``frameNavigated``; it cannot arise here, because the resource grammar
+    refuses a URL carrying a fragment.
+
+    Returns the URL that navigation committed to, taken from the very event
+    that proved it committed.
+
+    Uncertainty is never converted into an answer. A navigation whose terminal
+    state cannot be established - no correlatable loader, or more protocol
+    traffic than one navigation may produce - raises ``BrowserCommandStarted``,
+    which Core settles as an unknown outcome, because a request really was
+    dispatched and what became of it is not known.
 
     ponytail: this gate covers the approved navigation's own redirect chain,
     which is what an approval authorizes. A page that, once loaded, navigates
@@ -621,18 +660,53 @@ def guarded_navigate(
     between operations would make it a standing network policy over the
     profile, which is a different and much larger thing.
     """
+    connection.command("Page.enable", session_id=session_id)
     connection.command("Fetch.enable", {"patterns": _DOCUMENT_PATTERN}, session_id=session_id)
+    settled = False
     try:
         pending = connection.send("Page.navigate", {"url": url}, session_id=session_id)
-        for _ in range(BROWSER_MAX_REDIRECT_HOPS):
-            kind, payload = connection.exchange(pending, "Page.navigate", "Fetch.requestPaused")
+        guarded: tuple[str, str] | None = None
+        committed: dict[tuple[str, str], str] = {}
+        hops = 0
+        for _ in range(BROWSER_MAX_NAVIGATION_EVENTS):
+            if guarded is not None and guarded in committed:
+                settled = True
+                return committed[guarded]
+            kind, payload = connection.exchange(
+                pending, "Page.navigate", ("Fetch.requestPaused", "Page.frameNavigated")
+            )
             if kind == "reply":
                 if payload.get("errorText"):
+                    # Definitively failed, and the browser says so.
+                    settled = True
                     raise BrowserCommandStarted(
                         f"the browser reported a navigation error: {payload.get('errorText')}"
                     )
-                landed, _ = _page_state(connection, session_id)
-                return landed
+                frame_id = str(payload.get("frameId", ""))
+                loader_id = str(payload.get("loaderId", ""))
+                if not frame_id or not loader_id:
+                    raise BrowserCommandStarted(
+                        "the browser acknowledged the navigation without naming the "
+                        "frame and loader it belongs to, so its completion cannot "
+                        "be established"
+                    )
+                guarded = (frame_id, loader_id)
+                continue
+            if kind == "Page.frameNavigated":
+                frame = payload.get("frame")
+                if isinstance(frame, dict):
+                    # Recorded, never acted on until it is known to be OURS.
+                    committed[(str(frame.get("id", "")), str(frame.get("loaderId", "")))] = str(
+                        frame.get("url", "")
+                    )
+                continue
+            hops += 1
+            if hops > BROWSER_MAX_REDIRECT_HOPS:
+                raise BrowserOriginBlocked(
+                    "the navigation redirected more times than one approved "
+                    "navigation may follow, so it was refused",
+                    blocked=origin,
+                )
             request_id = str(payload.get("requestId", ""))
             requested = payload.get("request")
             hop = str(requested.get("url", "")) if isinstance(requested, dict) else ""
@@ -640,12 +714,14 @@ def guarded_navigate(
                 raise BrowserCommandFailed("the browser paused an unreadable request")
             if not url_in_origin(hop, origin):
                 # BEFORE THE WIRE. The request is refused here, so nothing of
-                # this navigation ever reaches that origin.
+                # this navigation ever reaches that origin - whether or not the
+                # acknowledgement for this navigation has already arrived.
                 connection.command(
                     "Fetch.failRequest",
                     {"requestId": request_id, "errorReason": "BlockedByClient"},
                     session_id=session_id,
                 )
+                settled = True
                 raise BrowserOriginBlocked(
                     "the approved origin redirected outside it, so the request to "
                     f"{_origin_of(hop)} was refused before it was sent and the "
@@ -655,17 +731,35 @@ def guarded_navigate(
             connection.command(
                 "Fetch.continueRequest", {"requestId": request_id}, session_id=session_id
             )
-        raise BrowserOriginBlocked(
-            "the navigation redirected more times than one approved navigation "
-            "may follow, so it was refused",
-            blocked=origin,
+        raise BrowserCommandStarted(
+            "the navigation did not reach a terminal state within the traffic "
+            "one navigation may produce, so its outcome is not established"
         )
     finally:
-        # Never left armed: a gate that outlived its operation would be a
-        # standing policy over the profile, and a paused request with nobody
-        # left to judge it would hang the tab.
+        # Never left armed, on any path: a gate that outlived its operation
+        # would be a standing policy over the profile, and a paused request
+        # with nobody left to judge it would hang the tab.
+        #
+        # DISARMING RELEASES WHAT IT WAS HOLDING. On every settled path there
+        # is nothing paused - each request was continued or failed before the
+        # next frame was read. On an unsettled one there may be a request that
+        # arrived and was never judged, so those are FAILED first rather than
+        # freed by the disable.
+        if not settled:
+            for stranded in connection.take_buffered("Fetch.requestPaused"):
+                with _suppressed():
+                    connection.command(
+                        "Fetch.failRequest",
+                        {
+                            "requestId": str(stranded.get("requestId", "")),
+                            "errorReason": "BlockedByClient",
+                        },
+                        session_id=session_id,
+                    )
         with _suppressed():
             connection.command("Fetch.disable", session_id=session_id)
+        with _suppressed():
+            connection.command("Page.disable", session_id=session_id)
 
 
 @contextmanager

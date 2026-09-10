@@ -634,12 +634,27 @@ _ELEMENT_METHODS = _PAGE_READ_METHODS | {
 #: no more: ``Fetch.fulfillRequest`` (which would let JARVIS synthesize a
 #: response) and ``Fetch.continueWithAuth`` (which would put JARVIS in a
 #: credential prompt) are absent, so neither is reachable.
+#: ``Page.enable``/``Page.disable`` are here and not in the reading set: the
+#: gate needs ``Page.frameNavigated`` to know WHICH navigation completed, and
+#: nothing else in this build listens to frame events at all.
 _ORIGIN_GATE_METHODS = frozenset(
-    {"Fetch.enable", "Fetch.disable", "Fetch.continueRequest", "Fetch.failRequest"}
+    {
+        "Fetch.enable",
+        "Fetch.disable",
+        "Fetch.continueRequest",
+        "Fetch.failRequest",
+        "Page.enable",
+        "Page.disable",
+    }
 )
 
 #: What one approved navigation may follow before the chain itself is refused.
 BROWSER_MAX_REDIRECT_HOPS = 10
+#: How much protocol traffic one guarded navigation may produce before its
+#: terminal state is declared unestablished. A ceiling on the wait, never a
+#: timer: the seam does not sleep and does not guess that a navigation is
+#: finished because nothing arrived for a while.
+BROWSER_MAX_NAVIGATION_EVENTS = 64
 
 BROWSER_CAPABILITY_METHODS: Mapping[str, frozenset[str]] = {
     "browser_page_read": _PAGE_READ_METHODS,
@@ -1040,6 +1055,7 @@ __all__ = [
     "BROWSER_ELEMENT_KINDS",
     "BROWSER_ENABLED_CAPABILITIES",
     "BROWSER_INTERACT_CAPABILITIES",
+    "BROWSER_MAX_NAVIGATION_EVENTS",
     "BROWSER_MAX_NODES",
     "BROWSER_MAX_REDIRECT_HOPS",
     "BROWSER_MAX_TABS",
