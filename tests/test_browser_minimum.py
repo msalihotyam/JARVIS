@@ -68,6 +68,7 @@ from jarvis.contracts import (
     ActionScope,
     AgentRun,
     AttemptState,
+    AttemptState,
     ErrorCode,
     PermissionGrant,
     RunStatus,
@@ -240,15 +241,45 @@ class FakeBrowser(threading.Thread):
         if method == "Page.navigate":
             outbound = navigator.navigate(params["url"], message["id"])
         elif method == "Fetch.failRequest":
-            outbound = [{"id": message["id"], "result": {}}, *navigator.fail()]
+            refusal = navigator.refuse_fail(params["requestId"])
+            if refusal:
+                # NOT acknowledged, and the request stays paused. A caller
+                # that shrugs this off and disables the gate will find out
+                # what that means below.
+                outbound = [{"id": message["id"], "error": {"message": refusal}}]
+            else:
+                outbound = [
+                    {"id": message["id"], "result": {}},
+                    *navigator.fail(params["requestId"]),
+                ]
         elif method == "Fetch.continueRequest":
+            # The extra pause is written whether or not the continue is
+            # answered: it belongs to the browser's own traffic, not to the
+            # client's decision.
+            extra = navigator.before_continue()
             refusal = navigator.refuse_continue()
             if refusal:
                 # The continue is NOT acknowledged, so the request stays
                 # paused and stays this navigation's responsibility.
-                outbound = [{"id": message["id"], "error": {"message": refusal}}]
+                outbound = [*extra, {"id": message["id"], "error": {"message": refusal}}]
             else:
-                outbound = [{"id": message["id"], "result": {}}, *navigator.follow()]
+                outbound = [
+                    *extra,
+                    {"id": message["id"], "result": {}},
+                    *navigator.follow(params["requestId"]),
+                ]
+        elif method == "Fetch.disable":
+            # WHAT DISABLING ACTUALLY MEANS: everything still paused resumes,
+            # which for this scripted browser means the request is really made
+            # to the real local server. A gate that disables while holding
+            # something will be caught by that server, not by an assertion
+            # about which methods were sent.
+            navigator.release_paused()
+            outbound = [{"id": message["id"], "result": {}}]
+        elif method == "Target.closeTarget":
+            # The page and its pending loads are destroyed; nothing resumes.
+            navigator.destroy_paused()
+            outbound = [{"id": message["id"], "result": {}}]
         else:
             return False
         for one in outbound:
@@ -1174,6 +1205,9 @@ class _GatedNavigator:
         noise: bool = False,
         never_commits: bool = False,
         fail_continue_at: int = 0,
+        refuse_fail_for: tuple[str, ...] = (),
+        extra_pause_at_continue: int = 0,
+        extra_pause_url: str = "",
     ) -> None:
         self.early_reply = early_reply
         self.noise = noise
@@ -1184,6 +1218,21 @@ class _GatedNavigator:
         #: request is delivered and then never acknowledged either way.
         self.fail_continue_at = fail_continue_at
         self._continues = 0
+        #: Request ids whose Fetch.failRequest is refused at the protocol
+        #: level, so the cleanup ATTEMPT is not a disposition.
+        self.refuse_fail_for = frozenset(refuse_fail_for or ())
+        #: Emit one extra paused request just before the Nth continue's reply,
+        #: so it lands in the connection's buffer rather than in the gate's
+        #: hands - the buffered custody case.
+        self.extra_pause_at_continue = extra_pause_at_continue
+        self.extra_pause_url = extra_pause_url
+        self._before = 0
+        #: Requests still paused in the browser, id -> url.
+        self.paused: dict[str, str] = {}
+        #: What a Fetch.disable actually let through, and what a target close
+        #: destroyed. The point of the whole exercise.
+        self.released: list[str] = []
+        self.destroyed: list[str] = []
         self.hop = ""
         self.fetched: list[str] = []
         self.failed: list[str] = []
@@ -1203,12 +1252,11 @@ class _GatedNavigator:
 
     def _pause(self, url: str) -> dict:
         self.hop = url
+        request_id = f"r{len(self.paused) + len(self.fetched) + len(self.failed) + 1}"
+        self.paused[request_id] = url
         return {
             "method": "Fetch.requestPaused",
-            "params": {
-                "requestId": f"r{len(self.fetched) + 1}",
-                "request": {"url": url},
-            },
+            "params": {"requestId": request_id, "request": {"url": url}},
         }
 
     def _reply(self) -> dict:
@@ -1241,20 +1289,39 @@ class _GatedNavigator:
             return "the renderer went away"
         return ""
 
-    def fail(self) -> list[dict]:
-        self.failed.append(self.hop)
+    def refuse_fail(self, request_id: str) -> str:
+        if request_id in self.refuse_fail_for:
+            return "the request is gone"
+        return ""
+
+    def before_continue(self) -> list[dict]:
+        """One extra paused request, written BEFORE the continue is answered.
+
+        The client is scanning for its own reply, so this one goes into its
+        event buffer and is never handed to the gate's loop.
+        """
+        self._before += 1
+        if self._before != self.extra_pause_at_continue:
+            return []
+        return [self._pause(self.extra_pause_url)]
+
+    def fail(self, request_id: str) -> list[dict]:
+        self.failed.append(self.paused.pop(request_id, ""))
         self.hop = ""
         return []
 
-    def follow(self) -> list[dict]:
-        """Perform the hop the client continued; announce whatever follows."""
-        outbound: list[dict] = []
-        if self.early_reply and not self._replied:
-            outbound.append(self._reply())
-            if self.noise:
-                outbound.extend(self._unrelated())
-        url = self.hop
-        self.fetched.append(url)
+    def release_paused(self) -> None:
+        for request_id, url in list(self.paused.items()):
+            self.released.append(request_id)
+            self._request(url)
+        self.paused.clear()
+
+    def destroy_paused(self) -> None:
+        self.destroyed.extend(self.paused)
+        self.paused.clear()
+
+    @staticmethod
+    def _request(url: str):
         parsed = urlsplit(url)
         connection = HTTPConnection(parsed.hostname, parsed.port, timeout=5)
         try:
@@ -1266,6 +1333,18 @@ class _GatedNavigator:
             response.read()
         finally:
             connection.close()
+        return location
+
+    def follow(self, request_id: str) -> list[dict]:
+        """Perform the hop the client continued; announce whatever follows."""
+        outbound: list[dict] = []
+        if self.early_reply and not self._replied:
+            outbound.append(self._reply())
+            if self.noise:
+                outbound.extend(self._unrelated())
+        url = self.paused.pop(request_id, self.hop)
+        self.fetched.append(url)
+        location = self._request(url)
         if location:
             self.replied_before_redirect = self._replied
             outbound.append(self._pause(location))
@@ -1306,6 +1385,8 @@ class RedirectAuthorityTests(unittest.TestCase):
         *,
         early_reply: bool = False,
         fail_continue_at: int = 0,
+        refuse_fail_for: tuple[str, ...] = (),
+        extra_pause_at_continue: int = 0,
     ) -> BrowserCommandOutput:
         """One real operation of ``capability`` against origin A + ``path``."""
         origin = self.a.origin
@@ -1323,6 +1404,9 @@ class RedirectAuthorityTests(unittest.TestCase):
             early_reply=early_reply,
             noise=early_reply,
             fail_continue_at=fail_continue_at,
+            refuse_fail_for=refuse_fail_for,
+            extra_pause_at_continue=extra_pause_at_continue,
+            extra_pause_url=f"{self.b.origin}/subframe",
         )
         answers = page_answers(
             **{
@@ -1377,7 +1461,7 @@ class RedirectAuthorityTests(unittest.TestCase):
                     [method for method, _ in self.browser.sent][-1:],
                 )
 
-    def run_through_core(self, capability: str, path: str):
+    def run_through_core(self, capability: str, path: str, **kwargs):
         """One approved run of ``capability`` for origin A + ``path``."""
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, temp)
@@ -1386,7 +1470,7 @@ class RedirectAuthorityTests(unittest.TestCase):
         destination = f"browser/{origin}"
         made = BrowserCdpConnector(
             self.profile,
-            plan_runner=lambda plan, **kwargs: self.drive(capability, path),
+            plan_runner=lambda plan, **unused: self.drive(capability, path, **kwargs),
         )
         registry = ToolRegistry()
         registry.register(made)
@@ -1417,6 +1501,7 @@ class RedirectAuthorityTests(unittest.TestCase):
         waiting = core.run(task)
         self.assertEqual(RunStatus.AWAITING_APPROVAL, waiting.status)
         self.memory = memory
+        self.task_id = waiting.task.id
         return core.resume(
             waiting.session.id,
             waiting.task.id,
@@ -1723,6 +1808,128 @@ class RedirectAuthorityTests(unittest.TestCase):
         self.assertEqual(
             [], [method for method, _ in self.transcript() if method == "Fetch.failRequest"]
         )
+
+    # -- an attempt is not a disposition -----------------------------------
+
+    def test_a_current_request_whose_refusal_is_unacknowledged_is_destroyed(self) -> None:
+        """TEST A. The gate holds origin B and cannot get rid of it.
+
+        The cross-origin hop is refused inline, but the browser does not
+        acknowledge the refusal, so custody never ends. Disabling the gate
+        here would RESUME that request - the scripted browser really does
+        make the call - so the page holding it is destroyed instead.
+        """
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                with self.assertRaises(BrowserCommandStarted) as raised:
+                    self.drive_watching_the_drain(
+                        capability, "/offsite", refuse_fail_for=("r2",)
+                    )
+                methods = [method for method, _ in self.transcript()]
+                # 5. the gate was NOT disabled while still holding it.
+                self.assertNotIn("Fetch.disable", methods)
+                self.assertNotIn("Page.disable", methods)
+                # 6. the fail-closed teardown ran instead.
+                self.assertIn("Target.closeTarget", methods)
+                self.assertEqual(["r2"], self.navigator.destroyed)
+                self.assertEqual([], self.navigator.released)
+                # 7. origin B was never contacted - by its own server.
+                self.assertEqual([], self.b.received)
+                self.assertEqual(["/offsite"], self.a.received)
+                # 8. uncertain, not a definite refusal and not a success.
+                self.assertIn("not established", str(raised.exception))
+                self.assertNotIsInstance(raised.exception, BrowserOriginBlocked)
+
+    def test_a_buffered_request_whose_refusal_is_unacknowledged_is_destroyed(self) -> None:
+        """TEST B. The same, for a request the gate never had in hand.
+
+        An extra paused request for origin B is written while the client is
+        scanning for its own continue reply, so it lands in the event buffer
+        and is only met during cleanup - where its refusal is unacknowledged.
+        """
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                with self.assertRaises(BrowserCommandStarted):
+                    self.drive_watching_the_drain(
+                        capability,
+                        "/local",
+                        fail_continue_at=2,
+                        extra_pause_at_continue=2,
+                        refuse_fail_for=("r3",),
+                    )
+                methods = [method for method, _ in self.transcript()]
+                # 1. it really was buffered, and only the drain found it.
+                self.assertIn("r3", self.drained)
+                # 2./3. no unsafe disable, fail-closed teardown instead.
+                self.assertNotIn("Fetch.disable", methods)
+                self.assertIn("Target.closeTarget", methods)
+                self.assertEqual(["r3"], self.navigator.destroyed)
+                self.assertEqual([], self.navigator.released)
+                # the current request WAS acknowledged and is not destroyed.
+                self.assertIn(f"{self.a.origin}/final", self.navigator.failed)
+                self.assertEqual([], self.b.received)
+
+    def test_normal_cleanup_still_disables_the_gate_exactly_once(self) -> None:
+        """TEST C. Everything acknowledged, so the ordinary teardown runs."""
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                output = self.drive_watching_the_drain(capability, "/local")[0]
+                methods = [method for method, _ in self.transcript()]
+                self.assertEqual(1, methods.count("Fetch.disable"))
+                self.assertEqual(1, methods.count("Page.disable"))
+                self.assertNotIn("Target.closeTarget", methods)
+                # Nothing was left paused for the disable to release.
+                self.assertEqual([], self.navigator.released)
+                self.assertEqual([], self.navigator.destroyed)
+                self.assertEqual(f"{self.a.origin}/final", output.payload["url"])
+        # And a definite cross-origin refusal still ends the ordinary way.
+        self.b.received.clear()
+        with self.assertRaises(BrowserOriginBlocked):
+            self.drive_watching_the_drain("browser_navigate", "/offsite")
+        methods = [method for method, _ in self.transcript()]
+        self.assertEqual(1, methods.count("Fetch.disable"))
+        self.assertEqual(1, methods.count("Page.disable"))
+        self.assertNotIn("Target.closeTarget", methods)
+        self.assertEqual([], self.navigator.released)
+        self.assertEqual([], self.b.received)
+
+    def test_an_unresolved_custody_is_an_unknown_outcome_through_core(self) -> None:
+        done = self.run_through_core(
+            "browser_navigate", "/offsite", refuse_fail_for=("r2",)
+        )
+        self.assertNotEqual(RunStatus.COMPLETED, done.status)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, done.error.code)
+        self.assertIs(
+            AttemptState.UNKNOWN_OUTCOME,
+            self.memory.latest_execution_attempt(self.task_id).state,
+        )
+        self.assertEqual([], self.b.received)
+
+    def test_a_disable_while_holding_a_request_would_really_send_it(self) -> None:
+        """The scripted browser is adversarial, not cooperative.
+
+        Proof that TEST A and TEST B are not satisfied merely by omitting a
+        method call: disabling the gate with something still paused makes the
+        real request, and origin B's own server records it.
+        """
+        self.b.received.clear()
+        navigator = _GatedNavigator()
+        browser = FakeBrowser(page_answers(), navigator=navigator)
+        self.addCleanup(browser.stop)
+        navigator.paused["rX"] = f"{self.b.origin}/landing"
+        navigator.release_paused()
+        self.assertEqual(["/landing"], self.b.received)
+        self.assertEqual(["rX"], navigator.released)
+        # Destroying instead makes no request at all.
+        self.b.received.clear()
+        navigator.paused["rY"] = f"{self.b.origin}/landing"
+        navigator.destroy_paused()
+        self.assertEqual([], self.b.received)
 
     # -- what must keep working -------------------------------------------
 

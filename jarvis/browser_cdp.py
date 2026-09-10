@@ -607,7 +607,7 @@ _DOCUMENT_PATTERN = [{"urlPattern": "*", "resourceType": "Document", "requestSta
 
 
 def guarded_navigate(
-    connection: CdpConnection, session_id: str, *, url: str, origin: str
+    connection: CdpConnection, session_id: str, *, tab_id: str, url: str, origin: str
 ) -> str:
     """Navigate to ``url`` and refuse any hop that leaves ``origin``.
 
@@ -651,6 +651,13 @@ def guarded_navigate(
     delivered until a ``Fetch.continueRequest`` or ``Fetch.failRequest`` is
     ACKNOWLEDGED for it, and no exit in between - the hop limit included -
     can end that custody without failing it first.
+
+    AN ATTEMPT IS NOT A DISPOSITION. ``Fetch.disable`` RESUMES whatever is
+    still paused, so it may only be sent once every outstanding request is
+    known to have been continued or failed - known, not attempted. A cleanup
+    ``Fetch.failRequest`` whose acknowledgement cannot be established leaves
+    custody open, and the teardown then destroys the page instead of
+    disabling the gate (see ``_fail_closed_teardown``).
 
     Uncertainty is never converted into an answer. A navigation whose terminal
     state cannot be established - no correlatable loader, or more protocol
@@ -787,22 +794,79 @@ def guarded_navigate(
         #    correlation failure, or any other exception raised after delivery.
         # 2. THE BUFFERED REQUESTS - delivered by the browser while some other
         #    reply was being awaited, and never delivered to this function.
+        unresolved: list[str] = []
         for stranded in ([current] if current else []) + [
             str(one.get("requestId", ""))
             for one in connection.take_buffered("Fetch.requestPaused")
         ]:
             if not stranded:
                 continue
-            with _suppressed():
+            try:
                 connection.command(
                     "Fetch.failRequest",
                     {"requestId": stranded, "errorReason": "BlockedByClient"},
                     session_id=session_id,
                 )
+            except Exception:  # noqa: BLE001 - an attempt is not a disposition
+                # NOT swallowed. The request may still be paused, so the gate
+                # may not be disabled and this operation may not claim to know
+                # what happened.
+                unresolved.append(stranded)
+        if unresolved:
+            # Deliberately raised from a ``finally``: it replaces whatever
+            # answer the operation had reached, because that answer was
+            # premature. A navigation cannot be a success, or even a definite
+            # refusal, while a request it caused may still be paused and
+            # unaccounted for.
+            _fail_closed_teardown(connection, session_id, tab_id, unresolved)
         with _suppressed():
             connection.command("Fetch.disable", session_id=session_id)
         with _suppressed():
             connection.command("Page.disable", session_id=session_id)
+
+
+def _fail_closed_teardown(
+    connection: CdpConnection, session_id: str, tab_id: str, unresolved: list[str]
+) -> None:
+    """End the gate WITHOUT releasing what it is still holding. Always raises.
+
+    Reached only when a paused request could not be given an acknowledged
+    terminal disposition. ``Fetch.disable`` is not an option here and is never
+    sent on this path: it is defined to RESUME paused requests, so using it as
+    a fallback would dispatch exactly the request that could not be refused.
+
+    WHAT IS DONE INSTEAD is the narrowest thing that removes the request
+    rather than freeing it: ``Target.closeTarget`` on the ONE
+    JARVIS-owned tab this operation was driving. The request is paused at the
+    Request stage, which means the browser has not sent it; it belongs to a
+    navigation of that page's frame; and closing the target destroys the page,
+    its frames and its pending loads. There is then no frame the response
+    could be delivered to and no loader to resume, so the request cannot
+    afterwards reach the network. Nothing wider is touched: not the browser,
+    not the profile, not another tab.
+
+    The outcome is UNCERTAIN either way and is reported as such. If even the
+    close cannot be acknowledged, this says so rather than claiming the
+    stronger guarantee: the connection is then dropped with the gate still
+    ARMED, which at least leaves the request held rather than resumed, but
+    that is not a proof and is not presented as one.
+    """
+    names = ", ".join(unresolved)
+    try:
+        connection.command("Target.closeTarget", {"targetId": tab_id})
+    except Exception as exc:  # noqa: BLE001 - the stronger guarantee is gone
+        raise BrowserCommandStarted(
+            f"the browser did not acknowledge refusing paused request(s) {names}, "
+            "and the page holding them could not be closed either; the gate is "
+            "left armed rather than disabled so nothing is resumed, but whether "
+            "those requests were sent is not established"
+        ) from exc
+    raise BrowserCommandStarted(
+        f"the browser did not acknowledge refusing paused request(s) {names}, so "
+        "the page holding them was destroyed instead of disabling the gate; "
+        "those requests cannot have been sent, but the outcome of this "
+        "navigation is not established"
+    )
 
 
 @contextmanager
@@ -913,7 +977,7 @@ def _perform(
         write_current_tab(profile_dir, tab_id)
         session_id = _attach(connection, tab_id)
         landed = guarded_navigate(
-            connection, session_id, url=resource.url, origin=origin
+            connection, session_id, tab_id=tab_id, url=resource.url, origin=origin
         )
         return BrowserCommandOutput({"tab_id": tab_id, "url": landed})
 
@@ -951,7 +1015,9 @@ def _perform(
         # The only capability that may act on a tab standing outside the bound
         # origin: arriving there is what it is for. Where it may GO is decided
         # hop by hop under the gate, before each request is sent.
-        url = guarded_navigate(connection, session_id, url=resource.url, origin=origin)
+        url = guarded_navigate(
+            connection, session_id, tab_id=tab_id, url=resource.url, origin=origin
+        )
         write_current_tab(profile_dir, tab_id)
         return BrowserCommandOutput({"tab_id": tab_id, "url": url})
 

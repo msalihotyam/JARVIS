@@ -645,6 +645,11 @@ _ORIGIN_GATE_METHODS = frozenset(
         "Fetch.failRequest",
         "Page.enable",
         "Page.disable",
+        # THE FAIL-CLOSED TEARDOWN, and the only reason this verb is here: a
+        # paused request that could not be refused is removed by destroying
+        # the one JARVIS-owned tab holding it, never by disabling the gate,
+        # which would resume it.
+        "Target.closeTarget",
     }
 )
 
