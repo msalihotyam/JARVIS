@@ -567,6 +567,7 @@ CONFIG_SETTABLE_KEYS = (
     "claude_effort",
     "github_principal",
     "github_repositories",
+    "gmail_principal",
 )
 
 
@@ -650,6 +651,10 @@ def _config_change(key: str, raw: str):
             part.strip() for part in raw.split(",") if part.strip()
         )
         return lambda current: replace(current, github_repositories=entries)
+    # gmail_principal: the raw operator string is passed through and the
+    # Gmail grammar in ``settings`` is the only validator.
+    if key == "gmail_principal":
+        return lambda current: replace(current, gmail_principal=raw)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)

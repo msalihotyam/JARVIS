@@ -28,6 +28,7 @@ from jarvis.connectors.base import BaseConnector
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.github_cli import GitHubCliConnector
+from jarvis.connectors.gmail_cli import GmailCliConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
@@ -117,6 +118,16 @@ from jarvis.destinations import (
     canonical_destination,
     destination_refusal,
 )
+from jarvis.gmail import (
+    GMAIL_CAPABILITIES,
+    GMAIL_CONNECTOR,
+    GMAIL_ENABLED_CAPABILITIES,
+    GmailExecutionUnavailable,
+    GmailIdentityBinding,
+    gmail_external_read_refusal,
+    gmail_resource_binding_refusal,
+    gmail_resource_from_dict,
+)
 from jarvis.github import (
     GITHUB_CONNECTOR,
     ExternalReadSnapshot,
@@ -155,6 +166,9 @@ from jarvis.settings import (
 #: that cannot, which is what this field is for - so the block is a bump
 #: rather than a silent key. The SQLite schema is untouched by it and stays
 #: at 10.
+#: Gmail minimum (no bump): the same ``external_read`` block now also carries
+#: one authorized Gmail read, with ``connector`` naming ``gmail-cli``; the
+#: shape of the block is unchanged, so the version is not.
 OUTPUT_SCHEMA_VERSION = 7
 
 #: Untrusted task JSON is bounded before it is parsed.
@@ -249,6 +263,9 @@ _TASK_KEYS = frozenset(
         # payload, so a context key would be an egress channel. Nothing adds
         # this section to an outbound key set.
         "github",
+        # Gmail minimum. A TOP-LEVEL section for the same reason: recipients,
+        # a subject and a body must never ride in ``context``.
+        "gmail",
         # M9. The bounded LINE REGION of the read target. A top-level section
         # for the same reason ``write`` is: ``context`` egresses verbatim.
         LOCAL_READ_REGION_SECTION,
@@ -266,6 +283,16 @@ _WRITE_KEYS = frozenset({"content", "mode", LOCAL_WRITE_SOURCE_KEY})
 #: optional fields whose presence each kind decides.
 _GITHUB_KEYS = frozenset(
     {"kind", "owner", "repository", "number", "ref", "path", "state", "limit", "query"}
+)
+#: Gmail minimum. The typed resource fields, and nothing else: no raw
+#: message, no header, no argv and no attachment content is expressible.
+#: ``kind`` and ``account`` are required; the rest are the optional fields
+#: whose presence each kind decides.
+_GMAIL_KEYS = frozenset(
+    {
+        "kind", "account", "query", "limit", "message_id", "thread_id",
+        "attachment_id", "to", "cc", "bcc", "subject", "body",
+    }
 )
 #: M9. The only two read-window parameters. Default-deny like every other
 #: section: anything else is rejected, never ignored.
@@ -737,6 +764,47 @@ def decode_task_json(raw: str | bytes) -> Task:
     elif capability in GITHUB_READ_CAPABILITIES:
         raise TaskInputError("a GitHub read capability requires a 'github' section.")
 
+    # Gmail minimum. Judged by the Gmail contracts themselves, stored in the
+    # canonical serialization of the object that passed. Recipients are
+    # typed lists here and nowhere else: a model answer, a body or a
+    # ``context`` value cannot become one.
+    gmail_input = _section(document, "gmail", _GMAIL_KEYS)
+    gmail_resource: dict[str, Any] = {}
+    if gmail_input:
+        if capability not in GMAIL_ENABLED_CAPABILITIES:
+            raise TaskInputError(
+                "'gmail' may only be named by an enabled Gmail capability."
+            )
+        for key in ("kind", "account"):
+            if key not in gmail_input:
+                raise TaskInputError(f"'gmail' requires '{key}'.")
+        candidate = {
+            "kind": gmail_input["kind"],
+            "account": gmail_input["account"],
+            "query": gmail_input.get("query", ""),
+            "limit": gmail_input.get("limit", 0),
+            "message_id": gmail_input.get("message_id", ""),
+            "thread_id": gmail_input.get("thread_id", ""),
+            "attachment_id": gmail_input.get("attachment_id", ""),
+            "to": gmail_input.get("to", []),
+            "cc": gmail_input.get("cc", []),
+            "bcc": gmail_input.get("bcc", []),
+            "subject": gmail_input.get("subject", ""),
+            "body": gmail_input.get("body", ""),
+        }
+        try:
+            resource = gmail_resource_from_dict(candidate)
+        except GmailExecutionUnavailable as exc:
+            raise TaskInputError(f"'gmail' is refused: {exc}.") from exc
+        reason = gmail_resource_binding_refusal(
+            resource, capability=capability, destination=destination
+        )
+        if reason is not None:
+            raise TaskInputError(f"'gmail' is refused: {reason}.")
+        gmail_resource = resource.to_dict()
+    elif capability in GMAIL_CAPABILITIES:
+        raise TaskInputError("a Gmail capability requires a 'gmail' section.")
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -752,6 +820,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         preferences=preferences,
         project_id=project_id,
         github=github_resource,
+        gmail=gmail_resource,
         write_content=write_content,
         write_mode=write_mode,
         write_source=write_source,
@@ -810,6 +879,13 @@ _SECRET_VALUE_PATTERNS = (
     # of the two.
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    # Google OAuth access tokens (``ya29.``), refresh tokens (``1//0``) and
+    # API keys (``AIza``) carry documented prefixes too. Gmail minimum never
+    # handles one, and this is what keeps a token that leaks into a captured
+    # stream or a message body from ever being shown.
+    re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}"),
+    re.compile(r"\b1//0[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
 )
 
 
@@ -1114,7 +1190,14 @@ def _external_read_payload(stored: Any) -> dict[str, Any] | None:
         )
     except Exception:  # noqa: BLE001 - an unrenderable snapshot renders nothing
         return None
-    if external_read_refusal(snapshot) is not None:
+    # The producer decides which vocabulary judges it; both refuse anything
+    # that is not self-consistent, and neither grants the block authority.
+    refusal = (
+        gmail_external_read_refusal
+        if snapshot.connector == GMAIL_CONNECTOR
+        else external_read_refusal
+    )
+    if refusal(snapshot) is not None:
         return None
     return {
         "connector": snapshot.connector,
@@ -3031,6 +3114,7 @@ def create_app(
     verifier: ResultVerifier | None = None,
     destination_policy: AbstractSet[DestinationGrant] | None = None,
     github_identity: GitHubIdentityBinding | None = None,
+    gmail_identity: GmailIdentityBinding | None = None,
 ) -> JarvisApp:
     """Assemble an application from injected parts. Tests use this.
 
@@ -3058,6 +3142,7 @@ def create_app(
             verifier,
             destination_policy=destination_policy,
             github_identity=github_identity,
+            gmail_identity=gmail_identity,
         ),
         memory,
         settings,
@@ -3100,13 +3185,21 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     github_identity, github_policy = github_authority(settings)
     if github_identity is not None:
         connectors += (GitHubCliConnector(github_identity),)
+    # Gmail minimum: the same rule, from the same kind of statement. An
+    # installation that configured no mailbox composes with no Gmail
+    # connector, no Gmail grant and no expected identity.
+    gmail_identity, gmail_policy = gmail_authority(settings)
+    if gmail_identity is not None:
+        connectors += (GmailCliConnector(gmail_identity),)
+    configured = github_policy | gmail_policy
     return create_app(
         settings=settings,
         connectors=connectors,
         destination_policy=(
-            CONNECTOR_DESTINATION_POLICY | github_policy if github_policy else None
+            CONNECTOR_DESTINATION_POLICY | configured if configured else None
         ),
         github_identity=github_identity,
+        gmail_identity=gmail_identity,
     )
 
 
@@ -3133,3 +3226,26 @@ def github_authority(
         for capability in GITHUB_READ_CAPABILITIES
     }
     return (GitHubIdentityBinding(principal=principal), frozenset(grants))
+
+
+def gmail_authority(
+    settings: Settings,
+) -> tuple[GmailIdentityBinding | None, frozenset[DestinationGrant]]:
+    """The Gmail identity and the exact grants this installation configured.
+
+    One configured mailbox address becomes the Core-owned identity binding
+    and one exact grant per ENABLED Gmail capability for ``gmail/<account>``
+    - reads, the draft and the send alike, because every one of them is
+    still behind mandatory approval and the send additionally binds its
+    exact bytes. The deferred capability gets no row. An unconfigured
+    installation returns ``(None, frozenset())``.
+    """
+    principal = settings.gmail_principal
+    if principal is None:
+        return (None, frozenset())
+    destination = f"gmail/{principal}"
+    grants = {
+        DestinationGrant(GMAIL_CONNECTOR, capability, destination)
+        for capability in GMAIL_ENABLED_CAPABILITIES
+    }
+    return (GmailIdentityBinding(principal=principal), frozenset(grants))

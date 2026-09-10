@@ -121,6 +121,16 @@ from jarvis.destinations import (
     canonical_destination,
     connector_destination_refusal,
 )
+from jarvis.gmail import (
+    GMAIL_READ_CAPABILITIES,
+    GmailIdentityBinding,
+    build_gmail_request_frame,
+    gmail_external_read_binding_refusal,
+    gmail_identity_binding_refusal,
+    gmail_identity_refusal,
+    gmail_resource_from_dict,
+    is_gmail_destination,
+)
 from jarvis.github import (
     GITHUB_IDENTITY_BINDING,
     GITHUB_READ_CAPABILITIES,
@@ -576,6 +586,7 @@ class AgentCore:
         *,
         destination_policy: AbstractSet[DestinationGrant] | None = None,
         github_identity: GitHubIdentityBinding | None = None,
+        gmail_identity: GmailIdentityBinding | None = None,
     ) -> None:
         self.registry = registry
         self.memory = memory
@@ -614,6 +625,17 @@ class AgentCore:
                     f"identity binding: {reason}."
                 )
         self.github_identity: GitHubIdentityBinding | None = github_identity
+        # Gmail minimum: THE expected mailbox identity, on exactly the same
+        # footing. ``None`` is a refusal, not a waiver - see
+        # ``_gmail_identity_refusal``.
+        if gmail_identity is not None:
+            reason = gmail_identity_binding_refusal(gmail_identity)
+            if reason is not None:
+                raise ValueError(
+                    f"AgentCore was composed with an unusable Gmail "
+                    f"identity binding: {reason}."
+                )
+        self.gmail_identity: GmailIdentityBinding | None = gmail_identity
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)
@@ -2533,6 +2555,9 @@ class AgentCore:
         reason = self._github_identity_refusal(connector, scope)
         if reason is not None:
             refuse(reason)
+        reason = self._gmail_identity_refusal(connector, scope)
+        if reason is not None:
+            refuse(reason)
 
     def _github_identity_refusal(
         self, connector: BaseConnector, scope: ActionScope
@@ -2581,6 +2606,40 @@ class AgentCore:
             return "the connector's reported GitHub identity is not a (principal, route) pair"
         return github_identity_refusal(
             self.github_identity,
+            observed_principal=observed[0],
+            observed_credential_route=observed[1],
+        )
+
+    def _gmail_identity_refusal(
+        self, connector: BaseConnector, scope: ActionScope
+    ) -> str | None:
+        """Why the connector is not acting as the mailbox CORE expects.
+
+        The Gmail twin of ``_github_identity_refusal``, asked only of a
+        mailbox destination: ``self.gmail_identity`` is Core's composition
+        state, the connector's report is an input to a comparison, and a
+        build with no expected mailbox refuses every mailbox rather than
+        believing a connector's account of itself. Nothing here reads a
+        credential.
+        """
+        if not is_gmail_destination(scope.destination):
+            return None
+        if self.gmail_identity is None:
+            return (
+                "this build owns no expected Gmail identity, so no "
+                "connector-reported identity can be accepted"
+            )
+        observe = getattr(connector, "observed_gmail_identity", None)
+        if not callable(observe):
+            return "the connector reports no observable Gmail identity"
+        try:
+            observed = observe()
+        except Exception:  # noqa: BLE001 - an unreportable identity is a refusal
+            return "the connector could not report an observable Gmail identity"
+        if type(observed) is not tuple or len(observed) != 2:
+            return "the connector's reported Gmail identity is not a (principal, route) pair"
+        return gmail_identity_refusal(
+            self.gmail_identity,
             observed_principal=observed[0],
             observed_credential_route=observed[1],
         )
@@ -3590,6 +3649,9 @@ class AgentCore:
         with no authority - it selects nothing, satisfies nothing and grants
         nothing.
         """
+        if set(connector.manifest.capabilities) & set(GMAIL_READ_CAPABILITIES):
+            self._bind_gmail_external_read(task, connector, result)
+            return
         if not set(connector.manifest.capabilities) & set(GITHUB_READ_CAPABILITIES):
             return
         raw = result.data if isinstance(result.data, dict) else {}
@@ -3629,6 +3691,48 @@ class AgentCore:
         if snapshot.source_task_id != task.id:
             return
         if external_read_binding_refusal(snapshot, frame=frame) is not None:
+            return
+        task.external_read = snapshot.to_dict()
+
+    def _bind_gmail_external_read(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """The Gmail twin of the GitHub binding above, same gates, same
+        non-raising discard: the frame is rebuilt from the task's own
+        validated resource and Core's OWN Gmail identity, and the snapshot
+        must describe exactly that request or it is dropped."""
+        raw = result.data if isinstance(result.data, dict) else {}
+        payload = raw.get(EXTERNAL_READ_RESULT_KEY)
+        if not isinstance(payload, dict) or self.gmail_identity is None:
+            return
+        try:
+            resource = gmail_resource_from_dict(task.gmail)
+            frame = build_gmail_request_frame(
+                capability=task.capability,
+                destination=resource.destination,
+                resource=resource,
+                binding=self.gmail_identity,
+                connector=connector.manifest.name,
+            )
+            snapshot = ExternalReadSnapshot(
+                source_task_id=str(payload.get("source_task_id", "")),
+                connector=str(payload.get("connector", "")),
+                capability=str(payload.get("capability", "")),
+                destination=str(payload.get("destination", "")),
+                resource_kind=str(payload.get("resource_kind", "")),
+                resource_id=str(payload.get("resource_id", "")),
+                content=str(payload.get("content", "")),
+                truncated=bool(payload.get("truncated", False)),
+                byte_size=int(payload.get("byte_size", 0)),
+                sha256=str(payload.get("sha256", "")),
+                classification=task.scope.data_classification,
+                captured_at=str(payload.get("captured_at", "")),
+            )
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return
+        if snapshot.source_task_id != task.id:
+            return
+        if gmail_external_read_binding_refusal(snapshot, frame=frame) is not None:
             return
         task.external_read = snapshot.to_dict()
 

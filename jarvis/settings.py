@@ -27,6 +27,7 @@ from jarvis.github import (
     github_principal_refusal,
     github_raw_destination_refusal,
 )
+from jarvis.gmail import gmail_principal_refusal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -147,6 +148,13 @@ class Settings:
     #: grant, and a read outside that list is refused by Core's destination
     #: policy rather than by the connector.
     github_repositories: tuple[str, ...] = ()
+    #: Gmail minimum usable-v1 authority, configuration like GitHub's: the
+    #: one mailbox address the local Google Workspace CLI session belongs to.
+    #: The composition root turns it into the Core-owned identity binding
+    #: and one exact ``DestinationGrant`` per enabled Gmail capability for
+    #: ``gmail/<account>``. A NON-SECRET address, never a token: there is no
+    #: setting anywhere in this product that holds a Google credential.
+    gmail_principal: str | None = None
 
     def __post_init__(self) -> None:
         # THE typed runtime authority, and it has to actually be typed. Core
@@ -242,6 +250,10 @@ class Settings:
             raise ValueError(
                 "github_repositories requires github_principal to be set"
             )
+        if self.gmail_principal is not None:
+            reason = gmail_principal_refusal(self.gmail_principal)
+            if reason is not None:
+                raise ValueError(f"gmail_principal is unusable: {reason}")
         if not MIN_APPROVAL_TTL_MINUTES <= self.approval_ttl_minutes <= (
             MAX_APPROVAL_TTL_MINUTES
         ):
@@ -317,14 +329,22 @@ CONFIG_KEYS = (
     # one.
     "github_principal",
     "github_repositories",
+    # Gmail minimum. Authority as CONFIGURATION: the one mailbox the local
+    # Google Workspace CLI session belongs to. Not a credential.
+    "gmail_principal",
 )
+
+#: The pre-Gmail key set: the document exactly as the GitHub v1 build wrote
+#: it. Accepted whole, with the Gmail setting unset, for the same reason the
+#: two older shapes are: a second CLOSED shape, not an optional-keys hole.
+PRE_GMAIL_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"gmail_principal"}
 
 #: The pre-GitHub key set: the document exactly as a build before GitHub v1
 #: wrote it. Accepted whole, with both GitHub settings unset, for the same
 #: reason the legacy shape below is - an operator's existing preferences must
 #: survive an upgrade without a repair - and it is a second CLOSED shape, not
 #: an "optional keys" hole.
-PRE_GITHUB_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {
+PRE_GITHUB_CONFIG_KEYS = PRE_GMAIL_CONFIG_KEYS - {
     "github_principal",
     "github_repositories",
 }
@@ -361,6 +381,9 @@ _EXTRA_CREDENTIAL_SHAPES = (
     re.compile(r"\Axapp-", re.IGNORECASE),
     # Google OAuth access token.
     re.compile(r"\Aya29\.", re.IGNORECASE),
+    # Google OAuth refresh token and API key (Gmail minimum).
+    re.compile(r"\A1//0"),
+    re.compile(r"\AAIza"),
 )
 
 
@@ -604,6 +627,15 @@ def _exact_github_repositories(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _exact_gmail_principal(value: object) -> str | None:
+    """The configured mailbox address, or ``None``. Never coerced."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        _fail("'gmail_principal' must be a string or null.")
+    return value
+
+
 def _document_from_settings(settings: Settings) -> dict[str, object]:
     """The complete canonical document for a Settings. Always every key."""
     return {
@@ -619,6 +651,7 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "claude_effort": settings.claude_effort,
         "github_principal": settings.github_principal,
         "github_repositories": list(settings.github_repositories),
+        "gmail_principal": settings.gmail_principal,
     }
 
 
@@ -635,6 +668,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     keys = set(document)
     if keys not in (
         set(CONFIG_KEYS),
+        set(PRE_GMAIL_CONFIG_KEYS),
         set(PRE_GITHUB_CONFIG_KEYS),
         set(LEGACY_CONFIG_KEYS),
     ):
@@ -685,6 +719,9 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             github_repositories=_exact_github_repositories(
                 document.get("github_repositories")
             ),
+            # Absent means unset (a pre-Gmail document): no connector, no
+            # grant and no expected identity.
+            gmail_principal=_exact_gmail_principal(document.get("gmail_principal")),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

@@ -177,6 +177,10 @@ def normalize_locator(value: str | Path | None) -> str:
 #: because that is where the repair below has to be refused; ``jarvis.github``
 #: re-exports this exact value rather than spelling it a second time.
 REPOSITORY_DESTINATION_PREFIX = "github/"
+#: The namespace prefix of a MAILBOX destination, spelled ``gmail/<account>``.
+#: Declared beside the repository prefix for the same reason: the central
+#: normalizer must refuse to repair it, and ``jarvis.gmail`` re-exports it.
+MAILBOX_DESTINATION_PREFIX = "gmail/"
 
 
 def normalize_destination(value: str | Path | None) -> str:
@@ -208,8 +212,8 @@ def normalize_destination(value: str | Path | None) -> str:
     checks stays the string persistence, the fingerprint and the attestation
     hold.
 
-    Only the repository namespace is treated this way. URLs, provider
-    endpoints and the empty destination normalize exactly as before.
+    Only the repository and mailbox namespaces are treated this way. URLs,
+    provider endpoints and the empty destination normalize exactly as before.
     """
     if value is None:
         return ""
@@ -219,7 +223,10 @@ def normalize_destination(value: str | Path | None) -> str:
         return ""
     url = normalize_url(text)
     normalized = url if url is not None else normalize_symbol(text)
-    if normalized.startswith(REPOSITORY_DESTINATION_PREFIX) and normalized != raw:
+    if (
+        normalized.startswith((REPOSITORY_DESTINATION_PREFIX, MAILBOX_DESTINATION_PREFIX))
+        and normalized != raw
+    ):
         return raw
     return normalized
 
@@ -5012,6 +5019,13 @@ _CREDENTIAL_VALUE_PATTERNS = (
     # future length change cannot silently stop matching.
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    # Google OAuth access tokens (``ya29.``), refresh tokens (``1//0``) and
+    # API keys (``AIza``) carry documented prefixes too. Gmail minimum never
+    # handles one, and this is what keeps a token that leaks into a captured
+    # stream or a message body from ever being shown.
+    re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}"),
+    re.compile(r"\b1//0[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
 )
 
 
@@ -5575,6 +5589,14 @@ class Task:
     #: reference material that cannot select a capability, widen a
     #: destination, satisfy an approval or grant a tool.
     external_read: dict[str, Any] = field(default_factory=dict)
+    #: Gmail minimum. The typed Gmail resource this task names, in its own
+    #: canonical serialized form (``{}`` = none), on exactly the footing of
+    #: ``github``: accepted from untrusted input as THE REQUEST, validated at
+    #: the input boundary, re-judged by every consumer through
+    #: ``gmail_resource_from_dict``, and persisted so an approved operation
+    #: still knows what it was approved to do after a reload. For a draft or
+    #: a send it carries the recipients, subject and body the approval binds.
+    gmail: dict[str, Any] = field(default_factory=dict)
     write_content: str = ""
     #: M5. The declared write mode, part of the authority rather than a hint.
     #: Separate from ``local_write`` because the record is the post-execution
@@ -5683,6 +5705,7 @@ class Task:
             # ever erased - a completed read's answer is the deliverable.
             "github": dict(self.github),
             "external_read": dict(self.external_read),
+            "gmail": dict(self.gmail),
             "write_content": self.write_content,
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
@@ -5893,6 +5916,13 @@ class Task:
             external_read=(
                 dict(data["external_read"])
                 if isinstance(data.get("external_read"), dict)
+                else {}
+            ),
+            # Gmail minimum. Same rule as ``github``: a plain mapping, nothing
+            # inferred from the load, re-judged by every consumer.
+            gmail=(
+                dict(data["gmail"])
+                if isinstance(data.get("gmail"), dict)
                 else {}
             ),
             # M5. The same grammar the input boundary applies, so a row edited

@@ -175,6 +175,7 @@ class ParsingTests(ConfigTestCase):
                 "claude_call_budget_usd", "approval_ttl_minutes",
                 "memory_database", "claude_model", "claude_effort",
                 "github_principal", "github_repositories",
+                "gmail_principal",
             },
         )
 
@@ -1523,8 +1524,10 @@ ONE_PER_PROVIDER = ("github_pat", "glpat", "xoxb", "ya29")
 #: refusal below is still asserted for every family either way. The split is
 #: explicit so that a family silently CHANGING side - in either direction -
 #: is a failure rather than a shrug.
+#: Gmail minimum moved the Google access-token family the same way, when
+#: its shapes were added to the shared scanner.
 SHARED_POLICY_FAMILIES = frozenset(
-    {"github_pat", "ghp", "gho", "ghu", "ghs", "ghr"}
+    {"github_pat", "ghp", "gho", "ghu", "ghs", "ghr", "ya29"}
 )
 
 #: Ordinary approval identifiers that merely CONTAIN a harmless word, or sit

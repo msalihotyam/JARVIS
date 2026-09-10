@@ -1409,27 +1409,21 @@ class ExternalReadSnapshot:
         }
 
 
-def external_read_refusal(snapshot: Any) -> str | None:
-    """Why this snapshot is not usable reference data, or ``None``.
+def external_read_shape_refusal(snapshot: Any) -> str | None:
+    """Why this snapshot is not self-consistent as a snapshot, or ``None``.
 
-    SELF-CONSISTENCY. Everything here can be checked from the snapshot alone:
-    the shapes, the closed vocabularies, and - the part that matters - that
-    the digest, the byte size and the capture time really describe the
-    content the object is carrying rather than whatever a producer claimed
-    beside it. Whether that content answers the request Core actually
-    approved is the separate question ``external_read_binding_refusal``
-    asks; neither one grants the snapshot any authority.
+    The producer-independent half of ``external_read_refusal``: the shapes,
+    and - the part that matters - that the digest, the byte size and the
+    capture time really describe the content the object carries rather than
+    whatever a producer claimed beside it. Which producer, capability and
+    destination vocabularies a snapshot may name is the producer's own
+    question (``external_read_refusal`` for GitHub, ``jarvis.gmail`` for
+    Gmail); neither one grants the snapshot any authority.
     """
     if type(snapshot) is not ExternalReadSnapshot:
         return "the snapshot is not an ExternalReadSnapshot"
     if type(snapshot.classification) is not DataClassification:
         return "the snapshot classification is not recognized"
-    if snapshot.connector != GITHUB_CONNECTOR:
-        return "the snapshot names no known producer"
-    if snapshot.capability not in GITHUB_READ_CAPABILITIES:
-        return "the snapshot capability is not a GitHub read capability"
-    if not is_github_destination(snapshot.destination):
-        return "the snapshot destination is not a canonical repository"
     if type(snapshot.truncated) is not bool:
         return "the snapshot truncation flag is not a boolean"
     if type(snapshot.content) is not str:
@@ -1441,8 +1435,6 @@ def external_read_refusal(snapshot: Any) -> str | None:
         return reason
     if type(snapshot.byte_size) is not int or snapshot.byte_size < 0:
         return "the snapshot byte size is not a count"
-    # The three claims a producer could otherwise make freely, each checked
-    # against the bytes the snapshot is actually carrying.
     encoded = snapshot.content.encode("utf-8")
     if snapshot.sha256 != hashlib.sha256(encoded).hexdigest():
         return "the snapshot digest is not the digest of its content"
@@ -1452,12 +1444,37 @@ def external_read_refusal(snapshot: Any) -> str | None:
         return "the snapshot capture time is not a canonical UTC timestamp"
     if type(snapshot.source_task_id) is not str or not snapshot.source_task_id:
         return "the snapshot names no source task"
-    if type(snapshot.resource_kind) is not str or snapshot.resource_kind not in {
-        kind.value for kind in GitHubResourceKind
-    }:
+    if type(snapshot.resource_kind) is not str or not snapshot.resource_kind:
         return "the snapshot resource kind is not a recognized kind"
     if type(snapshot.resource_id) is not str or not snapshot.resource_id:
         return "the snapshot names no resource"
+    return None
+
+
+def external_read_refusal(snapshot: Any) -> str | None:
+    """Why this snapshot is not usable GitHub reference data, or ``None``.
+
+    SELF-CONSISTENCY, then the GitHub vocabulary: the producer must be the
+    GitHub connector, the capability a GitHub read, the destination a
+    canonical repository and the resource kind a GitHub kind. Whether the
+    content answers the request Core actually approved is the separate
+    question ``external_read_binding_refusal`` asks.
+    """
+    if type(snapshot) is not ExternalReadSnapshot:
+        return "the snapshot is not an ExternalReadSnapshot"
+    if type(snapshot.classification) is not DataClassification:
+        return "the snapshot classification is not recognized"
+    if snapshot.connector != GITHUB_CONNECTOR:
+        return "the snapshot names no known producer"
+    if snapshot.capability not in GITHUB_READ_CAPABILITIES:
+        return "the snapshot capability is not a GitHub read capability"
+    if not is_github_destination(snapshot.destination):
+        return "the snapshot destination is not a canonical repository"
+    reason = external_read_shape_refusal(snapshot)
+    if reason is not None:
+        return reason
+    if snapshot.resource_kind not in {kind.value for kind in GitHubResourceKind}:
+        return "the snapshot resource kind is not a recognized kind"
     return None
 
 
@@ -1687,6 +1704,7 @@ __all__ = [
     "build_github_request_frame",
     "external_read_binding_refusal",
     "external_read_refusal",
+    "external_read_shape_refusal",
     "github_atomic_read_content",
     "github_comment_body",
     "github_credential_route_refusal",
