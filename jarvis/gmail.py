@@ -1218,6 +1218,14 @@ def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
 # SHA-256 of its ciphertext, which contains no secret - and every operation
 # holds the file against replacement and checks the digest before and while
 # the CLI reads it. Non-secret, Core-owned data in the dedicated directory.
+#
+# The boundary this holds within (usable-v1): the OS user and the
+# JARVIS-owned dedicated directory are TRUSTED. The attestation detects a
+# credential that JARVIS's controlled login did not create, or that changed
+# since; the hold prevents a swap while a child runs; the seam's cooperative
+# lock keeps JARVIS's own steps from racing. A process already running as
+# this Windows user that rewrites the trusted directory - the attestation
+# included - is out of scope and is not claimed to be defended against.
 
 #: The scopes the controlled login requests: the reads, and drafts + send.
 #: Fixed - not a parameter - so the login vector is a constant.

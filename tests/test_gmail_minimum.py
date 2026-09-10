@@ -20,6 +20,7 @@ import unittest
 import argparse
 import contextlib
 import hashlib
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -95,6 +96,7 @@ from jarvis.gmail import (
 )
 from jarvis import gmail_cli
 from jarvis.gmail_cli import (
+    GMAIL_STEP_LOCK_NAME,
     GWS_RUN_DIRNAME,
     GWS_TRANSPORT_DIRNAME,
     GmailCommandExited,
@@ -108,6 +110,7 @@ from jarvis.gmail_cli import (
     dotenv_refusal,
     gmail_controlled_login,
     gmail_route_check,
+    gmail_step_lock,
     held_credential,
     observed_gmail_identity,
     read_credential_attestation,
@@ -1129,15 +1132,18 @@ def login_report(config_dir: str, **change) -> dict:
     }
 
 
-def login_runner(report=None, *, writes: bytes | None = CREDENTIAL_BYTES):
+def login_runner(report=None, *, writes: bytes | None = CREDENTIAL_BYTES, observe=None):
     """A ``Popen`` stand-in for the login: the child writes the credential
     file (as gws does, atomically, before it prints) and answers ``report``
-    (bytes, a FakeCompleted or an exception the created child raises)."""
+    (bytes, a FakeCompleted or an exception the created child raises).
+    ``observe(call)`` runs in the child's turn."""
     calls: list[dict] = []
 
     def popen(argv, **kwargs):
         call = {"argv": list(argv), **kwargs}
         calls.append(call)
+        if observe is not None:
+            observe(call)
         config_dir = kwargs["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"]
         if writes is not None:
             Path(config_dir, "credentials.enc").write_bytes(writes)
@@ -1287,7 +1293,101 @@ class CredentialInstanceTests(SeamTestCase):
                 with self.assertRaises((GmailCommandFailed, GmailOutcomeUnknown)):
                     self.run_plan(runner, "gmail_send")
                 self.assertTrue(rewrite_allowed(self.credential_path))
+                self.assertTrue(step_lock_free(self.config))
                 self.assertEqual([], self.transport_entries())
+
+
+def step_lock_free(config_dir: str) -> bool:
+    """Whether no JARVIS step holds the dedicated directory right now."""
+    try:
+        with gmail_step_lock(config_dir):
+            return True
+    except GmailCommandFailed:
+        return False
+
+
+class StepLockTests(SeamTestCase):
+    """JARVIS's own login and operation steps are serialized by one
+    cooperative lock. Cooperative: it binds JARVIS processes, which is the
+    only thing it is claimed to do."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fresh = str(Path(self.temp.name) / "fresh")
+        Path(self.fresh).mkdir()
+
+    def steps(self):
+        answer = json.dumps({"emailAddress": ACCOUNT}).encode()
+        return {
+            "identity": lambda: observed_gmail_identity(ACCOUNT, self.config, path_lookup=fake_path_lookup, popen=self.runner, environ={}),
+            "read": lambda: run_operation_plan(gmail_operation_plan(frame_for("gmail_thread_list")), config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=self.runner),
+            "send": lambda: run_operation_plan(gmail_operation_plan(frame_for("gmail_send")), config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=self.runner),
+            "login over the same directory": lambda: gmail_controlled_login(self.config, ACCOUNT, environ={}, path_lookup=fake_path_lookup, popen=self.runner),
+        }
+
+    def assert_every_step_refused_without_a_child(self) -> None:
+        for name, step in self.steps().items():
+            with self.subTest(step=name):
+                self.runner = scripted_runner(answer=json.dumps({"emailAddress": ACCOUNT}).encode())
+                with self.assertRaisesRegex(GmailCommandFailed, "another JARVIS Gmail step is in progress"):
+                    step()
+                self.assertEqual([], self.runner.calls)
+        self.assertEqual(self.attestation, read_credential_attestation(self.config))
+        self.assertEqual(CREDENTIAL_BYTES, Path(self.credential_path).read_bytes())
+        self.assertEqual([], self.transport_entries())
+
+    def test_a_step_in_this_process_excludes_every_other_step_until_it_ends(self) -> None:
+        with gmail_step_lock(self.config):
+            self.assertFalse(step_lock_free(self.config))
+            self.assert_every_step_refused_without_a_child()
+        self.assertTrue(step_lock_free(self.config))
+        self.runner = scripted_runner(answer=json.dumps({"emailAddress": ACCOUNT}).encode())
+        self.assertEqual((ACCOUNT, GMAIL_CREDENTIAL_ROUTE), self.steps()["identity"]())
+        self.assertEqual(2, len(self.runner.calls))
+
+    def test_a_step_in_another_jarvis_process_excludes_this_one(self) -> None:
+        with subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\nfrom jarvis.gmail_cli import gmail_step_lock\n"
+             "with gmail_step_lock(sys.argv[1]):\n    print('held', flush=True)\n    sys.stdin.read()\n",
+             self.config],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as holder:
+            try:
+                self.assertEqual("held", holder.stdout.readline().strip())
+                self.assertFalse(step_lock_free(self.config))
+                self.assert_every_step_refused_without_a_child()
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=30)
+            self.assertEqual(0, holder.returncode, holder.stderr.read())
+        self.assertTrue(step_lock_free(self.config))
+
+    def test_every_step_holds_the_lock_while_its_child_runs_and_releases_it_after(self) -> None:
+        seen: list[bool] = []
+
+        def during_child(call) -> None:
+            seen.append(step_lock_free(os.path.dirname(call["cwd"]) if "transport" not in call["cwd"] else os.path.dirname(os.path.dirname(call["cwd"]))))
+
+        self.runner = scripted_runner(answer=json.dumps({"emailAddress": ACCOUNT}).encode(), observe=during_child)
+        self.steps()["identity"]()
+        self.runner = scripted_runner(answer=json.dumps(send_ack()).encode(), observe=during_child)
+        self.steps()["send"]()
+        login = login_runner(observe=during_child)
+        gmail_controlled_login(self.fresh, ACCOUNT, environ={}, path_lookup=fake_path_lookup, popen=login, now=lambda: ESTABLISHED_AT)
+        self.assertEqual([False] * (2 + 3 + 1), seen, "the lock was held in every child's turn")
+        self.assertTrue(step_lock_free(self.config))
+        self.assertTrue(step_lock_free(self.fresh))
+        self.assertTrue((Path(self.fresh) / GMAIL_STEP_LOCK_NAME).exists())
+
+    def test_the_lock_is_released_when_a_login_fails(self) -> None:
+        with self.assertRaises(GmailCommandFailed):
+            gmail_controlled_login(self.fresh, ACCOUNT, environ={}, path_lookup=fake_path_lookup, popen=login_runner(FakeCompleted(1, b"", b"")), now=lambda: ESTABLISHED_AT)
+        self.assertTrue(step_lock_free(self.fresh))
+        with self.assertRaises(GmailCommandFailed):
+            gmail_controlled_login(self.config, ACCOUNT, environ={}, path_lookup=fake_path_lookup, popen=login_runner(), now=lambda: ESTABLISHED_AT)
+        self.assertTrue(step_lock_free(self.config))
 
 
 class ControlledLoginTests(SeamTestCase):

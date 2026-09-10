@@ -47,9 +47,31 @@ gws 0.22.5 on 2026-09-10:
   the handle is open, its bytes are read through that very handle and
   digested against the attestation, and the handle stays open until the
   child has exited - so the credential the child decrypted is the attested
-  one, and no replacement (ABA included) can occur between the check and
-  the use. Nothing decrypts anything: the digest is of ciphertext;
+  one: a credential replaced or re-created since the attestation is refused
+  before any child starts, and none can be swapped in while one runs.
+  Nothing decrypts anything: the digest is of ciphertext;
+- JARVIS's own steps never race each other: the controlled login and every
+  operation bracket take a cooperative exclusive lock on one file in the
+  dedicated directory (``gmail_step_lock``: share mode 0, released when
+  the handle closes - on return, on exception and on a crash alike), and a
+  second JARVIS step is refused before any child starts, never interleaved;
 - a ``.env`` in the child's working directory or any ancestor is a refusal.
+
+THE TRUSTED LOCAL BOUNDARY (usable-v1). The OS user JARVIS runs as, and the
+JARVIS-owned data directory - the dedicated directory with its
+``client_secret.json``, ``credentials.enc``, attestation, lock, run and
+transport directories - are TRUSTED, exactly as the database beside them
+is. Everything above defends the route against ambient and foreign
+credentials; against a stored credential that JARVIS's controlled login
+did not create (a service account dressed as a user, an operator's own
+``gws auth login``, a file copied in); against a credential changed since
+the attestation; against a swap while a child runs; and against JARVIS's
+own concurrent steps. It does NOT defend against, and does not claim to
+defend against, a process already running with this Windows user's
+authority that deliberately rewrites the trusted directory: such a process
+can rewrite the attestation and ``client_secret.json`` as readily as the
+credential, and a cooperative lock does not bind it. That is out of scope
+for usable-v1.
 
 ``users.getProfile`` then proves the EFFECTIVE ACCOUNT only.
 
@@ -371,8 +393,85 @@ def _one_json_object(stdout: Any) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------
 
 _GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_FILE_SHARE_NONE = 0
 _FILE_SHARE_READ = 0x00000001
 _OPEN_EXISTING = 3
+_OPEN_ALWAYS = 4
+#: ``ERROR_SHARING_VIOLATION`` and ``ERROR_LOCK_VIOLATION``: the file is
+#: open elsewhere in a way that excludes this open.
+_SHARING_ERRORS = (32, 33)
+#: The cooperative lock every JARVIS Gmail step takes in the dedicated
+#: directory. An empty file; the exclusion is the open handle's share mode.
+GMAIL_STEP_LOCK_NAME = "jarvis-gmail.lock"
+
+
+def _win32_open(path: str, access: int, share: int, disposition: int) -> Any:
+    """One ``CreateFileW``: an open handle, or ``OSError``.
+
+    ponytail: Windows-only by construction - the mandatory share modes this
+    seam relies on have no POSIX equivalent - and the seam fails closed on
+    any other platform rather than pretend.
+    """
+    if sys.platform != "win32":
+        raise GmailCommandFailed(
+            "the Windows share semantics this seam relies on are unavailable on this platform"
+        )
+    import ctypes  # noqa: PLC0415 - platform-conditional
+    from ctypes import wintypes  # noqa: PLC0415
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    handle = create_file(path, access, share, None, disposition, 0, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _win32_close(handle: Any) -> None:
+    import ctypes  # noqa: PLC0415 - platform-conditional
+
+    ctypes.WinDLL("kernel32").CloseHandle(handle)
+
+
+@contextlib.contextmanager
+def gmail_step_lock(config_dir: str) -> Iterator[None]:
+    """Exclude every other JARVIS Gmail step for the block's duration.
+
+    COOPERATIVE and JARVIS-INTERNAL. The lock file is opened with share
+    mode 0, so a second open by any other JARVIS process - a concurrent
+    ``jarvis gmail login``, an operation from another session - fails at
+    once with a sharing violation and that step is refused before any
+    child starts, never interleaved: two logins cannot both attest, a
+    write's residue sweep cannot remove another write's in-flight transport
+    directory, and no attestation is read while a login is replacing it.
+    The handle closes when the block ends or the process dies, so no stale
+    lock survives a crash. It binds JARVIS's own processes only: a process
+    that ignores it is outside the trusted local boundary (module doc).
+    """
+    path = os.path.join(config_dir, GMAIL_STEP_LOCK_NAME)
+    try:
+        handle = _win32_open(
+            path, _GENERIC_READ | _GENERIC_WRITE, _FILE_SHARE_NONE, _OPEN_ALWAYS
+        )
+    except OSError as exc:
+        if exc.winerror in _SHARING_ERRORS:
+            raise GmailCommandFailed(
+                "another JARVIS Gmail step is in progress in the dedicated directory; "
+                "retry when it has finished"
+            ) from exc
+        raise GmailCommandFailed(
+            "the dedicated directory's step lock cannot be created"
+        ) from exc
+    try:
+        yield
+    finally:
+        _win32_close(handle)
 
 
 @contextlib.contextmanager
@@ -388,36 +487,21 @@ def held_credential(config_dir: str) -> Iterator[bytes]:
     Rust's ``std::fs::read`` opens) succeeds. The bytes are read through
     THIS handle, never through the path, so they are the held instance's.
     The ciphertext is digested by the caller and never decrypted here.
-
-    ponytail: Windows-only by construction - POSIX has no mandatory share
-    mode - and the seam fails closed elsewhere rather than pretend.
     """
-    if sys.platform != "win32":
-        raise GmailCommandFailed(
-            "the credential instance cannot be held against replacement on this platform"
-        )
-    import ctypes  # noqa: PLC0415 - platform-conditional
-    import msvcrt  # noqa: PLC0415
-    from ctypes import wintypes  # noqa: PLC0415
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.restype = wintypes.HANDLE
-    create_file.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
     path = os.path.join(config_dir, GMAIL_ENCRYPTED_CREDENTIALS_NAME)
-    handle = create_file(path, _GENERIC_READ, _FILE_SHARE_READ, None, _OPEN_EXISTING, 0, None)
-    if handle is None or handle == wintypes.HANDLE(-1).value:
+    try:
+        handle = _win32_open(path, _GENERIC_READ, _FILE_SHARE_READ, _OPEN_EXISTING)
+    except OSError as exc:
         raise GmailCommandFailed(
             "the dedicated credential file cannot be held: it is absent or "
             "another process holds it open for writing"
-        )
+        ) from exc
+    import msvcrt  # noqa: PLC0415 - platform-conditional, after _win32_open proved win32
+
     try:
         descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
     except OSError as exc:
-        kernel32.CloseHandle(handle)
+        _win32_close(handle)
         raise GmailCommandFailed("the dedicated credential file cannot be held") from exc
     with os.fdopen(descriptor, "rb") as held:
         try:
@@ -472,21 +556,24 @@ def attested_credential(config_dir: str, principal: Any) -> Iterator[GmailCreden
     credential file is held against replacement and is the exact instance
     the attestation names for this principal - or the block never runs.
 
-    Order: the attestation is read first (a missing or malformed record is
-    a refusal before any file is touched), then the credential is held and
-    its bytes are digested against the record, then the block runs with the
-    hold still in place, then the hold is released.
+    Order: the JARVIS step lock is taken (another JARVIS step in progress
+    is a refusal), the attestation is read (a missing or malformed record
+    is a refusal before any file is touched), the credential is held and
+    its bytes are digested against the record, the block runs with the
+    hold and the lock still in place, then both are released.
     """
-    attestation = read_credential_attestation(config_dir)
-    with held_credential(config_dir) as credentials:
-        reason = gmail_attestation_refusal(
-            attestation, principal=principal, config_dir=config_dir, credentials=credentials
-        )
-        if reason is not None:
-            raise GmailCommandFailed(
-                f"the credential instance is not the attested authorized-user credential: {reason}"
+    with gmail_step_lock(config_dir):
+        attestation = read_credential_attestation(config_dir)
+        with held_credential(config_dir) as credentials:
+            reason = gmail_attestation_refusal(
+                attestation, principal=principal, config_dir=config_dir, credentials=credentials
             )
-        yield attestation
+            if reason is not None:
+                raise GmailCommandFailed(
+                    "the credential instance is not the attested authorized-user "
+                    f"credential: {reason}"
+                )
+            yield attestation
 
 
 def _utc_now_text() -> str:
@@ -505,7 +592,8 @@ def gmail_controlled_login(
     """Run ``gws auth login`` into the dedicated directory and attest the
     credential it created, or fail closed.
 
-    Provenance, step by step: the directory must hold NO credential and no
+    Provenance, step by step, under the JARVIS step lock so no second login
+    or operation interleaves: the directory must hold NO credential and no
     token cache (an existing one is refused, never removed - the operator
     removes it with ``gws auth logout`` under the dedicated directory); any
     stale attestation is removed first, so a failed login can never leave a
@@ -524,6 +612,21 @@ def gmail_controlled_login(
     if reason is not None:
         raise GmailCommandFailed(f"the dedicated configuration directory is unusable: {reason}")
     Path(config_dir).mkdir(parents=True, exist_ok=True)
+    with gmail_step_lock(config_dir):
+        return _login_under_lock(
+            config_dir, principal, environ=environ, path_lookup=path_lookup, popen=popen, now=now
+        )
+
+
+def _login_under_lock(
+    config_dir: str,
+    principal: str,
+    *,
+    environ: Mapping[str, str] | None,
+    path_lookup: Any,
+    popen: Any,
+    now: Any,
+) -> GmailCredentialAttestation:
     present = [
         name for name in GMAIL_LOGIN_PRECLUDING_FILES
         if os.path.lexists(os.path.join(config_dir, name))
@@ -747,9 +850,9 @@ def run_operation_plan(
     Order, and what each step means:
 
     1. the plan is re-derived - refusal;
-    2. the credential INSTANCE is proved and held for every later step
-       (``attested_credential``), then the credential route is proved -
-       refusal;
+    2. the JARVIS step lock is taken and the credential INSTANCE is proved
+       and held, both for every later step (``attested_credential``), then
+       the credential route is proved - refusal;
     3. a READ runs once in the run directory; every failure is a refusal;
     4. a WRITE first requires the transport directory to sweep clean (an
        earlier residue is a refusal before anything starts), gets a fresh
@@ -890,6 +993,7 @@ __all__ = [
     "GWS_OUTPUT_MAX_BYTES",
     "GWS_READ_TIMEOUT_SECONDS",
     "GWS_RUN_DIRNAME",
+    "GMAIL_STEP_LOCK_NAME",
     "GWS_LOGIN_TIMEOUT_SECONDS",
     "GWS_TRANSPORT_DIRNAME",
     "GWS_WRITE_TIMEOUT_SECONDS",
@@ -904,6 +1008,7 @@ __all__ = [
     "dotenv_refusal",
     "gmail_controlled_login",
     "gmail_route_check",
+    "gmail_step_lock",
     "held_credential",
     "read_credential_attestation",
     "write_credential_attestation",

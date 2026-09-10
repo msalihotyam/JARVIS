@@ -162,10 +162,11 @@ class Settings:
 
         DERIVED, never configured: it lives beside the memory database, in
         JARVIS's own data directory, so the one credential route Gmail
-        accepts is always the login an operator performed INTO this
-        directory (``GOOGLE_WORKSPACE_CLI_CONFIG_DIR=<this> gws auth login``)
-        and never the operator's ambient ``~/.config/gws`` session. Not a
-        secret and not a credential: a location.
+        accepts is always the credential ``jarvis gmail login`` established
+        INTO this directory through the controlled ``gws auth login``, and
+        never the operator's ambient ``~/.config/gws`` session. Part of the
+        trusted local boundary, JARVIS-owned like the database beside it.
+        Not a secret and not a credential: a location.
         """
         return Path(self.memory_database).resolve().parent / "gws-gmail"
 
