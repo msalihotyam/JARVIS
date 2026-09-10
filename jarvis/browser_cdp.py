@@ -646,6 +646,12 @@ def guarded_navigate(
     Returns the URL that navigation committed to, taken from the very event
     that proved it committed.
 
+    NOTHING PAUSED IS EVER RELEASED BY THE DISARM. A ``Fetch.requestPaused``
+    that reaches this function is in its custody from the instant it is
+    delivered until a ``Fetch.continueRequest`` or ``Fetch.failRequest`` is
+    ACKNOWLEDGED for it, and no exit in between - the hop limit included -
+    can end that custody without failing it first.
+
     Uncertainty is never converted into an answer. A navigation whose terminal
     state cannot be established - no correlatable loader, or more protocol
     traffic than one navigation may produce - raises ``BrowserCommandStarted``,
@@ -662,7 +668,10 @@ def guarded_navigate(
     """
     connection.command("Page.enable", session_id=session_id)
     connection.command("Fetch.enable", {"patterns": _DOCUMENT_PATTERN}, session_id=session_id)
-    settled = False
+    #: The paused request this function currently holds and has NOT yet had
+    #: continued or failed. Empty means nothing is owed: either none has been
+    #: delivered, or the last one's disposition was acknowledged.
+    current = ""
     try:
         pending = connection.send("Page.navigate", {"url": url}, session_id=session_id)
         guarded: tuple[str, str] | None = None
@@ -670,7 +679,6 @@ def guarded_navigate(
         hops = 0
         for _ in range(BROWSER_MAX_NAVIGATION_EVENTS):
             if guarded is not None and guarded in committed:
-                settled = True
                 return committed[guarded]
             kind, payload = connection.exchange(
                 pending, "Page.navigate", ("Fetch.requestPaused", "Page.frameNavigated")
@@ -678,7 +686,6 @@ def guarded_navigate(
             if kind == "reply":
                 if payload.get("errorText"):
                     # Definitively failed, and the browser says so.
-                    settled = True
                     raise BrowserCommandStarted(
                         f"the browser reported a navigation error: {payload.get('errorText')}"
                     )
@@ -700,6 +707,25 @@ def guarded_navigate(
                         frame.get("url", "")
                     )
                 continue
+            # CUSTODY FIRST. ``exchange`` has already taken this event off the
+            # stream and out of the buffer, so from here on nothing else can
+            # settle it - not the cleanup drain, not another reader, nobody.
+            # Its id is therefore recorded BEFORE any check that could raise,
+            # because every one of those exits would otherwise leave a paused
+            # request that ``Fetch.disable`` goes on to release onto the wire.
+            request_id = str(payload.get("requestId", ""))
+            requested = payload.get("request")
+            hop = str(requested.get("url", "")) if isinstance(requested, dict) else ""
+            if not request_id:
+                # Nothing here can name it, so nothing here can dispose of it.
+                # That is uncertainty, not a verdict: disabling the gate may
+                # release a request this seam never judged.
+                raise BrowserCommandStarted(
+                    "the browser paused a request it did not name, so that "
+                    "request cannot be disposed of and the outcome is not "
+                    "established"
+                )
+            current = request_id
             hops += 1
             if hops > BROWSER_MAX_REDIRECT_HOPS:
                 raise BrowserOriginBlocked(
@@ -707,10 +733,7 @@ def guarded_navigate(
                     "navigation may follow, so it was refused",
                     blocked=origin,
                 )
-            request_id = str(payload.get("requestId", ""))
-            requested = payload.get("request")
-            hop = str(requested.get("url", "")) if isinstance(requested, dict) else ""
-            if not request_id or not hop:
+            if not hop:
                 raise BrowserCommandFailed("the browser paused an unreadable request")
             if not url_in_origin(hop, origin):
                 # BEFORE THE WIRE. The request is refused here, so nothing of
@@ -721,7 +744,11 @@ def guarded_navigate(
                     {"requestId": request_id, "errorReason": "BlockedByClient"},
                     session_id=session_id,
                 )
-                settled = True
+                # Acknowledged: ``command`` returned, so the browser answered
+                # without an error. Custody ends HERE and not a line earlier,
+                # so a failed fail is retried by the cleanup rather than
+                # assumed to have worked.
+                current = ""
                 raise BrowserOriginBlocked(
                     "the approved origin redirected outside it, so the request to "
                     f"{_origin_of(hop)} was refused before it was sent and the "
@@ -731,31 +758,47 @@ def guarded_navigate(
             connection.command(
                 "Fetch.continueRequest", {"requestId": request_id}, session_id=session_id
             )
+            current = ""
         raise BrowserCommandStarted(
             "the navigation did not reach a terminal state within the traffic "
             "one navigation may produce, so its outcome is not established"
         )
+    except (BrowserOriginBlocked, BrowserCommandStarted):
+        raise
+    except BrowserCommandFailed as exc:
+        # ONE RULE FOR BOTH CALLERS. Past ``Page.navigate`` a protocol failure
+        # is not evidence that nothing happened, so it becomes uncertainty
+        # here rather than in one caller and not the other.
+        raise BrowserCommandStarted(f"the navigation was not acknowledged: {exc}") from exc
     finally:
         # Never left armed, on any path: a gate that outlived its operation
         # would be a standing policy over the profile, and a paused request
         # with nobody left to judge it would hang the tab.
         #
-        # DISARMING RELEASES WHAT IT WAS HOLDING. On every settled path there
-        # is nothing paused - each request was continued or failed before the
-        # next frame was read. On an unsettled one there may be a request that
-        # arrived and was never judged, so those are FAILED first rather than
-        # freed by the disable.
-        if not settled:
-            for stranded in connection.take_buffered("Fetch.requestPaused"):
-                with _suppressed():
-                    connection.command(
-                        "Fetch.failRequest",
-                        {
-                            "requestId": str(stranded.get("requestId", "")),
-                            "errorReason": "BlockedByClient",
-                        },
-                        session_id=session_id,
-                    )
+        # DISARMING RELEASES WHAT IT WAS HOLDING, so everything paused is given
+        # an explicit terminal disposition first. TWO DISTINCT
+        # RESPONSIBILITIES, and neither can stand in for the other:
+        #
+        # 1. THE CURRENT REQUEST - delivered to this function and therefore no
+        #    longer in any buffer. Only the tracked id can settle it; the drain
+        #    below would never see it. Every early exit lands here: the hop
+        #    limit, an unreadable hop, a refusal whose own fail was not
+        #    acknowledged, a protocol error, a cancellation, a timeout, a
+        #    correlation failure, or any other exception raised after delivery.
+        # 2. THE BUFFERED REQUESTS - delivered by the browser while some other
+        #    reply was being awaited, and never delivered to this function.
+        for stranded in ([current] if current else []) + [
+            str(one.get("requestId", ""))
+            for one in connection.take_buffered("Fetch.requestPaused")
+        ]:
+            if not stranded:
+                continue
+            with _suppressed():
+                connection.command(
+                    "Fetch.failRequest",
+                    {"requestId": stranded, "errorReason": "BlockedByClient"},
+                    session_id=session_id,
+                )
         with _suppressed():
             connection.command("Fetch.disable", session_id=session_id)
         with _suppressed():
@@ -908,14 +951,7 @@ def _perform(
         # The only capability that may act on a tab standing outside the bound
         # origin: arriving there is what it is for. Where it may GO is decided
         # hop by hop under the gate, before each request is sent.
-        try:
-            url = guarded_navigate(
-                connection, session_id, url=resource.url, origin=origin
-            )
-        except (BrowserOriginBlocked, BrowserCommandStarted):
-            raise
-        except BrowserCommandFailed as exc:
-            raise BrowserCommandStarted(f"the navigation was not acknowledged: {exc}") from exc
+        url = guarded_navigate(connection, session_id, url=resource.url, origin=origin)
         write_current_tab(profile_dir, tab_id)
         return BrowserCommandOutput({"tab_id": tab_id, "url": url})
 

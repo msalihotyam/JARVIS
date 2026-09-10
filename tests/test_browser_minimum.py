@@ -23,6 +23,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from urllib.parse import urlsplit
 
 from jarvis.app import TaskInputError, browser_authority, decode_task_json
@@ -241,7 +242,13 @@ class FakeBrowser(threading.Thread):
         elif method == "Fetch.failRequest":
             outbound = [{"id": message["id"], "result": {}}, *navigator.fail()]
         elif method == "Fetch.continueRequest":
-            outbound = [{"id": message["id"], "result": {}}, *navigator.follow()]
+            refusal = navigator.refuse_continue()
+            if refusal:
+                # The continue is NOT acknowledged, so the request stays
+                # paused and stays this navigation's responsibility.
+                outbound = [{"id": message["id"], "error": {"message": refusal}}]
+            else:
+                outbound = [{"id": message["id"], "result": {}}, *navigator.follow()]
         else:
             return False
         for one in outbound:
@@ -1166,12 +1173,17 @@ class _GatedNavigator:
         early_reply: bool = False,
         noise: bool = False,
         never_commits: bool = False,
+        fail_continue_at: int = 0,
     ) -> None:
         self.early_reply = early_reply
         self.noise = noise
         #: Acknowledge the navigation, then talk forever about OTHER frames
         #: and never commit this loader.
         self.never_commits = never_commits
+        #: Refuse the Nth Fetch.continueRequest at the protocol level, so a
+        #: request is delivered and then never acknowledged either way.
+        self.fail_continue_at = fail_continue_at
+        self._continues = 0
         self.hop = ""
         self.fetched: list[str] = []
         self.failed: list[str] = []
@@ -1222,6 +1234,12 @@ class _GatedNavigator:
         ]
 
     # -- what the client's decisions cause --------------------------------
+
+    def refuse_continue(self) -> str:
+        self._continues += 1
+        if self.fail_continue_at and self._continues == self.fail_continue_at:
+            return "the renderer went away"
+        return ""
 
     def fail(self) -> list[dict]:
         self.failed.append(self.hop)
@@ -1282,7 +1300,12 @@ class RedirectAuthorityTests(unittest.TestCase):
         self.addCleanup(self.a.stop)
 
     def drive(
-        self, capability: str, path: str, *, early_reply: bool = False
+        self,
+        capability: str,
+        path: str,
+        *,
+        early_reply: bool = False,
+        fail_continue_at: int = 0,
     ) -> BrowserCommandOutput:
         """One real operation of ``capability`` against origin A + ``path``."""
         origin = self.a.origin
@@ -1296,7 +1319,11 @@ class RedirectAuthorityTests(unittest.TestCase):
             destination=f"browser/{origin}",
             resource=BrowserResource(kind=kind, origin=origin, url=f"{origin}{path}"),
         )
-        self.navigator = _GatedNavigator(early_reply=early_reply, noise=early_reply)
+        self.navigator = _GatedNavigator(
+            early_reply=early_reply,
+            noise=early_reply,
+            fail_continue_at=fail_continue_at,
+        )
         answers = page_answers(
             **{
                 "Target.getTargets": {
@@ -1349,6 +1376,52 @@ class RedirectAuthorityTests(unittest.TestCase):
                     "Fetch.continueRequest",
                     [method for method, _ in self.browser.sent][-1:],
                 )
+
+    def run_through_core(self, capability: str, path: str):
+        """One approved run of ``capability`` for origin A + ``path``."""
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        memory = SQLiteMemoryStore(Path(temp.name) / "jarvis.db")
+        origin = self.a.origin
+        destination = f"browser/{origin}"
+        made = BrowserCdpConnector(
+            self.profile,
+            plan_runner=lambda plan, **kwargs: self.drive(capability, path),
+        )
+        registry = ToolRegistry()
+        registry.register(made)
+        core = AgentCore(
+            registry,
+            memory,
+            Settings(memory_database=memory.database_path),
+            destination_policy=frozenset(
+                DestinationGrant(BROWSER_CONNECTOR, name, destination)
+                for name in BROWSER_ENABLED_CAPABILITIES
+            ),
+        )
+        task = Task(
+            objective="drive the browser",
+            capability=capability,
+            scope=ActionScope(action="browse", target="", destination=destination),
+            browser={
+                "kind": "navigation" if capability == "browser_navigate" else "new_tab",
+                "origin": origin,
+                "url": f"{origin}{path}",
+                "seconds": 0,
+                "tab_id": "",
+                "ref": "",
+                "page_digest": "",
+                "text": "",
+            },
+        )
+        waiting = core.run(task)
+        self.assertEqual(RunStatus.AWAITING_APPROVAL, waiting.status)
+        self.memory = memory
+        return core.resume(
+            waiting.session.id,
+            waiting.task.id,
+            PermissionGrant.for_request(waiting.permission_request),
+        )
 
     def test_the_blocked_navigation_is_not_reported_as_success(self) -> None:
         for capability in ("browser_navigate", "browser_tab_open"):
@@ -1515,6 +1588,141 @@ class RedirectAuthorityTests(unittest.TestCase):
                     len(methods) - 1 - methods[::-1].index("Fetch.continueRequest"),
                     methods.index("Fetch.disable"),
                 )
+
+    # -- custody of the request currently in hand --------------------------
+
+    def chain(self, length: int, last: str) -> str:
+        """``/chain0 -> /chain1 -> ... -> last`` on origin A. Returns the head."""
+        for step in range(length - 1):
+            self.a.redirects[f"/chain{step}"] = f"{self.a.origin}/chain{step + 1}"
+        self.a.redirects[f"/chain{length - 1}"] = last
+        return "/chain0"
+
+    def drive_watching_the_drain(self, capability: str, path: str, **kwargs):
+        """Run one operation, recording what the cleanup drain recovered."""
+        drained: list[str] = []
+        original = CdpConnection.take_buffered
+
+        def spy(connection, event):
+            recovered = original(connection, event)
+            drained.extend(str(one.get("requestId", "")) for one in recovered)
+            return recovered
+
+        with mock.patch.object(CdpConnection, "take_buffered", spy):
+            try:
+                return self.drive(capability, path, **kwargs), drained
+            finally:
+                self.drained = drained
+
+    def transcript(self) -> list[tuple[str, dict]]:
+        return list(self.browser.sent)
+
+    def test_the_hop_limit_cannot_let_the_current_request_escape(self) -> None:
+        """Ten permitted hops, then origin B on the eleventh.
+
+        The eleventh pause has already been taken off the stream by the time
+        the hop limit fires, so nothing but the gate's own record of it can
+        settle it - and it must be settled before the disarm, or the browser
+        sends it.
+        """
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                head = self.chain(
+                    BROWSER_MAX_REDIRECT_HOPS, f"{self.b.origin}/landing"
+                )
+                with self.assertRaises(BrowserOriginBlocked):
+                    self.drive_watching_the_drain(capability, head)
+                # 1. ten same-origin hops were processed and permitted.
+                self.assertEqual(
+                    [f"/chain{step}" for step in range(BROWSER_MAX_REDIRECT_HOPS)],
+                    self.a.received,
+                )
+                methods = [method for method, _ in self.transcript()]
+                self.assertEqual(
+                    BROWSER_MAX_REDIRECT_HOPS, methods.count("Fetch.continueRequest")
+                )
+                # 2. the eleventh pause was for origin B.
+                eleventh = f"r{BROWSER_MAX_REDIRECT_HOPS + 1}"
+                # 3. and it was NOT recovered from the buffered collection -
+                #    exchange had already consumed it.
+                self.assertNotIn(eleventh, self.drained)
+                # 4./5. it was explicitly failed, and BEFORE the disarm.
+                failed = [
+                    params["requestId"]
+                    for method, params in self.transcript()
+                    if method == "Fetch.failRequest"
+                ]
+                self.assertEqual([eleventh], failed)
+                self.assertLess(
+                    methods.index("Fetch.failRequest"), methods.index("Fetch.disable")
+                )
+                # 6. origin B was never contacted.
+                self.assertEqual([], self.b.received)
+                self.assertEqual(
+                    [], [url for url in self.navigator.fetched if self.b.origin in url]
+                )
+
+    def test_the_hop_limit_refusal_is_not_reported_as_success(self) -> None:
+        head = self.chain(BROWSER_MAX_REDIRECT_HOPS, f"{self.b.origin}/landing")
+        done = self.run_through_core("browser_navigate", head)
+        self.assertNotEqual(RunStatus.COMPLETED, done.status)
+        self.assertEqual(ErrorCode.EGRESS_REFUSED, done.error.code)
+        self.assertFalse(done.error.retryable)
+        self.assertEqual([], self.b.received)
+
+    def test_an_unacknowledged_continue_also_leaves_no_request_behind(self) -> None:
+        """A non-hop-limit exit after delivery, to prove this is structural.
+
+        The browser refuses the second ``Fetch.continueRequest`` at the
+        protocol level. That request is in the gate's hands, was never
+        acknowledged either way, and the exception leaves the loop from a
+        completely different place than the hop limit does.
+        """
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                with self.assertRaises(BrowserCommandStarted):
+                    self.drive_watching_the_drain(
+                        capability, "/local", fail_continue_at=2
+                    )
+                methods = [method for method, _ in self.transcript()]
+                failed = [
+                    params["requestId"]
+                    for method, params in self.transcript()
+                    if method == "Fetch.failRequest"
+                ]
+                # The second hop was delivered, never acknowledged, and is the
+                # one the cleanup had to settle.
+                self.assertEqual(["r2"], failed)
+                self.assertNotIn("r2", self.drained)
+                self.assertLess(
+                    methods.index("Fetch.failRequest"), methods.index("Fetch.disable")
+                )
+                self.assertEqual(1, methods.count("Fetch.disable"))
+                self.assertEqual([], self.b.received)
+
+    def test_an_acknowledged_disposition_is_never_repeated(self) -> None:
+        # Blocked cross-origin hop: failed inline, acknowledged, and therefore
+        # NOT failed a second time by the cleanup.
+        self.b.received.clear()
+        with self.assertRaises(BrowserOriginBlocked):
+            self.drive_watching_the_drain("browser_navigate", "/offsite")
+        failed = [
+            params["requestId"]
+            for method, params in self.transcript()
+            if method == "Fetch.failRequest"
+        ]
+        self.assertEqual(["r2"], failed)
+        # Same for a wholly successful run: every hop was continued, so the
+        # cleanup owes nothing.
+        self.a.received.clear()
+        self.drive_watching_the_drain("browser_navigate", "/local")
+        self.assertEqual(
+            [], [method for method, _ in self.transcript() if method == "Fetch.failRequest"]
+        )
 
     # -- what must keep working -------------------------------------------
 
