@@ -19,6 +19,7 @@ from jarvis.contracts import (
     DIAGNOSTIC_DETAIL_MAX_CHARS,
     LOCAL_READ_CAPABILITY,
     LOCAL_READ_CONTEXT_REFERENCE_KEY,
+    EXTERNAL_READ_RESULT_KEY,
     LOCAL_READ_RESULT_KEY,
     LOCAL_READ_TASK_REFERENCE_KEY,
     LOCAL_WRITE_CAPABILITY,
@@ -122,9 +123,15 @@ from jarvis.destinations import (
 )
 from jarvis.github import (
     GITHUB_IDENTITY_BINDING,
+    GITHUB_READ_CAPABILITIES,
+    GITHUB_READ_OPERATION,
+    ExternalReadSnapshot,
     GitHubIdentityBinding,
+    GitHubRequestFrame,
+    external_read_binding_refusal,
     github_identity_binding_refusal,
     github_identity_refusal,
+    github_resource_from_dict,
     is_github_destination,
 )
 from jarvis.lifecycle import is_terminal, terminal_run_status
@@ -1600,6 +1607,10 @@ class AgentCore:
                 # what stops an external model's answer from being reduced to
                 # the H4 diagnostic summary before the user ever sees it.
                 self._bind_model_answer(task, connector, result)
+                # GitHub v1: the fourth lift, same point, same reason. It is
+                # what stops the read's answer from being reduced to the H4
+                # diagnostic summary before the operator ever sees it.
+                self._bind_external_read(task, connector, result)
                 # H4: connector-authored free-form text is bounded and
                 # scrubbed before it can become persisted task, decision or
                 # audit state. It never touches approval, billing, execution or
@@ -3558,6 +3569,68 @@ class AgentCore:
         task.local_read = replace(
             snapshot, classification=task.scope.data_classification
         )
+
+    def _bind_external_read(
+        self, task: Task, connector: BaseConnector, result: ToolResult
+    ) -> None:
+        """Bind the external read snapshot to the task, or bind nothing.
+
+        The same two gates the local bindings use, plus the one this boundary
+        adds: the snapshot must describe THE request Core authorized. The
+        frame is rebuilt HERE, from the task's own validated resource and
+        Core's OWN identity binding - never from anything the connector
+        returned - and ``external_read_binding_refusal`` then requires the
+        snapshot to name that exact repository, kind and resource. Content
+        fetched for one resource can therefore never be presented as the
+        answer to another.
+
+        Non-raising like its neighbours: a malformed or unbound snapshot is
+        DISCARDED, leaving the task with no external read at all, rather than
+        stranding the lifecycle. What is bound is untrusted reference data
+        with no authority - it selects nothing, satisfies nothing and grants
+        nothing.
+        """
+        if not set(connector.manifest.capabilities) & set(GITHUB_READ_CAPABILITIES):
+            return
+        raw = result.data if isinstance(result.data, dict) else {}
+        payload = raw.get(EXTERNAL_READ_RESULT_KEY)
+        if not isinstance(payload, dict):
+            return
+        if self.github_identity is None:
+            # No expected identity means no authorized request to bind to.
+            return
+        try:
+            resource = github_resource_from_dict(task.github)
+            frame = GitHubRequestFrame(
+                connector=connector.manifest.name,
+                capability=task.capability,
+                destination=resource.destination,
+                resource=resource,
+                principal=self.github_identity.principal,
+                credential_route=self.github_identity.credential_route,
+                operation=GITHUB_READ_OPERATION,
+            )
+            snapshot = ExternalReadSnapshot(
+                source_task_id=str(payload.get("source_task_id", "")),
+                connector=str(payload.get("connector", "")),
+                capability=str(payload.get("capability", "")),
+                destination=str(payload.get("destination", "")),
+                resource_kind=str(payload.get("resource_kind", "")),
+                resource_id=str(payload.get("resource_id", "")),
+                content=str(payload.get("content", "")),
+                truncated=bool(payload.get("truncated", False)),
+                byte_size=int(payload.get("byte_size", 0)),
+                sha256=str(payload.get("sha256", "")),
+                classification=task.scope.data_classification,
+                captured_at=str(payload.get("captured_at", "")),
+            )
+        except Exception:  # noqa: BLE001 - discard, never strand the lifecycle
+            return
+        if snapshot.source_task_id != task.id:
+            return
+        if external_read_binding_refusal(snapshot, frame=frame) is not None:
+            return
+        task.external_read = snapshot.to_dict()
 
     def _bind_local_write(
         self, task: Task, connector: BaseConnector, result: ToolResult

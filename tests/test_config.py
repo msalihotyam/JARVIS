@@ -164,6 +164,9 @@ class ParsingTests(ConfigTestCase):
         self.assertEqual(result.settings.claude_call_budget_usd, 1.5)
 
     def test_the_key_set_is_exactly_closed(self) -> None:
+        # Still an EXACT set, now including the two GitHub authority keys
+        # that GitHub v1 added. Neither holds a credential: one is a login and
+        # the other is a list of canonical repository destinations.
         self.assertEqual(
             set(CONFIG_KEYS),
             {
@@ -171,6 +174,7 @@ class ParsingTests(ConfigTestCase):
                 "paid_api_enabled", "paid_api_approval_id",
                 "claude_call_budget_usd", "approval_ttl_minutes",
                 "memory_database", "claude_model", "claude_effort",
+                "github_principal", "github_repositories",
             },
         )
 

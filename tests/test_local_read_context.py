@@ -1638,7 +1638,7 @@ class IsolationTests(LocalReadContextBase):
         payload = self.run_consumer([first, second])
         final = self.approve(payload)
         self.assertEqual(OUTPUT_SCHEMA_VERSION, final["schema_version"])
-        self.assertEqual(6, final["schema_version"])
+        self.assertEqual(7, final["schema_version"])
         self.assertIsNone(final["local_read"])
         self.assertNotIn("local_read_context", final)
         self.assertNotIn("local_reads", final)
@@ -1661,6 +1661,10 @@ class IsolationTests(LocalReadContextBase):
                 "command",
                 "effective_permission_mode",
                 "error",
+                # GitHub v1 added the bounded external-read block (envelope
+                # 6 -> 7). It renders None for a task that named no GitHub
+                # read, so this suite's isolation property is unchanged.
+                "external_read",
                 "local_read",
                 "local_write",
                 "model_answer",

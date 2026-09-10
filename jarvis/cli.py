@@ -565,6 +565,8 @@ CONFIG_SETTABLE_KEYS = (
     "memory_database",
     "claude_model",
     "claude_effort",
+    "github_principal",
+    "github_repositories",
 )
 
 
@@ -636,6 +638,18 @@ def _config_change(key: str, raw: str):
         return lambda current: replace(current, claude_model=raw)
     if key == "claude_effort":
         return lambda current: replace(current, claude_effort=raw)
+    # github_principal / github_repositories: the raw operator string is
+    # passed through and the GitHub grammars in ``settings`` are the only
+    # validators. The repository list is comma-separated because a list is
+    # what the authority IS - one grant per repository - and an empty value
+    # clears it, which is how an operator revokes GitHub access.
+    if key == "github_principal":
+        return lambda current: replace(current, github_principal=raw)
+    if key == "github_repositories":
+        entries = tuple(
+            part.strip() for part in raw.split(",") if part.strip()
+        )
+        return lambda current: replace(current, github_repositories=entries)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)

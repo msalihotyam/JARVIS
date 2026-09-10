@@ -1205,7 +1205,7 @@ class CompositionTests(unittest.TestCase):
         payload = self.app.resume(
             session_id=self.session_id, task_id=task_id
         ).payload
-        self.assertEqual(6, payload["schema_version"])
+        self.assertEqual(7, payload["schema_version"])
         self.assertEqual(OUTPUT_SCHEMA_VERSION, payload["schema_version"])
         # The span rides inside the existing local_read block, nowhere else.
         self.assertNotIn("local_region", payload)
@@ -1385,7 +1385,7 @@ class HeadCompatibilityTests(RegionReadBase):
         # Scheduler phase 2A owns the current SQLite schema (9); the
         # output envelope contract is untouched by it and remains at 6.
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":  # pragma: no cover

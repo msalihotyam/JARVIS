@@ -652,7 +652,8 @@ class CliTestCase(unittest.TestCase):
         # added without a bump, is now covered by a version too).
         # M5 bumped it again, 3 -> 4, for the bounded ``local_write`` block.
         # M6 bumped it again, 4 -> 5, for the bounded ``model_answer`` block.
-        self.assertEqual(6, payload["schema_version"])
+        # GitHub v1 bumped it 6 -> 7 for the bounded ``external_read`` block.
+        self.assertEqual(7, payload["schema_version"])
         self.assertEqual(
             {
                 "schema_version",
@@ -667,6 +668,7 @@ class CliTestCase(unittest.TestCase):
                 "local_read",
                 "local_write",
                 "model_answer",
+                "external_read",
                 "chain",
                 "result",
                 "error",

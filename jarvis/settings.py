@@ -21,6 +21,12 @@ from jarvis.contracts import (
     credential_bearing,
     nano_usd,
 )
+# The GitHub grammars themselves, so a configured value is judged by the same
+# contracts a request is - never by a second, weaker copy living here.
+from jarvis.github import (
+    github_principal_refusal,
+    github_raw_destination_refusal,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -124,6 +130,23 @@ class Settings:
     #: field is a secret: both are bounded, validated, displayable data.
     claude_model: str | None = None
     claude_effort: str | None = None
+    #: GitHub v1 authority, and it is CONFIGURATION rather than source. The
+    #: build ships no account and no repository: an operator states the login
+    #: their local CLI session belongs to and the exact repositories that
+    #: session may read, and the composition root turns those two statements
+    #: into the Core-owned identity binding and the exact
+    #: ``DestinationGrant`` rows. Nothing is inferred - not from the CLI's own
+    #: session, not from a local git remote, not from task text - so an
+    #: unconfigured installation can reach no repository at all.
+    #:
+    #: ``github_principal`` is a NON-SECRET login, never a token. There is no
+    #: setting anywhere in this product that holds a GitHub credential.
+    github_principal: str | None = None
+    #: Canonical repository destinations, spelled exactly
+    #: ``github/<owner>/<repository>``. Each becomes one exact destination
+    #: grant, and a read outside that list is refused by Core's destination
+    #: policy rather than by the connector.
+    github_repositories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # THE typed runtime authority, and it has to actually be typed. Core
@@ -190,6 +213,35 @@ class Settings:
             object.__setattr__(self, "paid_api_approval_id", approval_id)
         if self.paid_api_enabled and approval_id is None:
             raise ValueError("Enabling paid APIs requires an explicit approval id")
+        # GitHub authority, validated by the GitHub contracts themselves so
+        # this module grows no second grammar. A configured value that would
+        # not pass there is refused HERE, at construction, rather than
+        # becoming a grant nobody can use or - worse - a plausible one.
+        principal = self.github_principal
+        if principal is not None:
+            reason = github_principal_refusal(principal)
+            if reason is not None:
+                raise ValueError(f"github_principal is unusable: {reason}")
+        if type(self.github_repositories) is list:
+            object.__setattr__(
+                self, "github_repositories", tuple(self.github_repositories)
+            )
+        if type(self.github_repositories) is not tuple:
+            raise ValueError(
+                "github_repositories must be a tuple of github/<owner>/<repository>"
+            )
+        for entry in self.github_repositories:
+            reason = github_raw_destination_refusal(entry)
+            if reason is not None:
+                raise ValueError(f"github_repositories entry is unusable: {reason}")
+        if self.github_repositories and principal is None:
+            # A repository with nobody to read it as would be an authority
+            # that can never be exercised, and an identity-less GitHub grant
+            # is exactly what Core refuses at execution. Refused here instead,
+            # where the operator can see why.
+            raise ValueError(
+                "github_repositories requires github_principal to be set"
+            )
         if not MIN_APPROVAL_TTL_MINUTES <= self.approval_ttl_minutes <= (
             MAX_APPROVAL_TTL_MINUTES
         ):
@@ -259,7 +311,23 @@ CONFIG_KEYS = (
     "memory_database",
     "claude_model",
     "claude_effort",
+    # GitHub v1. Authority as CONFIGURATION: the login the local CLI session
+    # belongs to, and the exact repositories it may read. Neither is a
+    # credential, and there is no key anywhere in this document that holds
+    # one.
+    "github_principal",
+    "github_repositories",
 )
+
+#: The pre-GitHub key set: the document exactly as a build before GitHub v1
+#: wrote it. Accepted whole, with both GitHub settings unset, for the same
+#: reason the legacy shape below is - an operator's existing preferences must
+#: survive an upgrade without a repair - and it is a second CLOSED shape, not
+#: an "optional keys" hole.
+PRE_GITHUB_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {
+    "github_principal",
+    "github_repositories",
+}
 
 #: The legacy v1 key set: the document exactly as the canonical ea1c123 build
 #: wrote it, before manual Claude selection existed. A document carrying
@@ -268,7 +336,7 @@ CONFIG_KEYS = (
 #: - one new key without the other, any unknown key, any missing
 #: pre-existing key - is refused whole: this is a second accepted CLOSED
 #: shape, never a general "optional keys" hole.
-LEGACY_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"claude_model", "claude_effort"}
+LEGACY_CONFIG_KEYS = PRE_GITHUB_CONFIG_KEYS - {"claude_model", "claude_effort"}
 
 #: Raw provider tokens the canonical policy does not classify. It is
 #: syntax-aware - it reads labels and delimiters - and a raw token carries
@@ -513,6 +581,29 @@ def _exact_claude_effort(value: object) -> str | None:
     raise AssertionError("unreachable")
 
 
+def _exact_github_principal(value: object) -> str | None:
+    """The configured login, or ``None``. Never coerced, never a credential."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        _fail("'github_principal' must be a string or null.")
+    return value
+
+
+def _exact_github_repositories(value: object) -> tuple[str, ...]:
+    """The configured canonical repository destinations, exactly as written.
+
+    A list of strings and nothing else: no coercion, no splitting of a single
+    string, no de-duplication that could hide a typo. Each entry's spelling is
+    judged by the GitHub destination grammar in the constructor.
+    """
+    if value is None:
+        return ()
+    if type(value) is not list or any(type(item) is not str for item in value):
+        _fail("'github_repositories' must be a list of strings.")
+    return tuple(value)
+
+
 def _document_from_settings(settings: Settings) -> dict[str, object]:
     """The complete canonical document for a Settings. Always every key."""
     return {
@@ -526,6 +617,8 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "memory_database": str(settings.memory_database),
         "claude_model": settings.claude_model,
         "claude_effort": settings.claude_effort,
+        "github_principal": settings.github_principal,
+        "github_repositories": list(settings.github_repositories),
     }
 
 
@@ -540,7 +633,11 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     if type(document) is not dict:
         _fail("The configuration document must be a JSON object.")
     keys = set(document)
-    if keys != set(CONFIG_KEYS) and keys != set(LEGACY_CONFIG_KEYS):
+    if keys not in (
+        set(CONFIG_KEYS),
+        set(PRE_GITHUB_CONFIG_KEYS),
+        set(LEGACY_CONFIG_KEYS),
+    ):
         # One verdict for missing and unknown alike: a typo silently ignored
         # is a setting the operator believes they made and did not. Exactly
         # two shapes are accepted: the current full v1 key set, or the
@@ -579,6 +676,15 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             # shape) or both absent (legacy shape); absent means unset.
             claude_model=_exact_claude_model(document.get("claude_model")),
             claude_effort=_exact_claude_effort(document.get("claude_effort")),
+            # Absent means unset (a pre-GitHub document), which composes to no
+            # connector, no grant and no expected identity. A present value is
+            # judged by the GitHub grammars through the constructor below.
+            github_principal=_exact_github_principal(
+                document.get("github_principal")
+            ),
+            github_repositories=_exact_github_repositories(
+                document.get("github_repositories")
+            ),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

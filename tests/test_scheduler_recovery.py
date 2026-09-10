@@ -1731,7 +1731,7 @@ class RecoveryAuthorityTests(unittest.TestCase):
         from jarvis.memory import SCHEMA_VERSION
 
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

@@ -573,7 +573,7 @@ class SchemaMigrationTests(unittest.TestCase):
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
         self.assertEqual(1, JOB_DEFINITION_VERSION)
 
 

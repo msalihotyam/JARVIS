@@ -434,7 +434,7 @@ class Schema10MigrationTests(unittest.TestCase):
     def test_the_output_schema_did_not_move(self) -> None:
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
 
 # --------------------------------------------------------------------------

@@ -577,7 +577,7 @@ class OrphanSurfaceTests(unittest.TestCase):
         from jarvis.memory import SCHEMA_VERSION
 
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
     def test_the_typed_abandonment_result_is_what_resolution_requires(self) -> None:
         # The exact contract the resolution proof reads, asserted against the

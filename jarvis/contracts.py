@@ -2201,6 +2201,12 @@ LOCAL_READ_CAPABILITY = "file_read"
 #: to ``next_step``, so this transport is read once and never persisted.
 LOCAL_READ_RESULT_KEY = "local_read"
 
+#: GitHub v1. The ``ToolResult.data`` key an external read connector hands its
+#: bounded snapshot back through. Here rather than in the connector module for
+#: the same reason the local one is: the execution boundary must know the
+#: transport without importing an implementation of it.
+EXTERNAL_READ_RESULT_KEY = "external_read"
+
 #: The task ``context`` key that references an earlier completed local read.
 #: A reference only: content is always re-derived from the referenced task's
 #: own persisted state and re-validated.
@@ -5546,6 +5552,29 @@ class Task:
     #: rebuilds a task solely from storage, so bytes that are not stored
     #: cannot be re-attested. At authoritative terminal state the storage
     #: layer blanks it in the same guarded transaction.
+    #: GitHub v1. The typed GitHub resource this task names, in its own
+    #: canonical serialized form ( ``{}`` = this task names none). A DICT
+    #: rather than the typed object because the typed object lives in
+    #: ``jarvis.github``, which imports this module - and every consumer
+    #: rebuilds it through ``github_resource_from_dict``, which judges it
+    #: again, so nothing here is trusted for being stored.
+    #:
+    #: It IS accepted from untrusted task input, like ``write_content`` and
+    #: for the same reason: it is the request, and authority over it comes
+    #: from the exact destination grant and the approval, never from
+    #: provenance. It is validated at the input boundary before it is ever
+    #: written here. It must survive a reload, because ``resume`` rebuilds a
+    #: task solely from storage and an approved read has to still know what
+    #: it was approved to read.
+    github: dict[str, Any] = field(default_factory=dict)
+    #: GitHub v1. The bounded, untrusted snapshot of what an external read
+    #: returned, in the serialized form of ``ExternalReadSnapshot``. Written
+    #: only by AgentCore from a validated connector result; never accepted
+    #: from untrusted task input, never persisted into project memory, never
+    #: a retrieval candidate and never authority of any kind - it is
+    #: reference material that cannot select a capability, widen a
+    #: destination, satisfy an approval or grant a tool.
+    external_read: dict[str, Any] = field(default_factory=dict)
     write_content: str = ""
     #: M5. The declared write mode, part of the authority rather than a hint.
     #: Separate from ``local_write`` because the record is the post-execution
@@ -5649,6 +5678,11 @@ class Task:
             "result_snapshot": sanitize_result_snapshot(self.result_snapshot),
             "retrieved_context": self.retrieved_context.to_dict(),
             "local_read": self.local_read.to_dict(),
+            # GitHub v1. Both are plain serialized state: the request this
+            # task names, and the untrusted content one returned. Neither is
+            # ever erased - a completed read's answer is the deliverable.
+            "github": dict(self.github),
+            "external_read": dict(self.external_read),
             "write_content": self.write_content,
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
@@ -5845,6 +5879,22 @@ class Task:
             # Legacy task JSON without the field loads as an empty snapshot;
             # a malformed one loads closed (SECRET, re-bounded excerpt).
             local_read=LocalReadSnapshot.from_dict(data.get("local_read")),
+            # GitHub v1. Loaded as plain mappings and NOTHING is inferred from
+            # the load: a value that is not a dict loads as absent rather than
+            # partly believed, and every consumer re-judges the content
+            # through the GitHub contracts before acting on it. A row edited
+            # outside the product therefore cannot become a request this build
+            # would have refused, because being stored proves nothing here.
+            github=(
+                dict(data["github"])
+                if isinstance(data.get("github"), dict)
+                else {}
+            ),
+            external_read=(
+                dict(data["external_read"])
+                if isinstance(data.get("external_read"), dict)
+                else {}
+            ),
             # M5. The same grammar the input boundary applies, so a row edited
             # outside the product cannot carry a payload the boundary would
             # have refused. An empty value is legitimate twice over: a task

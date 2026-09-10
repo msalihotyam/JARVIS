@@ -427,7 +427,7 @@ class Schema9MigrationTests(unittest.TestCase):
         from jarvis.contracts import JOB_DEFINITION_VERSION
 
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
         self.assertEqual(1, JOB_DEFINITION_VERSION)
 
 

@@ -27,6 +27,7 @@ from jarvis.connectors.base import BaseConnector
 # Imported only because this module is the production composition root. The
 # presentation redaction policy below is owned here, not by any connector.
 from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.connectors.github_cli import GitHubCliConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
@@ -110,12 +111,23 @@ from jarvis.contracts import (
 from jarvis.core import AgentCore
 from jarvis.dispatch import DISPATCH_REFUSED, cancel_job_run
 from jarvis.destinations import (
+    CONNECTOR_DESTINATION_POLICY,
     DEFAULT_TASK_DESTINATION,
     DestinationGrant,
     canonical_destination,
     destination_refusal,
 )
-from jarvis.github import GitHubIdentityBinding
+from jarvis.github import (
+    GITHUB_CONNECTOR,
+    ExternalReadSnapshot,
+    GITHUB_READ_CAPABILITIES,
+    GitHubExecutionUnavailable,
+    GitHubIdentityBinding,
+    github_destination_refusal,
+    github_resource_binding_refusal,
+    github_resource_from_dict,
+    external_read_refusal,
+)
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
@@ -137,7 +149,13 @@ from jarvis.settings import (
 #: Version 6 (M11) added the top-level ``chain`` object: the session's inert
 #: sequential declaration, presentation only. The SQLite schema is a separate
 #: contract and stays at its own version.
-OUTPUT_SCHEMA_VERSION = 6
+#: Version 7 (GitHub v1) added the bounded top-level ``external_read`` object:
+#: the untrusted content one authorized GitHub read returned. A consumer must
+#: be able to tell a build that can carry inbound external content from one
+#: that cannot, which is what this field is for - so the block is a bump
+#: rather than a silent key. The SQLite schema is untouched by it and stays
+#: at 10.
+OUTPUT_SCHEMA_VERSION = 7
 
 #: Untrusted task JSON is bounded before it is parsed.
 MAX_TASK_JSON_BYTES = 256 * 1024
@@ -226,6 +244,11 @@ _TASK_KEYS = frozenset(
         # verbatim into its payload, so a context key would have been an
         # egress channel for up to 64 KiB of file content.
         "write",
+        # GitHub v1. A TOP-LEVEL section for the same reason ``write`` is
+        # one: the Claude connector serializes ``context`` verbatim into its
+        # payload, so a context key would be an egress channel. Nothing adds
+        # this section to an outbound key set.
+        "github",
         # M9. The bounded LINE REGION of the read target. A top-level section
         # for the same reason ``write`` is: ``context`` egresses verbatim.
         LOCAL_READ_REGION_SECTION,
@@ -236,6 +259,14 @@ _TASK_KEYS = frozenset(
 #: ``content`` and the reference is mandatory; the durable source kind is
 #: derived here from that shape and is never accepted from input.
 _WRITE_KEYS = frozenset({"content", "mode", LOCAL_WRITE_SOURCE_KEY})
+#: GitHub v1. The typed resource fields, and nothing else. Default-deny like
+#: every other section: a URL, an endpoint, an argv, a shell fragment or a
+#: search-qualifier string has no key here, so none of them is expressible.
+#: ``kind``, ``owner`` and ``repository`` are required; the rest are the
+#: optional fields whose presence each kind decides.
+_GITHUB_KEYS = frozenset(
+    {"kind", "owner", "repository", "number", "ref", "path", "state", "limit", "query"}
+)
 #: M9. The only two read-window parameters. Default-deny like every other
 #: section: anything else is rejected, never ignored.
 _READ_KEYS = frozenset({"start_line", "max_lines"})
@@ -663,6 +694,49 @@ def decode_task_json(raw: str | bytes) -> Task:
                 f"'{LOCAL_READ_REGION_SECTION}' is refused: {reason}."
             )
 
+    # GitHub v1. The typed resource, judged HERE by the GitHub contracts
+    # themselves rather than by a second grammar living in this module. What
+    # is stored on the task is the CANONICAL serialization of the object that
+    # passed - never the raw input - so a task can only ever carry a resource
+    # this build would construct today.
+    github_input = _section(document, "github", _GITHUB_KEYS)
+    github_resource: dict[str, Any] = {}
+    if github_input:
+        if capability not in GITHUB_READ_CAPABILITIES:
+            raise TaskInputError(
+                "'github' may only be named by a GitHub read capability."
+            )
+        for key in ("kind", "owner", "repository"):
+            if key not in github_input:
+                raise TaskInputError(f"'github' requires '{key}'.")
+        candidate = {
+            "kind": github_input["kind"],
+            "owner": github_input["owner"],
+            "repository": github_input["repository"],
+            "number": github_input.get("number", 0),
+            "ref": github_input.get("ref", ""),
+            "path": github_input.get("path", ""),
+            "state": github_input.get("state", ""),
+            "limit": github_input.get("limit", 0),
+            "query": github_input.get("query", ""),
+        }
+        try:
+            resource = github_resource_from_dict(candidate)
+        except GitHubExecutionUnavailable as exc:
+            raise TaskInputError(f"'github' is refused: {exc}.") from exc
+        reason = github_resource_binding_refusal(
+            resource, capability=capability, destination=destination
+        )
+        if reason is not None:
+            # The scope's destination and the resource's repository are two
+            # statements about the same thing, and an approval binds both. A
+            # task whose destination does not match the repository it names is
+            # refused here rather than reconciled into one of them.
+            raise TaskInputError(f"'github' is refused: {reason}.")
+        github_resource = resource.to_dict()
+    elif capability in GITHUB_READ_CAPABILITIES:
+        raise TaskInputError("a GitHub read capability requires a 'github' section.")
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -677,6 +751,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         context=context,
         preferences=preferences,
         project_id=project_id,
+        github=github_resource,
         write_content=write_content,
         write_mode=write_mode,
         write_source=write_source,
@@ -1008,6 +1083,56 @@ def _chain_payload(
     }
 
 
+def _external_read_payload(stored: Any) -> dict[str, Any] | None:
+    """The external read as a rendered block, or ``None``.
+
+    RE-VALIDATED HERE, from the stored mapping, through the same
+    ``external_read_refusal`` the producer had to satisfy: a row edited
+    outside the product renders no block rather than a plausible one. The
+    digest and byte size are shown so the content can be checked against what
+    was attested, and the classification is shown because it is what governs
+    where the content may go next.
+    """
+    if not isinstance(stored, dict) or not stored:
+        return None
+    try:
+        snapshot = ExternalReadSnapshot(
+            source_task_id=str(stored.get("source_task_id", "")),
+            connector=str(stored.get("connector", "")),
+            capability=str(stored.get("capability", "")),
+            destination=str(stored.get("destination", "")),
+            resource_kind=str(stored.get("resource_kind", "")),
+            resource_id=str(stored.get("resource_id", "")),
+            content=str(stored.get("content", "")),
+            truncated=bool(stored.get("truncated", False)),
+            byte_size=int(stored.get("byte_size", 0)),
+            sha256=str(stored.get("sha256", "")),
+            classification=DataClassification(
+                str(stored.get("classification", DataClassification.SECRET.value))
+            ),
+            captured_at=str(stored.get("captured_at", "")),
+        )
+    except Exception:  # noqa: BLE001 - an unrenderable snapshot renders nothing
+        return None
+    if external_read_refusal(snapshot) is not None:
+        return None
+    return {
+        "connector": snapshot.connector,
+        "capability": snapshot.capability,
+        "destination": snapshot.destination,
+        "resource_kind": snapshot.resource_kind,
+        "content": snapshot.content,
+        "truncated": snapshot.truncated,
+        "byte_size": snapshot.byte_size,
+        "sha256": snapshot.sha256,
+        "classification": snapshot.classification.value,
+        "captured_at": snapshot.captured_at,
+        # Stated rather than implied, like every other bounded fact this
+        # envelope prints: external content is reference material.
+        "trusted": False,
+    }
+
+
 def _result_payload(result: ToolResult) -> dict[str, Any]:
     usage = result.usage
     return {
@@ -1096,6 +1221,13 @@ def build_envelope(
         # nothing downstream reads it back, and it never returns to the model.
         "model_answer": (
             None if task is None else _model_answer_payload(task.model_answer)
+        ),
+        # GitHub v1. The bounded external read, re-validated the same way and
+        # shown for the same reason the model answer is: it is the operator's
+        # deliverable. It is UNTRUSTED inbound content - it grants nothing,
+        # nothing downstream reads it back, and it never travels onward.
+        "external_read": (
+            None if task is None else _external_read_payload(task.external_read)
         ),
         # M11. The session's inert sequential declaration. Presentation only:
         # it grants nothing, and declaring a chain never creates a task,
@@ -2956,6 +3088,48 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
     )
+    # GitHub v1. The authority is CONFIGURATION, resolved here and nowhere
+    # else: an operator's stated login becomes the Core-owned identity
+    # binding, and each stated repository becomes exact
+    # ``DestinationGrant`` rows - one per read capability, per repository.
+    # Nothing is inferred and nothing is defaulted, so an installation that
+    # configured no GitHub account composes with no GitHub connector, no
+    # GitHub grant and no expected identity, and therefore cannot reach a
+    # repository even if a task names one.
+    connectors: tuple[BaseConnector, ...] = (connector, local_reader, local_writer)
+    github_identity, github_policy = github_authority(settings)
+    if github_identity is not None:
+        connectors += (GitHubCliConnector(github_identity),)
     return create_app(
-        settings=settings, connectors=(connector, local_reader, local_writer)
+        settings=settings,
+        connectors=connectors,
+        destination_policy=(
+            CONNECTOR_DESTINATION_POLICY | github_policy if github_policy else None
+        ),
+        github_identity=github_identity,
     )
+
+
+def github_authority(
+    settings: Settings,
+) -> tuple[GitHubIdentityBinding | None, frozenset[DestinationGrant]]:
+    """The identity and the exact grants this installation configured.
+
+    Two values because Core needs two, and they are deliberately produced
+    together from ONE source: an installation cannot end up authorized for a
+    repository it has no identity for, or hold an identity that authorizes
+    nothing. Both halves stay Core's - this function only reads configuration
+    the operator wrote and hands the result to the composition root.
+
+    An unconfigured installation returns ``(None, frozenset())``, which is the
+    shipped default: no connector, no grant, no expected identity.
+    """
+    principal = settings.github_principal
+    if principal is None or not settings.github_repositories:
+        return (None, frozenset())
+    grants = {
+        DestinationGrant(GITHUB_CONNECTOR, capability, destination)
+        for destination in settings.github_repositories
+        for capability in GITHUB_READ_CAPABILITIES
+    }
+    return (GitHubIdentityBinding(principal=principal), frozenset(grants))

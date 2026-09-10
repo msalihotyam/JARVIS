@@ -74,6 +74,12 @@ GITHUB_READ_CAPABILITIES: tuple[str, ...] = (
     "github_issue_read",
     "github_pull_request_list",
     "github_pull_request_read",
+    # Phase 2 completes the usable-v1 READ surface. Each name is a row in the
+    # same closed table the six above are rows of - not a new mechanism.
+    "github_commit_list",
+    "github_commit_read",
+    "github_pull_request_files",
+    "github_code_search",
 )
 
 #: The write half of the same closed vocabulary. Declared because the
@@ -89,9 +95,19 @@ GITHUB_CAPABILITIES: tuple[str, ...] = (
     GITHUB_READ_CAPABILITIES + GITHUB_WRITE_CAPABILITIES
 )
 
-#: What this build can actually EXECUTE. Empty, and separately so: a name
-#: existing in the vocabulary above is a spelling, never a permission to run.
-GITHUB_ENABLED_CAPABILITIES: tuple[str, ...] = ()
+#: What this build can actually EXECUTE, and separately so: a name existing in
+#: the vocabulary above is a spelling, never a permission to run.
+#:
+#: Phase 2 gives the READ half a body - a process seam, a connector and a
+#: derived argument vector each - so those names move here. The write half
+#: stays absent and is not merely switched off: it has no argument builder
+#: anywhere in this build, so a write frame produces no plan at all.
+#:
+#: This is still not authority. An enabled capability reaches a repository
+#: only when an operator has configured the exact ``DestinationGrant`` row for
+#: it AND the build holds the Core-owned identity to act under; an
+#: unconfigured installation composes with neither.
+GITHUB_ENABLED_CAPABILITIES: tuple[str, ...] = GITHUB_READ_CAPABILITIES
 
 #: A GitHub operation is served by an already-authenticated local CLI over an
 #: API with no per-call price. Rate limits are not money and never touch the
@@ -292,6 +308,10 @@ class GitHubResourceKind(str, Enum):
     ISSUE = "issue"
     PULL_REQUEST_LIST = "pull_request_list"
     PULL_REQUEST = "pull_request"
+    COMMIT_LIST = "commit_list"
+    COMMIT = "commit"
+    PULL_REQUEST_FILES = "pull_request_files"
+    CODE_SEARCH = "code_search"
     NEW_ISSUE = "new_issue"
     NEW_ISSUE_COMMENT = "new_issue_comment"
     NEW_PULL_REQUEST_COMMENT = "new_pull_request_comment"
@@ -308,6 +328,10 @@ GITHUB_CAPABILITY_RESOURCE: Mapping[str, GitHubResourceKind] = {
     "github_issue_read": GitHubResourceKind.ISSUE,
     "github_pull_request_list": GitHubResourceKind.PULL_REQUEST_LIST,
     "github_pull_request_read": GitHubResourceKind.PULL_REQUEST,
+    "github_commit_list": GitHubResourceKind.COMMIT_LIST,
+    "github_commit_read": GitHubResourceKind.COMMIT,
+    "github_pull_request_files": GitHubResourceKind.PULL_REQUEST_FILES,
+    "github_code_search": GitHubResourceKind.CODE_SEARCH,
     "github_issue_create": GitHubResourceKind.NEW_ISSUE,
     "github_issue_comment_create": GitHubResourceKind.NEW_ISSUE_COMMENT,
     "github_pull_request_comment_create": (
@@ -320,6 +344,15 @@ GITHUB_LIST_STATES: tuple[str, ...] = ("open", "closed", "all")
 
 #: The deterministic list bound. A listing is a bounded read, never an export.
 GITHUB_LIST_MAX_ITEMS = 50
+
+#: The SEPARATE, tighter bound on a code search. Its own policy surface on
+#: purpose: a listing names one repository's own issues or pull requests,
+#: while a search reaches across a repository's whole content, and the two
+#: must stay free to diverge. A search is a lookup, never a crawl.
+GITHUB_SEARCH_MAX_ITEMS = 10
+
+#: Hard ceiling on the one bounded search query field.
+GITHUB_QUERY_MAX_CHARS = 128
 
 #: Hard ceiling on a repository-relative file path. Its OWN policy surface:
 #: it bounds a path INSIDE a repository, not a local filesystem target, so it
@@ -336,6 +369,11 @@ GITHUB_NUMBER_MAX = 1_000_000_000
 
 _REF_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 
+#: The bounded literal search term: words and the characters real identifiers
+#: carry, separated by single spaces. No ``:`` (qualifiers), no quotes, no
+#: boolean operators, no wildcards, no path syntax.
+_QUERY_PATTERN = re.compile(r"\A[A-Za-z0-9_.-]+(?: [A-Za-z0-9_.-]+)*\Z")
+
 #: The optional fields, and which kinds REQUIRE each of them. A field a kind
 #: does not require must be absent: the model is closed in both directions,
 #: so a repository target cannot quietly carry an issue number.
@@ -346,6 +384,13 @@ _RESOURCE_FIELDS: Mapping[GitHubResourceKind, frozenset[str]] = {
     GitHubResourceKind.ISSUE: frozenset({"number"}),
     GitHubResourceKind.PULL_REQUEST_LIST: frozenset({"state", "limit"}),
     GitHubResourceKind.PULL_REQUEST: frozenset({"number"}),
+    # A commit listing is bounded by count alone; naming a ref would make it
+    # a second, differently-shaped history query, which usable-v1 does not
+    # need. A commit READ names the exact sha (or ref) it is about.
+    GitHubResourceKind.COMMIT_LIST: frozenset({"limit"}),
+    GitHubResourceKind.COMMIT: frozenset({"ref"}),
+    GitHubResourceKind.PULL_REQUEST_FILES: frozenset({"number", "limit"}),
+    GitHubResourceKind.CODE_SEARCH: frozenset({"query", "limit"}),
     GitHubResourceKind.NEW_ISSUE: frozenset(),
     GitHubResourceKind.NEW_ISSUE_COMMENT: frozenset({"number"}),
     GitHubResourceKind.NEW_PULL_REQUEST_COMMENT: frozenset({"number"}),
@@ -358,6 +403,7 @@ _RESOURCE_ABSENT: Mapping[str, Any] = {
     "path": "",
     "state": "",
     "limit": 0,
+    "query": "",
 }
 
 
@@ -435,13 +481,50 @@ def _limit_refusal(value: Any) -> str | None:
     return None
 
 
+def github_query_refusal(value: Any) -> str | None:
+    """Why this is not the ONE bounded code-search term, or ``None``.
+
+    A LITERAL TERM, never a query language. GitHub's search syntax is
+    deliberately unavailable here: ``:`` would let a caller write
+    ``repo:other/repo`` or ``org:...`` and reach outside the repository the
+    destination grant authorizes, and the boolean/qualifier operators would
+    turn one bounded lookup into a crawl. So the grammar is plain words -
+    letters, digits, and a small set of characters real identifiers contain -
+    with no leading dash, which is also what keeps a term from being read as
+    a flag by the CLI that receives it.
+    """
+    reason = _ascii_text_refusal(value, "search query", GITHUB_QUERY_MAX_CHARS)
+    if reason is not None:
+        return reason
+    if value != value.strip():
+        return "the search query has leading or trailing whitespace"
+    if value.startswith("-"):
+        return "the search query starts like a command-line flag"
+    if not _QUERY_PATTERN.fullmatch(value):
+        return "the search query is not a bounded literal term"
+    return None
+
+
+def _search_limit_refusal(value: Any) -> str | None:
+    if type(value) is not int:
+        return "the search bound is not an integer"
+    if not 1 <= value <= GITHUB_SEARCH_MAX_ITEMS:
+        return "the search bound is outside the deterministic range"
+    return None
+
+
 _RESOURCE_FIELD_REFUSAL = {
     "number": github_number_refusal,
     "ref": github_ref_refusal,
     "path": github_path_refusal,
     "state": _state_refusal,
     "limit": _limit_refusal,
+    "query": github_query_refusal,
 }
+
+#: The one kind whose bound is the tighter search bound rather than the list
+#: bound. Stated as data so the refusal table stays a table.
+_SEARCH_LIMIT_KINDS = frozenset({GitHubResourceKind.CODE_SEARCH})
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +539,9 @@ class GitHubResource:
     path: str = ""
     state: str = ""
     limit: int = 0
+    #: The ONE bounded literal search term, and only a code search may carry
+    #: it. It is a term, never a query language - see ``github_query_refusal``.
+    query: str = ""
 
     @property
     def destination(self) -> str:
@@ -471,6 +557,7 @@ class GitHubResource:
             "path": self.path,
             "state": self.state,
             "limit": self.limit,
+            "query": self.query,
         }
 
     @property
@@ -504,10 +591,73 @@ def github_resource_refusal(resource: Any) -> str | None:
                     f"the {resource.kind.value} target may not carry a {field_name}"
                 )
             continue
-        reason = _RESOURCE_FIELD_REFUSAL[field_name](value)
+        # A code search is bounded by its own tighter ceiling. Chosen by the
+        # KIND rather than by the field, so a listing can never borrow the
+        # search bound or the other way round.
+        if field_name == "limit" and resource.kind in _SEARCH_LIMIT_KINDS:
+            reason = _search_limit_refusal(value)
+        else:
+            reason = _RESOURCE_FIELD_REFUSAL[field_name](value)
         if reason is not None:
             return reason
     return None
+
+
+#: The exact keys a serialized resource carries. Default-deny in both
+#: directions: a missing key and an unknown key are the same failure.
+_RESOURCE_KEYS = frozenset(
+    {"kind", "owner", "repository"} | set(_RESOURCE_ABSENT)
+)
+
+
+def github_resource_from_dict(data: Any) -> GitHubResource:
+    """Rebuild one typed resource from its serialized form, or fail closed.
+
+    THE only way a stored or decoded resource becomes a typed one. Exact
+    keys, exact types, no coercion, no defaults filled in for a missing key
+    and no partial acceptance - and the rebuilt object is then judged by the
+    same ``github_resource_refusal`` a freshly built one is, so a row that
+    was valid under an older vocabulary cannot re-enter as a resource this
+    build would refuse to construct.
+
+    Raises ``GitHubExecutionUnavailable``: a resource that cannot be rebuilt
+    truthfully must not exist in a half-built form that later looks whole.
+    """
+    if not isinstance(data, dict):
+        raise GitHubExecutionUnavailable("the resource is not an object")
+    if set(data) != _RESOURCE_KEYS:
+        raise GitHubExecutionUnavailable(
+            "the resource carries a missing or unsupported key"
+        )
+    raw_kind = data["kind"]
+    if type(raw_kind) is not str:
+        raise GitHubExecutionUnavailable("the resource kind is not a string")
+    try:
+        kind = GitHubResourceKind(raw_kind)
+    except ValueError:
+        raise GitHubExecutionUnavailable(
+            f"unknown GitHub resource kind {raw_kind!r}"
+        ) from None
+    for field_name, absent in _RESOURCE_ABSENT.items():
+        if type(data[field_name]) is not type(absent):
+            raise GitHubExecutionUnavailable(
+                f"the resource {field_name} is not the type this contract holds"
+            )
+    resource = GitHubResource(
+        kind=kind,
+        owner=data["owner"],
+        repository=data["repository"],
+        number=data["number"],
+        ref=data["ref"],
+        path=data["path"],
+        state=data["state"],
+        limit=data["limit"],
+        query=data["query"],
+    )
+    reason = github_resource_refusal(resource)
+    if reason is not None:
+        raise GitHubExecutionUnavailable(reason)
+    return resource
 
 
 def github_resource_binding_refusal(
@@ -653,6 +803,11 @@ GITHUB_REQUEST_FRAME_HEADER = b"jarvis.github_request.v1"
 #: Digest of no request body at all. A read binds this; only a write carries
 #: real bytes, and an empty digest can never masquerade as one that does.
 GITHUB_EMPTY_BODY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+#: The operation label every READ frame carries. One value, here rather than
+#: in a connector: the label is part of what the approval digest binds, so the
+#: execution boundary must know it without importing an implementation.
+GITHUB_READ_OPERATION = "read"
 
 #: Hard ceiling on the operation label. Its own bounded policy surface.
 GITHUB_OPERATION_MAX_CHARS = 64
@@ -973,6 +1128,50 @@ _GH_ARGV_BUILDERS: Mapping[str, Any] = {
         _slug(r),
         "--json",
         "number,title,state,body,updatedAt",
+    ),
+    # Phase 2. The same two shapes as above and no third one: a typed ``gh``
+    # subcommand where one exists, and ``gh api`` with a literal hostname
+    # where it does not. Every interpolated value has already passed its own
+    # grammar, and those grammars exclude ``?``, ``#``, ``&`` and ``%``, so
+    # none of them can bolt a second parameter onto a query string.
+    "github_commit_list": lambda r: (
+        "api",
+        *GITHUB_HOSTNAME_ARGS,
+        "--method",
+        "GET",
+        f"repos/{_slug(r)}/commits?per_page={r.limit}",
+    ),
+    "github_commit_read": lambda r: (
+        "api",
+        *GITHUB_HOSTNAME_ARGS,
+        "--method",
+        "GET",
+        f"repos/{_slug(r)}/commits/{r.ref}",
+    ),
+    # The PR file list IS the diff surface: each entry carries the filename,
+    # the added/removed counts and the per-file patch, which is what "PR
+    # files/diff" needs and is bounded by the same per-page ceiling.
+    "github_pull_request_files": lambda r: (
+        "api",
+        *GITHUB_HOSTNAME_ARGS,
+        "--method",
+        "GET",
+        f"repos/{_slug(r)}/pulls/{r.number}/files?per_page={r.limit}",
+    ),
+    # ``--repo`` is what keeps a search inside the repository the grant
+    # authorizes, and the query grammar is what keeps a qualifier from
+    # widening it back out. The term is last so it cannot be read as the
+    # value of a preceding flag.
+    "github_code_search": lambda r: (
+        "search",
+        "code",
+        "--repo",
+        _slug(r),
+        "--limit",
+        str(r.limit),
+        "--json",
+        "path,repository",
+        r.query,
     ),
 }
 
@@ -1343,8 +1542,11 @@ __all__ = [
     "GITHUB_NUMBER_MAX",
     "GITHUB_OPERATION_MAX_CHARS",
     "GITHUB_PATH_MAX_CHARS",
+    "GITHUB_QUERY_MAX_CHARS",
     "GITHUB_READ_CAPABILITIES",
+    "GITHUB_READ_OPERATION",
     "GITHUB_REF_MAX_CHARS",
+    "GITHUB_SEARCH_MAX_ITEMS",
     "GITHUB_REMOVED_ENVIRONMENT",
     "GITHUB_REMOVED_ENVIRONMENT_PREFIXES",
     "GITHUB_REQUEST_FRAME_HEADER",
@@ -1375,8 +1577,10 @@ __all__ = [
     "github_path_refusal",
     "github_principal_refusal",
     "github_raw_destination_refusal",
+    "github_query_refusal",
     "github_ref_refusal",
     "github_resource_binding_refusal",
+    "github_resource_from_dict",
     "github_resource_refusal",
     "is_github_destination",
     "sanitized_github_environment",

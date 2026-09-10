@@ -1711,15 +1711,18 @@ class NoPartialMutationTests(BoundaryTestCase):
 class EnvelopeSurfaceTests(BoundaryTestCase):
     """The public chain block: presentation only, deterministic, fixed-key."""
 
-    def test_the_output_schema_is_six(self) -> None:
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+    def test_the_output_schema_is_current(self) -> None:
+        # M11 shipped the chain block at envelope 6; GitHub v1 moved the
+        # contract to 7 for its own bounded block. What this suite pins is
+        # that the chain key is always present, which the tests below prove.
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
     def test_a_session_with_no_chain_renders_explicit_absence(self) -> None:
         result = chain_show_result(self.memory, self.settings, self.session.id)
         self.assertEqual(result.exit_code, EXIT_OK)
         self.assertIn("chain", result.payload)
         self.assertIsNone(result.payload["chain"])
-        self.assertEqual(result.payload["schema_version"], 6)
+        self.assertEqual(result.payload["schema_version"], 7)
 
     def test_the_envelope_always_carries_the_chain_key(self) -> None:
         payload = build_envelope("run", self.settings.permission_mode)
@@ -1808,7 +1811,7 @@ class CliSurfaceTests(BoundaryTestCase):
         )
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(payload["command"], "chain-declare")
-        self.assertEqual(payload["schema_version"], 6)
+        self.assertEqual(payload["schema_version"], 7)
         self.assertEqual(len(payload["chain"]["steps"]), 2)
         code, shown = self._run(
             ["chain", "show", "--session-id", self.session.id]
@@ -5247,7 +5250,7 @@ class DriverSurfaceTests(DriverTestCase):
         result = self.app.run_chain(self.session.id)
         payload = result.payload
         self.assertEqual(payload["command"], "chain-run")
-        self.assertEqual(payload["schema_version"], 6)
+        self.assertEqual(payload["schema_version"], 7)
         block = payload["chain"]
         self.assertIsNotNone(block)
         self.assertIn("verdict", block)

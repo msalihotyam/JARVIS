@@ -1,0 +1,288 @@
+"""GitHub Phase 2 - THE process seam, and the only one in this build.
+
+Phase 1 shipped the offline foundation: the destination grammar, the closed
+capability and resource vocabularies, the Core-owned identity binding, the
+canonical request frame and the closed argument vectors as pure data. It
+shipped no way to run anything, on purpose. This module is the deferred
+half - the single place a child process is started - and it is deliberately
+small enough to read in one sitting.
+
+WHAT IT WILL RUN. Exactly one executable, ``gh``, found on PATH, with an
+argument vector that is RE-DERIVED from a validated typed resource by
+``jarvis.github`` and re-proved here before the process is started. There is
+no subcommand parameter, no argv parameter, no shell, no string command line
+and no way for a caller to add, reorder or override an argument. A plan that
+does not equal its own derivation never runs.
+
+WHAT IT NEVER TOUCHES. The credential. JARVIS does not read, request, store,
+pass, log or display a GitHub token: authentication is the CLI's own
+already-established session, backed by the OS credential store, and the only
+thing this module learns about it is the NON-SECRET login it belongs to and
+the NAME of the storage backing it. The child environment has every
+``GH_``/``GITHUB_``/``GIT_`` variable stripped before it is handed over, so a
+token sitting in the parent environment cannot even reach the child - which
+is also what makes the observed route provably the credential store rather
+than an environment override.
+
+WHAT IT DECIDES. Nothing. It observes an identity and returns bytes; Core
+compares that identity against its own binding, Core owns the destination
+grant, and Core owns the approval. A refusal here is always a refusal - it
+never falls back, retries, re-authenticates, prompts, opens a browser or
+widens anything.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from shutil import which
+from typing import Any, Mapping
+
+from jarvis.github import (
+    GH_ARGUMENT_MAX_CHARS,
+    GH_MAX_ARGUMENTS,
+    GITHUB_CREDENTIAL_ROUTE,
+    GITHUB_HOST,
+    GITHUB_HOSTNAME_ARGS,
+    GitHubExecutionUnavailable,
+    GitHubOperationPlan,
+    github_operation_plan_refusal,
+    sanitized_github_environment,
+)
+
+#: The one executable name this build will ever start. Resolved through PATH
+#: by ``shutil.which`` - never a caller-supplied path, and never a shell.
+GH_EXECUTABLE_NAME = "gh"
+
+#: Wall-clock ceiling on one child process. A read that cannot answer inside
+#: it is a refusal, not a longer wait: an unbounded call would hold Core's
+#: execution path open on a network the operator cannot see.
+GH_TIMEOUT_SECONDS = 30
+
+#: Ceiling on captured child output, applied to the BYTES before any decode,
+#: so an unexpectedly huge response is refused rather than loaded.
+GH_OUTPUT_MAX_BYTES = 1_048_576
+
+#: The argument vector that observes - and only observes - which account the
+#: local CLI session belongs to. It is a constant, not a parameter.
+GH_AUTH_STATUS_ARGS: tuple[str, ...] = ("auth", "status", *GITHUB_HOSTNAME_ARGS)
+
+#: ``gh auth status`` names the account and, in parentheses, the storage
+#: backing its token. The login grammar is GitHub's own; the storage word is
+#: what tells a keyring-backed session apart from a config-file or
+#: environment one.
+_LOGIN_PATTERN = re.compile(
+    r"Logged in to " + re.escape(GITHUB_HOST) + r" account ([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?) \(([a-z_]+)\)"
+)
+
+#: The ONE storage word that is the credential route Core knows. Anything
+#: else - a token in a config file, a token from the environment, a helper
+#: this build does not recognize - is refused rather than mapped onto it.
+_KEYRING_STORAGE = "keyring"
+
+
+class GitHubCommandFailed(GitHubExecutionUnavailable):
+    """A GitHub read did not happen. Never a partial or assumed result."""
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubCommandOutput:
+    """What one completed child process produced. Data, with no authority."""
+
+    stdout: str
+    truncated: bool
+
+
+def gh_executable(*, path_lookup: Any = which) -> str:
+    """The resolved ``gh`` path, or fail closed.
+
+    Resolved fresh for every call rather than cached: a cached path could
+    outlive the file it names, and a stale absolute path is exactly the kind
+    of thing that is worth resolving twice instead of guessing once.
+    """
+    resolved = path_lookup(GH_EXECUTABLE_NAME)
+    if not resolved or type(resolved) is not str:
+        raise GitHubCommandFailed(
+            "the GitHub CLI is not available on this machine"
+        )
+    return resolved
+
+
+def _child_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The sanitized environment the child gets, through Phase 1's policy.
+
+    ``HOME``/``APPDATA``/``USERPROFILE`` deliberately SURVIVE: they are how
+    the CLI finds its own configuration and the OS credential store, which is
+    the authentication route this build requires. What does not survive is
+    everything that could redirect the call - the whole ``GH_``/``GITHUB_``/
+    ``GIT_`` families (tokens, hosts, config paths included), the proxy
+    variables and the XDG relocations.
+    """
+    return sanitized_github_environment(
+        os.environ if environ is None else environ
+    )
+
+
+def _neutral_directory() -> str:
+    """A working directory with no repository in it.
+
+    The CLI infers a repository from the current directory's git remote when
+    one is not stated. Every vector this build derives states ``--repo`` or a
+    literal API path, so the inference is already unreachable - and running
+    outside any repository means it cannot be reached by a future argument
+    either.
+    """
+    return tempfile.gettempdir()
+
+
+def _run(
+    arguments: tuple[str, ...],
+    *,
+    environ: Mapping[str, str] | None = None,
+    path_lookup: Any = which,
+    runner: Any = subprocess.run,
+    timeout: int = GH_TIMEOUT_SECONDS,
+) -> GitHubCommandOutput:
+    """Start ``gh`` once with exactly these arguments, or fail closed.
+
+    ``shell=False`` and a real argument LIST: there is no command string
+    anywhere in this module, so quoting, globbing and interpolation are not
+    failure modes it can have. Stdin is closed with empty bytes so the child
+    can never block on a prompt, and the prompt is disabled by environment as
+    well.
+
+    Output is captured as bytes, bounded, then decoded with replacement - a
+    response that is not valid UTF-8 is a response, not an exception. Nothing
+    from ``stderr`` is returned or re-raised: a diagnostic can carry paths,
+    environment values and URLs, so the refusal states the shape of the
+    failure and the exit status only.
+    """
+    if type(arguments) is not tuple or not arguments:
+        raise GitHubCommandFailed("no argument vector was derived")
+    if len(arguments) > GH_MAX_ARGUMENTS:
+        raise GitHubCommandFailed("the argument list is over the bound")
+    for argument in arguments:
+        if type(argument) is not str or len(argument) > GH_ARGUMENT_MAX_CHARS:
+            raise GitHubCommandFailed("an argument is not bounded text")
+    executable = gh_executable(path_lookup=path_lookup)
+    try:
+        completed = runner(
+            [executable, *arguments],
+            input=b"",
+            capture_output=True,
+            shell=False,
+            env=_child_environment(environ),
+            cwd=_neutral_directory(),
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitHubCommandFailed(
+            "the GitHub CLI did not answer inside its time bound"
+        ) from exc
+    except OSError as exc:
+        raise GitHubCommandFailed("the GitHub CLI could not be started") from exc
+    if completed.returncode != 0:
+        raise GitHubCommandFailed(
+            f"the GitHub CLI refused the request (exit {completed.returncode})"
+        )
+    raw = completed.stdout or b""
+    if type(raw) is str:  # a runner configured for text; bound it the same way
+        raw = raw.encode("utf-8", errors="replace")
+    truncated = len(raw) > GH_OUTPUT_MAX_BYTES
+    return GitHubCommandOutput(
+        stdout=raw[:GH_OUTPUT_MAX_BYTES].decode("utf-8", errors="replace"),
+        truncated=truncated,
+    )
+
+
+def observed_github_identity(
+    *,
+    environ: Mapping[str, str] | None = None,
+    path_lookup: Any = which,
+    runner: Any = subprocess.run,
+) -> tuple[str, str]:
+    """The ``(principal, credential_route)`` the local session belongs to.
+
+    AN OBSERVATION, NEVER A DECISION. Core compares this against its own
+    binding; nothing here can influence what it is compared against, and a
+    connector cannot select the identity it proves.
+
+    Fail closed on every uncertainty: no session, an unreadable status, no
+    recognizable account line, MORE than one account line (which of them a
+    later call would use is exactly the ambiguity that must not be guessed),
+    or a token whose storage is not the OS credential store. The token itself
+    is never parsed, returned or logged - only the login and the storage word.
+    """
+    try:
+        output = _run(
+            GH_AUTH_STATUS_ARGS,
+            environ=environ,
+            path_lookup=path_lookup,
+            runner=runner,
+        )
+    except GitHubCommandFailed as exc:
+        raise GitHubCommandFailed(
+            "the GitHub CLI reports no usable authenticated session"
+        ) from exc
+    matches = _LOGIN_PATTERN.findall(output.stdout)
+    if len(matches) != 1:
+        raise GitHubCommandFailed(
+            "the authenticated GitHub account could not be established "
+            "unambiguously"
+        )
+    principal, storage = matches[0]
+    if storage != _KEYRING_STORAGE:
+        raise GitHubCommandFailed(
+            "the GitHub session is not backed by the OS credential store"
+        )
+    return (principal, GITHUB_CREDENTIAL_ROUTE)
+
+
+def run_operation_plan(
+    plan: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+    path_lookup: Any = which,
+    runner: Any = subprocess.run,
+) -> GitHubCommandOutput:
+    """Execute ONE re-proved read plan, or fail closed.
+
+    The plan is checked by RE-DERIVATION first, exactly as Phase 1 specified:
+    its capability must be a closed read capability, its resource must bind to
+    that capability and its destination, and its arguments must equal - element
+    for element - what the closed builder produces for that resource. A
+    hand-built plan carrying an arbitrary subcommand, an injected flag, a
+    second repository or a token-shaped argument is refused by what it SAYS,
+    not by where it came from.
+
+    Passing that check is still not authorization. The destination grant and
+    the identity comparison are Core's, they have already happened by the time
+    anything reaches here, and this function neither consults nor re-decides
+    them.
+    """
+    reason = github_operation_plan_refusal(plan)
+    if reason is not None:
+        raise GitHubCommandFailed(reason)
+    if plan.host != GITHUB_HOST:  # pragma: no cover - the refusal just proved it
+        raise GitHubCommandFailed("the plan names a host this build does not talk to")
+    return _run(
+        plan.arguments, environ=environ, path_lookup=path_lookup, runner=runner
+    )
+
+
+__all__ = [
+    "GH_AUTH_STATUS_ARGS",
+    "GH_EXECUTABLE_NAME",
+    "GH_OUTPUT_MAX_BYTES",
+    "GH_TIMEOUT_SECONDS",
+    "GitHubCommandFailed",
+    "GitHubCommandOutput",
+    "GitHubOperationPlan",
+    "gh_executable",
+    "observed_github_identity",
+    "run_operation_plan",
+]

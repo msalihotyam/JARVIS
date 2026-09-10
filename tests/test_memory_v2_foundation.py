@@ -857,7 +857,7 @@ class CompatibilityTests(unittest.TestCase):
         from jarvis.app import OUTPUT_SCHEMA_VERSION
 
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
 
     def test_legacy_non_default_lifecycle_data_survives(self) -> None:
         self._build_v6_database()

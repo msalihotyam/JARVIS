@@ -1817,10 +1817,12 @@ class PublicShapeTests(EditTestCase):
         from jarvis.connectors.claude_code import EGRESS_TOOL_GRANTS
         from jarvis.memory import SCHEMA_VERSION
 
-        # Scheduler phase 2B1 owns the current SQLite schema (10); the
-        # output envelope contract is untouched by it and remains at 6.
+        # Scheduler phase 2B1 owns the current SQLite schema (10) and no
+        # later phase has changed it. The output envelope moved to 7 when
+        # GitHub v1 added the bounded ``external_read`` block; neither
+        # contract is touched by the local-write path this suite covers.
         self.assertEqual(10, SCHEMA_VERSION)
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
         self.assertEqual((), EGRESS_TOOL_GRANTS)
 
     def test_the_write_effect_is_honest(self) -> None:

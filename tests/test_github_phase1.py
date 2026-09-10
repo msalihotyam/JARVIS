@@ -92,6 +92,7 @@ from jarvis.github import (
     github_identity_refusal,
     github_issue_body,
     github_operation_plan,
+    github_query_refusal,
     github_operation_plan_refusal,
     github_raw_destination_refusal,
     github_resource_binding_refusal,
@@ -483,9 +484,15 @@ class ResourceTargetTests(unittest.TestCase):
         self.assertNotEqual(
             GitHubResourceKind.ISSUE.value, GitHubResourceKind.PULL_REQUEST.value
         )
-        # Nine capabilities, nine distinct kinds; no capability serves two.
-        self.assertEqual(9, len(GITHUB_CAPABILITY_RESOURCE))
-        self.assertEqual(9, len(set(GITHUB_CAPABILITY_RESOURCE.values())))
+        # One distinct kind per capability, whatever the vocabulary's size:
+        # no capability serves two kinds and no kind serves two capabilities.
+        self.assertEqual(
+            len(GITHUB_CAPABILITIES), len(GITHUB_CAPABILITY_RESOURCE)
+        )
+        self.assertEqual(
+            len(GITHUB_CAPABILITY_RESOURCE),
+            len(set(GITHUB_CAPABILITY_RESOURCE.values())),
+        )
         # And a capability cannot carry the other kind's target.
         self.assertIsNotNone(
             github_resource_binding_refusal(
@@ -547,12 +554,33 @@ class ResourceTargetTests(unittest.TestCase):
                     github_resource_refusal(issue(7, owner=owner, repo=repo))
                 )
         # There is no constructor that accepts a URL: the type has typed
-        # fields only, and no ``url``, ``endpoint``, ``query`` or ``argv``.
+        # fields only, and no ``url``, ``endpoint`` or ``argv``. Phase 2 added
+        # ``query`` - the ONE bounded code-search term - and it is not a
+        # locator: its grammar admits plain words only, so it can carry
+        # neither a URL, a path, a qualifier nor a flag (proved below and in
+        # the Phase 2 suite).
         fields = {item.name for item in dataclass_fields(GitHubResource)}
         self.assertEqual(
-            {"kind", "owner", "repository", "number", "ref", "path", "state", "limit"},
+            {
+                "kind",
+                "owner",
+                "repository",
+                "number",
+                "ref",
+                "path",
+                "state",
+                "limit",
+                "query",
+            },
             fields,
         )
+        for locator in (
+            "https://github.com/acme/widgets",
+            "repo:acme/widgets",
+            "acme/widgets",
+            "--repo",
+        ):
+            self.assertIsNotNone(github_query_refusal(locator), locator)
 
     def test_an_endpoint_or_graphql_document_can_never_become_a_target(self) -> None:  # 17
         for capability in (
@@ -601,7 +629,11 @@ class ResourceTargetTests(unittest.TestCase):
                     )
                 )
 
-    def test_the_capability_vocabulary_is_exactly_the_approved_nine(self) -> None:
+    def test_the_capability_vocabulary_is_exactly_the_approved_set(self) -> None:
+        # Phase 2 completed the usable-v1 READ surface, so the exact list this
+        # guard pins is the longer one. It stays an EXACT list: the property
+        # protected here was never "six names", it is that the vocabulary is
+        # closed and that no name appears without review.
         self.assertEqual(
             (
                 "github_repository_read",
@@ -610,6 +642,10 @@ class ResourceTargetTests(unittest.TestCase):
                 "github_issue_read",
                 "github_pull_request_list",
                 "github_pull_request_read",
+                "github_commit_list",
+                "github_commit_read",
+                "github_pull_request_files",
+                "github_code_search",
             ),
             GITHUB_READ_CAPABILITIES,
         )
@@ -621,9 +657,13 @@ class ResourceTargetTests(unittest.TestCase):
             ),
             GITHUB_WRITE_CAPABILITIES,
         )
-        self.assertEqual(9, len(set(GITHUB_CAPABILITIES)))
-        # Phase 1 declares the names and enables none of them.
-        self.assertEqual((), GITHUB_ENABLED_CAPABILITIES)
+        self.assertEqual(13, len(set(GITHUB_CAPABILITIES)))
+        # Phase 2 enables the READ half and no more: the write vocabulary is
+        # still declaration only, and enabling is still not authority.
+        self.assertEqual(GITHUB_READ_CAPABILITIES, GITHUB_ENABLED_CAPABILITIES)
+        self.assertEqual(
+            set(), set(GITHUB_ENABLED_CAPABILITIES) & set(GITHUB_WRITE_CAPABILITIES)
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1140,13 +1180,33 @@ class OfflineTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
 
-    def test_no_github_connector_is_registered_in_production(self) -> None:
-        # The strongest form of "no live execution": nothing named github-cli
-        # exists as a shipped connector at all.
-        import jarvis.connectors as connectors
+    def test_the_shipped_github_connector_is_read_only_and_unconfigured(self) -> None:
+        # Phase 2 ships a connector, so "no connector exists" is no longer the
+        # property. What replaces it is stronger than the name check it
+        # supersedes: the shipped connector declares READ capabilities only,
+        # and a build that configured no GitHub account composes without it,
+        # without a grant and without an expected identity - so an
+        # unconfigured installation still cannot reach a repository.
+        from jarvis.app import build_default_app, github_authority
+        from jarvis.connectors.github_cli import GitHubCliConnector
+        from jarvis.settings import Settings
 
-        self.assertNotIn("GitHubConnector", dir(connectors))
-        self.assertEqual((), GITHUB_ENABLED_CAPABILITIES)
+        self.assertEqual(
+            set(GITHUB_READ_CAPABILITIES),
+            set(GitHubCliConnector.manifest.capabilities),
+        )
+        self.assertEqual(
+            set(),
+            set(GitHubCliConnector.manifest.capabilities)
+            & set(GITHUB_WRITE_CAPABILITIES),
+        )
+        self.assertEqual(GITHUB_READ_CAPABILITIES, GITHUB_ENABLED_CAPABILITIES)
+        identity, policy = github_authority(Settings())
+        self.assertIsNone(identity)
+        self.assertEqual(frozenset(), policy)
+        application = build_default_app(Settings())
+        self.assertIsNone(application.core.github_identity)
+        self.assertNotIn(GITHUB_CONNECTOR, application.core.registry.list_names())
 
 
 # --------------------------------------------------------------------------
@@ -1397,6 +1457,10 @@ class RawDestinationLaunderingTests(unittest.TestCase):
         from jarvis.app import decode_task_json, TaskInputError
 
         def document(destination: str) -> str:
+            # The typed section names the CANONICAL repository in every case,
+            # so a laundered spelling is refused for the destination itself
+            # rather than for a missing section - the property this guard is
+            # about stays the one being measured.
             return json.dumps(
                 {
                     "objective": "read an issue",
@@ -1405,6 +1469,12 @@ class RawDestinationLaunderingTests(unittest.TestCase):
                         "action": "read",
                         "target": "issue-7",
                         "destination": destination,
+                    },
+                    "github": {
+                        "kind": "issue",
+                        "owner": OWNER,
+                        "repository": REPO,
+                        "number": 7,
                     },
                 }
             )
@@ -1947,6 +2017,33 @@ class OperationPlanTests(unittest.TestCase):
                 repository=REPO,
                 number=7,
             ),
+            # Phase 2 rows, held to the identical property.
+            "github_commit_list": GitHubResource(
+                kind=GitHubResourceKind.COMMIT_LIST,
+                owner=OWNER,
+                repository=REPO,
+                limit=5,
+            ),
+            "github_commit_read": GitHubResource(
+                kind=GitHubResourceKind.COMMIT,
+                owner=OWNER,
+                repository=REPO,
+                ref="a" * 40,
+            ),
+            "github_pull_request_files": GitHubResource(
+                kind=GitHubResourceKind.PULL_REQUEST_FILES,
+                owner=OWNER,
+                repository=REPO,
+                number=7,
+                limit=5,
+            ),
+            "github_code_search": GitHubResource(
+                kind=GitHubResourceKind.CODE_SEARCH,
+                owner=OWNER,
+                repository=REPO,
+                query="parse_token",
+                limit=3,
+            ),
         }
         self.assertEqual(set(GITHUB_READ_CAPABILITIES), set(targets))
         for capability, resource in targets.items():
@@ -2049,24 +2146,40 @@ class OperationPlanTests(unittest.TestCase):
         with self.assertRaises(GitHubExecutionUnavailable):
             github_operation_plan(replace(forged, resource=issue(7, repo="gadgets")))
 
-    def test_no_phase_one_function_can_interpret_a_plan_as_authority(self) -> None:
-        """Source guard: no production module READS a plan at all.
+    def test_only_the_declared_seam_can_interpret_a_plan(self) -> None:
+        """Source guard: exactly TWO modules may route a plan to a process.
 
-        The claim is not that the package never starts a process - the Claude
-        Code connector legitimately does - but that nothing anywhere routes a
-        GitHub plan or frame towards one. The only module that mentions
-        either name is the one that defines them.
+        Phase 2 gave the plan a reader, so "nothing reads one" is no longer
+        the property. What replaces it is the same claim, narrowed: the ONLY
+        modules that may name a plan are the one that defines it, the one
+        process seam, and the one connector that sequences them. Anything else
+        naming a plan would be a second route to GitHub, which is exactly what
+        this guard exists to prevent.
         """
         package = Path(github.__file__).parent
+        # Compared by PATH, not by basename: the process seam and the
+        # connector share the file name ``github_cli.py``, and a basename
+        # allowlist would silently exempt both.
+        definer = "github.py"
+        seam = "github_cli.py"
+        connector = "connectors/github_cli.py"
         readers = []
         for module in sorted(package.rglob("*.py")):
-            if module.name == "github.py":
+            relative = module.relative_to(package).as_posix()
+            if relative == definer:
                 continue
             source = module.read_text(encoding="utf-8")
             for name in ("GitHubOperationPlan", "github_operation_plan"):
                 if name in source:
-                    readers.append(f"{module.name}:{name}")
-        self.assertEqual([], readers)
+                    readers.append(f"{relative}:{name}")
+        self.assertEqual(
+            [
+                f"{connector}:github_operation_plan",
+                f"{seam}:GitHubOperationPlan",
+                f"{seam}:github_operation_plan",
+            ],
+            sorted(readers),
+        )
         # jarvis/github.py itself reaches for no process primitive.
         source = Path(github.__file__).read_text(encoding="utf-8")
         for forbidden in (
@@ -2081,9 +2194,13 @@ class OperationPlanTests(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
-        # And the enabled GitHub authority is still empty, so no capability
-        # could be dispatched even if something did.
-        self.assertEqual((), GITHUB_ENABLED_CAPABILITIES)
+        # ``jarvis/github.py`` itself still reaches for no process primitive:
+        # the seam that does lives in its own module, and this file - the one
+        # that derives the argument vector - remains unable to run it.
+        self.assertEqual(
+            set(),
+            set(GITHUB_ENABLED_CAPABILITIES) & set(GITHUB_WRITE_CAPABILITIES),
+        )
 
     def test_no_token_can_travel_by_argv_stdin_or_environment(self) -> None:
         plan = github_operation_plan(frame())

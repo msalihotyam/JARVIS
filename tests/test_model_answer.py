@@ -1371,10 +1371,10 @@ class CrashRestartTests(ModelAnswerTestCase):
 
 class EnvelopeTests(ModelAnswerTestCase):
     def test_the_envelope_is_version_five_with_a_fixed_key_set(self) -> None:
-        self.assertEqual(6, OUTPUT_SCHEMA_VERSION)
+        self.assertEqual(7, OUTPUT_SCHEMA_VERSION)
         run = self.core.run(make_task())
         payload = build_envelope("run", PermissionMode.SESSION, run)
-        self.assertEqual(6, payload["schema_version"])
+        self.assertEqual(7, payload["schema_version"])
         self.assertIn("model_answer", payload)
 
     def test_a_task_without_an_answer_carries_a_null_block(self) -> None:
