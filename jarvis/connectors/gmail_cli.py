@@ -77,9 +77,9 @@ from jarvis.gmail import (
 )
 from jarvis.gmail_cli import (
     GWS_WRITE_TIMEOUT_SECONDS,
-    GmailCommandExited,
     GmailCommandFailed,
-    GmailCommandTimedOut,
+    GmailCommandStarted,
+    GmailTransportResidue,
     observed_gmail_identity,
     run_operation_plan,
 )
@@ -302,18 +302,45 @@ class GmailCliConnector(BaseConnector):
         """One draft or one send.
 
         A refusal here means nothing left the machine: the plan or the
-        credential route was refused, the CLI could not be started, or the
-        local dry run refused the request. Once the child has started,
-        NOTHING short of a readable acknowledgement is proof of no effect: a
-        nonzero exit, a timeout, an unclassified failure and an
+        credential route was refused, an earlier transport residue is still
+        on disk, the child could not be created, or the local dry run
+        refused the request. Once the child exists, NOTHING short of a
+        readable acknowledgement is proof of no effect: a nonzero exit, a
+        timeout, an OSError on the pipes, an unclassified failure and an
         acknowledgement that cannot be read all ESCAPE as
-        ``GmailOutcomeUnknown`` so Core marks the attempt in doubt.
+        ``GmailOutcomeUnknown`` so Core marks the attempt in doubt. An
+        acknowledged write whose transport file then could not be removed
+        is reported as exactly that (``CONFIDENTIAL_CLEANUP_FAILED``).
         """
         try:
             output = self._run(plan, config_dir=self.binding.config_dir)
         except GmailOutcomeUnknown:
             raise
-        except (GmailCommandExited, GmailCommandTimedOut) as exc:
+        except GmailTransportResidue as residue:
+            # The remote side acknowledged the write; the local transport
+            # file could not be removed. Both facts are reported, as an
+            # error that is terminal and never retryable - the acknowledged
+            # write must not be repeated - and the seam refuses every later
+            # write until the residue is gone. An acknowledgement that
+            # cannot be read beside a residue stays UNKNOWN (raised below).
+            outcome = gmail_write_outcome(residue.output.stdout, frame=frame)
+            message = (
+                f"{_acknowledgement(outcome)}; LOCAL CLEANUP FAILED: the message "
+                "transport file could not be removed and is quarantined in the "
+                "dedicated transport directory, so further Gmail writes are refused "
+                f"until it is securely removed. The acknowledged {frame.operation} "
+                "must not be repeated."
+            )
+            return ToolResult(
+                outcome=OutcomeStatus.ERROR,
+                summary=message,
+                data={"gmail_outcome": outcome.to_dict()},
+                error=StructuredError(
+                    ErrorCode.CONFIDENTIAL_CLEANUP_FAILED, message, {}, False
+                ),
+                usage=self._usage(task, session_id=session.id, call_count=1),
+            )
+        except GmailCommandStarted as exc:
             # The seam already maps these for a write; kept here so no
             # started-child failure can ever read as "nothing happened".
             raise GmailOutcomeUnknown(

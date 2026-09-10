@@ -421,6 +421,14 @@ class ErrorCode(str, Enum):
     #: The configuration store could not be read or written. Never carries
     #: the underlying OS error, the path or a traceback.
     CONFIG_IO_FAILED = "config_io_failed"
+    #: Gmail minimum. A connector performed its external effect and the
+    #: remote side ACKNOWLEDGED it, but a local file that carried the
+    #: effect's confidential payload could not be removed afterwards. The
+    #: remote outcome is known and reported in the message; the local
+    #: fault is a confidentiality fault. Terminal and never retryable: the
+    #: effect must not be repeated, and the connector refuses further
+    #: effects of that kind until the residue is securely removed.
+    CONFIDENTIAL_CLEANUP_FAILED = "confidential_cleanup_failed"
 
 
 class AttestationError(Exception):

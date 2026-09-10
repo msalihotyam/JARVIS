@@ -1069,20 +1069,42 @@ def gmail_operation_plan(frame: Any) -> GmailOperationPlan:
 # The one credential route, as the CLI reports it
 # --------------------------------------------------------------------------
 #
-# ``gws auth status`` (0.22.5) prints one JSON object: ``auth_method`` (none |
-# oauth2), ``credential_source`` (none, or the environment source in use:
-# token_env_var / environment_variables), ``storage`` (none | plaintext |
-# encrypted), ``keyring_backend`` (keyring | file), the paths of the
-# encrypted and plaintext credential files and of the OAuth client
-# configuration with an ``_exists`` flag each, ``token_cache_exists`` and,
-# when relevant, ``encryption_valid`` / ``encryption_error`` / ``token_error``.
-# Application Default Credentials do not appear in it at all - which is why
-# the dedicated credentials are REQUIRED to exist: the CLI consults ADC only
-# when its config directory holds none, and the env-named ADC route is
-# stripped from the child environment.
+# ``gws auth status`` (0.22.5) prints one JSON object. Measured, credential-
+# free, on 2026-09-10:
+#
+# * ``credential_source`` names where the OAUTH CLIENT configuration comes
+#   from - ``client_secret.json`` (a valid installed-app file in the config
+#   directory), ``environment_variables`` (client id/secret from the
+#   environment), ``token_env_var`` (a pre-obtained token) or ``none`` (absent
+#   or MALFORMED, in which case ``client_config_error`` says why). It says
+#   nothing about the stored credential's type.
+# * ``auth_method`` is ``oauth2`` for a stored authorized-user credential AND
+#   for a stored service-account credential alike, so it proves nothing about
+#   the type either.
+# * What differs between the two is the credential metadata the status
+#   report carries without any secret: an authorized-user credential has a
+#   REFRESH TOKEN (``has_refresh_token``) and was issued for an OAuth client,
+#   so its (masked) ``client_id`` equals the configured client's
+#   ``config_client_id``; a service-account credential has no refresh token
+#   and a numeric ``client_id`` that never equals an OAuth client id. The CLI
+#   also performs its own token check for a user credential and reports
+#   ``token_valid`` / ``token_error``.
+# * ``storage`` is ``none`` / ``plaintext`` / ``encrypted`` and
+#   ``keyring_backend`` is ``keyring`` / ``file``; each credential file and
+#   the client configuration is reported with its path and an ``_exists``.
+# * Application Default Credentials never appear - which is why the
+#   dedicated credential is REQUIRED to exist: the CLI consults ADC only when
+#   its config directory holds none, and the env-named ADC route is stripped.
+#
+# ``gws auth export`` is deliberately NOT used as the type verifier: it
+# decrypts the stored credential to stdout. The status report above carries
+# the same type evidence with the secrets absent.
 
 GMAIL_ENCRYPTED_CREDENTIALS_NAME = "credentials.enc"
 GMAIL_CLIENT_CONFIG_NAME = "client_secret.json"
+#: The ``credential_source`` value that means "the client configuration is
+#: the valid client_secret.json in the config directory".
+GMAIL_CLIENT_CONFIG_SOURCE = "client_secret.json"
 
 
 def _same_path(reported: Any, expected: str) -> bool:
@@ -1095,23 +1117,51 @@ def _same_path(reported: Any, expected: str) -> bool:
     )
 
 
+def _masked_id(value: Any) -> str | None:
+    """A non-empty, bounded, masked client id as the status report prints it,
+    or ``None``. Never a secret: the CLI masks it before printing."""
+    if type(value) is not str or not value or len(value) > 256 or not value.isascii():
+        return None
+    return value
+
+
 def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
     """Why the CLI's reported authentication state is not the ONE allowed
     route, or ``None``.
 
-    Every clause is a route this build refuses by name: a token or client
-    from the environment, a plaintext credential file (the CLI's own or one
-    named by the environment), no stored credential at all (which would
-    hand the call to ADC or a service account), a file-backed encryption
-    key, a missing OAuth client configuration, an unusable credential, and
-    any file that lives outside the dedicated directory.
+    The allowed route, clause by clause: the OAuth client configuration is a
+    VALID ``client_secret.json`` in the dedicated directory (named as the
+    source, no ``client_config_error``, a masked client id present); the
+    stored credential is OAuth2, stored ENCRYPTED with the OS-keyring backend,
+    with no plaintext file beside it and its file in the dedicated directory;
+    and it is an AUTHORIZED-USER credential - it carries a refresh token, its
+    client id is the configured client's, and the CLI's own token check
+    passed. A service account fails the last three whether it sits in the
+    encrypted store or anywhere else; a token, client or file from the
+    environment fails the first; ADC has no stored credential to show.
     """
     if type(payload) is not dict:
         return "the authentication state is not one JSON object"
+    # -- the OAuth client configuration ---------------------------------
+    if "client_config_error" in payload:
+        return "the OAuth client configuration is malformed"
+    if payload.get("credential_source") != GMAIL_CLIENT_CONFIG_SOURCE:
+        return (
+            "the OAuth client configuration is not the dedicated directory's "
+            "client_secret.json"
+        )
+    if payload.get("client_config_exists") is not True:
+        return "the OAuth client configuration is not in the dedicated directory"
+    if not _same_path(
+        payload.get("client_config"), os.path.join(config_dir, GMAIL_CLIENT_CONFIG_NAME)
+    ):
+        return "the OAuth client configuration is not the dedicated directory's"
+    configured_client = _masked_id(payload.get("config_client_id"))
+    if configured_client is None:
+        return "the OAuth client configuration names no client"
+    # -- the stored credential and its storage --------------------------
     if payload.get("auth_method") != "oauth2":
-        return "the session is not OAuth2 user credentials"
-    if payload.get("credential_source") != "none":
-        return "the credential comes from the environment, not the dedicated directory"
+        return "the session holds no OAuth2 credential"
     if payload.get("storage") != "encrypted":
         return "the credential is not stored encrypted"
     if payload.get("keyring_backend") != GMAIL_KEYRING_BACKEND:
@@ -1120,21 +1170,26 @@ def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
         return "no encrypted credential exists in the dedicated directory"
     if payload.get("plain_credentials_exists") is not False:
         return "a plaintext credential file is present"
-    if payload.get("client_config_exists") is not True:
-        return "the OAuth client configuration is not in the dedicated directory"
-    if payload.get("encryption_valid") is False or "encryption_error" in payload:
-        return "the stored credential cannot be decrypted on this machine"
-    if "token_error" in payload:
-        return "the stored credential is not usable"
     if not _same_path(
         payload.get("encrypted_credentials"),
         os.path.join(config_dir, GMAIL_ENCRYPTED_CREDENTIALS_NAME),
     ):
         return "the encrypted credential is not the dedicated directory's"
-    if not _same_path(
-        payload.get("client_config"), os.path.join(config_dir, GMAIL_CLIENT_CONFIG_NAME)
-    ):
-        return "the OAuth client configuration is not the dedicated directory's"
+    if payload.get("encryption_valid") is False or "encryption_error" in payload:
+        return "the stored credential cannot be decrypted on this machine"
+    # -- the credential TYPE: authorized user, not a service account ------
+    if payload.get("has_refresh_token") is not True:
+        return "the stored credential carries no refresh token (not an authorized-user credential)"
+    credential_client = _masked_id(payload.get("client_id"))
+    if credential_client is None or credential_client != configured_client:
+        return (
+            "the stored credential was not issued for the configured OAuth "
+            "client (not an authorized-user credential of this configuration)"
+        )
+    if "token_error" in payload:
+        return "the stored credential is not usable"
+    if payload.get("token_valid") is not True:
+        return "the CLI's own token check did not pass for the stored credential"
     return None
 
 
@@ -1472,6 +1527,7 @@ __all__ = [
     "GMAIL_BILLING_CLASS",
     "GMAIL_BODY_MAX_BYTES",
     "GMAIL_CLIENT_CONFIG_NAME",
+    "GMAIL_CLIENT_CONFIG_SOURCE",
     "GMAIL_CONFIG_DIR_MAX_CHARS",
     "GMAIL_CONFIG_DIR_VARIABLE",
     "GMAIL_ENCRYPTED_CREDENTIALS_NAME",

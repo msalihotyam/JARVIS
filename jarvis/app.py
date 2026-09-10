@@ -224,6 +224,9 @@ _ERROR_EXIT = {
     ErrorCode.EXECUTION_DISABLED: EXIT_POLICY,
     ErrorCode.CONFIG_INVALID: EXIT_POLICY,
     ErrorCode.CONFIG_IO_FAILED: EXIT_INTERNAL,
+    # A confidentiality fault after an acknowledged effect: a policy exit,
+    # because it blocks further effects until a person removes the residue.
+    ErrorCode.CONFIDENTIAL_CLEANUP_FAILED: EXIT_POLICY,
     ErrorCode.CONNECTOR_AMBIGUOUS: EXIT_POLICY,
     ErrorCode.EGRESS_REFUSED: EXIT_POLICY,
     ErrorCode.EXECUTION_UNKNOWN_OUTCOME: EXIT_POLICY,

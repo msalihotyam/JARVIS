@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jarvis.app import (
     TaskInputError,
@@ -80,17 +81,22 @@ from jarvis.gmail import (
     gmail_write_outcome,
     sanitized_gmail_environment,
 )
+from jarvis import gmail_cli
 from jarvis.gmail_cli import (
     GWS_RUN_DIRNAME,
     GWS_TRANSPORT_DIRNAME,
     GmailCommandExited,
     GmailCommandFailed,
+    GmailCommandInterrupted,
+    GmailCommandStarted,
     GmailCommandTimedOut,
+    GmailTransportResidue,
     _run,
     dotenv_refusal,
     gmail_route_check,
     observed_gmail_identity,
     run_operation_plan,
+    transport_residue_present,
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
@@ -216,18 +222,22 @@ def allowed_status(config_dir: str = CONFIG_DIR) -> dict:
     """``gws auth status`` for the ONE allowed route, as gws 0.22.5 prints it."""
     return {
         "auth_method": "oauth2",
-        "credential_source": "none",
-        "storage": "encrypted",
-        "keyring_backend": "keyring",
-        "encrypted_credentials": os.path.join(config_dir, "credentials.enc"),
-        "encrypted_credentials_exists": True,
-        "plain_credentials": os.path.join(config_dir, "credentials.json"),
-        "plain_credentials_exists": False,
         "client_config": os.path.join(config_dir, "client_secret.json"),
         "client_config_exists": True,
-        "token_cache_exists": True,
+        "client_id": "123-abc.....com",
+        "config_client_id": "123-abc.....com",
+        "credential_source": "client_secret.json",
+        "encrypted_credentials": os.path.join(config_dir, "credentials.enc"),
+        "encrypted_credentials_exists": True,
         "encryption_valid": True,
         "has_refresh_token": True,
+        "keyring_backend": "keyring",
+        "plain_credentials": os.path.join(config_dir, "credentials.json"),
+        "plain_credentials_exists": False,
+        "project_id": "proj",
+        "storage": "encrypted",
+        "token_cache_exists": True,
+        "token_valid": True,
     }
 
 
@@ -242,16 +252,18 @@ def dry_run_payload(kind: str = "messages/send") -> dict:
     }
 
 
-def scripted_runner(*, status=None, dry_run=None, answer=None, observe=None):
-    """A ``subprocess.run`` stand-in scripted by argv: ``auth status`` answers
-    ``status``, a ``--dry-run`` vector answers ``dry_run``, everything else
-    answers ``answer`` (bytes, a FakeCompleted, or an exception to raise).
+def scripted_runner(*, status=None, dry_run=None, answer=None, observe=None, creation_error=None):
+    """A ``subprocess.Popen`` stand-in scripted by argv: ``auth status``
+    answers ``status``, a ``--dry-run`` vector answers ``dry_run``, everything
+    else answers ``answer`` (bytes, a FakeCompleted, or an exception the
+    CREATED child raises on communicate). ``creation_error`` is raised by the
+    spawn itself for the real call, i.e. before any child exists.
     ``observe(call)`` runs in the child's turn, so a test can look at the
     transport file while it exists. The default status names the pinned
     directory the child was given, exactly as the real CLI would."""
     calls: list[dict] = []
 
-    def run(argv, **kwargs):
+    def popen(argv, **kwargs):
         call = {"argv": list(argv), **kwargs}
         calls.append(call)
         if observe is not None:
@@ -263,15 +275,17 @@ def scripted_runner(*, status=None, dry_run=None, answer=None, observe=None):
         elif "--dry-run" in argv:
             chosen = dry_run if dry_run is not None else json.dumps(dry_run_payload()).encode()
         else:
+            if creation_error is not None:
+                raise creation_error
             chosen = answer
         if isinstance(chosen, BaseException):
-            raise chosen
+            return FakeProcess(FakeCompleted(failure=chosen))
         if isinstance(chosen, FakeCompleted):
-            return chosen
-        return FakeCompleted(0, chosen if chosen is not None else b"{}", b"")
+            return FakeProcess(chosen)
+        return FakeProcess(FakeCompleted(0, chosen if chosen is not None else b"{}", b""))
 
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
+    popen.calls = calls  # type: ignore[attr-defined]
+    return popen
 
 
 def payload_for(plan: GmailOperationPlan) -> dict:
@@ -294,21 +308,48 @@ class FakeOutput:
 
 
 class FakeCompleted:
-    def __init__(self, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
+    """The scripted answer of one child: exit status and streams, or a
+    failure raised AFTER the child exists (on communicate)."""
+
+    def __init__(self, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"", failure=None):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.failure = failure
 
 
-def fake_runner(stdout: bytes = b"{}", returncode: int = 0, stderr: bytes = b""):
+class FakeProcess:
+    """A created child, Popen-shaped. Its failure, if any, happens on
+    ``communicate`` - strictly after creation."""
+
+    def __init__(self, answer: FakeCompleted) -> None:
+        self.answer = answer
+        self.returncode = None
+        self.killed = False
+
+    def communicate(self, input=b"", timeout=None):
+        if self.answer.failure is not None:
+            raise self.answer.failure
+        self.returncode = self.answer.returncode
+        return self.answer.stdout, self.answer.stderr
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout=None) -> int:
+        return self.returncode if self.returncode is not None else -9
+
+
+def fake_runner(stdout: bytes = b"{}", returncode: int = 0, stderr: bytes = b"", failure=None):
+    """A ``subprocess.Popen`` stand-in that records how each child was created."""
     calls: list[dict] = []
 
-    def run(argv, **kwargs):
+    def popen(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
-        return FakeCompleted(returncode, stdout, stderr)
+        return FakeProcess(FakeCompleted(returncode, stdout, stderr, failure))
 
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
+    popen.calls = calls  # type: ignore[attr-defined]
+    return popen
 
 
 def fake_path_lookup(name: str) -> str:
@@ -450,7 +491,7 @@ class VocabularyTests(unittest.TestCase):
             arguments=("gmail", "users", "messages", "delete", "--params", json.dumps({"userId": ACCOUNT, "id": MESSAGE_ID})),
         )
         with self.assertRaises(GmailCommandFailed):
-            run_operation_plan(forged, config_dir=CONFIG_DIR, path_lookup=fake_path_lookup, runner=fake_runner(), environ={})
+            run_operation_plan(forged, config_dir=CONFIG_DIR, path_lookup=fake_path_lookup, popen=fake_runner(), environ={})
 
 
 # --------------------------------------------------------------------------
@@ -587,24 +628,38 @@ class RoutePolicyTests(unittest.TestCase):
         # Case of the drive letter is not identity on Windows.
         self.assertIsNone(gmail_route_refusal(allowed_status(CONFIG_DIR.lower()), config_dir=CONFIG_DIR))
         deviations = {
-            "adc or service account only (nothing stored)": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "client_config_exists": False},
+            "adc or service account only (nothing stored)": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "has_refresh_token": False},
             "token from the environment": {"credential_source": "token_env_var"},
             "client id/secret from the environment": {"credential_source": "environment_variables"},
+            "no oauth client configuration at all": {"credential_source": "none", "client_config_exists": False},
+            "malformed client configuration": {"credential_source": "none", "client_config_error": "Invalid client_secret.json format: EOF while parsing"},
+            "web-type client configuration": {"credential_source": "none", "client_config_error": "Invalid client_secret.json format: missing field `installed`"},
+            "client configuration names no client": {"config_client_id": ""},
             "plaintext credentials, file backend": {"storage": "plaintext", "keyring_backend": "file", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
             "plaintext credentials, keyring backend": {"storage": "plaintext", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
             "env credentials file (reported as plaintext)": {"storage": "plaintext", "plain_credentials": r"C:\elsewhere\creds.json", "plain_credentials_exists": True},
             "encrypted but a plaintext file also present": {"plain_credentials_exists": True},
             "encrypted with a file-backed key": {"keyring_backend": "file"},
-            "no oauth client configuration": {"client_config_exists": False},
             "credential from another directory": {"encrypted_credentials": r"C:\Users\someone\.config\gws\credentials.enc"},
             "client config from another directory": {"client_config": r"C:\Users\someone\.config\gws\client_secret.json"},
             "cannot decrypt on this machine": {"encryption_valid": False},
             "encryption error": {"encryption_error": "Could not decrypt"},
+            # THE TYPE PROOF: a service account in the encrypted store has no
+            # refresh token and a numeric client id; forging one half is not enough.
+            "service account in the encrypted store": {"has_refresh_token": False, "client_id": "1"},
+            "service account with a forged refresh flag": {"has_refresh_token": True, "client_id": "1"},
+            "refresh token for a different oauth client": {"client_id": "987-zzz.....com"},
+            "no refresh token": {"has_refresh_token": False},
+            "credential client id absent": {"client_id": ""},
+            "token check failed": {"token_valid": False},
+            "token check absent": {"token_valid": None},
             "token error": {"token_error": "The OAuth client was not found."},
         }
         for name, change in deviations.items():
             with self.subTest(route=name):
-                self.assertIsNotNone(gmail_route_refusal({**allowed_status(), **change}, config_dir=CONFIG_DIR))
+                payload = {**allowed_status(), **change}
+                payload = {k: v for k, v in payload.items() if v is not None}
+                self.assertIsNotNone(gmail_route_refusal(payload, config_dir=CONFIG_DIR))
         self.assertIsNotNone(gmail_route_refusal(None, config_dir=CONFIG_DIR))
         self.assertIsNotNone(gmail_route_refusal([], config_dir=CONFIG_DIR))
         self.assertIsNotNone(gmail_route_refusal(allowed_status(), config_dir=r"C:\other\dir"))
@@ -659,13 +714,13 @@ class SeamTests(SeamTestCase):
         }
         runner = fake_runner(b"{}")
         Path(self.run_dir).mkdir()
-        _run(("auth", "status"), config_dir=self.config, cwd=self.run_dir, environ=hostile, path_lookup=fake_path_lookup, runner=runner)
+        _run(("auth", "status"), config_dir=self.config, cwd=self.run_dir, environ=hostile, path_lookup=fake_path_lookup, popen=runner)
         call = runner.calls[0]
         self.assertEqual(["C:/tools/gws.exe", "auth", "status"], call["argv"])
         self.assertFalse(call["shell"])
-        self.assertEqual(b"", call["input"])
-        self.assertTrue(call["capture_output"])
-        self.assertFalse(call["check"])
+        self.assertIs(subprocess.PIPE, call["stdin"])
+        self.assertIs(subprocess.PIPE, call["stdout"])
+        self.assertIs(subprocess.PIPE, call["stderr"])
         self.assertEqual(self.run_dir, call["cwd"])
         child = call["env"]
         for removed in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_WORKSPACE_CLI_TOKEN", "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
@@ -685,49 +740,52 @@ class SeamTests(SeamTestCase):
         hostile = cwd / ".env"
         hostile.write_text("GOOGLE_WORKSPACE_CLI_TOKEN=ya29.secret\n")
         with self.assertRaises(GmailCommandFailed):
-            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, popen=runner)
         hostile.unlink()
         ancestor = Path(self.temp.name) / ".env"
         ancestor.write_text("GOOGLE_WORKSPACE_CLI_CONFIG_DIR=C:/elsewhere\n")
         with self.assertRaises(GmailCommandFailed):
-            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, popen=runner)
         self.assertIsNotNone(dotenv_refusal(str(cwd)))
         ancestor.unlink()
         self.assertEqual([], runner.calls)
         self.assertIsNone(dotenv_refusal(str(cwd)))
-        _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+        _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, popen=runner)
         self.assertEqual(1, len(runner.calls))
 
     def test_pre_spawn_failures_are_refusals_and_started_failures_are_typed(self) -> None:
         Path(self.run_dir).mkdir()
         common = dict(config_dir=self.config, cwd=self.run_dir, environ={}, path_lookup=fake_path_lookup)
         with self.assertRaises(GmailCommandFailed) as missing:
-            _run(("auth", "status"), **{**common, "path_lookup": lambda name: None}, runner=fake_runner())
+            _run(("auth", "status"), **{**common, "path_lookup": lambda name: None}, popen=fake_runner())
         self.assertNotIsInstance(missing.exception, (GmailCommandExited, GmailCommandTimedOut))
 
         def not_started(argv, **kwargs):
             raise OSError("spawn failed")
 
         with self.assertRaises(GmailCommandFailed) as spawn:
-            _run(("auth", "status"), **common, runner=not_started)
-        self.assertNotIsInstance(spawn.exception, (GmailCommandExited, GmailCommandTimedOut))
+            _run(("auth", "status"), **common, popen=not_started)
+        self.assertNotIsInstance(spawn.exception, GmailCommandStarted)
         with self.assertRaises(GmailCommandExited) as exited:
-            _run(("auth", "status"), **common, runner=fake_runner(b"", returncode=1, stderr=b"token ya29.leaked is invalid"))
+            _run(("auth", "status"), **common, popen=fake_runner(b"", returncode=1, stderr=b"token ya29.leaked is invalid"))
         self.assertEqual(1, exited.exception.returncode)
         self.assertNotIn("ya29", str(exited.exception))
-
-        def timing_out(argv, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
-
+        self.assertIsInstance(exited.exception, GmailCommandStarted)
         with self.assertRaises(GmailCommandTimedOut):
-            _run(("auth", "status"), **common, runner=timing_out)
+            _run(("auth", "status"), **common, popen=fake_runner(failure=subprocess.TimeoutExpired(cmd=["gws"], timeout=1)))
+        # An OSError AFTER the child exists is not a spawn failure.
+        for post_start in (OSError("broken pipe"), BrokenPipeError("stdin closed"), ValueError("I/O operation on closed file")):
+            with self.subTest(failure=type(post_start).__name__):
+                with self.assertRaises(GmailCommandInterrupted) as interrupted:
+                    _run(("auth", "status"), **common, popen=fake_runner(failure=post_start))
+                self.assertIsInstance(interrupted.exception, GmailCommandStarted)
 
     def test_an_unusable_dedicated_directory_is_refused_before_anything_runs(self) -> None:
         runner = fake_runner()
         for bad in ("", "relative/dir", "C:\\dir\x00"):
             with self.subTest(config_dir=repr(bad)):
                 with self.assertRaises(GmailCommandFailed):
-                    _run(("auth", "status"), config_dir=bad, cwd=self.temp.name, environ={}, path_lookup=fake_path_lookup, runner=runner)
+                    _run(("auth", "status"), config_dir=bad, cwd=self.temp.name, environ={}, path_lookup=fake_path_lookup, popen=runner)
                 with self.assertRaises(GmailExecutionUnavailable):
                     sanitized_gmail_environment({}, config_dir=bad)
         self.assertEqual([], runner.calls)
@@ -744,7 +802,7 @@ class SeamTests(SeamTestCase):
 
 class IdentityObservationTests(SeamTestCase):
     def observe(self, runner, principal=ACCOUNT, config_dir=None):
-        return observed_gmail_identity(principal, config_dir or self.config, path_lookup=fake_path_lookup, runner=runner, environ={})
+        return observed_gmail_identity(principal, config_dir or self.config, path_lookup=fake_path_lookup, popen=runner, environ={})
 
     def test_the_route_is_proved_then_the_bound_account_is_asked_by_name(self) -> None:
         runner = scripted_runner(answer=json.dumps({"emailAddress": "Operator@example.com", "messagesTotal": 10}).encode())
@@ -760,11 +818,13 @@ class IdentityObservationTests(SeamTestCase):
 
     def test_every_foreign_credential_source_fails_closed_before_the_profile_is_asked(self) -> None:
         foreign = {
-            "adc or service account only": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "client_config_exists": False},
+            "adc or service account only": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "has_refresh_token": False},
             "token from a .env or the environment": {"credential_source": "token_env_var"},
             "plaintext credentials": {"storage": "plaintext", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
             "another directory's credential": {"encrypted_credentials": r"C:\Users\someone\.config\gws\credentials.enc"},
             "file-backed key": {"keyring_backend": "file"},
+            "service account in the encrypted store": {"has_refresh_token": False, "client_id": "1"},
+            "malformed client configuration": {"credential_source": "none", "client_config_error": "Invalid client_secret.json format"},
         }
         for name, change in foreign.items():
             with self.subTest(route=name):
@@ -807,7 +867,7 @@ class WriteTransportTests(SeamTestCase):
 
     def run_plan(self, capability: str, runner):
         plan = gmail_operation_plan(frame_for(capability))
-        return run_operation_plan(plan, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, runner=runner)
+        return run_operation_plan(plan, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=runner)
 
     def assert_argv_carries_no_payload(self, argv: list[str], message: bytes) -> None:
         joined = "\x00".join(argv)
@@ -868,6 +928,7 @@ class WriteTransportTests(SeamTestCase):
             "validation exit": FakeCompleted(3, b"", b""),
             "internal exit": FakeCompleted(5, b"", b""),
             "timeout": subprocess.TimeoutExpired(cmd=["gws"], timeout=1),
+            "oserror after the child exists": OSError("broken pipe"),
             "unclassified failure": RuntimeError("socket reset mid-call"),
         }
         for name, answer in outcomes.items():
@@ -900,7 +961,14 @@ class WriteTransportTests(SeamTestCase):
         self.assertEqual([], self.transport_entries())
         # the executable is missing: nothing started
         with self.assertRaises(GmailCommandFailed):
-            run_operation_plan(gmail_operation_plan(frame_for("gmail_send")), config_dir=self.config, environ={}, path_lookup=lambda name: None, runner=scripted_runner())
+            run_operation_plan(gmail_operation_plan(frame_for("gmail_send")), config_dir=self.config, environ={}, path_lookup=lambda name: None, popen=scripted_runner())
+        self.assertEqual([], self.transport_entries())
+        # the spawn of the real call itself fails: no child ever existed
+        runner = scripted_runner(creation_error=OSError("spawn failed"))
+        with self.assertRaises(GmailCommandFailed) as spawn:
+            self.run_plan("gmail_send", runner)
+        self.assertNotIsInstance(spawn.exception, GmailOutcomeUnknown)
+        self.assertEqual(3, len(runner.calls))
         self.assertEqual([], self.transport_entries())
 
     def test_a_stale_transport_directory_is_swept_before_a_write(self) -> None:
@@ -931,7 +999,7 @@ class WriteTransportTests(SeamTestCase):
                                     arguments=genuine.arguments[:-2] + ("--json", '{"raw":"aGVsbG8"}'))
         runner = scripted_runner()
         with self.assertRaises(GmailCommandFailed):
-            run_operation_plan(forged, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, runner=runner)
+            run_operation_plan(forged, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=runner)
         self.assertEqual([], runner.calls)
 
 
@@ -947,7 +1015,7 @@ class LiveProbeTests(SeamTestCase):
                 self.transport_root.mkdir(exist_ok=True)
                 directory = tempfile.mkdtemp(prefix="msg-", dir=str(self.transport_root))
                 (Path(directory) / GMAIL_UPLOAD_NAME).write_bytes(gmail_outbound_message(RESOURCES[capability]))
-                output = _run((*plan.arguments, "--dry-run"), config_dir=self.config, cwd=directory, environ=dict(os.environ), runner=subprocess.run)
+                output = _run((*plan.arguments, "--dry-run"), config_dir=self.config, cwd=directory, environ=dict(os.environ), popen=subprocess.Popen)
                 payload = json.loads(output.stdout)
                 self.assertIsNone(gmail_dry_run_refusal(payload), payload)
                 self.assertIn(f"/upload/gmail/v1/users/", payload["url"])
@@ -955,7 +1023,7 @@ class LiveProbeTests(SeamTestCase):
 
     def test_the_installed_cli_refuses_an_empty_dedicated_directory(self) -> None:
         with self.assertRaises(GmailCommandFailed):
-            gmail_route_check(self.config, environ=dict(os.environ), runner=subprocess.run)
+            gmail_route_check(self.config, environ=dict(os.environ), popen=subprocess.Popen)
 
 
 # --------------------------------------------------------------------------
@@ -1102,7 +1170,7 @@ class ConnectorWriteTests(unittest.TestCase):
                 self.assertFalse(result.error.retryable)
 
     def test_a_started_child_that_fails_is_unknown_never_a_refusal(self) -> None:
-        for started in (GmailCommandExited(1), GmailCommandExited(2), GmailCommandTimedOut("no answer")):
+        for started in (GmailCommandExited(1), GmailCommandExited(2), GmailCommandTimedOut("no answer"), GmailCommandInterrupted("pipe broke")):
             with self.subTest(started=str(started)[:30]):
                 with self.assertRaises(GmailOutcomeUnknown):
                     connector(answer=started).execute(gmail_task("gmail_send"), SessionState(id="s-1"))
@@ -1234,6 +1302,172 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(RunStatus.FAILED, run.status)
         self.assertEqual(ErrorCode.EXECUTION_DISABLED, run.error.code)
         self.assertEqual([], made.ran)
+
+
+class ResidueTests(SeamTestCase):
+    """The transport file could not be removed: never silent, never a retry."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        delay = mock.patch.object(gmail_cli, "_REMOVE_DELAY_SECONDS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+
+    def forced_failure(self):
+        """Deletion does nothing at all, so the residue stays on disk."""
+        patcher = mock.patch.object(gmail_cli.shutil, "rmtree", lambda *a, **k: None)
+        patcher.start()
+        return patcher
+
+    def run_plan(self, capability: str, popen):
+        plan = gmail_operation_plan(frame_for(capability))
+        return run_operation_plan(plan, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=popen)
+
+    def test_an_acknowledged_write_with_residue_is_reported_as_exactly_that(self) -> None:
+        patcher = self.forced_failure()
+        try:
+            with self.assertRaises(GmailTransportResidue) as caught:
+                self.run_plan("gmail_send", scripted_runner(answer=json.dumps(send_ack()).encode()))
+        finally:
+            patcher.stop()
+        self.assertEqual(MESSAGE_ID, json.loads(caught.exception.output.stdout)["id"])
+        self.assertEqual(1, len(self.transport_entries()))
+        self.assertNotIn("Selam", str(caught.exception))
+        self.assertTrue(transport_residue_present(self.config) is False)  # the sweep (unpatched) clears it
+        self.assertEqual([], self.transport_entries())
+
+    def test_the_connector_reports_the_acknowledgement_and_the_cleanup_fault_without_a_retry(self) -> None:
+        patcher = self.forced_failure()
+        try:
+            made = GmailCliConnector(
+                GmailIdentityBinding(principal=ACCOUNT, config_dir=self.config),
+                identity_observer=lambda p, c: (ACCOUNT, GMAIL_CREDENTIAL_ROUTE),
+                plan_runner=lambda plan, config_dir: run_operation_plan(
+                    plan, config_dir=config_dir, environ={}, path_lookup=fake_path_lookup,
+                    popen=scripted_runner(answer=json.dumps(send_ack()).encode()),
+                ),
+            )
+            result = made.execute(gmail_task("gmail_send"), SessionState(id="s-1"))
+        finally:
+            patcher.stop()
+        self.assertFalse(result.ok)
+        self.assertEqual(ErrorCode.CONFIDENTIAL_CLEANUP_FAILED, result.error.code)
+        self.assertFalse(result.error.retryable)
+        self.assertIn(f"message id={MESSAGE_ID}", result.summary)
+        self.assertIn("LOCAL CLEANUP FAILED", result.summary)
+        for word in ("Selam", "alice@example.com", "Merhaba", "msg-"):
+            self.assertNotIn(word, result.summary)
+        self.assertEqual(1, len(self.transport_entries()))
+
+    def test_further_writes_are_refused_until_the_residue_is_gone_and_reads_are_not(self) -> None:
+        patcher = self.forced_failure()
+        try:
+            with self.assertRaises(GmailTransportResidue):
+                self.run_plan("gmail_send", scripted_runner(answer=json.dumps(send_ack()).encode()))
+            # blocked: refused before any transport is created, after the route check only
+            runner = scripted_runner(answer=json.dumps(send_ack()).encode())
+            with self.assertRaises(GmailCommandFailed) as blocked:
+                self.run_plan("gmail_send", runner)
+            self.assertNotIsInstance(blocked.exception, GmailOutcomeUnknown)
+            self.assertEqual(1, len(runner.calls))
+            self.assertEqual(["auth", "status"], runner.calls[0]["argv"][1:])
+            self.assertEqual(1, len(self.transport_entries()))
+            # a read is not blocked
+            self.run_plan("gmail_message_read", scripted_runner(answer=json.dumps(message_payload()).encode()))
+        finally:
+            patcher.stop()
+        # a later cleanup attempt (the sweep) clears the block and the write proceeds
+        runner = scripted_runner(answer=json.dumps(send_ack()).encode())
+        self.run_plan("gmail_send", runner)
+        self.assertEqual(3, len(runner.calls))
+        self.assertEqual([], self.transport_entries())
+
+    def test_residue_beside_an_unknown_or_a_refusal_keeps_that_verdict(self) -> None:
+        patcher = self.forced_failure()
+        try:
+            with self.assertRaises(GmailOutcomeUnknown) as unknown:
+                self.run_plan("gmail_send", scripted_runner(answer=FakeCompleted(1, b"", b"")))
+            self.assertIn("could not be removed", str(unknown.exception))
+            with self.assertRaises(GmailCommandFailed) as refused:
+                self.run_plan("gmail_send", scripted_runner(dry_run=FakeCompleted(3, b"", b"")))
+            self.assertNotIsInstance(refused.exception, GmailOutcomeUnknown)
+        finally:
+            patcher.stop()
+        self.assertTrue(len(self.transport_entries()) >= 1)
+        self.assertFalse(transport_residue_present(self.config))
+
+    def test_normal_cleanup_leaves_no_residue_and_removal_is_bounded(self) -> None:
+        self.run_plan("gmail_send", scripted_runner(answer=json.dumps(send_ack()).encode()))
+        self.assertEqual([], self.transport_entries())
+        self.assertFalse(transport_residue_present(self.config))
+        self.assertLessEqual(gmail_cli._REMOVE_ATTEMPTS * 0.1, 1.0)
+
+
+class CoreSeamTests(unittest.TestCase):
+    """The real connector over the real seam, through AgentCore."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
+        self.config = str(Path(self.temp.name) / "gws-gmail")
+        Path(self.config).mkdir()
+        delay = mock.patch.object(gmail_cli, "_REMOVE_DELAY_SECONDS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+
+    def seam_connector(self, popen) -> GmailCliConnector:
+        made = GmailCliConnector(
+            GmailIdentityBinding(principal=ACCOUNT, config_dir=self.config),
+            identity_observer=lambda p, c: (ACCOUNT, GMAIL_CREDENTIAL_ROUTE),
+            plan_runner=lambda plan, config_dir: run_operation_plan(
+                plan, config_dir=config_dir, environ={}, path_lookup=fake_path_lookup, popen=popen
+            ),
+        )
+        return made
+
+    def run_and_approve(self, made: GmailCliConnector, capability: str = "gmail_send") -> AgentRun:
+        core = gmail_core(self.memory, (made,))
+        waiting = core.run(gmail_task(capability))
+        self.assertEqual(RunStatus.AWAITING_APPROVAL, waiting.status)
+        grant = PermissionGrant.for_request(waiting.permission_request)
+        done = core.resume(waiting.session.id, waiting.task.id, grant)
+        self.core, self.waiting, self.grant = core, waiting, grant
+        return done
+
+    def test_a_post_start_oserror_settles_unknown_outcome_and_is_never_replayed(self) -> None:
+        popen = scripted_runner(answer=OSError("broken pipe after the child started"))
+        done = self.run_and_approve(self.seam_connector(popen))
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, done.error.code)
+        self.assertIs(AttemptState.UNKNOWN_OUTCOME, self.memory.latest_execution_attempt(self.waiting.task.id).state)
+        real_calls = [c for c in popen.calls if "auth" not in c["argv"] and "--dry-run" not in c["argv"]]
+        self.assertEqual(1, len(real_calls))
+        again = self.core.resume(self.waiting.session.id, self.waiting.task.id, self.grant)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, again.error.code)
+        self.assertEqual(1, len([c for c in popen.calls if "auth" not in c["argv"] and "--dry-run" not in c["argv"]]))
+
+    def test_an_acknowledged_write_with_residue_ends_terminal_and_is_never_replayed(self) -> None:
+        popen = scripted_runner(answer=json.dumps(send_ack()).encode())
+        patcher = mock.patch.object(gmail_cli.shutil, "rmtree", lambda *a, **k: None)
+        patcher.start()
+        try:
+            done = self.run_and_approve(self.seam_connector(popen))
+        finally:
+            patcher.stop()
+        self.assertEqual(RunStatus.FAILED, done.status)
+        self.assertEqual(ErrorCode.CONFIDENTIAL_CLEANUP_FAILED, done.error.code)
+        self.assertFalse(done.error.retryable)
+        self.assertIn(f"message id={MESSAGE_ID}", done.error.message)
+        real_calls = lambda: [c for c in popen.calls if "auth" not in c["argv"] and "--dry-run" not in c["argv"]]
+        self.assertEqual(1, len(real_calls()))
+        again = self.core.resume(self.waiting.session.id, self.waiting.task.id, self.grant)
+        self.assertNotEqual(RunStatus.COMPLETED, again.status)
+        self.assertEqual(1, len(real_calls()))
+
+    def test_a_normal_send_through_the_seam_completes_and_leaves_nothing(self) -> None:
+        done = self.run_and_approve(self.seam_connector(scripted_runner(answer=json.dumps(send_ack()).encode())))
+        self.assertEqual(RunStatus.COMPLETED, done.status, done.error)
+        self.assertEqual([], sorted(p.name for p in (Path(self.config) / GWS_TRANSPORT_DIRNAME).iterdir()))
 
 
 # --------------------------------------------------------------------------
