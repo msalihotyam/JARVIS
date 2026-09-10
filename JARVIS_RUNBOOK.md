@@ -31,14 +31,19 @@ itself. State only what changed and what is now being asked for.
 
 ## Model policy
 
+Sonnet is **no longer the default coder**: in real use it is too slow.
+
 | Model / effort | Use for |
 |---|---|
-| Sonnet 5, High | Bounded daily implementation |
-| Fable 5.1, High | Broad or complex design and coding |
-| Opus 5, High | Critical blocker, debug, security, concurrency, recovery |
+| Fable 5.1, High | Primary choice: normal and complex coding, design + implementation |
+| Opus 5, High | Critical blocker, debug, security, concurrency, recovery — and whenever wall-clock speed matters |
+| Sonnet 5, High | Only with a clear reason: a small, mechanical task |
 
-Use a higher effort level only when justified by the task at hand — not by
+`xhigh` / `max` stay exceptional — justified by the task at hand, never a
 default.
+
+Choose on **wall-clock time + correctness + turn count + Claude Max quota
+impact**, not token count alone.
 
 ## Independent review (Work)
 
