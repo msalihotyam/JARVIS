@@ -77,7 +77,9 @@ from jarvis.gmail import (
 )
 from jarvis.gmail_cli import (
     GWS_WRITE_TIMEOUT_SECONDS,
+    GmailCommandExited,
     GmailCommandFailed,
+    GmailCommandTimedOut,
     observed_gmail_identity,
     run_operation_plan,
 )
@@ -181,9 +183,11 @@ class GmailCliConnector(BaseConnector):
     # -- identity -------------------------------------------------------------
 
     def observed_gmail_identity(self) -> tuple[str, str]:
-        """The account the local session can act as. AN OBSERVATION, for the
-        bound account by name; Core compares it against its OWN binding."""
-        return self._observe(self.binding.principal)
+        """The account the DEDICATED session acts as. AN OBSERVATION: the
+        seam proves the credential route under the bound config directory
+        and then the effective account, by name; Core compares the answer
+        against its OWN binding."""
+        return self._observe(self.binding.principal, self.binding.config_dir)
 
     # -- attestation ----------------------------------------------------------
 
@@ -258,7 +262,7 @@ class GmailCliConnector(BaseConnector):
 
     def _read(self, task: Task, session: SessionState, frame: GmailRequestFrame, plan: Any) -> ToolResult:
         try:
-            output = self._run(plan)
+            output = self._run(plan, config_dir=self.binding.config_dir)
         except GmailCommandFailed as exc:
             return self._refusal(task, ErrorCode.CONNECTOR_FAILED, str(exc))
         except Exception:  # noqa: BLE001 - an unclassified failure is a refusal
@@ -297,16 +301,24 @@ class GmailCliConnector(BaseConnector):
     def _write(self, task: Task, session: SessionState, frame: GmailRequestFrame, plan: Any) -> ToolResult:
         """One draft or one send.
 
-        A refusal here means the request was never accepted: the plan was
-        refused, the CLI could not start, or the API said no. Anything that
-        leaves the outcome open - a timeout, an unclassified failure after the
-        process started, an acknowledgement that cannot be read - ESCAPES as
+        A refusal here means nothing left the machine: the plan or the
+        credential route was refused, the CLI could not be started, or the
+        local dry run refused the request. Once the child has started,
+        NOTHING short of a readable acknowledgement is proof of no effect: a
+        nonzero exit, a timeout, an unclassified failure and an
+        acknowledgement that cannot be read all ESCAPE as
         ``GmailOutcomeUnknown`` so Core marks the attempt in doubt.
         """
         try:
-            output = self._run(plan)
+            output = self._run(plan, config_dir=self.binding.config_dir)
         except GmailOutcomeUnknown:
             raise
+        except (GmailCommandExited, GmailCommandTimedOut) as exc:
+            # The seam already maps these for a write; kept here so no
+            # started-child failure can ever read as "nothing happened".
+            raise GmailOutcomeUnknown(
+                f"the Gmail {frame.operation} started and did not succeed: {exc}"
+            ) from exc
         except GmailCommandFailed as exc:
             return self._refusal(task, ErrorCode.CONNECTOR_FAILED, str(exc))
         except Exception as exc:  # noqa: BLE001 - after the process may have started

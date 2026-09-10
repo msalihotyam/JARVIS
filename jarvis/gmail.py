@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -106,10 +107,16 @@ GMAIL_ENABLED_CAPABILITIES: tuple[str, ...] = (
 GMAIL_BILLING_CLASS = BillingClass.NO_ADDITIONAL_CHARGE
 GMAIL_MONETARY_STATE = MonetaryState.NOT_APPLICABLE
 
-#: THE canonical credential-route identity: a NON-SECRET name for how a call
-#: is authenticated - the Google Workspace CLI's own authenticated session.
-#: JARVIS never requests, retrieves, persists or presents the OAuth token.
-GMAIL_CREDENTIAL_ROUTE = "google_workspace_cli_session"
+#: THE canonical credential-route identity, and it names exactly what is
+#: allowed: OAuth2 USER credentials that the Google Workspace CLI stores
+#: ENCRYPTED in a JARVIS-DEDICATED config directory, with the encryption key
+#: held by the OS KEYRING. Not a token from the environment, not a
+#: credentials file named by the environment, not plaintext storage, not
+#: Application Default Credentials and not a service account: the process
+#: seam proves this route with ``gws auth status`` before every call
+#: (``gmail_route_refusal``), and the constant is reported only after that
+#: proof. JARVIS never requests, retrieves, persists or presents the token.
+GMAIL_CREDENTIAL_ROUTE = "gws_dedicated_config_oauth2_encrypted_keyring"
 GMAIL_CREDENTIAL_ROUTES = frozenset({GMAIL_CREDENTIAL_ROUTE})
 
 
@@ -148,9 +155,8 @@ GMAIL_QUERY_MAX_CHARS = 256
 #: message; more than this is a campaign, which is not a usable-v1 feature.
 GMAIL_RECIPIENTS_MAX = 10
 GMAIL_SUBJECT_MAX_CHARS = 256
-#: Bound on the body in UTF-8 BYTES, because the body travels base64-encoded
-#: inside one command-line argument and Windows caps a command line at 32 K
-#: characters. 12 000 bytes of text is a long email and a short argument.
+#: Bound on the body in UTF-8 BYTES. A usable-v1 message is a bounded
+#: deliverable, not an attachment channel; 12 000 bytes is a long email.
 GMAIL_BODY_MAX_BYTES = 12_000
 
 
@@ -597,6 +603,29 @@ class GmailIdentityBinding:
 
     principal: str
     credential_route: str = GMAIL_CREDENTIAL_ROUTE
+    #: The JARVIS-dedicated Google Workspace CLI configuration directory the
+    #: credential must come from. Part of the binding because it is part of
+    #: the route: the seam pins the CLI to this directory and refuses any
+    #: credential that does not live encrypted inside it.
+    config_dir: str = ""
+
+
+GMAIL_CONFIG_DIR_MAX_CHARS = 1_024
+
+
+def gmail_config_dir_refusal(value: Any) -> str | None:
+    """Why this is not a usable dedicated configuration directory, or ``None``.
+
+    Lexical only: an absolute, bounded, control-character-free path. Whether
+    it holds the dedicated credential is the seam's question, asked of the
+    CLI itself before every call.
+    """
+    reason = _text_refusal(value, "configuration directory", GMAIL_CONFIG_DIR_MAX_CHARS, ascii_only=False)
+    if reason is not None:
+        return reason
+    if not os.path.isabs(value):
+        return "the configuration directory is not an absolute path"
+    return None
 
 
 def gmail_identity_binding_refusal(binding: Any) -> str | None:
@@ -605,7 +634,10 @@ def gmail_identity_binding_refusal(binding: Any) -> str | None:
     reason = gmail_principal_refusal(binding.principal)
     if reason is not None:
         return reason
-    return gmail_credential_route_refusal(binding.credential_route)
+    reason = gmail_credential_route_refusal(binding.credential_route)
+    if reason is not None:
+        return reason
+    return gmail_config_dir_refusal(binding.config_dir)
 
 
 def gmail_identity_refusal(
@@ -675,11 +707,6 @@ def gmail_outbound_message(resource: GmailResource) -> bytes:
     encoded = base64.b64encode(resource.body.encode("utf-8")).decode("ascii")
     lines += [encoded[start : start + 76] for start in range(0, len(encoded), 76)]
     return ("\r\n".join(lines) + "\r\n").encode("ascii")
-
-
-def gmail_raw_message(message: bytes) -> str:
-    """The API's ``raw`` form of the message: URL-safe base64."""
-    return base64.urlsafe_b64encode(message).decode("ascii")
 
 
 # --------------------------------------------------------------------------
@@ -858,9 +885,23 @@ GMAIL_REMOVED_ENVIRONMENT: frozenset[str] = frozenset(
 
 GMAIL_FORCED_ENVIRONMENT: Mapping[str, str] = {"NO_COLOR": "1", "CI": "1"}
 
+#: The two variables that PIN the CLI to the dedicated route, set explicitly
+#: in every child environment after the removals. dotenvy - the CLI's
+#: ``.env`` support - never overrides a variable that is already set, so a
+#: side-loaded file cannot move the config directory or the key storage.
+GMAIL_CONFIG_DIR_VARIABLE = "GOOGLE_WORKSPACE_CLI_CONFIG_DIR"
+GMAIL_KEYRING_BACKEND_VARIABLE = "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"
+GMAIL_KEYRING_BACKEND = "keyring"
 
-def sanitized_gmail_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """The child environment: removals first, forced values last. Pure."""
+
+def sanitized_gmail_environment(
+    environ: Mapping[str, str], *, config_dir: str
+) -> dict[str, str]:
+    """The child environment: removals first, forced values last, then the
+    dedicated config directory and the keyring backend pinned. Pure."""
+    reason = gmail_config_dir_refusal(config_dir)
+    if reason is not None:
+        raise GmailExecutionUnavailable(reason)
     child = {
         str(name): str(value)
         for name, value in environ.items()
@@ -868,6 +909,8 @@ def sanitized_gmail_environment(environ: Mapping[str, str]) -> dict[str, str]:
         and not str(name).upper().startswith(GMAIL_REMOVED_ENVIRONMENT_PREFIXES)
     }
     child.update(GMAIL_FORCED_ENVIRONMENT)
+    child[GMAIL_CONFIG_DIR_VARIABLE] = config_dir
+    child[GMAIL_KEYRING_BACKEND_VARIABLE] = GMAIL_KEYRING_BACKEND
     return child
 
 
@@ -875,12 +918,28 @@ def sanitized_gmail_environment(environ: Mapping[str, str]) -> dict[str, str]:
 # The closed operation plan - data, checked by re-derivation
 # --------------------------------------------------------------------------
 
-#: Bounds on one derived argument and on how many there may be. The largest
-#: argument is the JSON body carrying the base64 message, bounded by
-#: ``GMAIL_BODY_MAX_BYTES`` upstream; the whole vector stays well inside the
-#: Windows command-line ceiling.
-GWS_ARGUMENT_MAX_CHARS = 24_000
-GWS_MAX_ARGUMENTS = 16
+#: Bounds on one derived argument and on how many there may be. No argument
+#: ever carries message content: a write names a transport FILE, so the
+#: vector is short and the bound is tight.
+GWS_ARGUMENT_MAX_CHARS = 1_024
+GWS_MAX_ARGUMENTS = 12
+
+#: The write transport. The RFC 2822 bytes live in a file of this name inside
+#: a unique JARVIS-owned directory that is the child's working directory, and
+#: the CLI uploads it as ``message/rfc822`` through the multipart upload
+#: endpoint. The command line therefore names the file and nothing of what
+#: is in it. The name is a constant so the vector stays derivable from the
+#: frame alone and re-provable without knowing the directory.
+GMAIL_UPLOAD_NAME = "message.eml"
+GMAIL_UPLOAD_CONTENT_TYPE = "message/rfc822"
+
+#: The CLI's local rehearsal flag: it validates the request and reports what
+#: WOULD be sent, without sending. A write is rehearsed under its exact
+#: vector before the real call.
+GWS_DRY_RUN_FLAG = "--dry-run"
+
+#: The constant vector that reports the CLI's authentication state.
+GMAIL_AUTH_STATUS_ARGS: tuple[str, ...] = ("auth", "status")
 
 #: The one API family every derived vector names. A capability chooses a
 #: resource and a method; it cannot choose another API.
@@ -912,15 +971,20 @@ _GWS_ARGV_BUILDERS: Mapping[str, Any] = {
         *GWS_API_ARGS, "threads", "get",
         "--params", _params(userId=r.account, id=r.thread_id, format="full"),
     ),
+    # The two writes name the transport file, never the message: the bytes
+    # are derived from the same validated resource by the seam and written
+    # to that file in the child's working directory.
     "gmail_draft_create": lambda r: (
         *GWS_API_ARGS, "drafts", "create",
         "--params", _params(userId=r.account),
-        "--json", _params(message={"raw": gmail_raw_message(gmail_outbound_message(r))}),
+        "--upload", GMAIL_UPLOAD_NAME,
+        "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE,
     ),
     "gmail_send": lambda r: (
         *GWS_API_ARGS, "messages", "send",
         "--params", _params(userId=r.account),
-        "--json", _params(raw=gmail_raw_message(gmail_outbound_message(r))),
+        "--upload", GMAIL_UPLOAD_NAME,
+        "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE,
     ),
 }
 
@@ -999,6 +1063,103 @@ def gmail_operation_plan(frame: Any) -> GmailOperationPlan:
     if reason is not None:  # pragma: no cover - the derivation just built it
         raise GmailExecutionUnavailable(reason)
     return plan
+
+
+# --------------------------------------------------------------------------
+# The one credential route, as the CLI reports it
+# --------------------------------------------------------------------------
+#
+# ``gws auth status`` (0.22.5) prints one JSON object: ``auth_method`` (none |
+# oauth2), ``credential_source`` (none, or the environment source in use:
+# token_env_var / environment_variables), ``storage`` (none | plaintext |
+# encrypted), ``keyring_backend`` (keyring | file), the paths of the
+# encrypted and plaintext credential files and of the OAuth client
+# configuration with an ``_exists`` flag each, ``token_cache_exists`` and,
+# when relevant, ``encryption_valid`` / ``encryption_error`` / ``token_error``.
+# Application Default Credentials do not appear in it at all - which is why
+# the dedicated credentials are REQUIRED to exist: the CLI consults ADC only
+# when its config directory holds none, and the env-named ADC route is
+# stripped from the child environment.
+
+GMAIL_ENCRYPTED_CREDENTIALS_NAME = "credentials.enc"
+GMAIL_CLIENT_CONFIG_NAME = "client_secret.json"
+
+
+def _same_path(reported: Any, expected: str) -> bool:
+    """Lexical path equality, case-insensitive on Windows. No filesystem."""
+    if type(reported) is not str or not reported:
+        return False
+    text = reported[4:] if reported.startswith("\\\\?\\") else reported
+    return os.path.normcase(os.path.normpath(text)) == os.path.normcase(
+        os.path.normpath(expected)
+    )
+
+
+def gmail_route_refusal(payload: Any, *, config_dir: str) -> str | None:
+    """Why the CLI's reported authentication state is not the ONE allowed
+    route, or ``None``.
+
+    Every clause is a route this build refuses by name: a token or client
+    from the environment, a plaintext credential file (the CLI's own or one
+    named by the environment), no stored credential at all (which would
+    hand the call to ADC or a service account), a file-backed encryption
+    key, a missing OAuth client configuration, an unusable credential, and
+    any file that lives outside the dedicated directory.
+    """
+    if type(payload) is not dict:
+        return "the authentication state is not one JSON object"
+    if payload.get("auth_method") != "oauth2":
+        return "the session is not OAuth2 user credentials"
+    if payload.get("credential_source") != "none":
+        return "the credential comes from the environment, not the dedicated directory"
+    if payload.get("storage") != "encrypted":
+        return "the credential is not stored encrypted"
+    if payload.get("keyring_backend") != GMAIL_KEYRING_BACKEND:
+        return "the encryption key is not held by the OS keyring"
+    if payload.get("encrypted_credentials_exists") is not True:
+        return "no encrypted credential exists in the dedicated directory"
+    if payload.get("plain_credentials_exists") is not False:
+        return "a plaintext credential file is present"
+    if payload.get("client_config_exists") is not True:
+        return "the OAuth client configuration is not in the dedicated directory"
+    if payload.get("encryption_valid") is False or "encryption_error" in payload:
+        return "the stored credential cannot be decrypted on this machine"
+    if "token_error" in payload:
+        return "the stored credential is not usable"
+    if not _same_path(
+        payload.get("encrypted_credentials"),
+        os.path.join(config_dir, GMAIL_ENCRYPTED_CREDENTIALS_NAME),
+    ):
+        return "the encrypted credential is not the dedicated directory's"
+    if not _same_path(
+        payload.get("client_config"), os.path.join(config_dir, GMAIL_CLIENT_CONFIG_NAME)
+    ):
+        return "the OAuth client configuration is not the dedicated directory's"
+    return None
+
+
+GMAIL_UPLOAD_URL_PREFIX = "https://gmail.googleapis.com/upload/gmail/v1/users/"
+
+
+def gmail_dry_run_refusal(payload: Any) -> str | None:
+    """Why the CLI's local rehearsal does not describe the write this build
+    performs, or ``None``: a POST to the Gmail UPLOAD endpoint, carried as a
+    multipart upload, with NO JSON body - so the message travels as the
+    file and nothing about it is on the command line or in a body."""
+    if type(payload) is not dict:
+        return "the rehearsal is not one JSON object"
+    if payload.get("dry_run") is not True:
+        return "the rehearsal did not run as a dry run"
+    if payload.get("method") != "POST":
+        return "the rehearsal is not a POST"
+    if payload.get("is_multipart_upload") is not True:
+        return "the rehearsal is not a multipart upload"
+    if payload.get("body") is not None:
+        return "the rehearsal carries a request body"
+    url = payload.get("url")
+    if type(url) is not str or not url.startswith(GMAIL_UPLOAD_URL_PREFIX):
+        return "the rehearsal does not target the Gmail upload endpoint"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1307,8 +1468,19 @@ def build_gmail_read_snapshot(
 
 
 __all__ = [
+    "GMAIL_AUTH_STATUS_ARGS",
     "GMAIL_BILLING_CLASS",
     "GMAIL_BODY_MAX_BYTES",
+    "GMAIL_CLIENT_CONFIG_NAME",
+    "GMAIL_CONFIG_DIR_MAX_CHARS",
+    "GMAIL_CONFIG_DIR_VARIABLE",
+    "GMAIL_ENCRYPTED_CREDENTIALS_NAME",
+    "GMAIL_KEYRING_BACKEND",
+    "GMAIL_KEYRING_BACKEND_VARIABLE",
+    "GMAIL_UPLOAD_CONTENT_TYPE",
+    "GMAIL_UPLOAD_NAME",
+    "GMAIL_UPLOAD_URL_PREFIX",
+    "GWS_DRY_RUN_FLAG",
     "GMAIL_CAPABILITIES",
     "GMAIL_CAPABILITY_OPERATION",
     "GMAIL_CAPABILITY_RESOURCE",
@@ -1349,6 +1521,8 @@ __all__ = [
     "build_gmail_request_frame",
     "gmail_address_refusal",
     "gmail_body_refusal",
+    "gmail_config_dir_refusal",
+    "gmail_dry_run_refusal",
     "gmail_credential_route_refusal",
     "gmail_destination",
     "gmail_destination_refusal",
@@ -1364,11 +1538,11 @@ __all__ = [
     "gmail_principal_refusal",
     "gmail_query_refusal",
     "gmail_raw_destination_refusal",
-    "gmail_raw_message",
     "gmail_read_content",
     "gmail_resource_binding_refusal",
     "gmail_resource_from_dict",
     "gmail_resource_refusal",
+    "gmail_route_refusal",
     "gmail_subject_refusal",
     "gmail_write_outcome",
     "is_gmail_destination",

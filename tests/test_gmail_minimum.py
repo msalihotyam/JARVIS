@@ -12,6 +12,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -56,6 +58,8 @@ from jarvis.gmail import (
     GMAIL_LIST_MAX_ITEMS,
     GMAIL_READ_CAPABILITIES,
     GMAIL_RECIPIENTS_MAX,
+    GMAIL_UPLOAD_CONTENT_TYPE,
+    GMAIL_UPLOAD_NAME,
     GMAIL_WRITE_CAPABILITIES,
     GmailExecutionUnavailable,
     GmailIdentityBinding,
@@ -64,6 +68,7 @@ from jarvis.gmail import (
     GmailResource,
     GmailResourceKind,
     build_gmail_request_frame,
+    gmail_dry_run_refusal,
     gmail_frame_refusal,
     gmail_operation_plan,
     gmail_outbound_message,
@@ -71,12 +76,19 @@ from jarvis.gmail import (
     gmail_read_content,
     gmail_resource_from_dict,
     gmail_resource_refusal,
+    gmail_route_refusal,
     gmail_write_outcome,
     sanitized_gmail_environment,
 )
 from jarvis.gmail_cli import (
+    GWS_RUN_DIRNAME,
+    GWS_TRANSPORT_DIRNAME,
+    GmailCommandExited,
     GmailCommandFailed,
+    GmailCommandTimedOut,
     _run,
+    dotenv_refusal,
+    gmail_route_check,
     observed_gmail_identity,
     run_operation_plan,
 )
@@ -87,7 +99,8 @@ from tests.helpers import safe_cleanup
 
 ACCOUNT = "operator@example.com"
 DEST = f"gmail/{ACCOUNT}"
-BINDING = GmailIdentityBinding(principal=ACCOUNT)
+CONFIG_DIR = r"C:\jarvis-test\data\gws-gmail"
+BINDING = GmailIdentityBinding(principal=ACCOUNT, config_dir=CONFIG_DIR)
 MESSAGE_ID = "18c1a2b3c4d5e6f7"
 THREAD_ID = "18c1a2b3c4d5e6f0"
 DRAFT_ID = "r-7788990011223344"
@@ -199,6 +212,68 @@ def send_ack() -> dict:
     return {"id": MESSAGE_ID, "threadId": THREAD_ID, "labelIds": ["SENT"]}
 
 
+def allowed_status(config_dir: str = CONFIG_DIR) -> dict:
+    """``gws auth status`` for the ONE allowed route, as gws 0.22.5 prints it."""
+    return {
+        "auth_method": "oauth2",
+        "credential_source": "none",
+        "storage": "encrypted",
+        "keyring_backend": "keyring",
+        "encrypted_credentials": os.path.join(config_dir, "credentials.enc"),
+        "encrypted_credentials_exists": True,
+        "plain_credentials": os.path.join(config_dir, "credentials.json"),
+        "plain_credentials_exists": False,
+        "client_config": os.path.join(config_dir, "client_secret.json"),
+        "client_config_exists": True,
+        "token_cache_exists": True,
+        "encryption_valid": True,
+        "has_refresh_token": True,
+    }
+
+
+def dry_run_payload(kind: str = "messages/send") -> dict:
+    return {
+        "body": None,
+        "dry_run": True,
+        "is_multipart_upload": True,
+        "method": "POST",
+        "query_params": [],
+        "url": f"https://gmail.googleapis.com/upload/gmail/v1/users/{ACCOUNT}/{kind}",
+    }
+
+
+def scripted_runner(*, status=None, dry_run=None, answer=None, observe=None):
+    """A ``subprocess.run`` stand-in scripted by argv: ``auth status`` answers
+    ``status``, a ``--dry-run`` vector answers ``dry_run``, everything else
+    answers ``answer`` (bytes, a FakeCompleted, or an exception to raise).
+    ``observe(call)`` runs in the child's turn, so a test can look at the
+    transport file while it exists. The default status names the pinned
+    directory the child was given, exactly as the real CLI would."""
+    calls: list[dict] = []
+
+    def run(argv, **kwargs):
+        call = {"argv": list(argv), **kwargs}
+        calls.append(call)
+        if observe is not None:
+            observe(call)
+        if "auth" in argv:
+            chosen = status
+            if chosen is None:
+                chosen = json.dumps(allowed_status(kwargs["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])).encode()
+        elif "--dry-run" in argv:
+            chosen = dry_run if dry_run is not None else json.dumps(dry_run_payload()).encode()
+        else:
+            chosen = answer
+        if isinstance(chosen, BaseException):
+            raise chosen
+        if isinstance(chosen, FakeCompleted):
+            return chosen
+        return FakeCompleted(0, chosen if chosen is not None else b"{}", b"")
+
+    run.calls = calls  # type: ignore[attr-defined]
+    return run
+
+
 def payload_for(plan: GmailOperationPlan) -> dict:
     kind = plan.resource.kind
     if kind in (GmailResourceKind.THREAD_LIST, GmailResourceKind.SEARCH):
@@ -252,7 +327,7 @@ def connector(*, observed=(ACCOUNT, GMAIL_CREDENTIAL_ROUTE), answer=None, ran=No
             return FakeOutput(answer(plan))
         return FakeOutput(json.dumps(payload_for(plan)) if answer is None else answer)
 
-    def observer(principal):
+    def observer(principal, config_dir):
         if isinstance(observed, Exception):
             raise observed
         return observed
@@ -375,7 +450,7 @@ class VocabularyTests(unittest.TestCase):
             arguments=("gmail", "users", "messages", "delete", "--params", json.dumps({"userId": ACCOUNT, "id": MESSAGE_ID})),
         )
         with self.assertRaises(GmailCommandFailed):
-            run_operation_plan(forged, path_lookup=fake_path_lookup, runner=fake_runner(), environ={})
+            run_operation_plan(forged, config_dir=CONFIG_DIR, path_lookup=fake_path_lookup, runner=fake_runner(), environ={})
 
 
 # --------------------------------------------------------------------------
@@ -468,6 +543,22 @@ class ApprovalBindingTests(unittest.TestCase):
         as_draft = resource(GmailResourceKind.NEW_DRAFT, to=base.to, cc=base.cc, subject=base.subject, body=base.body)
         self.assertNotEqual(digest, frame_for("gmail_draft_create", as_draft).digest)
 
+    def test_the_frame_binds_the_message_and_no_transport_detail(self) -> None:
+        frame = frame_for("gmail_send")
+        self.assertEqual(
+            {"connector", "capability", "destination", "resource", "principal", "credential_route", "operation", "body_sha256"},
+            set(frame.to_dict()),
+        )
+        self.assertEqual(GMAIL_CREDENTIAL_ROUTE, frame.credential_route)
+        # Where the dedicated credential lives is deployment, not authority: the
+        # same message under the same account and route is the same approval.
+        elsewhere = build_gmail_request_frame(
+            capability="gmail_send", destination=DEST, resource=WRITE_RESOURCES["gmail_send"],
+            binding=GmailIdentityBinding(principal=ACCOUNT, config_dir=r"D:\other\gws-gmail"),
+        )
+        self.assertEqual(frame.digest, elsewhere.digest)
+        self.assertNotIn(GMAIL_UPLOAD_NAME, frame.canonical_bytes().decode())
+
     def test_the_frame_cannot_name_another_account_or_a_different_operation(self) -> None:
         other = GmailResource(kind=GmailResourceKind.MESSAGE, account="other@example.com", message_id=MESSAGE_ID)
         with self.assertRaises(AttestationError):
@@ -490,23 +581,72 @@ class ApprovalBindingTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-class ProcessSeamTests(unittest.TestCase):
-    def test_the_child_is_started_with_a_list_no_shell_and_no_stdin(self) -> None:
-        runner = fake_runner(b"{}")
-        _run(("gmail", "users", "getProfile"), path_lookup=fake_path_lookup, runner=runner, environ={})
-        call = runner.calls[0]
-        self.assertEqual(["C:/tools/gws.exe", "gmail", "users", "getProfile"], call["argv"])
-        self.assertFalse(call["shell"])
-        self.assertEqual(b"", call["input"])
-        self.assertTrue(call["capture_output"])
-        self.assertFalse(call["check"])
-        self.assertGreater(call["timeout"], 0)
-        self.assertNotIn(".git", call["cwd"])
+class RoutePolicyTests(unittest.TestCase):
+    def test_only_the_dedicated_encrypted_keyring_route_is_accepted(self) -> None:
+        self.assertIsNone(gmail_route_refusal(allowed_status(), config_dir=CONFIG_DIR))
+        # Case of the drive letter is not identity on Windows.
+        self.assertIsNone(gmail_route_refusal(allowed_status(CONFIG_DIR.lower()), config_dir=CONFIG_DIR))
+        deviations = {
+            "adc or service account only (nothing stored)": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "client_config_exists": False},
+            "token from the environment": {"credential_source": "token_env_var"},
+            "client id/secret from the environment": {"credential_source": "environment_variables"},
+            "plaintext credentials, file backend": {"storage": "plaintext", "keyring_backend": "file", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
+            "plaintext credentials, keyring backend": {"storage": "plaintext", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
+            "env credentials file (reported as plaintext)": {"storage": "plaintext", "plain_credentials": r"C:\elsewhere\creds.json", "plain_credentials_exists": True},
+            "encrypted but a plaintext file also present": {"plain_credentials_exists": True},
+            "encrypted with a file-backed key": {"keyring_backend": "file"},
+            "no oauth client configuration": {"client_config_exists": False},
+            "credential from another directory": {"encrypted_credentials": r"C:\Users\someone\.config\gws\credentials.enc"},
+            "client config from another directory": {"client_config": r"C:\Users\someone\.config\gws\client_secret.json"},
+            "cannot decrypt on this machine": {"encryption_valid": False},
+            "encryption error": {"encryption_error": "Could not decrypt"},
+            "token error": {"token_error": "The OAuth client was not found."},
+        }
+        for name, change in deviations.items():
+            with self.subTest(route=name):
+                self.assertIsNotNone(gmail_route_refusal({**allowed_status(), **change}, config_dir=CONFIG_DIR))
+        self.assertIsNotNone(gmail_route_refusal(None, config_dir=CONFIG_DIR))
+        self.assertIsNotNone(gmail_route_refusal([], config_dir=CONFIG_DIR))
+        self.assertIsNotNone(gmail_route_refusal(allowed_status(), config_dir=r"C:\other\dir"))
 
-    def test_the_child_environment_carries_no_token_or_redirection(self) -> None:
+    def test_the_rehearsal_must_describe_a_bodiless_multipart_upload(self) -> None:
+        self.assertIsNone(gmail_dry_run_refusal(dry_run_payload()))
+        self.assertIsNone(gmail_dry_run_refusal(dry_run_payload("drafts")))
+        for change in (
+            {"body": {"raw": "aGVsbG8"}},
+            {"is_multipart_upload": False},
+            {"dry_run": False},
+            {"method": "GET"},
+            {"url": f"https://gmail.googleapis.com/gmail/v1/users/{ACCOUNT}/messages/send"},
+        ):
+            with self.subTest(change=change):
+                self.assertIsNotNone(gmail_dry_run_refusal({**dry_run_payload(), **change}))
+        self.assertIsNotNone(gmail_dry_run_refusal("not json"))
+
+
+class SeamTestCase(unittest.TestCase):
+    """A real, JARVIS-owned temporary config directory for the seam."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.config = str(Path(self.temp.name) / "gws-gmail")
+        Path(self.config).mkdir()
+        self.run_dir = str(Path(self.config) / GWS_RUN_DIRNAME)
+        self.transport_root = Path(self.config) / GWS_TRANSPORT_DIRNAME
+
+    def transport_entries(self) -> list[str]:
+        return sorted(p.name for p in self.transport_root.iterdir()) if self.transport_root.exists() else []
+
+
+class SeamTests(SeamTestCase):
+    def test_the_child_is_started_with_a_list_no_shell_no_stdin_and_a_pinned_environment(self) -> None:
         hostile = {
             "GOOGLE_APPLICATION_CREDENTIALS": "C:/secrets/sa.json",
-            "GOOGLE_OAUTH_ACCESS_TOKEN": "ya29.secret",
+            "GOOGLE_WORKSPACE_CLI_TOKEN": "ya29.secret",
+            "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE": "C:/secrets/creds.json",
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": "C:/Users/o/.config/gws",
+            "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file",
             "GWS_TOKEN": "ya29.secret",
             "CLOUDSDK_CONFIG": "C:/other",
             "GCLOUD_PROJECT": "evil",
@@ -517,38 +657,82 @@ class ProcessSeamTests(unittest.TestCase):
             "USERPROFILE": "C:/Users/o",
             "PATH": "C:/tools",
         }
-        child = sanitized_gmail_environment(hostile)
-        for removed in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GWS_TOKEN",
-                        "CLOUDSDK_CONFIG", "GCLOUD_PROJECT", "HTTPS_PROXY", "XDG_CONFIG_HOME", "BROWSER"):
+        runner = fake_runner(b"{}")
+        Path(self.run_dir).mkdir()
+        _run(("auth", "status"), config_dir=self.config, cwd=self.run_dir, environ=hostile, path_lookup=fake_path_lookup, runner=runner)
+        call = runner.calls[0]
+        self.assertEqual(["C:/tools/gws.exe", "auth", "status"], call["argv"])
+        self.assertFalse(call["shell"])
+        self.assertEqual(b"", call["input"])
+        self.assertTrue(call["capture_output"])
+        self.assertFalse(call["check"])
+        self.assertEqual(self.run_dir, call["cwd"])
+        child = call["env"]
+        for removed in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_WORKSPACE_CLI_TOKEN", "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+                        "GWS_TOKEN", "CLOUDSDK_CONFIG", "GCLOUD_PROJECT", "HTTPS_PROXY", "XDG_CONFIG_HOME", "BROWSER"):
             self.assertNotIn(removed, child, removed)
+        # The ambient config directory and key storage are REPLACED, not merely removed.
+        self.assertEqual(self.config, child["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])
+        self.assertEqual("keyring", child["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"])
         self.assertEqual("C:/Users/o/AppData/Roaming", child["APPDATA"])
         self.assertEqual("C:/Users/o", child["USERPROFILE"])
         self.assertEqual("1", child["NO_COLOR"])
-        runner = fake_runner()
-        _run(("gmail", "users", "getProfile"), path_lookup=fake_path_lookup, runner=runner, environ=hostile)
-        self.assertNotIn("GWS_TOKEN", runner.calls[0]["env"])
 
-    def test_a_failing_call_refuses_without_echoing_its_diagnostics(self) -> None:
-        runner = fake_runner(b"", returncode=1, stderr=b"token ya29.leaked-token-value is invalid")
-        with self.assertRaises(GmailCommandFailed) as caught:
-            _run(("gmail",), path_lookup=fake_path_lookup, runner=runner, environ={})
-        self.assertNotIn("ya29", str(caught.exception))
-        self.assertIn("exit 1", str(caught.exception))
-
-    def test_a_missing_cli_is_a_refusal(self) -> None:
+    def test_a_dotenv_in_the_working_directory_or_an_ancestor_is_a_refusal(self) -> None:
+        cwd = Path(self.temp.name) / "deep" / "cwd"
+        cwd.mkdir(parents=True)
+        runner = fake_runner(b"{}")
+        hostile = cwd / ".env"
+        hostile.write_text("GOOGLE_WORKSPACE_CLI_TOKEN=ya29.secret\n")
         with self.assertRaises(GmailCommandFailed):
-            _run(("gmail",), path_lookup=lambda name: None, runner=fake_runner(), environ={})
+            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+        hostile.unlink()
+        ancestor = Path(self.temp.name) / ".env"
+        ancestor.write_text("GOOGLE_WORKSPACE_CLI_CONFIG_DIR=C:/elsewhere\n")
+        with self.assertRaises(GmailCommandFailed):
+            _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+        self.assertIsNotNone(dotenv_refusal(str(cwd)))
+        ancestor.unlink()
+        self.assertEqual([], runner.calls)
+        self.assertIsNone(dotenv_refusal(str(cwd)))
+        _run(("auth", "status"), config_dir=self.config, cwd=str(cwd), environ={}, path_lookup=fake_path_lookup, runner=runner)
+        self.assertEqual(1, len(runner.calls))
 
-    def test_a_read_timeout_is_a_refusal_and_a_write_timeout_is_unknown(self) -> None:
+    def test_pre_spawn_failures_are_refusals_and_started_failures_are_typed(self) -> None:
+        Path(self.run_dir).mkdir()
+        common = dict(config_dir=self.config, cwd=self.run_dir, environ={}, path_lookup=fake_path_lookup)
+        with self.assertRaises(GmailCommandFailed) as missing:
+            _run(("auth", "status"), **{**common, "path_lookup": lambda name: None}, runner=fake_runner())
+        self.assertNotIsInstance(missing.exception, (GmailCommandExited, GmailCommandTimedOut))
+
+        def not_started(argv, **kwargs):
+            raise OSError("spawn failed")
+
+        with self.assertRaises(GmailCommandFailed) as spawn:
+            _run(("auth", "status"), **common, runner=not_started)
+        self.assertNotIsInstance(spawn.exception, (GmailCommandExited, GmailCommandTimedOut))
+        with self.assertRaises(GmailCommandExited) as exited:
+            _run(("auth", "status"), **common, runner=fake_runner(b"", returncode=1, stderr=b"token ya29.leaked is invalid"))
+        self.assertEqual(1, exited.exception.returncode)
+        self.assertNotIn("ya29", str(exited.exception))
+
         def timing_out(argv, **kwargs):
             raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
 
-        read = gmail_operation_plan(frame_for("gmail_message_read"))
-        with self.assertRaises(GmailCommandFailed):
-            run_operation_plan(read, path_lookup=fake_path_lookup, runner=timing_out, environ={})
-        send = gmail_operation_plan(frame_for("gmail_send"))
-        with self.assertRaises(GmailOutcomeUnknown):
-            run_operation_plan(send, path_lookup=fake_path_lookup, runner=timing_out, environ={})
+        with self.assertRaises(GmailCommandTimedOut):
+            _run(("auth", "status"), **common, runner=timing_out)
+
+    def test_an_unusable_dedicated_directory_is_refused_before_anything_runs(self) -> None:
+        runner = fake_runner()
+        for bad in ("", "relative/dir", "C:\\dir\x00"):
+            with self.subTest(config_dir=repr(bad)):
+                with self.assertRaises(GmailCommandFailed):
+                    _run(("auth", "status"), config_dir=bad, cwd=self.temp.name, environ={}, path_lookup=fake_path_lookup, runner=runner)
+                with self.assertRaises(GmailExecutionUnavailable):
+                    sanitized_gmail_environment({}, config_dir=bad)
+        self.assertEqual([], runner.calls)
+        with self.assertRaises(ValueError):
+            GmailCliConnector(GmailIdentityBinding(principal=ACCOUNT, config_dir="relative"))
 
     def test_google_token_shapes_are_credentials_everywhere(self) -> None:
         for token in ("ya29.a0AfB_byC1234567890abcdefghijk", "1//0gAbCdEfGhIjKlMnOpQrStUvWxYz", "AIzaSyA1234567890abcdefghijklmnopqrstuv"):
@@ -558,31 +742,220 @@ class ProcessSeamTests(unittest.TestCase):
             Settings(gmail_principal="ya29.a0AfB_byC1234567890abcdefghijk")
 
 
-class IdentityObservationTests(unittest.TestCase):
-    def test_the_bound_account_is_asked_for_by_name_and_answers_itself(self) -> None:
-        runner = fake_runner(json.dumps({"emailAddress": "Operator@example.com", "messagesTotal": 10}).encode())
-        observed = observed_gmail_identity(ACCOUNT, path_lookup=fake_path_lookup, runner=runner, environ={})
-        self.assertEqual((ACCOUNT, GMAIL_CREDENTIAL_ROUTE), observed)
-        argv = runner.calls[0]["argv"]
-        self.assertEqual(["gmail", "users", "getProfile", "--params"], argv[1:5])
-        self.assertEqual({"userId": ACCOUNT}, json.loads(argv[5]))
+class IdentityObservationTests(SeamTestCase):
+    def observe(self, runner, principal=ACCOUNT, config_dir=None):
+        return observed_gmail_identity(principal, config_dir or self.config, path_lookup=fake_path_lookup, runner=runner, environ={})
 
-    def test_every_uncertain_session_fails_closed(self) -> None:
-        cases = {
-            "another account": json.dumps({"emailAddress": "other@example.com"}),
-            "an api error": json.dumps({"error": {"code": 403, "message": "Delegation denied"}}),
-            "no address": json.dumps({"messagesTotal": 3}),
-            "not json": "Logged in as operator",
-            "empty": "",
+    def test_the_route_is_proved_then_the_bound_account_is_asked_by_name(self) -> None:
+        runner = scripted_runner(answer=json.dumps({"emailAddress": "Operator@example.com", "messagesTotal": 10}).encode())
+        self.assertEqual((ACCOUNT, GMAIL_CREDENTIAL_ROUTE), self.observe(runner))
+        self.assertEqual(2, len(runner.calls))
+        self.assertEqual(["auth", "status"], runner.calls[0]["argv"][1:])
+        self.assertEqual(["gmail", "users", "getProfile", "--params"], runner.calls[1]["argv"][1:5])
+        self.assertEqual({"userId": ACCOUNT}, json.loads(runner.calls[1]["argv"][5]))
+        for call in runner.calls:
+            self.assertEqual(self.run_dir, call["cwd"])
+            self.assertEqual(self.config, call["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])
+            self.assertEqual("keyring", call["env"]["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"])
+
+    def test_every_foreign_credential_source_fails_closed_before_the_profile_is_asked(self) -> None:
+        foreign = {
+            "adc or service account only": {"auth_method": "none", "storage": "none", "encrypted_credentials_exists": False, "client_config_exists": False},
+            "token from a .env or the environment": {"credential_source": "token_env_var"},
+            "plaintext credentials": {"storage": "plaintext", "plain_credentials_exists": True, "encrypted_credentials_exists": False},
+            "another directory's credential": {"encrypted_credentials": r"C:\Users\someone\.config\gws\credentials.enc"},
+            "file-backed key": {"keyring_backend": "file"},
         }
-        for name, body in cases.items():
+        for name, change in foreign.items():
+            with self.subTest(route=name):
+                runner = scripted_runner(status=json.dumps({**allowed_status(self.config), **change}).encode(),
+                                         answer=json.dumps({"emailAddress": ACCOUNT}).encode())
+                with self.assertRaises(GmailCommandFailed):
+                    self.observe(runner)
+                self.assertEqual(1, len(runner.calls))
+                self.assertEqual(["auth", "status"], runner.calls[0]["argv"][1:])
+        for broken in (b"not json", b"", FakeCompleted(2, b"", b"")):
+            with self.subTest(status=str(broken)[:12]):
+                runner = scripted_runner(status=broken, answer=json.dumps({"emailAddress": ACCOUNT}).encode())
+                with self.assertRaises(GmailCommandFailed):
+                    self.observe(runner)
+                self.assertEqual(1, len(runner.calls))
+
+    def test_the_profile_proves_the_account_only(self) -> None:
+        for name, answer in {
+            "another account": json.dumps({"emailAddress": "other@example.com"}).encode(),
+            "an api error": json.dumps({"error": {"code": 403, "message": "Delegation denied"}}).encode(),
+            "no address": json.dumps({"messagesTotal": 3}).encode(),
+            "not json": b"Logged in as operator",
+            "auth error exit": FakeCompleted(2, b"", b""),
+        }.items():
             with self.subTest(case=name):
                 with self.assertRaises(GmailCommandFailed):
-                    observed_gmail_identity(ACCOUNT, path_lookup=fake_path_lookup, runner=fake_runner(body.encode()), environ={})
+                    self.observe(scripted_runner(answer=answer))
+
+    def test_an_unusable_principal_or_directory_is_refused_without_running(self) -> None:
+        runner = scripted_runner(answer=json.dumps({"emailAddress": ACCOUNT}).encode())
         with self.assertRaises(GmailCommandFailed):
-            observed_gmail_identity(ACCOUNT, path_lookup=fake_path_lookup, runner=fake_runner(b"", returncode=1), environ={})
+            self.observe(runner, principal="not an address")
         with self.assertRaises(GmailCommandFailed):
-            observed_gmail_identity("not an address", path_lookup=fake_path_lookup, runner=fake_runner(), environ={})
+            self.observe(runner, config_dir="relative")
+        self.assertEqual([], runner.calls)
+
+
+class WriteTransportTests(SeamTestCase):
+    FORBIDDEN = ("alice@example.com", "bob@example.com", "Merhaba", "Selam", "deneme", "Subject", "raw")
+
+    def run_plan(self, capability: str, runner):
+        plan = gmail_operation_plan(frame_for(capability))
+        return run_operation_plan(plan, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, runner=runner)
+
+    def assert_argv_carries_no_payload(self, argv: list[str], message: bytes) -> None:
+        joined = "\x00".join(argv)
+        for word in self.FORBIDDEN:
+            self.assertNotIn(word, joined, word)
+        self.assertNotIn(base64.urlsafe_b64encode(message).decode()[:24], joined)
+        self.assertNotIn(base64.b64encode(message).decode()[:24], joined)
+
+    def test_the_message_travels_as_a_file_and_never_on_the_command_line(self) -> None:
+        message = gmail_outbound_message(WRITE_RESOURCES["gmail_send"])
+        seen: list[dict] = []
+
+        def observe(call):
+            if "auth" in call["argv"]:
+                return
+            path = Path(call["cwd"]) / GMAIL_UPLOAD_NAME
+            seen.append({"cwd": call["cwd"], "exists": path.exists(), "bytes": path.read_bytes() if path.exists() else b""})
+
+        runner = scripted_runner(answer=json.dumps(send_ack()).encode(), observe=observe)
+        output = self.run_plan("gmail_send", runner)
+        self.assertEqual(MESSAGE_ID, json.loads(output.stdout)["id"])
+        self.assertEqual(3, len(runner.calls))
+        status, rehearsal, real = runner.calls
+        self.assertEqual(["auth", "status"], status["argv"][1:])
+        expected = ["gmail", "users", "messages", "send", "--params", json.dumps({"userId": ACCOUNT}, separators=(",", ":")),
+                    "--upload", GMAIL_UPLOAD_NAME, "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE]
+        self.assertEqual(expected + ["--dry-run"], rehearsal["argv"][1:])
+        self.assertEqual(expected, real["argv"][1:])
+        for call in (rehearsal, real):
+            self.assert_argv_carries_no_payload(call["argv"], message)
+            self.assertEqual(str(self.transport_root), str(Path(call["cwd"]).parent))
+            self.assertEqual(self.config, call["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])
+        # The file existed, with exactly the bound bytes, while the child ran.
+        self.assertEqual(2, len(seen))
+        for turn in seen:
+            self.assertTrue(turn["exists"])
+            self.assertEqual(message, turn["bytes"])
+        self.assertEqual(seen[0]["cwd"], seen[1]["cwd"])
+        # And it is gone now.
+        self.assertEqual([], self.transport_entries())
+
+    def test_a_draft_uses_the_same_transport(self) -> None:
+        runner = scripted_runner(dry_run=json.dumps(dry_run_payload("drafts")).encode(), answer=json.dumps(draft_ack()).encode())
+        self.run_plan("gmail_draft_create", runner)
+        real = runner.calls[-1]["argv"][1:]
+        self.assertEqual(["gmail", "users", "drafts", "create", "--params"], real[:5])
+        self.assertEqual(["--upload", GMAIL_UPLOAD_NAME, "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE], real[6:])
+        self.assert_argv_carries_no_payload(runner.calls[-1]["argv"], gmail_outbound_message(WRITE_RESOURCES["gmail_draft_create"]))
+        self.assertEqual([], self.transport_entries())
+
+    def test_a_started_write_that_does_not_succeed_is_unknown_and_the_transport_is_removed(self) -> None:
+        def timing_out(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
+
+        outcomes = {
+            "nonzero exit": FakeCompleted(1, b"", b""),
+            "auth-error exit": FakeCompleted(2, b"", b""),
+            "validation exit": FakeCompleted(3, b"", b""),
+            "internal exit": FakeCompleted(5, b"", b""),
+            "timeout": subprocess.TimeoutExpired(cmd=["gws"], timeout=1),
+            "unclassified failure": RuntimeError("socket reset mid-call"),
+        }
+        for name, answer in outcomes.items():
+            with self.subTest(outcome=name):
+                runner = scripted_runner(answer=answer)
+                with self.assertRaises(GmailOutcomeUnknown):
+                    self.run_plan("gmail_send", runner)
+                self.assertEqual(3, len(runner.calls))
+                self.assertEqual([], self.transport_entries())
+
+    def test_a_refusal_before_the_boundary_starts_nothing_and_leaves_nothing(self) -> None:
+        # the local dry run refuses: nothing was sent, the real call never happens
+        runner = scripted_runner(dry_run=FakeCompleted(3, b"", b""))
+        with self.assertRaises(GmailCommandFailed) as refused:
+            self.run_plan("gmail_send", runner)
+        self.assertNotIsInstance(refused.exception, GmailOutcomeUnknown)
+        self.assertEqual(2, len(runner.calls))
+        self.assertEqual([], self.transport_entries())
+        # the dry run describes a bodied request: refused, the real call never happens
+        runner = scripted_runner(dry_run=json.dumps({**dry_run_payload(), "body": {"raw": "x"}}).encode())
+        with self.assertRaises(GmailCommandFailed):
+            self.run_plan("gmail_send", runner)
+        self.assertEqual(2, len(runner.calls))
+        self.assertEqual([], self.transport_entries())
+        # the route is not the dedicated one: no transport is even created
+        runner = scripted_runner(status=json.dumps({**allowed_status(self.config), "storage": "plaintext", "plain_credentials_exists": True, "encrypted_credentials_exists": False}).encode())
+        with self.assertRaises(GmailCommandFailed):
+            self.run_plan("gmail_send", runner)
+        self.assertEqual(1, len(runner.calls))
+        self.assertEqual([], self.transport_entries())
+        # the executable is missing: nothing started
+        with self.assertRaises(GmailCommandFailed):
+            run_operation_plan(gmail_operation_plan(frame_for("gmail_send")), config_dir=self.config, environ={}, path_lookup=lambda name: None, runner=scripted_runner())
+        self.assertEqual([], self.transport_entries())
+
+    def test_a_stale_transport_directory_is_swept_before_a_write(self) -> None:
+        stale = self.transport_root / "msg-stale"
+        stale.mkdir(parents=True)
+        (stale / GMAIL_UPLOAD_NAME).write_bytes(b"leftover")
+        self.run_plan("gmail_send", scripted_runner(answer=json.dumps(send_ack()).encode()))
+        self.assertEqual([], self.transport_entries())
+
+    def test_a_read_runs_in_the_run_directory_with_no_transport(self) -> None:
+        runner = scripted_runner(answer=json.dumps(message_payload()).encode())
+        self.run_plan("gmail_message_read", runner)
+        self.assertEqual(2, len(runner.calls))
+        self.assertEqual(self.run_dir, runner.calls[1]["cwd"])
+        self.assertNotIn("--upload", runner.calls[1]["argv"])
+        self.assertFalse(self.transport_root.exists())
+
+    def test_a_read_that_fails_after_starting_is_a_refusal_not_an_unknown(self) -> None:
+        for answer in (FakeCompleted(1, b"", b""), subprocess.TimeoutExpired(cmd=["gws"], timeout=1)):
+            with self.subTest(answer=str(answer)[:20]):
+                with self.assertRaises(GmailCommandFailed) as caught:
+                    self.run_plan("gmail_message_read", scripted_runner(answer=answer))
+                self.assertNotIsInstance(caught.exception, GmailOutcomeUnknown)
+
+    def test_a_forged_plan_is_refused_before_the_route_is_even_asked(self) -> None:
+        genuine = gmail_operation_plan(frame_for("gmail_send"))
+        forged = GmailOperationPlan(capability=genuine.capability, destination=genuine.destination, resource=genuine.resource,
+                                    arguments=genuine.arguments[:-2] + ("--json", '{"raw":"aGVsbG8"}'))
+        runner = scripted_runner()
+        with self.assertRaises(GmailCommandFailed):
+            run_operation_plan(forged, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, runner=runner)
+        self.assertEqual([], runner.calls)
+
+
+@unittest.skipUnless(shutil.which("gws"), "the Google Workspace CLI is not installed here")
+class LiveProbeTests(SeamTestCase):
+    """Credential-free, network-free probes of the INSTALLED gws: a local dry
+    run and an empty dedicated directory. Skipped where gws is absent."""
+
+    def test_the_installed_cli_rehearses_both_writes_as_bodiless_multipart_uploads(self) -> None:
+        for capability, kind in (("gmail_send", "messages/send"), ("gmail_draft_create", "drafts")):
+            with self.subTest(capability=capability):
+                plan = gmail_operation_plan(frame_for(capability))
+                self.transport_root.mkdir(exist_ok=True)
+                directory = tempfile.mkdtemp(prefix="msg-", dir=str(self.transport_root))
+                (Path(directory) / GMAIL_UPLOAD_NAME).write_bytes(gmail_outbound_message(RESOURCES[capability]))
+                output = _run((*plan.arguments, "--dry-run"), config_dir=self.config, cwd=directory, environ=dict(os.environ), runner=subprocess.run)
+                payload = json.loads(output.stdout)
+                self.assertIsNone(gmail_dry_run_refusal(payload), payload)
+                self.assertIn(f"/upload/gmail/v1/users/", payload["url"])
+                self.assertNotIn("raw", output.stdout)
+
+    def test_the_installed_cli_refuses_an_empty_dedicated_directory(self) -> None:
+        with self.assertRaises(GmailCommandFailed):
+            gmail_route_check(self.config, environ=dict(os.environ), runner=subprocess.run)
 
 
 # --------------------------------------------------------------------------
@@ -695,8 +1068,8 @@ class ConnectorWriteTests(unittest.TestCase):
         argv = made.ran[0].arguments
         self.assertEqual(("gmail", "users", "drafts", "create", "--params"), argv[:5])
         self.assertEqual({"userId": ACCOUNT}, json.loads(argv[5]))
-        raw = json.loads(argv[argv.index("--json") + 1])["message"]["raw"]
-        self.assertEqual(gmail_outbound_message(WRITE_RESOURCES["gmail_draft_create"]), base64.urlsafe_b64decode(raw))
+        self.assertEqual(("--upload", GMAIL_UPLOAD_NAME, "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE), argv[6:])
+        self.assertNotIn("--json", argv)
         self.assertEqual("passed", made.verify(task, result, SessionState(id="s-1")).status.value)
 
     def test_a_send_is_acknowledged_and_verified_against_its_own_operation(self) -> None:
@@ -706,19 +1079,33 @@ class ConnectorWriteTests(unittest.TestCase):
         self.assertTrue(result.ok, result.summary)
         argv = made.ran[0].arguments
         self.assertEqual(("gmail", "users", "messages", "send", "--params"), argv[:5])
-        raw = json.loads(argv[argv.index("--json") + 1])["raw"]
-        self.assertEqual(gmail_outbound_message(WRITE_RESOURCES["gmail_send"]), base64.urlsafe_b64decode(raw))
+        self.assertEqual(("--upload", GMAIL_UPLOAD_NAME, "--upload-content-type", GMAIL_UPLOAD_CONTENT_TYPE), argv[6:])
+        joined = "\x00".join(argv)
+        for word in ("alice@example.com", "bob@example.com", "Merhaba", "Selam", "raw"):
+            self.assertNotIn(word, joined)
         self.assertEqual("passed", made.verify(task, result, SessionState(id="s-1")).status.value)
         # A draft acknowledgement is not evidence for a send.
         draft_result = connector().execute(gmail_task("gmail_draft_create"), SessionState(id="s-1"))
         self.assertEqual("failed", made.verify(task, draft_result, SessionState(id="s-1")).status.value)
 
-    def test_a_refused_write_is_a_non_retryable_failure_that_sent_nothing(self) -> None:
-        made = connector(answer=GmailCommandFailed("the Google Workspace CLI refused the request (exit 1)"))
-        result = made.execute(gmail_task("gmail_send"), SessionState(id="s-1"))
-        self.assertFalse(result.ok)
-        self.assertEqual(ErrorCode.CONNECTOR_FAILED, result.error.code)
-        self.assertFalse(result.error.retryable)
+    def test_a_pre_spawn_refusal_is_a_non_retryable_failure_that_sent_nothing(self) -> None:
+        for refusal in (
+            GmailCommandFailed("the Google Workspace CLI is not available on this machine"),
+            GmailCommandFailed("the credential route is not the dedicated one: the credential is not stored encrypted"),
+            GmailCommandFailed("the write was refused by the local dry run before any request could leave the machine"),
+        ):
+            with self.subTest(refusal=str(refusal)[:30]):
+                made = connector(answer=refusal)
+                result = made.execute(gmail_task("gmail_send"), SessionState(id="s-1"))
+                self.assertFalse(result.ok)
+                self.assertEqual(ErrorCode.CONNECTOR_FAILED, result.error.code)
+                self.assertFalse(result.error.retryable)
+
+    def test_a_started_child_that_fails_is_unknown_never_a_refusal(self) -> None:
+        for started in (GmailCommandExited(1), GmailCommandExited(2), GmailCommandTimedOut("no answer")):
+            with self.subTest(started=str(started)[:30]):
+                with self.assertRaises(GmailOutcomeUnknown):
+                    connector(answer=started).execute(gmail_task("gmail_send"), SessionState(id="s-1"))
 
     def test_an_unanswered_or_unreadable_write_escapes_as_unknown(self) -> None:
         for made in (
@@ -821,6 +1208,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, again.error.code)
         self.assertEqual(1, len(made.ran))
 
+    def test_a_write_whose_child_exited_nonzero_is_in_doubt_and_never_replayed(self) -> None:
+        made = connector(answer=GmailCommandExited(1))
+        core = gmail_core(self.memory, (made,))
+        waiting = core.run(gmail_task("gmail_draft_create"))
+        in_doubt = self.approve_and_resume(core, waiting)
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, in_doubt.error.code)
+        self.assertIs(AttemptState.UNKNOWN_OUTCOME, self.memory.latest_execution_attempt(waiting.task.id).state)
+        again = core.resume(waiting.session.id, waiting.task.id, PermissionGrant.for_request(waiting.permission_request))
+        self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, again.error.code)
+        self.assertEqual(1, len(made.ran))
+
     def test_the_kill_switch_refuses_before_any_authority(self) -> None:
         made = connector()
         registry = ToolRegistry()
@@ -848,8 +1246,16 @@ class ConfiguredAuthorityTests(unittest.TestCase):
         self.assertEqual((None, frozenset()), gmail_authority(Settings()))
 
     def test_configuration_becomes_the_binding_and_exact_grants(self) -> None:
-        identity, policy = gmail_authority(Settings(gmail_principal=ACCOUNT))
-        self.assertEqual(BINDING, identity)
+        settings = Settings(gmail_principal=ACCOUNT)
+        identity, policy = gmail_authority(settings)
+        self.assertEqual(ACCOUNT, identity.principal)
+        self.assertEqual(GMAIL_CREDENTIAL_ROUTE, identity.credential_route)
+        # The dedicated directory is derived from JARVIS's own data directory,
+        # beside the memory database - never the operator's ambient gws config.
+        self.assertEqual(str(settings.gmail_config_dir), identity.config_dir)
+        self.assertEqual("gws-gmail", Path(identity.config_dir).name)
+        self.assertEqual(Path(settings.memory_database).resolve().parent, Path(identity.config_dir).parent)
+        self.assertTrue(os.path.isabs(identity.config_dir))
         self.assertEqual(POLICY, policy)
         self.assertNotIn(DestinationGrant(GMAIL_CONNECTOR, "gmail_attachment_read", DEST), policy)
 

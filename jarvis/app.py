@@ -3248,4 +3248,9 @@ def gmail_authority(
         DestinationGrant(GMAIL_CONNECTOR, capability, destination)
         for capability in GMAIL_ENABLED_CAPABILITIES
     }
-    return (GmailIdentityBinding(principal=principal), frozenset(grants))
+    return (
+        GmailIdentityBinding(
+            principal=principal, config_dir=str(settings.gmail_config_dir)
+        ),
+        frozenset(grants),
+    )

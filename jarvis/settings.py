@@ -156,6 +156,19 @@ class Settings:
     #: setting anywhere in this product that holds a Google credential.
     gmail_principal: str | None = None
 
+    @property
+    def gmail_config_dir(self) -> Path:
+        """The JARVIS-dedicated Google Workspace CLI configuration directory.
+
+        DERIVED, never configured: it lives beside the memory database, in
+        JARVIS's own data directory, so the one credential route Gmail
+        accepts is always the login an operator performed INTO this
+        directory (``GOOGLE_WORKSPACE_CLI_CONFIG_DIR=<this> gws auth login``)
+        and never the operator's ambient ``~/.config/gws`` session. Not a
+        secret and not a credential: a location.
+        """
+        return Path(self.memory_database).resolve().parent / "gws-gmail"
+
     def __post_init__(self) -> None:
         # THE typed runtime authority, and it has to actually be typed. Core
         # compares ``permission_mode`` with ``is`` against enum members and
