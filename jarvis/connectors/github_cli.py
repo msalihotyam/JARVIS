@@ -18,7 +18,9 @@ the safety property:
    ago must not execute under an account that changed since;
 5. run the one child process, then re-observe the identity once more - a
    snapshot may only claim a principal that was still the credential's account
-   on BOTH sides of the read;
+   on BOTH sides of the read. This catches a one-way switch and NOT an account
+   that moves away and back across the read; step 5's comment says why that
+   remains open and what closing it would take;
 6. bind the returned content to the frame that asked for it, and hand back an
    UNTRUSTED snapshot.
 
@@ -276,16 +278,27 @@ class GitHubCliConnector(BaseConnector):
                 task, ErrorCode.CONNECTOR_FAILED, "the GitHub read did not complete"
             )
 
-        # (5a) THE SAME IDENTITY, ON THE OTHER SIDE OF THE READ. The check
-        # above and the read are separate processes, and the local CLI picks
-        # its credential when each one starts, so an account switched in
-        # between would be used by the read - and nothing available here can
-        # pin a stored credential to a process without handling the token
-        # itself, which this build will not do. What CAN be closed is the
-        # attestation: a snapshot may only claim the principal that was still
-        # the credential's account after the bytes came back, so a read that
-        # straddled a switch is refused and its content discarded rather than
-        # bound to a principal it did not execute as.
+        # (5a) THE SAME IDENTITY, ON THE OTHER SIDE OF THE READ - AND THIS IS
+        # NOT A PROOF OF WHICH ACCOUNT THE READ RAN AS. State the limit before
+        # the reassurance, because the reassurance is partial.
+        #
+        # The check above, the read, and this check are three processes, and
+        # the CLI picks its credential when each one starts. A one-way switch
+        # is caught here. A switch that goes back is NOT: with the account
+        # moved to another login before the read and returned to this one
+        # after it, both observations answer identically and the bytes the
+        # other account fetched reach the snapshot as if this account had
+        # fetched them. That is an ordinary interleaving, not an attack that
+        # needs a hostile local user - two tools touching the same CLI session
+        # produce it by accident.
+        #
+        # Closing it needs the identity and the result to come out of ONE
+        # credential selection, which means one request. The CLI has no way to
+        # do that for these vectors and no way to pin a stored credential to a
+        # process without being handed the raw token, which this build will not
+        # accept - ``jarvis.github_cli`` records what was measured. So this
+        # check is a detector for the one-way case and nothing more, and the
+        # exact-principal invariant stays unproven for the interleaved one.
         try:
             after = self._observe()
         except Exception:  # noqa: BLE001 - an unreportable identity refuses

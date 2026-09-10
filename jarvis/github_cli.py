@@ -34,6 +34,33 @@ user`` - the authenticated endpoint, answered by the token actually in use -
 and the two must agree before either is reported. Neither call can be pointed
 at a different account by a caller: both vectors are constants.
 
+WHAT IT CANNOT PROMISE, AND WHY - MEASURED, NOT ASSUMED. That the account an
+observation names is the account the NEXT process reads as. The CLI selects
+its credential when each process starts, so an identity and a result obtained
+from two processes are two selections, and an account that moves away and back
+between them is invisible to any number of before/after checks. Closing that
+needs one credential selection to yield both facts, which means one request.
+Against gh 2.98 on 2026-09-10:
+
+- No environment variable selects a stored account. ``GH_TOKEN`` would mean
+  handling the raw token, which this build refuses.
+- ``GH_CONFIG_DIR`` does not pin one either: a configuration naming an account
+  with no per-user keyring entry still authenticates, from the active-account
+  slot that ``gh auth switch`` rewrites. The pin is cosmetic, and that slot
+  exists on a normal installation, so it cannot be excluded.
+- No REST response header names the caller. ``X-OAuth-Client-Id`` names the
+  OAuth application, which is identical for every account.
+- ONE GraphQL request can return both: ``{ viewer { login } repository(...) }``
+  answers with the login of the token that served the same request. But the
+  ten read capabilities run over five different subcommands (``repo``, ``api``,
+  ``issue``, ``pr``, ``search``), so using it would mean re-deriving the whole
+  closed vector table onto one transport and changing the shape of every
+  response - and it would still not cover ``github_code_search``, because
+  GitHub's GraphQL ``SearchType`` has no ``CODE`` member.
+
+So the exact-principal invariant is proved at the moment of each observation
+and is NOT proved across the read. The connector says where that lands.
+
 WHAT IT DECIDES. Nothing. It observes an identity and returns bytes; Core
 compares that identity against its own binding, Core owns the destination
 grant, and Core owns the approval. A refusal here is always a refusal - it

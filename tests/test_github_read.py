@@ -551,6 +551,47 @@ class ConnectorTests(unittest.TestCase):
         # discarded rather than carried into an attested snapshot.
         self.assertEqual(1, len(self.ran))
 
+    def test_an_account_that_moves_away_and_back_is_NOT_caught(self) -> None:
+        """The ABA hole, reproduced deterministically. THIS IS AN OPEN GAP.
+
+        This test asserts what the boundary does TODAY, not what it should do.
+        It exists so the gap is a recorded, executable fact instead of a
+        sentence in a review, and so that a future atomic binding has a case
+        that must flip: the assertions below say the wrong principal is bound,
+        and closing the hole means rewriting them.
+
+        The sequence is the counterexample itself. Both observations answer
+        with the bound principal, the read in between runs under another
+        account, and nothing the connector can see distinguishes it from a
+        clean read - because the identity and the result come from two
+        separate credential selections.
+        """
+        active = [PRINCIPAL]
+        executed_as: list[str] = []
+
+        def observer():
+            return (active[0], GITHUB_CREDENTIAL_ROUTE)
+
+        def runner(plan, **kwargs):
+            active[0] = "intruder"  # (2) the account switches
+            executed_as.append(active[0])  # (3) the READ runs as the intruder
+            active[0] = PRINCIPAL  # (4) and it switches back
+            return FakeOutput('{"name":"private-to-intruder"}')
+
+        connector = GitHubCliConnector(
+            BINDING, identity_observer=observer, plan_runner=runner
+        )
+        task = github_task()
+        result = connector.execute(task, SessionState(id="s-aba"))
+
+        self.assertEqual(["intruder"], executed_as)
+        # (6) The bracket sees PRINCIPAL on both sides and accepts. The content
+        # the intruder's credential fetched is now bound to PRINCIPAL.
+        self.assertIs(OutcomeStatus.SUCCESS, result.outcome)
+        snapshot = result.data[EXTERNAL_READ_RESULT_KEY]
+        self.assertEqual(PRINCIPAL, connector.binding.principal)
+        self.assertIn("private-to-intruder", snapshot["content"])
+
     def test_an_unreadable_identity_after_the_read_also_refuses(self) -> None:
         answers = [(PRINCIPAL, GITHUB_CREDENTIAL_ROUTE)]
 
