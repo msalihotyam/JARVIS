@@ -4,20 +4,20 @@ Short, current-state snapshot. Keep this file small and update it whenever
 the state below actually changes — see `JARVIS_RUNBOOK.md` for the rules this
 state is tracked under.
 
-- **Current work:** GitHub usable-v1 READ security correction (identity bound
-  to the credential, then atomic principal binding: `viewer.login` and the
-  requested data come from the same authenticated GraphQL request; 9 READ
-  capabilities; `github_code_search` deferred post-v1) and dev-helper S1
-  optimization (one canonical repo template, one copy per test) — completed,
-  integrated and cleaned. Targeted GitHub tests: 155 OK.
+- **Current work:** dev-helper S2 process-level sharding — completed and
+  integrated (`17589d2`): the helper suite runs as 4 isolated PowerShell shard
+  processes, 736 passed / 0 failed, wall-clock 2:15.9 (previous S1/user
+  baseline 8:07.4); no leftover shard processes, worktrees or temp bases;
+  product code and product suite untouched. S1/S2 performance work is
+  CLOSED — no further helper optimization is planned.
 - **Dashboard:** 58% (GitHub capability 60%, Scheduler 92%).
 - **Latest canonical main** includes the GitHub READ commit `5007c15`, the
-  security correction `2301b53` → `83b701a` (atomic principal binding) and
-  dev-helper S1 `b716905`; housekeeping commits after those do not change the
-  product state recorded here.
-- **Next implementation:** dev-helper S2 process-level sharding (dev tooling,
-  no product code). Gmail minimum remains the next product milestone. GitHub
-  writes and `github_code_search` stay out of scope.
+  security correction `2301b53` → `83b701a` (atomic principal binding, 9 READ
+  capabilities, `github_code_search` deferred post-v1, targeted GitHub tests
+  155 OK), dev-helper S1 `b716905` and S2 `17589d2`; housekeeping commits
+  after those do not change the product state recorded here.
+- **Next implementation:** Gmail minimum usable-v1 (design not started).
+  GitHub writes and `github_code_search` stay out of scope.
 - **Contracts:** SQLite schema 10; output envelope 7 (GitHub READ moved it
   from 6 for the bounded `external_read` block). The security correction
   changed neither.
