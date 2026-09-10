@@ -24,6 +24,16 @@ token sitting in the parent environment cannot even reach the child - which
 is also what makes the observed route provably the credential store rather
 than an environment override.
 
+WHICH ACCOUNT AN OBSERVATION IS ABOUT. The one the CREDENTIAL belongs to,
+established by GitHub rather than by this machine. ``gh auth status`` reports
+the account named in the CLI's own configuration and does not reconcile it
+with the token it then uses: a configuration naming one login while the
+credential store answers with another's token passes it, and the storage word
+is all that is worth taking from it. So the login is taken from ``gh api
+user`` - the authenticated endpoint, answered by the token actually in use -
+and the two must agree before either is reported. Neither call can be pointed
+at a different account by a caller: both vectors are constants.
+
 WHAT IT DECIDES. Nothing. It observes an identity and returns bytes; Core
 compares that identity against its own binding, Core owns the destination
 grant, and Core owns the approval. A refusal here is always a refusal - it
@@ -50,6 +60,7 @@ from jarvis.github import (
     GitHubExecutionUnavailable,
     GitHubOperationPlan,
     github_operation_plan_refusal,
+    github_principal_refusal,
     sanitized_github_environment,
 )
 
@@ -69,6 +80,23 @@ GH_OUTPUT_MAX_BYTES = 1_048_576
 #: The argument vector that observes - and only observes - which account the
 #: local CLI session belongs to. It is a constant, not a parameter.
 GH_AUTH_STATUS_ARGS: tuple[str, ...] = ("auth", "status", *GITHUB_HOSTNAME_ARGS)
+
+#: The argument vector that asks GITHUB which account the credential in use
+#: belongs to. Also a constant: there is no parameter here either, the path is
+#: the authenticated-user endpoint, and ``--jq`` reduces the answer to one
+#: non-secret field so no other part of the profile is ever captured.
+# ponytail: one network round trip per observation, and an observation happens
+# on both sides of every read. Cache it per (process, wall-clock window) only
+# if read latency ever measurably matters - a cached identity is exactly the
+# stale answer this call exists to replace, so the cache would have to expire
+# faster than an account can be switched, which is not obviously worth it.
+GH_API_USER_ARGS: tuple[str, ...] = (
+    "api",
+    *GITHUB_HOSTNAME_ARGS,
+    "user",
+    "--jq",
+    ".login",
+)
 
 #: ``gh auth status`` names the account and, in parentheses, the storage
 #: backing its token. The login grammar is GitHub's own; the storage word is
@@ -216,6 +244,14 @@ def observed_github_identity(
     later call would use is exactly the ambiguity that must not be guessed),
     or a token whose storage is not the OS credential store. The token itself
     is never parsed, returned or logged - only the login and the storage word.
+
+    TWO SOURCES, AND THEY MUST AGREE. ``gh auth status`` is asked only what
+    this machine's configuration SAYS - the account name and the storage word
+    behind it - and it is not evidence of whose credential would be used: it
+    reports the configured name whether or not the token the CLI then reaches
+    for belongs to that account. So the login is taken from ``gh api user``,
+    which GitHub answers using the credential itself, and a disagreement
+    between the two is a refusal rather than a preference for one of them.
     """
     try:
         output = _run(
@@ -234,10 +270,31 @@ def observed_github_identity(
             "the authenticated GitHub account could not be established "
             "unambiguously"
         )
-    principal, storage = matches[0]
+    configured, storage = matches[0]
     if storage != _KEYRING_STORAGE:
         raise GitHubCommandFailed(
             "the GitHub session is not backed by the OS credential store"
+        )
+    try:
+        answered = _run(
+            GH_API_USER_ARGS,
+            environ=environ,
+            path_lookup=path_lookup,
+            runner=runner,
+        )
+    except GitHubCommandFailed as exc:
+        raise GitHubCommandFailed(
+            "the GitHub credential in use did not identify its own account"
+        ) from exc
+    principal = answered.stdout.strip()
+    if github_principal_refusal(principal) is not None:
+        raise GitHubCommandFailed(
+            "the GitHub credential in use did not identify its own account"
+        )
+    if principal.lower() != configured.lower():
+        raise GitHubCommandFailed(
+            "the configured GitHub account is not the account the credential "
+            "belongs to"
         )
     return (principal, GITHUB_CREDENTIAL_ROUTE)
 
@@ -275,6 +332,7 @@ def run_operation_plan(
 
 
 __all__ = [
+    "GH_API_USER_ARGS",
     "GH_AUTH_STATUS_ARGS",
     "GH_EXECUTABLE_NAME",
     "GH_OUTPUT_MAX_BYTES",

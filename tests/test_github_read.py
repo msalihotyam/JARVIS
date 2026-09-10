@@ -23,6 +23,7 @@ from jarvis.contracts import (
     EXTERNAL_READ_RESULT_KEY,
     ActionScope,
     AgentRun,
+    ErrorCode,
     RunStatus,
     OutcomeStatus,
     SessionState,
@@ -50,6 +51,7 @@ from jarvis.github import (
     github_resource_refusal,
 )
 from jarvis.github_cli import (
+    GH_API_USER_ARGS,
     GH_AUTH_STATUS_ARGS,
     GitHubCommandFailed,
     _run,
@@ -128,6 +130,29 @@ def fake_runner(stdout: bytes = b"{}", returncode: int = 0, stderr: bytes = b"")
     def run(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
         return FakeCompleted(returncode, stdout, stderr)
+
+    run.calls = calls  # type: ignore[attr-defined]
+    return run
+
+
+def fake_session_runner(
+    status: str = f"  Logged in to github.com account {PRINCIPAL} (keyring)\n",
+    login: str = PRINCIPAL,
+    returncode: int = 0,
+):
+    """A runner that answers the two identity calls SEPARATELY.
+
+    The point of the pair is that they can disagree: ``gh auth status`` reports
+    what this machine's configuration says, ``gh api user`` reports whose token
+    GitHub actually saw. A stand-in that answered both from one string could
+    not express the case the boundary exists to refuse.
+    """
+    calls: list[dict] = []
+
+    def run(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        answer = login if "user" in argv else status
+        return FakeCompleted(returncode, answer.encode(), b"")
 
     run.calls = calls  # type: ignore[attr-defined]
     return run
@@ -376,10 +401,10 @@ class ProcessSeamTests(unittest.TestCase):
 
 
 class IdentityObservationTests(unittest.TestCase):
-    def observe(self, stdout: str):
+    def observe(self, stdout: str, login: str = PRINCIPAL):
         return observed_github_identity(
             path_lookup=fake_path_lookup,
-            runner=fake_runner(stdout.encode()),
+            runner=fake_session_runner(status=stdout, login=login),
             environ={},
         )
 
@@ -391,17 +416,34 @@ class IdentityObservationTests(unittest.TestCase):
         )
         self.assertEqual((PRINCIPAL, GITHUB_CREDENTIAL_ROUTE), observed)
 
-    def test_the_status_call_is_a_constant_naming_the_one_host(self) -> None:
-        runner = fake_runner(
-            b"  Logged in to github.com account operator (keyring)\n"
-        )
+    def test_the_two_identity_calls_are_constants_naming_the_one_host(self) -> None:
+        runner = fake_session_runner()
         observed_github_identity(
             path_lookup=fake_path_lookup, runner=runner, environ={}
         )
         self.assertEqual(
-            ["C:/tools/gh.exe", *GH_AUTH_STATUS_ARGS], runner.calls[0]["argv"]
+            [
+                ["C:/tools/gh.exe", *GH_AUTH_STATUS_ARGS],
+                ["C:/tools/gh.exe", *GH_API_USER_ARGS],
+            ],
+            [call["argv"] for call in runner.calls],
         )
         self.assertIn("--hostname", GH_AUTH_STATUS_ARGS)
+        self.assertIn("--hostname", GH_API_USER_ARGS)
+
+    def test_the_reported_login_is_the_credentials_not_the_configurations(self) -> None:
+        """The defect a single ``gh auth status`` cannot see.
+
+        ``gh auth status`` prints the account this machine's configuration
+        names and does not check it against the token it would then use. A
+        configuration naming one login while the credential store answers as
+        another must not be reported as either.
+        """
+        with self.assertRaises(GitHubCommandFailed):
+            self.observe(
+                "  Logged in to github.com account operator (keyring)\n",
+                login="someone-else",
+            )
 
     def test_every_uncertain_session_fails_closed(self) -> None:
         for stdout in (
@@ -416,6 +458,14 @@ class IdentityObservationTests(unittest.TestCase):
         ):
             with self.assertRaises(GitHubCommandFailed, msg=stdout):
                 self.observe(stdout)
+
+    def test_an_unanswerable_credential_identity_fails_closed(self) -> None:
+        for login in ("", "not a login", "{}\n", "error: HTTP 401"):
+            with self.assertRaises(GitHubCommandFailed, msg=repr(login)):
+                self.observe(
+                    "  Logged in to github.com account operator (keyring)\n",
+                    login=login,
+                )
 
     def test_a_failing_status_call_is_an_unusable_session(self) -> None:
         with self.assertRaises(GitHubCommandFailed):
@@ -462,6 +512,61 @@ class ConnectorTests(unittest.TestCase):
         return GitHubCliConnector(
             BINDING, identity_observer=observer, plan_runner=runner
         )
+
+    def sequence_connector(self, *identities) -> GitHubCliConnector:
+        """A connector whose identity answers CHANGE between observations."""
+        answers = list(identities)
+        self.ran = []
+
+        def runner(plan, **kwargs):
+            self.ran.append(plan)
+            return FakeOutput('{"name":"widgets"}')
+
+        def observer():
+            return answers.pop(0) if answers else identities[-1]
+
+        return GitHubCliConnector(
+            BINDING, identity_observer=observer, plan_runner=runner
+        )
+
+    def test_an_account_switched_across_the_read_refuses_the_snapshot(self) -> None:
+        """The read straddled a switch, so its bytes are never attested.
+
+        The identity check and the read are separate processes and the CLI
+        chooses its credential when each one starts, so the read CAN run under
+        an account the pre-check did not see. What must never happen is the
+        content being bound to the principal the approval named.
+        """
+        connector = self.sequence_connector(
+            (PRINCIPAL, GITHUB_CREDENTIAL_ROUTE),
+            ("intruder", GITHUB_CREDENTIAL_ROUTE),
+        )
+        task = github_task()
+        result = connector.execute(task, SessionState(id="s-switch"))
+        self.assertIs(OutcomeStatus.ERROR, result.outcome)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
+        self.assertFalse(result.error.retryable)
+        self.assertEqual({}, result.data)
+        # The read did happen - that is the honest part - and its content is
+        # discarded rather than carried into an attested snapshot.
+        self.assertEqual(1, len(self.ran))
+
+    def test_an_unreadable_identity_after_the_read_also_refuses(self) -> None:
+        answers = [(PRINCIPAL, GITHUB_CREDENTIAL_ROUTE)]
+
+        def observer():
+            if answers:
+                return answers.pop(0)
+            raise GitHubCommandFailed("the session vanished")
+
+        connector = GitHubCliConnector(
+            BINDING,
+            identity_observer=observer,
+            plan_runner=lambda plan, **kwargs: FakeOutput("{}"),
+        )
+        result = connector.execute(github_task(), SessionState(id="s-gone"))
+        self.assertIs(OutcomeStatus.ERROR, result.outcome)
+        self.assertIs(ErrorCode.EGRESS_REFUSED, result.error.code)
 
     def test_the_manifest_is_read_only(self) -> None:
         self.assertEqual(

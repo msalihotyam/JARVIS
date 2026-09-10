@@ -16,7 +16,9 @@ the safety property:
 4. re-observe the local session's identity and compare it against Core's
    binding AGAIN, immediately before the call - an approval granted minutes
    ago must not execute under an account that changed since;
-5. run the one child process;
+5. run the one child process, then re-observe the identity once more - a
+   snapshot may only claim a principal that was still the credential's account
+   on BOTH sides of the read;
 6. bind the returned content to the frame that asked for it, and hand back an
    UNTRUSTED snapshot.
 
@@ -272,6 +274,32 @@ class GitHubCliConnector(BaseConnector):
         except Exception:  # noqa: BLE001 - an unclassified failure is a refusal
             return self._refusal(
                 task, ErrorCode.CONNECTOR_FAILED, "the GitHub read did not complete"
+            )
+
+        # (5a) THE SAME IDENTITY, ON THE OTHER SIDE OF THE READ. The check
+        # above and the read are separate processes, and the local CLI picks
+        # its credential when each one starts, so an account switched in
+        # between would be used by the read - and nothing available here can
+        # pin a stored credential to a process without handling the token
+        # itself, which this build will not do. What CAN be closed is the
+        # attestation: a snapshot may only claim the principal that was still
+        # the credential's account after the bytes came back, so a read that
+        # straddled a switch is refused and its content discarded rather than
+        # bound to a principal it did not execute as.
+        try:
+            after = self._observe()
+        except Exception:  # noqa: BLE001 - an unreportable identity refuses
+            return self._refusal(
+                task,
+                ErrorCode.EGRESS_REFUSED,
+                "the authenticated GitHub identity could not be re-observed "
+                "after the read",
+            )
+        if type(after) is not tuple or len(after) != 2 or after != observed:
+            return self._refusal(
+                task,
+                ErrorCode.EGRESS_REFUSED,
+                "the authenticated GitHub identity changed across the read",
             )
 
         content = output.stdout
