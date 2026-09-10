@@ -43,6 +43,7 @@ from jarvis.browser import (
     BROWSER_INTERACT_CAPABILITIES,
     BROWSER_MONETARY_STATE,
     BrowserExecutionUnavailable,
+    BrowserOriginBlocked,
     BrowserOutcome,
     BrowserOutcomeUnknown,
     BrowserRequestFrame,
@@ -304,6 +305,25 @@ class BrowserCdpConnector(BaseConnector):
             )
         except BrowserOutcomeUnknown:
             raise
+        except BrowserOriginBlocked as exc:
+            # THE DESTINATION BOUNDARY, enforced rather than observed. The
+            # approved origin was contacted, it answered with a redirect out
+            # of that origin, and that request was refused before it was sent.
+            # A definite outcome, so it is neither a "nothing happened"
+            # refusal nor an unknown one - and never a success. Terminal:
+            # repeating it would only contact the approved origin again to be
+            # redirected to the same place.
+            message = (
+                f"Browser {frame.capability} refused: {exc}. The approval named "
+                f"{frame.destination} and authorizes no other origin."
+            )
+            return ToolResult(
+                outcome=OutcomeStatus.ERROR,
+                summary=message,
+                data={"browser_blocked_origin": exc.blocked},
+                error=StructuredError(ErrorCode.EGRESS_REFUSED, message, {}, False),
+                usage=self._usage(task, session_id=session.id, call_count=1),
+            )
         except BrowserCommandStarted as exc:
             raise BrowserOutcomeUnknown(
                 f"the browser {frame.capability} started and did not succeed: {exc}"

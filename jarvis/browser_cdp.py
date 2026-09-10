@@ -37,23 +37,28 @@ import socket
 import struct
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 from jarvis.browser import (
     BROWSER_CAPABILITY_METHODS,
+    BROWSER_MAX_REDIRECT_HOPS,
     BROWSER_TEXT_ROLES,
     BrowserExecutionUnavailable,
+    BrowserOriginBlocked,
     browser_node_role,
     browser_operation_plan_refusal,
     browser_page_rendering,
     browser_ref_index,
     browser_rendered_nodes,
     browser_staleness_refusal,
+    browser_tab_id_refusal,
     browser_tab_rendering,
     url_in_origin,
 )
@@ -233,11 +238,16 @@ class CdpConnection:
         self._methods = frozenset(methods)
         self._socket = _WebSocket(socket_url, timeout=timeout)
         self._next_id = 0
+        #: Events that arrived while a reply was being awaited. BUFFERED, not
+        #: dropped: a request the browser paused mid-navigation is delivered as
+        #: an event, and discarding it would leave that request hanging while
+        #: the seam waited for it forever.
+        self._events: list[dict[str, Any]] = []
 
-    def command(
+    def send(
         self, method: str, params: dict[str, Any] | None = None, *, session_id: str = ""
-    ) -> dict[str, Any]:
-        """Send one method and return its result, or fail closed.
+    ) -> int:
+        """Write one method and return its id, without awaiting the reply.
 
         THE METHOD ALLOWLIST. A method outside the running capability's set is
         refused HERE, before anything is written, so a capability can never
@@ -253,19 +263,60 @@ class CdpConnection:
         if session_id:
             message["sessionId"] = session_id
         self._socket.send(json.dumps(message, separators=(",", ":")))
+        return identifier
+
+    def _frame(self) -> dict[str, Any]:
+        try:
+            answer = json.loads(self._socket.receive())
+        except ValueError as exc:
+            raise BrowserCommandFailed("the browser answered with unreadable protocol data") from exc
+        if not isinstance(answer, dict):
+            raise BrowserCommandFailed("the browser answered with unreadable protocol data")
+        return answer
+
+    @staticmethod
+    def _result(method: str, answer: dict[str, Any]) -> dict[str, Any]:
+        error = answer.get("error")
+        if error is not None:
+            detail = error.get("message") if isinstance(error, dict) else error
+            raise BrowserCommandFailed(f"the browser refused '{method}': {detail}")
+        result = answer.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def command(
+        self, method: str, params: dict[str, Any] | None = None, *, session_id: str = ""
+    ) -> dict[str, Any]:
+        """Send one method and return its result, or fail closed."""
+        identifier = self.send(method, params, session_id=session_id)
         for _ in range(_MAX_SKIPPED_EVENTS):
-            try:
-                answer = json.loads(self._socket.receive())
-            except ValueError as exc:
-                raise BrowserCommandFailed("the browser answered with unreadable protocol data") from exc
-            if not isinstance(answer, dict) or answer.get("id") != identifier:
+            answer = self._frame()
+            if answer.get("id") != identifier:
+                if "id" not in answer:
+                    self._events.append(answer)
                 continue  # an event, or another command's answer
-            error = answer.get("error")
-            if error is not None:
-                detail = error.get("message") if isinstance(error, dict) else error
-                raise BrowserCommandFailed(f"the browser refused '{method}': {detail}")
-            result = answer.get("result")
-            return result if isinstance(result, dict) else {}
+            return self._result(method, answer)
+        raise BrowserCommandFailed(f"the browser did not answer '{method}'")
+
+    def exchange(self, identifier: int, method: str, event: str) -> tuple[str, dict[str, Any]]:
+        """The next frame that is either ``identifier``'s reply or ``event``.
+
+        The one place the seam listens to the browser rather than asking it.
+        Bounded like every other read, and deliberately narrow: exactly one
+        awaited reply and exactly one named event, so nothing here becomes a
+        general event loop.
+        """
+        for _ in range(_MAX_SKIPPED_EVENTS):
+            buffered = next((one for one in self._events if one.get("method") == event), None)
+            if buffered is not None:
+                self._events.remove(buffered)
+                return (event, buffered.get("params") or {})
+            answer = self._frame()
+            if answer.get("id") == identifier:
+                return ("reply", self._result(method, answer))
+            if answer.get("method") == event:
+                return (event, answer.get("params") or {})
+            if "id" not in answer:
+                self._events.append(answer)
         raise BrowserCommandFailed(f"the browser did not answer '{method}'")
 
     def close(self) -> None:
@@ -528,6 +579,110 @@ def _subtree(connection: CdpConnection, session_id: str, backend_id: int) -> fro
     return frozenset(found)
 
 
+#: The empty document a new tab is created at. JARVIS's own constant, never a
+#: task-supplied URL: it exists so the tab is attached and gated BEFORE the
+#: approved navigation is sent, instead of racing a load already in flight.
+BROWSER_BLANK_PAGE = "about:blank"
+
+#: Only top-level documents are paused. A page's own stylesheets, scripts,
+#: images and XHRs are never intercepted, inspected or decided about - this is
+#: a destination gate on the navigation the approval names, not a network
+#: policy over the page.
+_DOCUMENT_PATTERN = [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]
+
+
+def guarded_navigate(
+    connection: CdpConnection, session_id: str, *, url: str, origin: str
+) -> str:
+    """Navigate to ``url`` and refuse any hop that leaves ``origin``.
+
+    THE INVARIANT. An approval for one origin is not an approval for wherever
+    that origin chooses to redirect. So every top-level document request of
+    this navigation - the first one and every redirect hop - is PAUSED BEFORE
+    IT IS SENT and judged by ``url_in_origin``, the same predicate the
+    resource grammar uses. A hop inside the origin is continued; the first hop
+    outside it is failed with ``BlockedByClient``, which means the browser
+    never opens a connection to that origin, never sends it a request, never
+    sends it a cookie and never receives a byte from it. Detection after
+    landing would have been none of those things.
+
+    ``Page.navigate``'s own reply cannot be awaited first: with the gate armed
+    the navigation does not commit until its request is continued, so the
+    reply and the paused requests are read from the SAME stream, in whatever
+    order they arrive.
+
+    Returns the URL the navigation committed to.
+
+    ponytail: this gate covers the approved navigation's own redirect chain,
+    which is what an approval authorizes. A page that, once loaded, navigates
+    itself somewhere else with script is a NEW navigation this operation never
+    asked for; it is left to the next capability, each of which re-checks the
+    tab's origin and refuses when it has drifted. Keeping the gate armed
+    between operations would make it a standing network policy over the
+    profile, which is a different and much larger thing.
+    """
+    connection.command("Fetch.enable", {"patterns": _DOCUMENT_PATTERN}, session_id=session_id)
+    try:
+        pending = connection.send("Page.navigate", {"url": url}, session_id=session_id)
+        for _ in range(BROWSER_MAX_REDIRECT_HOPS):
+            kind, payload = connection.exchange(pending, "Page.navigate", "Fetch.requestPaused")
+            if kind == "reply":
+                if payload.get("errorText"):
+                    raise BrowserCommandStarted(
+                        f"the browser reported a navigation error: {payload.get('errorText')}"
+                    )
+                landed, _ = _page_state(connection, session_id)
+                return landed
+            request_id = str(payload.get("requestId", ""))
+            requested = payload.get("request")
+            hop = str(requested.get("url", "")) if isinstance(requested, dict) else ""
+            if not request_id or not hop:
+                raise BrowserCommandFailed("the browser paused an unreadable request")
+            if not url_in_origin(hop, origin):
+                # BEFORE THE WIRE. The request is refused here, so nothing of
+                # this navigation ever reaches that origin.
+                connection.command(
+                    "Fetch.failRequest",
+                    {"requestId": request_id, "errorReason": "BlockedByClient"},
+                    session_id=session_id,
+                )
+                raise BrowserOriginBlocked(
+                    "the approved origin redirected outside it, so the request to "
+                    f"{_origin_of(hop)} was refused before it was sent and the "
+                    "navigation did not happen",
+                    blocked=_origin_of(hop),
+                )
+            connection.command(
+                "Fetch.continueRequest", {"requestId": request_id}, session_id=session_id
+            )
+        raise BrowserOriginBlocked(
+            "the navigation redirected more times than one approved navigation "
+            "may follow, so it was refused",
+            blocked=origin,
+        )
+    finally:
+        # Never left armed: a gate that outlived its operation would be a
+        # standing policy over the profile, and a paused request with nobody
+        # left to judge it would hang the tab.
+        with _suppressed():
+            connection.command("Fetch.disable", session_id=session_id)
+
+
+@contextmanager
+def _suppressed() -> Iterator[None]:
+    """Let a cleanup failure not replace the answer the operation reached."""
+    try:
+        yield
+    except Exception:  # noqa: BLE001 - cleanup, never the reported outcome
+        pass
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlsplit(url)
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
 def _describe(connection: CdpConnection, session_id: str, backend_id: int) -> dict[str, Any]:
     node = connection.command(
         "DOM.describeNode", {"backendNodeId": backend_id}, session_id=session_id
@@ -608,10 +763,22 @@ def _perform(
         return BrowserCommandOutput({"content": content})
 
     if capability == "browser_tab_open":
-        created = connection.command("Target.createTarget", {"url": resource.url})
+        # EMPTY FIRST. Creating the tab straight at the approved URL would
+        # start the load before anything could be attached to it, so the first
+        # request - and any redirect it answered with - would already be on the
+        # wire. The tab is created blank, attached and gated, and only then
+        # navigated, so it enforces the boundary by exactly the same code
+        # ``browser_navigate`` does.
+        created = connection.command("Target.createTarget", {"url": BROWSER_BLANK_PAGE})
         tab_id = str(created.get("targetId", ""))
+        if browser_tab_id_refusal(tab_id) is not None:
+            raise BrowserCommandFailed("the browser opened no readable tab")
         write_current_tab(profile_dir, tab_id)
-        return BrowserCommandOutput({"tab_id": tab_id, "url": resource.url})
+        session_id = _attach(connection, tab_id)
+        landed = guarded_navigate(
+            connection, session_id, url=resource.url, origin=origin
+        )
+        return BrowserCommandOutput({"tab_id": tab_id, "url": landed})
 
     if capability in {"browser_tab_switch", "browser_tab_close"}:
         target = next(
@@ -644,18 +811,15 @@ def _perform(
     session_id = _attach(connection, tab_id)
 
     if capability == "browser_navigate":
-        # The only capability that may act on a tab standing outside the
-        # bound origin: arriving there is what it is for. Where it LANDED is
-        # judged by the connector against the same origin.
-        answer = connection.command(
-            "Page.navigate", {"url": resource.url}, session_id=session_id
-        )
-        if answer.get("errorText"):
-            raise BrowserCommandStarted(
-                f"the browser reported a navigation error: {answer.get('errorText')}"
-            )
+        # The only capability that may act on a tab standing outside the bound
+        # origin: arriving there is what it is for. Where it may GO is decided
+        # hop by hop under the gate, before each request is sent.
         try:
-            url, _ = _page_state(connection, session_id)
+            url = guarded_navigate(
+                connection, session_id, url=resource.url, origin=origin
+            )
+        except (BrowserOriginBlocked, BrowserCommandStarted):
+            raise
         except BrowserCommandFailed as exc:
             raise BrowserCommandStarted(f"the navigation was not acknowledged: {exc}") from exc
         write_current_tab(profile_dir, tab_id)
@@ -729,7 +893,10 @@ __all__ = [
     "BrowserCommandFailed",
     "BrowserCommandOutput",
     "BrowserCommandStarted",
+    "BrowserOriginBlocked",
     "CdpConnection",
+    "BROWSER_BLANK_PAGE",
+    "guarded_navigate",
     "attached_browser",
     "browser_arguments",
     "browser_executable",

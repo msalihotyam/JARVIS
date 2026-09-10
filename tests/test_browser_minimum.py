@@ -19,11 +19,16 @@ import struct
 import tempfile
 import threading
 import unittest
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 from jarvis.app import TaskInputError, browser_authority, decode_task_json
 from jarvis.browser import (
     BROWSER_CAPABILITIES,
+    BROWSER_MAX_REDIRECT_HOPS,
     BROWSER_CAPABILITY_METHODS,
     BROWSER_CONNECTOR,
     BROWSER_DEFERRED_CAPABILITIES,
@@ -32,6 +37,7 @@ from jarvis.browser import (
     BROWSER_READ_CAPABILITIES,
     BROWSER_TEXT_MAX_CHARS,
     BrowserExecutionUnavailable,
+    BrowserOriginBlocked,
     BrowserOutcomeUnknown,
     BrowserResource,
     BrowserResourceKind,
@@ -45,6 +51,7 @@ from jarvis.browser import (
     url_in_origin,
 )
 from jarvis.browser_cdp import (
+    BROWSER_BLANK_PAGE,
     BrowserCommandFailed,
     BrowserCommandOutput,
     BrowserCommandStarted,
@@ -151,9 +158,11 @@ def _write_frame(connection: socket.socket, text: str) -> None:
 class FakeBrowser(threading.Thread):
     """One scripted DevTools endpoint on loopback. Answers, never decides."""
 
-    def __init__(self, answers: dict) -> None:
+    def __init__(self, answers: dict, navigator: Any = None) -> None:
         super().__init__(daemon=True)
         self.answers = answers
+        self.navigator = navigator
+        self._pending_id = 0
         self.sent: list[tuple[str, dict]] = []
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
@@ -178,19 +187,57 @@ class FakeBrowser(threading.Thread):
                 except (ConnectionError, OSError, ValueError):
                     return
                 self.sent.append((message["method"], message.get("params", {})))
-                answer = self.answers.get(message["method"])
-                if callable(answer):
-                    answer = answer(message.get("params", {}))
-                if isinstance(answer, str):  # a scripted protocol error
-                    body = {"id": message["id"], "error": {"message": answer}}
-                else:
-                    body = {"id": message["id"], "result": answer or {}}
-                # One unrelated event first, so the command loop must skip it.
-                _write_frame(connection, json.dumps({"method": "Page.frameResized", "params": {}}))
                 try:
-                    _write_frame(connection, json.dumps(body))
+                    if not self._navigation(connection, message):
+                        self._answer(connection, message)
                 except OSError:
                     return
+
+    def _answer(self, connection: socket.socket, message: dict) -> None:  # pragma: no cover
+        answer = self.answers.get(message["method"])
+        if callable(answer):
+            answer = answer(message.get("params", {}))
+        if isinstance(answer, str):  # a scripted protocol error
+            body = {"id": message["id"], "error": {"message": answer}}
+        else:
+            body = {"id": message["id"], "result": answer or {}}
+        # One unrelated event first, so the command loop must skip it.
+        _write_frame(connection, json.dumps({"method": "Page.frameResized", "params": {}}))
+        _write_frame(connection, json.dumps(body))
+
+    def _navigation(self, connection: socket.socket, message: dict) -> bool:  # pragma: no cover
+        """Behave like a browser under a document gate, or decline to.
+
+        Only when the test handed over a ``navigator``. Then a navigation is
+        not answered until its request is CONTINUED, each hop is announced as
+        a paused request before anything is fetched, and a FAILED hop is never
+        fetched at all - which is the whole property under test.
+        """
+        navigator = self.navigator
+        if navigator is None:
+            return False
+        method = message["method"]
+        params = message.get("params", {})
+        if method == "Page.navigate":
+            self._pending_id = message["id"]
+            _write_frame(connection, json.dumps(navigator.pause(params["url"])))
+            return True
+        if method == "Fetch.failRequest":
+            navigator.fail()
+            _write_frame(connection, json.dumps({"id": message["id"], "result": {}}))
+            return True
+        if method == "Fetch.continueRequest":
+            following = navigator.follow()
+            _write_frame(connection, json.dumps({"id": message["id"], "result": {}}))
+            if following is None:
+                _write_frame(
+                    connection,
+                    json.dumps({"id": self._pending_id, "result": {"frameId": "f1"}}),
+                )
+            else:
+                _write_frame(connection, json.dumps(following))
+            return True
+        return False
 
     def _handshake(self, connection: socket.socket) -> None:  # pragma: no cover
         request = b""
@@ -1031,6 +1078,368 @@ class TaskInputTests(unittest.TestCase):
         document["context"] = {"browser": {"kind": "click_target", "origin": ORIGIN}}
         with self.assertRaises(TaskInputError):
             self.decode(document)
+
+
+# --------------------------------------------------------------------------
+# Cross-origin redirect authority: two real local origins, one real chain
+# --------------------------------------------------------------------------
+
+
+class _Origin(HTTPServer):
+    """One controlled local origin that records every request it received."""
+
+    def __init__(self, redirects: dict) -> None:
+        self.received: list[str] = []
+        self.redirects = redirects
+        super().__init__(("127.0.0.1", 0), _OriginHandler)
+        self.origin = f"http://127.0.0.1:{self.server_address[1]}"
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    def stop(self) -> None:
+        self.shutdown()
+        self.server_close()
+
+
+class _OriginHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802 - the stdlib spelling
+        self.server.received.append(self.path)
+        target = self.server.redirects.get(self.path)
+        if callable(target):
+            target = target()
+        if target:
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = b"<html><body>landed</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: Any) -> None:  # pragma: no cover - quiet
+        pass
+
+
+class _GatedNavigator:
+    """A browser's navigation behaviour under a document gate.
+
+    A hop is announced BEFORE it is fetched, and it is fetched only if the
+    client continues it - so a hop the client fails is never requested at all,
+    exactly as a real browser refusing a paused request never opens the
+    connection to that origin. The redirect chain itself is real: it comes
+    from the local servers, over HTTP, one hop at a time, without the client
+    library following anything on its own.
+    """
+
+    def __init__(self) -> None:
+        self.hop = ""
+        self.fetched: list[str] = []
+        self.failed: list[str] = []
+        self.landed = ""
+
+    def pause(self, url: str) -> dict:
+        self.hop = url
+        return {
+            "method": "Fetch.requestPaused",
+            "params": {
+                "requestId": f"r{len(self.fetched) + 1}",
+                "request": {"url": url},
+            },
+        }
+
+    def fail(self) -> None:
+        self.failed.append(self.hop)
+        self.hop = ""
+
+    def follow(self) -> dict | None:
+        """Perform the hop the client continued; announce the next, if any."""
+        url = self.hop
+        self.fetched.append(url)
+        parsed = urlsplit(url)
+        connection = HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            connection.request("GET", parsed.path or "/")
+            response = connection.getresponse()
+            location = (
+                response.getheader("Location") if 300 <= response.status < 400 else None
+            )
+            response.read()
+        finally:
+            connection.close()
+        if location:
+            return self.pause(location)
+        self.landed = url
+        return None
+
+
+class RedirectAuthorityTests(unittest.TestCase):
+    """An approval for one origin is not an approval for wherever it points."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.profile = str(Path(self.temp.name) / "browser-profile")
+        self.b = _Origin({})
+        self.addCleanup(self.b.stop)
+        self.a = _Origin(
+            {
+                "/offsite": lambda: f"{self.b.origin}/landing",
+                "/local": lambda: f"{self.a.origin}/final",
+            }
+        )
+        self.addCleanup(self.a.stop)
+
+    def drive(self, capability: str, path: str) -> BrowserCommandOutput:
+        """One real operation of ``capability`` against origin A + ``path``."""
+        origin = self.a.origin
+        kind = (
+            BrowserResourceKind.NAVIGATION
+            if capability == "browser_navigate"
+            else BrowserResourceKind.NEW_TAB
+        )
+        frame = build_browser_request_frame(
+            capability=capability,
+            destination=f"browser/{origin}",
+            resource=BrowserResource(kind=kind, origin=origin, url=f"{origin}{path}"),
+        )
+        self.navigator = _GatedNavigator()
+        answers = page_answers(
+            **{
+                "Target.getTargets": {
+                    "targetInfos": [
+                        {"type": "page", "targetId": TAB, "url": f"{origin}/", "title": "A"}
+                    ]
+                },
+                "Target.createTarget": {"targetId": TAB},
+                "Page.getNavigationHistory": lambda params: {
+                    "currentIndex": 0,
+                    "entries": [{"url": self.navigator.landed, "title": "A"}],
+                },
+            }
+        )
+        browser = FakeBrowser(answers, navigator=self.navigator)
+        self.addCleanup(browser.stop)
+        self.browser = browser
+        return run_operation_plan(
+            browser_operation_plan(frame),
+            frame=frame,
+            profile_dir=self.profile,
+            attach=lambda **kwargs: browser.socket_url,
+            sleep=lambda seconds: None,
+        )
+
+    # -- the invariant ----------------------------------------------------
+
+    def test_a_cross_origin_redirect_is_never_dispatched(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                self.b.received.clear()
+                with self.assertRaises(BrowserOriginBlocked) as raised:
+                    self.drive(capability, "/offsite")
+                # The approved origin was contacted, as authorized.
+                self.assertEqual(["/offsite"], self.a.received)
+                # The redirected request never reached origin B. Proved by B's
+                # OWN server, not by our transcript of what we meant to do.
+                self.assertEqual([], self.b.received)
+                self.assertEqual(
+                    [], [url for url in self.navigator.fetched if self.b.origin in url]
+                )
+                self.assertEqual([f"{self.b.origin}/landing"], self.navigator.failed)
+                self.assertEqual(self.b.origin, raised.exception.blocked)
+                # Refused at the socket, before the wire.
+                self.assertIn(
+                    "Fetch.failRequest", [method for method, _ in self.browser.sent]
+                )
+                self.assertNotIn(
+                    "Fetch.continueRequest",
+                    [method for method, _ in self.browser.sent][-1:],
+                )
+
+    def test_the_blocked_navigation_is_not_reported_as_success(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+                self.addCleanup(safe_cleanup, temp)
+                memory = SQLiteMemoryStore(Path(temp.name) / "jarvis.db")
+                origin = self.a.origin
+                destination = f"browser/{origin}"
+                made = BrowserCdpConnector(
+                    self.profile,
+                    plan_runner=lambda plan, **kwargs: self.drive(capability, "/offsite"),
+                )
+                registry = ToolRegistry()
+                registry.register(made)
+                core = AgentCore(
+                    registry,
+                    memory,
+                    Settings(memory_database=memory.database_path),
+                    destination_policy=frozenset(
+                        DestinationGrant(BROWSER_CONNECTOR, name, destination)
+                        for name in BROWSER_ENABLED_CAPABILITIES
+                    ),
+                )
+                task = Task(
+                    objective="drive the browser",
+                    capability=capability,
+                    scope=ActionScope(action="browse", target="", destination=destination),
+                    browser={
+                        "kind": (
+                            "navigation"
+                            if capability == "browser_navigate"
+                            else "new_tab"
+                        ),
+                        "origin": origin,
+                        "url": f"{origin}/offsite",
+                        "seconds": 0,
+                        "tab_id": "",
+                        "ref": "",
+                        "page_digest": "",
+                        "text": "",
+                    },
+                )
+                waiting = core.run(task)
+                self.assertEqual(RunStatus.AWAITING_APPROVAL, waiting.status)
+                done = core.resume(
+                    waiting.session.id,
+                    waiting.task.id,
+                    PermissionGrant.for_request(waiting.permission_request),
+                )
+                self.assertNotEqual(RunStatus.COMPLETED, done.status)
+                self.assertEqual(ErrorCode.EGRESS_REFUSED, done.error.code)
+                self.assertFalse(done.error.retryable)
+                self.assertIn("before it was sent", done.error.message)
+                # Not an unknown outcome: exactly what happened is known.
+                self.assertNotEqual(
+                    ErrorCode.EXECUTION_UNKNOWN_OUTCOME, done.error.code
+                )
+                # The violation is known NOW. No page reading was needed to
+                # discover it, and none was performed.
+                self.assertEqual({}, memory.load_task(done.task.id).external_read)
+                self.assertEqual([], self.b.received)
+
+    # -- what must keep working -------------------------------------------
+
+    def test_a_same_origin_redirect_still_completes(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                output = self.drive(capability, "/local")
+                self.assertEqual(f"{self.a.origin}/final", output.payload["url"])
+                self.assertEqual(["/local", "/final"], self.a.received)
+                self.assertEqual([], self.navigator.failed)
+                self.assertEqual([], self.b.received)
+
+    def test_a_direct_same_origin_request_still_completes(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.a.received.clear()
+                output = self.drive(capability, "/final")
+                self.assertEqual(f"{self.a.origin}/final", output.payload["url"])
+                self.assertEqual(["/final"], self.a.received)
+                self.assertEqual(TAB, output.payload["tab_id"])
+
+    # -- how the gate is armed --------------------------------------------
+
+    def test_a_new_tab_is_opened_empty_so_nothing_loads_before_the_gate(self) -> None:
+        self.drive("browser_tab_open", "/final")
+        created = [
+            params
+            for method, params in self.browser.sent
+            if method == "Target.createTarget"
+        ]
+        self.assertEqual([{"url": BROWSER_BLANK_PAGE}], created)
+
+    def test_the_gate_is_armed_before_the_navigation_and_never_left_armed(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                self.drive(capability, "/final")
+                methods = [method for method, _ in self.browser.sent]
+                self.assertLess(
+                    methods.index("Fetch.enable"), methods.index("Page.navigate")
+                )
+                self.assertEqual(1, methods.count("Fetch.disable"))
+                patterns = dict(self.browser.sent)["Fetch.enable"]["patterns"]
+                self.assertEqual(
+                    [
+                        {
+                            "urlPattern": "*",
+                            "resourceType": "Document",
+                            "requestStage": "Request",
+                        }
+                    ],
+                    patterns,
+                )
+
+    def test_the_gate_is_disarmed_even_when_a_hop_is_blocked(self) -> None:
+        with self.assertRaises(BrowserOriginBlocked):
+            self.drive("browser_navigate", "/offsite")
+        self.assertEqual(
+            1, [method for method, _ in self.browser.sent].count("Fetch.disable")
+        )
+
+    def test_the_gate_cannot_synthesize_a_response_or_answer_a_credential(self) -> None:
+        for capability in ("browser_navigate", "browser_tab_open"):
+            with self.subTest(capability=capability):
+                methods = BROWSER_CAPABILITY_METHODS[capability]
+                self.assertNotIn("Fetch.fulfillRequest", methods)
+                self.assertNotIn("Fetch.continueWithAuth", methods)
+                self.assertNotIn("Fetch.getResponseBody", methods)
+                self.assertIn("Fetch.failRequest", methods)
+
+    def test_only_top_level_documents_are_gated(self) -> None:
+        # A page's own stylesheets, scripts and XHRs are never paused, so this
+        # is a destination gate on the approved navigation, not a network
+        # policy over the page.
+        self.drive("browser_navigate", "/final")
+        patterns = dict(self.browser.sent)["Fetch.enable"]["patterns"]
+        self.assertEqual(["Document"], [one["resourceType"] for one in patterns])
+
+    def test_an_endless_redirect_chain_is_refused_rather_than_followed(self) -> None:
+        loop = _Origin({})
+        loop.redirects["/loop"] = lambda: f"{loop.origin}/loop"
+        self.addCleanup(loop.stop)
+        origin = loop.origin
+        frame = build_browser_request_frame(
+            capability="browser_navigate",
+            destination=f"browser/{origin}",
+            resource=BrowserResource(
+                kind=BrowserResourceKind.NAVIGATION, origin=origin, url=f"{origin}/loop"
+            ),
+        )
+        self.navigator = _GatedNavigator()
+        browser = FakeBrowser(
+            page_answers(
+                **{
+                    "Target.getTargets": {
+                        "targetInfos": [
+                            {
+                                "type": "page",
+                                "targetId": TAB,
+                                "url": f"{origin}/",
+                                "title": "loop",
+                            }
+                        ]
+                    }
+                }
+            ),
+            navigator=self.navigator,
+        )
+        self.addCleanup(browser.stop)
+        with self.assertRaises(BrowserOriginBlocked):
+            run_operation_plan(
+                browser_operation_plan(frame),
+                frame=frame,
+                profile_dir=self.profile,
+                attach=lambda **kwargs: browser.socket_url,
+                sleep=lambda seconds: None,
+            )
+        self.assertLessEqual(len(self.navigator.fetched), BROWSER_MAX_REDIRECT_HOPS)
 
 
 if __name__ == "__main__":  # pragma: no cover

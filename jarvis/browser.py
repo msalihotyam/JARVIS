@@ -318,6 +318,11 @@ def _tab_id_refusal(value: Any) -> str | None:
     return None
 
 
+#: The same predicate under a public name, for the seam that has to judge a
+#: tab id the browser just handed back.
+browser_tab_id_refusal = _tab_id_refusal
+
+
 def _digest_refusal(value: Any) -> str | None:
     if type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None:
         return "the page digest is not a sha256 digest"
@@ -434,6 +439,21 @@ class BrowserExecutionUnavailable(RuntimeError):
 
 class BrowserOutcomeUnknown(RuntimeError):
     """The operation may have taken effect and the outcome is not established."""
+
+
+class BrowserOriginBlocked(BrowserExecutionUnavailable):
+    """A navigation hop left the approved origin and was NOT dispatched.
+
+    A DEFINITE outcome, and deliberately neither of its neighbours. It is not
+    a plain refusal - the approved origin really was contacted, so something
+    happened - and it is not an unknown outcome - exactly what happened is
+    known: the request to ``blocked`` was refused before it was sent. Reported
+    as itself so nobody has to guess which of the two it was.
+    """
+
+    def __init__(self, message: str, *, blocked: str = "") -> None:
+        super().__init__(message)
+        self.blocked = blocked
 
 
 def browser_resource_from_dict(data: Any) -> BrowserResource:
@@ -608,12 +628,37 @@ _ELEMENT_METHODS = _PAGE_READ_METHODS | {
     "DOM.scrollIntoViewIfNeeded",
 }
 
+#: THE DESTINATION GATE. A top-level document request - the initial one and
+#: EVERY redirect hop - is paused before it is sent and judged by the one
+#: predicate the resource grammar already uses. Deliberately three verbs and
+#: no more: ``Fetch.fulfillRequest`` (which would let JARVIS synthesize a
+#: response) and ``Fetch.continueWithAuth`` (which would put JARVIS in a
+#: credential prompt) are absent, so neither is reachable.
+_ORIGIN_GATE_METHODS = frozenset(
+    {"Fetch.enable", "Fetch.disable", "Fetch.continueRequest", "Fetch.failRequest"}
+)
+
+#: What one approved navigation may follow before the chain itself is refused.
+BROWSER_MAX_REDIRECT_HOPS = 10
+
 BROWSER_CAPABILITY_METHODS: Mapping[str, frozenset[str]] = {
     "browser_page_read": _PAGE_READ_METHODS,
     "browser_tab_list": frozenset({"Target.getTargets"}),
     "browser_wait": _PAGE_READ_METHODS,
-    "browser_navigate": _PAGE_READ_METHODS | {"Page.navigate"},
-    "browser_tab_open": frozenset({"Target.getTargets", "Target.createTarget"}),
+    "browser_navigate": _PAGE_READ_METHODS | {"Page.navigate"} | _ORIGIN_GATE_METHODS,
+    # A new tab is opened EMPTY and then navigated under the same gate, so the
+    # two navigating capabilities enforce the boundary by the same code rather
+    # than by two rules that could drift.
+    "browser_tab_open": frozenset(
+        {
+            "Target.getTargets",
+            "Target.createTarget",
+            "Target.attachToTarget",
+            "Page.navigate",
+            "Page.getNavigationHistory",
+        }
+    )
+    | _ORIGIN_GATE_METHODS,
     "browser_tab_switch": frozenset({"Target.getTargets", "Target.activateTarget"}),
     "browser_tab_close": frozenset({"Target.getTargets", "Target.closeTarget"}),
     "browser_click": _ELEMENT_METHODS | {"Input.dispatchMouseEvent"},
@@ -996,6 +1041,7 @@ __all__ = [
     "BROWSER_ENABLED_CAPABILITIES",
     "BROWSER_INTERACT_CAPABILITIES",
     "BROWSER_MAX_NODES",
+    "BROWSER_MAX_REDIRECT_HOPS",
     "BROWSER_MAX_TABS",
     "BROWSER_MONETARY_STATE",
     "BROWSER_ORIGIN_MAX_CHARS",
@@ -1007,6 +1053,7 @@ __all__ = [
     "BROWSER_WAIT_MIN_SECONDS",
     "BrowserExecutionUnavailable",
     "BrowserOperationPlan",
+    "BrowserOriginBlocked",
     "BrowserOrigin",
     "BrowserOutcome",
     "BrowserOutcomeUnknown",
@@ -1034,6 +1081,7 @@ __all__ = [
     "browser_resource_from_dict",
     "browser_resource_refusal",
     "browser_staleness_refusal",
+    "browser_tab_id_refusal",
     "browser_tab_rendering",
     "browser_text_refusal",
     "browser_url_refusal",
