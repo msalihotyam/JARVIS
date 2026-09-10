@@ -37,13 +37,13 @@ state is tracked under.
 - **Contracts:** SQLite schema 10; output envelope 7. Gmail minimum changed
   neither — it reuses the same bounded `external_read` block with the
   connector named `gmail-cli`.
-- **Active implementation worktree:** `C:\Users\realk\Masaüstü\JARVIS-Claude-gmail-minimum`
-  (`claude/gmail-minimum`, accepted and integrated) is still present and awaits
-  the normal `finish-current` / `cleanup` sequence. This persistent chat is
-  already rebound to canonical `C:\Users\realk\Masaüstü\JARVIS`.
-  `dev.ps1 status` still reports the old `claude/scheduler-phase1b` recovery
-  residue (PARTIAL REMOVAL — RECOVERY REQUIRED); it is left untouched on
-  purpose and needs an explicit human recovery checkpoint.
+- **Active implementation worktree:** none. The Gmail worktree
+  `JARVIS-Claude-gmail-minimum` and its branch `claude/gmail-minimum` were
+  finished and cleaned up after integration; this persistent chat is rebound
+  to canonical `C:\Users\realk\Masaüstü\JARVIS`. `dev.ps1 status` still
+  reports the old `claude/scheduler-phase1b` recovery residue (PARTIAL
+  REMOVAL — RECOVERY REQUIRED); it is left untouched on purpose and needs an
+  explicit human recovery checkpoint.
 - **Push:** forbidden unless explicitly authorized by Salih. Nothing has been
   pushed; canonical main is ahead of `origin/main`.
 - **Before any worktree lifecycle operation:** the persistent Scheduler
