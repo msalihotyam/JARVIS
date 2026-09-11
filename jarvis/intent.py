@@ -556,37 +556,16 @@ def destination_label(destination: str) -> str:
     return destination
 
 
-#: Characters that continue an identifier. A label only counts as named when
-#: neither neighbour is one of these, so ``a@example.com`` is not found inside
-#: ``aa@example.com`` or ``a@example.com.tr``, and ``owner/repo`` is not found
-#: inside ``owner/repo2``.
-_IDENTIFIER_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyz0123456789._%+-@:/\\"
-)
+def _is_exact_choice(user_text: str, label: str) -> bool:
+    """Whether the user's CURRENT input IS this offered choice label.
 
-
-def _names_label(text: str, label: str) -> bool:
-    """Whether the user's own text names this exact label. No fuzzy matching.
-
-    Case-insensitive (every configured spelling is already lower-case
-    canonical) and, for a Windows image path, blind to the slash direction.
-    A trailing ``/`` after an origin is allowed (``https://a.com/`` still
-    names ``https://a.com``); any other identifier character on either side
-    means a DIFFERENT identifier was written.
+    Equality after trimming surrounding whitespace, and nothing else. A
+    label occurring inside a sentence proves nothing about its role - it may
+    be a recipient, a reference or content - so only a reply that consists
+    of exactly one backend-offered label is a destination selection. No
+    substring, case folding, alias or separator rewriting.
     """
-    haystack = text.casefold().replace("\\", "/")
-    needle = label.casefold()
-    start = haystack.find(needle)
-    while start != -1:
-        end = start + len(needle)
-        before = haystack[start - 1] if start else " "
-        after = haystack[end] if end < len(haystack) else " "
-        if before not in _IDENTIFIER_CHARS and (
-            after not in _IDENTIFIER_CHARS or (after == "/" and "://" in needle)
-        ):
-            return True
-        start = haystack.find(needle, start + 1)
-    return False
+    return user_text.strip() == label
 
 
 def _choose(entry: CatalogEntry) -> Resolution:
@@ -617,11 +596,12 @@ def _resolve_destination(
       is refused as unauthorized - nothing is canonicalized or repaired.
     * ONE configured destination: an empty proposal resolves to it; the same
       one is accepted; anything else was refused above.
-    * SEVERAL configured destinations: the model's pick is not evidence. The
-      destination is the one configured destination whose exact identifier
-      the user's own current text names - exactly one of them - and a model
-      proposal that disagrees with the user fails closed. Zero or several
-      named means the user is asked, with the configured choices.
+    * SEVERAL configured destinations: neither the model's pick nor a label
+      appearing somewhere in a sentence is evidence. The destination is
+      selected only when the user's current input, trimmed, EQUALS exactly
+      one offered choice label; a model proposal that disagrees with that
+      selection fails closed. Anything else asks the user, with the
+      configured choices. An earlier turn never selects.
     """
     if proposed and proposed not in entry.destinations:
         setting = _AUTHORITY_SETTING.get(entry.hint.section or "")
@@ -640,7 +620,7 @@ def _resolve_destination(
     named = [
         destination
         for destination in entry.destinations
-        if _names_label(user_text, destination_label(destination))
+        if _is_exact_choice(user_text, destination_label(destination))
     ]
     if len(named) != 1 or proposed not in ("", named[0]):
         return "", _choose(entry)

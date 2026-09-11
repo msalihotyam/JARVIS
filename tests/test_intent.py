@@ -788,21 +788,21 @@ class DestinationAmbiguityTests(IntentTestCase):
         payload = app.submit_text("Uygulamayı aç.").payload
         self.assertAskedToChoose(payload, [APP, OTHER_APP])
 
-    def test_5_user_naming_exactly_one_configured_destination_resolves_it(self) -> None:
+    def test_5_an_exact_offered_label_as_the_whole_reply_resolves_it(self) -> None:
         cases = [
             (dict(gmail=(ACCOUNT, OTHER_ACCOUNT)), task_proposal("gmail_thread_list", limit=5),
-             f"{OTHER_ACCOUNT}'daki son mailleri kontrol et.", f"gmail/{OTHER_ACCOUNT}"),
+             OTHER_ACCOUNT, f"gmail/{OTHER_ACCOUNT}"),
             (dict(github=(REPO, OTHER_REPO)), task_proposal("github_commit_list", limit=10),
-             "salih/notes reposundaki son commitlere bak.", OTHER_REPO),
+             "salih/notes", OTHER_REPO),
             (dict(browser=(ORIGIN, OTHER_ORIGIN)), task_proposal("browser_navigate", ORIGIN, url="https://openai.com/"),
-             "https://openai.com/ adresini aç.", ORIGIN),
+             "https://openai.com", ORIGIN),
             (dict(desktop=(APP, OTHER_APP)), task_proposal("desktop_app_launch"),
-             r"C:\Windows\System32\calc.exe uygulamasını aç.", APP),
+             "c:/windows/system32/calc.exe", APP),
         ]
         for configured, answer, text, expected in cases:
             with self.subTest(text=text):
                 app = self.build(ScriptedModel(answer), **configured)
-                payload = app.submit_text(text).payload
+                payload = app.submit_text(text, previous_text="Bunu yap.").payload
                 self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
                 self.assertEqual(expected, payload["intent"]["destination"])
                 task = self.memory.load_task(payload["run"]["task"]["id"])
@@ -865,13 +865,14 @@ class DestinationAmbiguityTests(IntentTestCase):
         self.assertEqual(0, self.execute_calls())
 
     def test_9_and_10_user_selected_send_still_needs_the_exact_approval(self) -> None:
-        app = self.build(
-            ScriptedModel(task_proposal(
-                "gmail_send", to=["alice@example.com"], subject="Merhaba", body="Selam\n",
-            )),
-            gmail=(ACCOUNT, OTHER_ACCOUNT),
-        )
-        result = app.submit_text(f"{ACCOUNT} hesabından alice@example.com adresine mail gönder.")
+        send = task_proposal("gmail_send", to=["alice@example.com"], subject="Merhaba", body="Selam\n")
+        app = self.build(ScriptedModel(send, send), gmail=(ACCOUNT, OTHER_ACCOUNT))
+        original = "alice@example.com adresine mail gönder."
+        first = app.submit_text(original).payload
+        self.assertAskedToChoose(first, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+        # The UI sends back the exact offered label as the next current input.
+        label = next(c["label"] for c in first["intent"]["choices"] if c["destination"] == f"gmail/{ACCOUNT}")
+        result = app.submit_text(label, previous_text=original)
         run = result.payload["run"]
         self.assertEqual(EXIT_AWAITING_APPROVAL, result.exit_code, result.payload)
         self.assertEqual(f"gmail/{ACCOUNT}", run["approval"]["scope"]["destination"])
@@ -906,6 +907,105 @@ class DestinationAmbiguityTests(IntentTestCase):
         )
         payload = app.submit_text("salih/jarvis", previous_text="GitHub'daki son değişikliklere bak.").payload
         self.assertEqual(REPO, payload["intent"]["destination"], payload)
+
+
+class TextualOccurrenceIsNotSelectionTests(IntentTestCase):
+    """Re-gate blocker: a label inside a sentence may be a recipient, a
+    reference or content. Only a reply that IS one offered label selects."""
+
+    SEND = dict(to=["salih@example.com"], subject="Merhaba", body="Selam\n")
+
+    def assertAskedToChoose(self, payload, destinations) -> None:
+        DestinationAmbiguityTests.assertAskedToChoose(self, payload, destinations)
+
+    def two_accounts(self, *answers):
+        return self.build(ScriptedModel(*answers), gmail=(ACCOUNT, OTHER_ACCOUNT))
+
+    def test_1_a_recipient_address_is_not_the_sending_account(self) -> None:
+        app = self.two_accounts(task_proposal("gmail_send", "", **self.SEND))
+        payload = app.submit_text(f"{ACCOUNT} adresine mail gönder").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_2_nor_when_the_model_also_proposes_that_account(self) -> None:
+        app = self.two_accounts(task_proposal("gmail_send", f"gmail/{ACCOUNT}", **self.SEND))
+        payload = app.submit_text(f"{ACCOUNT} adresine mail gönder").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_3_and_4_the_exact_label_reply_selects_after_trimming_only(self) -> None:
+        for reply in (ACCOUNT, f" {ACCOUNT} ", f"\t{ACCOUNT}\n"):
+            with self.subTest(reply=reply):
+                app = self.two_accounts(task_proposal("gmail_thread_list", limit=5))
+                payload = app.submit_text(reply, previous_text="Son maillerimi kontrol et.").payload
+                self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
+                self.assertEqual(f"gmail/{ACCOUNT}", payload["intent"]["destination"])
+
+    def test_4b_nothing_but_surrounding_whitespace_is_forgiven(self) -> None:
+        for reply in (ACCOUNT.upper(), f"{ACCOUNT}.", f"<{ACCOUNT}>", f"gmail/{ACCOUNT}"):
+            with self.subTest(reply=reply):
+                app = self.two_accounts(task_proposal("gmail_thread_list", limit=5))
+                payload = app.submit_text(reply, previous_text="Son maillerimi kontrol et.").payload
+                self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_5_and_6_a_label_inside_a_sentence_never_selects(self) -> None:
+        for text, answer in (
+            (f"{ACCOUNT} hesabını kullan", task_proposal("gmail_thread_list", limit=5)),
+            (f"maili {ACCOUNT} adresine gönder", task_proposal("gmail_send", **self.SEND)),
+        ):
+            with self.subTest(text=text):
+                payload = self.two_accounts(answer).submit_text(text).payload
+                self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_7_8_9_every_family_needs_the_exact_reply(self) -> None:
+        for configured, answer, text, destinations in (
+            (dict(github=(REPO, OTHER_REPO)), task_proposal("github_commit_list", REPO, limit=10),
+             "salih/jarvis reposundaki bir hatayı salih/notes içinde not ettim, son commitlere bak",
+             [REPO, OTHER_REPO]),
+            (dict(browser=(ORIGIN, OTHER_ORIGIN)), task_proposal("browser_navigate", ORIGIN, url="https://openai.com/"),
+             "https://openai.com adresini aç", [ORIGIN, OTHER_ORIGIN]),
+            (dict(desktop=(APP, OTHER_APP)), task_proposal("desktop_app_launch", APP),
+             "c:/windows/system32/calc.exe uygulamasını aç", [APP, OTHER_APP]),
+        ):
+            with self.subTest(text=text):
+                payload = self.build(ScriptedModel(answer), **configured).submit_text(text).payload
+                self.assertAskedToChoose(payload, destinations)
+
+    def test_10_previous_text_alone_never_selects(self) -> None:
+        app = self.two_accounts(task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5))
+        payload = app.submit_text("Son maillerimi kontrol et.", previous_text=ACCOUNT).payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_11_the_model_conflicting_with_the_exact_choice_fails_closed(self) -> None:
+        app = self.two_accounts(task_proposal("gmail_thread_list", f"gmail/{OTHER_ACCOUNT}", limit=5))
+        payload = app.submit_text(ACCOUNT, previous_text="Son maillerimi kontrol et.").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_12_and_13_exact_follow_up_send_waits_for_exact_approval(self) -> None:
+        send = task_proposal("gmail_send", **self.SEND)
+        app = self.two_accounts(send, send)
+        original = f"{ACCOUNT} adresine mail gönder"
+        self.assertAskedToChoose(app.submit_text(original).payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+        result = app.submit_text(ACCOUNT, previous_text=original)
+        run = result.payload["run"]
+        self.assertEqual(EXIT_AWAITING_APPROVAL, result.exit_code, result.payload)
+        self.assertEqual(f"gmail/{ACCOUNT}", run["approval"]["scope"]["destination"])
+        self.assertEqual(0, self.execute_calls())
+        self.assertEqual(0, self.table_count("permission_grants"))
+        stale = app.approve(run["session"]["id"], run["task"]["id"], run["approval"]["request_id"], "0" * 64)
+        self.assertEqual("invalid_grant", stale.payload["error"]["code"])
+        self.assertEqual(0, self.execute_calls())
+        approved = app.approve(
+            run["session"]["id"], run["task"]["id"], run["approval"]["request_id"], run["approval"]["fingerprint"]
+        )
+        self.assertEqual(EXIT_OK, approved.exit_code, approved.payload)
+        self.assertEqual(1, self.gmail.execute_calls)
+
+    def test_14_single_destination_is_unchanged(self) -> None:
+        app = self.build(ScriptedModel(task_proposal("gmail_send", **self.SEND)), gmail=(ACCOUNT,))
+        payload = app.submit_text(f"{ACCOUNT} adresine mail gönder").payload
+        self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
+        self.assertEqual(f"gmail/{ACCOUNT}", payload["intent"]["destination"])
+        self.assertEqual("awaiting_approval", payload["run"]["run_status"])
+        self.assertEqual(0, self.execute_calls())
 
 
 if __name__ == "__main__":  # pragma: no cover
