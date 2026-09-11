@@ -153,6 +153,25 @@ def _not_cancelled(cancelled: Callable[[], bool]) -> None:
         raise DesktopExecutionUnavailable("the operation was cancelled before anything was dispatched")
 
 
+def _still_the_approved_window(desk: Any, frame: DesktopRequestFrame, window: DesktopWindow) -> None:
+    """Re-prove, AFTER the element and its pattern were acquired, that the
+    handle they came from still belongs to the approved window.
+
+    A window can close and Windows can hand its handle to another process
+    while UI Automation is being walked; elements acquired through that
+    handle would belong to the newcomer, and their rendering can look exactly
+    like the approved one. So the live owner is judged again here - handle,
+    pid, creation time, allowed image, refused classes, and the same image
+    and class as approved - before dispatch starts. The pattern already in
+    hand is what gets called; nothing is re-acquired after this check.
+    """
+    live = _window(desk, frame)
+    if (live.image, live.class_name) != (window.image, window.class_name):
+        raise DesktopExecutionUnavailable(
+            "the window changed owner while its elements were being read; nothing was dispatched"
+        )
+
+
 def _list(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
     return {"content": desktop_window_rendering(desk.windows(), app=frame.app)}
 
@@ -191,6 +210,7 @@ def _click(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dis
             "the element offers no UI Automation Invoke, so it cannot be clicked "
             "by a call bound to it; nothing was clicked"
         )
+    _still_the_approved_window(desk, frame, window)
     _not_cancelled(cancelled)
     dispatch.started = True
     desk.invoke(invoke)
@@ -212,6 +232,7 @@ def _type(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Disp
             "the field offers no writable UI Automation value, so it cannot be "
             "typed into by a call bound to it; nothing was typed"
         )
+    _still_the_approved_window(desk, frame, window)
     _not_cancelled(cancelled)
     dispatch.started = True
     desk.set_value(value, frame.resource.text)

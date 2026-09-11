@@ -137,6 +137,8 @@ class FakeDesktop:
         self.launch_error = None
         self.fail = None
         self.on_elements = None
+        self.on_pattern = None
+        self.acquired: list[tuple] = []
         self._owner: dict = {}
 
     def __enter__(self):
@@ -149,6 +151,7 @@ class FakeDesktop:
         return [replace(window, foreground=window.hwnd == self.fg) for window in self.window_list]
 
     def elements(self, hwnd):
+        self.acquired.append(("elements", hwnd))
         if self.on_elements:
             self.on_elements()
         for element in self.element_list:
@@ -177,6 +180,9 @@ class FakeDesktop:
         return 777, True
 
     def pattern(self, element, kind):
+        self.acquired.append(("pattern", element.handle))
+        if self.on_pattern:
+            self.on_pattern()
         if kind not in self.patterns.get(element.handle, set()):
             return None
         return (kind, element.handle)
@@ -516,6 +522,80 @@ class TargetRaceTests(unittest.TestCase):
                 self.assertNotRegex(source, rf"[\"']{name}[\"']|\.{name}\b")
         for name in ("click", "type_text", "press_key", "move_cursor", "cursor", "root_at"):
             self.assertFalse(hasattr(desktop_win32.Win32Desktop, name), name)
+
+
+#: The SAME handle as the approved window, now owned by an unrelated process.
+REUSED = replace(OTHER, hwnd=WINDOW.hwnd)
+_IDENTITY_REFUSAL = "different process|outside the authorized|changed owner|no longer exists"
+
+
+class HwndReuseTests(unittest.TestCase):
+    """The approved handle passes its first check; then, at the UI Automation
+    acquisition boundary, window A is destroyed and Windows presents the SAME
+    handle as owned by someone else. The newcomer exposes the SAME elements,
+    so the rendering, the ref and the digest still match - only the identity
+    check made after acquisition can stop the action."""
+
+    def reused(self, capability, replacement, at="on_elements"):
+        desk = FakeDesktop()
+
+        def swap() -> None:
+            desk.window_list = [replacement] if replacement else []
+
+        setattr(desk, at, swap)
+        with self.assertRaisesRegex(DesktopExecutionUnavailable, _IDENTITY_REFUSAL):
+            run(capability, desk)
+        self.assertIn("pattern", [step[0] for step in desk.acquired])
+        self.assertEqual([], desk.delivered)
+        return desk
+
+    def test_a_click_through_a_reused_handle_never_reaches_the_new_owner(self) -> None:
+        for at in ("on_elements", "on_pattern"):
+            with self.subTest(at=at):
+                self.reused("desktop_click", REUSED, at)
+
+    def test_a_type_through_a_reused_handle_never_reaches_the_new_owner(self) -> None:
+        for at in ("on_elements", "on_pattern"):
+            with self.subTest(at=at):
+                self.reused("desktop_type", REUSED, at)
+
+    def test_a_new_process_id_or_creation_time_cannot_satisfy_the_binding(self) -> None:
+        for replacement in (replace(WINDOW, pid=9999), replace(WINDOW, created=1)):
+            for capability in ("desktop_click", "desktop_type"):
+                with self.subTest(replacement=replacement, capability=capability):
+                    self.reused(capability, replacement)
+
+    def test_an_executable_class_or_existence_drift_refuses_before_dispatch(self) -> None:
+        for replacement in (
+            replace(WINDOW, image="C:\\Program Files\\Bank\\winver.exe"),
+            replace(WINDOW, class_name="ConsoleWindowClass"),
+            replace(WINDOW, class_name="SomeOtherWindowClass"),
+            None,
+        ):
+            with self.subTest(replacement=replacement):
+                self.reused("desktop_click", replacement, "on_pattern")
+
+    def test_the_refusal_is_definite_not_an_unknown_outcome(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        memory = SQLiteMemoryStore(Path(temp.name) / "jarvis.db")
+        desk = FakeDesktop()
+        desk.on_pattern = lambda: setattr(desk, "window_list", [REUSED])
+        core = desktop_core(memory, connector(desk))
+        waiting = core.run(desktop_task("desktop_click"))
+        done = core.resume(waiting.session.id, waiting.task.id, PermissionGrant.for_request(waiting.permission_request))
+        self.assertNotEqual(RunStatus.COMPLETED, done.status)
+        self.assertNotEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, done.error.code)
+        self.assertIs(AttemptState.FINISHED, memory.latest_execution_attempt(waiting.task.id).state)
+        self.assertEqual([], desk.delivered)
+
+    def test_a_stable_target_is_dispatched_once_through_the_pattern_it_acquired(self) -> None:
+        for capability, handle, action in (("desktop_click", "ok", "invoke"), ("desktop_type", "edit", "set_value")):
+            with self.subTest(capability=capability):
+                desk = FakeDesktop()
+                run(capability, desk)
+                self.assertEqual([("elements", WINDOW.hwnd), ("pattern", handle)], desk.acquired)
+                self.assertEqual([(WINDOW.hwnd, action, handle)], [d[:3] for d in desk.delivered])
 
 
 # --------------------------------------------------------------------------
