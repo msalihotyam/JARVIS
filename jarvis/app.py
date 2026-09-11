@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Iterable
+from uuid import uuid4
 
 from jarvis.connectors.base import BaseConnector
 
@@ -74,8 +75,10 @@ from jarvis.contracts import (
     LocalReadSnapshot,
     LocalWriteRecord,
     MEMORY_ORIGIN_DETAIL_CAP,
+    MODEL_ANSWER_RESULT_KEY,
     MemoryStore,
     MemoryLifecycle,
+    ModelAdapter,
     ModelAnswer,
     PermissionGrant,
     PermissionMode,
@@ -159,6 +162,18 @@ from jarvis.github import (
     github_resource_binding_refusal,
     github_resource_from_dict,
     external_read_refusal,
+)
+from jarvis.intent import (
+    INTENT_ACTION,
+    INTENT_CAPABILITY,
+    ClaudeIntentAdapter,
+    IntentStatus,
+    ProposalError,
+    build_catalog,
+    intent_text_refusal,
+    model_failure_status,
+    parse_proposal,
+    resolve_proposal,
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
@@ -2934,19 +2949,267 @@ def chain_show_result(
 # --------------------------------------------------------------------------
 
 
+#: Exit code and error code of each pre-task understanding outcome. Every
+#: one of them means NOTHING external ran; the run envelope, when there is
+#: one, carries Core's own verdict instead.
+_INTENT_EXIT: dict[IntentStatus, tuple[int, ErrorCode | None]] = {
+    IntentStatus.CLARIFICATION_REQUIRED: (EXIT_AWAITING_CLARIFICATION, None),
+    IntentStatus.UNSUPPORTED: (EXIT_INVALID_INPUT, ErrorCode.NO_CONNECTOR),
+    IntentStatus.AUTHORITY_UNAVAILABLE: (EXIT_POLICY, ErrorCode.INVALID_TASK),
+    IntentStatus.MALFORMED_MODEL_OUTPUT: (EXIT_INTERNAL, ErrorCode.CONNECTOR_FAILED),
+    IntentStatus.MODEL_UNAVAILABLE: (EXIT_INTERNAL, ErrorCode.CONNECTOR_UNAVAILABLE),
+    IntentStatus.MODEL_TIMEOUT: (EXIT_INTERNAL, ErrorCode.CONNECTOR_FAILED),
+    IntentStatus.MODEL_CANCELLED: (EXIT_CANCELLED, ErrorCode.CANCELLED),
+    IntentStatus.MODEL_FAILED: (EXIT_INTERNAL, ErrorCode.CONNECTOR_FAILED),
+    IntentStatus.EXECUTION_DISABLED: (EXIT_POLICY, ErrorCode.EXECUTION_DISABLED),
+    IntentStatus.INVALID_INPUT: (EXIT_INVALID_INPUT, ErrorCode.INVALID_TASK),
+}
+
+#: The message the execution barrier prints, reused verbatim so a refused
+#: natural-language request reads exactly like a refused structured one.
+_EXECUTION_DISABLED_MESSAGE = (
+    "Execution is disabled for this installation. No connector was called "
+    "and nothing was changed. Re-enable it with "
+    "'jarvis config set execution_enabled true'."
+)
+
+
+def text_result(
+    permission_mode: PermissionMode,
+    status: IntentStatus,
+    request_id: str,
+    *,
+    message: str = "",
+    question: str = "",
+    capability: str = "",
+    destination: str = "",
+    objective: str = "",
+    run: dict[str, Any] | None = None,
+    job: dict[str, Any] | None = None,
+    exit_code: int | None = None,
+) -> CommandResult:
+    """The ONE envelope of the free-text entry.
+
+    Its shape is fixed: the understanding verdict in ``intent``, and then
+    EXACTLY the existing run envelope (unchanged, its own version) under
+    ``run`` when a task was created, or the existing job-create payload under
+    ``job`` when a job was. A consumer therefore reads one new block and
+    everything it already knew how to read; no existing envelope changes.
+    """
+    code, error_code = _INTENT_EXIT.get(status, (EXIT_OK, None))
+    if exit_code is not None:
+        code = exit_code
+    error = None
+    if error_code is not None:
+        error = {"code": error_code.value, "message": message, "retryable": False}
+    payload = {
+        "command": "text",
+        "effective_permission_mode": permission_mode.value,
+        "intent": {
+            "status": status.value,
+            "request_id": request_id,
+            "message": message or None,
+            "question": question or None,
+            "capability": capability or None,
+            "destination": destination or None,
+            "objective": objective or None,
+        },
+        "run": run,
+        "job": job,
+        "error": error,
+    }
+    return CommandResult(_redact(payload), code)
+
+
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
 
     def __init__(
-        self, core: AgentCore, memory: MemoryStore, settings: Settings
+        self,
+        core: AgentCore,
+        memory: MemoryStore,
+        settings: Settings,
+        intent_model: ModelAdapter | None = None,
     ) -> None:
         self.core = core
         self.memory = memory
         self.settings = settings
+        #: The understanding model, or ``None`` when none is composed. Never
+        #: a registered connector: it interprets, it does not execute.
+        self.intent_model = intent_model
+        self._cancelled_text: set[str] = set()
 
     @property
     def permission_mode(self) -> PermissionMode:
         return self.settings.permission_mode
+
+    def submit_text(
+        self,
+        text: str,
+        session_id: str | None = None,
+        *,
+        previous_text: str = "",
+        request_id: str | None = None,
+    ) -> CommandResult:
+        """Free text in, the authoritative envelope out.
+
+        The pre-task understanding boundary. The model proposes, this method
+        validates the proposal against the catalog built from the composed
+        registry and grant table, ``decode_task_json`` judges the resulting
+        document exactly as typed JSON, and ``AgentCore.run`` decides every
+        approval, attestation and billing question as it always has. No
+        outcome of the understanding step is ever an unknown outcome: no
+        connector is reached before the task exists.
+
+        ``previous_text`` carries the earlier turn when the caller is
+        answering a clarification; the seam is stateless on purpose, so a
+        stale clarification can never mutate a later task or session.
+        ``request_id`` is the caller's handle for ``cancel_text``.
+        """
+        request_id = request_id or str(uuid4())
+        mode = self.settings.permission_mode
+
+        def refused(status: IntentStatus, message: str) -> CommandResult:
+            return text_result(mode, status, request_id, message=message)
+
+        reason = intent_text_refusal(text)
+        if reason is None and previous_text:
+            reason = intent_text_refusal(previous_text)
+        if reason is not None:
+            return refused(IntentStatus.INVALID_INPUT, f"The request was refused: {reason}.")
+        if not self.settings.execution_enabled:
+            # THE barrier, ahead of the model: understanding is the first
+            # step of starting work, and nothing may start work.
+            return refused(IntentStatus.EXECUTION_DISABLED, _EXECUTION_DISABLED_MESSAGE)
+        session = None
+        if session_id is not None:
+            session = self.memory.load_session(session_id)
+            if session is None:
+                return text_result(
+                    mode, IntentStatus.INVALID_INPUT, request_id,
+                    message=f"Unknown session: {session_id}", exit_code=EXIT_NOT_FOUND,
+                )
+        model = self.intent_model
+        if model is None:
+            return refused(
+                IntentStatus.MODEL_UNAVAILABLE,
+                "No understanding model is composed into this build.",
+            )
+        availability = model.availability()
+        if not availability.available:
+            return refused(
+                IntentStatus.MODEL_UNAVAILABLE,
+                availability.reason or "The understanding model is unavailable.",
+            )
+        now = datetime.now().astimezone()
+        catalog = build_catalog(
+            self.core.registry,
+            self.core.destination_policy,
+            self.memory.list_projects(),
+            session.project_id if session is not None else None,
+            now,
+        )
+        intent_task = Task(
+            objective=text,
+            capability=INTENT_CAPABILITY,
+            scope=ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION),
+            context={
+                "previous_request": previous_text,
+                "local_time": catalog.local_time,
+                "catalog": catalog.to_dict(),
+            },
+            id=request_id,
+        )
+        self._cancelled_text.discard(request_id)
+        try:
+            result = model.complete(intent_task, SessionState(objective=text))
+        except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
+            self._cancelled_text.discard(request_id)
+            return refused(
+                IntentStatus.MODEL_FAILED,
+                f"The understanding model failed: {type(exc).__name__}.",
+            )
+        cancelled = request_id in self._cancelled_text
+        self._cancelled_text.discard(request_id)
+        if not result.ok:
+            status = model_failure_status(result, cancelled)
+            detail = result.error.message if result.error is not None else result.summary
+            return refused(status, sanitize_diagnostic_text(detail, 240))
+        if cancelled:
+            return refused(IntentStatus.MODEL_CANCELLED, "The understanding call was cancelled.")
+        answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
+        if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
+            return refused(
+                IntentStatus.MALFORMED_MODEL_OUTPUT,
+                "The understanding model returned no usable proposal. Nothing was executed.",
+            )
+        try:
+            proposal = parse_proposal(answer.content)
+        except ProposalError as exc:
+            return refused(
+                IntentStatus.MALFORMED_MODEL_OUTPUT,
+                f"The proposal was refused: {exc}. Nothing was executed.",
+            )
+        resolution = resolve_proposal(proposal, catalog, now)
+        if resolution.status is IntentStatus.STRUCTURED:
+            try:
+                task = decode_task_json(json.dumps(resolution.task_document))
+            except TaskInputError as exc:
+                return refused(
+                    IntentStatus.MALFORMED_MODEL_OUTPUT,
+                    f"The proposal was refused by the task boundary: {exc} Nothing was executed.",
+                )
+            # From here on the ordinary lifecycle owns everything. No grant
+            # is passed: a natural-language request cannot approve itself.
+            run = self.core.run(task, session_id)
+            return text_result(
+                mode, IntentStatus.STRUCTURED, request_id,
+                capability=resolution.capability,
+                destination=resolution.destination,
+                objective=resolution.objective,
+                run=build_envelope("run", mode, run),
+                exit_code=self._exit_code(run),
+            )
+        if resolution.status is IntentStatus.SCHEDULED:
+            created = job_create_result(
+                self.memory, self.settings, json.dumps(resolution.job_document)
+            )
+            if created.exit_code != EXIT_OK:
+                error = created.payload.get("error") or {}
+                return refused(
+                    IntentStatus.MALFORMED_MODEL_OUTPUT,
+                    f"The proposed job was refused: {error.get('message')} Nothing was created.",
+                )
+            return text_result(
+                mode, IntentStatus.SCHEDULED, request_id,
+                capability=resolution.capability,
+                destination=resolution.destination,
+                objective=resolution.objective,
+                job=created.payload,
+            )
+        return text_result(
+            mode, resolution.status, request_id,
+            message=resolution.message,
+            question=resolution.question,
+            capability=resolution.capability,
+            destination=resolution.destination,
+        )
+
+    def cancel_text(self, request_id: str) -> bool:
+        """Ask the running understanding call for ``request_id`` to stop.
+
+        Advisory and best-effort, exactly like connector cancellation: the
+        return value says a signal was delivered, never that nothing left
+        the machine. A cancelled call reports ``model_cancelled`` and
+        creates nothing.
+        """
+        if self.intent_model is None or type(request_id) is not str:
+            return False
+        self._cancelled_text.add(request_id)
+        try:
+            return bool(self.intent_model.cancel(request_id))
+        except Exception:  # noqa: BLE001 - advisory signal; never raises
+            return False
 
     def run(self, raw_task_json: str | bytes, session_id: str | None = None) -> CommandResult:
         try:
@@ -3223,8 +3486,13 @@ def create_app(
     destination_policy: AbstractSet[DestinationGrant] | None = None,
     github_identity: GitHubIdentityBinding | None = None,
     gmail_identity: GmailIdentityBinding | None = None,
+    intent_model: ModelAdapter | None = None,
 ) -> JarvisApp:
     """Assemble an application from injected parts. Tests use this.
+
+    ``intent_model`` is the natural-language understanding adapter. It is
+    held by the application, never registered as a connector, and ``None``
+    means the free-text entry reports itself unavailable.
 
     ``destination_policy`` is the closed (connector, capability, canonical
     destination) authorization table this build runs under. It belongs to
@@ -3254,6 +3522,7 @@ def create_app(
         ),
         memory,
         settings,
+        intent_model=intent_model,
     )
 
 
@@ -3262,6 +3531,16 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     settings = settings or Settings()
     startup_directory = Path.cwd().resolve()
     connector = ClaudeCodeConnector(
+        allowed_roots=(startup_directory,),
+        default_working_directory=startup_directory,
+        max_budget_usd=settings.claude_call_budget_usd,
+        model=settings.claude_model,
+        effort=settings.claude_effort,
+    )
+    # The natural-language understanding call: the same hardened CLI seam
+    # and the same operator model/effort/budget, held by the app and NOT
+    # registered - it interprets a request, it never executes one.
+    intent_model = ClaudeIntentAdapter(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
         max_budget_usd=settings.claude_call_budget_usd,
@@ -3320,6 +3599,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         ),
         github_identity=github_identity,
         gmail_identity=gmail_identity,
+        intent_model=intent_model,
     )
 
 

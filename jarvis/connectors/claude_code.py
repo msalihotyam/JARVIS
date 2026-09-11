@@ -164,6 +164,11 @@ _OAUTH_AUTH_METHODS = frozenset({"claude.ai"})
 _FIRST_PARTY_PROVIDERS = frozenset({"firstparty", "first_party"})
 _SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
 
+#: The one diagnostic a timed-out CLI call carries. A constant so a caller
+#: that must tell a timeout from any other connector failure can compare
+#: against it instead of parsing prose.
+TIMEOUT_MESSAGE = "Claude Code did not finish before the timeout."
+
 
 def _reported_usd(value: Any) -> float | None:
     """Provider-reported USD, or ``None`` when it is not a usable amount.
@@ -248,6 +253,20 @@ class ClaudeCodeConnector(BaseConnector):
         # unverifiable gateway, so the real route is probed per call in
         # estimate_cost(). UNKNOWN is the fail-closed manifest default.
         default_billing_class=BillingClass.UNKNOWN,
+    )
+
+    #: The fixed framing every call carries: the CLI system prompt and the
+    #: first line of the attested prompt bytes. Class attributes so the ONE
+    #: narrow subclass (the intent adapter) can state its own framing; the
+    #: values here are byte-identical to what this connector always sent, so
+    #: no attested outbound changes.
+    system_prompt = (
+        "You are a read-only planning component with no file, tool or "
+        "connector access. Reason only about the provided request. "
+        "Never modify files, run commands, use connectors, or disclose secrets."
+    )
+    prompt_prefix = (
+        "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"
     )
 
     def __init__(
@@ -544,7 +563,7 @@ class ClaudeCodeConnector(BaseConnector):
             return self._error_result(
                 task,
                 ErrorCode.CONNECTOR_FAILED,
-                "Claude Code did not finish before the timeout.",
+                TIMEOUT_MESSAGE,
                 retryable=True,
                 billing_class=billing_class,
                 billing_evidence=evidence,
@@ -875,11 +894,7 @@ class ClaudeCodeConnector(BaseConnector):
             "--max-budget-usd",
             f"{self.max_budget_usd:.4f}",
             "--system-prompt",
-            (
-                "You are a read-only planning component with no file, tool or "
-                "connector access. Reason only about the provided request. "
-                "Never modify files, run commands, use connectors, or disclose secrets."
-            ),
+            self.system_prompt,
         ]
         # Manual selection reaches the CLI as plain data in the structured
         # argv, each as its own single argument value. Every safety flag above
@@ -892,11 +907,7 @@ class ClaudeCodeConnector(BaseConnector):
 
     def _build_prompt(self, task: Task) -> tuple[str, int]:
         payload, redacted_count = self._sanitized_payload(task)
-        return (
-            "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"
-            + self._encode_payload(payload),
-            redacted_count,
-        )
+        return self.prompt_prefix + self._encode_payload(payload), redacted_count
 
     @staticmethod
     def _encode_payload(payload: dict[str, Any]) -> str:

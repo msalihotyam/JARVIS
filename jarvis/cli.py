@@ -293,6 +293,20 @@ def _build_parser() -> _ArgumentParser:
     run_command.add_argument("--task-json", required=True, metavar="PATH|-")
     run_command.add_argument("--session-id")
 
+    # The natural-language entry. It executes exactly like ``run`` does -
+    # through the ordinary application path - after the understanding model
+    # has proposed and deterministic code has validated a task document.
+    text_command = commands.add_parser(
+        "text", help="Start work from one natural-language request."
+    )
+    text_command.add_argument("--text", required=True)
+    text_command.add_argument("--session-id")
+    text_command.add_argument(
+        "--previous-text",
+        default="",
+        help="The earlier request this text answers a clarification for.",
+    )
+
     for name in ("resume", "cancel"):
         command = commands.add_parser(name)
         command.add_argument("--session-id", required=True)
@@ -852,6 +866,10 @@ def _dispatch(app: JarvisApp, command: str, args: argparse.Namespace) -> Command
         return app.run_chain(args.session_id)
     if command == "run":
         return app.run(_read_task_json(args.task_json), args.session_id)
+    if command == "text":
+        return app.submit_text(
+            args.text, args.session_id, previous_text=args.previous_text
+        )
     if command == "resume":
         return app.resume(args.session_id, args.task_id)
     if command == "clarify":
