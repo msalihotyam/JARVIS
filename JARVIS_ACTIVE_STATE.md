@@ -4,53 +4,62 @@ Short, current-state snapshot. Keep this file small and update it whenever
 the state below actually changes — see `JARVIS_RUNBOOK.md` for the rules this
 state is tracked under.
 
-- **Current work:** Browser basic usable-v1 — COMPLETED and integrated
-  (`e3d5d14`); the accepted task line ended at task commit `5ceb270`. Nine
-  capabilities in the closed vocabulary: `browser_navigate`,
-  `browser_page_read`, `browser_click`, `browser_type`, `browser_wait`,
-  `browser_tab_list`, `browser_tab_open`, `browser_tab_switch`,
-  `browser_tab_close`. `browser_script_evaluate`, `browser_download`,
-  `browser_upload`, `browser_screenshot` and `browser_cookie_read` are refused
-  BY NAME, so no task can ask for them. The backend is the local Microsoft
-  Edge driven over the DevTools protocol with the standard library only — the
-  project keeps `dependencies = []`, and Playwright/Selenium were not added.
-  A target is never a model-authored selector: it is a `ref` a previous
-  reading printed plus that reading's digest, so a page that moved fails
-  closed. Cross-origin redirect authority is ENFORCEMENT, not detection: every
-  top-level Document request is paused before it is sent, the first hop
-  leaving the approved origin is refused with `BlockedByClient`, the gate
-  stays armed until `Page.frameNavigated` correlated on frameId AND loaderId,
-  and `Fetch.disable` is never sent while a paused request lacks an
-  acknowledged disposition — that tab is destroyed with `Target.closeTarget`
-  instead. Field values are never rendered (the accessibility tree reports a
-  password input as an ordinary textbox) and credential-shaped text is never
-  typed. Targeted Browser suite: **79 tests, 0 failed, 0 errors**. Final
-  independent gate: PASS.
-- **Live validation:** the teardown claim was measured on real Microsoft Edge
-  **152.0.4191.66**, once. Control run: `Fetch.disable` really did send the
-  paused request to the destination server. Claim run: after
-  `Target.closeTarget` the destination server received **zero** requests. No
-  Edge process, tab, server or temporary file was left behind.
-- **Dashboard:** 67% (Browser capability 75%, Gmail 75%, GitHub 60%,
-  Scheduler 92%), as computed by the renderer from `dev/dashboard/status.json`.
-- **Latest canonical main** is `e3d5d14` and includes the Gmail minimum series
-  through `37404e0`, the dev-tooling `jarvis-lifecycle` skill `c41d898`, and
-  the Browser basic series `f979fd7` → `e3908c0` → `f4685d5` → `bcfe67e` →
-  `e3d5d14`. Housekeeping commits after those do not change the product state
-  recorded here.
-- **Next implementation (product):** Windows Desktop basic usable-v1 (design
-  not started). GitHub writes, `github_code_search`, `gmail_attachment_read`
-  and Browser end-to-end hardening stay out of scope.
-- **Contracts:** SQLite schema 10; output envelope 7. Browser basic changed
-  neither — it reuses the same bounded `external_read` block with the
-  connector named `browser-cdp`.
+- **Current work:** Windows Desktop basic usable-v1 — COMPLETED and integrated
+  (`ca8f780`); the accepted task line ended at task commit `2f8ed55`, and the
+  integrated tree is byte-identical to it. Six capabilities in the closed
+  vocabulary: `desktop_app_launch`, `desktop_window_list`,
+  `desktop_window_inspect`, `desktop_window_focus`, `desktop_click`,
+  `desktop_type`. `desktop_key`, `desktop_screenshot`,
+  `desktop_clipboard_read`, `desktop_clipboard_write`, `desktop_window_close`,
+  `desktop_window_move`, `desktop_drag`, `desktop_field_value_read` and
+  `desktop_command_run` are refused BY NAME. The backend is standard-library
+  `ctypes` over user32/kernel32 and Windows' own UI Automation client — the
+  project keeps `dependencies = []`. Authority is configuration: each
+  `desktop_apps` entry (`desktop/<canonical exe path>`) becomes exact
+  `DestinationGrant` rows; shells, terminals, script hosts, explorer and the
+  UWP frame host are refused by the grammar. A window is hwnd + pid + process
+  creation time; a target is a `ref` an inspection printed plus that
+  inspection's digest. Actions are TARGET-BOUND, never global input: a click
+  is `InvokePattern.Invoke` and typing is `ValuePattern.SetValue`, called on
+  the pattern object of the element just re-inspected and digest-verified;
+  the global `SendInput` path was removed (Gemini finding). After the pattern
+  is acquired and before dispatch, window ownership (hwnd, pid, creation
+  time, image, class) is re-proven, so HWND/process reuse is a definite
+  pre-dispatch refusal (Codex final-gate finding). Password fields are never
+  written, field values are never read, credential-shaped text is never
+  typed; an uncertain post-dispatch outcome is UNKNOWN_OUTCOME and is never
+  replayed. Targeted Desktop suite: **48 tests, green**. Gemini independent
+  review: PASS. Codex final independent gate: PASS.
+- **Previous closure:** Browser basic usable-v1 (`e3d5d14`, task commit
+  `5ceb270`) — nine capabilities, local Edge over DevTools, origin-gated
+  navigation; targeted Browser suite 79 tests; teardown claim measured on real
+  Edge 152.0.4191.66.
+- **Live validation (Desktop):** on real Windows, once per property: the UIA
+  vtable slots were cross-checked against Win32's own answers (winver), and
+  target-bound dispatch was shown with an unrelated app in front and covering
+  the target — charmap's field received the text while winver covered it, and
+  winver's OK button was invoked while charmap covered it and stayed in
+  front. Nothing launched was left running.
+- **Dashboard:** 71% (Desktop capability 75%, Browser 75%, Gmail 75%, GitHub
+  60%, Scheduler 92%), as computed by the renderer from
+  `dev/dashboard/status.json`.
+- **Latest canonical main** is `ca8f780` and includes the Browser basic series
+  through `e3d5d14` and the Windows Desktop basic series `62b669b` →
+  `47af4e2` → `ca8f780`. Housekeeping commits after those do not change the
+  product state recorded here.
+- **Next implementation (product):** Minimal UI (design not started). Desktop
+  `desktop_key`, packaged/UWP apps, checkbox/radio/selection patterns and
+  Desktop/Browser end-to-end hardening stay out of scope.
+- **Contracts:** SQLite schema 10; output envelope 7. Windows Desktop basic
+  changed neither — it reuses the same bounded `external_read` block with the
+  connector named `desktop-uia`.
 - **Test coverage note:** the last FULL canonical product-suite run is still
-  the Gmail one (3593 tests). Browser basic ran the full suite once on its own
-  task tree (3648 tests, 0 failed, 1 skipped) because shared Core contracts
-  changed there; its later corrections touched no shared contract and were
-  verified by the targeted suite only, per the runbook.
-- **Active implementation worktree:** none. The Browser worktree
-  `JARVIS-Claude-browser-minimum` and its branch `claude/browser-minimum` were
+  the Gmail one (3593 tests). Windows Desktop basic ran the full suite once on
+  its own task tree (3713 tests OK, 1 skipped) because shared Core contracts
+  changed there; its two later corrections were Desktop-local and verified by
+  the targeted suite only, per the runbook.
+- **Active implementation worktree:** none. The Desktop worktree
+  `JARVIS-Claude-desktop-minimum` and its branch `claude/desktop-minimum` were
   finished and cleaned up after integration; this persistent chat is rebound
   to canonical `C:\Users\realk\Masaüstü\JARVIS`. `dev.ps1 status` still
   reports the old `claude/scheduler-phase1b` recovery residue (PARTIAL
