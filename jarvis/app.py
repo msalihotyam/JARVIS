@@ -335,7 +335,7 @@ _BROWSER_KEYS = frozenset(
 #: Windows Desktop basic. The typed target fields, and nothing else: no
 #: coordinate, class name, automation id, process id or command line is
 #: expressible. ``kind`` and ``app`` are required.
-_DESKTOP_KEYS = frozenset({"kind", "app", "window_id", "ref", "digest", "text", "key"})
+_DESKTOP_KEYS = frozenset({"kind", "app", "window_id", "ref", "digest", "text"})
 #: M9. The only two read-window parameters. Default-deny like every other
 #: section: anything else is rejected, never ignored.
 _READ_KEYS = frozenset({"start_line", "max_lines"})

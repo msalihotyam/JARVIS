@@ -1,19 +1,29 @@
 """The Windows seam for Desktop basic: one validated operation, one backend.
 
 ``run_desktop_operation`` is the ORDER of checks, and the order is the safety
-property: every refusal happens before anything is dispatched, and once
-input may have reached an application nothing short of Windows' own count is
+property: every refusal happens before anything is dispatched, and once an
+action may have reached an application nothing short of a completed call is
 treated as an answer. The backend (``Win32Desktop``) is primitives only -
-enumerate, inspect, focus, inject - over the standard library's ``ctypes``:
-user32/kernel32 for windows, processes and ``SendInput``, and the operating
+enumerate, inspect, invoke, set a value - over the standard library's
+``ctypes``: user32/kernel32 for windows and processes, and the operating
 system's own UI Automation client (``IUIAutomation``) for the accessibility
-tree. No dependency, no helper process, no screenshot, and no call that reads
-a field's value.
+tree and for every action.
+
+TARGET-BOUND DISPATCH. No action travels through the global input stream.
+A click is ``IUIAutomationInvokePattern::Invoke`` and typing is
+``IUIAutomationValuePattern::SetValue``, each called on the pattern object of
+the ONE element this operation just re-inspected and digest-verified. UI
+Automation routes that call to that element's own provider, so which window
+is in front, where the pointer is and what covers the element decide nothing:
+there is no step at which Windows picks a recipient. There is no SendInput,
+no synthesized mouse or keyboard event and no posted key message anywhere in
+this module. An element that offers no such pattern is refused - never
+clicked or typed into some other way.
 
 OUTCOMES. ``DesktopExecutionUnavailable`` is a DEFINITE outcome: nothing was
 dispatched, or - for a focus Windows declined - the observed end state is
-known. ``DesktopOutcomeUnknown`` means input may have been dispatched and its
-effect is not established; it is never replayed.
+known. ``DesktopOutcomeUnknown`` means the call was dispatched and did not
+complete; it is never replayed.
 """
 
 from __future__ import annotations
@@ -24,7 +34,6 @@ import sys
 from typing import Any, Callable
 
 from jarvis.desktop import (
-    DESKTOP_KEYS,
     DESKTOP_TEXT_ROLES,
     DesktopElement,
     DesktopExecutionUnavailable,
@@ -75,7 +84,7 @@ def run_desktop_operation(
             return _OPERATIONS[frame.capability](desk, frame, cancelled, dispatch)
     except (DesktopExecutionUnavailable, DesktopOutcomeUnknown):
         raise
-    except Exception as exc:  # noqa: BLE001 - classified by whether input left
+    except Exception as exc:  # noqa: BLE001 - classified by whether the call left
         if dispatch.started:
             raise DesktopOutcomeUnknown(
                 f"the {frame.capability} was dispatched and did not complete"
@@ -113,7 +122,12 @@ def _view(desk: Any, window: DesktopWindow) -> tuple[str, list[DesktopElement]]:
 
 
 def _target(desk: Any, frame: DesktopRequestFrame) -> tuple[DesktopWindow, DesktopElement]:
-    """The approved element in the approved window, still exactly as inspected."""
+    """The approved element in the approved window, still exactly as inspected.
+
+    The element returned is the live UI Automation element of THIS
+    inspection - the one whose rendering was just proven byte-identical to
+    the approved one - and it is the object the action is then called on.
+    """
     window = _window(desk, frame)
     if window.minimized:
         raise DesktopExecutionUnavailable("the window is minimized; focus it first")
@@ -125,13 +139,11 @@ def _target(desk: Any, frame: DesktopRequestFrame) -> tuple[DesktopWindow, Deskt
     element = elements[desktop_ref_index(rendering, frame.resource.ref) - 1]
     if not element.enabled:
         raise DesktopExecutionUnavailable("the target element is disabled")
-    if desk.foreground() != window.hwnd:
-        raise DesktopExecutionUnavailable("the window is not in the foreground; focus it first")
     if desk.input_blocked(window.pid):
-        # UIPI drops input to an elevated window SILENTLY - SendInput still
-        # reports success - so an injection there could never be confirmed.
+        # UIPI stands between a medium-integrity client and an elevated
+        # application's UI; a call into it could only fail after dispatch.
         raise DesktopExecutionUnavailable(
-            "the application runs elevated; Windows would silently drop the input"
+            "the application runs elevated; JARVIS may not act on its UI"
         )
     return window, element
 
@@ -139,16 +151,6 @@ def _target(desk: Any, frame: DesktopRequestFrame) -> tuple[DesktopWindow, Deskt
 def _not_cancelled(cancelled: Callable[[], bool]) -> None:
     if cancelled():
         raise DesktopExecutionUnavailable("the operation was cancelled before anything was dispatched")
-
-
-def _injected(sent: int, expected: int) -> None:
-    """Windows' own count is the only answer. None inserted is definite; a
-    partial insertion means some input left and the rest did not."""
-    if sent == expected:
-        return
-    if sent == 0:
-        raise DesktopExecutionUnavailable("Windows accepted none of the input")
-    raise DesktopOutcomeUnknown(f"Windows accepted {sent} of {expected} input events")
 
 
 def _list(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
@@ -173,8 +175,7 @@ def _focus(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dis
     desk.bring_to_front(window.hwnd)
     if desk.foreground() != window.hwnd:
         # A definite, observed end state rather than a guess: Windows kept
-        # another window in front (its foreground lock), so nothing typed or
-        # clicked next could land here.
+        # another window in front (its foreground lock).
         raise DesktopExecutionUnavailable(
             "Windows kept another window in the foreground; the window may have "
             "been restored but it is not focused"
@@ -184,53 +185,36 @@ def _focus(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dis
 
 def _click(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
     window, element = _target(desk, frame)
-    left, top, right, bottom = element.rect
-    x, y = (left + right) // 2, (top + bottom) // 2
-    if desk.root_at(x, y) != window.hwnd:
-        raise DesktopExecutionUnavailable("another window covers the target element")
+    invoke = desk.pattern(element, "invoke")
+    if invoke is None:
+        raise DesktopExecutionUnavailable(
+            "the element offers no UI Automation Invoke, so it cannot be clicked "
+            "by a call bound to it; nothing was clicked"
+        )
     _not_cancelled(cancelled)
-    # The pointer is placed first and CHECKED: a move clicks nothing, and a
-    # pointer that did not land on the approved window refuses the click.
-    if not desk.move_cursor(x, y):
-        raise DesktopExecutionUnavailable("the pointer could not be placed on the target")
-    cx, cy = desk.cursor()
-    if abs(cx - x) > 1 or abs(cy - y) > 1 or desk.root_at(cx, cy) != window.hwnd:
-        raise DesktopExecutionUnavailable("the pointer did not land on the target element")
-    if desk.foreground() != window.hwnd:
-        raise DesktopExecutionUnavailable("the window lost the foreground before the click")
-    # ponytail: another process can still take the foreground between this
-    # check and SendInput; SendInput is atomic only against other input.
     dispatch.started = True
-    _injected(desk.click(x, y), 3)
+    desk.invoke(invoke)
     return {"window_id": window.window_id}
 
 
-def _focused_field(desk: Any, frame: DesktopRequestFrame, cancelled: Any) -> DesktopWindow:
+def _type(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
     window, element = _target(desk, frame)
     if element.password:
         raise DesktopExecutionUnavailable(
             "the target is a password field; JARVIS does not type into it, the person does"
         )
-    if frame.capability == "desktop_type" and desktop_element_role(element) not in DESKTOP_TEXT_ROLES:
+    if desktop_element_role(element) not in DESKTOP_TEXT_ROLES:
         raise DesktopExecutionUnavailable("the target is not a text field")
+    value = desk.pattern(element, "value")
+    # Only the read-only FLAG is asked for; the field's value is never read.
+    if value is None or desk.read_only(value):
+        raise DesktopExecutionUnavailable(
+            "the field offers no writable UI Automation value, so it cannot be "
+            "typed into by a call bound to it; nothing was typed"
+        )
     _not_cancelled(cancelled)
-    desk.set_focus(element)
-    if not desk.has_focus(element) or desk.foreground() != window.hwnd:
-        raise DesktopExecutionUnavailable("the target did not take keyboard focus")
-    return window
-
-
-def _type(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
-    window = _focused_field(desk, frame, cancelled)
     dispatch.started = True
-    _injected(*desk.type_text(frame.resource.text))
-    return {"window_id": window.window_id}
-
-
-def _key(desk: Any, frame: DesktopRequestFrame, cancelled: Any, dispatch: _Dispatch) -> dict:
-    window = _focused_field(desk, frame, cancelled)
-    dispatch.started = True
-    _injected(*desk.press_key(*DESKTOP_KEYS[frame.resource.key]))
+    desk.set_value(value, frame.resource.text)
     return {"window_id": window.window_id}
 
 
@@ -241,7 +225,6 @@ _OPERATIONS = {
     "desktop_window_focus": _focus,
     "desktop_click": _click,
     "desktop_type": _type,
-    "desktop_key": _key,
 }
 
 
@@ -258,31 +241,11 @@ if sys.platform == "win32":
     _ole32 = ctypes.WinDLL("ole32")
     _oleaut32 = ctypes.WinDLL("oleaut32")
 
-    class _POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
     class _RECT(ctypes.Structure):
         _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
     class _GUID(ctypes.Structure):
         _fields_ = [("d1", ctypes.c_uint32), ("d2", ctypes.c_uint16), ("d3", ctypes.c_uint16), ("d4", ctypes.c_ubyte * 8)]
-
-    class _MOUSEINPUT(ctypes.Structure):
-        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", _wt.DWORD),
-                    ("dwFlags", _wt.DWORD), ("time", _wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _KEYBDINPUT(ctypes.Structure):
-        _fields_ = [("wVk", _wt.WORD), ("wScan", _wt.WORD), ("dwFlags", _wt.DWORD),
-                    ("time", _wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _HARDWAREINPUT(ctypes.Structure):
-        _fields_ = [("uMsg", _wt.DWORD), ("wParamL", _wt.WORD), ("wParamH", _wt.WORD)]
-
-    class _INPUTUNION(ctypes.Union):
-        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
-
-    class _INPUT(ctypes.Structure):
-        _fields_ = [("type", _wt.DWORD), ("u", _INPUTUNION)]
 
     _WNDENUMPROC = ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
 
@@ -300,11 +263,6 @@ if sys.platform == "win32":
         ("GetForegroundWindow", _wt.HWND, ()),
         ("SetForegroundWindow", _wt.BOOL, (_wt.HWND,)),
         ("ShowWindow", _wt.BOOL, (_wt.HWND, ctypes.c_int)),
-        ("GetAncestor", _wt.HWND, (_wt.HWND, _wt.UINT)),
-        ("WindowFromPoint", _wt.HWND, (_POINT,)),
-        ("GetCursorPos", _wt.BOOL, (ctypes.POINTER(_POINT),)),
-        ("GetSystemMetrics", ctypes.c_int, (ctypes.c_int,)),
-        ("SendInput", _wt.UINT, (_wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)),
         ("SetThreadDpiAwarenessContext", ctypes.c_void_p, (ctypes.c_void_p,)),
         ("WaitForInputIdle", _wt.DWORD, (_wt.HANDLE, _wt.DWORD)),
     ):
@@ -320,20 +278,19 @@ if sys.platform == "win32":
     _sig(_ole32, "CoUninitialize", None)
     _sig(_ole32, "CLSIDFromString", ctypes.c_long, _wt.LPCWSTR, ctypes.POINTER(_GUID))
     _sig(_ole32, "CoCreateInstance", ctypes.c_long, ctypes.POINTER(_GUID), ctypes.c_void_p, _wt.DWORD, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+    _sig(_oleaut32, "SysAllocString", ctypes.c_void_p, _wt.LPCWSTR)
     _sig(_oleaut32, "SysStringLen", _wt.UINT, ctypes.c_void_p)
     _sig(_oleaut32, "SysFreeString", None, ctypes.c_void_p)
 
 # UI Automation, from UIAutomationClient.h. Vtable slots count IUnknown's
-# three methods first; each is checked against Win32's own answer for the
-# same window in the one live validation (name, pid, handle, rectangle).
+# three methods first; the element slots were checked against Win32's own
+# answers for the same window in the live validation.
 _CLSID_CUIAUTOMATION = "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
 _IID_IUIAUTOMATION = "{30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}"
-_UIA_COMPARE_ELEMENTS = 3
 _UIA_ELEMENT_FROM_HANDLE = 6
-_UIA_GET_FOCUSED_ELEMENT = 8
 _UIA_CONTROL_VIEW_CONDITION = 18
-_ELEMENT_SET_FOCUS = 3
 _ELEMENT_FIND_ALL = 6
+_ELEMENT_GET_CURRENT_PATTERN_AS = 14
 _ELEMENT_CONTROL_TYPE = 21
 _ELEMENT_NAME = 23
 _ELEMENT_IS_ENABLED = 28
@@ -343,17 +300,20 @@ _ELEMENT_BOUNDING_RECTANGLE = 43
 _ARRAY_LENGTH = 3
 _ARRAY_GET_ELEMENT = 4
 _TREE_SCOPE_DESCENDANTS = 4
+#: The two patterns an action may be called through: (pattern id, IID).
+_PATTERNS = {
+    "invoke": (10000, "{FB377FBE-8EA6-46D5-9C73-6499642D3059}"),
+    "value": (10002, "{A94CD8B1-0844-4CD6-9D2D-640537AB39E9}"),
+}
+_INVOKE = 3
+_VALUE_SET_VALUE = 3
+_VALUE_IS_READ_ONLY = 5  # slot 4, get_CurrentValue, is never called
 
 _DPI_PER_MONITOR_AWARE_V2 = -4
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20
-_GA_ROOT = 2
 _SW_RESTORE = 9
-_INPUT_MOUSE, _INPUT_KEYBOARD = 0, 1
-_MOUSE_MOVE, _MOUSE_LEFTDOWN, _MOUSE_LEFTUP = 0x0001, 0x0002, 0x0004
-_MOUSE_VIRTUALDESK, _MOUSE_ABSOLUTE = 0x4000, 0x8000
-_KEY_EXTENDED, _KEY_UP, _KEY_UNICODE = 0x0001, 0x0002, 0x0004
 
 
 def _com(pointer: int, index: int, argtypes: tuple, *args: Any) -> None:
@@ -380,8 +340,8 @@ class Win32Desktop:
     def __enter__(self) -> "Win32Desktop":
         if sys.platform != "win32":
             raise DesktopExecutionUnavailable("Windows Desktop control needs Windows")
-        # Physical pixels everywhere - UI Automation rectangles, hit tests,
-        # the cursor and SendInput - for this thread only.
+        # Physical pixels for UI Automation rectangles, for this thread only,
+        # so an inspection renders the same bytes however the process scales.
         self._dpi = _user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(_DPI_PER_MONITOR_AWARE_V2))
         self._com_owned = _ole32.CoInitializeEx(None, 0) in (0, 1)
         self._held: list[int] = []
@@ -464,15 +424,6 @@ class Win32Desktop:
             _user32.ShowWindow(hwnd, _SW_RESTORE)
         _user32.SetForegroundWindow(hwnd)
 
-    def root_at(self, x: int, y: int) -> int:
-        hwnd = _user32.WindowFromPoint(_POINT(x, y))
-        return (_user32.GetAncestor(hwnd, _GA_ROOT) or 0) if hwnd else 0
-
-    def cursor(self) -> tuple[int, int]:
-        point = _POINT()
-        _user32.GetCursorPos(ctypes.byref(point))
-        return point.x, point.y
-
     @staticmethod
     def _elevated(process: int) -> bool | None:
         token = _wt.HANDLE()
@@ -486,8 +437,8 @@ class Win32Desktop:
             _kernel32.CloseHandle(token)
 
     def input_blocked(self, pid: int) -> bool:
-        """Whether UIPI would drop our input to this process. Unknown counts
-        as blocked: a token we may not even read is not one we outrank."""
+        """Whether UIPI stands between us and this process. Unknown counts as
+        blocked: a token we may not even read is not one we outrank."""
         if self._elevated(_kernel32.GetCurrentProcess()):
             return False
         handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -557,53 +508,35 @@ class Win32Desktop:
             )
         return result
 
-    def set_focus(self, element: DesktopElement) -> None:
-        _com(element.handle, _ELEMENT_SET_FOCUS, ())
+    def pattern(self, element: DesktopElement, kind: str) -> int | None:
+        """This element's own Invoke or Value pattern object, or ``None`` when
+        it offers none. Asking changes nothing in the application."""
+        pattern_id, iid = _PATTERNS[kind]
+        out = ctypes.c_void_p()
+        _com(
+            element.handle, _ELEMENT_GET_CURRENT_PATTERN_AS,
+            (ctypes.c_int, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)),
+            pattern_id, ctypes.byref(_guid(iid)), ctypes.byref(out),
+        )
+        if not out.value:
+            return None
+        self._held.append(out.value)
+        return out.value
 
-    def has_focus(self, element: DesktopElement) -> bool:
-        uia = self._uia
-        focused = self._new(lambda out: _com(uia, _UIA_GET_FOCUSED_ELEMENT, (ctypes.POINTER(ctypes.c_void_p),), out))
-        same = ctypes.c_int()
-        _com(uia, _UIA_COMPARE_ELEMENTS, (ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)), element.handle, focused, ctypes.byref(same))
-        return bool(same.value)
+    def read_only(self, pattern: int) -> bool:
+        return bool(self._int(pattern, _VALUE_IS_READ_ONLY))
 
-    # -- input ----------------------------------------------------------------
+    def invoke(self, pattern: int) -> None:
+        _com(pattern, _INVOKE, ())
 
-    @staticmethod
-    def _send(events: list[Any]) -> int:
-        array = (_INPUT * len(events))(*events)
-        return _user32.SendInput(len(events), array, ctypes.sizeof(_INPUT))
-
-    @staticmethod
-    def _mouse(x: int, y: int, flags: int) -> Any:
-        left, top = _user32.GetSystemMetrics(76), _user32.GetSystemMetrics(77)
-        width, height = _user32.GetSystemMetrics(78), _user32.GetSystemMetrics(79)
-        dx = round((x - left) * 65535 / max(width - 1, 1))
-        dy = round((y - top) * 65535 / max(height - 1, 1))
-        flags |= _MOUSE_MOVE | _MOUSE_ABSOLUTE | _MOUSE_VIRTUALDESK
-        return _INPUT(type=_INPUT_MOUSE, u=_INPUTUNION(mi=_MOUSEINPUT(dx, dy, 0, flags, 0, 0)))
-
-    def move_cursor(self, x: int, y: int) -> bool:
-        return self._send([self._mouse(x, y, 0)]) == 1
-
-    def click(self, x: int, y: int) -> int:
-        return self._send([self._mouse(x, y, 0), self._mouse(x, y, _MOUSE_LEFTDOWN), self._mouse(x, y, _MOUSE_LEFTUP)])
-
-    @staticmethod
-    def _key(vk: int, scan: int, flags: int) -> Any:
-        return _INPUT(type=_INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(vk, scan, flags, 0, 0)))
-
-    def type_text(self, text: str) -> tuple[int, int]:
-        units = text.encode("utf-16-le")
-        events = []
-        for offset in range(0, len(units), 2):
-            unit = int.from_bytes(units[offset : offset + 2], "little")
-            events += [self._key(0, unit, _KEY_UNICODE), self._key(0, unit, _KEY_UNICODE | _KEY_UP)]
-        return self._send(events), len(events)
-
-    def press_key(self, vk: int, extended: bool) -> tuple[int, int]:
-        flags = _KEY_EXTENDED if extended else 0
-        return self._send([self._key(vk, 0, flags), self._key(vk, 0, flags | _KEY_UP)]), 2
+    def set_value(self, pattern: int, text: str) -> None:
+        value = _oleaut32.SysAllocString(text)
+        if not value:
+            raise MemoryError("no string for the value")
+        try:
+            _com(pattern, _VALUE_SET_VALUE, (ctypes.c_void_p,), value)
+        finally:
+            _oleaut32.SysFreeString(value)
 
 
 __all__ = ["DESKTOP_TIMEOUT_SECONDS", "Win32Desktop", "run_desktop_operation"]

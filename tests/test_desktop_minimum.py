@@ -1,11 +1,18 @@
-"""Windows Desktop basic usable-v1: bounded application, window and input control.
+"""Windows Desktop basic usable-v1: bounded application, window and element control.
 
 Offline throughout. ``FakeDesktop`` stands in for Windows and only ANSWERS:
-it reports windows, elements, the foreground and how many input events were
-accepted, and records every primitive it was asked for. Every check and its
-order belongs to the real seam, ``run_desktop_operation``. Core is driven end
-to end for what only Core can prove: the mandatory approval, a mutation after
-approval, the in-doubt outcome, the kill switch and cancellation.
+it reports windows, elements, the foreground and which patterns an element
+offers, and it records every action by the window that RECEIVED it. Every
+check and its order belongs to the real seam, ``run_desktop_operation``. Core
+is driven end to end for what only Core can prove: the mandatory approval, a
+mutation after approval, the in-doubt outcome, the kill switch and
+cancellation.
+
+THE RACE. Global state - the foreground window, what covers a point, where
+the keyboard focus is - can change between the last check and dispatch. The
+regressions below change all three to an unrelated application at the last
+moment the seam gives anyone a hook, immediately before dispatch, and require
+that the unrelated application receives nothing.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from jarvis import desktop_win32
 from jarvis.app import TaskInputError, _external_read_payload, decode_task_json, desktop_authority
 from jarvis.connectors.desktop_uia import DesktopUiaConnector
 from jarvis.contracts import (
@@ -42,7 +50,6 @@ from jarvis.desktop import (
     DesktopWindow,
     build_desktop_request_frame,
     desktop_rendered_elements,
-    desktop_resource_from_dict,
     desktop_resource_refusal,
     desktop_text_refusal,
     desktop_view_digest,
@@ -103,28 +110,34 @@ FIELDS = {
     "desktop_window_focus": {"window_id": WID},
     "desktop_click": {"window_id": WID, "ref": "r4", "digest": DIGEST},
     "desktop_type": {"window_id": WID, "ref": "r2", "digest": DIGEST, "text": "hello"},
-    "desktop_key": {"window_id": WID, "ref": "r2", "digest": DIGEST, "key": "enter"},
 }
-_INPUT = ("click", "type", "key", "launch")
 
 
 class FakeDesktop:
-    """Scripted Windows. Answers; never decides."""
+    """Scripted Windows. Answers; never decides.
+
+    ``fg``, ``covering`` and ``keyboard`` are the GLOBAL state a race can
+    change. An action is recorded against the window of the element whose
+    pattern received it - which is what UI Automation does - so a test can
+    see exactly who got it.
+    """
 
     def __init__(self, windows=None, elements=None) -> None:
         self.window_list = list(windows if windows is not None else (WINDOW, OTHER, CONSOLE))
         self.element_list = list(elements if elements is not None else ELEMENTS)
         self.fg = WINDOW.hwnd
-        self.calls: list[tuple] = []
-        self.cursor_at = (0, 0)
-        self.focused = None
-        self.takes_focus = True
-        self.sent = None
         self.covering = None
+        self.keyboard = WINDOW.hwnd
+        self.calls: list[tuple] = []
+        self.delivered: list[tuple] = []
+        self.patterns = {"ok": {"invoke"}, "edit": {"value"}, "password": {"value"}}
+        self.read_only_fields: set = set()
         self.blocked = False
         self.refuse_foreground = False
         self.launch_error = None
+        self.fail = None
         self.on_elements = None
+        self._owner: dict = {}
 
     def __enter__(self):
         return self
@@ -132,16 +145,14 @@ class FakeDesktop:
     def __exit__(self, *exc) -> None:
         return None
 
-    @property
-    def injected(self) -> list[tuple]:
-        return [call for call in self.calls if call[0] in _INPUT]
-
     def windows(self):
         return [replace(window, foreground=window.hwnd == self.fg) for window in self.window_list]
 
     def elements(self, hwnd):
         if self.on_elements:
             self.on_elements()
+        for element in self.element_list:
+            self._owner[element.handle] = hwnd
         return list(self.element_list)
 
     def foreground(self):
@@ -156,51 +167,33 @@ class FakeDesktop:
         if not self.refuse_foreground:
             self.fg = hwnd
 
-    def root_at(self, x, y):
-        return self.covering or WINDOW.hwnd
-
-    def cursor(self):
-        return self.cursor_at
-
-    def move_cursor(self, x, y) -> bool:
-        self.calls.append(("move", x, y))
-        self.cursor_at = (x, y)
-        return True
-
     def input_blocked(self, pid) -> bool:
         return self.blocked
-
-    def set_focus(self, element) -> None:
-        self.calls.append(("set_focus", element.handle))
-        if self.takes_focus:
-            self.focused = element.handle
-
-    def has_focus(self, element) -> bool:
-        return self.focused == element.handle
-
-    def _count(self, expected):
-        if isinstance(self.sent, Exception):
-            raise self.sent
-        return expected if self.sent is None else self.sent
-
-    def click(self, x, y):
-        self.calls.append(("click", x, y))
-        return self._count(3)
-
-    def type_text(self, text):
-        self.calls.append(("type", text))
-        expected = len(text.encode("utf-16-le"))
-        return self._count(expected), expected
-
-    def press_key(self, vk, extended):
-        self.calls.append(("key", vk, extended))
-        return self._count(2), 2
 
     def launch(self, app):
         self.calls.append(("launch", app))
         if self.launch_error:
             raise self.launch_error
         return 777, True
+
+    def pattern(self, element, kind):
+        if kind not in self.patterns.get(element.handle, set()):
+            return None
+        return (kind, element.handle)
+
+    def read_only(self, pattern) -> bool:
+        return pattern[1] in self.read_only_fields
+
+    def _deliver(self, pattern, *detail) -> None:
+        self.delivered.append((self._owner[pattern[1]], *detail))
+        if self.fail:
+            raise self.fail
+
+    def invoke(self, pattern) -> None:
+        self._deliver(pattern, "invoke", pattern[1])
+
+    def set_value(self, pattern, text) -> None:
+        self._deliver(pattern, "set_value", pattern[1], text)
 
 
 def frame_for(capability: str, **fields):
@@ -213,6 +206,17 @@ def run(capability: str, desk: FakeDesktop, cancelled=lambda: False, **fields):
     return run_desktop_operation(
         frame_for(capability, **fields), cancelled=cancelled, backend_factory=lambda: desk
     )
+
+
+def race_to(desk: FakeDesktop):
+    """The last hook before dispatch: every piece of global UI state moves to
+    an unrelated application. Returns False - nothing is cancelled."""
+
+    def race() -> bool:
+        desk.fg = desk.covering = desk.keyboard = OTHER.hwnd
+        return False
+
+    return race
 
 
 def desktop_task(capability: str, **fields) -> Task:
@@ -254,13 +258,14 @@ class VocabularyTests(unittest.TestCase):
         self.assertEqual(
             {
                 "desktop_app_launch", "desktop_window_list", "desktop_window_inspect",
-                "desktop_window_focus", "desktop_click", "desktop_type", "desktop_key",
+                "desktop_window_focus", "desktop_click", "desktop_type",
             },
             set(DESKTOP_ENABLED_CAPABILITIES),
         )
 
     def test_unsupported_actions_are_named_and_unreachable(self) -> None:
         grants = desktop_authority(Settings(desktop_apps=(DEST,)))
+        self.assertIn("desktop_key", DESKTOP_DEFERRED_CAPABILITIES)
         for capability in DESKTOP_DEFERRED_CAPABILITIES:
             with self.subTest(capability=capability):
                 self.assertNotIn(capability, DESKTOP_CAPABILITY_RESOURCE)
@@ -279,14 +284,6 @@ class VocabularyTests(unittest.TestCase):
         self.assertIsNotNone(
             desktop_resource_refusal(DesktopResource(DesktopResourceKind.CLICK_TARGET, APP, window_id=WID, ref="r1"))
         )
-
-    def test_only_the_closed_keys_can_be_pressed(self) -> None:
-        for key in ("ctrl+s", "alt+f4", "f5", "win", "ENTER"):
-            with self.subTest(key=key):
-                with self.assertRaises(DesktopExecutionUnavailable):
-                    desktop_resource_from_dict(
-                        {"kind": "key_target", "app": APP, "window_id": WID, "ref": "r2", "digest": DIGEST, "key": key}
-                    )
 
 
 class AllowedAppTests(unittest.TestCase):
@@ -380,11 +377,11 @@ class WindowTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# The seam: bounded input
+# The seam: target-bound actions
 # --------------------------------------------------------------------------
 
 
-class InputTests(unittest.TestCase):
+class ActionTests(unittest.TestCase):
     def test_a_launch_starts_exactly_the_authorized_image(self) -> None:
         desk = FakeDesktop()
         self.assertEqual({"pid": 777, "ready": True}, run("desktop_app_launch", desk))
@@ -396,12 +393,17 @@ class InputTests(unittest.TestCase):
         with self.assertRaises(DesktopExecutionUnavailable):
             run("desktop_app_launch", desk)
 
-    def test_a_click_lands_at_the_centre_of_the_inspected_element(self) -> None:
+    def test_a_click_invokes_exactly_the_inspected_element(self) -> None:
         desk = FakeDesktop()
         self.assertEqual({"window_id": WID}, run("desktop_click", desk))
-        self.assertEqual([("click", 340, 315)], desk.injected)
+        self.assertEqual([(WINDOW.hwnd, "invoke", "ok")], desk.delivered)
 
-    def test_a_window_that_changed_since_inspection_refuses_before_any_input(self) -> None:
+    def test_typing_writes_exactly_the_text_into_exactly_the_field(self) -> None:
+        desk = FakeDesktop()
+        run("desktop_type", desk)
+        self.assertEqual([(WINDOW.hwnd, "set_value", "edit", "hello")], desk.delivered)
+
+    def test_a_window_that_changed_since_inspection_refuses_before_any_action(self) -> None:
         for changed in (
             [replace(ELEMENTS[3], name="Delete everything") if e is ELEMENTS[3] else e for e in ELEMENTS],
             [replace(ELEMENTS[3], rect=(0, 0, 80, 30)) if e is ELEMENTS[3] else e for e in ELEMENTS],
@@ -411,58 +413,24 @@ class InputTests(unittest.TestCase):
                 desk = FakeDesktop(elements=changed)
                 with self.assertRaisesRegex(DesktopExecutionUnavailable, "changed since it was inspected"):
                     run("desktop_click", desk)
-                self.assertEqual([], desk.calls)
+                self.assertEqual([], desk.delivered)
 
     def test_a_ref_that_names_no_single_element_is_refused(self) -> None:
         desk = FakeDesktop()
         with self.assertRaisesRegex(DesktopExecutionUnavailable, "exactly one element"):
             run("desktop_click", desk, window_id=WID, ref="r9", digest=DIGEST)
-        self.assertEqual([], desk.calls)
+        self.assertEqual([], desk.delivered)
 
-    def test_no_input_reaches_a_covered_background_or_elevated_target(self) -> None:
-        for setup in (
-            lambda desk: setattr(desk, "covering", OTHER.hwnd),
-            lambda desk: setattr(desk, "fg", OTHER.hwnd),
-            lambda desk: setattr(desk, "blocked", True),
-        ):
-            with self.subTest():
-                desk = FakeDesktop()
-                setup(desk)
-                with self.assertRaises(DesktopExecutionUnavailable):
-                    run("desktop_click", desk)
-                self.assertEqual([], desk.injected)
-
-    def test_typing_focuses_the_field_and_injects_exactly_the_text(self) -> None:
+    def test_an_elevated_application_is_refused_before_any_action(self) -> None:
         desk = FakeDesktop()
-        run("desktop_type", desk)
-        self.assertEqual([("set_focus", "edit"), ("type", "hello")], desk.calls)
-
-    def test_a_key_is_one_closed_key_to_the_focused_element(self) -> None:
-        desk = FakeDesktop()
-        run("desktop_key", desk)
-        self.assertEqual([("set_focus", "edit"), ("key", 0x0D, False)], desk.calls)
-
-    def test_typing_needs_a_text_field_that_really_took_focus(self) -> None:
-        desk = FakeDesktop()
-        with self.assertRaisesRegex(DesktopExecutionUnavailable, "not a text field"):
-            run("desktop_type", desk, window_id=WID, ref="r4", digest=DIGEST, text="hello")
-        desk.takes_focus = False
-        with self.assertRaisesRegex(DesktopExecutionUnavailable, "did not take keyboard focus"):
-            run("desktop_type", desk)
-        self.assertEqual([], desk.injected)
-
-    def test_a_partial_injection_is_unknown_and_none_is_definite(self) -> None:
-        desk = FakeDesktop()
-        desk.sent = 1
-        with self.assertRaises(DesktopOutcomeUnknown):
+        desk.blocked = True
+        with self.assertRaisesRegex(DesktopExecutionUnavailable, "elevated"):
             run("desktop_click", desk)
-        desk.sent = 0
-        with self.assertRaises(DesktopExecutionUnavailable):
-            run("desktop_click", desk)
+        self.assertEqual([], desk.delivered)
 
     def test_a_failure_after_dispatch_is_unknown_and_before_it_is_a_refusal(self) -> None:
         desk = FakeDesktop()
-        desk.sent = OSError("the input stream broke")
+        desk.fail = OSError("UIA_E_TIMEOUT")
         with self.assertRaises(DesktopOutcomeUnknown):
             run("desktop_type", desk)
         desk = FakeDesktop()
@@ -471,12 +439,83 @@ class InputTests(unittest.TestCase):
             run("desktop_type", desk)
 
     def test_a_cancellation_before_dispatch_sends_nothing(self) -> None:
-        for capability in ("desktop_app_launch", "desktop_window_focus", "desktop_click", "desktop_type", "desktop_key"):
+        for capability in ("desktop_app_launch", "desktop_window_focus", "desktop_click", "desktop_type"):
             with self.subTest(capability=capability):
                 desk = FakeDesktop()
                 with self.assertRaisesRegex(DesktopExecutionUnavailable, "cancelled"):
                     run(capability, desk, cancelled=lambda: True)
-                self.assertEqual([], desk.injected)
+                self.assertEqual([], desk.delivered)
+                self.assertEqual([], desk.calls)
+
+
+class TargetRaceTests(unittest.TestCase):
+    """The TOCTOU regressions: global UI state moves to an unrelated
+    application after every check and immediately before dispatch."""
+
+    def test_a_type_cannot_be_retargeted_to_the_new_foreground(self) -> None:
+        desk = FakeDesktop()
+        self.assertEqual({"window_id": WID}, run("desktop_type", desk, cancelled=race_to(desk)))
+        self.assertEqual(OTHER.hwnd, desk.fg)
+        self.assertEqual([(WINDOW.hwnd, "set_value", "edit", "hello")], desk.delivered)
+        self.assertNotIn(OTHER.hwnd, [delivery[0] for delivery in desk.delivered])
+
+    def test_a_click_cannot_be_retargeted_to_a_covering_window(self) -> None:
+        desk = FakeDesktop()
+        self.assertEqual({"window_id": WID}, run("desktop_click", desk, cancelled=race_to(desk)))
+        self.assertEqual(OTHER.hwnd, desk.covering)
+        self.assertEqual([(WINDOW.hwnd, "invoke", "ok")], desk.delivered)
+
+    def test_a_key_cannot_be_sent_at_all_so_it_cannot_be_retargeted(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        memory = SQLiteMemoryStore(Path(temp.name) / "jarvis.db")
+        desk = FakeDesktop()
+        desk.keyboard = OTHER.hwnd
+        document = {
+            "objective": "press enter",
+            "capability": "desktop_key",
+            "scope": {"action": "operate", "target": "", "destination": DEST},
+            "desktop": {"kind": "text_target", "app": APP, "window_id": WID, "ref": "r2", "digest": DIGEST, "text": "x"},
+        }
+        with self.assertRaises(TaskInputError):
+            decode_task_json(json.dumps(document))
+        # Even a task built past the input boundary finds no connector.
+        task = Task(
+            objective="press enter",
+            capability="desktop_key",
+            scope=ActionScope(action="operate", target="", destination=DEST),
+            desktop=dict(document["desktop"]),
+        )
+        run_ = desktop_core(memory, connector(desk)).run(task)
+        self.assertNotEqual(RunStatus.COMPLETED, run_.status)
+        self.assertEqual([], desk.delivered)
+
+    def test_an_element_with_no_bound_mechanism_refuses_and_never_falls_back(self) -> None:
+        cases = (
+            ("desktop_click", {"window_id": WID, "ref": "r1", "digest": DIGEST}, None),
+            ("desktop_click", {"window_id": WID, "ref": "r2", "digest": DIGEST}, None),
+            ("desktop_type", FIELDS["desktop_type"], "no_value"),
+            ("desktop_type", FIELDS["desktop_type"], "read_only"),
+        )
+        for capability, fields, shape in cases:
+            with self.subTest(capability=capability, fields=fields, shape=shape):
+                desk = FakeDesktop()
+                if shape == "no_value":
+                    desk.patterns["edit"] = set()
+                if shape == "read_only":
+                    desk.read_only_fields.add("edit")
+                with self.assertRaisesRegex(DesktopExecutionUnavailable, "bound to it"):
+                    run(capability, desk, cancelled=race_to(desk), **fields)
+                self.assertEqual([], desk.delivered)
+
+    def test_no_global_input_primitive_exists_in_the_backend(self) -> None:
+        source = Path(desktop_win32.__file__).read_text(encoding="utf-8")
+        for name in ("SendInput", "keybd_event", "mouse_event", "SetCursorPos",
+                     "PostMessageW", "SendMessageW", "WindowFromPoint"):
+            with self.subTest(name=name):
+                self.assertNotRegex(source, rf"[\"']{name}[\"']|\.{name}\b")
+        for name in ("click", "type_text", "press_key", "move_cursor", "cursor", "root_at"):
+            self.assertFalse(hasattr(desktop_win32.Win32Desktop, name), name)
 
 
 # --------------------------------------------------------------------------
@@ -485,13 +524,11 @@ class InputTests(unittest.TestCase):
 
 
 class ConfidentialityTests(unittest.TestCase):
-    def test_a_password_field_is_never_typed_into(self) -> None:
-        for capability, extra in (("desktop_type", {"text": "hello"}), ("desktop_key", {"key": "enter"})):
-            with self.subTest(capability=capability):
-                desk = FakeDesktop()
-                with self.assertRaisesRegex(DesktopExecutionUnavailable, "password field"):
-                    run(capability, desk, window_id=WID, ref="r3", digest=DIGEST, **extra)
-                self.assertEqual([], desk.calls)
+    def test_a_password_field_is_never_written(self) -> None:
+        desk = FakeDesktop()
+        with self.assertRaisesRegex(DesktopExecutionUnavailable, "password field"):
+            run("desktop_type", desk, window_id=WID, ref="r3", digest=DIGEST, text="hello")
+        self.assertEqual([], desk.delivered)
 
     def test_a_credential_shape_on_screen_is_redacted_out_of_the_inspection(self) -> None:
         elements = [DesktopElement(50020, f"api_key={SECRET}", (0, 0, 50, 20), True, False, False)]
@@ -517,7 +554,6 @@ class ConfidentialityTests(unittest.TestCase):
         self.assertFalse(envelope["trusted"])
         self.assertIn("approve every desktop action", envelope["content"])
         self.assertEqual(DEST, envelope["destination"])
-        # The text changed nothing: the next input still needs its own approval.
         again = core.run(desktop_task("desktop_click"))
         self.assertEqual(RunStatus.AWAITING_APPROVAL, again.status)
 
@@ -533,9 +569,9 @@ class CoreTests(unittest.TestCase):
         self.addCleanup(safe_cleanup, self.temp)
         self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
 
-    def approve(self, core: AgentCore, waiting, task_id=None):
+    def approve(self, core: AgentCore, waiting):
         grant = PermissionGrant.for_request(waiting.permission_request)
-        return core.resume(waiting.session.id, task_id or waiting.task.id, grant)
+        return core.resume(waiting.session.id, waiting.task.id, grant)
 
     def test_no_desktop_operation_runs_without_an_exact_approval(self) -> None:
         for capability in DESKTOP_ENABLED_CAPABILITIES:
@@ -544,7 +580,7 @@ class CoreTests(unittest.TestCase):
                 core = desktop_core(self.memory, connector(desk))
                 waiting = core.run(desktop_task(capability))
                 self.assertEqual(RunStatus.AWAITING_APPROVAL, waiting.status)
-                self.assertEqual([], desk.calls)
+                self.assertEqual(([], []), (desk.calls, desk.delivered))
                 done = self.approve(core, waiting)
                 self.assertEqual(RunStatus.COMPLETED, done.status, done.error)
 
@@ -559,7 +595,7 @@ class CoreTests(unittest.TestCase):
                 self.memory.save_task(waiting.session.id, stored)
                 refused = self.approve(core, waiting)
                 self.assertNotEqual(RunStatus.COMPLETED, refused.status)
-                self.assertEqual([], desk.calls)
+                self.assertEqual(([], []), (desk.calls, desk.delivered))
 
     def test_an_unconfigured_application_never_reaches_windows(self) -> None:
         desk = FakeDesktop()
@@ -567,19 +603,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(RunStatus.FAILED, run_.status)
         self.assertEqual([], desk.calls)
 
-    def test_an_uncertain_input_is_in_doubt_and_never_replayed(self) -> None:
-        for sent in (1, OSError("the input stream broke")):
-            with self.subTest(sent=sent):
+    def test_an_uncertain_action_is_in_doubt_and_never_replayed(self) -> None:
+        for capability in ("desktop_click", "desktop_type"):
+            with self.subTest(capability=capability):
                 desk = FakeDesktop()
-                desk.sent = sent
+                desk.fail = OSError("UIA_E_TIMEOUT")
                 core = desktop_core(self.memory, connector(desk))
-                waiting = core.run(desktop_task("desktop_click"))
+                waiting = core.run(desktop_task(capability))
                 in_doubt = self.approve(core, waiting)
                 self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, in_doubt.error.code)
                 self.assertIs(AttemptState.UNKNOWN_OUTCOME, self.memory.latest_execution_attempt(waiting.task.id).state)
                 again = self.approve(core, waiting)
                 self.assertEqual(ErrorCode.EXECUTION_UNKNOWN_OUTCOME, again.error.code)
-                self.assertEqual(1, len(desk.injected))
+                self.assertEqual(1, len(desk.delivered))
 
     def test_a_refusal_before_dispatch_is_not_an_unknown_outcome(self) -> None:
         desk = FakeDesktop(elements=ELEMENTS[1:])
@@ -596,7 +632,7 @@ class CoreTests(unittest.TestCase):
         run_ = core.run(desktop_task("desktop_click"))
         self.assertEqual(RunStatus.FAILED, run_.status)
         self.assertEqual(ErrorCode.EXECUTION_DISABLED, run_.error.code)
-        self.assertEqual([], desk.calls)
+        self.assertEqual(([], []), (desk.calls, desk.delivered))
 
     def test_a_cancelled_run_never_reaches_windows(self) -> None:
         desk = FakeDesktop()
@@ -605,9 +641,9 @@ class CoreTests(unittest.TestCase):
         core.cancel(waiting.session.id, waiting.task.id)
         done = self.approve(core, waiting)
         self.assertNotEqual(RunStatus.COMPLETED, done.status)
-        self.assertEqual([], desk.calls)
+        self.assertEqual([], desk.delivered)
 
-    def test_a_cancellation_during_the_operation_stops_the_input(self) -> None:
+    def test_a_cancellation_during_the_operation_stops_the_action(self) -> None:
         desk = FakeDesktop()
         made = connector(desk)
         self.assertFalse(made.cancel("idle"))
@@ -617,7 +653,7 @@ class CoreTests(unittest.TestCase):
         done = self.approve(core, waiting)
         self.assertNotEqual(RunStatus.COMPLETED, done.status)
         self.assertIn("cancelled", done.error.message)
-        self.assertEqual([], desk.injected)
+        self.assertEqual([], desk.delivered)
 
 
 # --------------------------------------------------------------------------
@@ -639,7 +675,7 @@ class TaskInputTests(unittest.TestCase):
 
     def test_a_valid_desktop_section_is_stored_canonically(self) -> None:
         task = self.decode(self.document())
-        self.assertEqual(FIELDS["desktop_click"]["digest"], task.desktop["digest"])
+        self.assertEqual(DIGEST, task.desktop["digest"])
         self.assertEqual(APP, task.desktop["app"])
 
     def test_malformed_sections_are_refused(self) -> None:
@@ -649,7 +685,7 @@ class TaskInputTests(unittest.TestCase):
         smuggled = self.document()
         smuggled["context"] = {"desktop": {"kind": "click_target", "app": APP}}
         cases = [missing, other_app, smuggled]
-        cases += [self.document(**{key: "1"}) for key in ("x", "y", "pid", "command", "automation_id", "value")]
+        cases += [self.document(**{key: "1"}) for key in ("x", "y", "pid", "command", "automation_id", "value", "key")]
         for capability in DESKTOP_DEFERRED_CAPABILITIES:
             deferred = self.document()
             deferred["capability"] = capability

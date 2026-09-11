@@ -73,8 +73,8 @@ class DesktopUiaConnector(BaseConnector):
         capabilities=DESKTOP_ENABLED_CAPABILITIES,
         description=(
             "Launching, listing, inspecting and focusing the windows of one "
-            "authorized Windows application, and bounded clicks and keyboard "
-            "input on elements an inspection printed."
+            "authorized Windows application, and invoking or writing into "
+            "elements an inspection printed, by calls bound to that element."
         ),
         priority=50,
         default_risk=RiskLevel.MEDIUM,
@@ -136,7 +136,6 @@ class DesktopUiaConnector(BaseConnector):
             f"{frame.capability} on {frame.app}"
             + (f" window {resource.window_id}" if resource.window_id else "")
             + (f" element {resource.ref}" if resource.ref else "")
-            + (f" key {resource.key}" if resource.key else "")
             + (f" text: {resource.text[:80]}" if resource.text else "")
             + "; this approval binds that exact application, window and element state."
         )[:400]

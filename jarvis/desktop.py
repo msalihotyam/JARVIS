@@ -27,7 +27,12 @@ name, an automation id, a command line or a process id of its own choosing.
 
 WHAT IS STRUCTURALLY ABSENT. No capability reads a field's value, reads or
 writes the clipboard, takes a screenshot, closes or moves a window, drags,
-or runs a command. Those names are refused by name.
+or runs a command. Those names are refused by name. Neither does any
+capability press a key: Windows has no way to deliver a keystroke to one
+chosen element - only to whatever holds the keyboard focus when it arrives -
+so ``desktop_key`` is refused by name rather than sent somewhere it was
+never approved for. Every action is dispatched to the element itself (see
+``jarvis.desktop_win32``), never through the global input stream.
 """
 
 from __future__ import annotations
@@ -70,14 +75,14 @@ DESKTOP_READ_CAPABILITIES: tuple[str, ...] = (
 )
 
 #: Capabilities that act. Every one is irreversible for this product: a
-#: launch starts a program, a focus decides where the NEXT input lands, and a
-#: click or a keystroke can do anything the application does with one.
+#: launch starts a program, a focus changes what the operator sees in front,
+#: and an invoked control or a written field can do anything the application
+#: does with one.
 DESKTOP_INTERACT_CAPABILITIES: tuple[str, ...] = (
     "desktop_app_launch",
     "desktop_window_focus",
     "desktop_click",
     "desktop_type",
-    "desktop_key",
 )
 
 #: Refused BY NAME rather than by silence. usable-v1 ships none of them.
@@ -90,6 +95,7 @@ DESKTOP_DEFERRED_CAPABILITIES: tuple[str, ...] = (
     "desktop_drag",
     "desktop_field_value_read",
     "desktop_command_run",
+    "desktop_key",
 )
 
 DESKTOP_ENABLED_CAPABILITIES: tuple[str, ...] = (
@@ -187,26 +193,6 @@ _WINDOW_ID_PATTERN = re.compile(r"\A([0-9a-f]{1,16})-([0-9]{1,10})-([0-9]{1,20})
 _REF_PATTERN = re.compile(r"\Ar[1-9][0-9]{0,3}\Z")
 _SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
-#: The closed key set ``desktop_key`` may press: (virtual-key code, extended).
-#: No modifier and no combination - a shortcut is a command.
-DESKTOP_KEYS: Mapping[str, tuple[int, bool]] = {
-    "enter": (0x0D, False),
-    "tab": (0x09, False),
-    "escape": (0x1B, False),
-    "backspace": (0x08, False),
-    "space": (0x20, False),
-    "delete": (0x2E, True),
-    "home": (0x24, True),
-    "end": (0x23, True),
-    "pageup": (0x21, True),
-    "pagedown": (0x22, True),
-    "left": (0x25, True),
-    "up": (0x26, True),
-    "right": (0x27, True),
-    "down": (0x28, True),
-}
-
-
 def desktop_window_id(hwnd: int, pid: int, created: int) -> str:
     return f"{hwnd:x}-{pid}-{created}"
 
@@ -219,14 +205,15 @@ def parse_desktop_window_id(value: Any) -> tuple[int, int, int]:
 
 
 def desktop_text_refusal(value: Any) -> str | None:
-    """Why this text may not be typed, or ``None``. A credential shape is
-    refused outright: JARVIS does not type secrets, the person does."""
+    """Why this text may not be written into a field, or ``None``. A
+    credential shape is refused outright: JARVIS does not type secrets, the
+    person does."""
     if type(value) is not str:
         return "the text is not a string"
     if not value or len(value) > DESKTOP_TEXT_MAX_CHARS:
         return "the text is not bounded text"
     if any(char < " " or char == "\x7f" for char in value):
-        return "the text carries a control character; name a key with desktop_key"
+        return "the text carries a control character"
     if credential_bearing(value):
         return "the text carries a credential shape and will not be typed"
     return None
@@ -239,7 +226,6 @@ class DesktopResourceKind(str, Enum):
     FOCUS = "focus"
     CLICK_TARGET = "click_target"
     TEXT_TARGET = "text_target"
-    KEY_TARGET = "key_target"
 
 
 DESKTOP_CAPABILITY_RESOURCE: Mapping[str, DesktopResourceKind] = {
@@ -249,7 +235,6 @@ DESKTOP_CAPABILITY_RESOURCE: Mapping[str, DesktopResourceKind] = {
     "desktop_window_focus": DesktopResourceKind.FOCUS,
     "desktop_click": DesktopResourceKind.CLICK_TARGET,
     "desktop_type": DesktopResourceKind.TEXT_TARGET,
-    "desktop_key": DesktopResourceKind.KEY_TARGET,
 }
 
 _ELEMENT_FIELDS = frozenset({"window_id", "ref", "digest"})
@@ -260,14 +245,12 @@ _RESOURCE_FIELDS: Mapping[DesktopResourceKind, frozenset[str]] = {
     DesktopResourceKind.FOCUS: frozenset({"window_id"}),
     DesktopResourceKind.CLICK_TARGET: _ELEMENT_FIELDS,
     DesktopResourceKind.TEXT_TARGET: _ELEMENT_FIELDS | {"text"},
-    DesktopResourceKind.KEY_TARGET: _ELEMENT_FIELDS | {"key"},
 }
 _RESOURCE_ABSENT: Mapping[str, str] = {
     "window_id": "",
     "ref": "",
     "digest": "",
     "text": "",
-    "key": "",
 }
 
 
@@ -278,9 +261,7 @@ def _field_refusal(name: str, value: str) -> str | None:
         return None if _REF_PATTERN.fullmatch(value) else "the target ref is not one an inspection produced"
     if name == "digest":
         return None if _SHA256_PATTERN.fullmatch(value) else "the inspection digest is not a sha256 digest"
-    if name == "text":
-        return desktop_text_refusal(value)
-    return None if value in DESKTOP_KEYS else "the key is not one desktop_key may press"
+    return desktop_text_refusal(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +274,6 @@ class DesktopResource:
     ref: str = ""
     digest: str = ""
     text: str = ""
-    key: str = ""
 
     @property
     def destination(self) -> str:
@@ -307,7 +287,6 @@ class DesktopResource:
             "ref": self.ref,
             "digest": self.digest,
             "text": self.text,
-            "key": self.key,
         }
 
     @property
@@ -627,11 +606,13 @@ def desktop_outcome(payload: Any, *, frame: DesktopRequestFrame) -> DesktopOutco
         if payload.get("window_id") != frame.resource.window_id:
             raise DesktopOutcomeUnknown(f"the {frame.capability} was dispatched and reported no window")
         detail = f"window={frame.resource.window_id}"
-        if frame.capability != "desktop_window_focus":
-            # INJECTED is the strongest thing Windows can say: SendInput put
-            # the events in the input stream; what the application did with
-            # them is not observable here.
-            detail += " input=injected"
+        # The element's own UI Automation provider accepted the call; that is
+        # the strongest thing Windows can say. What the application did next
+        # is not observable here.
+        if frame.capability == "desktop_click":
+            detail += " action=invoked"
+        elif frame.capability == "desktop_type":
+            detail += " action=value_set"
     return DesktopOutcome(capability=frame.capability, destination=frame.destination, detail=detail)
 
 
