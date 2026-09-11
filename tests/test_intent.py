@@ -312,7 +312,7 @@ class RoutingTests(IntentTestCase):
         app = self.build(ScriptedModel(task_proposal("github_commit_list", limit=10)), github=(REPO, OTHER_REPO))
         payload = app.submit_text("GitHub'daki son değişikliklere bak.").payload
         self.assertNothingHappened(payload, IntentStatus.CLARIFICATION_REQUIRED)
-        self.assertIn(OTHER_REPO, payload["intent"]["question"])
+        self.assertIn("salih/notes", payload["intent"]["question"])
 
     def test_browser_destination_allowed(self) -> None:
         app = self.build(
@@ -733,11 +733,179 @@ class CliTests(IntentTestCase):
         self.assertEqual(EXIT_AWAITING_APPROVAL, code)
         self.assertEqual({"command", "effective_permission_mode", "intent", "run", "job", "error"}, set(payload))
         self.assertEqual(
-            {"status", "request_id", "message", "question", "capability", "destination", "objective"},
+            {"status", "request_id", "message", "question", "capability", "destination", "objective", "choices"},
             set(payload["intent"]),
         )
         self.assertEqual("text", payload["command"])
         self.assertEqual("awaiting_approval", payload["run"]["run_status"])
+        self.assertEqual([], payload["intent"]["choices"])
+
+
+# --------------------------------------------------------------------------
+# THE MODEL NEVER RESOLVES USER AMBIGUITY (final-gate blocker regression)
+# --------------------------------------------------------------------------
+
+OTHER_ORIGIN = "browser/https://example.com"
+OTHER_APP = "desktop/c:/windows/system32/notepad.exe"
+
+
+class DestinationAmbiguityTests(IntentTestCase):
+    """Several authorized destinations: only the USER's own words may choose."""
+
+    def assertAskedToChoose(self, payload, destinations) -> None:
+        self.assertNothingHappened(payload, IntentStatus.CLARIFICATION_REQUIRED)
+        self.assertEqual(sorted(destinations), [c["destination"] for c in payload["intent"]["choices"]])
+        for choice in payload["intent"]["choices"]:
+            self.assertIn(choice["label"], payload["intent"]["question"])
+            self.assertTrue(choice["destination"].endswith(choice["label"]))
+
+    def test_1_gmail_model_pick_among_several_accounts_is_not_enough(self) -> None:
+        app = self.build(
+            ScriptedModel(task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5)),
+            gmail=(ACCOUNT, OTHER_ACCOUNT),
+        )
+        payload = app.submit_text("Son maillerimi kontrol et.").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+        self.assertEqual(0, self.table_count("sessions"))
+
+    def test_2_github_model_pick_among_several_repositories_is_not_enough(self) -> None:
+        app = self.build(
+            ScriptedModel(task_proposal("github_commit_list", REPO, limit=10)), github=(REPO, OTHER_REPO)
+        )
+        payload = app.submit_text("GitHub'daki son değişiklikleri incele.").payload
+        self.assertAskedToChoose(payload, [REPO, OTHER_REPO])
+
+    def test_3_browser_model_pick_among_several_origins_is_not_enough(self) -> None:
+        app = self.build(
+            ScriptedModel(task_proposal("browser_navigate", ORIGIN, url="https://openai.com/")),
+            browser=(ORIGIN, OTHER_ORIGIN),
+        )
+        payload = app.submit_text("Tarayıcıda siteyi aç.").payload
+        self.assertAskedToChoose(payload, [ORIGIN, OTHER_ORIGIN])
+
+    def test_4_desktop_model_pick_among_several_apps_is_not_enough(self) -> None:
+        app = self.build(ScriptedModel(task_proposal("desktop_app_launch", APP)), desktop=(APP, OTHER_APP))
+        payload = app.submit_text("Uygulamayı aç.").payload
+        self.assertAskedToChoose(payload, [APP, OTHER_APP])
+
+    def test_5_user_naming_exactly_one_configured_destination_resolves_it(self) -> None:
+        cases = [
+            (dict(gmail=(ACCOUNT, OTHER_ACCOUNT)), task_proposal("gmail_thread_list", limit=5),
+             f"{OTHER_ACCOUNT}'daki son mailleri kontrol et.", f"gmail/{OTHER_ACCOUNT}"),
+            (dict(github=(REPO, OTHER_REPO)), task_proposal("github_commit_list", limit=10),
+             "salih/notes reposundaki son commitlere bak.", OTHER_REPO),
+            (dict(browser=(ORIGIN, OTHER_ORIGIN)), task_proposal("browser_navigate", ORIGIN, url="https://openai.com/"),
+             "https://openai.com/ adresini aç.", ORIGIN),
+            (dict(desktop=(APP, OTHER_APP)), task_proposal("desktop_app_launch"),
+             r"C:\Windows\System32\calc.exe uygulamasını aç.", APP),
+        ]
+        for configured, answer, text, expected in cases:
+            with self.subTest(text=text):
+                app = self.build(ScriptedModel(answer), **configured)
+                payload = app.submit_text(text).payload
+                self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
+                self.assertEqual(expected, payload["intent"]["destination"])
+                task = self.memory.load_task(payload["run"]["task"]["id"])
+                self.assertEqual(expected, task.scope.destination)
+                self.assertEqual(0, self.execute_calls())
+                self.assertEqual(0, self.table_count("permission_grants"))
+
+    def test_6_user_naming_no_configured_destination_executes_nothing(self) -> None:
+        for answer, text, status in (
+            (task_proposal("gmail_thread_list", limit=5), "boss@example.com hesabına bak.",
+             IntentStatus.CLARIFICATION_REQUIRED),
+            (task_proposal("gmail_thread_list", "gmail/boss@example.com", limit=5), "boss@example.com hesabına bak.",
+             IntentStatus.AUTHORITY_UNAVAILABLE),
+            # Exact identifiers only: a longer address or repository is a different one.
+            (task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5), f"x{ACCOUNT} hesabına bak.",
+             IntentStatus.CLARIFICATION_REQUIRED),
+            (task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5), f"{ACCOUNT}.tr hesabına bak.",
+             IntentStatus.CLARIFICATION_REQUIRED),
+        ):
+            with self.subTest(text=text, status=status):
+                app = self.build(ScriptedModel(answer), gmail=(ACCOUNT, OTHER_ACCOUNT))
+                self.assertNothingHappened(app.submit_text(text).payload, status)
+        app = self.build(ScriptedModel(task_proposal("github_commit_list", REPO, limit=10)), github=(REPO, OTHER_REPO))
+        self.assertNothingHappened(
+            app.submit_text("salih/jarvis2 reposuna bak.").payload, IntentStatus.CLARIFICATION_REQUIRED
+        )
+
+    def test_7_the_model_cannot_override_the_users_choice(self) -> None:
+        app = self.build(
+            ScriptedModel(task_proposal("gmail_thread_list", f"gmail/{OTHER_ACCOUNT}", limit=5)),
+            gmail=(ACCOUNT, OTHER_ACCOUNT),
+        )
+        payload = app.submit_text(f"{ACCOUNT} hesabımdaki mailleri kontrol et.").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+        # Naming both is not a choice either.
+        app = self.build(
+            ScriptedModel(task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5)),
+            gmail=(ACCOUNT, OTHER_ACCOUNT),
+        )
+        payload = app.submit_text(f"{ACCOUNT} ve {OTHER_ACCOUNT} hesaplarına bak.").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+
+    def test_8_single_destination_behaviour_is_unchanged(self) -> None:
+        for destination in ("", f"gmail/{ACCOUNT}"):
+            with self.subTest(destination=destination):
+                app = self.build(
+                    ScriptedModel(task_proposal("gmail_thread_list", destination, limit=5)), gmail=(ACCOUNT,)
+                )
+                payload = app.submit_text("Son maillerimi kontrol et.").payload
+                self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
+                self.assertEqual(f"gmail/{ACCOUNT}", payload["intent"]["destination"])
+                self.assertEqual([], payload["intent"]["choices"])
+        before = self.table_count("tasks")
+        app = self.build(ScriptedModel(task_proposal("gmail_thread_list", f"gmail/{OTHER_ACCOUNT}", limit=5)),
+                         gmail=(ACCOUNT,))
+        payload = app.submit_text("maillere bak").payload
+        self.assertEqual(IntentStatus.AUTHORITY_UNAVAILABLE.value, payload["intent"]["status"])
+        self.assertIsNone(payload["run"])
+        self.assertEqual(before, self.table_count("tasks"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_9_and_10_user_selected_send_still_needs_the_exact_approval(self) -> None:
+        app = self.build(
+            ScriptedModel(task_proposal(
+                "gmail_send", to=["alice@example.com"], subject="Merhaba", body="Selam\n",
+            )),
+            gmail=(ACCOUNT, OTHER_ACCOUNT),
+        )
+        result = app.submit_text(f"{ACCOUNT} hesabından alice@example.com adresine mail gönder.")
+        run = result.payload["run"]
+        self.assertEqual(EXIT_AWAITING_APPROVAL, result.exit_code, result.payload)
+        self.assertEqual(f"gmail/{ACCOUNT}", run["approval"]["scope"]["destination"])
+        self.assertEqual(0, self.execute_calls())
+        self.assertEqual(0, self.table_count("permission_grants"))
+        approved = app.approve(
+            run["session"]["id"], run["task"]["id"],
+            run["approval"]["request_id"], run["approval"]["fingerprint"],
+        )
+        self.assertEqual(EXIT_OK, approved.exit_code, approved.payload)
+        self.assertEqual(1, self.gmail.execute_calls)
+
+    def test_11_an_earlier_turn_or_another_familys_label_is_not_a_selection(self) -> None:
+        # Only the CURRENT turn counts: an earlier turn naming an account
+        # does not select it for this request.
+        app = self.build(
+            ScriptedModel(task_proposal("gmail_thread_list", f"gmail/{ACCOUNT}", limit=5)),
+            gmail=(ACCOUNT, OTHER_ACCOUNT),
+        )
+        payload = app.submit_text("Son maillerimi kontrol et.", previous_text=f"{ACCOUNT} kullan").payload
+        self.assertAskedToChoose(payload, [f"gmail/{ACCOUNT}", f"gmail/{OTHER_ACCOUNT}"])
+        # A choice offered for one capability family selects nothing in another.
+        app = self.build(
+            ScriptedModel(task_proposal("github_commit_list", REPO, limit=10)),
+            gmail=(ACCOUNT, OTHER_ACCOUNT), github=(REPO, OTHER_REPO),
+        )
+        payload = app.submit_text(ACCOUNT, previous_text="GitHub'daki son değişikliklere bak.").payload
+        self.assertAskedToChoose(payload, [REPO, OTHER_REPO])
+        # And the offered label, sent back as the next turn, is a valid selection.
+        app = self.build(
+            ScriptedModel(task_proposal("github_commit_list", limit=10)), github=(REPO, OTHER_REPO)
+        )
+        payload = app.submit_text("salih/jarvis", previous_text="GitHub'daki son değişikliklere bak.").payload
+        self.assertEqual(REPO, payload["intent"]["destination"], payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

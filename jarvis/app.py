@@ -2984,6 +2984,7 @@ def text_result(
     capability: str = "",
     destination: str = "",
     objective: str = "",
+    choices: Iterable[dict[str, str]] = (),
     run: dict[str, Any] | None = None,
     job: dict[str, Any] | None = None,
     exit_code: int | None = None,
@@ -3013,6 +3014,10 @@ def text_result(
             "capability": capability or None,
             "destination": destination or None,
             "objective": objective or None,
+            # The configured destinations a clarification asks the user to
+            # choose between, each with the exact text that selects it. Built
+            # from the grant rows only; empty when no choice is pending.
+            "choices": [dict(choice) for choice in choices],
         },
         "run": run,
         "job": job,
@@ -3150,7 +3155,9 @@ class JarvisApp:
                 IntentStatus.MALFORMED_MODEL_OUTPUT,
                 f"The proposal was refused: {exc}. Nothing was executed.",
             )
-        resolution = resolve_proposal(proposal, catalog, now)
+        # Only the user's CURRENT turn may choose among several configured
+        # destinations - never the model, and never an earlier turn.
+        resolution = resolve_proposal(proposal, catalog, now, text)
         if resolution.status is IntentStatus.STRUCTURED:
             try:
                 task = decode_task_json(json.dumps(resolution.task_document))
@@ -3193,6 +3200,7 @@ class JarvisApp:
             question=resolution.question,
             capability=resolution.capability,
             destination=resolution.destination,
+            choices=resolution.choices,
         )
 
     def cancel_text(self, request_id: str) -> bool:
