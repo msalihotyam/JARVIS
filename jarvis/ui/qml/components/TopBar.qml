@@ -17,6 +17,9 @@ Item {
     property string clock: ""
     property string date: ""
     property bool fullscreen: true
+    // Below the design width the core shrinks, the state ticker and HUD
+    // lines go, and the model chip collapses to its icon, so nothing overlaps.
+    readonly property bool narrow: width < 1500
 
     // -- brand ------------------------------------------------------------
     Row {
@@ -44,15 +47,17 @@ Item {
     // -- core + state ticker ------------------------------------------------
     JarvisCore {
         id: core
-        anchors.horizontalCenter: parent.horizontalCenter
-        y: -8
-        width: 150; height: 150
+        x: (bar.narrow ? bar.width * 0.42 : bar.width / 2) - width / 2
+        y: bar.narrow ? 4 : -8
+        width: bar.narrow ? 110 : 150; height: width
         state_: bridge.coreState
         active: Window.active
+        Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
     }
-    Rectangle { anchors.verticalCenter: core.verticalCenter; anchors.right: core.left; anchors.rightMargin: 24; width: 240; height: 1; color: Theme.hud; opacity: 0.7 }
-    Rectangle { anchors.verticalCenter: core.verticalCenter; anchors.left: core.right; anchors.leftMargin: 24; width: 240; height: 1; color: Theme.hud; opacity: 0.7 }
+    Rectangle { visible: !bar.narrow; anchors.verticalCenter: core.verticalCenter; anchors.right: core.left; anchors.rightMargin: 24; width: 240; height: 1; color: Theme.hud; opacity: 0.7 }
+    Rectangle { visible: !bar.narrow; anchors.verticalCenter: core.verticalCenter; anchors.left: core.right; anchors.leftMargin: 24; width: 240; height: 1; color: Theme.hud; opacity: 0.7 }
     Column {
+        visible: !bar.narrow
         anchors { left: core.right; leftMargin: 34; verticalCenter: core.verticalCenter }
         spacing: 6
         Repeater {
@@ -69,6 +74,7 @@ Item {
         }
     }
     Text {
+        visible: !bar.narrow
         anchors { right: core.left; rightMargin: 34; verticalCenter: core.verticalCenter }
         text: Theme.stateLabel(bridge.coreState)
         color: Theme.stateColor(bridge.coreState)
@@ -90,10 +96,10 @@ Item {
                 anchors.centerIn: parent; spacing: 8
                 Rectangle { width: 18; height: 18; radius: 4; color: Theme.accent; anchors.verticalCenter: parent.verticalCenter
                     Text { anchors.centerIn: parent; text: "AI"; color: Theme.bg0; font { pixelSize: 9; weight: Font.Bold } } }
-                Text { anchors.verticalCenter: parent.verticalCenter
+                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter
                     text: "claude · " + (bridge.config.claude_model || "cli default") + (bridge.config.claude_effort ? " · " + bridge.config.claude_effort : "")
                     color: Theme.text; font { family: Theme.font; pixelSize: 13 } }
-                Text { anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textMuted; font.pixelSize: 14 }
+                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textMuted; font.pixelSize: 14 }
             }
             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bar.openSettings() }
         }

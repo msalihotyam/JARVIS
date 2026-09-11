@@ -9,6 +9,10 @@ description = "Local, model-independent JARVIS orchestration core"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# The desktop interface only (python -m jarvis.ui). The core keeps dependencies = [].
+ui = ["PySide6>=6.11"]
+
 [project.scripts]
 jarvis = "jarvis.cli:main"
 

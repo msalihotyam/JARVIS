@@ -36,7 +36,7 @@ GlassPanel {
         id: quick
         anchors { left: parent.left; right: parent.right; bottom: choices.top; bottomMargin: 14 }
         spacing: 12
-        visible: bridge.feed.length === 0
+        visible: bridge.feed.length === 0 && width >= 960
         height: visible ? 74 : 0
         component QuickCard: Rectangle {
             property string title: ""; property string line1: ""; property string line2: ""; property string glyph: "◈"
