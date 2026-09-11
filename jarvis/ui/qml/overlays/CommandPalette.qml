@@ -10,6 +10,7 @@ Item {
     property bool open: false
     property int cursor: 0
     signal killSwitchRequested()
+    signal settingsRequested()
     visible: open || dim.opacity > 0
     z: 400
 
@@ -21,7 +22,7 @@ Item {
         { label: "Open Automations", run: function() { bridge.setPage("automations") } },
         { label: "Open Memory", run: function() { bridge.setPage("memory") } },
         { label: "Open History", run: function() { bridge.setPage("history") } },
-        { label: "Open Settings (provider / model / effort)", run: function() { bridge.setPage("settings") } },
+        { label: "Open Settings (theme / model / effort / layout)", run: function() { palette.settingsRequested() } },
         { label: "Toggle Focus Mode", run: function() { bridge.setFocusMode(!bridge.focusMode) } },
         { label: "Toggle Edit Layout", run: function() { bridge.setEditMode(!bridge.editMode) } },
         { label: "Reset layout", run: function() { bridge.resetLayout() } },
@@ -62,8 +63,10 @@ Item {
         padding: 16
         Column {
             width: parent.width; spacing: 10
-            Rectangle { width: parent.width; height: 40; radius: Theme.radiusSmall; color: Theme.surface; border.width: 1; border.color: Theme.accent
-                TextField { id: search; anchors.fill: parent; anchors.margins: 4; background: Item {}  color: Theme.text; placeholderText: "Type a command…"; placeholderTextColor: Theme.textDim; font { family: Theme.font; pixelSize: 15 }
+            Rectangle { width: parent.width; height: 44; radius: Theme.radiusSmall; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.6)
+                Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: Theme.radiusSmall + 3; color: Theme.alpha(Theme.accent, 0.1) }
+                Text { x: 14; anchors.verticalCenter: parent.verticalCenter; text: "›"; color: Theme.accent; font.pixelSize: 18 }
+                TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: "Type a command…"; placeholderTextColor: Theme.textDim; font { family: Theme.font; pixelSize: 15 }
                     onTextChanged: palette.cursor = 0
                     Keys.onDownPressed: palette.cursor = Math.min(palette.cursor + 1, palette.matches.length - 1)
                     Keys.onUpPressed: palette.cursor = Math.max(palette.cursor - 1, 0)
@@ -76,8 +79,10 @@ Item {
                 model: palette.matches
                 delegate: Rectangle {
                     width: ListView.view.width; height: 36; radius: Theme.radiusSmall
-                    color: index === palette.cursor ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.16) : "transparent"
-                    Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: index === palette.cursor ? Theme.accent : Theme.text; font { family: Theme.font; pixelSize: 14 } }
+                    color: index === palette.cursor ? Theme.alpha(Theme.accent, 0.14) : "transparent"
+                    border.width: 1; border.color: index === palette.cursor ? Theme.alpha(Theme.accent, 0.4) : "transparent"
+                    Rectangle { visible: index === palette.cursor; x: 0; y: 10; width: 2; height: 16; radius: 1; color: Theme.accent }
+                    Text { anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: index === palette.cursor ? Theme.accent : Theme.textLabel; font { family: Theme.font; pixelSize: 14 } }
                     MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: palette.cursor = index; onClicked: { palette.cursor = index; palette.runCurrent() } }
                 }
             }

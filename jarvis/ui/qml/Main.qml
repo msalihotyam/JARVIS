@@ -27,6 +27,9 @@ Window {
     readonly property string loadedPage: pageLoader.current
     readonly property bool paletteOpen: palette.open
     readonly property bool navOpen: nav.open
+    readonly property bool settingsOpen: settings.open
+
+    function toggleSettings() { settings.open = !settings.open }
 
     Component.onCompleted: {
         Theme.name = bridge.theme
@@ -50,13 +53,14 @@ Window {
         clock: Qt.formatTime(clock.now, "HH:mm")
         date: Qt.formatDate(clock.now, "ddd, d MMMM yyyy")
         fullscreen: root.fullscreen
+        settingsOpen: settings.open
         onMenuRequested: nav.open = !nav.open
         onKillSwitchRequested: root.askKillSwitch()
         onEditRequested: bridge.setEditMode(!bridge.editMode)
         onMinimizeRequested: root.showMinimized()
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
-        onOpenSettings: bridge.setPage("settings")
+        onOpenSettings: root.toggleSettings()
     }
 
     function askKillSwitch() {
@@ -67,9 +71,13 @@ Window {
     }
 
     // -- content ----------------------------------------------------------
+    // The reference composition keeps a quiet left gutter under the clock;
+    // the workspace and the column float to the right of it.
     Item {
         id: content
-        anchors { left: parent.left; right: parent.right; top: topBar.bottom; bottom: parent.bottom; leftMargin: 28; rightMargin: 28; bottomMargin: 26; topMargin: 6 }
+        anchors { left: parent.left; right: parent.right; top: topBar.bottom; bottom: parent.bottom
+                  leftMargin: root.width < 1500 ? Theme.margin : Math.round(root.width * 0.122); rightMargin: Theme.margin; bottomMargin: 40; topMargin: 8 }
+        Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
         readonly property bool showColumn: root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
 
@@ -77,13 +85,13 @@ Window {
         Item {
             id: workspace
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
-            width: content.width - (content.showColumn ? content.columnWidth + Theme.gap : 0)
+            width: content.width - (content.showColumn ? content.columnWidth + Theme.gap + 4 : 0)
             Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Loader {
                 id: pageLoader
                 anchors.fill: parent
                 property string current: bridge.page
-                sourceComponent: current === "home" ? homePage : current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : settingsPage
+                sourceComponent: current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : homePage
                 onCurrentChanged: pageIn.restart()
                 opacity: 1
                 transform: Translate { id: pageSlide; y: 0 }
@@ -103,12 +111,11 @@ Window {
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
         Component { id: memoryPage; MemoryPage {} }
         Component { id: historyPage; HistoryPage {} }
-        Component { id: settingsPage; SettingsPage {} }
 
         // Column width grip (Edit Mode): direct while dragging, snapped on release.
         Rectangle {
             visible: bridge.editMode && content.showColumn
-            x: workspace.width + Theme.gap / 2 - 3; width: 6; height: 60
+            x: workspace.width + (Theme.gap + 4) / 2 - 3; width: 6; height: 60
             anchors.verticalCenter: parent.verticalCenter
             radius: 3; color: Theme.accent; opacity: widthGrip.pressed ? 1 : 0.6
             MouseArea {
@@ -132,21 +139,32 @@ Window {
         }
     }
 
-    // Focus-mode badge: a tiny reminder that the arrangement is temporary.
-    Rectangle {
-        visible: bridge.focusMode
-        anchors { right: parent.right; bottom: parent.bottom; margins: 10 }
-        width: focusText.width + 20; height: 24; radius: 12; color: Theme.surface; border.width: 1; border.color: Theme.accent
-        Text { id: focusText; anchors.centerIn: parent; text: "FOCUS MODE · Ctrl+Shift+F to leave"; color: Theme.accent; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5 } }
+    // -- HUD captions and fragments along the bottom edge -----------------------
+    Item {
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        height: 30
+        Row { anchors { left: parent.left; leftMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMicro; letterSpacing: 3.2 } }
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
+        }
+        Row { anchors { right: parent.right; rightMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "SAME HIGHER FURTHER"; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMicro; letterSpacing: 3.2 } }
+        }
     }
-    Text {
-        anchors { left: parent.left; bottom: parent.bottom; margins: 12 }
-        text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 3 }
+    // Focus-mode badge: a tiny reminder that the arrangement is temporary.
+    Pill {
+        visible: bridge.focusMode
+        anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 8 }
+        text: "Focus mode · Ctrl+Shift+F to leave"; tint: Theme.accent
     }
 
-    NavMenu { id: nav }
+    NavMenu { id: nav; onSettingsRequested: settings.open = true }
     ApprovalOverlay {}
-    CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onFocusComposer: {} }
+    SettingsDrawer { id: settings }
+    CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: settings.open = true; onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 
     // -- shortcuts -----------------------------------------------------------
@@ -160,6 +178,11 @@ Window {
     Shortcut { sequence: "Ctrl+3"; onActivated: bridge.setPage("automations") }
     Shortcut { sequence: "Ctrl+4"; onActivated: bridge.setPage("memory") }
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
-    Shortcut { sequence: "Ctrl+6"; onActivated: bridge.setPage("settings") }
-    Shortcut { sequence: "Escape"; onActivated: { if (palette.open) palette.hide(); else if (confirm.open) confirm.open = false; else if (nav.open) nav.open = false; else if (bridge.editMode) bridge.setEditMode(false) } }
+    Shortcut { sequence: "Ctrl+6"; onActivated: root.toggleSettings() }
+    Shortcut { sequence: "Escape"; onActivated: {
+        if (palette.open) palette.hide()
+        else if (confirm.open) confirm.open = false
+        else if (settings.open) settings.open = false
+        else if (nav.open) nav.open = false
+        else if (bridge.editMode) bridge.setEditMode(false) } }
 }

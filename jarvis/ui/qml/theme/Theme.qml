@@ -22,63 +22,82 @@ QtObject {
     readonly property int editMs: 200
     readonly property int focusMs: 280
     readonly property int themeMs: 400
+    readonly property int hoverMs: 140
     readonly property int ease: Easing.OutCubic
     readonly property int easeInOut: Easing.InOutCubic
 
     // -- typography -----------------------------------------------------
+    // System faces only: nothing here depends on a font that may be absent.
     readonly property string font: "Segoe UI"
     readonly property string mono: "Cascadia Mono"
-    readonly property int fsLabel: 11
-    readonly property int fsBody: 14
+    readonly property int fsMicro: 9      // HUD captions
+    readonly property int fsLabel: 11     // section headers (letter-spaced)
+    readonly property int fsMeta: 12      // timestamps, secondary metadata
+    readonly property int fsBody: 14      // conversation body
+    readonly property int fsLead: 16      // greeting subtitle
     readonly property int fsTitle: 20
-    readonly property int fsHero: 30
-    readonly property real labelSpacing: 2.2
+    readonly property int fsHero: 32      // greeting
+    readonly property real labelSpacing: 2.4
 
     // -- geometry -------------------------------------------------------
-    readonly property int radius: 14
-    readonly property int radiusSmall: 8
-    readonly property int gap: 18
-    readonly property int pad: 18
+    readonly property int radius: 18
+    readonly property int radiusSmall: 10
+    readonly property int radiusTiny: 6
+    readonly property int gap: 16
+    readonly property int pad: 20
+    readonly property int margin: 28
 
     // -- stage 1: glow (0-120 ms) --------------------------------------
-    property color glow: space ? "#5a2cc7ff" : "#3a2aa7d8"
+    property color glow: space ? "#3d8bff" : "#2a5fb0"
     Behavior on glow { ColorAnimation { duration: 120; easing.type: Easing.InOutCubic } }
-    property real glowStrength: space ? 1.0 : 0.55
+    property real glowStrength: space ? 1.0 : 0.5
     Behavior on glowStrength { NumberAnimation { duration: 120; easing.type: Easing.InOutCubic } }
 
     // -- stage 2: background (60-360 ms) --------------------------------
-    property color bg0: space ? "#040812" : "#050608"
-    property color bg1: space ? "#0b1630" : "#0b0e14"
-    property color horizon: space ? "#122a5c" : "#0d1420"
+    property color bg0: space ? "#03060f" : "#050608"
+    property color bg1: space ? "#071228" : "#0a0d13"
+    property color horizon: space ? "#0c2050" : "#0c121c"
     Behavior on bg0 { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
     Behavior on bg1 { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
     Behavior on horizon { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
-    property real starOpacity: space ? 1.0 : 0.25
+    property real starOpacity: space ? 0.9 : 0.22
     Behavior on starOpacity { SequentialAnimation { PauseAnimation { duration: 60 } NumberAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
 
     // -- stage 3: core energy / accent (120-300 ms) ---------------------
     property color accent: space ? "#4fd8ff" : "#3ab4e0"
     property color accentSoft: space ? "#5d9dff" : "#4d86c8"
+    property color accentDeep: space ? "#1e8fd0" : "#1d6f9a"
     Behavior on accent { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
     Behavior on accentSoft { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
+    Behavior on accentDeep { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
 
     // -- stage 4: surfaces and borders (180-400 ms) ---------------------
-    property color surface: space ? "#8c0a1428" : "#d4090b10"
-    property color surfaceRaised: space ? "#b40f1d3a" : "#ee10141b"
-    property color border: space ? "#5533a0d8" : "#36284f66"
-    property color borderStrong: space ? "#9040c8ff" : "#663a8fb4"
-    property color hud: space ? "#2a3fc4ff" : "#12244f70"
+    // Three material levels: surfaceDeep (row strips, wells), surface
+    // (panels), surfaceRaised (cards, fields, floating layers).
+    property color surfaceDeep: space ? "#66040a1a" : "#a0050709"
+    property color surface: space ? "#a6081226" : "#d60a0e15"
+    property color surfaceRaised: space ? "#c40d1b3a" : "#ee10161f"
+    property color sheen: space ? "#1a9fd8ff" : "#10a0c8e0"
+    property color border: space ? "#3a4fd8ff" : "#2e4a7f9a"
+    property color borderStrong: space ? "#8a4fd8ff" : "#66408aa8"
+    property color hud: space ? "#4fd8ff" : "#3a90b0"
+    property real hudOpacity: space ? 0.5 : 0.3
+    Behavior on surfaceDeep { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on surface { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on surfaceRaised { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
+    Behavior on sheen { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on border { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on borderStrong { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on hud { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
+    Behavior on hudOpacity { SequentialAnimation { PauseAnimation { duration: 180 } NumberAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
 
     // -- stage 5: text and state accents (260-420 ms) -------------------
-    property color text: space ? "#e8f1ff" : "#dfe6ee"
-    property color textMuted: space ? "#8ea3c7" : "#7f8b9a"
-    property color textDim: space ? "#5a6f96" : "#556070"
+    property color text: space ? "#eef4ff" : "#e3e9f0"
+    property color textLabel: space ? "#b7c7e6" : "#a3aebd"
+    property color textMuted: space ? "#8ea3c9" : "#7f8b9a"
+    property color textDim: space ? "#56698c" : "#4f5a68"
     Behavior on text { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
+    Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
     Behavior on textMuted { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
     Behavior on textDim { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
 
@@ -89,6 +108,11 @@ QtObject {
     readonly property color unknown: "#ffd166"
     readonly property color unknownEdge: "#ff8a3d"
     readonly property color info: "#4fd8ff"
+    readonly property color violet: "#9b7bff"
+    readonly property color teal: "#35d0b0"
+
+    // A color at a given alpha; the one helper every surface uses.
+    function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
     // The color a core state speaks in.
     function stateColor(state) {

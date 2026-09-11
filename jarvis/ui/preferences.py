@@ -21,7 +21,10 @@ from typing import Any
 PREFERENCES_VERSION = 1
 THEMES = ("space", "dark")
 PROFILES = ("normal", "focus", "monitoring")
-PAGES = ("home", "tasks", "automations", "memory", "history", "settings")
+PAGES = ("home", "tasks", "automations", "memory", "history")
+#: Pages earlier documents may name that no longer exist (Settings became a
+#: drawer over the current page); they load as the Command Center.
+_RETIRED_PAGES = {"settings": "home"}
 
 #: The panels the canonical layout knows. Order is the canonical order.
 PANEL_IDS = ("system", "workflow", "activity", "automations")
@@ -136,6 +139,8 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         return defaults
     if candidate["theme"] not in THEMES or type(candidate["ambient_effects"]) is not bool:
         return defaults
+    if candidate["page"] in _RETIRED_PAGES:
+        candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
     if candidate["profile"] not in PROFILES or candidate["page"] not in PAGES:
         return defaults
     profiles = candidate["profiles"]

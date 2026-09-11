@@ -1,31 +1,59 @@
 import QtQuick
 import "../theme"
 
+// The one button. Idle / hover / pressed / focused / disabled are all
+// designed; nothing falls back to a stock control.
 Rectangle {
     id: button
     property string label: ""
     property bool primary: false
     property bool danger: false
+    property bool compact: false
     signal clicked()
 
-    implicitWidth: text.width + 28; implicitHeight: 34
+    readonly property color tone: danger ? Theme.danger : Theme.accent
+    readonly property bool hovered: area.containsMouse && enabled
+    readonly property bool pressed: area.pressed && enabled
+
+    implicitWidth: text.width + (compact ? 22 : 30); implicitHeight: compact ? 30 : 36
     radius: Theme.radiusSmall
-    color: primary ? (danger ? Theme.danger : Theme.accent)
-                   : (area.containsMouse ? Qt.rgba(1, 1, 1, 0.07) : "transparent")
+    color: primary ? (pressed ? Qt.darker(tone, 1.25) : hovered ? Qt.lighter(tone, 1.08) : tone)
+                   : (pressed ? Theme.alpha(tone, 0.20) : hovered ? Theme.alpha(tone, 0.12) : Theme.alpha(Theme.text, 0.035))
     border.width: 1
-    border.color: danger ? Theme.danger : (primary ? Theme.accent : Theme.borderStrong)
-    opacity: enabled ? 1 : 0.4
-    Behavior on color { ColorAnimation { duration: 120 } }
+    border.color: primary ? Theme.alpha(tone, 0.9) : (hovered || pressed ? Theme.alpha(tone, 0.6) : Theme.border)
+    opacity: enabled ? 1 : 0.38
+    scale: pressed ? 0.97 : 1
+    Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+    Behavior on scale { NumberAnimation { duration: 90 } }
+
+    // Top sheen on the primary fill, so it reads as a lit key rather than a flat block.
+    Rectangle {
+        visible: primary
+        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
+        height: parent.height * 0.5; radius: parent.radius - 1
+        gradient: Gradient {
+            GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.22) }
+            GradientStop { position: 1.0; color: "transparent" }
+        }
+    }
+    // Primary glow halo.
+    Rectangle { z: -1; visible: primary; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: Theme.alpha(tone, hovered ? 0.30 : 0.16)
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+    // Focus ring (keyboard focus, when a parent forwards it).
+    Rectangle { visible: button.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: "transparent"; border.width: 1; border.color: Theme.alpha(tone, 0.8) }
+
     Text {
         id: text
         anchors.centerIn: parent
         text: button.label
-        color: primary ? Theme.bg0 : (danger ? Theme.danger : Theme.text)
-        font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold }
+        color: primary ? "#04101c" : (danger ? Theme.danger : (hovered ? Theme.text : Theme.textLabel))
+        font { family: Theme.font; pixelSize: compact ? 12 : 13; weight: Font.DemiBold }
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     }
     MouseArea {
         id: area
-        anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-        onClicked: button.clicked()
+        anchors.fill: parent; hoverEnabled: true; cursorShape: button.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onClicked: if (button.enabled) button.clicked()
     }
 }

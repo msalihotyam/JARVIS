@@ -1,16 +1,18 @@
 import QtQuick
+import QtQuick.Shapes
 import "../theme"
 
-// The environment behind everything. STATIC by design: a gradient horizon,
-// a faint HUD grid and a fixed star field, plus one optional image asset
-// slot for the canonical Earth/space plate. The only motion is the optional
-// ambient shimmer of a few stars, and it pauses when the window is inactive.
+// The environment behind everything. STATIC by design: a gradient sky,
+// three pieces of atmospheric lighting (a crown of light behind the core,
+// a soft planetary limb low on the left, a vignette), a fixed star field,
+// and one image slot for the canonical Earth/space plate. The only motion
+// is the optional shimmer of three stars, and it pauses when inactive.
 Item {
     id: bg
     property bool active: true
     // The canonical background asset slot. Empty until a clean, UI-free
-    // Earth/space plate is supplied; the neutral treatment below is the
-    // development stand-in and is not the accepted canonical look.
+    // Earth/space plate is supplied; the lighting below is tuned so the
+    // plate replaces the limb and sits under the same crown and vignette.
     property url imageSource: ""
     readonly property bool hasImage: imageSource != ""
 
@@ -34,51 +36,11 @@ Item {
         Behavior on opacity { NumberAnimation { duration: Theme.themeMs; easing.type: Easing.InOutCubic } }
     }
 
-    // A soft planetary limb: one large circle whose top edge sits on the
-    // lower right, hinting at the orbital horizon of the reference.
-    Rectangle {
-        width: parent.width * 1.6; height: width; radius: width / 2
-        x: parent.width * 0.05; y: parent.height * 0.82
-        color: Theme.horizon
-        opacity: bg.hasImage ? 0 : (Theme.space ? 0.9 : 0.35)
-        border.width: 3
-        border.color: Theme.hud
-        Behavior on opacity { NumberAnimation { duration: Theme.themeMs } }
-    }
-    Rectangle {
-        width: parent.width * 1.6; height: width; radius: width / 2
-        x: parent.width * 0.05; y: parent.height * 0.82 + 10
-        color: "transparent"
-        border.width: 60
-        border.color: Theme.glow
-        opacity: (bg.hasImage ? 0.25 : 0.5) * Theme.glowStrength
-    }
-
-    // Faint HUD grid lines.
-    Repeater {
-        model: 6
-        Rectangle {
-            x: 0; y: (index + 1) * bg.height / 7
-            width: bg.width; height: 1
-            color: Theme.hud
-            opacity: 0.22
-        }
-    }
-    Repeater {
-        model: 10
-        Rectangle {
-            x: (index + 1) * bg.width / 11; y: 0
-            width: 1; height: bg.height
-            color: Theme.hud
-            opacity: 0.14
-        }
-    }
-
-    // Star field: a deterministic pseudo-random scatter, painted once.
+    // Star field: a deterministic scatter, painted once. Small and quiet.
     Canvas {
         id: stars
         anchors.fill: parent
-        opacity: Theme.starOpacity
+        opacity: Theme.starOpacity * (bg.hasImage ? 0.4 : 1)
         onWidthChanged: requestPaint()
         onHeightChanged: requestPaint()
         onPaint: {
@@ -86,13 +48,89 @@ Item {
             ctx.clearRect(0, 0, width, height)
             var seed = 7
             function rnd() { seed = (seed * 9301 + 49297) % 233280; return seed / 233280 }
-            for (var i = 0; i < 260; i++) {
-                var x = rnd() * width, y = rnd() * height * 0.8
-                var r = 0.4 + rnd() * 1.3
-                ctx.globalAlpha = 0.25 + rnd() * 0.6
+            for (var i = 0; i < 190; i++) {
+                var x = rnd() * width, y = rnd() * height * 0.85
+                var r = 0.3 + rnd() * 1.0
+                ctx.globalAlpha = 0.18 + rnd() * 0.5
                 ctx.fillStyle = rnd() > 0.85 ? "#bfe6ff" : "#ffffff"
                 ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill()
             }
+        }
+    }
+
+    // Atmospheric light low on the left: a wide, soft scatter with a faint
+    // brighter horizon inside it. Lighting only - no drawn planet; the
+    // supplied plate replaces it. Space theme only.
+    Item {
+        id: limb
+        anchors.fill: parent
+        opacity: (bg.hasImage || !Theme.space) ? 0 : 1
+        Behavior on opacity { NumberAnimation { duration: Theme.themeMs } }
+        readonly property real radius: bg.width * 1.5
+        readonly property real cx: -bg.width * 0.5
+        readonly property real cy: bg.height * 3.07
+        Shape {
+            id: haloShape
+            x: limb.cx - limb.radius * 1.12; y: limb.cy - limb.radius * 1.12
+            width: limb.radius * 2.24; height: width
+            preferredRendererType: Shape.CurveRenderer
+            opacity: Theme.glowStrength
+            ShapePath {
+                strokeWidth: -1
+                fillGradient: RadialGradient {
+                    centerX: haloShape.width / 2; centerY: haloShape.height / 2; centerRadius: haloShape.width / 2
+                    focalX: centerX; focalY: centerY
+                    GradientStop { position: 0.860; color: Theme.alpha(Theme.bg0, 0.0) }
+                    GradientStop { position: 0.888; color: Theme.alpha(Theme.horizon, 0.55) }
+                    GradientStop { position: 0.894; color: Theme.alpha(Theme.glow, 0.26) }
+                    GradientStop { position: 0.915; color: Theme.alpha(Theme.glow, 0.10) }
+                    GradientStop { position: 0.960; color: Theme.alpha(Theme.glow, 0.025) }
+                    GradientStop { position: 1.000; color: "transparent" }
+                }
+                PathAngleArc { centerX: haloShape.width / 2; centerY: haloShape.height / 2; radiusX: haloShape.width / 2; radiusY: haloShape.height / 2; startAngle: 0; sweepAngle: 360 }
+            }
+        }
+    }
+
+    // Crown of light behind the core, top center.
+    Shape {
+        id: crown
+        width: bg.width * 0.95; height: bg.height * 0.62
+        x: (bg.width - width) / 2; y: -height * 0.52
+        preferredRendererType: Shape.CurveRenderer
+        opacity: Theme.glowStrength * (bg.hasImage ? 0.7 : 1)
+        ShapePath {
+            strokeWidth: -1
+            fillGradient: RadialGradient {
+                centerX: crown.width / 2; centerY: crown.height / 2; centerRadius: crown.width / 2
+                focalX: centerX; focalY: centerY
+                GradientStop { position: 0.00; color: Theme.alpha(Theme.glow, 0.34) }
+                GradientStop { position: 0.30; color: Theme.alpha(Theme.glow, 0.12) }
+                GradientStop { position: 0.62; color: Theme.alpha(Theme.glow, 0.03) }
+                GradientStop { position: 1.00; color: "transparent" }
+            }
+            PathAngleArc { centerX: crown.width / 2; centerY: crown.height / 2; radiusX: crown.width / 2; radiusY: crown.height / 2; startAngle: 0; sweepAngle: 360 }
+        }
+        transform: Scale { origin.x: crown.width / 2; origin.y: crown.height / 2; yScale: 0.62 }
+    }
+
+    // Vignette: the edges fall away, so the lit center reads as foreground.
+    Shape {
+        id: vignette
+        width: 1000; height: 1000
+        preferredRendererType: Shape.CurveRenderer
+        transform: Scale { xScale: bg.width * 1.5 / 1000; yScale: bg.height * 1.5 / 1000; origin.x: 0; origin.y: 0 }
+        x: -bg.width * 0.25; y: -bg.height * 0.25
+        ShapePath {
+            strokeWidth: -1
+            fillGradient: RadialGradient {
+                centerX: 500; centerY: 500; centerRadius: 500; focalX: 500; focalY: 500
+                GradientStop { position: 0.00; color: "transparent" }
+                GradientStop { position: 0.42; color: "transparent" }
+                GradientStop { position: 0.72; color: Qt.rgba(0, 0, 0, 0.28) }
+                GradientStop { position: 1.00; color: Qt.rgba(0, 0, 0, 0.62) }
+            }
+            PathAngleArc { centerX: 500; centerY: 500; radiusX: 500; radiusY: 500; startAngle: 0; sweepAngle: 360 }
         }
     }
 

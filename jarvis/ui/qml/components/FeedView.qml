@@ -2,14 +2,15 @@ import QtQuick
 import QtQuick.Controls.Basic
 import "../theme"
 
-// The conversation / task stream. Not chat bubbles: user requests are a
-// short raised line, JARVIS answers are integrated body text, system and
-// state notes are muted, errors / unknown / approval carry their own color
-// and rail. Long content stays readable and selectable.
+// The conversation / task stream, composed like the reference: an avatar
+// column (you / a small JARVIS orb / a state marker), a name + time line,
+// then the body. User requests sit in a raised card; JARVIS answers are
+// integrated body text; system, error, unknown and approval entries carry
+// their own color. Long content stays readable and selectable.
 ListView {
     id: feed
     model: bridge.feed
-    spacing: 14
+    spacing: 18
     clip: true
     boundsBehavior: Flickable.StopAtBounds
     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -30,12 +31,12 @@ ListView {
     }
     function kindLabel(kind) {
         switch (kind) {
-        case "user": return "YOU"
+        case "user": return "You"
         case "jarvis": return "JARVIS"
         case "error": return "ERROR"
         case "unknown": return "OUTCOME UNKNOWN"
         case "approval": return "APPROVAL"
-        case "clarify": return "JARVIS · NEEDS ONE DETAIL"
+        case "clarify": return "JARVIS · needs one detail"
         case "scheduled": return "SCHEDULED"
         case "data": return "UNTRUSTED DATA"
         default: return "SYSTEM"
@@ -45,9 +46,12 @@ ListView {
     delegate: Item {
         id: row
         width: feed.width
-        height: card.height
-        property bool isUser: modelData.kind === "user"
-        property bool loud: modelData.kind === "error" || modelData.kind === "unknown" || modelData.kind === "approval"
+        height: Math.max(avatar.height, card.height)
+        readonly property string kind: modelData.kind
+        readonly property bool isUser: kind === "user"
+        readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
+        readonly property bool loud: kind === "error" || kind === "unknown" || kind === "approval"
+        readonly property color tone: feed.railColor(kind)
         // Appearance: fade + short slide, no bounce.
         opacity: 0
         transform: Translate { id: slide; y: 8 }
@@ -58,25 +62,63 @@ ListView {
             NumberAnimation { target: slide; property: "y"; to: 0; duration: Theme.panelIn; easing.type: Easing.OutCubic }
         }
 
+        // -- avatar column ---------------------------------------------------
+        Item {
+            id: avatar
+            width: 46; height: 46
+            // You: a soft disc with a person mark.
+            Rectangle {
+                visible: row.isUser
+                anchors.fill: parent; radius: 23
+                color: Theme.alpha(Theme.accentSoft, 0.16); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, 0.45)
+                Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 11; width: 12; height: 12; radius: 6; color: Theme.accentSoft; opacity: 0.9 }
+                Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 25; width: 22; height: 12; radius: 6; color: Theme.accentSoft; opacity: 0.9
+                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 6; color: Theme.alpha(Theme.accentSoft, 0.16) } }
+            }
+            // JARVIS: a small orb - ring, arc, sphere.
+            Item {
+                visible: row.isJarvis
+                anchors.fill: parent
+                Rectangle { anchors.fill: parent; radius: 23; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.45) }
+                Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: "transparent"; border.width: 2; border.color: Theme.accent; opacity: 0.8 }
+                Rectangle { anchors.centerIn: parent; width: 40; height: 40; radius: 20; color: "transparent"; border.width: 4; border.color: Theme.accent; opacity: 0.16 }
+                Rectangle { anchors.centerIn: parent; width: 24; height: 24; radius: 12
+                    gradient: Gradient { GradientStop { position: 0; color: Qt.lighter(Theme.accent, 1.2) } GradientStop { position: 0.55; color: Theme.bg1 } GradientStop { position: 1; color: Theme.bg0 } }
+                    border.width: 1; border.color: Theme.accent }
+                Rectangle { anchors.centerIn: parent; width: 60; height: 60; radius: 30; color: Theme.accent; opacity: 0.08; z: -1 }
+            }
+            // Everything else: a state marker on the rail.
+            Rectangle {
+                visible: !row.isUser && !row.isJarvis
+                anchors.centerIn: parent; width: 30; height: 30; radius: 15
+                color: Theme.alpha(row.tone, 0.12); border.width: 1; border.color: Theme.alpha(row.tone, 0.5)
+                Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: row.tone }
+            }
+        }
+
+        // -- body --------------------------------------------------------------
         Rectangle {
             id: card
-            width: parent.width
-            height: content.height + (isUser ? 22 : 16)
-            radius: Theme.radiusSmall
-            color: isUser ? Theme.surfaceRaised : (loud ? Qt.rgba(railColor(modelData.kind).r, railColor(modelData.kind).g, railColor(modelData.kind).b, 0.08) : "transparent")
-            border.width: isUser || loud ? 1 : 0
-            border.color: isUser ? Theme.border : Qt.rgba(railColor(modelData.kind).r, railColor(modelData.kind).g, railColor(modelData.kind).b, 0.5)
-            Rectangle { x: 0; y: 8; width: 2; height: parent.height - 16; radius: 1; color: feed.railColor(modelData.kind); visible: !isUser }
+            anchors { left: avatar.right; leftMargin: 18; right: parent.right; rightMargin: 4 }
+            height: body.height + (row.isUser || row.loud ? 30 : 14)
+            radius: 12
+            color: row.isUser ? Theme.surfaceRaised : (row.loud ? Theme.alpha(row.tone, 0.07) : "transparent")
+            border.width: row.isUser || row.loud ? 1 : 0
+            border.color: row.isUser ? Theme.border : Theme.alpha(row.tone, 0.45)
+            // Top sheen on the raised user card.
+            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: parent.height * 0.5; radius: 11
+                gradient: Gradient { GradientStop { position: 0; color: Theme.sheen } GradientStop { position: 1; color: "transparent" } } }
             Column {
-                id: content
-                x: 16; y: isUser ? 11 : 8
-                width: parent.width - 32
-                spacing: 4
+                id: body
+                x: row.isUser || row.loud ? 18 : 0; y: row.isUser || row.loud ? 14 : 4
+                width: parent.width - (row.isUser || row.loud ? 36 : 4)
+                spacing: 6
                 Row {
-                    spacing: 10
-                    Text { text: feed.kindLabel(modelData.kind); color: feed.railColor(modelData.kind)
-                        font { family: Theme.font; pixelSize: 10; letterSpacing: 2; weight: Font.DemiBold } }
-                    Text { text: modelData.time; color: Theme.textDim; font { family: Theme.font; pixelSize: 10 } }
+                    spacing: 12
+                    Text { text: feed.kindLabel(row.kind); color: row.isUser ? Theme.accentSoft : row.tone
+                        font { family: Theme.font; pixelSize: row.isUser || row.isJarvis ? 13 : 10; weight: Font.DemiBold
+                               letterSpacing: row.isUser ? 0.3 : (row.isJarvis ? 1.6 : 2.2) } }
+                    Text { anchors.baseline: parent.children[0].baseline; text: modelData.time; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMeta } }
                 }
                 TextEdit {
                     width: parent.width
@@ -84,9 +126,9 @@ ListView {
                     readOnly: true
                     selectByMouse: true
                     wrapMode: Text.Wrap
-                    color: modelData.kind === "system" ? Theme.textMuted : Theme.text
+                    color: row.kind === "system" ? Theme.textMuted : Theme.text
                     selectionColor: Theme.accentSoft
-                    font { family: modelData.kind === "data" ? Theme.mono : Theme.font; pixelSize: modelData.kind === "data" ? 12 : Theme.fsBody }
+                    font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : Theme.fsBody + 1 }
                     textFormat: TextEdit.PlainText
                 }
             }

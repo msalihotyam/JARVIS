@@ -2,42 +2,53 @@ import QtQuick
 import "../theme"
 
 // A small icon-only control. The glyph is a text glyph or a short label;
-// no icon pack.
+// no icon pack. Frameless until hovered, like the reference window chrome.
 Rectangle {
     id: button
     property string glyph: ""
     property string tip: ""
     property bool danger: false
     property bool active: false
+    property bool framed: false
     signal clicked()
 
-    implicitWidth: 30; implicitHeight: 30
+    readonly property bool hovered: area.containsMouse && enabled
+    readonly property bool pressed: area.pressed && enabled
+    readonly property color tone: danger ? Theme.danger : Theme.accent
+
+    implicitWidth: 34; implicitHeight: 34
     radius: Theme.radiusSmall
-    color: active ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
-                  : (area.containsMouse ? Qt.rgba(1, 1, 1, 0.06) : "transparent")
+    color: active ? Theme.alpha(tone, 0.16)
+                  : pressed ? Theme.alpha(tone, 0.14)
+                  : hovered ? Theme.alpha(Theme.text, 0.07)
+                  : framed ? Theme.alpha(Theme.text, 0.035) : "transparent"
     border.width: 1
-    border.color: active ? Theme.accent : (area.containsMouse ? Theme.borderStrong : Theme.border)
-    opacity: enabled ? 1 : 0.4
-    Behavior on color { ColorAnimation { duration: 120 } }
+    border.color: active ? Theme.alpha(tone, 0.7) : hovered ? Theme.alpha(tone, 0.45) : framed ? Theme.border : "transparent"
+    opacity: enabled ? 1 : 0.38
+    scale: pressed ? 0.94 : 1
+    Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+    Behavior on scale { NumberAnimation { duration: 90 } }
 
     Text {
         anchors.centerIn: parent
         text: button.glyph
-        color: danger ? Theme.danger : (active ? Theme.accent : Theme.text)
+        color: danger ? Theme.danger : (active ? tone : (hovered ? Theme.text : Theme.textLabel))
         font { family: Theme.font; pixelSize: 14 }
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     }
     MouseArea {
         id: area
         anchors.fill: parent
         hoverEnabled: true
-        cursorShape: Qt.PointingHandCursor
-        onClicked: button.clicked()
+        cursorShape: button.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onClicked: if (button.enabled) button.clicked()
     }
     Rectangle {
-        visible: area.containsMouse && button.tip !== ""
-        anchors.top: parent.bottom; anchors.topMargin: 6; anchors.horizontalCenter: parent.horizontalCenter
-        width: tipText.width + 14; height: tipText.height + 8
-        radius: 6; color: Theme.surfaceRaised; border.color: Theme.border; border.width: 1
+        visible: hovered && button.tip !== ""
+        anchors.top: parent.bottom; anchors.topMargin: 8; anchors.horizontalCenter: parent.horizontalCenter
+        width: tipText.width + 16; height: tipText.height + 10
+        radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.color: Theme.borderStrong; border.width: 1
         z: 50
         Text { id: tipText; anchors.centerIn: parent; text: button.tip; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
     }

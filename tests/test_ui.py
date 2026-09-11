@@ -613,11 +613,13 @@ class LayoutTests(UiTestCase):
     def test_navigation_pages_and_command_palette(self) -> None:
         bridge = self.bridge()
         root = self.load(bridge)
-        for page in ("tasks", "automations", "memory", "history", "settings", "home"):
+        for page in ("tasks", "automations", "memory", "history", "home"):
             bridge.setPage(page)
             pump(30)
             self.assertEqual(page, root.property("loadedPage"))
         bridge.setPage("nowhere")
+        self.assertEqual("home", bridge.page)
+        bridge.setPage("settings")  # no longer a page: a drawer over the current one
         self.assertEqual("home", bridge.page)
         self.assertFalse(root.property("paletteOpen"))
         QTest.keyClick(root, Qt.Key_K, Qt.ControlModifier)
@@ -632,6 +634,58 @@ class LayoutTests(UiTestCase):
         QTest.keyClick(root, Qt.Key_3, Qt.ControlModifier)
         pump(30)
         self.assertEqual("automations", bridge.page)
+
+    def test_settings_is_a_drawer_that_never_traps(self) -> None:
+        from PySide6.QtCore import QPointF
+        from PySide6.QtQuick import QQuickItem
+        bridge = self.bridge()
+        root = self.load(bridge)
+        bridge.setPage("tasks")
+        pump(30)
+        self.assertFalse(root.property("settingsOpen"))
+
+        def click(object_name: str) -> None:
+            item = root.findChild(QQuickItem, object_name)
+            self.assertIsNotNone(item, object_name)
+            center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+            QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
+            pump(60)
+
+        # The orb left of the wordmark opens it, over the current page.
+        click("settingsOrb")
+        self.assertTrue(root.property("settingsOpen"))
+        self.assertEqual("tasks", root.property("loadedPage"))
+        # Esc closes it; the page and its state are exactly as before.
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(60)
+        self.assertFalse(root.property("settingsOpen"))
+        self.assertEqual("tasks", bridge.page)
+        # The orb toggles: open, then the same click closes.
+        click("settingsOrb")
+        self.assertTrue(root.property("settingsOpen"))
+        click("settingsOrb")
+        self.assertFalse(root.property("settingsOpen"))
+        # Ctrl+6 toggles both ways; the close control closes.
+        QTest.keyClick(root, Qt.Key_6, Qt.ControlModifier)
+        pump(40)
+        self.assertTrue(root.property("settingsOpen"))
+        QTest.keyClick(root, Qt.Key_6, Qt.ControlModifier)
+        pump(40)
+        self.assertFalse(root.property("settingsOpen"))
+        QMetaObject.invokeMethod(root, "toggleSettings")
+        pump(40)
+        self.assertTrue(root.property("settingsOpen"))
+        click("settingsClose")
+        self.assertFalse(root.property("settingsOpen"))
+        # No stuck state: normal interaction resumes on the page underneath.
+        bridge.setPage("home")
+        pump(30)
+        bridge.submitText("Bu projeyi incele.")
+        self.assertEqual("user", self.kinds(bridge)[0])
+        # A document written by the earlier build (page "settings") loads as home,
+        # keeping the rest of the user's choices.
+        legacy = {**canonical_preferences(), "theme": "dark", "page": "settings"}
+        self.assertEqual({**canonical_preferences(), "theme": "dark", "page": "home"}, validate_preferences(legacy))
 
 
 if __name__ == "__main__":  # pragma: no cover

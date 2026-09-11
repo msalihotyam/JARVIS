@@ -35,7 +35,11 @@ Item {
         Column {
             id: column
             width: parent.width; spacing: 14
-            Text { text: dialog.title.toUpperCase(); color: dialog.danger ? Theme.danger : Theme.accent; font { family: Theme.font; pixelSize: 12; letterSpacing: 3; weight: Font.DemiBold } }
+            Row { spacing: 12
+                Rectangle { width: 10; height: 10; radius: 5; color: dialog.danger ? Theme.danger : Theme.accent; anchors.verticalCenter: parent.verticalCenter
+                    Rectangle { anchors.centerIn: parent; width: 20; height: 20; radius: 10; color: parent.color; opacity: 0.22 } }
+                Text { anchors.verticalCenter: parent.verticalCenter; text: dialog.title.toUpperCase(); color: dialog.danger ? Theme.danger : Theme.accent; font { family: Theme.font; pixelSize: 12; letterSpacing: 3; weight: Font.DemiBold } }
+            }
             Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font { family: Theme.font; pixelSize: 14 } }
             Row { spacing: 10; anchors.right: parent.right
                 ActionButton { label: "Back"; onClicked: dialog.open = false }
