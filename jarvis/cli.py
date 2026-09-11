@@ -627,6 +627,7 @@ CONFIG_SETTABLE_KEYS = (
     "github_repositories",
     "gmail_principal",
     "browser_origins",
+    "desktop_apps",
 )
 
 
@@ -720,6 +721,10 @@ def _config_change(key: str, raw: str):
     if key == "browser_origins":
         origins = tuple(part.strip() for part in raw.split(",") if part.strip())
         return lambda current: replace(current, browser_origins=origins)
+    # desktop_apps: the same comma-separated list, one grant per application.
+    if key == "desktop_apps":
+        apps = tuple(part.strip() for part in raw.split(",") if part.strip())
+        return lambda current: replace(current, desktop_apps=apps)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)

@@ -176,7 +176,7 @@ class ParsingTests(ConfigTestCase):
                 "claude_call_budget_usd", "approval_ttl_minutes",
                 "memory_database", "claude_model", "claude_effort",
                 "github_principal", "github_repositories",
-                "gmail_principal", "browser_origins",
+                "gmail_principal", "browser_origins", "desktop_apps",
             },
         )
 

@@ -28,6 +28,7 @@ from jarvis.github import (
     github_raw_destination_refusal,
 )
 from jarvis.browser import browser_raw_destination_refusal
+from jarvis.desktop import desktop_raw_destination_refusal
 from jarvis.gmail import gmail_principal_refusal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +166,12 @@ class Settings:
     #: browser credential setting, because JARVIS holds no browser
     #: credential: it drives a dedicated profile of its own.
     browser_origins: tuple[str, ...] = ()
+    #: Windows Desktop basic authority, configuration like the browser's:
+    #: the applications, spelled exactly ``desktop/<image path>``, whose
+    #: windows this installation may launch, inspect and drive. Each becomes
+    #: one exact destination grant per enabled desktop capability; every
+    #: other application is refused by Core's destination policy.
+    desktop_apps: tuple[str, ...] = ()
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -299,6 +306,14 @@ class Settings:
             reason = browser_raw_destination_refusal(entry)
             if reason is not None:
                 raise ValueError(f"browser_origins entry is unusable: {reason}")
+        if type(self.desktop_apps) is list:
+            object.__setattr__(self, "desktop_apps", tuple(self.desktop_apps))
+        if type(self.desktop_apps) is not tuple:
+            raise ValueError("desktop_apps must be a tuple of desktop/<image path>")
+        for entry in self.desktop_apps:
+            reason = desktop_raw_destination_refusal(entry)
+            if reason is not None:
+                raise ValueError(f"desktop_apps entry is unusable: {reason}")
         if not MIN_APPROVAL_TTL_MINUTES <= self.approval_ttl_minutes <= (
             MAX_APPROVAL_TTL_MINUTES
         ):
@@ -380,12 +395,19 @@ CONFIG_KEYS = (
     # Browser basic. Authority as CONFIGURATION: the exact origins a browser
     # may be driven inside. Not a credential; there is no browser credential.
     "browser_origins",
+    # Windows Desktop basic. Authority as CONFIGURATION: the exact
+    # applications whose windows may be driven. Not a credential.
+    "desktop_apps",
 )
+
+#: The pre-Desktop key set: the document exactly as the Browser build wrote
+#: it. Accepted whole, with no application configured.
+PRE_DESKTOP_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"desktop_apps"}
 
 #: The pre-Browser key set: the document exactly as the Gmail build wrote it.
 #: Accepted whole, with no origin configured, for the same reason every older
 #: shape is: a second CLOSED shape, not an optional-keys hole.
-PRE_BROWSER_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"browser_origins"}
+PRE_BROWSER_CONFIG_KEYS = PRE_DESKTOP_CONFIG_KEYS - {"browser_origins"}
 
 #: The pre-Gmail key set: the document exactly as the GitHub v1 build wrote
 #: it. Accepted whole, with the Gmail setting unset, for the same reason the
@@ -695,6 +717,15 @@ def _exact_browser_origins(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _exact_desktop_apps(value: object) -> tuple[str, ...]:
+    """The configured application destinations, exactly as written."""
+    if value is None:
+        return ()
+    if type(value) is not list or any(type(item) is not str for item in value):
+        _fail("'desktop_apps' must be a list of strings.")
+    return tuple(value)
+
+
 def _exact_gmail_principal(value: object) -> str | None:
     """The configured mailbox address, or ``None``. Never coerced."""
     if value is None:
@@ -721,6 +752,7 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "github_repositories": list(settings.github_repositories),
         "gmail_principal": settings.gmail_principal,
         "browser_origins": list(settings.browser_origins),
+        "desktop_apps": list(settings.desktop_apps),
     }
 
 
@@ -737,6 +769,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     keys = set(document)
     if keys not in (
         set(CONFIG_KEYS),
+        set(PRE_DESKTOP_CONFIG_KEYS),
         set(PRE_BROWSER_CONFIG_KEYS),
         set(PRE_GMAIL_CONFIG_KEYS),
         set(PRE_GITHUB_CONFIG_KEYS),
@@ -795,6 +828,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             # Absent means unset (a pre-Browser document): no connector and
             # no grant, so no origin is reachable.
             browser_origins=_exact_browser_origins(document.get("browser_origins")),
+            # Absent means unset (a pre-Desktop document): no application.
+            desktop_apps=_exact_desktop_apps(document.get("desktop_apps")),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

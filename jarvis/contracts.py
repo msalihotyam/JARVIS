@@ -186,6 +186,10 @@ MAILBOX_DESTINATION_PREFIX = "gmail/"
 #: the same reason: the central normalizer must refuse to repair it, and
 #: ``jarvis.browser`` re-exports it.
 ORIGIN_DESTINATION_PREFIX = "browser/"
+#: The namespace prefix of an APPLICATION destination, spelled
+#: ``desktop/<canonical executable image path>``. Declared here for the same
+#: reason; ``jarvis.desktop`` re-exports it.
+APPLICATION_DESTINATION_PREFIX = "desktop/"
 
 #: The namespaces ``normalize_destination`` must never REPAIR. Each is an
 #: unenumerable family judged by its own closed grammar, so a lossy repair
@@ -194,6 +198,7 @@ _UNREPAIRED_DESTINATION_PREFIXES = (
     REPOSITORY_DESTINATION_PREFIX,
     MAILBOX_DESTINATION_PREFIX,
     ORIGIN_DESTINATION_PREFIX,
+    APPLICATION_DESTINATION_PREFIX,
 )
 
 
@@ -5628,6 +5633,12 @@ class Task:
     #: interaction still knows which element on which page state it was
     #: approved for after a reload.
     browser: dict[str, Any] = field(default_factory=dict)
+    #: Windows Desktop basic. The typed desktop target this task names, in
+    #: its own canonical serialized form (``{}`` = none), on exactly the
+    #: footing of ``browser``: THE REQUEST, re-judged by every consumer
+    #: through ``desktop_resource_from_dict``, and persisted so an approved
+    #: input still knows which window and element state it was approved for.
+    desktop: dict[str, Any] = field(default_factory=dict)
     write_content: str = ""
     #: M5. The declared write mode, part of the authority rather than a hint.
     #: Separate from ``local_write`` because the record is the post-execution
@@ -5738,6 +5749,7 @@ class Task:
             "external_read": dict(self.external_read),
             "gmail": dict(self.gmail),
             "browser": dict(self.browser),
+            "desktop": dict(self.desktop),
             "write_content": self.write_content,
             "write_mode": self.write_mode,
             "local_write": self.local_write.to_dict(),
@@ -5961,6 +5973,12 @@ class Task:
             browser=(
                 dict(data["browser"])
                 if isinstance(data.get("browser"), dict)
+                else {}
+            ),
+            # Windows Desktop basic. Same rule again.
+            desktop=(
+                dict(data["desktop"])
+                if isinstance(data.get("desktop"), dict)
                 else {}
             ),
             # M5. The same grammar the input boundary applies, so a row edited

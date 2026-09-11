@@ -32,7 +32,9 @@ from enum import Enum
 from typing import AbstractSet, Any, Mapping
 
 from jarvis.browser import browser_raw_destination_refusal
+from jarvis.desktop import desktop_raw_destination_refusal
 from jarvis.contracts import (
+    APPLICATION_DESTINATION_PREFIX,
     MAILBOX_DESTINATION_PREFIX,
     ORIGIN_DESTINATION_PREFIX,
     REPOSITORY_DESTINATION_PREFIX,
@@ -73,6 +75,10 @@ class DestinationKind(str, Enum):
     #: from the closed grammar in ``jarvis.browser``; reaching it still needs
     #: an exact grant, which only a configured origin composes into.
     ORIGIN = "origin"
+    #: One local Windows application, spelled ``desktop/<image path>``. Its
+    #: validity comes from the closed grammar in ``jarvis.desktop``; reaching
+    #: it still needs an exact grant, which only a configured app composes into.
+    APPLICATION = "application"
 
 
 #: The canonical destination the Claude Code connector is registered for, and
@@ -238,6 +244,13 @@ def destination_refusal(canonical: Any, *, egress: bool = False) -> str | None:
         if reason is not None:
             return f"the destination is not a canonical origin: {reason}"
         kind = DestinationKind.ORIGIN
+    if kind is None and canonical.startswith(APPLICATION_DESTINATION_PREFIX):
+        # The application namespace, judged by the closed desktop grammar on
+        # the spelling as written, for exactly the reason the others are.
+        reason = desktop_raw_destination_refusal(canonical)
+        if reason is not None:
+            return f"the destination is not a canonical application: {reason}"
+        kind = DestinationKind.APPLICATION
     if kind is None:
         return "the destination is not registered with Core"
     if egress and kind is DestinationKind.NONE:

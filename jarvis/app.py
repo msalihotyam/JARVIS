@@ -29,6 +29,7 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.github_cli import GitHubCliConnector
 from jarvis.connectors.browser_cdp import BrowserCdpConnector
+from jarvis.connectors.desktop_uia import DesktopUiaConnector
 from jarvis.connectors.gmail_cli import GmailCliConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
@@ -118,6 +119,15 @@ from jarvis.destinations import (
     DestinationGrant,
     canonical_destination,
     destination_refusal,
+)
+from jarvis.desktop import (
+    DESKTOP_CAPABILITIES,
+    DESKTOP_CONNECTOR,
+    DESKTOP_ENABLED_CAPABILITIES,
+    DesktopExecutionUnavailable,
+    desktop_external_read_refusal,
+    desktop_resource_binding_refusal,
+    desktop_resource_from_dict,
 )
 from jarvis.browser import (
     BROWSER_CAPABILITIES,
@@ -283,6 +293,9 @@ _TASK_KEYS = frozenset(
         # Browser basic. A TOP-LEVEL section for the same reason: a URL, an
         # element ref and typed text must never ride in ``context``.
         "browser",
+        # Windows Desktop basic. Top-level for the same reason: a window id,
+        # an element ref and typed text must never ride in ``context``.
+        "desktop",
         # M9. The bounded LINE REGION of the read target. A top-level section
         # for the same reason ``write`` is: ``context`` egresses verbatim.
         LOCAL_READ_REGION_SECTION,
@@ -319,6 +332,10 @@ _GMAIL_KEYS = frozenset(
 _BROWSER_KEYS = frozenset(
     {"kind", "origin", "url", "seconds", "tab_id", "ref", "page_digest", "text"}
 )
+#: Windows Desktop basic. The typed target fields, and nothing else: no
+#: coordinate, class name, automation id, process id or command line is
+#: expressible. ``kind`` and ``app`` are required.
+_DESKTOP_KEYS = frozenset({"kind", "app", "window_id", "ref", "digest", "text", "key"})
 #: M9. The only two read-window parameters. Default-deny like every other
 #: section: anything else is rejected, never ignored.
 _READ_KEYS = frozenset({"start_line", "max_lines"})
@@ -867,6 +884,33 @@ def decode_task_json(raw: str | bytes) -> Task:
     elif capability in BROWSER_CAPABILITIES:
         raise TaskInputError("a browser capability requires a 'browser' section.")
 
+    # Windows Desktop basic. Judged by the desktop contracts themselves and
+    # stored in the canonical serialization of the object that passed. The
+    # window id, element ref and digest are typed fields here and nowhere
+    # else: application content or a model answer cannot become one.
+    desktop_input = _section(document, "desktop", _DESKTOP_KEYS)
+    desktop_resource: dict[str, Any] = {}
+    if desktop_input:
+        if capability not in DESKTOP_ENABLED_CAPABILITIES:
+            raise TaskInputError(
+                "'desktop' may only be named by an enabled desktop capability."
+            )
+        for key in ("kind", "app"):
+            if key not in desktop_input:
+                raise TaskInputError(f"'desktop' requires '{key}'.")
+        try:
+            resource = desktop_resource_from_dict(dict(desktop_input))
+        except DesktopExecutionUnavailable as exc:
+            raise TaskInputError(f"'desktop' is refused: {exc}.") from exc
+        reason = desktop_resource_binding_refusal(
+            resource, capability=capability, destination=destination
+        )
+        if reason is not None:
+            raise TaskInputError(f"'desktop' is refused: {reason}.")
+        desktop_resource = resource.to_dict()
+    elif capability in DESKTOP_CAPABILITIES:
+        raise TaskInputError("a desktop capability requires a 'desktop' section.")
+
     # Everything else - id, timestamps, status, stage, estimate, risk and side
     # effect - comes from the dataclass defaults and stays connector-owned.
     return Task(
@@ -884,6 +928,7 @@ def decode_task_json(raw: str | bytes) -> Task:
         github=github_resource,
         gmail=gmail_resource,
         browser=browser_resource,
+        desktop=desktop_resource,
         write_content=write_content,
         write_mode=write_mode,
         write_source=write_source,
@@ -1258,6 +1303,7 @@ def _external_read_payload(stored: Any) -> dict[str, Any] | None:
     refusal = {
         GMAIL_CONNECTOR: gmail_external_read_refusal,
         BROWSER_CONNECTOR: browser_external_read_refusal,
+        DESKTOP_CONNECTOR: desktop_external_read_refusal,
     }.get(snapshot.connector, external_read_refusal)
     if refusal(snapshot) is not None:
         return None
@@ -3260,7 +3306,12 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     browser_policy = browser_authority(settings)
     if browser_policy:
         connectors += (BrowserCdpConnector(str(settings.browser_profile_dir)),)
-    configured = github_policy | gmail_policy | browser_policy
+    # Windows Desktop basic: the same rule. No configured application means
+    # no desktop connector and no desktop grant.
+    desktop_policy = desktop_authority(settings)
+    if desktop_policy:
+        connectors += (DesktopUiaConnector(),)
+    configured = github_policy | gmail_policy | browser_policy | desktop_policy
     return create_app(
         settings=settings,
         connectors=connectors,
@@ -3343,6 +3394,19 @@ def browser_authority(settings: Settings) -> frozenset[DestinationGrant]:
         DestinationGrant(BROWSER_CONNECTOR, capability, destination)
         for destination in settings.browser_origins
         for capability in BROWSER_ENABLED_CAPABILITIES
+    )
+
+
+def desktop_authority(settings: Settings) -> frozenset[DestinationGrant]:
+    """The exact desktop grants this installation configured: one row per
+    enabled capability per configured application, every one still behind
+    mandatory approval. Unconfigured means an empty set - no connector and no
+    grant. No identity half: the desktop acts as the operator's own session,
+    and the boundary is WHICH application, never who."""
+    return frozenset(
+        DestinationGrant(DESKTOP_CONNECTOR, capability, destination)
+        for destination in settings.desktop_apps
+        for capability in DESKTOP_ENABLED_CAPABILITIES
     )
 
 
