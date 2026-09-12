@@ -18,6 +18,7 @@ Item {
     signal closeRequested()
     signal openSettings()
     property string clock: ""
+    property string meridiem: ""
     property string date: ""
     property bool fullscreen: true
     property bool settingsOpen: false
@@ -25,7 +26,7 @@ Item {
     // model chip collapses to its icon, so nothing overlaps.
     readonly property bool narrow: width < 1500
     readonly property real coreCx: narrow ? width * 0.42 : width * 0.4844
-    readonly property real coreCy: narrow ? 72 : 85
+    readonly property real coreCy: narrow ? 72 : 87
 
     function tz() {
         var m = -new Date().getTimezoneOffset(); var sign = m < 0 ? "-" : "+"; m = Math.abs(m)
@@ -39,8 +40,8 @@ Item {
         visible: !bar.narrow
         opacity: Theme.hudOpacity
         preferredRendererType: Shape.CurveRenderer
-        readonly property real yLine: 147
-        readonly property real yRight: 125
+        readonly property real yLine: 150
+        readonly property real yRight: 126
         ShapePath {
             strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
             startX: bar.width * 0.245; startY: hudLines.yLine + 22
@@ -103,38 +104,46 @@ Item {
     Item {
         id: orb
         objectName: "settingsOrb"
-        x: 28; y: 17; width: 60; height: 60
+        x: 28; y: 16; width: 62; height: 62
         readonly property bool hovered: orbArea.containsMouse
         readonly property bool lit: hovered || bar.settingsOpen
         scale: orbArea.pressed ? 0.95 : 1
         Behavior on scale { NumberAnimation { duration: 90 } }
-        Rectangle { anchors.centerIn: parent; width: 80; height: 80; radius: 40; color: Theme.alpha(Theme.accent, orb.lit ? 0.16 : 0); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
-        Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.accent; opacity: orb.lit ? 0.95 : 0.45; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
-        Repeater { model: 12
-            Rectangle { width: 1; height: index % 3 === 0 ? 4 : 2; color: Theme.accent; opacity: orb.lit ? 0.9 : 0.5; x: orb.width / 2 - 0.5; y: 2
-                transform: Rotation { origin.x: 0.5; origin.y: orb.height / 2 - 2; angle: index * 30 } } }
+        Rectangle { anchors.centerIn: parent; width: 84; height: 84; radius: 42; color: Theme.alpha(Theme.accent, orb.lit ? 0.18 : 0.07); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+        // Outer calibrated ring with nodes.
+        Item {
+            anchors.fill: parent
+            RotationAnimator on rotation { running: Theme.ambient && bar.settingsOpen; loops: Animation.Infinite; from: 0; to: 360; duration: 12000 }
+            Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.accent; opacity: orb.lit ? 0.95 : 0.5; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
+            Repeater { model: 12
+                Rectangle { width: index % 3 === 0 ? 3 : 1; height: index % 3 === 0 ? 3 : 3; radius: index % 3 === 0 ? 1.5 : 0; color: Theme.accent; opacity: orb.lit ? 0.95 : 0.6; x: orb.width / 2 - width / 2; y: index % 3 === 0 ? -1 : 2
+                    transform: Rotation { origin.x: width / 2; origin.y: orb.height / 2 - y; angle: index * 30 } } }
+        }
+        // The luminous ring: thick, uniform cyan with a soft outer glow and a dark centre.
+        Rectangle { anchors.centerIn: parent; width: 56; height: 56; radius: 28; color: "transparent"; border.width: 10; border.color: Theme.accent; opacity: 0.18 }
+        Rectangle { anchors.centerIn: parent; width: 50; height: 50; radius: 25; color: "transparent"; border.width: 7; border.color: Theme.accent; opacity: 0.3 }
+        Rectangle { anchors.centerIn: parent; width: 46; height: 46; radius: 23; color: Theme.bg0 }
         Shape {
             id: orbRing
-            anchors.centerIn: parent; width: 44; height: 44
+            anchors.centerIn: parent; width: 46; height: 46
             preferredRendererType: Shape.CurveRenderer
-            RotationAnimator on rotation { running: Theme.ambient && bar.settingsOpen; loops: Animation.Infinite; from: 0; to: 360; duration: 6000 }
+            opacity: orb.lit ? 1 : 0.9
             ShapePath {
                 strokeWidth: -1; fillRule: ShapePath.OddEvenFill
                 fillGradient: ConicalGradient {
-                    centerX: orbRing.width / 2; centerY: orbRing.height / 2; angle: 90
-                    GradientStop { position: 0.00; color: Qt.lighter(Theme.accent, 1.3) }
-                    GradientStop { position: 0.30; color: Theme.accent }
-                    GradientStop { position: 0.58; color: Theme.alpha(Theme.accentDeep, 0.55) }
-                    GradientStop { position: 0.80; color: Theme.alpha(Theme.accent, 0.25) }
-                    GradientStop { position: 1.00; color: Qt.lighter(Theme.accent, 1.3) }
+                    centerX: 23; centerY: 23; angle: 135
+                    GradientStop { position: 0.00; color: Qt.lighter(Theme.accent, 1.25) }
+                    GradientStop { position: 0.35; color: Theme.accent }
+                    GradientStop { position: 0.60; color: Theme.accentDeep }
+                    GradientStop { position: 0.80; color: Theme.accent }
+                    GradientStop { position: 1.00; color: Qt.lighter(Theme.accent, 1.25) }
                 }
-                PathAngleArc { centerX: orbRing.width / 2; centerY: orbRing.height / 2; radiusX: 22; radiusY: 22; startAngle: 0; sweepAngle: 360 }
-                PathAngleArc { centerX: orbRing.width / 2; centerY: orbRing.height / 2; radiusX: 16; radiusY: 16; startAngle: 0; sweepAngle: 360 }
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 23; radiusY: 23; startAngle: 0; sweepAngle: 360 }
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 17; radiusY: 17; startAngle: 0; sweepAngle: 360 }
             }
         }
-        Rectangle { anchors.centerIn: parent; width: 31; height: 31; radius: 15.5; color: Theme.bg0; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.35) }
-        Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: Theme.accent; opacity: orb.lit ? 0.95 : 0.55; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
-            Rectangle { anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: Theme.accent; opacity: 0.3 } }
+        Rectangle { anchors.centerIn: parent; width: 34; height: 34; radius: 17; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.35) }
+        Rectangle { anchors.centerIn: parent; width: 28; height: 28; radius: 14; color: "transparent"; border.width: 2; border.color: Theme.accent; opacity: orb.lit ? 0.5 : 0.18; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
         MouseArea { id: orbArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openSettings() }
         Rectangle {
             visible: orb.hovered && !bar.settingsOpen
@@ -143,26 +152,29 @@ Item {
             Text { id: tipText; anchors.centerIn: parent; text: "Settings"; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
         }
     }
-    Text { x: 120; y: 21; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 25; letterSpacing: 9; weight: Font.Light } }
-    Text { x: 122; y: 58; text: "THINKS AHEAD FOR YOU"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 9; letterSpacing: 3.4 } }
+    Text { x: 120; y: 19; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 27; letterSpacing: 12; weight: Font.Normal } }
+    Text { x: 122; y: 58; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 3.8 } }
 
-    Text { x: 38; y: 116; text: bar.date; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13; letterSpacing: 0.2 } }
-    Text { x: 36; y: 132; text: bar.clock; color: Theme.text; font { family: Theme.font; pixelSize: 34; weight: Font.Light; letterSpacing: 0.5 } }
+    Text { x: 40; y: 112; text: bar.date; color: Theme.textLabel; font { family: Theme.font; pixelSize: 14; letterSpacing: 0.2 } }
+    Row { x: 38; y: 128; spacing: 9
+        Text { text: bar.clock; color: "#9fdcff"; font { family: Theme.font; pixelSize: 40; weight: Font.Medium; letterSpacing: 0.4 } }
+        Text { text: bar.meridiem; color: "#9fdcff"; anchors.baseline: parent.children[0].baseline; font { family: Theme.font; pixelSize: 21; weight: Font.Medium; letterSpacing: 0.6 } }
+    }
 
     // Local-context block (the reference's weather slot). No weather source
     // exists, so it carries the real local time zone and says so.
     Item {
-        x: 36; y: 215; width: 140; height: 60
+        x: 38; y: 214; width: 150; height: 60
         visible: !bar.narrow
-        Item { width: 26; height: 26; y: 6
-            Rectangle { anchors.fill: parent; radius: 13; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.5) }
+        Item { width: 28; height: 28; y: 8
+            Rectangle { anchors.fill: parent; radius: 14; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.5) }
             Rectangle { anchors.centerIn: parent; width: 14; height: 14; radius: 7; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.8) }
-            Rectangle { anchors.centerIn: parent; width: 4; height: 4; radius: 2; color: Theme.accent }
-            Repeater { model: 4; Rectangle { width: 1; height: 3; color: Theme.accent; opacity: 0.7; x: 12.5; y: -1; transform: Rotation { origin.x: 0.5; origin.y: 14; angle: index * 90 } } }
+            Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: Theme.accent }
+            Repeater { model: 8; Rectangle { width: 1; height: 4; color: Theme.accent; opacity: 0.7; x: 13.5; y: -2; transform: Rotation { origin.x: 0.5; origin.y: 16; angle: index * 45 } } }
         }
-        Column { x: 40; y: 0; spacing: 2
-            Text { text: bar.tz() + "  Local"; color: Theme.text; font { family: Theme.font; pixelSize: 13 } }
-            Text { text: "Weather not connected"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
+        Column { x: 44; y: 2; spacing: 3
+            Text { text: bar.tz() + "  Local"; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
+            Text { text: "Weather not connected"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
         }
     }
 
@@ -178,7 +190,7 @@ Item {
     }
     Column {
         visible: !bar.narrow
-        x: bar.coreCx + 151; y: 46
+        x: bar.coreCx + 152; y: 46
         spacing: 13
         Repeater {
             model: ["LISTENING", "REASONING", "EXECUTING"]
@@ -187,15 +199,15 @@ Item {
                 property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
                                    || (modelData === "REASONING" && bridge.coreState === "running")
                                    || (modelData === "EXECUTING" && bridge.coreState === "awaiting_approval")
-                color: lit ? Theme.accent : Theme.textDim
-                font { family: Theme.font; pixelSize: 10; letterSpacing: 3.2; weight: lit ? Font.DemiBold : Font.Normal }
+                color: lit ? "#eaf6ff" : Theme.textLabel
+                font { family: Theme.font; pixelSize: 12; letterSpacing: 3; weight: Font.DemiBold }
                 Behavior on color { ColorAnimation { duration: 200 } }
             }
         }
     }
     Text {
         visible: !bar.narrow && bridge.coreState !== "idle"
-        x: bar.coreCx + 151; y: 128
+        x: bar.coreCx + 150; y: 128
         text: Theme.stateLabel(bridge.coreState)
         color: Theme.stateColor(bridge.coreState)
         font { family: Theme.font; pixelSize: 9; letterSpacing: 2.6; weight: Font.DemiBold }
@@ -204,25 +216,24 @@ Item {
 
     // -- right controls -------------------------------------------------------
     Row {
-        anchors { right: parent.right; top: parent.top; rightMargin: 16; topMargin: 27 }
-        spacing: 12
+        anchors { right: parent.right; top: parent.top; rightMargin: 18; topMargin: 25 }
+        spacing: 13
 
         // Provider / model chip -> Settings (quiet; the orb is the primary trigger).
         Rectangle {
-            width: modelRow.width + 24; height: 36; radius: Theme.radiusSmall
+            width: Math.max(bar.narrow ? 46 : 178, modelRow.width + 30); height: 37; radius: Theme.radiusSmall
             color: chipArea.containsMouse ? Theme.surfaceRaised : Theme.surface; border.width: 1; border.color: chipArea.containsMouse ? Theme.borderStrong : Theme.border
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
             Row {
                 id: modelRow
-                anchors.centerIn: parent; spacing: 9
-                Rectangle { width: 20; height: 20; radius: 5; anchors.verticalCenter: parent.verticalCenter
-                    gradient: Gradient { orientation: Gradient.Horizontal
-                        GradientStop { position: 0; color: "#4f8dff" } GradientStop { position: 1; color: "#7a5cff" } }
-                    Text { anchors.centerIn: parent; text: "AI"; color: "#ffffff"; font { family: Theme.font; pixelSize: 9; weight: Font.Bold } } }
+                anchors.centerIn: parent; spacing: 10
+                Rectangle { width: 22; height: 22; radius: 6; anchors.verticalCenter: parent.verticalCenter
+                    gradient: Gradient { GradientStop { position: 0; color: "#f4bd66" } GradientStop { position: 1; color: "#d2842a" } }
+                    Text { anchors.centerIn: parent; text: "AI"; color: "#2b1700"; font { family: Theme.font; pixelSize: 10; weight: Font.Bold } } }
                 Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter
-                    text: "claude · " + (bridge.config.claude_model || "cli default") + (bridge.config.claude_effort ? " · " + bridge.config.claude_effort : "")
-                    color: Theme.text; font { family: Theme.font; pixelSize: 13 } }
-                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textMuted; font.pixelSize: 14 }
+                    text: "Claude" + (bridge.config.claude_model ? " · " + bridge.config.claude_model : "") + (bridge.config.claude_effort ? " · " + bridge.config.claude_effort : "")
+                    color: Theme.text; font { family: Theme.font; pixelSize: 15 } }
+                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textLabel; font.pixelSize: 15 }
             }
             MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openSettings() }
         }
@@ -230,63 +241,63 @@ Item {
         // Execution state.
         Rectangle {
             readonly property color tone: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
-            width: stateRow.width + 28; height: 36; radius: Theme.radiusSmall
-            color: Theme.alpha(tone, 0.09); border.width: 1; border.color: Theme.alpha(tone, 0.38)
+            width: Math.max(118, stateRow.width + 30); height: 37; radius: Theme.radiusSmall
+            color: Theme.alpha(tone, 0.10); border.width: 1; border.color: Theme.alpha(tone, 0.42)
             Row {
                 id: stateRow
-                anchors.centerIn: parent; spacing: 9
-                Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter; color: parent.parent.tone
-                    Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: parent.color; opacity: 0.25 } }
+                anchors.centerIn: parent; spacing: 10
+                Rectangle { width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter; color: parent.parent.tone
+                    Rectangle { anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: parent.color; opacity: 0.28 } }
                 Text { anchors.verticalCenter: parent.verticalCenter
                     text: bridge.configRefused ? "CONFIG REFUSED" : (bridge.executionEnabled ? (bridge.busy ? "RUNNING" : "READY") : "DISABLED")
                     color: parent.parent.tone
-                    font { family: Theme.font; pixelSize: 11; letterSpacing: 1.8; weight: Font.DemiBold } }
+                    font { family: Theme.font; pixelSize: 13; letterSpacing: 1.4; weight: Font.DemiBold } }
             }
         }
 
         // Kill switch.
         Rectangle {
-            width: killRow.width + 28; height: 36; radius: Theme.radiusSmall
-            color: bridge.executionEnabled ? Theme.alpha(Theme.danger, killArea.containsMouse ? 0.16 : 0.08) : Theme.danger
-            border.width: 1; border.color: Theme.alpha(Theme.danger, 0.6)
+            width: Math.max(138, killRow.width + 30); height: 37; radius: Theme.radiusSmall
+            color: bridge.executionEnabled ? Theme.alpha(Theme.danger, killArea.containsMouse ? 0.18 : 0.10) : Theme.danger
+            border.width: 1; border.color: Theme.alpha(Theme.danger, 0.65)
             opacity: bridge.configRefused ? 0.4 : 1
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+            Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: Theme.alpha(Theme.danger, 0.10) }
             Row {
                 id: killRow
-                anchors.centerIn: parent; spacing: 9
-                Text { anchors.verticalCenter: parent.verticalCenter; text: "⏻"; color: bridge.executionEnabled ? Theme.danger : "#12060a"; font.pixelSize: 14 }
+                anchors.centerIn: parent; spacing: 10
+                Text { anchors.verticalCenter: parent.verticalCenter; text: "⏻"; color: bridge.executionEnabled ? Theme.danger : "#12060a"; font.pixelSize: 16 }
                 Text { anchors.verticalCenter: parent.verticalCenter
                     text: bridge.executionEnabled ? "Kill Switch" : "Re-enable"
                     color: bridge.executionEnabled ? Theme.danger : "#12060a"
-                    font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold } }
+                    font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
             }
             MouseArea { id: killArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: !bridge.configRefused; onClicked: bar.killSwitchRequested() }
         }
 
-        Item { width: 6; height: 1 }
+        Rectangle { width: 1; height: 26; anchors.verticalCenter: parent.verticalCenter; color: Theme.borderStrong; opacity: 0.6 }
         IconButton {
-            tip: "Menu"; width: 34; height: 36; onClicked: bar.menuRequested()
+            tip: "Menu"; width: 36; height: 37; onClicked: bar.menuRequested()
             Grid { anchors.centerIn: parent; columns: 2; spacing: 4
-                Repeater { model: 4; Rectangle { width: 5; height: 5; radius: 1.5; color: Theme.textLabel } } }
+                Repeater { model: 4; Rectangle { width: 6; height: 6; radius: index === 3 ? 1 : 3; color: "transparent"; border.width: 1.4; border.color: Theme.accent } } }
         }
-        IconButton { glyph: "–"; tip: "Minimize"; width: 34; height: 36; onClicked: bar.minimizeRequested() }
-        IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 34; height: 36; onClicked: bar.restoreRequested() }
-        IconButton { glyph: "✕"; tip: "Close"; width: 34; height: 36; onClicked: bar.closeRequested() }
+        IconButton { glyph: "–"; tip: "Minimize"; width: 36; height: 37; onClicked: bar.minimizeRequested() }
+        IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 36; height: 37; onClicked: bar.restoreRequested() }
+        IconButton { glyph: "✕"; tip: "Close"; width: 36; height: 37; onClicked: bar.closeRequested() }
     }
 
     // The tiny icon-only layout-edit control: a sliders glyph in a framed square.
     IconButton {
-        anchors { right: parent.right; top: parent.top; rightMargin: 27; topMargin: 99 }
+        anchors { right: parent.right; top: parent.top; rightMargin: 26; topMargin: 98 }
         tip: bridge.editMode ? "Done editing" : "Edit layout"
         active: bridge.editMode
         framed: true
-        width: 32; height: 32
+        width: 34; height: 34
         onClicked: bar.editRequested()
-        Item { anchors.centerIn: parent; width: 16; height: 14
-            property color c: bridge.editMode ? Theme.accent : Theme.textLabel
-            Rectangle { x: 0; y: 1; width: 16; height: 1.2; color: parent.c }   Rectangle { x: 10; y: -1; width: 4; height: 5; radius: 1; color: parent.c }
-            Rectangle { x: 0; y: 7; width: 16; height: 1.2; color: parent.c }   Rectangle { x: 3; y: 5; width: 4; height: 5; radius: 1; color: parent.c }
-            Rectangle { x: 0; y: 13; width: 16; height: 1.2; color: parent.c }  Rectangle { x: 8; y: 11; width: 4; height: 5; radius: 1; color: parent.c }
+        Item { anchors.centerIn: parent; width: 16; height: 12
+            property color c: bridge.editMode ? Theme.accent : Theme.accent
+            Rectangle { x: 0; y: 2; width: 16; height: 1.2; color: parent.c }   Rectangle { x: 9; y: 0; width: 5; height: 5; radius: 2.5; color: Theme.bg0; border.width: 1.2; border.color: parent.c }
+            Rectangle { x: 0; y: 10; width: 16; height: 1.2; color: parent.c }  Rectangle { x: 3; y: 8; width: 5; height: 5; radius: 2.5; color: Theme.bg0; border.width: 1.2; border.color: parent.c }
         }
     }
 }

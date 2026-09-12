@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
@@ -153,13 +154,13 @@ class Bridge(QObject):
 
     def _say(self, kind: str, text: str) -> None:
         self._feed.append({"kind": kind, "text": redact_text(str(text)),
-                           "time": datetime.now().strftime("%H:%M")})
+                           "time": datetime.now().strftime("%I:%M %p").lstrip("0")})
         del self._feed[:-FEED_LIMIT]
         self.feedChanged.emit()
 
     def _note(self, text: str, kind: str = "system") -> None:
         self._activity.insert(0, {"kind": kind, "text": redact_text(str(text)),
-                                  "time": datetime.now().strftime("%H:%M:%S")})
+                                  "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time()})
         del self._activity[ACTIVITY_LIMIT:]
         self.dataChanged.emit()
 
@@ -287,6 +288,31 @@ class Bridge(QObject):
     def operatorName(self) -> str:
         """The person this installation greets. Display only; JARVIS_OPERATOR_NAME overrides."""
         return os.environ.get("JARVIS_OPERATOR_NAME", "").strip() or "Salih"
+
+    # -- development-only reconstruction aids (absent unless the environment
+    #    asks for them; nothing here touches authority or persisted state) ----
+
+    @Property(str, constant=True)
+    def devReference(self) -> str:
+        """file:// URL of the canonical reference image for the DEV overlay, or ""."""
+        path = os.environ.get("JARVIS_UI_DEV_REFERENCE", "").strip()
+        return Path(path).resolve().as_uri() if path and Path(path).is_file() else ""
+
+    @Property(bool, constant=True)
+    def devFixture(self) -> bool:
+        """True when the DEV visual fixture (sample feed / activity text) is active."""
+        return os.environ.get("JARVIS_UI_DEV_FIXTURE", "") == "1"
+
+    def _seed_dev_fixture(self) -> None:
+        """Display-only sample conversation for side-by-side reconstruction
+        against the reference. Feed and activity text only: no task, no
+        ticket, no config, no persistence. The UI shows a DEV FIXTURE badge."""
+        self._say("user", "Can you review my open tasks, check for any important updates, and help me plan the next steps for today?")
+        self._say("jarvis", "I’ll review your open tasks, check for relevant updates across your tools, and create a focused plan for today.")
+        self._say("jarvis", "Here’s what I found and a recommended plan for today. This takes into account your tasks, recent updates, and key priorities.")
+        for kind, text in (("system", "3 relevant documents found"), ("scheduled", "Calendar update"),
+                           ("system", "Claude Opus 5 ready"), ("system", "New research insight available")):
+            self._note(text, kind)
 
     @Property("QVariantList", notify=stateChanged)
     def effortChoices(self) -> list:
@@ -706,6 +732,8 @@ class Bridge(QObject):
         self.refreshJobs(False)
         self.refreshMemory("", False)
         self._note("JARVIS interface started", "system")
+        if self.devFixture:
+            self._seed_dev_fixture()
 
     @Slot()
     def waitIdle(self) -> None:

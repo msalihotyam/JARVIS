@@ -2,16 +2,16 @@ import QtQuick
 import "../theme"
 
 // One layered glass surface. No live blur: depth comes from a soft drop
-// shadow beneath, a translucent fill, a top sheen, a luminous top-left
-// edge, a darker bottom-right edge and a thin border - all plain
-// rectangles, all static. `level`: 1 workspace glass, 2 panel glass,
-// 3 raised / floating. `brackets` adds the small corner detail of the
-// reference panels.
+// shadow beneath, a translucent fill, a top sheen, a luminous top edge, a
+// darker bottom-right and a thin border - all plain rectangles, all
+// static. `level`: 1 workspace glass, 2 panel glass, 3 raised / floating.
+// `brackets` adds the small corner detail of the reference panels.
 Rectangle {
     id: panel
     property string title: ""
     property string badge: ""
     property color badgeColor: Theme.success
+    property bool badgeRight: false
     property alias headerRight: headerRight.data
     default property alias content: body.data
     property int padding: Theme.pad
@@ -28,6 +28,8 @@ Rectangle {
     // Depth: two soft shadow plates behind the panel (drawn below it: z < 0).
     Rectangle { z: -2; visible: panel.shadow; anchors.fill: parent; anchors.margins: -2; anchors.topMargin: 6; radius: panel.radius + 2; color: "#000000"; opacity: 0.22 }
     Rectangle { z: -1; visible: panel.shadow; anchors.fill: parent; anchors.topMargin: 3; radius: panel.radius; color: "#000000"; opacity: 0.30 }
+    // A faint outer cyan haze along the top edge (the reference's glowing rim).
+    Rectangle { z: -1; anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.radius; rightMargin: panel.radius; topMargin: -3 } height: 6; radius: 3; color: Theme.alpha(Theme.accent, 0.10) }
 
     // Material: a top sheen, a faint left light, a darker foot.
     Rectangle {
@@ -55,19 +57,21 @@ Rectangle {
             GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.18) }
         }
     }
-    // Edge highlights: the luminous top-left edge of the reference chrome.
+    // Edge highlights: the luminous top edge, brightest at the left, and the left edge.
     Rectangle {
-        x: panel.radius; y: 0; height: 1; width: Math.min(parent.width * 0.55, 420)
+        x: panel.radius; y: 0; height: 1; width: parent.width - panel.radius * 2
         gradient: Gradient {
             orientation: Gradient.Horizontal
-            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.75) }
-            GradientStop { position: 1.0; color: "transparent" }
+            GradientStop { position: 0.00; color: Theme.alpha(Theme.accent, 0.85) }
+            GradientStop { position: 0.35; color: Theme.alpha(Theme.accent, 0.45) }
+            GradientStop { position: 0.75; color: Theme.alpha(Theme.accent, 0.30) }
+            GradientStop { position: 1.00; color: Theme.alpha(Theme.accent, 0.10) }
         }
     }
     Rectangle {
         x: 0; y: panel.radius; width: 1; height: Math.min(parent.height * 0.45, 260)
         gradient: Gradient {
-            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.55) }
+            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.6) }
             GradientStop { position: 1.0; color: "transparent" }
         }
     }
@@ -89,16 +93,19 @@ Rectangle {
         height: visible ? 24 : 0
         Row {
             anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
-            spacing: 12
+            spacing: 14
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: panel.title.toUpperCase()
-                color: Theme.textLabel
-                font { family: Theme.font; pixelSize: Theme.fsLabel; letterSpacing: Theme.labelSpacing; weight: Font.DemiBold }
+                color: "#cfeaff"
+                font { family: Theme.font; pixelSize: 13; letterSpacing: 2.2; weight: Font.DemiBold }
             }
-            Pill { visible: panel.badge !== ""; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
+            Pill { visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }
-        Row { id: headerRight; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8 }
+        Row { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+            Row { id: headerRight; spacing: 8; anchors.verticalCenter: parent.verticalCenter }
+            Pill { visible: panel.badge !== "" && panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
+        }
     }
     Rectangle {
         visible: panel.title !== ""
@@ -116,6 +123,6 @@ Rectangle {
         clip: true
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; top: panel.title !== "" ? header.bottom : parent.top
                   leftMargin: panel.padding; rightMargin: panel.padding; bottomMargin: panel.padding
-                  topMargin: panel.title !== "" ? 20 : panel.padding }
+                  topMargin: panel.title !== "" ? 18 : panel.padding }
     }
 }

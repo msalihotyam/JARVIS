@@ -80,8 +80,8 @@ QtObject {
     property color surface: space ? "#b40a1530" : "#d80a0e15"
     property color surfaceRaised: space ? "#cc0e1c3c" : "#ee10161f"
     property color sheen: space ? "#1c9fd8ff" : "#10a0c8e0"
-    property color border: space ? "#3c4fd8ff" : "#2e4a7f9a"
-    property color borderStrong: space ? "#8a4fd8ff" : "#66408aa8"
+    property color border: space ? "#524fd8ff" : "#2e4a7f9a"
+    property color borderStrong: space ? "#964fd8ff" : "#66408aa8"
     property color hud: space ? "#4fd8ff" : "#3a90b0"
     property real hudOpacity: space ? 0.5 : 0.3
     Behavior on surfaceDeep { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }

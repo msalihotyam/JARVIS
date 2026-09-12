@@ -50,7 +50,8 @@ Window {
     TopBar {
         id: topBar
         anchors { left: parent.left; right: parent.right; top: parent.top }
-        clock: Qt.formatTime(clock.now, "HH:mm")
+        clock: Qt.formatTime(clock.now, "h:mm")
+        meridiem: Qt.formatTime(clock.now, "AP")
         date: Qt.formatDate(clock.now, "ddd, d MMMM yyyy")
         fullscreen: root.fullscreen
         settingsOpen: settings.open
@@ -169,6 +170,25 @@ Window {
     SettingsDrawer { id: settings }
     CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: settings.open = true; onFocusComposer: {} }
     ConfirmDialog { id: confirm }
+
+    // -- DEVELOPMENT ONLY: reconstruction aids. Both exist only when the
+    //    environment provides them (JARVIS_UI_DEV_REFERENCE / _FIXTURE); a
+    //    normal launch has neither. The reference overlay is non-interactive
+    //    and cycles hidden -> 50 % blend -> reference only with Ctrl+Shift+R.
+    Image {
+        id: devReference
+        anchors.fill: parent; z: 9000
+        source: bridge.devReference
+        visible: bridge.devReference !== "" && opacity > 0
+        opacity: 0
+        fillMode: Image.Stretch
+        enabled: false
+        Rectangle { anchors { right: parent.right; top: parent.top; margins: 8 } width: devLabel.width + 16; height: 22; radius: 6; color: "#c0000000"
+            Text { id: devLabel; anchors.centerIn: parent; text: "DEV REFERENCE OVERLAY " + Math.round(devReference.opacity * 100) + " %"; color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
+    }
+    Shortcut { sequence: "Ctrl+Shift+R"; enabled: bridge.devReference !== ""; onActivated: devReference.opacity = devReference.opacity === 0 ? 0.5 : (devReference.opacity === 0.5 ? 1 : 0) }
+    Pill { visible: bridge.devFixture; z: 8000; text: "Dev fixture · sample text, not real activity"; tint: Theme.danger
+        anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 26 } }
 
     // -- shortcuts -----------------------------------------------------------
     Shortcut { sequence: "Ctrl+K"; onActivated: palette.open ? palette.hide() : palette.show() }
