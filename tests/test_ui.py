@@ -959,5 +959,53 @@ class SecondaryPageTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class StatusIndicatorTests(UiTestCase):
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def test_lamp_binds_to_real_execution_state_and_skin_persists(self) -> None:
+        bridge = self.bridge()
+        self.assertEqual("orb", bridge.statusIndicator)
+        root = self.window(bridge)
+        lamp = self.item(root, "statusOrb")
+        self.assertTrue(lamp.property("lit"))
+        self.assertEqual("orb", lamp.property("skin"))
+        # The kill switch changes the persisted barrier; the lamp only follows it.
+        bridge.setExecutionEnabled(False)
+        pump(50)
+        self.assertFalse(lamp.property("lit"))
+        self.assertFalse(self.store.load().settings.execution_enabled)
+        bridge.setExecutionEnabled(True)
+        pump(50)
+        self.assertTrue(lamp.property("lit"))
+        # Separate hit targets: the lamp and the kill switch never overlap.
+        from PySide6.QtCore import QPointF
+        kill = self.item(root, "killSwitchControl")
+        for width, height in ((1920, 1080), (1280, 760)):
+            root.resize(width, height)
+            pump(300)
+            l0 = lamp.mapToScene(QPointF(0, 0)); l1 = lamp.mapToScene(QPointF(lamp.width(), lamp.height()))
+            k0 = kill.mapToScene(QPointF(0, 0)); k1 = kill.mapToScene(QPointF(kill.width(), kill.height()))
+            self.assertLessEqual(l1.x(), k0.x() + 1, f"lamp overlaps kill switch at {width}x{height}")
+            self.assertLessEqual(l1.x(), width); self.assertLessEqual(k1.x(), width)
+        # Skin choice persists, survives a fresh load, is reversible and never touches execution.
+        bridge.setStatusIndicator("hud")
+        pump(50)
+        self.assertEqual("hud", lamp.property("skin"))
+        self.assertTrue(lamp.property("lit"))
+        self.assertEqual("hud", json.loads(self.prefs_path.read_text(encoding="utf-8"))["status_indicator"])
+        self.assertEqual("hud", UiPreferences(self.prefs_path).data["status_indicator"])
+        self.assertTrue(self.store.load().settings.execution_enabled)
+        bridge.setStatusIndicator("neon")  # not a skin: ignored
+        self.assertEqual("hud", bridge.statusIndicator)
+        bridge.setStatusIndicator("orb")
+        self.assertEqual("orb", UiPreferences(self.prefs_path).data["status_indicator"])
+        # A document written before the lamp existed keeps its choices and gains the default.
+        legacy = canonical_preferences(); del legacy["status_indicator"]; legacy["theme"] = "dark"
+        self.assertEqual({**canonical_preferences(), "theme": "dark"}, validate_preferences(legacy))
+        self.assertEqual(canonical_preferences(), validate_preferences({**canonical_preferences(), "status_indicator": "neon"}))
+        self.assertEqual(0, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

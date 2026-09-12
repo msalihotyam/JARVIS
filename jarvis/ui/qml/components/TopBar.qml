@@ -258,20 +258,27 @@ Item {
             MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openModel() }
         }
 
-        // Execution state.
-        Rectangle {
-            readonly property color tone: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
-            width: Math.max(118, stateRow.width + 30); height: 40; radius: Theme.radiusSmall
-            color: Theme.alpha(tone, 0.10); border.width: 1; border.color: Theme.alpha(tone, 0.42)
-            Row {
-                id: stateRow
-                anchors.centerIn: parent; spacing: 10
-                Rectangle { width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter; color: parent.parent.tone
-                    Rectangle { anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: parent.color; opacity: 0.28 } }
-                Text { anchors.verticalCenter: parent.verticalCenter
-                    text: bridge.configRefused ? "CONFIG REFUSED" : (bridge.executionEnabled ? (bridge.busy ? "RUNNING" : "READY") : "DISABLED")
-                    color: parent.parent.tone
-                    font { family: Theme.font; pixelSize: 13; letterSpacing: 1.4; weight: Font.DemiBold } }
+        // Execution state: the glass lamp. Indicates only - the Kill Switch
+        // beside it is the control. Sized so its ring reads at ~1.18x the
+        // kill switch ring, as in the reference; the axis nodes overhang the row.
+        Item {
+            width: 62; height: 40
+            StatusOrb {
+                id: statusOrb
+                objectName: "statusOrb"
+                anchors.centerIn: parent
+                lit: bridge.executionEnabled && !bridge.configRefused
+                skin: bridge.statusIndicator
+                Accessible.role: Accessible.Indicator
+                Accessible.name: bridge.configRefused ? "Execution status: configuration refused" : (bridge.executionEnabled ? (bridge.busy ? "Execution status: running" : "Execution status: ready") : "Execution status: disabled")
+                MouseArea { id: orbHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+                Rectangle {
+                    visible: orbHover.containsMouse
+                    anchors.top: parent.bottom; anchors.topMargin: 4; anchors.horizontalCenter: parent.horizontalCenter
+                    width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
+                    Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font { family: Theme.font; pixelSize: 11 }
+                        text: bridge.configRefused ? "Configuration refused" : (bridge.executionEnabled ? (bridge.busy ? "Execution ready · running" : "Execution ready") : "Execution disabled") }
+                }
             }
         }
 

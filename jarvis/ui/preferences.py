@@ -20,6 +20,8 @@ from typing import Any
 
 PREFERENCES_VERSION = 2
 THEMES = ("space", "dark", "command")
+#: Execution-status lamp skins: the canonical glass orb and the HUD variant.
+STATUS_INDICATORS = ("orb", "hud")
 PROFILES = ("normal", "focus", "monitoring")
 PAGES = ("home", "tasks", "automations", "memory", "history")
 #: Pages earlier documents may name that no longer exist (Settings became a
@@ -85,6 +87,7 @@ def canonical_preferences() -> dict[str, Any]:
         "version": PREFERENCES_VERSION,
         "theme": "space",
         "ambient_effects": True,
+        "status_indicator": "orb",
         "profile": "normal",
         "page": "home",
         "profiles": canonical_profiles(),
@@ -154,13 +157,19 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     defaults = canonical_preferences()
     # Preserve only a complete, valid v1 document. Validation below still
     # rejects malformed old fields; migration never writes product config.
-    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) == set(defaults) - {"packages"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator"} == set(defaults) - {"packages", "status_indicator"}:
         candidate = {**candidate, "version": PREFERENCES_VERSION, "packages": defaults["packages"]}
+    # A complete document from before the status lamp existed keeps every
+    # choice and gains the default lamp.
+    if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
+        candidate = {**candidate, "status_indicator": defaults["status_indicator"]}
     if not isinstance(candidate, dict) or set(candidate) != set(defaults):
         return defaults
     if candidate["version"] != PREFERENCES_VERSION:
         return defaults
     if candidate["theme"] not in THEMES or type(candidate["ambient_effects"]) is not bool:
+        return defaults
+    if candidate["status_indicator"] not in STATUS_INDICATORS:
         return defaults
     if candidate["page"] in _RETIRED_PAGES:
         candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
@@ -193,6 +202,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "version": PREFERENCES_VERSION,
         "theme": candidate["theme"],
         "ambient_effects": candidate["ambient_effects"],
+        "status_indicator": candidate["status_indicator"],
         "profile": candidate["profile"],
         "page": candidate["page"],
         "profiles": validated,

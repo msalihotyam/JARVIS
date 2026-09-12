@@ -30,6 +30,7 @@ from jarvis.ui.preferences import (
     PROFILES,
     THEMES,
     UiPreferences,
+    STATUS_INDICATORS,
 )
 from jarvis.ui.present import (
     TERMINAL_STATUSES,
@@ -619,6 +620,18 @@ class Bridge(QObject):
         self.prefs.data["ambient_effects"] = bool(enabled)
         self.prefs.save()
         self.prefsChanged.emit()
+
+    @Property(str, notify=prefsChanged)
+    def statusIndicator(self) -> str:
+        """Skin of the execution-status lamp. Presentation only; never authority."""
+        return self.prefs.data["status_indicator"]
+
+    @Slot(str)
+    def setStatusIndicator(self, skin: str) -> None:
+        if skin in STATUS_INDICATORS:
+            self.prefs.data["status_indicator"] = skin
+            self.prefs.save()
+            self.prefsChanged.emit()
 
     @Property(str, notify=prefsChanged)
     def profile(self) -> str:

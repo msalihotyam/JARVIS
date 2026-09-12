@@ -53,6 +53,10 @@ ContextPanel {
                 Text { text: "Ambient effects"; width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
                 Segmented { value: bridge.ambientEffects ? "on" : "off"; options: [{value:"on",label:"On"},{value:"off",label:"Off"}]; onPicked: function(v) { bridge.setAmbientEffects(v === "on") } }
             }
+            Row { width: parent.width; spacing: 18
+                Text { text: "Status indicator"; width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
+                Segmented { objectName: "statusIndicatorChoice"; value: bridge.statusIndicator; options: [{value:"orb",label:"Canonical Orb"},{value:"hud",label:"HUD Orb"}]; onPicked: function(v) { bridge.setStatusIndicator(v) } }
+            }
             Rectangle { width: parent.width; height: 1; color: Theme.border }
             Label { text: "THIS PACKAGE’S LAYOUT" }
             Segmented { value: bridge.profile; options: [{value:"normal",label:"Normal"},{value:"focus",label:"Focus"},{value:"monitoring",label:"Monitoring"}]; onPicked: function(v) { bridge.setProfile(v) } }
