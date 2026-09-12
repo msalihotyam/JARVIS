@@ -870,5 +870,94 @@ class PresentationTests(UiTestCase):
         self.assertEqual("completed", bridge.coreState)
 
 
+class SecondaryPageTests(UiTestCase):
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+
+    def test_all_secondary_pages_close_to_same_primary_package_by_x_and_escape(self):
+        from copy import deepcopy
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for theme in ("space", "dark", "command"):
+            bridge.setTheme(theme)
+            pump(450)
+            layout = deepcopy(bridge.prefs.layout())
+            for page in ("tasks", "automations", "memory", "history"):
+                for action in ("x", "escape"):
+                    with self.subTest(theme=theme, page=page, action=action):
+                        self.click(root, "navigationTrigger")
+                        self.click(root, "navigate_" + page)
+                        self.assertEqual(page, bridge.page)
+                        close = self.item(root, "secondaryPageClose")
+                        self.assertTrue(close.isVisible())
+                        self.assertTrue(close.isEnabled())
+                        if action == "x":
+                            self.click(root, "secondaryPageClose")
+                        else:
+                            QTest.keyClick(root, Qt.Key_Escape)
+                            pump(300)
+                        self.assertEqual("home", bridge.page)
+                        self.assertTrue(root.isVisible())
+                        self.assertEqual(theme, bridge.theme)
+                        self.assertEqual(layout, bridge.prefs.layout())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_escape_dismisses_context_first_then_page_even_with_spec_focus(self):
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge.setPage("automations")
+        pump(300)
+        self.click(root, "jobSpecInput")
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(300)
+        self.assertEqual("home", bridge.page)
+        bridge.setPage("automations")
+        pump(300)
+        self.click(root, "navigationTrigger")
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(250)
+        self.assertFalse(root.property("navOpen"))
+        self.assertEqual("automations", bridge.page)
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(300)
+        self.assertEqual("home", bridge.page)
+
+    def test_automations_creation_bounds_empty_and_populated_at_supported_sizes(self):
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge.setPage("automations")
+        pump(300)
+        viewport = self.item(root, "automationsViewport")
+        button = self.item(root, "createJobButton")
+        spec = self.item(root, "jobSpecification")
+        for count in (0, 8):
+            bridge._jobs = [dict(id=f"fixture-{i}", label=f"Display fixture {i}", kind="interval", readable=True, archived=False, enabled=False, revision=1, next_due_at_utc="") for i in range(count)]
+            bridge.dataChanged.emit()
+            for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
+                with self.subTest(jobs=count, size=(width, height)):
+                    root.resize(width, height)
+                    pump(400)
+                    viewport.setProperty("contentY", 0)
+                    self.assertGreaterEqual(spec.height(), 180)
+                    self.assertGreater(button.height(), 30)
+                    bottom = max(0, viewport.property("contentHeight") - viewport.height())
+                    if width == 1920:
+                        self.assertLessEqual(bottom, 1, "master layout must show the whole form without scrolling")
+                    viewport.setProperty("contentY", bottom)
+                    pump(50)
+                    top_left = button.mapToItem(viewport, QPointF(0, 0))
+                    bottom_right = button.mapToItem(viewport, QPointF(button.width(), button.height()))
+                    self.assertGreaterEqual(top_left.y(), 0)
+                    self.assertLessEqual(bottom_right.y(), viewport.height() - 16)
+                    self.assertLessEqual(bottom_right.x(), viewport.width())
+                    window_bottom = viewport.mapToScene(QPointF(viewport.width(), viewport.height()))
+                    self.assertLessEqual(window_bottom.y(), height - 40)
+                    self.assertTrue(button.isEnabled())
+                    self.assertEqual(count == 0, self.item(root, "automationsEmpty").isVisible())
+        self.assertEqual(0, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

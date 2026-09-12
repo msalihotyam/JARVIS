@@ -19,6 +19,8 @@ Rectangle {
     property bool raised: false
     property bool shadow: true
     property bool brackets: false
+    property bool closable: false
+    signal closeRequested()
 
     radius: Theme.radius
     color: raised || level === 3 ? Theme.surfaceRaised : level === 1 ? Theme.surfaceWorkspace : Theme.surface
@@ -98,7 +100,7 @@ Rectangle {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: panel.title.toUpperCase()
-                width: Math.min(implicitWidth, Math.max(0, header.width - headerTail.width - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8))
+                width: Math.min(implicitWidth, Math.max(0, header.width - headerTail.width - (panel.closable ? 42 : 0) - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8))
                 elide: Text.ElideRight
                 color: "#cfeaff"
                 font { family: Theme.font; pixelSize: 12; letterSpacing: 1.6; weight: Font.DemiBold }
@@ -106,8 +108,16 @@ Rectangle {
             Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }
         Row { id: headerTail; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+            anchors.rightMargin: panel.closable ? 42 : 0
             Row { id: headerRight; spacing: 8; anchors.verticalCenter: parent.verticalCenter }
             Pill { visible: panel.badge !== "" && panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
+        }
+        IconButton {
+            objectName: panel.closable ? "secondaryPageClose" : ""
+            visible: panel.closable
+            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            width: 28; height: 28; glyph: "✕"; tip: "Back to Command Center"
+            onClicked: panel.closeRequested()
         }
     }
     Rectangle {

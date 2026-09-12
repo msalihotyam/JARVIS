@@ -5,7 +5,7 @@ import "../components"
 
 // Recent activity of this interface session plus the durable session
 // listing. Bounded, read-only.
-GlassPanel {
+SecondaryPage {
     id: page
     title: "History"
     headerRight: [ ActionButton { label: "Refresh"; onClicked: bridge.refreshHistory() } ]

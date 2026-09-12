@@ -5,7 +5,7 @@ import "../components"
 
 // Project memory: explicit, untrusted reference data. Read-only here; it
 // is not chat and grants no authority.
-GlassPanel {
+SecondaryPage {
     id: page
     title: "Memory"
     property string project: ""

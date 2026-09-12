@@ -5,7 +5,7 @@ import "../components"
 
 // Sessions -> tasks -> one task's operational snapshot. Read-only, bounded,
 // with Resume for a task that is genuinely parked.
-GlassPanel {
+SecondaryPage {
     id: page
     title: "Tasks"
     property string selectedSession: ""

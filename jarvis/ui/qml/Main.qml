@@ -229,5 +229,6 @@ Window {
         else if (settings.open) settings.open = false
         else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
+        else if (!root.homePage && pageLoader.item) pageLoader.item.closePage()
         else if (bridge.editMode) bridge.setEditMode(false) } }
 }

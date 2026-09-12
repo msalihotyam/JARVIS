@@ -24,6 +24,7 @@ def main() -> int:
     parser.add_argument("--capture-dir", type=Path)
     parser.add_argument("--capture-name", default="preview")
     parser.add_argument("--size", default="1920x1080")
+    parser.add_argument("--page", choices=("home", "tasks", "automations", "memory", "history"), default="home")
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
@@ -46,6 +47,7 @@ def main() -> int:
     bridge.prefs.data["theme"] = args.theme
     window = case.load(bridge)
     window.setTitle("JARVIS — UI visual validation")
+    bridge.setPage(args.page)
     width, height = (int(n) for n in args.size.split("x"))
     if (width, height) != (1920, 1080):
         window.showNormal()
