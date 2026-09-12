@@ -11,7 +11,12 @@ import "../theme"
 ListView {
     id: feed
     model: bridge.feed
-    spacing: 20
+    spacing: 18
+    property bool pipelineEnabled: false
+    readonly property int pipelineIndex: {
+        var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
+        return first < 0 ? bridge.feed.length - 1 : first
+    }
     clip: true
     boundsBehavior: Flickable.StopAtBounds
     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -47,7 +52,13 @@ ListView {
     delegate: Item {
         id: row
         width: feed.width
-        height: Math.max(avatar.height, card.height)
+        height: Math.max(avatar.height, card.height) + (pipelineLoader.active ? pipelineLoader.height + 22 : 0)
+        Loader {
+            id: pipelineLoader
+            x: 68; y: Math.max(avatar.height, card.height) + 22; width: parent.width - 68
+            active: feed.pipelineEnabled && index === feed.pipelineIndex
+            sourceComponent: Component { StagePipeline { notes: false } }
+        }
         readonly property string kind: modelData.kind
         readonly property bool isUser: kind === "user"
         readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
@@ -103,10 +114,10 @@ ListView {
             x: avatar.width + 18
             // The reference wraps both the request card and JARVIS's text at
             // about 640 px rather than spanning the whole flow.
-            width: row.boxed ? Math.min(row.width - x - 4, 640) : row.width - x - 4
-            readonly property real textWidth: row.boxed ? width - 36 : Math.min(width - 4, 640)
+            width: row.boxed ? Math.min(row.width - x - 4, 625) : row.width - x - 4
+            readonly property real textWidth: row.boxed ? width - 32 : Math.min(width - 4, 710)
             height: body.height + (row.boxed ? 30 : 14)
-            radius: 12
+            radius: 9
             // The request card of the reference: quiet darker glass, a barely-there border.
             color: row.isUser ? Theme.alpha(Theme.bg0, 0.34) : (row.loud ? Theme.alpha(row.tone, 0.07) : "transparent")
             border.width: row.boxed ? 1 : 0
@@ -133,7 +144,7 @@ ListView {
                     wrapMode: Text.Wrap
                     color: row.kind === "system" ? Theme.textMuted : Theme.text
                     selectionColor: Theme.accentSoft
-                    font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : 16 }
+                    font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : 17 }
                     textFormat: TextEdit.PlainText
                 }
             }

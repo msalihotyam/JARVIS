@@ -28,8 +28,17 @@ Window {
     readonly property bool paletteOpen: palette.open
     readonly property bool navOpen: nav.open
     readonly property bool settingsOpen: settings.open
+    readonly property bool modelOpen: modelPanel.open
+    readonly property string presentation: bridge.theme
+    readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
+    property bool devApprovalVisible: false
 
-    function toggleSettings() { settings.open = !settings.open }
+    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false }
+    function toggleSettings() { var next = !settings.open; closeContexts(); settings.open = next }
+    function toggleModel() { var next = !modelPanel.open; closeContexts(); modelPanel.open = next }
+    function toggleNav() { var next = !nav.open; closeContexts(); nav.open = next }
+    onHomePageChanged: closeContexts()
+    onPresentationChanged: { nav.open = false; modelPanel.open = false }
 
     Component.onCompleted: {
         Theme.name = bridge.theme
@@ -39,7 +48,7 @@ Window {
     Connections {
         target: bridge
         function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects }
-        function onApprovalChanged() { if (bridge.approvalPending) bridge.setPage("home") }
+        function onApprovalChanged() { if (bridge.approvalPending) { root.closeContexts(); bridge.setPage("home") } }
     }
 
     Timer { interval: 1000; running: true; repeat: true; onTriggered: { clock.now = new Date() } }
@@ -49,19 +58,21 @@ Window {
 
     TopBar {
         id: topBar
+        controlLayer: topControls
         anchors { left: parent.left; right: parent.right; top: parent.top }
-        clock: Qt.formatTime(clock.now, "h:mm")
+        clock: Qt.formatTime(clock.now, "h:mm AP").split(" ")[0]
         meridiem: Qt.formatTime(clock.now, "AP")
         date: Qt.formatDate(clock.now, "ddd, d MMMM yyyy")
         fullscreen: root.fullscreen
         settingsOpen: settings.open
-        onMenuRequested: nav.open = !nav.open
+        onMenuRequested: root.toggleNav()
         onKillSwitchRequested: root.askKillSwitch()
         onEditRequested: bridge.setEditMode(!bridge.editMode)
         onMinimizeRequested: root.showMinimized()
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
         onOpenSettings: root.toggleSettings()
+        onOpenModel: root.toggleModel()
     }
 
     function askKillSwitch() {
@@ -77,11 +88,11 @@ Window {
         id: content
         readonly property bool wide: root.width >= 1500
         anchors { left: parent.left; right: parent.right; top: topBar.bottom; bottom: parent.bottom
-                  leftMargin: wide ? Math.round(root.width * 0.1276) : Theme.margin
+                  leftMargin: root.presentation === "command" ? Theme.margin : wide ? Math.round(root.width * 0.1292) : Theme.margin
                   rightMargin: wide ? Math.round(root.width * 0.0182) : Theme.margin
                   bottomMargin: wide ? Math.round(root.height * 0.046) : 40; topMargin: 8 }
         Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
-        readonly property bool showColumn: root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
+        readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
         readonly property int columnGap: 16
 
@@ -110,7 +121,9 @@ Window {
                 }
             }
         }
-        Component { id: homePage; CommandCenter { id: cc } }
+        Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
+        Component { id: canonicalPackage; CommandCenter {} }
+        Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
         Component { id: tasksPage; TasksPage {} }
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
         Component { id: memoryPage; MemoryPage {} }
@@ -165,10 +178,17 @@ Window {
         text: "Focus mode · Ctrl+Shift+F to leave"; tint: Theme.accent
     }
 
-    NavMenu { id: nav; onSettingsRequested: settings.open = true }
-    ApprovalOverlay {}
-    SettingsDrawer { id: settings }
-    CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: settings.open = true; onFocusComposer: {} }
+    NavMenu { id: nav; anchorPoint: Qt.point(topBar.navAnchor.x - panelWidth, topBar.navAnchor.y) }
+    Loader { anchors.fill: parent; z: 450; active: !root.inlineApproval
+        sourceComponent: Component { ApprovalOverlay { fixture: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
+    }
+
+    // Only interaction controls sit over contextual scrims. The clock,
+    // core and HUD stay behind floating glass, never across its text.
+    Item { id: topControls; anchors.fill: parent; z: 500 }
+    SettingsDrawer { id: settings; anchorPoint: topBar.settingsAnchor }
+    ModelPanel { id: modelPanel; anchorPoint: topBar.modelAnchor }
+    CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 
     // -- DEVELOPMENT ONLY: reconstruction aids. Both exist only when the
@@ -187,6 +207,7 @@ Window {
             Text { id: devLabel; anchors.centerIn: parent; text: "DEV REFERENCE OVERLAY " + Math.round(devReference.opacity * 100) + " %"; color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
     }
     Shortcut { sequence: "Ctrl+Shift+R"; enabled: bridge.devReference !== ""; onActivated: devReference.opacity = devReference.opacity === 0 ? 0.5 : (devReference.opacity === 0.5 ? 1 : 0) }
+    Shortcut { sequence: "Ctrl+Shift+A"; enabled: bridge.devFixture && !bridge.approvalPending; onActivated: { root.closeContexts(); root.devApprovalVisible = !root.devApprovalVisible } }
     Pill { visible: bridge.devFixture; z: 8000; text: "Dev fixture · sample text, not real activity"; tint: Theme.danger
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 26 } }
 
@@ -195,7 +216,7 @@ Window {
     Shortcut { sequence: "F11"; onActivated: root.fullscreen ? root.showNormal() : root.showFullScreen() }
     Shortcut { sequence: "Ctrl+Shift+F"; onActivated: bridge.setFocusMode(!bridge.focusMode) }
     Shortcut { sequence: "Ctrl+E"; onActivated: bridge.setEditMode(!bridge.editMode) }
-    Shortcut { sequence: "Ctrl+M"; onActivated: nav.open = !nav.open }
+    Shortcut { sequence: "Ctrl+M"; onActivated: root.toggleNav() }
     Shortcut { sequence: "Ctrl+1"; onActivated: bridge.setPage("home") }
     Shortcut { sequence: "Ctrl+2"; onActivated: bridge.setPage("tasks") }
     Shortcut { sequence: "Ctrl+3"; onActivated: bridge.setPage("automations") }
@@ -206,6 +227,7 @@ Window {
         if (palette.open) palette.hide()
         else if (confirm.open) confirm.open = false
         else if (settings.open) settings.open = false
+        else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
         else if (bridge.editMode) bridge.setEditMode(false) } }
 }

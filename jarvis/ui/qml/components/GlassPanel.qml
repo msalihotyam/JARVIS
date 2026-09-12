@@ -29,7 +29,8 @@ Rectangle {
     Rectangle { z: -2; visible: panel.shadow; anchors.fill: parent; anchors.margins: -2; anchors.topMargin: 6; radius: panel.radius + 2; color: "#000000"; opacity: 0.22 }
     Rectangle { z: -1; visible: panel.shadow; anchors.fill: parent; anchors.topMargin: 3; radius: panel.radius; color: "#000000"; opacity: 0.30 }
     // A faint outer cyan haze along the top edge (the reference's glowing rim).
-    Rectangle { z: -1; anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.radius; rightMargin: panel.radius; topMargin: -3 } height: 6; radius: 3; color: Theme.alpha(Theme.accent, 0.10) }
+    Rectangle { z: -1; visible: panel.raised; anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.radius; rightMargin: panel.width * 0.4; topMargin: -2 } height: 4; radius: 2; color: Theme.alpha(Theme.accent, 0.06) }
+    Rectangle { anchors.fill: parent; anchors.margins: 5; radius: Math.max(2, panel.radius - 4); color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, panel.level === 1 ? 0.09 : 0.045) }
 
     // Material: a top sheen, a faint left light, a darker foot.
     Rectangle {
@@ -62,16 +63,16 @@ Rectangle {
         x: panel.radius; y: 0; height: 1; width: parent.width - panel.radius * 2
         gradient: Gradient {
             orientation: Gradient.Horizontal
-            GradientStop { position: 0.00; color: Theme.alpha(Theme.accent, 0.85) }
-            GradientStop { position: 0.35; color: Theme.alpha(Theme.accent, 0.45) }
-            GradientStop { position: 0.75; color: Theme.alpha(Theme.accent, 0.30) }
-            GradientStop { position: 1.00; color: Theme.alpha(Theme.accent, 0.10) }
+            GradientStop { position: 0.00; color: Theme.alpha(Theme.accent, 0.38) }
+            GradientStop { position: 0.20; color: Theme.alpha(Theme.accent, 0.08) }
+            GradientStop { position: 0.75; color: Theme.alpha(Theme.accent, 0.04) }
+            GradientStop { position: 1.00; color: Theme.alpha(Theme.accent, 0.26) }
         }
     }
     Rectangle {
         x: 0; y: panel.radius; width: 1; height: Math.min(parent.height * 0.45, 260)
         gradient: Gradient {
-            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.6) }
+            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.28) }
             GradientStop { position: 1.0; color: "transparent" }
         }
     }
@@ -97,12 +98,14 @@ Rectangle {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: panel.title.toUpperCase()
+                width: Math.min(implicitWidth, Math.max(0, header.width - headerTail.width - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8))
+                elide: Text.ElideRight
                 color: "#cfeaff"
-                font { family: Theme.font; pixelSize: 13; letterSpacing: 2.2; weight: Font.DemiBold }
+                font { family: Theme.font; pixelSize: 12; letterSpacing: 1.6; weight: Font.DemiBold }
             }
-            Pill { visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
+            Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }
-        Row { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+        Row { id: headerTail; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8
             Row { id: headerRight; spacing: 8; anchors.verticalCenter: parent.verticalCenter }
             Pill { visible: panel.badge !== "" && panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }

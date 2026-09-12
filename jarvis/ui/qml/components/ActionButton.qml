@@ -10,6 +10,12 @@ Rectangle {
     property bool danger: false
     property bool compact: false
     signal clicked()
+    activeFocusOnTab: true
+    Accessible.role: Accessible.Button
+    Accessible.name: label
+    Accessible.onPressAction: if (enabled) clicked()
+    Keys.onReturnPressed: if (enabled) clicked()
+    Keys.onSpacePressed: if (enabled) clicked()
 
     readonly property color tone: danger ? Theme.danger : Theme.accent
     readonly property bool hovered: area.containsMouse && enabled

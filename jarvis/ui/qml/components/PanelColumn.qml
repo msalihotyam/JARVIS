@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls.Basic
 import "../theme"
 
 // The right-side information column: an ordered stack of real panels.
@@ -7,6 +8,7 @@ import "../theme"
 // Reset Layout. All geometry is derived, so nothing can leave the screen.
 Item {
     id: column
+    property bool commandMode: false
     property var panels: bridge.panels
     property var shown: panels.filter(function(p) { return p.shown })
     property real totalShare: shown.reduce(function(sum, p) { return sum + p.share }, 0)
@@ -14,7 +16,7 @@ Item {
     property real usable: height - editChrome - Math.max(0, shown.length - 1) * Theme.gap
     readonly property int minPanelHeight: 120
     property real nowSec: Date.now() / 1000
-    Timer { interval: 30000; running: true; repeat: true; onTriggered: column.nowSec = Date.now() / 1000 }
+    Timer { interval: 30000; running: column.visible; repeat: true; onTriggered: column.nowSec = Date.now() / 1000 }
     function ago(ts, fallback) {
         if (!ts) return fallback
         var s = Math.max(0, column.nowSec - ts)
@@ -25,9 +27,10 @@ Item {
     // share. The sum therefore never exceeds the column, whatever the shares.
     function heightFor(index) {
         var n = shown.length
-        var free = usable - n * minPanelHeight
+        var minima = shown.map(function(p) { return column.commandMode ? ({workflow:230,system:195,activity:180,automations:125})[p.id] : column.minPanelHeight })
+        var free = usable - minima.reduce(function(sum, value) { return sum + value }, 0)
         if (free < 0) return Math.max(0, usable / Math.max(n, 1))
-        return minPanelHeight + free * (shown[index].share / Math.max(totalShare, 0.0001))
+        return minima[index] + free * (shown[index].share / Math.max(totalShare, 0.0001))
     }
     function yFor(index) {
         var y = editChrome
@@ -102,11 +105,11 @@ Item {
                 id: glass
                 anchors.fill: parent
                 brackets: true
-                padding: 20
-                title: ({ system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
+                padding: column.width < 400 ? 12 : column.commandMode ? 16 : 20
+                title: (column.commandMode ? {system:"Model & execution",workflow:"Active task",activity:"Recent actions",automations:"Memory context"} : { system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
                 badge: modelData.id === "system" ? (bridge.configRefused ? "config refused" : (bridge.executionEnabled ? "enabled" : "disabled"))
                      : modelData.id === "activity" ? "live"
-                     : modelData.id === "automations" ? (bridge.jobs.length + " job" + (bridge.jobs.length === 1 ? "" : "s"))
+                     : modelData.id === "automations" ? (column.commandMode ? bridge.projects.length + " projects" : bridge.jobs.length + " job" + (bridge.jobs.length === 1 ? "" : "s"))
                      : ""
                 badgeRight: modelData.id !== "system"
                 badgeColor: modelData.id === "system" ? (bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success)
@@ -135,9 +138,16 @@ Item {
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: "PINNED"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
                     }
                 ]
-                Loader {
+                Flickable {
+                    id: bodyViewport
                     anchors.fill: parent
-                    sourceComponent: ({ system: systemPanel, workflow: workflowPanel, activity: activityPanel, automations: automationsPanel })[modelData.id]
+                    contentHeight: Math.max(height, modelData.id === "workflow" ? 166 : modelData.id === "system" ? (column.commandMode ? 138 : column.width < 400 ? 62 : 108) : 80)
+                    clip: true; boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    Loader {
+                        width: bodyViewport.width; height: bodyViewport.contentHeight
+                        sourceComponent: ({ system: column.commandMode ? modelPanel : systemPanel, workflow: workflowPanel, activity: activityPanel, automations: column.commandMode ? memoryPanel : automationsPanel })[modelData.id]
+                    }
                 }
             }
             // Resize grip: direct while dragging, snapped share on release.
@@ -177,11 +187,11 @@ Item {
     component Gauge: Item {
         property string label: ""; property string value: "—"; property real ratio: -1; property color tint: Theme.accent
         width: 74; height: 74
-        Rectangle { anchors.fill: parent; radius: 37; color: Theme.alpha(Theme.bg0, 0.55); border.width: 7; border.color: ratio < 0 ? Theme.alpha(Theme.textDim, 0.38) : Theme.alpha(tint, 0.9) }
-        Rectangle { anchors.fill: parent; anchors.margins: -3; radius: 40; color: "transparent"; border.width: 1; border.color: Theme.alpha(tint, ratio < 0 ? 0.12 : 0.35) }
+        Rectangle { anchors.fill: parent; radius: width / 2; color: Theme.alpha(Theme.bg0, 0.55); border.width: width < 60 ? 4 : 7; border.color: ratio < 0 ? Theme.alpha(Theme.textDim, 0.38) : Theme.alpha(tint, 0.9) }
+        Rectangle { anchors.fill: parent; anchors.margins: -3; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(tint, ratio < 0 ? 0.12 : 0.35) }
         Column { anchors.centerIn: parent; spacing: -2
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? Theme.textMuted : Theme.text; font { family: Theme.font; pixelSize: 20; weight: Font.DemiBold } }
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: Theme.textLabel; font { family: Theme.font; pixelSize: 11; letterSpacing: 0.6 } }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? Theme.textMuted : Theme.text; font { family: Theme.font; pixelSize: column.width < 400 ? 13 : 20; weight: Font.DemiBold } }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: Theme.textLabel; font { family: Theme.font; pixelSize: column.width < 400 ? 9 : 11; letterSpacing: 0.6 } }
         }
     }
     // One row of the reference's workflow well: icon box, label, dot, status, handle.
@@ -191,11 +201,11 @@ Item {
         Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: 30; height: 30; radius: 8
             color: Theme.alpha(Theme.accentSoft, empty ? 0.16 : 0.32); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, empty ? 0.3 : 0.55)
             Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.textMuted : Theme.accent; font { family: Theme.font; pixelSize: 14 } } }
-        Text { x: 60; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.text; font { family: Theme.font; pixelSize: 15 } }
-        Rectangle { x: 205; width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter; color: empty ? Theme.textDim : tint; opacity: empty ? 0.6 : 1
+        Text { x: 52; width: parent.width * 0.48 - 60; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.text; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
+        Rectangle { x: parent.width * 0.48 - 5; width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: empty ? Theme.textDim : tint; opacity: empty ? 0.6 : 1
             Rectangle { visible: !empty; anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: tint; opacity: 0.25 } }
-        Text { anchors.left: parent.left; anchors.leftMargin: 226; anchors.right: parent.right; anchors.rightMargin: 40; anchors.verticalCenter: parent.verticalCenter
-            text: v; color: empty ? Theme.textMuted : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: 15 } }
+        Text { anchors.left: parent.left; anchors.leftMargin: parent.width * 0.48 + 9; anchors.right: parent.right; anchors.rightMargin: 25; anchors.verticalCenter: parent.verticalCenter
+            text: v; color: empty ? Theme.textMuted : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
         Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: "⁘"; color: Theme.textMuted; font.pixelSize: 13 }
         Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: Theme.border; opacity: 0.55 }
     }
@@ -213,14 +223,14 @@ Item {
         Item {
             Row {
                 id: gauges
-                anchors.left: parent.left; anchors.top: parent.top; anchors.leftMargin: 4; anchors.topMargin: 6
-                spacing: 23
+                anchors.left: parent.left; anchors.top: parent.top; anchors.leftMargin: 4; anchors.topMargin: column.width < 400 ? 3 : 6
+                spacing: column.width < 400 ? Math.max(10, (parent.width - 150) / 2) : 23
                 // Not measured by this build: unlit slots, said plainly below.
-                Gauge { label: "CPU" }
-                Gauge { label: "RAM" }
-                Gauge { label: "Disk" }
+                Gauge { label: "CPU"; width: column.width < 400 ? 44 : 74; height: width }
+                Gauge { label: "RAM"; width: column.width < 400 ? 44 : 74; height: width }
+                Gauge { label: "Disk"; width: column.width < 400 ? 44 : 74; height: width }
             }
-            Text { anchors.left: parent.left; anchors.leftMargin: 4; anchors.top: gauges.bottom; anchors.topMargin: 7; text: "CPU · RAM · Disk are not measured by this build"; color: Theme.textDim; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.4 } }
+            Text { anchors.left: parent.left; anchors.leftMargin: 4; anchors.top: gauges.bottom; anchors.topMargin: column.width < 400 ? 3 : 7; text: column.width < 400 ? "Telemetry not measured" : "CPU · RAM · Disk are not measured by this build"; color: Theme.textDim; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.4 } }
             Column {
                 anchors { left: gauges.right; right: parent.right; top: parent.top; leftMargin: 26; topMargin: 4 }
                 visible: parent.width >= 430
@@ -234,16 +244,18 @@ Item {
     Component {
         id: workflowPanel
         Well {
+            id: workflowWell
+            fill: true
             readonly property bool has: !!bridge.task.task_id
-            WRow { glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !parent.has
-                v: parent.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
-            WRow { glyph: "⌘"; tint: Theme.success; k: "Connector"; empty: !parent.has; v: parent.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
-            WRow { glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !parent.has; v: parent.has ? (bridge.task.capability || "—") : "Chosen by the Core, never the model" }
-            WRow { glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !parent.has; v: parent.has ? (bridge.task.destination || "—") : "Granted destinations only" }
-            WRow { glyph: "◷"; k: "Outcome"; empty: !parent.has; last: true
+            WRow { height: (workflowWell.height - 2) / 5; glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !workflowWell.has
+                v: workflowWell.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
+            WRow { height: (workflowWell.height - 2) / 5; glyph: "⌘"; tint: Theme.success; k: "Connector"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
+            WRow { height: (workflowWell.height - 2) / 5; glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.capability || "—") : "Chosen by Core" }
+            WRow { height: (workflowWell.height - 2) / 5; glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.destination || "—") : "Granted destinations only" }
+            WRow { height: (workflowWell.height - 2) / 5; glyph: "◷"; k: "Outcome"; empty: !workflowWell.has; last: true
                 tint: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.success)
                 vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.textLabel)
-                v: parent.has ? (bridge.task.error_code || (bridge.task.run_status || "pending")) : "None yet" }
+                v: workflowWell.has ? (bridge.task.error_code || (bridge.task.run_status || "pending")) : "None yet" }
         }
     }
     Component {
@@ -256,12 +268,12 @@ Item {
                 model: bridge.activity
                 spacing: 0
                 delegate: Item {
-                    width: ListView.view.width; height: 60
+                    width: ListView.view.width; height: column.commandMode ? 47 : 60
                     readonly property color tint: modelData.kind === "approval" ? "#c58a2a" : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : modelData.kind === "scheduled" ? "#22a877" : "#2f7fe0"
                     readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
                     IconBox { x: 12; anchors.verticalCenter: parent.verticalCenter; width: 38; height: 38; glyph: parent.glyph; tint: parent.tint; solid: true; round: true; glyphSize: 16 }
                     Column { anchors.left: parent.left; anchors.leftMargin: 62; anchors.right: timeText.left; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 2
-                        Text { text: modelData.text; color: Theme.text; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: 15 } }
+                        Text { text: modelData.text; color: Theme.text; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
                         Text { text: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
                     }
                     Text { id: timeText; anchors.right: parent.right; anchors.rightMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: column.ago(modelData.ts, modelData.time); color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
@@ -278,6 +290,38 @@ Item {
                             Text { text: "Approvals, outcomes and scheduled runs appear here"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
                         }
                     }
+                }
+            }
+        }
+    }
+    Component {
+        id: modelPanel
+        Item {
+            Row { id: identity; width: parent.width; spacing: 12
+                IconBox { width: 38; height: 38; tint: "#e9b777"; glyph: "AI"; solid: true }
+                Column { spacing: 3
+                    Text { text: bridge.config.claude_model || "Claude · CLI default"; color: Theme.text; font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
+                    Text { text: "Claude Code · subscription route"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
+                }
+            }
+            Column { anchors { left: parent.left; right: parent.right; top: identity.bottom; topMargin: 12 } spacing: 8
+                Repeater { model: [{k:"Execution",v:bridge.executionEnabled ? "Enabled" : "Disabled"},{k:"Effort",v:bridge.config.claude_effort || "CLI default"},{k:"Context window",v:"Not reported"}]
+                    Item { width: parent.width; height: 20
+                        Text { text: modelData.k; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                        Text { anchors.right: parent.right; text: modelData.v; color: modelData.k === "Execution" ? (bridge.executionEnabled ? Theme.success : Theme.danger) : Theme.textLabel; font { family: Theme.font; pixelSize: 12 } }
+                        Rectangle { width: parent.width; height: 1; y: 20; color: Theme.border }
+                    }
+                }
+            }
+        }
+    }
+    Component {
+        id: memoryPanel
+        Item {
+            Text { width: parent.width; wrapMode: Text.Wrap; visible: bridge.projects.length === 0; text: "No project memory loaded. Only explicit, stored reference data appears here."; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+            Flow { width: parent.width; spacing: 8
+                Repeater { model: bridge.projects.slice(0, 8)
+                    Pill { text: modelData; tint: Theme.textMuted }
                 }
             }
         }

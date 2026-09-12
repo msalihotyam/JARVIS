@@ -15,8 +15,8 @@ Item {
     property color stateColor: Theme.stateColor(state_)
     readonly property bool running: state_ === "running"
     readonly property bool dormant: state_ === "disabled"
-    readonly property bool ambientMotion: Theme.ambient && active && !dormant
-    readonly property bool turning: ambientMotion || running
+    readonly property bool ambientMotion: Theme.ambient && active && visible && !dormant
+    readonly property bool turning: active && visible && (ambientMotion || running)
     readonly property real s: width
     implicitWidth: 300; implicitHeight: 300
 
@@ -165,14 +165,14 @@ Item {
     }
 
     // -- inner luminous ring: the bright rim right outside the sphere -------------------
-    Rectangle { anchors.centerIn: parent; width: core.s * 0.47; height: width; radius: width / 2; color: "transparent"; border.width: 9; border.color: core.stateColor; opacity: (core.dormant ? 0.05 : 0.22) * glow.energy }
-    Rectangle { anchors.centerIn: parent; width: core.s * 0.43; height: width; radius: width / 2; color: "transparent"; border.width: 3; border.color: core.stateColor; opacity: (core.dormant ? 0.08 : 0.5) * Math.min(glow.energy, 1.3) }
+    Rectangle { anchors.centerIn: parent; width: core.s * 0.47; height: width; radius: width / 2; color: "transparent"; border.width: 5; border.color: core.stateColor; opacity: (core.dormant ? 0.05 : 0.12) * glow.energy }
+    Rectangle { anchors.centerIn: parent; width: core.s * 0.43; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: core.stateColor; opacity: (core.dormant ? 0.08 : 0.5) * Math.min(glow.energy, 1.3) }
     Item {
         id: inner
         anchors.centerIn: parent
         width: core.s * 0.445; height: width
         opacity: core.dormant ? 0.25 : 0.8
-        RotationAnimator on rotation { running: core.running; loops: Animation.Infinite; from: 0; to: 360; duration: 20000 }
+        RotationAnimator on rotation { running: core.running && core.active && core.visible; loops: Animation.Infinite; from: 0; to: 360; duration: 40000 }
         Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: core.stateColor; opacity: 0.7 }
         Repeater {
             model: 8
@@ -188,7 +188,7 @@ Item {
         preferredRendererType: Shape.CurveRenderer
         visible: core.running; opacity: core.running ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 200 } }
-        RotationAnimator on rotation { running: core.running; loops: Animation.Infinite; from: 0; to: 360; duration: 2200 }
+        RotationAnimator on rotation { running: core.running && core.active && core.visible; loops: Animation.Infinite; from: 0; to: 360; duration: 12000 }
         ShapePath { strokeColor: core.stateColor; strokeWidth: 2; fillColor: "transparent"; capStyle: ShapePath.RoundCap
             PathAngleArc { centerX: sweep.width / 2; centerY: sweep.height / 2; radiusX: sweep.width / 2; radiusY: sweep.height / 2; startAngle: 0; sweepAngle: 48 } }
     }
@@ -204,12 +204,12 @@ Item {
             strokeWidth: -1
             fillGradient: RadialGradient {
                 centerX: sphere.width / 2; centerY: sphere.height / 2; centerRadius: sphere.width / 2
-                focalX: sphere.width * 0.36; focalY: sphere.height * 0.32; focalRadius: 0
-                GradientStop { position: 0.00; color: Qt.lighter(core.stateColor, 1.45) }
-                GradientStop { position: 0.14; color: core.stateColor }
-                GradientStop { position: 0.46; color: Qt.darker(core.stateColor, 2.4) }
-                GradientStop { position: 0.80; color: Theme.bg1 }
-                GradientStop { position: 1.00; color: Theme.alpha(core.stateColor, 0.35) }
+                focalX: sphere.width * 0.43; focalY: sphere.height * 0.58; focalRadius: 0
+                GradientStop { position: 0.00; color: "#020c14" }
+                GradientStop { position: 0.45; color: "#041624" }
+                GradientStop { position: 0.82; color: Qt.darker(core.stateColor, 7) }
+                GradientStop { position: 0.975; color: Qt.darker(core.stateColor, 2.8) }
+                GradientStop { position: 1.00; color: Qt.lighter(core.stateColor, 1.25) }
             }
             PathAngleArc { centerX: sphere.width / 2; centerY: sphere.height / 2; radiusX: sphere.width / 2; radiusY: sphere.height / 2; startAngle: 0; sweepAngle: 360 }
         }
@@ -218,6 +218,34 @@ Item {
             loops: Animation.Infinite
             NumberAnimation { to: 1.025; duration: 2600; easing.type: Easing.InOutSine }
             NumberAnimation { to: 1.0; duration: 2600; easing.type: Easing.InOutSine }
+        }
+    }
+    // Stable curved reflections give the sphere a dark glass volume.
+    Shape {
+        id: facets
+        anchors.centerIn: parent; width: core.s * 0.39; height: width
+        preferredRendererType: Shape.CurveRenderer
+        opacity: core.dormant ? 0.15 : 0.52
+        ShapePath {
+            strokeWidth: -1
+            fillGradient: LinearGradient {
+                x1: 0; y1: 0; x2: facets.width * 0.8; y2: facets.height * 0.6
+                GradientStop { position: 0; color: "#ccbfedff" }
+                GradientStop { position: 0.45; color: Theme.alpha(core.stateColor, 0.26) }
+                GradientStop { position: 1; color: "transparent" }
+            }
+            startX: facets.width * 0.08; startY: facets.height * 0.38
+            PathCubic { x: facets.width * 0.76; y: facets.height * 0.13; control1X: facets.width * 0.15; control1Y: -facets.height * 0.02; control2X: facets.width * 0.55; control2Y: -facets.height * 0.07 }
+            PathCubic { x: facets.width * 0.08; y: facets.height * 0.38; control1X: facets.width * 0.46; control1Y: facets.height * 0.10; control2X: facets.width * 0.26; control2Y: facets.height * 0.13 }
+        }
+        ShapePath { strokeWidth: 0.8; strokeColor: Theme.alpha(core.stateColor, 0.28); fillColor: "transparent"
+            startX: facets.width * 0.07; startY: facets.height * 0.65
+            PathCubic { x: facets.width * 0.9; y: facets.height * 0.23; control1X: facets.width * 0.4; control1Y: facets.height * 0.24; control2X: facets.width * 0.65; control2Y: facets.height * 0.5 }
+        }
+        ShapePath { strokeWidth: -1; fillColor: Theme.alpha(core.stateColor, 0.17)
+            startX: facets.width * 0.2; startY: facets.height * 0.83
+            PathCubic { x: facets.width * 0.91; y: facets.height * 0.62; control1X: facets.width * 0.35; control1Y: facets.height * 1.04; control2X: facets.width * 0.81; control2Y: facets.height * 0.97 }
+            PathCubic { x: facets.width * 0.2; y: facets.height * 0.83; control1X: facets.width * 0.52; control1Y: facets.height * 0.96; control2X: facets.width * 0.52; control2Y: facets.height * 0.75 }
         }
     }
     Rectangle { anchors.centerIn: parent; width: core.s * 0.41; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: Qt.lighter(core.stateColor, 1.15); opacity: core.dormant ? 0.3 : 0.9 }
@@ -242,7 +270,7 @@ Item {
         visible: core.state_ === "unknown"
         opacity: 0
         SequentialAnimation on opacity {
-            running: core.state_ === "unknown"
+            running: core.state_ === "unknown" && core.active && core.visible
             loops: Animation.Infinite
             NumberAnimation { to: 0.9; duration: 380; easing.type: Easing.InOutCubic }
             NumberAnimation { to: 0.15; duration: 900; easing.type: Easing.InOutCubic }

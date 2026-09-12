@@ -11,6 +11,12 @@ Rectangle {
     property bool active: false
     property bool framed: false
     signal clicked()
+    activeFocusOnTab: true
+    Accessible.role: Accessible.Button
+    Accessible.name: tip || glyph
+    Accessible.onPressAction: if (enabled) clicked()
+    Keys.onReturnPressed: if (enabled) clicked()
+    Keys.onSpacePressed: if (enabled) clicked()
 
     readonly property bool hovered: area.containsMouse && enabled
     readonly property bool pressed: area.pressed && enabled
@@ -29,6 +35,7 @@ Rectangle {
     Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on scale { NumberAnimation { duration: 90 } }
+    Rectangle { anchors.fill: parent; anchors.margins: -2; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: button.activeFocus }
 
     Text {
         anchors.centerIn: parent

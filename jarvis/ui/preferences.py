@@ -18,8 +18,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-PREFERENCES_VERSION = 1
-THEMES = ("space", "dark")
+PREFERENCES_VERSION = 2
+THEMES = ("space", "dark", "command")
 PROFILES = ("normal", "focus", "monitoring")
 PAGES = ("home", "tasks", "automations", "memory", "history")
 #: Pages earlier documents may name that no longer exist (Settings became a
@@ -88,7 +88,24 @@ def canonical_preferences() -> dict[str, Any]:
         "profile": "normal",
         "page": "home",
         "profiles": canonical_profiles(),
+        "packages": {name: {"profile": "normal", "profiles": package_profiles(name)}
+                     for name in THEMES if name != "space"},
     }
+
+
+def package_profiles(name: str) -> dict[str, dict[str, Any]]:
+    profiles = canonical_profiles()
+    if name == "command":
+        for layout in profiles.values():
+            layout["column_width"] = 0.24
+            layout["order"] = ["workflow", "system", "activity", "automations"]
+        profiles["normal"]["panels"] = {
+            "workflow": _panel(pinned=True, share=0.30),
+            "system": _panel(share=0.28),
+            "activity": _panel(share=0.24),
+            "automations": _panel(share=0.18),
+        }
+    return profiles
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -135,6 +152,10 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     the user with a layout they never saw.
     """
     defaults = canonical_preferences()
+    # Preserve only a complete, valid v1 document. Validation below still
+    # rejects malformed old fields; migration never writes product config.
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) == set(defaults) - {"packages"}:
+        candidate = {**candidate, "version": PREFERENCES_VERSION, "packages": defaults["packages"]}
     if not isinstance(candidate, dict) or set(candidate) != set(defaults):
         return defaults
     if candidate["version"] != PREFERENCES_VERSION:
@@ -154,6 +175,20 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         if valid is None:
             return defaults
         validated[name] = valid
+    packages = candidate["packages"]
+    if not isinstance(packages, dict) or set(packages) != {"dark", "command"}:
+        return defaults
+    validated_packages = {}
+    for name, package in packages.items():
+        if not isinstance(package, dict) or set(package) != {"profile", "profiles"} or package["profile"] not in PROFILES:
+            return defaults
+        pack_profiles = package["profiles"]
+        if not isinstance(pack_profiles, dict) or set(pack_profiles) != set(PROFILES):
+            return defaults
+        checked = {key: _valid_layout(value) for key, value in pack_profiles.items()}
+        if any(value is None for value in checked.values()):
+            return defaults
+        validated_packages[name] = {"profile": package["profile"], "profiles": checked}
     return {
         "version": PREFERENCES_VERSION,
         "theme": candidate["theme"],
@@ -161,6 +196,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "profile": candidate["profile"],
         "page": candidate["page"],
         "profiles": validated,
+        "packages": validated_packages,
     }
 
 
@@ -195,7 +231,10 @@ class UiPreferences:
     # -- layout mutations: every one bounded, snapped and deterministic -------
 
     def layout(self, profile: str | None = None) -> dict[str, Any]:
-        return self.data["profiles"][profile or self.data["profile"]]
+        return self.package()["profiles"][profile or self.package()["profile"]]
+
+    def package(self) -> dict[str, Any]:
+        return self.data if self.data["theme"] == "space" else self.data["packages"][self.data["theme"]]
 
     def set_visible(self, panel: str, visible: bool) -> None:
         if panel in PANEL_IDS:
@@ -222,8 +261,8 @@ class UiPreferences:
         self.layout()["column_width"] = clamp(snap(float(width)), MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
 
     def reset_layout(self, profile: str | None = None) -> None:
-        name = profile or self.data["profile"]
-        self.data["profiles"][name] = canonical_profiles()[name]
+        name = profile or self.package()["profile"]
+        self.package()["profiles"][name] = package_profiles(self.data["theme"])[name]
 
     def reset_all_layouts(self) -> None:
-        self.data["profiles"] = canonical_profiles()
+        self.package()["profiles"] = package_profiles(self.data["theme"])

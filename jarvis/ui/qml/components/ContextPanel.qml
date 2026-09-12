@@ -1,0 +1,48 @@
+import QtQuick
+import "../theme"
+
+// Anchored context surface; the triggers remain above the outside-click
+// layer. Geometry is always recomputed from the trigger and viewport.
+Item {
+    id: context
+    anchors.fill: parent
+    property bool open: false
+    property point anchorPoint: Qt.point(24, 88)
+    property real panelWidth: 430
+    property real panelHeight: 540
+    property string heading: ""
+    property string surfaceName: "contextSurface"
+    default property alias content: inner.data
+    readonly property real surfaceX: panel.x
+    readonly property real surfaceY: panel.y
+    readonly property real surfaceWidth: panel.width
+    readonly property real surfaceHeight: panel.height
+    visible: open || panel.opacity > 0
+    enabled: open
+    z: 400
+    onOpenChanged: if (open) panel.forceActiveFocus()
+    Rectangle { anchors.fill: parent; color: "#000000"; opacity: context.open ? 0.18 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.panelIn } }
+        MouseArea { anchors.fill: parent; onClicked: context.open = false }
+    }
+    GlassPanel {
+        id: panel
+        objectName: context.surfaceName
+        raised: true; brackets: true; padding: 22
+        width: Math.min(context.panelWidth, context.width - 32)
+        height: Math.min(context.panelHeight, context.height - 108)
+        x: Math.max(16, Math.min(context.anchorPoint.x, context.width - width - 16))
+        y: Math.max(80, Math.min(context.anchorPoint.y, context.height - height - 16))
+        opacity: context.open ? 1 : 0
+        transform: Translate { y: context.open ? 0 : -7; Behavior on y { NumberAnimation { duration: Theme.panelIn; easing.type: Easing.OutCubic } } }
+        Behavior on opacity { NumberAnimation { duration: Theme.panelIn; easing.type: Easing.OutCubic } }
+        Keys.onEscapePressed: context.open = false
+        MouseArea { parent: panel; anchors.fill: parent; z: -0.5 }
+        Item { id: heading; width: parent.width; height: 34
+            Text { anchors.verticalCenter: parent.verticalCenter; text: context.heading; color: Theme.text; font { family: Theme.font; pixelSize: 13; letterSpacing: 2.4; weight: Font.DemiBold } }
+            IconButton { objectName: context.surfaceName + "Close"; anchors.right: parent.right; glyph: "✕"; tip: "Close"; onClicked: context.open = false }
+        }
+        Rectangle { anchors.top: heading.bottom; width: parent.width; height: 1; color: Theme.border }
+        Item { id: inner; anchors { left: parent.left; right: parent.right; top: heading.bottom; bottom: parent.bottom; topMargin: 20 } }
+    }
+}

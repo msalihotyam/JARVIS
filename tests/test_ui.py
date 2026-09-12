@@ -26,6 +26,7 @@ os.environ.pop("ANTHROPIC_BASE_URL", None)
 
 from PySide6.QtCore import QMetaObject, Q_RETURN_ARG, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
+from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
 from PySide6.QtTest import QTest  # noqa: E402
 
 from jarvis.app import create_app  # noqa: E402
@@ -172,8 +173,8 @@ class BootstrapTests(UiTestCase):
         pump(500)
         dark_accent = QColor(root.property("accentToken"))
         dark_bg = QColor(root.property("bgToken"))
-        self.assertEqual("#3ab4e0", dark_accent.name())
-        self.assertEqual("#050608", dark_bg.name())
+        self.assertEqual("#1bbaff", dark_accent.name())
+        self.assertEqual("#030709", dark_bg.name())
         self.assertNotEqual(space_accent.name(), dark_accent.name())
         # Both themes reach a stable state; the transition completes cleanly.
         bridge.setTheme("space")
@@ -186,7 +187,7 @@ class BootstrapTests(UiTestCase):
         bridge.setAmbientEffects(False)
         bridge.setTheme("neon")  # not a theme: ignored
         saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))
-        self.assertEqual(("dark", False, 1), (saved["theme"], saved["ambient_effects"], saved["version"]))
+        self.assertEqual(("dark", False, 2), (saved["theme"], saved["ambient_effects"], saved["version"]))
         again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
         self.assertEqual("dark", again.theme)
         self.assertFalse(again.ambientEffects)
@@ -679,7 +680,7 @@ class LayoutTests(UiTestCase):
         QMetaObject.invokeMethod(root, "toggleSettings")
         pump(40)
         self.assertTrue(root.property("settingsOpen"))
-        click("settingsClose")
+        click("settingsSurfaceClose")
         self.assertFalse(root.property("settingsOpen"))
         # No stuck state: normal interaction resumes on the page underneath.
         bridge.setPage("home")
@@ -690,6 +691,183 @@ class LayoutTests(UiTestCase):
         # keeping the rest of the user's choices.
         legacy = {**canonical_preferences(), "theme": "dark", "page": "settings"}
         self.assertEqual({**canonical_preferences(), "theme": "dark", "page": "home"}, validate_preferences(legacy))
+
+
+class PresentationTests(UiTestCase):
+    """Real QML pointer/keyboard events, not source-string assertions."""
+
+    def item(self, root, name):
+        from PySide6.QtQuick import QQuickItem
+        def visual_find(node):
+            if node.objectName() == name:
+                return node
+            for child in node.childItems():
+                found = visual_find(child)
+                if found is not None:
+                    return found
+            return None
+        item = visual_find(root.contentItem())
+        self.assertIsNotNone(item, name)
+        return item
+
+    def click(self, root, name):
+        from PySide6.QtCore import QPointF
+        item = self.item(root, name)
+        center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
+        pump(260)
+
+    def window(self, bridge):
+        root = self.load(bridge)
+        root.showNormal()
+        root.resize(1920, 1080)
+        pump(350)
+        return root
+
+    def test_distinct_anchored_contexts_toggle_escape_outside_and_selection(self):
+        from PySide6.QtCore import QPoint
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for trigger, state, surface in (("settingsOrb", "settingsOpen", "settingsSurface"),
+                                        ("modelTrigger", "modelOpen", "modelSurface"),
+                                        ("navigationTrigger", "navOpen", "navSurface")):
+            with self.subTest(trigger=trigger):
+                self.click(root, trigger)
+                self.assertTrue(root.property(state))
+                self.assertEqual(1, sum(bool(root.property(key)) for key in ("settingsOpen", "modelOpen", "navOpen")))
+                panel = self.item(root, surface)
+                if trigger == "settingsOrb":
+                    self.assertLess(panel.x(), 80)
+                else:
+                    self.assertGreater(panel.x(), root.width() / 2)
+                self.assertGreaterEqual(panel.y(), 80)
+                self.click(root, trigger)
+                self.assertFalse(root.property(state))
+                self.click(root, trigger)
+                QTest.keyClick(root, Qt.Key_Escape)
+                pump(250)
+                self.assertFalse(root.property(state))
+                self.click(root, trigger)
+                QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPoint(850, 920))
+                pump(250)
+                self.assertFalse(root.property(state))
+        self.click(root, "settingsOrb")
+        self.click(root, "modelTrigger")
+        self.assertFalse(root.property("settingsOpen"))
+        self.assertTrue(root.property("modelOpen"))
+        self.click(root, "navigationTrigger")
+        self.assertFalse(root.property("modelOpen"))
+        self.click(root, "navigate_tasks")
+        self.assertEqual("tasks", bridge.page)
+        self.assertFalse(root.property("navOpen"))
+
+    def test_context_and_protected_composer_bounds_at_all_required_sizes(self):
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for theme in ("space", "dark", "command"):
+            bridge.setTheme(theme)
+            for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
+                with self.subTest(theme=theme, size=(width, height)):
+                    root.resize(width, height)
+                    pump(500)
+                    composer = self.item(root, "commandComposer" if theme == "command" else "canonicalComposer")
+                    corner = composer.mapToScene(QPointF(composer.width(), composer.height()))
+                    self.assertLessEqual(corner.x(), width)
+                    self.assertLessEqual(corner.y(), height)
+                    self.assertGreater(composer.width(), 360)
+                    for trigger, surface in (("settingsOrb", "settingsSurface"), ("modelTrigger", "modelSurface"), ("navigationTrigger", "navSurface")):
+                        self.click(root, trigger)
+                        panel = self.item(root, surface)
+                        self.assertGreaterEqual(panel.x(), 0)
+                        self.assertGreaterEqual(panel.y(), 80)
+                        self.assertLessEqual(panel.x() + panel.width(), width)
+                        self.assertLessEqual(panel.y() + panel.height(), height)
+                        QTest.keyClick(root, Qt.Key_Escape)
+                        pump(220)
+
+    def test_package_selection_restores_each_custom_layout_and_focus(self):
+        from copy import deepcopy
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.click(root, "settingsOrb")
+        bridge.setPanelShare("system", 0.52)
+        bridge.setColumnWidth(0.38)
+        canonical = deepcopy(bridge.prefs.layout())
+        self.click(root, "package_command")
+        self.assertEqual("command", bridge.theme)
+        self.assertIsNotNone(self.item(root, "commandPreset"))
+        self.assertNotEqual(canonical, bridge.prefs.layout())
+        bridge.movePanel("system", 2)
+        bridge.setPanelVisible("activity", False)
+        bridge.setColumnWidth(0.28)
+        command = deepcopy(bridge.prefs.layout())
+        saved = self.prefs_path.read_bytes()
+        bridge.setFocusMode(True)
+        bridge.setFocusMode(False)
+        self.assertEqual(saved, self.prefs_path.read_bytes())
+        self.assertEqual(command, bridge.prefs.layout())
+        self.click(root, "package_dark")
+        self.assertEqual("dark", bridge.theme)
+        bridge.setPanelShare("workflow", 0.64)
+        dark = deepcopy(bridge.prefs.layout())
+        self.click(root, "package_space")
+        self.assertEqual(canonical, bridge.prefs.layout())
+        bridge.setTheme("command")
+        self.assertEqual(command, bridge.prefs.layout())
+        bridge.setTheme("dark")
+        self.assertEqual(dark, bridge.prefs.layout())
+        self.assertEqual(bridge.prefs.data, UiPreferences(self.prefs_path).data)
+
+    def test_v1_migrates_without_losing_layout_and_invalid_packages_refuse(self):
+        from copy import deepcopy
+        legacy = canonical_preferences()
+        legacy.pop("packages")
+        legacy["version"] = 1
+        legacy["profiles"]["normal"]["panels"]["system"]["share"] = 0.54
+        migrated = validate_preferences(legacy)
+        self.assertEqual(2, migrated["version"])
+        self.assertEqual(legacy["profiles"], migrated["profiles"])
+        self.assertEqual({"dark", "command"}, set(migrated["packages"]))
+        for key, value in (("profile", "foreign"), ("profiles", {})):
+            bad = deepcopy(migrated)
+            bad["packages"]["command"][key] = value
+            self.assertEqual(canonical_preferences(), validate_preferences(bad))
+
+    def test_approval_fixture_cannot_create_authority_or_persist_product_state(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_UI_DEV_FIXTURE": "1"}):
+            bridge = self.bridge()
+            before = self.store.path.read_bytes() if hasattr(self.store, "path") else None
+            root = self.window(bridge)
+            QTest.keyClick(root, Qt.Key_A, Qt.ControlModifier | Qt.ShiftModifier)
+            pump(300)
+            self.assertTrue(root.property("devApprovalVisible"))
+            self.assertFalse(bridge.approvalPending)
+            self.assertIsNone(bridge._ticket)
+            self.assertEqual({}, bridge.task)
+            self.assertEqual("", bridge.sessionId)
+            self.assertFalse(self.item(root, "approvalApprove").isEnabled())
+            self.click(root, "approvalApprove")
+            self.assertEqual(0, self.execute_calls())
+            self.assertIsNone(bridge._ticket)
+            self.assertEqual([], bridge.sessions)
+            if before is not None:
+                self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_actual_approval_card_still_uses_exact_backend_ticket(self):
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.submitText("Bu projeyi incele.")
+        pump(300)
+        ticket = bridge._ticket
+        self.assertIsNotNone(ticket)
+        for name in ("session_id", "task_id", "request_id", "fingerprint", "expires_at"):
+            self.assertTrue(bridge.approval[name], name)
+        self.click(root, "approvalApprove")
+        self.assertFalse(bridge.approvalPending)
+        self.assertEqual(1, self.claude.execute_calls)
+        self.assertEqual("completed", bridge.coreState)
 
 
 if __name__ == "__main__":  # pragma: no cover

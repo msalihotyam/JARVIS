@@ -622,12 +622,12 @@ class Bridge(QObject):
 
     @Property(str, notify=prefsChanged)
     def profile(self) -> str:
-        return self.prefs.data["profile"]
+        return self.prefs.package()["profile"]
 
     @Slot(str)
     def setProfile(self, profile: str) -> None:
         if profile in PROFILES:
-            self.prefs.data["profile"] = profile
+            self.prefs.package()["profile"] = profile
             self.prefs.save()
             self.prefsChanged.emit()
 
