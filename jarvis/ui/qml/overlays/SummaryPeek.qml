@@ -20,16 +20,20 @@ ContextPanel {
     surfaceName: "summaryPeek"
     // The peek is the stronger member of the rail family: a crisp cyan edge.
     surfaceEdge: "#3aa3c2"
-    surfaceFill: "#f6000f1c"
+    surfaceFill: "#f5000e1a"
     surfaceBrackets: false
+    surfaceShell: "../assets/peek-shell.png"
+    surfaceShellMargin: 18
+    surfaceShellBorder: 46
+    surfaceRadius: 16
     panelWidth: 432
-    panelHeight: spec ? 50 + 16 + metricsHeight + 14 + listHeight + 14 + 58 + 44 : 300
+    panelHeight: spec ? 50 + 16 + metricsHeight + 14 + listHeight + 14 + 62 + 44 : 300
 
-    readonly property int metricsHeight: 68
+    readonly property int metricsHeight: 76
     readonly property int rowHeight: 52
     readonly property int emptyHeight: 112
     // Optional detail is the first thing to give way on a short viewport.
-    readonly property int maxRows: Math.max(2, Math.min(5, Math.floor((height - 108 - 50 - 16 - metricsHeight - 28 - 58 - 44) / rowHeight)))
+    readonly property int maxRows: Math.max(2, Math.min(5, Math.floor((height - 108 - 50 - 16 - metricsHeight - 28 - 62 - 44) / rowHeight)))
     readonly property var rows: spec ? spec.rows.slice(0, maxRows) : []
     readonly property int listHeight: rows.length ? rows.length * rowHeight : emptyHeight
 
@@ -105,8 +109,8 @@ ContextPanel {
             Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 2
-                Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 21; weight: Font.DemiBold } }
-                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#9fb6d4"; font { family: Theme.font; pixelSize: 13 } }
+                Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 24; weight: Font.DemiBold } }
+                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#a9bfdc"; font { family: Theme.font; pixelSize: 14 } }
             }
         }
     }
@@ -122,17 +126,25 @@ ContextPanel {
             Repeater {
                 model: peek.spec ? peek.spec.metrics : []
                 Rectangle {
-                    width: (parent.width - 10) / 2; height: parent.height; radius: 10
+                    id: tile
+                    width: (parent.width - 10) / 2; height: parent.height; radius: 12
                     gradient: Gradient {
-                        GradientStop { position: 0; color: "#f0001c30" }
-                        GradientStop { position: 1; color: "#f0001523" }
+                        GradientStop { position: 0; color: "#f2002238" }
+                        GradientStop { position: 1; color: "#f0001524" }
                     }
-                    border.width: 1; border.color: "#236a8c"
-                    Rectangle { x: 10; y: 1; width: parent.width - 20; height: 1; color: "#24bfeaff" }
+                    border.width: 1; border.color: "#2f86ad"
+                    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -2; radius: 14; color: "transparent"; border.width: 2; border.color: "#1a3fb4e6" }
+                    Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: 26; radius: 11
+                        gradient: Gradient { GradientStop { position: 0; color: "#1c3fc4f0" } GradientStop { position: 1; color: "transparent" } } }
+                    Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#5a8fe0ff" }
                     Column {
-                        x: 14; anchors.verticalCenter: parent.verticalCenter; spacing: -2
-                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 32; weight: Font.DemiBold } }
-                        Text { width: parent.parent.width - 28; elide: Text.ElideRight; text: modelData.label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                        x: 16; anchors.verticalCenter: parent.verticalCenter; spacing: -1
+                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 34; weight: Font.DemiBold } }
+                        Row {
+                            spacing: 7
+                            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 7; height: 7; radius: 3.5; color: modelData.tone; opacity: 0.9 }
+                            Text { width: tile.width - 46; elide: Text.ElideRight; text: modelData.label; color: "#b3c7e0"; font { family: Theme.font; pixelSize: 13 } }
+                        }
                     }
                 }
             }
@@ -141,6 +153,12 @@ ContextPanel {
         // Rows, or a truthful empty state.
         Item {
             width: parent.width; height: peek.listHeight
+            Rectangle {
+                visible: peek.rows.length > 0
+                anchors.fill: parent; anchors.leftMargin: -8; anchors.rightMargin: -8; radius: 12
+                color: "#a6001321"; border.width: 1; border.color: "#1a4462"
+                Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#306fd2f5" }
+            }
             Column {
                 width: parent.width
                 Repeater {
@@ -208,10 +226,15 @@ ContextPanel {
         // The deep action: the existing full page, nothing else.
         Rectangle {
             objectName: "summaryPeekAction"
-            width: parent.width; height: 58; radius: 10
-            color: actionHit.containsMouse ? "#f0002a44" : "#f0001828"
-            border.width: 1; border.color: actionHit.containsMouse ? "#5ccbeb" : "#2f7ea4"
-            Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#3a8fd8f5" }
+            width: parent.width; height: 62; radius: 12
+            gradient: Gradient {
+                GradientStop { position: 0; color: actionHit.containsMouse ? "#f4003050" : "#f2002034" }
+                GradientStop { position: 1; color: actionHit.containsMouse ? "#f0002238" : "#f0001524" }
+            }
+            border.width: 1; border.color: actionHit.containsMouse ? "#6fd6f2" : "#3a92b8"
+            Rectangle { z: -1; anchors.fill: parent; anchors.margins: -2; radius: 14; color: "transparent"; border.width: 2
+                        border.color: actionHit.containsMouse ? "#3a3fc4f0" : "#1a3fb4e6" }
+            Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#5a8fe0ff" }
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
             Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
             Accessible.role: Accessible.Button
@@ -232,7 +255,7 @@ ContextPanel {
             Column {
                 x: 48; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                 width: parent.width - 48 - 36
-                Text { text: peek.spec ? peek.spec.action.label : ""; color: Theme.text; font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
+                Text { text: peek.spec ? peek.spec.action.label : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
                 Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
             }
             Text { anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }

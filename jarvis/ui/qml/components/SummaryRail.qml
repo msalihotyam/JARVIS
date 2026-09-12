@@ -78,7 +78,7 @@ Item {
         { key: "Focus", page: "memory", tone: "#b7801e", well: "#523a03", count: "#f2b94c", icon: "focus",
           line: bridge.projects.length + (bridge.projects.length === 1 ? " project" : " projects"),
           note: bridge.projects.length ? (rail.roomy ? "Active in memory" : "In memory")
-                                       : (rail.roomy ? "No focus context yet" : rail.tight ? "No context" : "No context yet") },
+                                       : (rail.roomy ? "No focus context yet" : rail.width < 180 ? "No context" : "No context yet") },
         { key: "Plan", page: "automations", tone: "#7040c4", well: "#481e82", count: "#b89dff", icon: "plan",
           line: rail.enabledJobs.length + (rail.tight ? (rail.enabledJobs.length === 1 ? " job" : " jobs") : " scheduled"),
           note: rail.nextJob ? "Next " + rail.dueShort(rail.nextJob.next_due_at_utc)
@@ -107,20 +107,33 @@ Item {
                 radius: 14
                 // Closed: controlled glass. Active: a restrained cyan
                 // treatment - brighter edge and a slight lift, no glow bloom.
-                color: active ? rail.activeFill : hovered ? "#ec001a30" : "#e4001326"
-                border.width: 1
-                border.color: active ? "#48c9ee" : hovered ? "#3a7eaa" : "#225175"
+                color: active ? rail.activeFill : hovered ? "#f0001a2e" : "#ec00111f"
+                border.width: 0
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
                 activeFocusOnTab: true
                 Accessible.role: Accessible.Button
                 Accessible.name: modelData.key + ": " + modelData.line
                 Keys.onReturnPressed: rail.picked(modelData.key, card.y, card.height)
                 Keys.onSpacePressed: rail.picked(modelData.key, card.y, card.height)
 
-                // Luminous soft rim outside the edge.
-                Rectangle { z: -1; anchors.fill: parent; anchors.margins: -2; radius: parent.radius + 2; color: "transparent"
-                    border.width: 2; border.color: card.active ? "#552fc6ee" : card.hovered ? "#302f9fd6" : "#122f9fd6" }
+                // The shell: a static nine-slice of light - soft outer glow, a
+                // cyan rim brightest where light catches the upper left, and a
+                // faint secondary inner rim. The active shell fades in over it.
+                BorderImage {
+                    anchors.fill: parent; anchors.margins: -12
+                    source: "../assets/rail-card-shell.png"
+                    border { left: 34; top: 34; right: 34; bottom: 34 }
+                    opacity: card.active ? 0 : card.hovered ? 1 : 0.9
+                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+                }
+                BorderImage {
+                    anchors.fill: parent; anchors.margins: -12
+                    source: "../assets/rail-card-shell-active.png"
+                    border { left: 34; top: 34; right: 34; bottom: 34 }
+                    opacity: card.active ? 1 : card.hovered ? 0.35 : 0
+                    visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+                }
                 // Inner light from the upper left, fading down and across.
                 Rectangle {
                     anchors.fill: parent; anchors.margins: 1; radius: 13
@@ -129,7 +142,6 @@ Item {
                         GradientStop { position: 0.55; color: "transparent" }
                     }
                 }
-                Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: card.active ? "#7ab8f0ff" : "#3a8fd8f5" }
                 Rectangle {
                     anchors.fill: parent; anchors.margins: -3; radius: 14
                     color: "transparent"; border.color: Theme.alpha(Theme.accent, 0.7)
@@ -148,7 +160,7 @@ Item {
                         PathLine { x: 1.6; y: 0 } PathLine { x: 12; y: 11 } PathLine { x: 1.6; y: 22 } PathLine { x: 0; y: 22 } PathLine { x: 0; y: 0 }
                     }
                     ShapePath {
-                        strokeColor: "#48c9ee"; strokeWidth: 1; fillColor: "transparent"
+                        strokeColor: "#8fe4fb"; strokeWidth: 1.2; fillColor: "transparent"
                         joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.FlatCap
                         startX: 1.6; startY: 0.5
                         PathLine { x: 11.5; y: 11 } PathLine { x: 1.6; y: 21.5 }
@@ -161,12 +173,25 @@ Item {
                     x: rail.tight ? 9 : 13; anchors.verticalCenter: parent.verticalCenter
                     width: rail.tight ? 34 : rail.showNote ? 44 : 32; height: width; radius: rail.tight ? 9 : rail.showNote ? 12 : 8
                     gradient: Gradient {
-                        GradientStop { position: 0; color: Qt.lighter(modelData.well, 1.45) }
-                        GradientStop { position: 1; color: modelData.well }
+                        GradientStop { position: 0; color: Qt.lighter(modelData.well, 2.05) }
+                        GradientStop { position: 1; color: Qt.lighter(modelData.well, 1.2) }
                     }
-                    border.width: 1; border.color: Theme.alpha(Qt.lighter(modelData.well, 2.6), 0.5)
-                    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -4; radius: parent.radius + 4; color: Theme.alpha(Qt.lighter(modelData.well, 2.2), 0.09) }
-                    Rectangle { x: 7; y: 1; width: parent.width - 14; height: 1; color: Qt.rgba(1, 1, 1, 0.24) }
+                    border.width: 1; border.color: Theme.alpha(Qt.lighter(modelData.well, 3.2), 0.55)
+                    // Soft tinted glow from the static sprite (one 80 px frame per module).
+                    Image {
+                        z: -1; anchors.centerIn: parent
+                        width: 80 * tile.width / 44; height: width
+                        source: "../assets/icon-well-glow.png"
+                        sourceClipRect: Qt.rect(index * 80, 0, 80, 80)
+                        opacity: card.active || card.hovered ? 1 : 0.8
+                    }
+                    // Glossy upper half and a crisp top light.
+                    Rectangle {
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
+                        height: parent.height * 0.5; radius: parent.radius - 1
+                        gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.2) } GradientStop { position: 1; color: Qt.rgba(1, 1, 1, 0.02) } }
+                    }
+                    Rectangle { x: 7; y: 1; width: parent.width - 14; height: 1; color: Qt.rgba(1, 1, 1, 0.38) }
                     SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#f4fbff"; scale: tile.width / 42 * 1.42 }
                 }
 

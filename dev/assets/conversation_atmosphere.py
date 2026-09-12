@@ -2,13 +2,15 @@
 
 A static, decorative plate that sits behind the Command Center conversation
 surface in the Canonical Space theme: a deep blue-black field, a sparse star
-scatter, restrained blue bloom and a planetary limb entering from the lower
-left - the local atmosphere of the approved conversation helper. It carries
-no text, controls or data; everything interactive stays native QML.
+scatter, restrained blue bloom, and the supplied textured Earth limb
+(dev/assets/phase33-earth-limb-source.webp) entering from the lower left -
+the local atmosphere of the approved conversation helper. It carries no
+text, controls or data; everything interactive stays native QML.
 
-The limb is fitted to the helper's own horizon (traced at its 1448x1086
-scale and mapped onto the 1096x823 work surface at 1920x1080). Deterministic:
-the same seed always produces the same plate.
+The Earth is placed so its horizon enters the surface's left edge at ~61 %
+of the height and passes behind the workflow's lower left, close to the
+helper's horizon, and sits bottom-left so the plate crops gracefully at
+every supported size. Deterministic: the same inputs give the same plate.
 
     python dev/assets/conversation_atmosphere.py
 """
@@ -21,19 +23,12 @@ from PIL import Image
 W, H = 1096, 823
 OUT = Path(__file__).resolve().parents[2] / "jarvis" / "ui" / "qml" / "assets" / "conversation-atmosphere.png"
 
-# The helper's horizon, read off its grid, in helper pixels; its panel frame
-# starts at (50, 42) and maps onto the work surface at 0.812.
-HELPER_LIMB = [(0, 645), (110, 700), (245, 800), (390, 900), (540, 1000), (660, 1086)]
-SCALE = 0.812
-
-
-def fit_circle(points):
-    """Least-squares circle through the traced horizon."""
-    p = np.array(points, float)
-    a = np.c_[2 * p[:, 0], 2 * p[:, 1], np.ones(len(p))]
-    b = (p ** 2).sum(axis=1)
-    cx, cy, c = np.linalg.lstsq(a, b, rcond=None)[0]
-    return cx, cy, np.sqrt(c + cx * cx + cy * cy)
+EARTH = Path(__file__).resolve().parent / "phase33-earth-limb-source.webp"
+EARTH_SCALE = 0.80            # source 1672x941 -> 1338x753 on the 1096x823 surface
+EARTH_HORIZON_AT_LEFT = 385   # where the source's horizon meets its own left edge
+EARTH_ENTRY_Y = 430           # where it should meet the surface's left edge
+EARTH_TILT = 13.0             # degrees clockwise about that point: the helper's steeper horizon
+EARTH_OPACITY = 0.82          # restrained: the conversation text stays dominant
 
 
 def main() -> None:
@@ -51,8 +46,8 @@ def main() -> None:
         d = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
         rgb[:] += np.exp(-d)[..., None] * np.array(colour, np.float32) * strength
 
-    bloom(120, 640, 520, 300, (10, 60, 140), 0.55)
-    bloom(W * 0.9, H * 0.12, 520, 360, (4, 30, 70), 0.35)
+    bloom(120, 600, 520, 300, (10, 60, 140), 0.22)
+    bloom(W * 0.9, H * 0.12, 520, 360, (4, 30, 70), 0.22)
 
     # Sparse stars: tiny, a few with a soft halo.
     for _ in range(260):
@@ -66,32 +61,22 @@ def main() -> None:
         glow = np.exp(-d2 / (2 * r * r)) * v + (np.exp(-d2 / 10.0) * v * 0.12 if v > 0.6 else 0)
         rgb[y0:y1, x0:x1] += glow[..., None] * tint * 0.9
 
-    # The planetary limb.
-    limb = [((x - 50) * SCALE, (y - 42) * SCALE) for x, y in HELPER_LIMB]
-    cx, cy, radius = fit_circle(limb)
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) - radius     # < 0 inside the planet
-    inside = dist < 0
-    # Night side: very dark navy with faint surface texture and warm lights
-    # gathered near the terminator.
-    noise = rng.normal(0, 1, (H // 6 + 2, W // 6 + 2)).astype(np.float32)
-    noise = np.kron(noise, np.ones((6, 6), np.float32))[:H, :W]
-    depth = np.clip(-dist / 110.0, 0, 1)
-    surface = np.array([1, 8, 18], np.float32) + np.array([8, 34, 70], np.float32) * (1 - depth[..., None]) ** 1.6
-    surface = surface + noise[..., None] * np.array([2.0, 4.5, 7.5], np.float32) * (1 - depth[..., None] * 0.7)
-    rgb[inside] = surface[inside]
-    lights = (rng.random((H, W)) > 0.990) & inside & (dist > -260) & (dist < -10)
-    rgb[lights] += np.array([255, 196, 120], np.float32) * rng.uniform(0.3, 1.0, lights.sum())[:, None]
-    # Atmosphere: a thin bright rim, a blue scatter outside, haze inside.
-    rim = np.exp(-(dist / 1.6) ** 2)
-    band = np.exp(-((dist + 6.0) / 9.0) ** 2)                      # lit band just inside the edge
-    glow = np.exp(-np.abs(dist) / 14.0)
-    scatter = np.exp(-np.clip(dist, 0, None) / 90.0) * (dist >= 0)
-    haze = np.exp(np.clip(dist, None, 0) / 45.0) * inside
-    rgb += rim[..., None] * np.array([215, 244, 255], np.float32) * 0.7
-    rgb += band[..., None] * np.array([60, 170, 250], np.float32) * 0.55
-    rgb += glow[..., None] * np.array([30, 130, 235], np.float32) * 0.42
-    rgb += scatter[..., None] * np.array([12, 80, 180], np.float32) * 0.4
-    rgb += haze[..., None] * np.array([14, 80, 170], np.float32) * 0.5
+    # The textured Earth limb: the supplied production asset, scaled, tilted
+    # about the point where its horizon meets the surface's left edge, and
+    # composited once. The planet body covers the bottom-left corner.
+    src = Image.open(EARTH).convert("RGBA")
+    ew, eh = round(src.width * EARTH_SCALE), round(src.height * EARTH_SCALE)
+    src = src.resize((ew, eh), Image.LANCZOS)
+    pivot_y = EARTH_HORIZON_AT_LEFT * EARTH_SCALE
+    # A canvas the size of the surface, with the pivot at (0, EARTH_ENTRY_Y).
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    layer.paste(src, (0, round(EARTH_ENTRY_Y - pivot_y)), src)
+    layer = layer.rotate(-EARTH_TILT, resample=Image.BICUBIC, center=(0, EARTH_ENTRY_Y))
+    e = np.asarray(layer).astype(np.float32)
+    # The thin atmospheric haze fades more than the planet body (alpha
+    # gamma), so labels over the glow stay legible.
+    a = (e[..., 3:4] / 255.0) ** 1.6 * EARTH_OPACITY
+    rgb[:] = rgb * (1 - a) + e[..., :3] * a
 
     # Rounded corners, so the plate sits cleanly inside the glass frame.
     alpha = np.ones((H, W), np.float32)
@@ -105,7 +90,7 @@ def main() -> None:
     img = np.dstack([np.clip(rgb, 0, 255), alpha * 255]).astype(np.uint8)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(img, "RGBA").save(OUT, optimize=True)
-    print(f"wrote {OUT} ({OUT.stat().st_size // 1024} KB); limb centre ({cx:.0f}, {cy:.0f}) r={radius:.0f}")
+    print(f"wrote {OUT} ({OUT.stat().st_size // 1024} KB)")
 
 
 if __name__ == "__main__":

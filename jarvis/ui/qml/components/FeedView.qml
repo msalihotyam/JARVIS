@@ -165,12 +165,17 @@ ListView {
                 Row {
                     leftPadding: row.isJarvis && feed.referenceLayout ? 12 : 0
                     spacing: 16
+                    // Labels outside a bubble can sit over the planet's bright
+                    // horizon: a soft dark outline keeps them legible anywhere.
                     Text { text: feed.kindLabel(row.kind)
+                        style: row.isUser ? Text.Normal : Text.Outline; styleColor: "#b3000812"
                         color: row.isUser ? "#f5faff" : row.isJarvis ? "#22c8ee" : row.tone
                         font { family: Theme.font; pixelSize: row.isUser ? (feed.referenceLayout ? 17 : 16) : row.isJarvis ? (feed.referenceLayout ? 18 : 17) : 10
                                weight: row.isJarvis ? Font.Bold : Font.DemiBold
                                letterSpacing: row.isUser ? 0.2 : (row.isJarvis ? 0.6 : 2.2) } }
-                    Text { anchors.baseline: parent.children[0].baseline; text: modelData.time; color: "#aac1e2"; font { family: Theme.font; pixelSize: feed.referenceLayout ? 16 : 15 } }
+                    Text { anchors.baseline: parent.children[0].baseline; text: modelData.time; color: "#aac1e2"
+                           style: row.isUser ? Text.Normal : Text.Outline; styleColor: "#b3000812"
+                           font { family: Theme.font; pixelSize: feed.referenceLayout ? 16 : 15 } }
                 }
                 Item {
                     width: parent.width

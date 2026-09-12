@@ -16,6 +16,13 @@ Item {
     property color surfaceEdge: "transparent"   // a stronger edge, when set
     property color surfaceFill: "transparent"   // a deeper body, when set
     property bool surfaceBrackets: true
+    // An optional decorative nine-slice frame of light (glow + rims) drawn
+    // around the surface, and the surface radius it was drawn for. Every
+    // other context surface leaves both unset and keeps its theme border.
+    property url surfaceShell: ""
+    property int surfaceShellMargin: 0
+    property int surfaceShellBorder: 0
+    property int surfaceRadius: 0
     default property alias content: inner.data
     readonly property real surfaceX: panel.x
     readonly property real surfaceY: panel.y
@@ -33,10 +40,16 @@ Item {
         id: panel
         objectName: context.surfaceName
         raised: true; brackets: context.surfaceBrackets; padding: 22
-        border.color: context.surfaceEdge.a > 0 ? context.surfaceEdge : Theme.border
+        radius: context.surfaceRadius > 0 ? context.surfaceRadius : Theme.radius
+        border.color: context.surfaceShell != "" ? "transparent" : context.surfaceEdge.a > 0 ? context.surfaceEdge : Theme.border
         color: context.surfaceFill.a > 0 ? context.surfaceFill : Theme.surfaceRaised
         // A luminous halo around a strong edge.
-        Rectangle { parent: panel; z: -1; visible: context.surfaceEdge.a > 0; anchors.fill: parent; anchors.margins: -3; radius: panel.radius + 3
+        // Above the body fill (a negative z would sit behind it); its centre is
+        // transparent and the surface padding keeps it clear of the content.
+        BorderImage { parent: panel; z: 0.5; visible: context.surfaceShell != ""; source: context.surfaceShell
+            anchors.fill: parent; anchors.margins: -context.surfaceShellMargin
+            border { left: context.surfaceShellBorder; top: context.surfaceShellBorder; right: context.surfaceShellBorder; bottom: context.surfaceShellBorder } }
+        Rectangle { parent: panel; z: -1; visible: context.surfaceEdge.a > 0 && context.surfaceShell == ""; anchors.fill: parent; anchors.margins: -3; radius: panel.radius + 3
             color: "transparent"; border.width: 3; border.color: Qt.rgba(context.surfaceEdge.r, context.surfaceEdge.g, context.surfaceEdge.b, 0.22) }
         width: Math.min(context.panelWidth, context.width - 32)
         height: Math.min(context.panelHeight, context.height - 108)
