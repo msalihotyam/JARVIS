@@ -1169,5 +1169,132 @@ class CommandHeaderTests(UiTestCase):
         self.assertEqual("claude-opus-5", chip.property("modelName"))
         self.assertEqual(0, self.execute_calls())
 
+class ConversationSurfaceTests(UiTestCase):
+    """Phase 3: the summary modules leave the conversation for the left
+    ambient rail, open anchored quick-look peeks, and the conversation and
+    composer keep their place inside the Phase 1 work surface."""
+
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+    SUMMARY = ("Tasks", "Updates", "Focus", "Plan")
+
+    def box(self, root, name):
+        from PySide6.QtCore import QPointF
+        it = self.item(root, name)
+        a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+        return a.x(), a.y(), b.x(), b.y()
+
+    def texts(self, node, acc):
+        value = node.property("text")
+        if isinstance(value, str) and value:
+            acc.append(value)
+        for child in node.childItems():
+            self.texts(child, acc)
+        return acc
+
+    def test_summary_modules_live_in_the_rail_not_the_conversation(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        inside = self.texts(self.item(root, "canonicalWorkspace"), [])
+        for title in self.SUMMARY + ("Automations", "Memory", "History"):
+            self.assertNotIn(title, inside, f"{title} is still inside the conversation surface")
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height)
+            pump(700)
+            work = self.box(root, "canonicalWorkspace"); rail = self.box(root, "summaryRail")
+            composer = self.box(root, "canonicalComposer")
+            with self.subTest(size=(width, height)):
+                previous_bottom = rail[1]
+                for key in self.SUMMARY:
+                    card = self.box(root, "rail" + key)
+                    # In order, inside the Phase 1 rail, never over the work surface.
+                    self.assertGreaterEqual(card[1], previous_bottom - 1)
+                    self.assertLessEqual(card[2], work[0])
+                    self.assertGreaterEqual(card[0], 0)
+                    self.assertLessEqual(card[3], height)
+                    previous_bottom = card[3]
+                # The composer stays inside the work surface and on screen.
+                self.assertGreaterEqual(composer[0], work[0]); self.assertLessEqual(composer[2], work[2])
+                self.assertLessEqual(composer[3], work[3]); self.assertLessEqual(work[3], height)
+        # Ambient, not navigation: the rail belongs to the Command Center only.
+        bridge.setPage("tasks"); pump(400)
+        self.assertFalse(self.item(root, "summaryRail").isVisible())
+        bridge.setPage("home"); pump(400)
+        self.assertTrue(self.item(root, "summaryRail").isVisible())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_peek_opens_anchored_switches_and_closes_every_way(self) -> None:
+        from PySide6.QtCore import QPoint
+        bridge = self.bridge()
+        root = self.window(bridge)
+        pump(700)   # the work surface width animates in; read it settled
+        work = self.box(root, "canonicalWorkspace")
+        composer = self.box(root, "canonicalComposer")
+
+        self.click(root, "railTasks"); pump(300)
+        self.assertTrue(root.property("peekOpen")); self.assertEqual("Tasks", root.property("peekKey"))
+        self.assertTrue(self.item(root, "railTasks").property("active"))
+        peek = self.box(root, "summaryPeek"); rail = self.box(root, "summaryRail")
+        self.assertGreaterEqual(peek[0], rail[2], "the peek opens to the right of the rail")
+        # Quick look, not a reflow: the conversation does not move.
+        self.assertEqual(work, self.box(root, "canonicalWorkspace"))
+        self.assertEqual(composer, self.box(root, "canonicalComposer"))
+
+        # Another card switches in place; exactly one card is active.
+        self.click(root, "railUpdates"); pump(300)
+        self.assertTrue(root.property("peekOpen")); self.assertEqual("Updates", root.property("peekKey"))
+        self.assertEqual(["Updates"], [k for k in self.SUMMARY if self.item(root, "rail" + k).property("active")])
+        # The same card again closes it.
+        self.click(root, "railUpdates"); pump(300)
+        self.assertFalse(root.property("peekOpen"))
+        # X, Escape and an outside click close it too.
+        self.click(root, "railFocus"); pump(300)
+        self.click(root, "summaryPeekClose"); pump(300)
+        self.assertFalse(root.property("peekOpen"))
+        self.click(root, "railPlan"); pump(300)
+        QTest.keyClick(root, Qt.Key_Escape); pump(300)
+        self.assertFalse(root.property("peekOpen"))
+        self.click(root, "railTasks"); pump(300)
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPoint(1100, 620)); pump(300)
+        self.assertFalse(root.property("peekOpen"))
+        # Only one context at a time: a peek closes the model panel.
+        self.click(root, "modelTrigger"); pump(300)
+        self.assertTrue(root.property("modelOpen"))
+        self.click(root, "railTasks"); pump(300)
+        self.assertTrue(root.property("peekOpen")); self.assertFalse(root.property("modelOpen"))
+        # The deep action is the existing full page.
+        self.click(root, "summaryPeekAction"); pump(500)
+        self.assertEqual("tasks", bridge.page); self.assertFalse(root.property("peekOpen"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_peek_stays_inside_the_viewport_and_shows_only_real_state(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height)
+            pump(600)
+            for key in self.SUMMARY:
+                with self.subTest(size=(width, height), module=key):
+                    self.click(root, "rail" + key); pump(300)
+                    peek = self.box(root, "summaryPeek"); close = self.box(root, "summaryPeekClose")
+                    self.assertGreaterEqual(peek[0], 0); self.assertGreaterEqual(peek[1], 0)
+                    self.assertLessEqual(peek[2], width); self.assertLessEqual(peek[3], height)
+                    self.assertLessEqual(close[2], width); self.assertGreaterEqual(close[1], 0)
+                    self.click(root, "rail" + key); pump(300)
+                    self.assertFalse(root.property("peekOpen"))
+        # An empty installation: no tasks, projects or jobs exist, so those
+        # peeks show their truthful empty state rather than invented rows.
+        root.resize(1920, 1080); pump(400)
+        for key in ("Tasks", "Focus", "Plan"):
+            self.click(root, "rail" + key); pump(300)
+            self.assertTrue(self.item(root, "summaryPeekEmpty").isVisible(), f"{key} should be empty")
+            self.click(root, "rail" + key); pump(300)
+        # Updates is real too: this session's own activity note is listed.
+        self.click(root, "railUpdates"); pump(300)
+        self.assertFalse(self.item(root, "summaryPeekEmpty").isVisible())
+        self.assertIn("JARVIS interface started", self.texts(self.item(root, "summaryPeek"), []))
+        self.assertEqual(0, self.execute_calls())
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

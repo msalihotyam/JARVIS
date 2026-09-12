@@ -11,7 +11,7 @@ import "../theme"
 ListView {
     id: feed
     model: bridge.feed
-    spacing: 18
+    spacing: 22
     property bool pipelineEnabled: false
     readonly property int pipelineIndex: {
         var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
@@ -20,7 +20,11 @@ ListView {
     clip: true
     boundsBehavior: Flickable.StopAtBounds
     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-    onCountChanged: Qt.callLater(function() { feed.positionViewAtEnd() })
+    property bool followEnd: true
+    onMovementEnded: followEnd = atYEnd
+    onCountChanged: { followEnd = true; Qt.callLater(function() { feed.positionViewAtEnd() }) }
+    onContentHeightChanged: if (followEnd && !moving) Qt.callLater(function() { feed.positionViewAtEnd() })
+    onHeightChanged: if (followEnd && !moving) Qt.callLater(function() { feed.positionViewAtEnd() })
 
     function railColor(kind) {
         switch (kind) {
@@ -83,7 +87,8 @@ ListView {
             Rectangle {
                 visible: row.isUser
                 anchors.fill: parent; radius: 25
-                color: Theme.alpha(Theme.accentSoft, 0.5); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, 0.7)
+                gradient: Gradient { GradientStop { position: 0; color: "#2b6fae" } GradientStop { position: 1; color: "#123d68" } }
+                border.width: 1; border.color: Theme.alpha("#9fd4ff", 0.55)
                 Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: 24; radius: 24
                     gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.12) } GradientStop { position: 1; color: "transparent" } } }
                 Text { anchors.centerIn: parent; text: bridge.operatorName.charAt(0).toUpperCase(); color: "#f2f8ff"; font { family: Theme.font; pixelSize: 20; weight: Font.DemiBold } }
@@ -114,19 +119,19 @@ ListView {
             x: avatar.width + 18
             // The reference wraps both the request card and JARVIS's text at
             // about 640 px rather than spanning the whole flow.
-            width: row.boxed ? Math.min(row.width - x - 4, 625) : row.width - x - 4
+            width: row.boxed ? Math.min(row.width - x - 4, 625, Math.max(360, (row.width - x) * 0.66)) : row.width - x - 4
             readonly property real textWidth: row.boxed ? width - 32 : Math.min(width - 4, 710)
-            height: body.height + (row.boxed ? 30 : 14)
-            radius: 9
+            height: body.height + (row.boxed ? 32 : 14)
+            radius: 10
             // The request card of the reference: quiet darker glass, a barely-there border.
-            color: row.isUser ? Theme.alpha(Theme.bg0, 0.34) : (row.loud ? Theme.alpha(row.tone, 0.07) : "transparent")
+            color: row.isUser ? Theme.alpha(Theme.bg1, 0.72) : (row.loud ? Theme.alpha(row.tone, 0.07) : "transparent")
             border.width: row.boxed ? 1 : 0
-            border.color: row.isUser ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(row.tone, 0.45)
-            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: parent.height * 0.5; radius: 11
-                gradient: Gradient { GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0.035) } GradientStop { position: 1; color: "transparent" } } }
+            border.color: row.isUser ? Theme.alpha(Theme.accent, 0.3) : Theme.alpha(row.tone, 0.45)
+            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 34); radius: 9
+                gradient: Gradient { GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0.06) } GradientStop { position: 1; color: "transparent" } } }
             Column {
                 id: body
-                x: row.boxed ? 18 : 0; y: row.boxed ? 14 : 4
+                x: row.boxed ? 20 : 0; y: row.boxed ? 15 : 4
                 width: card.textWidth
                 spacing: 7
                 Row {

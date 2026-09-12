@@ -29,16 +29,26 @@ Window {
     readonly property bool navOpen: nav.open
     readonly property bool settingsOpen: settings.open
     readonly property bool modelOpen: modelPanel.open
+    readonly property bool peekOpen: peek.open
+    readonly property string peekKey: peek.open ? peek.key : ""
     readonly property string presentation: bridge.theme
     readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
     property bool devApprovalVisible: false
 
-    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false }
+    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; peek.open = false }
+    // One summary peek at a time: the same card again closes it, another
+    // card switches the content in place without closing the surface first.
+    function togglePeek(key, cardY) {
+        if (peek.open && peek.key === key) { peek.open = false; return }
+        if (palette.open) palette.hide()
+        settings.open = false; modelPanel.open = false; nav.open = false
+        peek.key = key; peek.cardY = cardY; peek.open = true
+    }
     function toggleSettings() { var next = !settings.open; closeContexts(); settings.open = next }
     function toggleModel() { var next = !modelPanel.open; closeContexts(); modelPanel.open = next }
     function toggleNav() { var next = !nav.open; closeContexts(); nav.open = next }
     onHomePageChanged: closeContexts()
-    onPresentationChanged: { nav.open = false; modelPanel.open = false }
+    onPresentationChanged: { nav.open = false; modelPanel.open = false; peek.open = false }
 
     Component.onCompleted: {
         Theme.name = bridge.theme
@@ -199,6 +209,27 @@ Window {
     Item { id: topControls; anchors.fill: parent; z: 500 }
     SettingsDrawer { id: settings; anchorPoint: topBar.settingsAnchor }
     ModelPanel { id: modelPanel; anchorPoint: topBar.modelAnchor }
+
+    // -- the left ambient rail's summary stack and its quick-look peek ------
+    // The rail sits under the date / time / context block, inside the Phase 1
+    // rail width, and above the peek's outside-click scrim so its cards can
+    // toggle and switch the peek; approval and confirmation still cover it.
+    SummaryPeek {
+        id: peek
+        rail: summaryRail
+        anchorPoint: Qt.point(summaryRail.x + summaryRail.width + 12, summaryRail.y + peek.cardY - 8)
+    }
+    SummaryRail {
+        id: summaryRail
+        z: 420
+        visible: root.presentation !== "command" && root.homePage
+        x: Math.max(10, Theme.px(root.width * 0.0163, 20, 34) - 6)
+        y: Math.round(root.height * 0.1980) + 76
+        width: Theme.railWidth(root.width) - x - 12
+        height: root.height - y - 64
+        activeKey: peek.open ? peek.key : ""
+        onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
+    }
     CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 
@@ -240,6 +271,7 @@ Window {
         else if (settings.open) settings.open = false
         else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
+        else if (peek.open) peek.open = false
         else if (!root.homePage && pageLoader.item) pageLoader.item.closePage()
         else if (bridge.editMode) bridge.setEditMode(false) } }
 }

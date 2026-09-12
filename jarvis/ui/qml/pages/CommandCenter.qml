@@ -36,39 +36,13 @@ GlassPanel {
     }
     Column {
         id: choices
-        anchors { left: parent.left; right: parent.right; bottom: quick.top; leftMargin: page.inset + 68; rightMargin: 36; bottomMargin: visible ? 14 : 0 }
+        anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: page.inset + 68; rightMargin: 36; bottomMargin: visible ? 18 : 0 }
         visible: !!bridge.clarification.choices && bridge.clarification.choices.length > 0
         height: visible ? implicitHeight : 0; spacing: 10
         Text { text: "CHOOSE ONE"; color: Theme.accentSoft; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
         Flow { width: parent.width; spacing: 10
             Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
             ActionButton { label: "Never mind"; onClicked: bridge.dismissClarification() }
-        }
-    }
-    Row {
-        id: quick
-        anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: 36; rightMargin: 14; bottomMargin: visible ? 26 : 0 }
-        spacing: 16; visible: width >= 780 && page.height >= 620; height: visible ? 92 : 0
-        Repeater {
-            model: [
-                {title:"Tasks",line:bridge.taskLive ? "1 active" : "0 active",note:bridge.sessions.length + " sessions",glyph:"▤",tone:"#058bf0",page:"tasks"},
-                {title:"Automations",line:bridge.jobs.length + " jobs",note:"Scheduled work",glyph:"⟳",tone:"#00a67d",page:"automations"},
-                {title:"Memory",line:bridge.projects.length + " projects",note:"Reference data",glyph:"◉",tone:"#b78624",page:"memory"},
-                {title:"History",line:bridge.sessions.length + " sessions",note:"Tasks and outcomes",glyph:"◷",tone:"#7547ba",page:"history"}
-            ]
-            Rectangle {
-                width: (quick.width - 48) / 4; height: 92; radius: 9
-                color: hover.containsMouse ? Theme.surfaceRaised : Theme.surfaceDeep; border.width: 1; border.color: hover.containsMouse ? Theme.borderStrong : Theme.border
-                Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                IconBox { x: 15; anchors.verticalCenter: parent.verticalCenter; width: 42; height: 44; glyph: modelData.glyph; tint: modelData.tone; solid: true; glyphSize: 21 }
-                Column { x: 70; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 96; spacing: 3
-                    Text { text: modelData.title; color: Theme.text; font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
-                    Text { text: modelData.line; color: Qt.lighter(modelData.tone, 1.5); font { family: Theme.font; pixelSize: 13 } }
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.note; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
-                }
-                Text { anchors.right: parent.right; anchors.rightMargin: 13; anchors.verticalCenter: parent.verticalCenter; text: "›"; color: Theme.accent; font.pixelSize: 25 }
-                MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setPage(modelData.page) }
-            }
         }
     }
     Composer { id: composer; objectName: "canonicalComposer"; height: 70
