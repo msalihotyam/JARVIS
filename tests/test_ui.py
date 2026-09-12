@@ -938,7 +938,7 @@ class SecondaryPageTests(UiTestCase):
             for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
                 with self.subTest(jobs=count, size=(width, height)):
                     root.resize(width, height)
-                    pump(400)
+                    pump(700)   # listing / editor heights rebind after the resize
                     viewport.setProperty("contentY", 0)
                     self.assertGreaterEqual(spec.height(), 180)
                     self.assertGreater(button.height(), 30)
@@ -946,7 +946,7 @@ class SecondaryPageTests(UiTestCase):
                     if width == 1920:
                         self.assertLessEqual(bottom, 1, "master layout must show the whole form without scrolling")
                     viewport.setProperty("contentY", bottom)
-                    pump(50)
+                    pump(120)
                     top_left = button.mapToItem(viewport, QPointF(0, 0))
                     bottom_right = button.mapToItem(viewport, QPointF(button.width(), button.height()))
                     self.assertGreaterEqual(top_left.y(), 0)
@@ -1005,6 +1005,82 @@ class StatusIndicatorTests(UiTestCase):
         self.assertEqual({**canonical_preferences(), "theme": "dark"}, validate_preferences(legacy))
         self.assertEqual(canonical_preferences(), validate_preferences({**canonical_preferences(), "status_indicator": "neon"}))
         self.assertEqual(0, self.execute_calls())
+
+
+class MacroGeometryTests(UiTestCase):
+    """The Canonical Space macro composition, normalized to the viewport.
+
+    Targets measured from the approved 1536x864 reference; the same ratios
+    must hold at every supported size. Major boundaries +-1.5 pp, the core
+    centre +-1.0 pp.
+    """
+    item = PresentationTests.item
+
+    REFERENCE = {
+        "central left": 12.83, "central width": 56.70, "central right": 69.53,
+        "column gap": 0.91, "stack left": 70.44, "stack width": 27.60, "stack right": 98.05,
+        "panel start Y": 18.98, "central bottom Y": 95.14, "stack bottom Y": 92.13,
+        "core centre X": 48.96, "core centre Y": 7.99,
+    }
+
+    def test_canonical_macro_composition_holds_at_every_supported_size(self) -> None:
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.load(bridge)
+        root.showNormal()
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height)
+            pump(760)   # the work surface width and the column reflow both animate
+            self.assertEqual((width, height), (root.width(), root.height()))
+
+            def box(name):
+                it = self.item(root, name)
+                a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+                return a.x(), a.y(), b.x(), b.y()
+
+            work = box("canonicalWorkspace"); stack = box("panelColumn"); core = box("jarvisCore")
+            measured = {
+                "central left": 100 * work[0] / width,
+                "central width": 100 * (work[2] - work[0]) / width,
+                "central right": 100 * work[2] / width,
+                "column gap": 100 * (stack[0] - work[2]) / width,
+                "stack left": 100 * stack[0] / width,
+                "stack width": 100 * (stack[2] - stack[0]) / width,
+                "stack right": 100 * stack[2] / width,
+                "panel start Y": 100 * work[1] / height,
+                "central bottom Y": 100 * work[3] / height,
+                "stack bottom Y": 100 * stack[3] / height,
+                "core centre X": 100 * (core[0] + core[2]) / 2 / width,
+                "core centre Y": 100 * (core[1] + core[3]) / 2 / height,
+            }
+            for key, target in self.REFERENCE.items():
+                tolerance = 1.0 if key.startswith("core centre") else 1.5
+                with self.subTest(size=(width, height), boundary=key):
+                    self.assertAlmostEqual(target, measured[key], delta=tolerance,
+                                           msg=f"{key} {measured[key]:.2f}% vs reference {target:.2f}%")
+            with self.subTest(size=(width, height), boundary="no overlap"):
+                # The work surface never reaches into the stack, and nothing leaves the viewport.
+                self.assertLessEqual(work[2], stack[0])
+                self.assertLessEqual(stack[2], width)
+                self.assertLessEqual(work[3], height)
+                self.assertGreater(work[2] - work[0], stack[2] - stack[0],
+                                   "the central work surface must dominate the right stack")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_command_preset_keeps_its_own_outer_geometry(self) -> None:
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.load(bridge)
+        root.showNormal(); root.resize(1920, 1080); pump(300)
+        canonical_left = self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x()
+        bridge.setTheme("command")
+        pump(600)
+        # The command preset is a different layout family: it must not inherit
+        # the canonical ambient rail inset.
+        self.assertEqual("command", root.property("themeName"))
+        bridge.setTheme("space")
+        pump(600)
+        self.assertAlmostEqual(canonical_left, self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x(), delta=1.0)
 
 
 if __name__ == "__main__":  # pragma: no cover

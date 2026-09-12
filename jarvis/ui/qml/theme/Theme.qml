@@ -41,6 +41,36 @@ QtObject {
     readonly property int fsHero: 34
     readonly property real labelSpacing: 2.4
 
+    // -- macro geometry ---------------------------------------------------
+    // The Canonical Space composition, normalized to the viewport and
+    // measured from the approved 1536x864 reference. Canonical and Dark
+    // share this family; the Command preset keeps its own outer geometry,
+    // so nothing here is consumed on that path.
+    readonly property real macroRail: 0.1283           // ambient rail width = central surface left edge
+    readonly property real macroStackRight: 0.9805     // right stack right edge
+    readonly property real macroGap: 0.0091            // column gap
+    readonly property real macroTopZone: 0.1898        // identity / core zone height = panels begin
+    readonly property real macroCentralBottom: 0.9514  // central surface bottom
+    readonly property real macroStackBottom: 0.9213    // right stack bottom
+    readonly property real macroStackGap: 0.030        // gap between stacked panels, of stack height
+    readonly property real macroCoreX: 0.4890          // core centre
+    readonly property real macroCoreY: 0.0799
+    readonly property real macroCoreSize: 0.1630       // core diameter, of viewport width
+    readonly property real macroStripRight: 0.0143     // command-strip right margin
+    readonly property real macroChip: 0.1010           // model-selector envelope, of viewport width
+    // The rail shrinks before the work surface does, and never disappears.
+    function px(v, lo, hi) { return Math.round(Math.max(lo, Math.min(hi, v))) }
+    function railWidth(w) { return px(w * macroRail, 132, 300) }
+    function outerRight(w) { return px(w * (1 - macroStackRight), 18, 48) }
+    function topZone(h) { return px(h * macroTopZone, 150, 240) }
+    function centralBottom(h) { return px(h * (1 - macroCentralBottom), 30, 70) }
+    function stackInset(h) { return px(h * (macroCentralBottom - macroStackBottom), 16, 44) }
+    function columnGap(w) { return px(w * macroGap, 12, 26) }
+    function stackGap(stackHeight) { return px(stackHeight * macroStackGap, 10, 30) }
+    function coreSize(w) { return px(w * macroCoreSize, 175, 330) }
+    function chipWidth(w) { return px(w * macroChip, 150, 210) }
+    function stripSpacing(w) { return px(w * 0.0073, 8, 16) }
+
     // -- geometry (1920x1080 contract, scaled by the layout) -------------
     readonly property int radius: 11
     readonly property int radiusSmall: 8

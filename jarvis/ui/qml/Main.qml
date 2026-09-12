@@ -60,9 +60,15 @@ Window {
         id: topBar
         controlLayer: topControls
         anchors { left: parent.left; right: parent.right; top: parent.top }
+        // The identity / core zone owns a proportional share of the height;
+        // the Command preset keeps its own compact strip.
+        height: root.presentation === "command" ? 110 : Theme.topZone(root.height)
+        railWidth: Theme.railWidth(root.width)
+        viewportHeight: root.height
         clock: Qt.formatTime(clock.now, "h:mm AP").split(" ")[0]
         meridiem: Qt.formatTime(clock.now, "AP")
         date: Qt.formatDate(clock.now, "ddd, d MMMM yyyy")
+        shortDate: Qt.formatDate(clock.now, "ddd, d MMM yyyy")
         fullscreen: root.fullscreen
         settingsOpen: settings.open
         onMenuRequested: root.toggleNav()
@@ -82,19 +88,22 @@ Window {
             confirm.ask("Re-enable execution", "Allow JARVIS to start work again? Every approval still applies.", "Re-enable", false, function() { bridge.setExecutionEnabled(true) })
     }
 
-    // -- content (1920x1080 contract: workspace x 245-1340 y 205-1030,
-    //    column x 1350-1885 y 205-1000; proportional at other widths) --------
+    // -- content: the macro regions. Canonical / Dark take the normalized
+    //    Canonical Space map (ambient rail | work surface | intelligence
+    //    stack); the Command preset keeps its own outer geometry. ----------
     Item {
         id: content
+        readonly property bool command: root.presentation === "command"
         readonly property bool wide: root.width >= 1500
-        anchors { left: parent.left; right: parent.right; top: topBar.bottom; bottom: parent.bottom
-                  leftMargin: root.presentation === "command" ? Theme.margin : wide ? Math.round(root.width * 0.1292) : Theme.margin
-                  rightMargin: wide ? Math.round(root.width * 0.0182) : Theme.margin
-                  bottomMargin: wide ? Math.round(root.height * 0.046) : 40; topMargin: 8 }
+        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: parent.bottom
+                  leftMargin: command ? Theme.margin : Theme.railWidth(root.width)
+                  rightMargin: command ? Theme.margin : Theme.outerRight(root.width)
+                  topMargin: command ? topBar.height + 8 : Theme.topZone(root.height)
+                  bottomMargin: command ? (wide ? Math.round(root.height * 0.046) : 40) : Theme.centralBottom(root.height) }
         Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
         readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
-        readonly property int columnGap: 16
+        readonly property int columnGap: command ? 16 : Theme.columnGap(root.width)
 
         // Workspace: the page, with a restrained crossfade + slide on change.
         Item {
@@ -147,7 +156,8 @@ Window {
         PanelColumn {
             id: panelColumn
             objectName: "panelColumn"
-            anchors { right: parent.right; top: parent.top; bottom: parent.bottom; bottomMargin: content.wide ? 30 : 0 }
+            anchors { right: parent.right; top: parent.top; bottom: parent.bottom
+                      bottomMargin: content.command ? 0 : Theme.stackInset(root.height) }
             width: content.columnWidth
             visible: content.showColumn
             opacity: content.showColumn ? 1 : 0

@@ -13,8 +13,10 @@ Item {
     property var shown: panels.filter(function(p) { return p.shown })
     property real totalShare: shown.reduce(function(sum, p) { return sum + p.share }, 0)
     property real editChrome: bridge.editMode ? 54 : 0
-    property real usable: height - editChrome - Math.max(0, shown.length - 1) * Theme.gap
+    property real usable: height - editChrome - Math.max(0, shown.length - 1) * gapPx
     readonly property int minPanelHeight: 120
+    // Gap between stacked panels: proportional to the stack, as in the reference.
+    readonly property int gapPx: Theme.stackGap(height)
     property real nowSec: Date.now() / 1000
     Timer { interval: 30000; running: column.visible; repeat: true; onTriggered: column.nowSec = Date.now() / 1000 }
     function ago(ts, fallback) {
@@ -34,7 +36,7 @@ Item {
     }
     function yFor(index) {
         var y = editChrome
-        for (var i = 0; i < index; i++) y += heightFor(i) + Theme.gap
+        for (var i = 0; i < index; i++) y += heightFor(i) + gapPx
         return y
     }
     // The rendered geometry of every shown panel, for inspection.

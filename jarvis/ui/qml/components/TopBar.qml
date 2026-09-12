@@ -9,7 +9,12 @@ import "../theme"
 // model / execution controls, window controls, the layout-edit control.
 Item {
     id: bar
-    height: Theme.command ? 110 : 197
+    // Height, rail width and the viewport height come from the macro
+    // layout (Main.qml); the rail's own rhythm is proportional to it.
+    property real railWidth: 246
+    property real viewportHeight: 1080
+    // The rail's own left inset, proportional like the rail itself.
+    readonly property real railInset: Theme.px(bar.width * 0.0163, 20, 34)
     signal menuRequested()
     signal killSwitchRequested()
     signal editRequested()
@@ -21,6 +26,7 @@ Item {
     property string clock: ""
     property string meridiem: ""
     property string date: ""
+    property string shortDate: ""
     property bool fullscreen: true
     property bool settingsOpen: false
     property Item controlLayer: null
@@ -30,8 +36,12 @@ Item {
     // Below the design width the core shrinks, the HUD geometry goes, and the
     // model chip collapses to its icon, so nothing overlaps.
     readonly property bool narrow: width < 1500
-    readonly property real coreCx: narrow ? width * 0.42 : width * 0.488
-    readonly property real coreCy: narrow ? 72 : Theme.command ? 60 : 87
+    // The core keeps the reference's centre and a proportional diameter at
+    // every width: it is the primary identity anchor, never repositioned
+    // out of the composition.
+    readonly property real coreCx: Theme.command ? width * 0.42 : width * Theme.macroCoreX
+    readonly property real coreCy: Theme.command ? 60 : bar.viewportHeight * Theme.macroCoreY
+    readonly property real coreDiameter: Theme.command ? 162 : Theme.coreSize(width)
 
     function tz() {
         var m = -new Date().getTimezoneOffset(); var sign = m < 0 ? "-" : "+"; m = Math.abs(m)
@@ -166,8 +176,15 @@ Item {
     Text { x: 120; y: 19; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 27; letterSpacing: 12; weight: Font.Normal } }
     Text { x: 122; y: 58; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 3.8 } }
 
-    Text { visible: !Theme.command; x: 40; y: 112; text: bar.date; color: Theme.textLabel; font { family: Theme.font; pixelSize: 14; letterSpacing: 0.2 } }
-    Row { visible: !Theme.command; x: 38; y: 128; spacing: 9
+    Text {
+        visible: !Theme.command; x: bar.railInset + 2; y: Math.round(bar.viewportHeight * 0.1040)
+        width: bar.railWidth - bar.railInset - 10; elide: Text.ElideRight
+        // The rail keeps the real date; a tight rail abbreviates the month
+        // rather than eliding it.
+        text: bar.railWidth >= 190 ? bar.date : bar.shortDate
+        color: Theme.textLabel; font { family: Theme.font; pixelSize: 14; letterSpacing: 0.2 }
+    }
+    Row { visible: !Theme.command; x: bar.railInset; y: Math.round(bar.viewportHeight * 0.1185); spacing: 9
         Text { text: bar.clock; color: "#9fdcff"; font { family: Theme.font; pixelSize: 40; weight: Font.Medium; letterSpacing: 0.4 } }
         Text { text: bar.meridiem; color: "#9fdcff"; anchors.baseline: parent.children[0].baseline; font { family: Theme.font; pixelSize: 21; weight: Font.Medium; letterSpacing: 0.6 } }
     }
@@ -175,26 +192,28 @@ Item {
     // Local-context block (the reference's weather slot). No weather source
     // exists, so it carries the real local time zone and says so.
     Item {
-        x: 38; y: 214; width: 150; height: 60
+        id: contextBlock
+        x: bar.railInset; y: Math.round(bar.viewportHeight * 0.1980); width: bar.railWidth - bar.railInset - 8; height: 60
         visible: !bar.narrow && !Theme.command
-        Item { width: 28; height: 28; y: 8
+        Item { id: contextMark; visible: bar.railWidth >= 220; width: 28; height: 28; y: 8
             Rectangle { anchors.fill: parent; radius: 14; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.5) }
             Rectangle { anchors.centerIn: parent; width: 14; height: 14; radius: 7; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.8) }
             Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: Theme.accent }
             Repeater { model: 8; Rectangle { width: 1; height: 4; color: Theme.accent; opacity: 0.7; x: 13.5; y: -2; transform: Rotation { origin.x: 0.5; origin.y: 16; angle: index * 45 } } }
         }
-        Column { x: 44; y: 2; spacing: 3
-            Text { text: bar.tz() + "  Local"; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
-            Text { text: "Weather not connected"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
+        Column { x: contextMark.visible ? 44 : 0; y: 2; width: parent.width - x; spacing: 3
+            Text { width: parent.width; elide: Text.ElideRight; text: bar.tz() + "  Local"; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
+            Text { width: parent.width; elide: Text.ElideRight; text: "Weather not connected"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
         }
     }
 
     // -- core + state ticker --------------------------------------------------
     JarvisCore {
         id: core
+        objectName: "jarvisCore"
         x: bar.coreCx - width / 2
         y: bar.coreCy - height / 2
-        width: bar.narrow ? 162 : 282; height: width
+        width: bar.coreDiameter; height: width
         state_: bridge.coreState
         active: Window.active
         Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
@@ -228,15 +247,17 @@ Item {
     // -- right controls -------------------------------------------------------
     Row {
         id: controls
+        objectName: "commandStrip"
         parent: bar.controlLayer || bar
-        anchors { right: parent.right; top: parent.top; rightMargin: 18; topMargin: 25 }
-        spacing: 14
+        anchors { right: parent.right; top: parent.top
+                  rightMargin: Math.round(bar.width * Theme.macroStripRight); topMargin: 25 }
+        spacing: Theme.stripSpacing(bar.width)
 
         // Provider / model chip opens ONLY its own model panel.
         Rectangle {
             id: modelChip
             objectName: "modelTrigger"
-            width: bar.narrow ? 50 : 196; height: 40; radius: Theme.radiusSmall
+            width: bar.narrow ? 50 : Theme.chipWidth(bar.width); height: 40; radius: Theme.radiusSmall
             activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: "Model and provider"
             Keys.onReturnPressed: bar.openModel()
             Keys.onSpacePressed: bar.openModel()
@@ -249,7 +270,7 @@ Item {
                     gradient: Gradient { GradientStop { position: 0; color: "#f4bd66" } GradientStop { position: 1; color: "#d2842a" } }
                     Text { anchors.centerIn: parent; text: "AI"; color: "#2b1700"; font { family: Theme.font; pixelSize: 10; weight: Font.Bold } } }
                 Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter
-                    width: 116; elide: Text.ElideRight
+                    width: Math.max(56, modelChip.width - 88); elide: Text.ElideRight
                     text: "Claude" + (bridge.config.claude_model ? " · " + bridge.config.claude_model : "")
                     color: Theme.text; font { family: Theme.font; pixelSize: 15 } }
                 Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textLabel; font.pixelSize: 15 }
@@ -297,7 +318,9 @@ Item {
 
     // The tiny icon-only layout-edit control: a sliders glyph in a framed square.
     IconButton {
-        anchors { right: parent.right; top: parent.top; rightMargin: 26; topMargin: 98 }
+        anchors { right: parent.right; top: parent.top
+                  rightMargin: Math.round(bar.width * Theme.macroStripRight) + 8
+                  topMargin: Math.round(bar.viewportHeight * 0.1130) }
         tip: bridge.editMode ? "Done editing" : "Edit layout"
         active: bridge.editMode
         framed: true
