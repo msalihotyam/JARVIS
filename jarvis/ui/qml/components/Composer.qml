@@ -6,7 +6,7 @@ import "../theme"
 // JarvisApp.submit_text; no JSON, no capability names, no grammar here.
 Rectangle {
     id: composer
-    height: 60
+    height: 62
     radius: 14
     color: Theme.surfaceRaised
     border.width: 1

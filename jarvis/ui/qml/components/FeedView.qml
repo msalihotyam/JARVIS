@@ -65,24 +65,23 @@ ListView {
         // -- avatar column ---------------------------------------------------
         Item {
             id: avatar
-            width: 46; height: 46
+            width: 50; height: 50
             // You: a soft disc with a person mark.
+            // You: the operator's initial on a soft disc.
             Rectangle {
                 visible: row.isUser
-                anchors.fill: parent; radius: 23
-                color: Theme.alpha(Theme.accentSoft, 0.16); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, 0.45)
-                Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 11; width: 12; height: 12; radius: 6; color: Theme.accentSoft; opacity: 0.9 }
-                Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 25; width: 22; height: 12; radius: 6; color: Theme.accentSoft; opacity: 0.9
-                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 6; color: Theme.alpha(Theme.accentSoft, 0.16) } }
+                anchors.fill: parent; radius: 25
+                color: Theme.alpha(Theme.accentSoft, 0.18); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, 0.5)
+                Text { anchors.centerIn: parent; text: bridge.operatorName.charAt(0).toUpperCase(); color: Theme.text; font { family: Theme.font; pixelSize: 19; weight: Font.DemiBold } }
             }
             // JARVIS: a small orb - ring, arc, sphere.
             Item {
                 visible: row.isJarvis
                 anchors.fill: parent
-                Rectangle { anchors.fill: parent; radius: 23; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.45) }
-                Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: "transparent"; border.width: 2; border.color: Theme.accent; opacity: 0.8 }
-                Rectangle { anchors.centerIn: parent; width: 40; height: 40; radius: 20; color: "transparent"; border.width: 4; border.color: Theme.accent; opacity: 0.16 }
-                Rectangle { anchors.centerIn: parent; width: 24; height: 24; radius: 12
+                Rectangle { anchors.fill: parent; radius: 25; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.45) }
+                Rectangle { anchors.centerIn: parent; width: 40; height: 40; radius: 20; color: "transparent"; border.width: 2; border.color: Theme.accent; opacity: 0.8 }
+                Rectangle { anchors.centerIn: parent; width: 44; height: 44; radius: 22; color: "transparent"; border.width: 4; border.color: Theme.accent; opacity: 0.16 }
+                Rectangle { anchors.centerIn: parent; width: 26; height: 26; radius: 13
                     gradient: Gradient { GradientStop { position: 0; color: Qt.lighter(Theme.accent, 1.2) } GradientStop { position: 0.55; color: Theme.bg1 } GradientStop { position: 1; color: Theme.bg0 } }
                     border.width: 1; border.color: Theme.accent }
                 Rectangle { anchors.centerIn: parent; width: 60; height: 60; radius: 30; color: Theme.accent; opacity: 0.08; z: -1 }

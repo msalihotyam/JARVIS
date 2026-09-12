@@ -45,13 +45,15 @@ def _panel(visible: bool = True, pinned: bool = False, share: float = 0.33) -> d
 def canonical_profiles() -> dict[str, dict[str, Any]]:
     """Fresh canonical layouts. A new dict every call: never a shared default."""
     return {
+        # The canonical 1920x1080 composition: a 535 px column holding
+        # System status (185) / Active workflow (275) / Live feed (305).
         "normal": {
-            "column_width": 0.31,
+            "column_width": 0.32,
             "order": list(PANEL_IDS),
             "panels": {
-                "system": _panel(share=0.30),
-                "workflow": _panel(share=0.36),
-                "activity": _panel(share=0.34),
+                "system": _panel(share=0.16),
+                "workflow": _panel(pinned=True, share=0.38),
+                "activity": _panel(share=0.46),
                 "automations": _panel(visible=False, share=0.20),
             },
         },

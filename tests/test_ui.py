@@ -522,7 +522,9 @@ class LayoutTests(UiTestCase):
 
     def test_edit_mode_show_hide_move_within_bounds(self) -> None:
         bridge = self.bridge()
-        self.assertEqual(["system", "activity"], self.shown(bridge))
+        self.assertEqual(["system", "workflow", "activity"], self.shown(bridge))
+        bridge.setPanelPinned("workflow", False)
+        self.assertEqual(["system", "activity"], self.shown(bridge))  # unpinned + no task: contextual, hidden
         bridge.setEditMode(True)
         self.assertTrue(bridge.editMode)
         self.assertEqual(["system", "workflow", "activity"], self.shown(bridge))  # edit mode reveals contextual panels
@@ -570,7 +572,7 @@ class LayoutTests(UiTestCase):
         bridge.movePanel("automations", -3)
         bridge.resetLayout()
         self.assertEqual(canonical_preferences()["profiles"]["normal"], bridge.prefs.layout())
-        self.assertEqual(["system", "activity"], self.shown(bridge))
+        self.assertEqual(["system", "workflow", "activity"], self.shown(bridge))
 
     def test_profiles_keep_their_own_customizations(self) -> None:
         bridge = self.bridge()
@@ -582,7 +584,7 @@ class LayoutTests(UiTestCase):
         self.assertEqual(0.24, bridge.columnWidth)
         self.assertEqual(["workflow"], self.shown(bridge))
         bridge.setProfile("normal")
-        self.assertEqual(["system", "activity", "automations"], self.shown(bridge))
+        self.assertEqual(["system", "workflow", "activity", "automations"], self.shown(bridge))
         self.assertEqual("normal", UiPreferences(self.prefs_path).data["profile"])
 
     def test_focus_mode_is_temporary_and_restores_exactly(self) -> None:
@@ -594,7 +596,7 @@ class LayoutTests(UiTestCase):
         bridge.setFocusMode(True)
         self.assertTrue(bridge.focusMode)
         self.assertFalse(bridge.editMode)
-        self.assertEqual(["activity"], self.shown(bridge))
+        self.assertEqual(["workflow", "activity"], self.shown(bridge))  # only the pinned panels stay
         self.assertEqual(before_file, self.prefs_path.read_text(encoding="utf-8"))
         bridge.setFocusMode(False)
         self.assertEqual(before_shown, self.shown(bridge))
@@ -602,6 +604,8 @@ class LayoutTests(UiTestCase):
 
     def test_pinned_contextual_panel_stays_visible(self) -> None:
         bridge = self.bridge(task_proposal("code_analysis"))
+        self.assertIn("workflow", self.shown(bridge))  # canonical: pinned, shown with its empty state
+        bridge.setPanelPinned("workflow", False)
         self.assertNotIn("workflow", self.shown(bridge))
         bridge.setPanelPinned("workflow", True)
         self.assertIn("workflow", self.shown(bridge))

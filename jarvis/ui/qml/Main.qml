@@ -70,22 +70,25 @@ Window {
             confirm.ask("Re-enable execution", "Allow JARVIS to start work again? Every approval still applies.", "Re-enable", false, function() { bridge.setExecutionEnabled(true) })
     }
 
-    // -- content ----------------------------------------------------------
-    // The reference composition keeps a quiet left gutter under the clock;
-    // the workspace and the column float to the right of it.
+    // -- content (1920x1080 contract: workspace x 245-1340 y 205-1030,
+    //    column x 1350-1885 y 205-1000; proportional at other widths) --------
     Item {
         id: content
+        readonly property bool wide: root.width >= 1500
         anchors { left: parent.left; right: parent.right; top: topBar.bottom; bottom: parent.bottom
-                  leftMargin: root.width < 1500 ? Theme.margin : Math.round(root.width * 0.122); rightMargin: Theme.margin; bottomMargin: 40; topMargin: 8 }
+                  leftMargin: wide ? Math.round(root.width * 0.1276) : Theme.margin
+                  rightMargin: wide ? Math.round(root.width * 0.0182) : Theme.margin
+                  bottomMargin: wide ? Math.round(root.height * 0.046) : 40; topMargin: 8 }
         Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
         readonly property bool showColumn: root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
+        readonly property int columnGap: 16
 
         // Workspace: the page, with a restrained crossfade + slide on change.
         Item {
             id: workspace
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
-            width: content.width - (content.showColumn ? content.columnWidth + Theme.gap + 4 : 0)
+            width: content.width - (content.showColumn ? content.columnWidth + content.columnGap : 0)
             Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Loader {
                 id: pageLoader
@@ -115,7 +118,7 @@ Window {
         // Column width grip (Edit Mode): direct while dragging, snapped on release.
         Rectangle {
             visible: bridge.editMode && content.showColumn
-            x: workspace.width + (Theme.gap + 4) / 2 - 3; width: 6; height: 60
+            x: workspace.width + content.columnGap / 2 - 3; width: 6; height: 60
             anchors.verticalCenter: parent.verticalCenter
             radius: 3; color: Theme.accent; opacity: widthGrip.pressed ? 1 : 0.6
             MouseArea {
@@ -130,7 +133,7 @@ Window {
         PanelColumn {
             id: panelColumn
             objectName: "panelColumn"
-            anchors { right: parent.right; top: parent.top; bottom: parent.bottom }
+            anchors { right: parent.right; top: parent.top; bottom: parent.bottom; bottomMargin: content.wide ? 30 : 0 }
             width: content.columnWidth
             visible: content.showColumn
             opacity: content.showColumn ? 1 : 0
@@ -141,7 +144,7 @@ Window {
 
     // -- HUD captions and fragments along the bottom edge -----------------------
     Item {
-        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: 24 }
         height: 30
         Row { anchors { left: parent.left; leftMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
             Text { anchors.verticalCenter: parent.verticalCenter; text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMicro; letterSpacing: 3.2 } }

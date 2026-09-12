@@ -13,6 +13,7 @@ selection and cancellation it is handed.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -281,6 +282,11 @@ class Bridge(QObject):
     @Property(int, notify=stateChanged)
     def uptimeSeconds(self) -> int:
         return int(time.monotonic() - self.started_at)
+
+    @Property(str, constant=True)
+    def operatorName(self) -> str:
+        """The person this installation greets. Display only; JARVIS_OPERATOR_NAME overrides."""
+        return os.environ.get("JARVIS_OPERATOR_NAME", "").strip() or "Salih"
 
     @Property("QVariantList", notify=stateChanged)
     def effortChoices(self) -> list:

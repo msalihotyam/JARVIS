@@ -17,7 +17,7 @@ Item {
         id: dim
         anchors.fill: parent
         color: "#000000"
-        opacity: overlay.pending ? 0.55 : 0
+        opacity: overlay.pending ? 0.62 : 0
         Behavior on opacity { NumberAnimation { duration: overlay.pending ? Theme.approvalIn : Theme.approvalOut; easing.type: Easing.OutCubic } }
         MouseArea { anchors.fill: parent; enabled: overlay.pending }
     }
@@ -39,9 +39,12 @@ Item {
             id: body
             width: parent.width
             spacing: 14
-            Row { spacing: 12
-                Rectangle { width: 10; height: 10; radius: 5; color: Theme.warning; anchors.verticalCenter: parent.verticalCenter }
-                Text { text: "AUTHORIZATION REQUIRED"; color: Theme.warning; font { family: Theme.font; pixelSize: 13; letterSpacing: 3; weight: Font.DemiBold } }
+            Row { spacing: 14
+                IconBox { width: 36; height: 36; glyph: "⚑"; tint: Theme.warning; anchors.verticalCenter: parent.verticalCenter }
+                Column { anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                    Text { text: "AUTHORIZATION REQUIRED"; color: Theme.warning; font { family: Theme.font; pixelSize: 13; letterSpacing: 3; weight: Font.DemiBold } }
+                    Text { text: "HUMAN GATE  ·  one action, exactly as shown"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.6 } }
+                }
             }
             Text { text: "JARVIS will not act until you decide. Nothing has executed."; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
             Grid {

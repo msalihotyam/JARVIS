@@ -3,7 +3,10 @@ import "../theme"
 
 // One layered glass surface. No live blur: depth comes from a soft drop
 // shadow beneath, a translucent fill, a top sheen, a luminous top-left
-// edge highlight and a thin border - all plain rectangles, all static.
+// edge, a darker bottom-right edge and a thin border - all plain
+// rectangles, all static. `level`: 1 workspace glass, 2 panel glass,
+// 3 raised / floating. `brackets` adds the small corner detail of the
+// reference panels.
 Rectangle {
     id: panel
     property string title: ""
@@ -12,11 +15,13 @@ Rectangle {
     property alias headerRight: headerRight.data
     default property alias content: body.data
     property int padding: Theme.pad
+    property int level: 2
     property bool raised: false
     property bool shadow: true
+    property bool brackets: false
 
     radius: Theme.radius
-    color: raised ? Theme.surfaceRaised : Theme.surface
+    color: raised || level === 3 ? Theme.surfaceRaised : level === 1 ? Theme.surfaceWorkspace : Theme.surface
     border.width: 1
     border.color: Theme.border
 
@@ -24,8 +29,7 @@ Rectangle {
     Rectangle { z: -2; visible: panel.shadow; anchors.fill: parent; anchors.margins: -2; anchors.topMargin: 6; radius: panel.radius + 2; color: "#000000"; opacity: 0.22 }
     Rectangle { z: -1; visible: panel.shadow; anchors.fill: parent; anchors.topMargin: 3; radius: panel.radius; color: "#000000"; opacity: 0.30 }
 
-    // Material: a top sheen, and a faint left light, so the glass reads as lit
-    // from the top-left rather than as a flat tint.
+    // Material: a top sheen, a faint left light, a darker foot.
     Rectangle {
         anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
         height: Math.min(parent.height * 0.5, 220); radius: panel.radius - 1
@@ -43,6 +47,14 @@ Rectangle {
             GradientStop { position: 1.0; color: "transparent" }
         }
     }
+    Rectangle {
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 1 }
+        height: Math.min(parent.height * 0.35, 160); radius: panel.radius - 1
+        gradient: Gradient {
+            GradientStop { position: 0.0; color: "transparent" }
+            GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.18) }
+        }
+    }
     // Edge highlights: the luminous top-left edge of the reference chrome.
     Rectangle {
         x: panel.radius; y: 0; height: 1; width: Math.min(parent.width * 0.55, 420)
@@ -58,6 +70,16 @@ Rectangle {
             GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.55) }
             GradientStop { position: 1.0; color: "transparent" }
         }
+    }
+    // Corner brackets: short L fragments just inside the top-right and bottom-left corners.
+    Item {
+        visible: panel.brackets
+        anchors.fill: parent
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 14; height: 1; color: Theme.accent; opacity: 0.55 }
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 1; height: 14; color: Theme.accent; opacity: 0.55 }
+        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 14; height: 1; color: Theme.accent; opacity: 0.4 }
+        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 1; height: 14; color: Theme.accent; opacity: 0.4 }
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 6; anchors.topMargin: 6; width: 3; height: 3; radius: 1.5; color: Theme.accent; opacity: 0.9 }
     }
 
     Item {
@@ -80,7 +102,7 @@ Rectangle {
     }
     Rectangle {
         visible: panel.title !== ""
-        anchors { left: parent.left; right: parent.right; top: header.bottom; leftMargin: panel.padding; rightMargin: panel.padding; topMargin: 10 }
+        anchors { left: parent.left; right: parent.right; top: header.bottom; leftMargin: panel.padding; rightMargin: panel.padding; topMargin: 9 }
         height: 1
         gradient: Gradient {
             orientation: Gradient.Horizontal
@@ -92,7 +114,7 @@ Rectangle {
     Item {
         id: body
         clip: true
-        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; top: header.bottom
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; top: panel.title !== "" ? header.bottom : parent.top
                   leftMargin: panel.padding; rightMargin: panel.padding; bottomMargin: panel.padding
                   topMargin: panel.title !== "" ? 20 : panel.padding }
     }

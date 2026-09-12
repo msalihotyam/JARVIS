@@ -84,6 +84,7 @@ Item {
             GlassPanel {
                 id: glass
                 anchors.fill: parent
+                brackets: true
                 title: ({ system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
                 badge: modelData.id === "system" ? (bridge.configRefused ? "config refused" : (bridge.executionEnabled ? "enabled" : "disabled"))
                      : modelData.id === "activity" ? "live"
@@ -94,7 +95,7 @@ Item {
                 border.color: bridge.editMode ? Theme.alpha(Theme.accent, 0.7) : Theme.border
                 headerRight: [
                     Item {
-                        height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowButtons.width : pinned.width)
+                        height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowHead.width : pinned.width)
                         Row {
                             id: handles
                             spacing: 2
@@ -105,11 +106,12 @@ Item {
                             IconButton { glyph: "✕"; tip: "Hide"; width: 24; height: 24; onClicked: bridge.setPanelVisible(modelData.id, false) }
                         }
                         Row {
-                            id: workflowButtons
+                            id: workflowHead
                             spacing: 6
                             visible: !bridge.editMode && modelData.id === "workflow"
-                            ActionButton { label: "Cancel"; danger: true; compact: true; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
-                            ActionButton { label: "New session"; compact: true; enabled: !bridge.busy; onClicked: bridge.newSession() }
+                            ActionButton { label: "Cancel"; danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
+                            ActionButton { label: "New session"; compact: true; visible: !!bridge.sessionId; enabled: !bridge.busy; onClicked: bridge.newSession() }
+                            Pill { visible: !bridge.taskLive && !bridge.sessionId; text: bridge.coreState === "idle" ? "idle" : Theme.stateLabel(bridge.coreState); tint: Theme.stateColor(bridge.coreState); anchors.verticalCenter: parent.verticalCenter }
                         }
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: "PINNED"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
                     }
@@ -142,96 +144,80 @@ Item {
     }
 
     // -- panel bodies -------------------------------------------------------
-    // A quiet stat line: dot, key, value right-aligned (the reference's
-    // Uptime / Memory / Network list).
+    // A quiet stat line: dot, key, value right-aligned.
     component StatRow: Item {
         property string k: ""; property string v: ""; property color tint: Theme.accent; property color vColor: Theme.text
         width: parent.width; height: 27
         Rectangle { width: 6; height: 6; radius: 3; color: tint; anchors.verticalCenter: parent.verticalCenter
             Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: tint; opacity: 0.22 } }
         Text { x: 18; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
-        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 150; horizontalAlignment: Text.AlignRight
+        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 100; horizontalAlignment: Text.AlignRight
             text: v; color: vColor; elide: Text.ElideMiddle; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } }
     }
-    // A strip: icon box, label, status text at the right (the reference's
-    // Active Workflow rows).
-    component Strip: Rectangle {
-        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: Theme.textLabel
-        width: parent.width; height: 38; radius: 9
-        color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.border, 0.7)
-        IconBox { x: 6; anchors.verticalCenter: parent.verticalCenter; width: 26; height: 26; glyph: parent.glyph; tint: parent.tint; glyphSize: 12 }
-        Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } }
-        Rectangle { x: 130; width: 5; height: 5; radius: 2.5; anchors.verticalCenter: parent.verticalCenter; color: tint; opacity: 0.9 }
-        Text { anchors.left: parent.left; anchors.leftMargin: 143; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
-            text: v; color: vColor; elide: Text.ElideMiddle; font { family: Theme.font; pixelSize: 12 } }
-    }
-
-    // A stat tile: one large honest figure with its label (the reference's
-    // gauge row, without inventing gauges for values this build does not measure).
-    component StatTile: Rectangle {
-        property string k: ""; property string v: ""; property color tint: Theme.accent
-        height: 66; radius: 12
-        color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.border, 0.8)
-        Rectangle { x: 12; y: 0; height: 1; width: parent.width * 0.5
-            gradient: Gradient { orientation: Gradient.Horizontal; GradientStop { position: 0; color: Theme.alpha(tint, 0.6) } GradientStop { position: 1; color: "transparent" } } }
-        Column { anchors.centerIn: parent; spacing: 3
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: v; color: Theme.text; font { family: Theme.font; pixelSize: 19; weight: Font.DemiBold; letterSpacing: -0.3 } }
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: k.toUpperCase(); color: Theme.textMuted; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.8 } }
+    // A gauge slot: the reference ring, lit only when a real value exists.
+    component Gauge: Item {
+        property string label: ""; property string value: "—"; property real ratio: -1; property color tint: Theme.accent
+        width: 62; height: 78
+        Item { width: 58; height: 58; anchors.horizontalCenter: parent.horizontalCenter
+            Rectangle { anchors.fill: parent; radius: 29; color: "transparent"; border.width: 4; border.color: ratio < 0 ? Theme.alpha(Theme.textDim, 0.35) : Theme.alpha(tint, 0.9) }
+            Rectangle { anchors.centerIn: parent; width: 46; height: 46; radius: 23; color: Theme.alpha(Theme.bg0, 0.5) }
+            Column { anchors.centerIn: parent; spacing: 0
+                Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? Theme.textDim : Theme.text; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
+            }
         }
+        Text { anchors.bottom: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; text: label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.2 } }
+    }
+    // A strip: icon box, label, status dot, status text at the right.
+    component Strip: Rectangle {
+        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: Theme.textLabel; property bool empty: false
+        width: parent.width; height: 36; radius: 9
+        color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.border, 0.7)
+        IconBox { x: 6; anchors.verticalCenter: parent.verticalCenter; width: 26; height: 26; glyph: parent.glyph; tint: empty ? Theme.textDim : parent.tint; glyphSize: 12 }
+        Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } }
+        Rectangle { x: 148; width: 5; height: 5; radius: 2.5; anchors.verticalCenter: parent.verticalCenter; color: empty ? Theme.textDim : tint; opacity: empty ? 0.5 : 0.9 }
+        Text { anchors.left: parent.left; anchors.leftMargin: 161; anchors.right: parent.right; anchors.rightMargin: 28; anchors.verticalCenter: parent.verticalCenter
+            text: v; color: empty ? Theme.textDim : vColor; elide: Text.ElideMiddle; font { family: Theme.font; pixelSize: 12 } }
+        Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "⁝"; color: Theme.textDim; font.pixelSize: 12 }
     }
 
     Component {
         id: systemPanel
         Item {
-            Column {
-                id: rows
-                width: parent.width
-                spacing: 0
-                StatRow { k: "Execution"; v: bridge.configRefused ? "configuration refused" : (bridge.executionEnabled ? "enabled" : "disabled"); tint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success; vColor: tint }
-                StatRow { k: "Permission mode"; v: bridge.config.permission_mode || "—"; tint: Theme.success }
-                StatRow { k: "Provider"; v: "claude · Claude Code CLI"; tint: Theme.success }
-                StatRow { k: "Model"; v: bridge.config.claude_model || "CLI default"; tint: Theme.accent }
-                StatRow { k: "Effort"; v: bridge.config.claude_effort || "CLI default"; tint: Theme.accent }
-                StatRow { k: "Paid API"; v: bridge.config.paid_api_enabled ? "enabled" : "off · subscription route"; tint: bridge.config.paid_api_enabled ? Theme.warning : Theme.accent }
-                StatRow { k: "Database"; v: bridge.config.memory_database || "—"; tint: Theme.accentSoft }
-            }
-            // Tiles fill the lower part when the panel has the room; otherwise the rows alone.
             Row {
-                id: tiles
-                anchors { left: parent.left; right: parent.right; top: rows.bottom; topMargin: 14 }
-                visible: parent.height >= rows.height + 14 + 66
-                spacing: 10
-                readonly property real w: (width - 20) / 3
-                StatTile { width: tiles.w; k: "Uptime"; v: Math.floor(bridge.uptimeSeconds / 60) + " min"; tint: Theme.accent }
-                StatTile { width: tiles.w; k: "Schema"; v: bridge.statusInfo.schema_version !== undefined ? "v" + bridge.statusInfo.schema_version : "?"; tint: Theme.accentSoft }
-                StatTile { width: tiles.w; k: "Session"; v: bridge.sessionId ? bridge.sessionId.substring(0, 8) : "new"; tint: Theme.teal }
+                id: gauges
+                anchors.left: parent.left; anchors.top: parent.top; anchors.topMargin: 2
+                spacing: 8
+                // Not measured by this build: unlit slots, said plainly below.
+                Gauge { label: "CPU" }
+                Gauge { label: "RAM" }
+                Gauge { label: "DISK" }
             }
-            Text { anchors { left: parent.left; bottom: parent.bottom } visible: parent.height >= rows.height + 14 + 66 + 34
-                text: "CPU, RAM and network are not measured by this build."; color: Theme.textDim; font { family: Theme.font; pixelSize: 10 } }
+            Text { anchors.left: parent.left; anchors.top: gauges.bottom; anchors.topMargin: 6; text: "not measured by this build"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 0.6 } }
+            Column {
+                anchors { left: gauges.right; right: parent.right; top: parent.top; leftMargin: 18; topMargin: 4 }
+                visible: parent.width >= 430
+                spacing: 1
+                StatRow { k: "Uptime"; v: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m"; tint: Theme.success }
+                StatRow { k: "Execution"; v: bridge.configRefused ? "refused" : (bridge.executionEnabled ? "enabled" : "disabled"); tint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success; vColor: tint }
+                StatRow { k: "Model"; v: (bridge.config.claude_model || "CLI default") + (bridge.config.claude_effort ? " · " + bridge.config.claude_effort : ""); tint: Theme.success }
+                StatRow { k: "Mode"; v: bridge.config.permission_mode || "—"; tint: Theme.accent }
+            }
         }
     }
     Component {
         id: workflowPanel
         Column {
-            spacing: 6
-            Item { width: parent.width; height: 26
-                Row { spacing: 9; anchors.verticalCenter: parent.verticalCenter
-                    Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter; color: Theme.stateColor(bridge.coreState)
-                        Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: parent.color; opacity: 0.25 } }
-                    Text { text: Theme.stateLabel(bridge.coreState); color: Theme.stateColor(bridge.coreState)
-                        font { family: Theme.font; pixelSize: 11; letterSpacing: 1.8; weight: Font.DemiBold } }
-                }
-                Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: bridge.task.task_id || ""; color: Theme.textDim; font { family: Theme.mono; pixelSize: 10 } }
-            }
-            Strip { glyph: "◇"; tint: Theme.accent; k: "Status"; v: (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") }
-            Strip { glyph: "▷"; tint: Theme.accent; k: "Run"; v: bridge.task.run_status || "—" }
-            Strip { glyph: "⌘"; tint: Theme.teal; k: "Connector"; v: bridge.task.connector || "—" }
-            Strip { glyph: "✦"; tint: Theme.teal; k: "Capability"; v: bridge.task.capability || "—" }
-            Strip { glyph: "➶"; tint: Theme.violet; k: "Destination"; v: bridge.task.destination || "—" }
-            Strip { glyph: "◈"; tint: Theme.violet; k: "Model"; v: (bridge.task.provider || "—") + (bridge.task.model ? " / " + bridge.task.model : "") }
-            Strip { glyph: "!"; k: "Error"; v: bridge.task.error_code || "none"
+            spacing: 5
+            readonly property bool has: !!bridge.task.task_id
+            Strip { glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !parent.has
+                v: parent.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
+            Strip { glyph: "⌘"; tint: Theme.teal; k: "Connector"; empty: !parent.has; v: parent.has ? (bridge.task.connector || "—") : "Waiting for your request" }
+            Strip { glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !parent.has; v: parent.has ? (bridge.task.capability || "—") : "Chosen by the Core, never by the model" }
+            Strip { glyph: "➶"; tint: Theme.violet; k: "Destination"; empty: !parent.has; v: parent.has ? (bridge.task.destination || "—") : "Granted destinations only" }
+            Strip { glyph: "!"; k: "Outcome"; empty: !parent.has
                 tint: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.success)
-                vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.textLabel) }
+                vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.textLabel)
+                v: parent.has ? (bridge.task.error_code || (bridge.task.run_status || "pending")) : "None yet" }
         }
     }
     Component {
@@ -241,10 +227,10 @@ Item {
             model: bridge.activity
             spacing: 0
             delegate: Item {
-                width: ListView.view.width; height: 54
+                width: ListView.view.width; height: 58
                 readonly property color tint: modelData.kind === "approval" ? Theme.warning : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : modelData.kind === "scheduled" ? Theme.success : Theme.accent
                 readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
-                IconBox { x: 0; anchors.verticalCenter: parent.verticalCenter; width: 34; height: 34; glyph: parent.glyph; tint: parent.tint; glyphSize: 14 }
+                IconBox { x: 2; anchors.verticalCenter: parent.verticalCenter; width: 32; height: 32; glyph: parent.glyph; tint: parent.tint; glyphSize: 13 }
                 Column { anchors.left: parent.left; anchors.leftMargin: 46; anchors.right: timeText.left; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 2
                     Text { text: modelData.text; color: Theme.text; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: 13 } }
                     Text { text: modelData.kind === "approval" ? "authorization" : modelData.kind === "unknown" ? "outcome unknown" : modelData.kind === "error" ? "error" : modelData.kind === "scheduled" ? "scheduled" : "interface"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
@@ -252,13 +238,25 @@ Item {
                 Text { id: timeText; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: modelData.time; color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
                 Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: Theme.border; opacity: 0.55 }
             }
+            footer: Item {
+                width: ListView.view.width; height: bridge.activity.length < 4 ? 58 : 0
+                visible: bridge.activity.length < 4
+                Row { anchors.verticalCenter: parent.verticalCenter; spacing: 12
+                    Rectangle { width: 32; height: 32; radius: 9; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.border, 0.9)
+                        Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: Theme.textDim } }
+                    Column { anchors.verticalCenter: parent.verticalCenter; spacing: 2
+                        Text { text: "Nothing else yet"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
+                        Text { text: "Approvals, outcomes and scheduled runs will appear here"; color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
+                    }
+                }
+            }
         }
     }
     Component {
         id: automationsPanel
         Column {
-            spacing: 6
-            Text { visible: bridge.jobs.length === 0; text: "No jobs defined."; color: Theme.textDim; font { family: Theme.font; pixelSize: 12 } }
+            spacing: 5
+            Strip { visible: bridge.jobs.length === 0; glyph: "⟳"; k: "Jobs"; empty: true; v: "No jobs defined" }
             Repeater {
                 model: bridge.jobs.slice(0, 5)
                 Strip { glyph: "⟳"; tint: modelData.enabled ? Theme.success : Theme.textDim
