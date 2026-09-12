@@ -29,9 +29,11 @@ Item {
     readonly property bool hovered: hit.containsMouse
     readonly property bool active: hovered || open || activeFocus
     readonly property int chamfer: Theme.stripChamfer
-    // The perimeter brightens on hover / open; it never changes weight, so
-    // the silhouette stays crisp.
-    property real edge: sel.open ? 1 : (sel.hovered ? 0.82 : 0.6)
+    // One progression drives every stroke, so the state hierarchy is
+    // unmistakable: idle is a restrained technical perimeter, hover is a
+    // step brighter, open (or keyboard focus) is the full accent. Weight
+    // never changes, so the silhouette stays crisp.
+    property real edge: (sel.open || sel.activeFocus) ? 1 : (sel.hovered ? 0.55 : 0.26)
     Behavior on edge { NumberAnimation { duration: Theme.hoverMs } }
 
     // -- layered glass body, chamfered ------------------------------------
@@ -62,7 +64,7 @@ Item {
         }
         // Outer perimeter: a single fine hairline, one step dimmer.
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdgeDim, 0.55 + 0.45 * sel.edge)
+            strokeColor: Theme.alpha(Theme.commandEdgeDim, 0.24 + 0.52 * sel.edge)
             strokeWidth: 1; fillColor: "transparent"; joinStyle: ShapePath.MiterJoin
             startX: frame.c; startY: 0.5
             PathLine { x: frame.w - frame.c; y: 0.5 }
@@ -76,7 +78,7 @@ Item {
         }
         // Inner perimeter: the illuminated frame proper.
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.30 + 0.55 * sel.edge)
+            strokeColor: Theme.alpha(Theme.commandEdge, 0.15 + 0.62 * sel.edge)
             strokeWidth: 1.4; fillColor: "transparent"; joinStyle: ShapePath.MiterJoin
             startX: 4 + frame.c; startY: 4
             PathLine { x: frame.w - 4 - frame.c; y: 4 }
@@ -91,25 +93,25 @@ Item {
         // Thin illuminated edge fragments: a bright run top-right, one
         // bottom-left, as in the reference.
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.95); strokeWidth: 1.6
+            strokeColor: Theme.alpha(Theme.commandEdge, 0.10 + 0.80 * sel.edge); strokeWidth: 1.6
             fillColor: "transparent"; capStyle: ShapePath.FlatCap
             startX: frame.w * 0.52; startY: 4.2
             PathLine { x: frame.w - 8 - frame.c; y: 4.2 }
         }
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.95); strokeWidth: 1.6
+            strokeColor: Theme.alpha(Theme.commandEdge, 0.10 + 0.80 * sel.edge); strokeWidth: 1.6
             fillColor: "transparent"; capStyle: ShapePath.FlatCap
             startX: 8 + frame.c; startY: frame.h - 4.2
             PathLine { x: frame.w * 0.48; y: frame.h - 4.2 }
         }
         // Small technical accents just inside the chamfered ends.
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.7); strokeWidth: 1; fillColor: "transparent"
+            strokeColor: Theme.alpha(Theme.commandEdge, 0.18 + 0.52 * sel.edge); strokeWidth: 1; fillColor: "transparent"
             startX: 4.5; startY: 4 + frame.c + 4
             PathLine { x: 4.5; y: frame.h - 4 - frame.c - 4 }
         }
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.7); strokeWidth: 1; fillColor: "transparent"
+            strokeColor: Theme.alpha(Theme.commandEdge, 0.18 + 0.52 * sel.edge); strokeWidth: 1; fillColor: "transparent"
             startX: frame.w - 4.5; startY: 4 + frame.c + 4
             PathLine { x: frame.w - 4.5; y: frame.h - 4 - frame.c - 4 }
         }
@@ -117,6 +119,7 @@ Item {
     // Restrained inner highlight: one soft sheen across the upper body.
     Rectangle {
         x: 6; y: 5; width: sel.width - 12; height: Math.round((sel.height - 10) * 0.45)
+        opacity: 0.35 + 0.65 * sel.edge
         gradient: Gradient {
             GradientStop { position: 0; color: Theme.alpha(Theme.commandEdge, 0.07) }
             GradientStop { position: 1; color: "transparent" }
@@ -124,7 +127,8 @@ Item {
     }
     Rectangle {
         anchors.fill: parent; anchors.margins: -3; radius: 4
-        color: "transparent"; border.color: Theme.accent; visible: sel.activeFocus
+        color: "transparent"; border.color: Theme.alpha(Theme.accent, 0.7)
+        visible: sel.activeFocus
     }
 
     // -- provider identity in its own inset instrument frame ---------------
@@ -189,6 +193,6 @@ Item {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onClicked: { sel.forceActiveFocus(); sel.activated() }
+        onClicked: sel.activated()
     }
 }
