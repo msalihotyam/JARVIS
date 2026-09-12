@@ -55,9 +55,10 @@ QtObject {
     readonly property real macroStackGap: 0.030        // gap between stacked panels, of stack height
     readonly property real macroCoreX: 0.4890          // core centre
     readonly property real macroCoreY: 0.0799
-    readonly property real macroCoreSize: 0.1630       // core diameter, of viewport width
+    readonly property real macroCoreSize: 0.1580       // core diameter, of viewport width (reference 15.4)
     readonly property real macroStripRight: 0.0143     // command-strip right margin
-    readonly property real macroChip: 0.1010           // model-selector envelope, of viewport width
+    readonly property real macroChip: 0.1458           // Option 5 selector envelope (280 px at 1920)
+    readonly property real macroHudLine: 0.1725         // header linework baseline, of viewport height
     // The rail shrinks before the work surface does, and never disappears.
     function px(v, lo, hi) { return Math.round(Math.max(lo, Math.min(hi, v))) }
     function railWidth(w) { return px(w * macroRail, 132, 300) }
@@ -68,8 +69,25 @@ QtObject {
     function columnGap(w) { return px(w * macroGap, 12, 26) }
     function stackGap(stackHeight) { return px(stackHeight * macroStackGap, 10, 30) }
     function coreSize(w) { return px(w * macroCoreSize, 175, 330) }
-    function chipWidth(w) { return px(w * macroChip, 150, 210) }
+    function chipWidth(w) { return px(w * macroChip, 188, 300) }
     function stripSpacing(w) { return px(w * 0.0073, 8, 16) }
+    function hudLine(h) { return px(h * macroHudLine, 132, 218) }
+
+    // -- command strip (Option 5 "Command") -------------------------------
+    // Element heights are part of the frozen control language, so they are
+    // fixed at the 1920x1080 contract; only the envelope is proportional.
+    readonly property int stripHeight: 56
+    readonly property int stripSelectorHeight: 54
+    readonly property int stripStatus: 64               // status instrument, clearly below the core
+    readonly property int stripKill: 50                 // kill switch: separate, a step below the status
+    readonly property int stripChamfer: 18              // Option 5 corner cut
+    // Option 5 frame tones: layered dark glass with a fine cyan perimeter.
+    property color commandEdge: space ? "#3fe0d2" : command ? "#24d8ff" : "#2fb9c9"
+    property color commandEdgeDim: space ? "#1c5f6b" : "#1d5560"
+    property color commandGlass0: space ? "#f00d2230" : "#f00b1a22"
+    property color commandGlass1: space ? "#f0060f1a" : "#f0050d12"
+    Behavior on commandEdge { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
+    Behavior on commandEdgeDim { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
 
     // -- geometry (1920x1080 contract, scaled by the layout) -------------
     readonly property int radius: 11

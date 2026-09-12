@@ -34,8 +34,9 @@ Item {
         x: Math.max(16, Math.min(context.anchorPoint.x, context.width - width - 16))
         y: Math.max(80, Math.min(context.anchorPoint.y, context.height - height - 16))
         opacity: context.open ? 1 : 0
-        transform: Translate { y: context.open ? 0 : -7; Behavior on y { NumberAnimation { duration: Theme.panelIn; easing.type: Easing.OutCubic } } }
-        Behavior on opacity { NumberAnimation { duration: Theme.panelIn; easing.type: Easing.OutCubic } }
+        // Opening ~220 ms, closing slightly faster; no bounce.
+        transform: Translate { y: context.open ? 0 : -7; Behavior on y { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } } }
+        Behavior on opacity { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } }
         Keys.onEscapePressed: context.open = false
         MouseArea { parent: panel; anchors.fill: parent; z: -0.5 }
         Item { id: heading; width: parent.width; height: 34

@@ -24,7 +24,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 os.environ.pop("ANTHROPIC_BASE_URL", None)
 
-from PySide6.QtCore import QMetaObject, Q_RETURN_ARG, Qt  # noqa: E402
+from PySide6.QtCore import QMetaObject, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
 from PySide6.QtTest import QTest  # noqa: E402
@@ -1082,6 +1082,92 @@ class MacroGeometryTests(UiTestCase):
         pump(600)
         self.assertAlmostEqual(canonical_left, self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x(), delta=1.0)
 
+
+class CommandHeaderTests(UiTestCase):
+    """The canonical header: the core dominates, the command strip is one
+    right-anchored assembly in the required order, and the selector reads
+    real provider state without inventing metadata."""
+
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+
+    def boxes(self, root, *names):
+        from PySide6.QtCore import QPointF
+        out = []
+        for name in names:
+            it = self.item(root, name)
+            a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+            out.append((a.x(), a.y(), b.x(), b.y()))
+        return out
+
+    def test_header_composition_holds_and_the_core_dominates(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height)
+            pump(600)
+            core, strip, chip, lamp, kill, nav = self.boxes(
+                root, "jarvisCore", "commandStrip", "modelTrigger", "statusOrb",
+                "killSwitchControl", "navigationTrigger")
+            with self.subTest(size=(width, height)):
+                # The core is the dominant header element and keeps its centre.
+                self.assertAlmostEqual(48.90, 100 * (core[0] + core[2]) / 2 / width, delta=1.0)
+                self.assertGreater(core[2] - core[0], chip[2] - chip[0])
+                self.assertGreater(core[3] - core[1], 3.5 * (chip[3] - chip[1]))
+                self.assertGreater(core[2] - core[0], 3 * (lamp[2] - lamp[0]))
+                self.assertGreater(core[2] - core[0], 3 * (kill[2] - kill[0]))
+                # The strip is right-anchored, inside the viewport, and never
+                # reaches into the core.
+                self.assertLess(width - strip[2], 0.02 * width)
+                self.assertLessEqual(strip[2], width)
+                self.assertGreaterEqual(strip[0], core[2] - 1)
+                # Required order, with separate hit targets throughout.
+                order = [chip, lamp, kill, nav]
+                for left, right in zip(order, order[1:]):
+                    self.assertLessEqual(left[2], right[0] + 1)
+                # Degradation never shrinks a control or the selector below a
+                # usable width.
+                self.assertGreaterEqual(chip[2] - chip[0], 188)
+                self.assertGreaterEqual(lamp[2] - lamp[0], 56)
+                self.assertGreaterEqual(kill[2] - kill[0], 44)
+                self.assertGreaterEqual(nav[2] - nav[0], 34)
+                # The core-side status group is present whenever it fits, and
+                # is what gives way when it does not - not the controls.
+                group = self.item(root, "coreStatusGroup")
+                if group.isVisible():
+                    g = self.boxes(root, "coreStatusGroup")[0]
+                    self.assertGreaterEqual(g[0], core[2] - 1)
+                    self.assertLessEqual(g[2], strip[0] + 1)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_selector_shows_real_model_state_and_opens_its_own_panel(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        chip = self.item(root, "modelTrigger")
+        # Nothing configured: the CLI's own default, never an invented name.
+        self.assertFalse(bridge.config["claude_model"])
+        self.assertEqual("CLI default", chip.property("modelName"))
+        self.assertIn("ANTHROPIC", chip.property("metadata"))
+        self.assertFalse(chip.property("open"))
+
+        self.click(root, "modelTrigger")
+        pump(300)
+        self.assertTrue(root.property("modelOpen"))
+        self.assertTrue(chip.property("open"))
+        # The dropdown offers the real choices and routes through the one
+        # authoritative call.
+        self.click(root, "modelRowDefault")
+        pump(200)
+        self.assertFalse(self.store.load().settings.claude_model)
+
+        QMetaObject.invokeMethod(self.item(root, "modelField"), "insert",
+                                 Q_ARG(int, 0), Q_ARG(str, "claude-opus-5"))
+        self.click(root, "applyModelButton")
+        pump(250)
+        self.assertEqual("claude-opus-5", self.store.load().settings.claude_model)
+        self.assertEqual("claude-opus-5", chip.property("modelName"))
+        self.assertEqual(0, self.execute_calls())
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

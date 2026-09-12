@@ -71,6 +71,7 @@ Window {
         shortDate: Qt.formatDate(clock.now, "ddd, d MMM yyyy")
         fullscreen: root.fullscreen
         settingsOpen: settings.open
+        modelOpen: modelPanel.open
         onMenuRequested: root.toggleNav()
         onKillSwitchRequested: root.askKillSwitch()
         onEditRequested: bridge.setEditMode(!bridge.editMode)

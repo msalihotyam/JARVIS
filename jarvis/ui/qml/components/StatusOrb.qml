@@ -16,7 +16,13 @@ Item {
     property string skin: "orb"          // "orb" | "hud"
     property bool ambient: true
     readonly property bool hud: skin === "hud"
+    // The instrument is authored at 60 px and scaled uniformly about its
+    // centre, so every internal relationship of the approved reference is
+    // preserved at whatever size the header gives it.
+    property real diameter: 60
     width: 60; height: 60
+    transform: Scale { origin.x: 30; origin.y: 30
+                       xScale: orb.diameter / 60; yScale: orb.diameter / 60 }
 
     // Staged power: the core ignites first, the glass follows, the halo last
     // (~420 ms). Powering down fades everything together (~300 ms).

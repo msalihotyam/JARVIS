@@ -2,11 +2,13 @@ import QtQuick
 import QtQuick.Shapes
 import "../theme"
 
-// The top of the canonical composition (1920x1080 contract, x positions
-// proportional to width): brand with the orb as the Settings trigger,
-// date / time, the local-context block, the core at (0.484 w, 85) with its
-// orbit and HUD circuit lines, the state ticker to its right, compact
-// model / execution controls, window controls, the layout-edit control.
+// The canonical command header. Left: the identity mark (which is also the
+// Settings trigger), the wordmark, and the ambient rail (date / time / local
+// context) whose geometry comes from the Phase 1 macro map. Centre: the
+// JARVIS core, the dominant element, with its lateral connector lines and
+// the core-side status group. Right: the Option 5 command strip -
+// selector, status instrument, kill switch, navigation grid, window
+// controls - anchored to the right edge and bound to real state only.
 Item {
     id: bar
     // Height, rail width and the viewport height come from the macro
@@ -29,43 +31,63 @@ Item {
     property string shortDate: ""
     property bool fullscreen: true
     property bool settingsOpen: false
+    property bool modelOpen: false
     property Item controlLayer: null
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
-    readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 18)
+    readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
     readonly property point navAnchor: Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
-    // Below the design width the core shrinks, the HUD geometry goes, and the
-    // model chip collapses to its icon, so nothing overlaps.
-    readonly property bool narrow: width < 1500
+    // Degradation, in the required order: decorative linework goes first,
+    // then secondary metadata, then micro spacing - never hit targets and
+    // never the authoritative controls.
+    readonly property bool narrow: width < 1360         // decorative linework
+    readonly property bool compact: width < 1420        // metadata / spacing
     // The core keeps the reference's centre and a proportional diameter at
     // every width: it is the primary identity anchor, never repositioned
     // out of the composition.
     readonly property real coreCx: Theme.command ? width * 0.42 : width * Theme.macroCoreX
     readonly property real coreCy: Theme.command ? 60 : bar.viewportHeight * Theme.macroCoreY
     readonly property real coreDiameter: Theme.command ? 162 : Theme.coreSize(width)
+    readonly property real coreEdge: coreCx + coreDiameter / 2
+    // The strip is anchored right and the selector takes what is left, but
+    // the core-side status group is reserved space first: the selector is
+    // only trimmed while it stays at a usable width, and below that the
+    // group (secondary metadata) is what gives way - never the controls.
+    readonly property real stripGap: compact ? 8 : 12
+    readonly property real tickerNeed: 88
+    readonly property real ticker0: coreEdge + 20
+    readonly property real stripFixed: Theme.stripStatus + Theme.stripKill + 38 + 13 + 106 + 5 * stripGap
+    readonly property real stripRoom: width - Math.round(width * Theme.macroStripRight)
+                                      - (ticker0 + tickerNeed + 10)
+    readonly property real selectorMax: stripRoom - stripFixed
+    readonly property bool tickerFits: !Theme.command && selectorMax >= 188
+    readonly property real selectorWidth: tickerFits ? Math.min(Theme.chipWidth(width), selectorMax)
+                                                     : Theme.chipWidth(width)
 
     function tz() {
         var m = -new Date().getTimezoneOffset(); var sign = m < 0 ? "-" : "+"; m = Math.abs(m)
         return "UTC" + sign + ("0" + Math.floor(m / 60)).slice(-2) + ":" + ("0" + (m % 60)).slice(-2)
     }
 
-    // -- HUD circuit line, broken around the core, with angled returns, end markers and ticks
+    // -- header linework ------------------------------------------------------
+    // The reference runs one fine cyan line across the header, broken around
+    // the core, with an angled return on the right and a second line closing
+    // the identity zone at the boundary the panels start from.
     Shape {
         id: hudLines
         anchors.fill: parent
-        visible: !bar.narrow
-        opacity: Theme.hudOpacity
+        opacity: Theme.hudOpacity * (bar.narrow ? 0.8 : 1)
         preferredRendererType: Shape.CurveRenderer
-        readonly property real yLine: Theme.command ? 100 : 150
-        readonly property real yRight: Theme.command ? 90 : 126
+        readonly property real yLine: Theme.command ? 100 : Theme.hudLine(bar.viewportHeight)
+        readonly property real yRight: Theme.command ? 90 : Math.round(hudLines.yLine * 0.84)
         ShapePath {
             strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
             startX: bar.width * 0.245; startY: hudLines.yLine + 22
             PathLine { x: bar.width * 0.265; y: hudLines.yLine }
-            PathLine { x: bar.coreCx - 168; y: hudLines.yLine }
+            PathLine { x: bar.coreCx - bar.coreDiameter * 0.56; y: hudLines.yLine }
         }
         ShapePath {
             strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
-            startX: bar.coreCx + 168; startY: hudLines.yLine
+            startX: bar.coreCx + bar.coreDiameter * 0.56; startY: hudLines.yLine
             PathLine { x: bar.width * 0.655; y: hudLines.yLine }
             PathLine { x: bar.width * 0.685; y: hudLines.yRight }
             PathLine { x: bar.width * 0.93; y: hudLines.yRight }
@@ -73,11 +95,11 @@ Item {
         ShapePath {
             strokeColor: Theme.alpha(Theme.hud, 0.45); strokeWidth: 1; fillColor: "transparent"
             startX: bar.width * 0.31; startY: hudLines.yLine + 7
-            PathLine { x: bar.coreCx - 186; y: hudLines.yLine + 7 }
+            PathLine { x: bar.coreCx - bar.coreDiameter * 0.62; y: hudLines.yLine + 7 }
         }
         ShapePath {
             strokeColor: Theme.alpha(Theme.hud, 0.45); strokeWidth: 1; fillColor: "transparent"
-            startX: bar.coreCx + 250; startY: hudLines.yLine + 7
+            startX: bar.coreCx + bar.coreDiameter * 0.82; startY: hudLines.yLine + 7
             PathLine { x: bar.width * 0.62; y: hudLines.yLine + 7 }
         }
     }
@@ -89,33 +111,83 @@ Item {
         Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 } }
     Rectangle { visible: !bar.narrow; x: bar.width * 0.93 - 2.5; y: hudLines.yRight - 2.5; width: 5; height: 5; radius: 2.5; color: Theme.hud; opacity: Theme.hudOpacity * 1.6
         Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 } }
+    // The boundary the panels start from: one restrained full-width line.
+    Rectangle {
+        visible: !Theme.command
+        x: 0; y: bar.height - 1; width: bar.width; height: 1
+        color: Theme.hud; opacity: Theme.hudOpacity * 0.7
+    }
 
-    // Orbit: a tilted ellipse to the left of the core, passing behind the
-    // sphere (the sphere is opaque), with a dotted companion and a node.
+    // Lateral connector traces at the core's own height: the reference ties
+    // the core into the header with fine lines, a dash and one node.
     Shape {
-        id: orbit
-        visible: !bar.narrow
-        width: 330; height: 84
-        x: bar.coreCx - 150 - width / 2; y: bar.coreCy + 6 - height / 2
-        rotation: -12
+        id: coreTrace
+        anchors.fill: parent
+        visible: !bar.narrow && !Theme.command
         opacity: Theme.hudOpacity
         preferredRendererType: Shape.CurveRenderer
         ShapePath {
-            strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"
-            PathAngleArc { centerX: orbit.width / 2; centerY: orbit.height / 2; radiusX: orbit.width / 2 - 2; radiusY: orbit.height / 2 - 2; startAngle: 0; sweepAngle: 360 }
+            strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+            startX: bar.coreCx - bar.coreDiameter * 0.52 - 116; startY: bar.coreCy
+            PathLine { x: bar.coreCx - bar.coreDiameter * 0.52; y: bar.coreCy }
+        }
+        ShapePath {
+            strokeColor: Theme.alpha(Theme.hud, 0.5); strokeWidth: 1; fillColor: "transparent"
+            strokeStyle: ShapePath.DashLine; dashPattern: [2, 5]
+            startX: bar.coreCx - bar.coreDiameter * 0.52 - 182; startY: bar.coreCy
+            PathLine { x: bar.coreCx - bar.coreDiameter * 0.52 - 124; y: bar.coreCy }
+        }
+        ShapePath {
+            strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+            startX: bar.coreCx + bar.coreDiameter * 0.51; startY: bar.coreCy
+            PathLine { x: bar.ticker0 - 7; y: bar.coreCy }
+        }
+    }
+    Rectangle {
+        visible: coreTrace.visible
+        x: bar.coreCx - bar.coreDiameter * 0.52 - 118; y: bar.coreCy - 2.5
+        width: 5; height: 5; radius: 2.5; color: Theme.hud; opacity: Theme.hudOpacity * 1.6
+        Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 }
+    }
+
+    // Trajectory linework: two wide arcs concentric with the core, on the
+    // open side of the composition, plus one tracking node. Faint, curved,
+    // and never a straight diagonal across the header.
+    Shape {
+        id: orbit
+        visible: !bar.narrow
+        anchors.fill: parent
+        opacity: Theme.hudOpacity * 0.8
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+            strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
+                           radiusX: bar.coreDiameter * 0.66; radiusY: bar.coreDiameter * 0.66
+                           startAngle: 118; sweepAngle: 116 }
         }
         ShapePath {
             strokeColor: Theme.alpha(Theme.hud, 0.6); strokeWidth: 1; fillColor: "transparent"
             strokeStyle: ShapePath.DashLine; dashPattern: [1, 5]
-            PathAngleArc { centerX: orbit.width / 2; centerY: orbit.height / 2; radiusX: orbit.width / 2 - 16; radiusY: orbit.height / 2 - 12; startAngle: 120; sweepAngle: 220 }
+            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
+                           radiusX: bar.coreDiameter * 0.82; radiusY: bar.coreDiameter * 0.82
+                           startAngle: 136; sweepAngle: 88 }
         }
-        Rectangle { width: 5; height: 5; radius: 2.5; color: Theme.hud
-            x: orbit.width / 2 + (orbit.width / 2 - 2) * Math.cos(205 * Math.PI / 180) - 2.5
-            y: orbit.height / 2 + (orbit.height / 2 - 2) * Math.sin(205 * Math.PI / 180) - 2.5
-            Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 } }
+        ShapePath {
+            strokeColor: Theme.alpha(Theme.hud, 0.75); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
+                           radiusX: bar.coreDiameter * 0.66; radiusY: bar.coreDiameter * 0.66
+                           startAngle: 306; sweepAngle: 34 }
+        }
+    }
+    Rectangle {
+        visible: !bar.narrow
+        width: 5; height: 5; radius: 2.5; color: Theme.hud; opacity: Theme.hudOpacity * 1.6
+        x: bar.coreCx + bar.coreDiameter * 0.66 * Math.cos(163 * Math.PI / 180) - 2.5
+        y: bar.coreCy + bar.coreDiameter * 0.66 * Math.sin(163 * Math.PI / 180) - 2.5
+        Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 }
     }
 
-    // -- brand: the orb IS the Settings trigger -------------------------------
+    // -- brand: the identity mark IS the Settings trigger ---------------------
     Item {
         id: orb
         parent: bar.controlLayer || bar
@@ -130,41 +202,50 @@ Item {
         Rectangle { anchors.fill: parent; anchors.margins: -5; radius: width / 2; color: "transparent"; border.color: Theme.accent; visible: orb.activeFocus }
         scale: orbArea.pressed ? 0.95 : 1
         Behavior on scale { NumberAnimation { duration: 90 } }
-        Rectangle { anchors.centerIn: parent; width: 84; height: 84; radius: 42; color: Theme.alpha(Theme.accent, orb.lit ? 0.18 : 0.07); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+        // Soft bloom, as in the reference mark: a gradient, so it has no edge.
+        Shape {
+            anchors.centerIn: parent; width: 106; height: 106
+            preferredRendererType: Shape.CurveRenderer
+            opacity: orb.lit ? 1 : 0.72
+            Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+            ShapePath {
+                strokeWidth: -1
+                fillGradient: RadialGradient {
+                    centerX: 53; centerY: 53; centerRadius: 53; focalX: 53; focalY: 53
+                    GradientStop { position: 0.00; color: Theme.alpha(Theme.accent, 0.34) }
+                    GradientStop { position: 0.42; color: Theme.alpha(Theme.accent, 0.15) }
+                    GradientStop { position: 0.72; color: Theme.alpha(Theme.accent, 0.04) }
+                    GradientStop { position: 1.00; color: "transparent" }
+                }
+                PathAngleArc { centerX: 53; centerY: 53; radiusX: 53; radiusY: 53; startAngle: 0; sweepAngle: 360 }
+            }
+        }
         // Outer calibrated ring with nodes.
         Item {
             anchors.fill: parent
             RotationAnimator on rotation { running: Theme.ambient && bar.settingsOpen; loops: Animation.Infinite; from: 0; to: 360; duration: 12000 }
-            Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.accent; opacity: orb.lit ? 0.95 : 0.5; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
+            Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.accent; opacity: orb.lit ? 0.9 : 0.45; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
             Repeater { model: 12
-                Rectangle { width: index % 3 === 0 ? 3 : 1; height: index % 3 === 0 ? 3 : 3; radius: index % 3 === 0 ? 1.5 : 0; color: Theme.accent; opacity: orb.lit ? 0.95 : 0.6; x: orb.width / 2 - width / 2; y: index % 3 === 0 ? -1 : 2
+                Rectangle { width: index % 3 === 0 ? 3 : 1; height: 3; radius: index % 3 === 0 ? 1.5 : 0; color: Theme.accent; opacity: orb.lit ? 0.95 : 0.6; x: orb.width / 2 - width / 2; y: index % 3 === 0 ? -1 : 2
                     transform: Rotation { origin.x: width / 2; origin.y: orb.height / 2 - y; angle: index * 30 } } }
         }
-        // The luminous ring: thick, uniform cyan with a soft outer glow and a dark centre.
-        Rectangle { anchors.centerIn: parent; width: 56; height: 56; radius: 28; color: "transparent"; border.width: 10; border.color: Theme.accent; opacity: 0.18 }
-        Rectangle { anchors.centerIn: parent; width: 50; height: 50; radius: 25; color: "transparent"; border.width: 7; border.color: Theme.accent; opacity: 0.3 }
-        Rectangle { anchors.centerIn: parent; width: 46; height: 46; radius: 23; color: Theme.bg0 }
+        // The luminous mark: a thick broken cyan ring around a dark centre.
+        Rectangle { anchors.centerIn: parent; width: 46; height: 46; radius: 23; color: Theme.bg0; opacity: 0.9 }
         Shape {
-            id: orbRing
             anchors.centerIn: parent; width: 46; height: 46
             preferredRendererType: Shape.CurveRenderer
-            opacity: orb.lit ? 1 : 0.9
-            ShapePath {
-                strokeWidth: -1; fillRule: ShapePath.OddEvenFill
-                fillGradient: ConicalGradient {
-                    centerX: 23; centerY: 23; angle: 135
-                    GradientStop { position: 0.00; color: Qt.lighter(Theme.accent, 1.25) }
-                    GradientStop { position: 0.35; color: Theme.accent }
-                    GradientStop { position: 0.60; color: Theme.accentDeep }
-                    GradientStop { position: 0.80; color: Theme.accent }
-                    GradientStop { position: 1.00; color: Qt.lighter(Theme.accent, 1.25) }
-                }
-                PathAngleArc { centerX: 23; centerY: 23; radiusX: 23; radiusY: 23; startAngle: 0; sweepAngle: 360 }
-                PathAngleArc { centerX: 23; centerY: 23; radiusX: 17; radiusY: 17; startAngle: 0; sweepAngle: 360 }
-            }
+            opacity: orb.lit ? 1 : 0.92
+            ShapePath { strokeColor: Theme.alpha(Theme.accent, 0.26); strokeWidth: 8; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 16.5; radiusY: 16.5; startAngle: 350; sweepAngle: 150 } }
+            ShapePath { strokeColor: Theme.accent; strokeWidth: 3.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 16.5; radiusY: 16.5; startAngle: 350; sweepAngle: 150 } }
+            ShapePath { strokeColor: Theme.accent; strokeWidth: 3.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 16.5; radiusY: 16.5; startAngle: 166; sweepAngle: 122 } }
+            ShapePath { strokeColor: Qt.lighter(Theme.accent, 1.5); strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+                PathAngleArc { centerX: 23; centerY: 23; radiusX: 16.5; radiusY: 16.5; startAngle: 30; sweepAngle: 54 } }
         }
-        Rectangle { anchors.centerIn: parent; width: 34; height: 34; radius: 17; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.35) }
-        Rectangle { anchors.centerIn: parent; width: 28; height: 28; radius: 14; color: "transparent"; border.width: 2; border.color: Theme.accent; opacity: orb.lit ? 0.5 : 0.18; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
+        Rectangle { anchors.centerIn: parent; width: 24; height: 24; radius: 12; color: Theme.bg0; opacity: 0.92 }
+        Rectangle { anchors.centerIn: parent; width: 34; height: 34; radius: 17; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.3) }
         MouseArea { id: orbArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openSettings() }
         Rectangle {
             visible: orb.hovered && !bar.settingsOpen
@@ -173,8 +254,8 @@ Item {
             Text { id: tipText; anchors.centerIn: parent; text: "Settings"; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
         }
     }
-    Text { x: 120; y: 19; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 27; letterSpacing: 12; weight: Font.Normal } }
-    Text { x: 122; y: 58; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 3.8 } }
+    Text { x: 120; y: 22; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 24; letterSpacing: 8.5; weight: Font.Normal } }
+    Text { x: 122; y: 55; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 2.4 } }
 
     Text {
         visible: !Theme.command; x: bar.railInset + 2; y: Math.round(bar.viewportHeight * 0.1040)
@@ -207,7 +288,7 @@ Item {
         }
     }
 
-    // -- core + state ticker --------------------------------------------------
+    // -- core + core-side status ----------------------------------------------
     JarvisCore {
         id: core
         objectName: "jarvisCore"
@@ -218,76 +299,82 @@ Item {
         active: Window.active
         Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
     }
-    Column {
-        visible: !bar.narrow
-        x: bar.coreCx + 141; y: 45
-        spacing: 10
-        Repeater {
-            model: ["LISTENING", "REASONING", "EXECUTING"]
-            Text {
-                text: modelData
-                property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
-                                   || (modelData === "REASONING" && bridge.coreState === "running")
-                                   || (modelData === "EXECUTING" && bridge.coreState === "awaiting_approval")
-                color: lit ? "#eaf6ff" : Theme.textLabel
-                font { family: Theme.font; pixelSize: 10; letterSpacing: 2.2; weight: Font.DemiBold }
-                Behavior on color { ColorAnimation { duration: 200 } }
+    // The compact vertical status group, immediately right of the core and
+    // clearly subordinate to it. Only states the installation genuinely
+    // reports are lit: there is no separate execution signal, so EXECUTING
+    // stays restrained rather than pretending activity.
+    Item {
+        id: ticker
+        objectName: "coreStatusGroup"
+        visible: bar.tickerFits
+        x: bar.ticker0
+        y: bar.coreCy - height / 2 - Math.round(bar.coreDiameter * 0.021)
+        width: bar.tickerNeed; height: stack.height
+        Column {
+            id: stack
+            width: parent.width; spacing: Math.round(bar.coreDiameter * 0.052)
+            Repeater {
+                model: ["LISTENING", "REASONING", "EXECUTING"]
+                Text {
+                    readonly property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
+                                                || (modelData === "REASONING" && bridge.coreState === "running")
+                    text: modelData
+                    color: lit ? "#eaf6ff" : Theme.textLabel
+                    opacity: lit ? 1 : 0.7
+                    font { family: Theme.font; pixelSize: 10; letterSpacing: 2.2; weight: Font.DemiBold }
+                    Behavior on color { ColorAnimation { duration: 200 } }
+                    Behavior on opacity { NumberAnimation { duration: 200 } }
+                }
             }
         }
     }
     Text {
-        visible: !bar.narrow && bridge.coreState !== "idle"
-        x: bar.coreCx + 150; y: 128
+        visible: ticker.visible && bridge.coreState !== "idle"
+        x: ticker.x; y: ticker.y + ticker.height + 12
         text: Theme.stateLabel(bridge.coreState)
         color: Theme.stateColor(bridge.coreState)
         font { family: Theme.font; pixelSize: 9; letterSpacing: 2.6; weight: Font.DemiBold }
         Behavior on color { ColorAnimation { duration: 200 } }
     }
 
-    // -- right controls -------------------------------------------------------
+    // -- the command strip ----------------------------------------------------
+    // One horizontal command assembly: selector, status instrument, kill
+    // switch, navigation grid, then the window chrome behind a divider. The
+    // right edge is anchored; the selector takes the space it needs to the
+    // left. Every element reads real state and nothing here duplicates it.
     Row {
         id: controls
         objectName: "commandStrip"
         parent: bar.controlLayer || bar
         anchors { right: parent.right; top: parent.top
-                  rightMargin: Math.round(bar.width * Theme.macroStripRight); topMargin: 25 }
-        spacing: Theme.stripSpacing(bar.width)
+                  rightMargin: Math.round(bar.width * Theme.macroStripRight); topMargin: 22 }
+        height: Theme.stripHeight
+        spacing: bar.stripGap
+        readonly property real mid: Theme.stripHeight / 2
 
-        // Provider / model chip opens ONLY its own model panel.
-        Rectangle {
+        ModelSelector {
             id: modelChip
             objectName: "modelTrigger"
-            width: bar.narrow ? 50 : Theme.chipWidth(bar.width); height: 40; radius: Theme.radiusSmall
-            activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: "Model and provider"
-            Keys.onReturnPressed: bar.openModel()
-            Keys.onSpacePressed: bar.openModel()
-            color: chipArea.containsMouse ? Theme.surfaceRaised : Theme.surface; border.width: 1; border.color: chipArea.containsMouse ? Theme.borderStrong : Theme.border
-            Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-            Row {
-                id: modelRow
-                anchors.centerIn: parent; spacing: 10
-                Rectangle { width: 22; height: 22; radius: 6; anchors.verticalCenter: parent.verticalCenter
-                    gradient: Gradient { GradientStop { position: 0; color: "#f4bd66" } GradientStop { position: 1; color: "#d2842a" } }
-                    Text { anchors.centerIn: parent; text: "AI"; color: "#2b1700"; font { family: Theme.font; pixelSize: 10; weight: Font.Bold } } }
-                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter
-                    width: Math.max(56, modelChip.width - 88); elide: Text.ElideRight
-                    text: "Claude" + (bridge.config.claude_model ? " · " + bridge.config.claude_model : "")
-                    color: Theme.text; font { family: Theme.font; pixelSize: 15 } }
-                Text { visible: !bar.narrow; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: Theme.textLabel; font.pixelSize: 15 }
-            }
-            Rectangle { anchors.fill: parent; anchors.margins: -3; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: modelChip.activeFocus }
-            MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openModel() }
+            y: controls.mid - height / 2
+            width: bar.selectorWidth; height: Theme.stripSelectorHeight
+            open: bar.modelOpen
+            // Real state: the configured model, or the CLI's own default.
+            modelName: bridge.config.claude_model ? bridge.config.claude_model : "CLI default"
+            metadata: bar.selectorWidth >= 240 ? "ANTHROPIC  |  CLI" : "ANTHROPIC"
+                      + (bridge.config.claude_effort ? "  |  " + String(bridge.config.claude_effort).toUpperCase() : "")
+            onActivated: bar.openModel()
         }
 
-        // Execution state: the glass lamp. Indicates only - the Kill Switch
-        // beside it is the control. Sized so its ring reads at ~1.18x the
-        // kill switch ring, as in the reference; the axis nodes overhang the row.
+        // Execution state: the glass lamp, at instrument scale. It indicates
+        // only - the Kill Switch beside it is the control.
         Item {
-            width: 62; height: 40
+            width: Theme.stripStatus; height: Theme.stripHeight
+            y: controls.mid - height / 2
             StatusOrb {
                 id: statusOrb
                 objectName: "statusOrb"
                 anchors.centerIn: parent
+                diameter: Theme.stripStatus
                 lit: bridge.executionEnabled && !bridge.configRefused
                 skin: bridge.statusIndicator
                 Accessible.role: Accessible.Indicator
@@ -295,7 +382,7 @@ Item {
                 MouseArea { id: orbHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
                 Rectangle {
                     visible: orbHover.containsMouse
-                    anchors.top: parent.bottom; anchors.topMargin: 4; anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.top: parent.bottom; anchors.topMargin: 2; anchors.horizontalCenter: parent.horizontalCenter
                     width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
                     Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font { family: Theme.font; pixelSize: 11 }
                         text: bridge.configRefused ? "Configuration refused" : (bridge.executionEnabled ? (bridge.busy ? "Execution ready · running" : "Execution ready") : "Execution disabled") }
@@ -303,17 +390,45 @@ Item {
             }
         }
 
-        PowerControl { objectName: "killSwitchControl"; enabled: !bridge.configRefused; engaged: !bridge.executionEnabled; onClicked: bar.killSwitchRequested() }
+        // The kill switch: a separate control with its own hit target,
+        // deliberately smaller than the status instrument and unmistakably
+        // an action rather than a state.
+        Item {
+            width: Theme.stripKill; height: Theme.stripHeight
+            y: controls.mid - height / 2
+            PowerControl {
+                objectName: "killSwitchControl"
+                anchors.centerIn: parent
+                diameter: Theme.stripKill
+                enabled: !bridge.configRefused
+                engaged: !bridge.executionEnabled
+                onClicked: bar.killSwitchRequested()
+            }
+        }
+
         IconButton {
             id: navigationTrigger
             objectName: "navigationTrigger"
-            tip: "Navigation"; width: 36; height: 40; onClicked: bar.menuRequested()
+            y: controls.mid - height / 2
+            tip: "Navigation"; width: 38; height: 38; onClicked: bar.menuRequested()
             Grid { anchors.centerIn: parent; columns: 2; spacing: 4
                 Repeater { model: 4; Rectangle { width: 6; height: 6; radius: index === 3 ? 1 : 3; color: "transparent"; border.width: 1.4; border.color: Theme.accent } } }
         }
-        IconButton { glyph: "–"; tip: "Minimize"; width: 36; height: 37; onClicked: bar.minimizeRequested() }
-        IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 36; height: 37; onClicked: bar.restoreRequested() }
-        IconButton { glyph: "✕"; tip: "Close"; width: 36; height: 37; onClicked: bar.closeRequested() }
+
+        // The window chrome sits behind a divider and stays restrained, so
+        // it never competes with the JARVIS controls.
+        Item {
+            width: 13; height: Theme.stripHeight
+            y: controls.mid - height / 2
+            Rectangle { anchors.centerIn: parent; width: 1; height: 26; color: Theme.borderStrong; opacity: 0.8 }
+        }
+        Row {
+            y: controls.mid - height / 2
+            spacing: 2
+            IconButton { glyph: "–"; tip: "Minimize"; width: 34; height: 34; onClicked: bar.minimizeRequested() }
+            IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 34; height: 34; onClicked: bar.restoreRequested() }
+            IconButton { glyph: "✕"; tip: "Close"; width: 34; height: 34; onClicked: bar.closeRequested() }
+        }
     }
 
     // The tiny icon-only layout-edit control: a sliders glyph in a framed square.
