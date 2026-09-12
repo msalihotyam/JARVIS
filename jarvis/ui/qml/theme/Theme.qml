@@ -82,8 +82,8 @@ QtObject {
     readonly property int stripKill: 50                 // kill switch: separate, a step below the status
     readonly property int stripChamfer: 18              // Option 5 corner cut
     // Option 5 frame tones: layered dark glass with a fine cyan perimeter.
-    property color commandEdge: space ? "#3fe0d2" : command ? "#24d8ff" : "#2fb9c9"
-    property color commandEdgeDim: space ? "#1c5f6b" : "#1d5560"
+    property color commandEdge: space ? "#24d8ff" : command ? "#24d8ff" : "#1fbde0"
+    property color commandEdgeDim: space ? "#1d4d6b" : "#193f57"
     property color commandGlass0: space ? "#f00d2230" : "#f00b1a22"
     property color commandGlass1: space ? "#f0060f1a" : "#f0050d12"
     Behavior on commandEdge { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }

@@ -150,40 +150,42 @@ Item {
         Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 }
     }
 
-    // Trajectory linework: two wide arcs concentric with the core, on the
-    // open side of the composition, plus one tracking node. Faint, curved,
-    // and never a straight diagonal across the header.
+    // Trajectory linework: a wide, shallow ellipse whose centre sits left
+    // of the core, with a dashed companion inside it - the reference's
+    // flattened trajectory, not a circle around the core. Measured from the
+    // canonical reference: centre 0.292 core-diameters left of the core,
+    // rx 0.699 d, ry 0.123 d (5.7:1). Its right end runs in behind the ring
+    // family, which draws over it.
     Shape {
         id: orbit
         visible: !bar.narrow
         anchors.fill: parent
         opacity: Theme.hudOpacity * 0.8
         preferredRendererType: Shape.CurveRenderer
+        readonly property real cx: bar.coreCx - bar.coreDiameter * 0.292
+        readonly property real cy: bar.coreCy
+        readonly property real rx: bar.coreDiameter * 0.699
+        readonly property real ry: bar.coreDiameter * 0.123
         ShapePath {
             strokeColor: Theme.hud; strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
-            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
-                           radiusX: bar.coreDiameter * 0.66; radiusY: bar.coreDiameter * 0.66
-                           startAngle: 118; sweepAngle: 116 }
+            PathAngleArc { centerX: orbit.cx; centerY: orbit.cy
+                           radiusX: orbit.rx; radiusY: orbit.ry
+                           startAngle: 78; sweepAngle: 204 }
         }
         ShapePath {
             strokeColor: Theme.alpha(Theme.hud, 0.6); strokeWidth: 1; fillColor: "transparent"
             strokeStyle: ShapePath.DashLine; dashPattern: [1, 5]
-            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
-                           radiusX: bar.coreDiameter * 0.82; radiusY: bar.coreDiameter * 0.82
-                           startAngle: 136; sweepAngle: 88 }
-        }
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.hud, 0.75); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.RoundCap
-            PathAngleArc { centerX: bar.coreCx; centerY: bar.coreCy
-                           radiusX: bar.coreDiameter * 0.66; radiusY: bar.coreDiameter * 0.66
-                           startAngle: 306; sweepAngle: 34 }
+            PathAngleArc { centerX: orbit.cx; centerY: orbit.cy
+                           radiusX: bar.coreDiameter * 0.627; radiusY: bar.coreDiameter * 0.088
+                           startAngle: 92; sweepAngle: 176 }
         }
     }
+    // One tracking node, on the ellipse at its leftmost vertex.
     Rectangle {
         visible: !bar.narrow
         width: 5; height: 5; radius: 2.5; color: Theme.hud; opacity: Theme.hudOpacity * 1.6
-        x: bar.coreCx + bar.coreDiameter * 0.66 * Math.cos(163 * Math.PI / 180) - 2.5
-        y: bar.coreCy + bar.coreDiameter * 0.66 * Math.sin(163 * Math.PI / 180) - 2.5
+        x: orbit.cx + orbit.rx * Math.cos(175 * Math.PI / 180) - 2.5
+        y: orbit.cy + orbit.ry * Math.sin(175 * Math.PI / 180) - 2.5
         Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 }
     }
 
