@@ -9,7 +9,10 @@ Rectangle {
     id: composer
     height: 66
     radius: 12
-    color: Theme.alpha(Theme.bg1, 0.9)
+    gradient: Gradient {
+        GradientStop { position: 0; color: "#f00f2538" }
+        GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.94) }
+    }
     border.width: 1.5
     border.color: input.activeFocus ? Theme.alpha(Theme.accent, 0.95) : Theme.alpha(Theme.accent, 0.72)
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
@@ -19,9 +22,9 @@ Rectangle {
     function submit() { if (canSend) { bridge.submitText(input.text); input.text = "" } }
 
     // Depth and the cyan rim of the reference: a soft outer haze, stronger when focused.
-    Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 4; radius: parent.radius; color: "#000000"; opacity: 0.3 }
-    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -5; radius: parent.radius + 5; color: Theme.alpha(Theme.accent, input.activeFocus ? 0.16 : 0.1)
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: "transparent"
+        border.width: 3; border.color: Theme.alpha(Theme.accent, input.activeFocus ? 0.2 : 0.12)
+        Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } } }
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 2 } height: parent.height * 0.5; radius: 10
         gradient: Gradient { GradientStop { position: 0; color: Theme.sheen } GradientStop { position: 1; color: "transparent" } } }
     Rectangle { x: 14; y: 0; height: 1; width: parent.width - 28
@@ -32,9 +35,10 @@ Rectangle {
     // The prompt mark, in its own inset well.
     Rectangle {
         id: well
-        anchors.left: parent.left; anchors.leftMargin: 8; anchors.verticalCenter: parent.verticalCenter
-        width: 50; height: parent.height - 16; radius: 9
-        color: Theme.alpha(Theme.bg0, 0.55); border.width: 1; border.color: Theme.alpha(Theme.accent, 0.18)
+        anchors.left: parent.left; anchors.leftMargin: 9; anchors.verticalCenter: parent.verticalCenter
+        width: 58; height: parent.height - 18; radius: 10
+        color: Theme.alpha(Theme.bg0, 0.62); border.width: 1; border.color: Theme.alpha(Theme.accent, 0.22)
+        Rectangle { x: 8; y: 1; width: parent.width - 16; height: 1; color: "#1abfeaff" }
         Rectangle {
             anchors.centerIn: parent
             width: 24; height: 24; radius: 12; color: "transparent"; border.width: 1.4; border.color: Theme.alpha(Theme.accent, input.activeFocus ? 0.9 : 0.55)
@@ -44,13 +48,13 @@ Rectangle {
     }
     TextField {
         id: input
-        anchors { left: parent.left; right: bridge.busy ? stopButton.left : sendButton.left; verticalCenter: parent.verticalCenter; leftMargin: 76; rightMargin: 12 }
+        anchors { left: parent.left; right: bridge.busy ? stopButton.left : sendButton.left; verticalCenter: parent.verticalCenter; leftMargin: 88; rightMargin: 14 }
         placeholderText: bridge.approvalPending ? "Answer the pending approval first"
                         : bridge.configRefused ? "Configuration refused - repair it with: jarvis config reset --all"
                         : (bridge.task.status === "awaiting_clarification" ? "Answer JARVIS's question…" : "Message JARVIS…")
-        placeholderTextColor: Theme.textLabel
-        color: Theme.text
-        font { family: Theme.font; pixelSize: 16 }
+        placeholderTextColor: "#aebbd9"
+        color: "#e8f2fa"
+        font { family: Theme.font; pixelSize: 17 }
         background: Item {}
         selectByMouse: true
         enabled: !bridge.configRefused
@@ -60,20 +64,20 @@ Rectangle {
     // Send: a lit key when there is something to send.
     Rectangle {
         id: sendButton
-        anchors.right: parent.right; anchors.rightMargin: 7; anchors.verticalCenter: parent.verticalCenter
-        width: 58; height: parent.height - 14; radius: 10
+        anchors.right: parent.right; anchors.rightMargin: 9; anchors.verticalCenter: parent.verticalCenter
+        width: 66; height: parent.height - 18; radius: 10
         readonly property bool hovered: sendArea.containsMouse && composer.canSend
         gradient: Gradient {
-            GradientStop { position: 0; color: composer.blocked ? Theme.alpha(Theme.accent, 0.25) : (sendButton.hovered ? "#5fd6ff" : "#34c3ff") }
-            GradientStop { position: 1; color: composer.blocked ? Theme.alpha(Theme.accentDeep, 0.25) : (sendArea.pressed ? Qt.darker(Theme.accentDeep, 1.2) : "#0aa2e8") }
+            GradientStop { position: 0; color: composer.blocked ? Theme.alpha(Theme.accent, 0.25) : (sendButton.hovered ? "#4fd0ff" : "#1ebcff") }
+            GradientStop { position: 1; color: composer.blocked ? Theme.alpha(Theme.accentDeep, 0.25) : (sendArea.pressed ? Qt.darker(Theme.accentDeep, 1.2) : "#08a8f0") }
         }
-        border.width: 1; border.color: composer.blocked ? Theme.alpha(Theme.accent, 0.3) : Theme.alpha("#b8ecff", 0.7)
+        border.width: 1; border.color: composer.blocked ? Theme.alpha(Theme.accent, 0.3) : "#73c9f1ff"
         scale: sendArea.pressed && composer.canSend ? 0.96 : 1
         Behavior on scale { NumberAnimation { duration: 90 } }
-        Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: 13; color: Theme.alpha(Theme.accent, composer.blocked ? 0 : (parent.hovered ? 0.3 : 0.16)); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+        Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: 13; color: Theme.alpha(Theme.accent, composer.blocked ? 0 : (parent.hovered ? 0.28 : 0)); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
         Shape {
             anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
-            width: 22; height: 20
+            width: 22; height: 20; scale: 1.18
             preferredRendererType: Shape.CurveRenderer
             opacity: composer.blocked ? 0.45 : 1
             ShapePath {

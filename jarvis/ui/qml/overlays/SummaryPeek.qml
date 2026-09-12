@@ -18,6 +18,8 @@ ContextPanel {
     property real cardY: 0
     property Item rail: null
     surfaceName: "summaryPeek"
+    // The peek is the stronger member of the rail family: a crisp cyan edge.
+    surfaceEdge: Theme.alpha(Theme.accent, 0.52)
     panelWidth: 392
     panelHeight: spec ? 50 + 16 + metricsHeight + 14 + listHeight + 14 + 58 + 44 : 300
 
@@ -93,20 +95,15 @@ ContextPanel {
     header: Component {
         Row {
             spacing: 13
-            Rectangle {
-                width: 40; height: 40; radius: 10
+            Item {
+                width: 40; height: 40
                 anchors.verticalCenter: parent.verticalCenter
-                gradient: Gradient {
-                    GradientStop { position: 0; color: Qt.lighter(peek.spec ? peek.spec.tone : Theme.accent, 1.18) }
-                    GradientStop { position: 1; color: Qt.darker(peek.spec ? peek.spec.tone : Theme.accent, 1.55) }
-                }
-                border.width: 1; border.color: Theme.alpha(Qt.lighter(peek.spec ? peek.spec.tone : Theme.accent, 1.6), 0.35)
-                SummaryIcon { anchors.centerIn: parent; icon: peek.spec ? peek.spec.icon : "tasks"; scale: 40 / 42 }
+                SummaryIcon { anchors.centerIn: parent; icon: peek.spec ? peek.spec.icon : "tasks"; tint: "#e8f6ff"; scale: 1.7 }
             }
             Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 2
-                Text { text: peek.spec ? peek.spec.title : ""; color: Theme.text; font { family: Theme.font; pixelSize: 19; weight: Font.DemiBold } }
+                Text { text: peek.spec ? peek.spec.title : ""; color: "#eef6fc"; font { family: Theme.font; pixelSize: 20; weight: Font.DemiBold } }
                 Text { text: peek.spec ? peek.spec.subtitle : ""; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
             }
         }
@@ -124,11 +121,15 @@ ContextPanel {
                 model: peek.spec ? peek.spec.metrics : []
                 Rectangle {
                     width: (parent.width - 10) / 2; height: parent.height; radius: 10
-                    color: Theme.alpha(Theme.bg1, 0.55)
-                    border.width: 1; border.color: Theme.alpha(Theme.accent, 0.2)
+                    gradient: Gradient {
+                        GradientStop { position: 0; color: "#cc0f2639" }
+                        GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.6) }
+                    }
+                    border.width: 1; border.color: Theme.alpha(Theme.accent, 0.32)
+                    Rectangle { x: 10; y: 1; width: parent.width - 20; height: 1; color: "#24bfeaff" }
                     Column {
-                        x: 14; anchors.verticalCenter: parent.verticalCenter; spacing: 0
-                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 26; weight: Font.DemiBold } }
+                        x: 14; anchors.verticalCenter: parent.verticalCenter; spacing: -2
+                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 30; weight: Font.DemiBold } }
                         Text { width: parent.parent.width - 28; elide: Text.ElideRight; text: modelData.label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
                     }
                 }
@@ -147,13 +148,13 @@ ContextPanel {
                         width: parent.width; height: peek.rowHeight
                         readonly property color tone: modelData.dot === "alert" ? Theme.danger : modelData.dot === "warn" ? Theme.warning
                                                      : modelData.dot === "live" ? Theme.accent : Theme.textDim
-                        Rectangle { visible: index > 0; width: parent.width; height: 1; color: Theme.alpha(Theme.accent, 0.1) }
+                        Rectangle { visible: index > 0; width: parent.width; height: 1; color: Theme.alpha(Theme.accent, 0.14) }
                         Rectangle { x: 4; anchors.verticalCenter: parent.verticalCenter; width: 8; height: 8; radius: 4; color: parent.tone }
                         Column {
                             x: 22; anchors.verticalCenter: parent.verticalCenter
                             width: parent.width - x - (pill.visible ? pill.width + 10 : 0) - (meta.visible ? meta.width + 12 : 0)
                             spacing: 2
-                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
+                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: "#eef6fc"; font { family: Theme.font; pixelSize: 15 } }
                             Text { width: parent.width; elide: Text.ElideRight; text: modelData.sub; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
                         }
                         Rectangle {
@@ -199,8 +200,8 @@ ContextPanel {
         Rectangle {
             objectName: "summaryPeekAction"
             width: parent.width; height: 58; radius: 10
-            color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.1) : Theme.alpha(Theme.bg1, 0.55)
-            border.width: 1; border.color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.55) : Theme.alpha(Theme.accent, 0.22)
+            color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.1) : Theme.alpha(Theme.bg1, 0.62)
+            border.width: 1; border.color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.6) : Theme.alpha(Theme.accent, 0.32)
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
             Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
             Accessible.role: Accessible.Button

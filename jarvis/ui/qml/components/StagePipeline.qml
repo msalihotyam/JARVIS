@@ -12,12 +12,17 @@ Rectangle {
     property bool notes: bridge.feed.length === 0
     readonly property bool hasTask: !!bridge.task.task_id
     readonly property string cs: bridge.coreState
-    readonly property int rowHeight: notes ? 54 : 44
-    implicitHeight: 40 + rowHeight * 4 + 10
+    readonly property int rowHeight: notes ? 54 : 43
+    implicitHeight: 36 + rowHeight * 4 + 8
     height: implicitHeight
     radius: 12
-    color: Theme.alpha(Theme.bg1, 0.62)
-    border.width: 1; border.color: Theme.alpha(Theme.accent, 0.24)
+    gradient: Gradient {
+        GradientStop { position: 0; color: "#bd0e2438" }
+        GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.7) }
+    }
+    border.width: 1; border.color: Theme.alpha(Theme.accent, 0.33)
+    // A crisp inner top highlight: depth without blur.
+    Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#24bfeaff" }
 
     function stage(i) {
         var t = bridge.task, has = hasTask, cs = pipeline.cs
@@ -45,8 +50,8 @@ Rectangle {
     // The current activity: the real task when there is one.
     Item {
         id: head
-        x: 20; width: parent.width - 40; height: 40
-        Text { anchors.verticalCenter: parent.verticalCenter; text: "CURRENT ACTIVITY"; color: Theme.textMuted
+        x: 20; width: parent.width - 40; height: 36
+        Text { anchors.verticalCenter: parent.verticalCenter; text: "CURRENT ACTIVITY"; color: Theme.textMuted; opacity: 0.85
                font { family: Theme.font; pixelSize: 10; letterSpacing: 2; weight: Font.DemiBold } }
         Row {
             anchors { right: parent.right; verticalCenter: parent.verticalCenter }
@@ -74,19 +79,19 @@ Rectangle {
                 readonly property bool quiet: s === "pending" || s === "skipped"
                 readonly property color tone: s === "done" ? Theme.success : s === "running" ? Theme.accent : s === "waiting" ? Theme.warning
                                               : s === "unknown" ? Theme.unknownEdge : s === "error" || s === "denied" ? Theme.danger : Theme.textMuted
-                Rectangle { width: parent.width; height: 1; color: Theme.alpha(Theme.accent, 0.11) }
+                Rectangle { width: parent.width; height: 1; color: Theme.alpha(Theme.accent, 0.15) }
 
                 // State marker: a filled check when done, a lit ring while
                 // running, a quiet ring otherwise.
                 Item {
                     x: 2; anchors.verticalCenter: parent.verticalCenter
-                    width: 22; height: 22
-                    Rectangle { visible: stageRow.s === "running"; anchors.centerIn: parent; width: 30; height: 30; radius: 15; color: Theme.alpha(Theme.accent, 0.14) }
+                    width: 24; height: 24
+                    Rectangle { visible: stageRow.s === "running"; anchors.centerIn: parent; width: 34; height: 34; radius: 17; color: Theme.alpha(Theme.accent, 0.16) }
                     Rectangle {
-                        anchors.fill: parent; radius: 11
+                        anchors.fill: parent; radius: 12
                         color: stageRow.s === "done" ? stageRow.tone : "transparent"
-                        border.width: stageRow.s === "running" ? 2.2 : 1.6
-                        border.color: stageRow.quiet ? Theme.alpha(Theme.textLabel, 0.62) : stageRow.tone
+                        border.width: stageRow.s === "done" ? 0 : 2
+                        border.color: stageRow.quiet ? "#d9a9b9dc" : stageRow.tone
                     }
                     Shape {
                         visible: stageRow.s === "done"
@@ -101,10 +106,10 @@ Rectangle {
                     }
                 }
                 Column {
-                    x: 40; anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - 180; spacing: 2
+                    x: 46; anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - 190; spacing: 2
                     Text { text: modelData.name; width: parent.width; elide: Text.ElideRight
-                           color: stageRow.quiet ? Theme.textLabel : Theme.text
+                           color: stageRow.quiet ? "#d3deec" : "#eef6fc"
                            font { family: Theme.font; pixelSize: 15 } }
                     Text { visible: pipeline.notes; text: modelData.note; width: parent.width; elide: Text.ElideRight
                            color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
@@ -112,8 +117,8 @@ Rectangle {
                 Text {
                     anchors { right: parent.right; verticalCenter: parent.verticalCenter }
                     text: ({pending:"Pending",waiting:"Awaiting you",running:"Running",done:"Completed",error:"Failed",unknown:"Outcome unknown",denied:"Denied",skipped:"Not run"})[stageRow.s]
-                    color: stageRow.quiet ? Theme.textLabel : stageRow.tone
-                    font { family: Theme.font; pixelSize: 14 }
+                    color: stageRow.quiet ? "#a9b9dc" : stageRow.tone
+                    font { family: Theme.font; pixelSize: 15 }
                 }
             }
         }

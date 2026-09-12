@@ -104,7 +104,7 @@ Item {
                 readonly property bool hovered: hit.containsMouse
                 width: rail.width
                 height: rail.cardHeight
-                radius: 12
+                radius: 14
                 // Closed: controlled glass. Active: a restrained cyan
                 // treatment - brighter edge and a slight lift, no glow bloom.
                 color: active ? rail.activeFill
@@ -122,12 +122,13 @@ Item {
 
                 Rectangle {
                     anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
-                    height: Math.min(parent.height, 36); radius: 11
+                    height: Math.min(parent.height, 36); radius: 13
                     gradient: Gradient {
-                        GradientStop { position: 0; color: Theme.alpha(Theme.accent, card.active ? 0.1 : 0.055) }
+                        GradientStop { position: 0; color: Theme.alpha(Theme.accent, card.active ? 0.12 : 0.08) }
                         GradientStop { position: 1; color: "transparent" }
                     }
                 }
+                Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: card.active ? "#4dbfeaff" : "#24bfeaff" }
                 Rectangle {
                     anchors.fill: parent; anchors.margins: -3; radius: 14
                     color: "transparent"; border.color: Theme.alpha(Theme.accent, 0.7)
@@ -156,14 +157,15 @@ Item {
                 // Icon tile: a solid tinted instrument with a drawn line icon.
                 Rectangle {
                     id: tile
-                    x: 10; anchors.verticalCenter: parent.verticalCenter
+                    x: rail.tight ? 9 : 11; anchors.verticalCenter: parent.verticalCenter
                     width: rail.tight ? 34 : rail.showNote ? 42 : 32; height: width; radius: rail.tight ? 9 : rail.showNote ? 10 : 8
                     gradient: Gradient {
-                        GradientStop { position: 0; color: Qt.lighter(modelData.tone, 1.18) }
-                        GradientStop { position: 1; color: Qt.darker(modelData.tone, 1.55) }
+                        GradientStop { position: 0; color: Qt.darker(modelData.tone, 1.2) }
+                        GradientStop { position: 1; color: Qt.darker(modelData.tone, 2.25) }
                     }
-                    border.width: 1; border.color: Theme.alpha(Qt.lighter(modelData.tone, 1.6), 0.35)
-                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; scale: tile.width / 42 }
+                    border.width: 1; border.color: Theme.alpha(Qt.lighter(modelData.tone, 1.9), 0.42)
+                    Rectangle { x: 6; y: 1; width: parent.width - 12; height: 1; color: Qt.rgba(1, 1, 1, 0.2) }
+                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; scale: tile.width / 42 * 1.22 }
                 }
 
                 Column {
@@ -171,9 +173,10 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - x - (rail.tight ? 17 : 24)
                     spacing: 0
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.key; color: Theme.text
+                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.key; color: "#eef6fc"
                            font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.line; color: Qt.lighter(modelData.tone, 1.75)
+                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.line
+                           color: modelData.key === "Tasks" ? Theme.accent : Qt.lighter(modelData.tone, 1.8)
                            font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold } }
                     Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: Theme.textMuted
                            font { family: Theme.font; pixelSize: 12 } }

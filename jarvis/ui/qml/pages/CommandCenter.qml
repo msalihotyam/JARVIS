@@ -45,7 +45,7 @@ GlassPanel {
             ActionButton { label: "Never mind"; onClicked: bridge.dismissClarification() }
         }
     }
-    Composer { id: composer; objectName: "canonicalComposer"; height: 70
+    Composer { id: composer; objectName: "canonicalComposer"; height: 76
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: page.width >= 900 ? 36 : 12; rightMargin: 8 }
     }
 }

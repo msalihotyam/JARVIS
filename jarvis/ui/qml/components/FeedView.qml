@@ -11,7 +11,7 @@ import "../theme"
 ListView {
     id: feed
     model: bridge.feed
-    spacing: 22
+    spacing: 18
     property bool pipelineEnabled: false
     readonly property int pipelineIndex: {
         var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
@@ -83,12 +83,13 @@ ListView {
         Item {
             id: avatar
             width: 50; height: 50
-            // You: the operator's initial on a blue disc.
+            // You: the operator's initial on a glossy blue disc with a soft glow.
+            Rectangle { visible: row.isUser; anchors.centerIn: parent; width: 62; height: 62; radius: 31; color: Theme.accentSoft; opacity: 0.12 }
             Rectangle {
                 visible: row.isUser
                 anchors.fill: parent; radius: 25
                 gradient: Gradient { GradientStop { position: 0; color: "#2b6fae" } GradientStop { position: 1; color: "#123d68" } }
-                border.width: 1; border.color: Theme.alpha("#9fd4ff", 0.55)
+                border.width: 1; border.color: "#8c9fd4ff"
                 Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: 24; radius: 24
                     gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.12) } GradientStop { position: 1; color: "transparent" } } }
                 Text { anchors.centerIn: parent; text: bridge.operatorName.charAt(0).toUpperCase(); color: "#f2f8ff"; font { family: Theme.font; pixelSize: 20; weight: Font.DemiBold } }
@@ -120,20 +121,25 @@ ListView {
             // The reference wraps both the request card and JARVIS's text at
             // about 640 px rather than spanning the whole flow.
             width: row.boxed ? Math.min(row.width - x - 4, 625, Math.max(360, (row.width - x) * 0.66)) : row.width - x - 4
-            readonly property real textWidth: row.boxed ? width - 32 : Math.min(width - 4, 710)
-            height: body.height + (row.boxed ? 32 : 14)
+            readonly property real textWidth: row.boxed ? width - 42 : Math.min(width - 4, 760)
+            height: body.height + (row.boxed ? 34 : 8)
             radius: 10
             // The request card of the reference: quiet darker glass, a barely-there border.
-            color: row.isUser ? Theme.alpha(Theme.bg1, 0.72) : (row.loud ? Theme.alpha(row.tone, 0.07) : "transparent")
+            color: row.loud ? Theme.alpha(row.tone, 0.07) : "transparent"
+            gradient: row.isUser ? requestGlass : null
+            Gradient { id: requestGlass
+                GradientStop { position: 0; color: "#db10283d" }
+                GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.8) } }
             border.width: row.boxed ? 1 : 0
-            border.color: row.isUser ? Theme.alpha(Theme.accent, 0.3) : Theme.alpha(row.tone, 0.45)
-            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 34); radius: 9
-                gradient: Gradient { GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0.06) } GradientStop { position: 1; color: "transparent" } } }
+            border.color: row.isUser ? Theme.alpha(Theme.accent, 0.42) : Theme.alpha(row.tone, 0.45)
+            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 30); radius: 9
+                gradient: Gradient { GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0.07) } GradientStop { position: 1; color: "transparent" } } }
+            Rectangle { visible: row.isUser; x: 12; y: 1; width: parent.width - 24; height: 1; color: "#29bfeaff" }
             Column {
                 id: body
-                x: row.boxed ? 20 : 0; y: row.boxed ? 15 : 4
+                x: row.boxed ? 21 : 0; y: row.boxed ? 16 : 2
                 width: card.textWidth
-                spacing: 7
+                spacing: 8
                 Row {
                     spacing: 12
                     Text { text: feed.kindLabel(row.kind); color: row.isUser ? "#eaf4ff" : row.tone
@@ -141,16 +147,33 @@ ListView {
                                letterSpacing: row.isUser ? 0.2 : (row.isJarvis ? 1.6 : 2.2) } }
                     Text { anchors.baseline: parent.children[0].baseline; text: modelData.time; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
                 }
-                TextEdit {
+                Item {
                     width: parent.width
+                    height: message.height + (row.isJarvis ? 24 : 0)
+                    Rectangle {
+                        visible: row.isJarvis
+                        anchors.fill: parent; radius: 10
+                        gradient: Gradient {
+                            GradientStop { position: 0; color: "#750d2336" }
+                            GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.34) }
+                        }
+                        border.width: 1; border.color: Theme.alpha(Theme.accent, 0.18)
+                        Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: 22; radius: 9
+                            gradient: Gradient { GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0.04) } GradientStop { position: 1; color: "transparent" } } }
+                    }
+                TextEdit {
+                    id: message
+                    x: row.isJarvis ? 18 : 0; y: row.isJarvis ? 12 : 0
+                    width: parent.width - 2 * x
                     text: modelData.text
                     readOnly: true
                     selectByMouse: true
                     wrapMode: Text.Wrap
-                    color: row.kind === "system" ? Theme.textMuted : Theme.text
+                    color: row.kind === "system" ? Theme.textMuted : "#e6f1fa"
                     selectionColor: Theme.accentSoft
                     font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : 17 }
                     textFormat: TextEdit.PlainText
+                }
                 }
             }
         }

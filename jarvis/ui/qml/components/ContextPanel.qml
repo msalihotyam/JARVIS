@@ -13,6 +13,7 @@ Item {
     property string heading: ""
     property string surfaceName: "contextSurface"
     property Component header: null     // replaces the caption when set
+    property color surfaceEdge: "transparent"   // a stronger edge, when set
     default property alias content: inner.data
     readonly property real surfaceX: panel.x
     readonly property real surfaceY: panel.y
@@ -30,6 +31,7 @@ Item {
         id: panel
         objectName: context.surfaceName
         raised: true; brackets: true; padding: 22
+        border.color: context.surfaceEdge.a > 0 ? context.surfaceEdge : Theme.border
         width: Math.min(context.panelWidth, context.width - 32)
         height: Math.min(context.panelHeight, context.height - 108)
         x: Math.max(16, Math.min(context.anchorPoint.x, context.width - width - 16))
