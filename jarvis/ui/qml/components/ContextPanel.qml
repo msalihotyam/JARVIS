@@ -14,6 +14,8 @@ Item {
     property string surfaceName: "contextSurface"
     property Component header: null     // replaces the caption when set
     property color surfaceEdge: "transparent"   // a stronger edge, when set
+    property color surfaceFill: "transparent"   // a deeper body, when set
+    property bool surfaceBrackets: true
     default property alias content: inner.data
     readonly property real surfaceX: panel.x
     readonly property real surfaceY: panel.y
@@ -30,8 +32,12 @@ Item {
     GlassPanel {
         id: panel
         objectName: context.surfaceName
-        raised: true; brackets: true; padding: 22
+        raised: true; brackets: context.surfaceBrackets; padding: 22
         border.color: context.surfaceEdge.a > 0 ? context.surfaceEdge : Theme.border
+        color: context.surfaceFill.a > 0 ? context.surfaceFill : Theme.surfaceRaised
+        // A luminous halo around a strong edge.
+        Rectangle { parent: panel; z: -1; visible: context.surfaceEdge.a > 0; anchors.fill: parent; anchors.margins: -3; radius: panel.radius + 3
+            color: "transparent"; border.width: 3; border.color: Qt.rgba(context.surfaceEdge.r, context.surfaceEdge.g, context.surfaceEdge.b, 0.22) }
         width: Math.min(context.panelWidth, context.width - 32)
         height: Math.min(context.panelHeight, context.height - 108)
         x: Math.max(16, Math.min(context.anchorPoint.x, context.width - width - 16))
@@ -47,7 +53,7 @@ Item {
             Loader { active: !!context.header; sourceComponent: context.header; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 44 }
             IconButton { objectName: context.surfaceName + "Close"; anchors.right: parent.right; glyph: "✕"; tip: "Close"; onClicked: context.open = false }
         }
-        Rectangle { anchors.top: heading.bottom; width: parent.width; height: 1; color: Theme.border }
+        Rectangle { visible: !context.header; anchors.top: heading.bottom; width: parent.width; height: 1; color: Theme.border }
         Item { id: inner; anchors { left: parent.left; right: parent.right; top: heading.bottom; bottom: parent.bottom; topMargin: context.header ? 16 : 20 } }
     }
 }

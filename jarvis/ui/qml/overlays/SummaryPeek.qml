@@ -19,8 +19,10 @@ ContextPanel {
     property Item rail: null
     surfaceName: "summaryPeek"
     // The peek is the stronger member of the rail family: a crisp cyan edge.
-    surfaceEdge: Theme.alpha(Theme.accent, 0.52)
-    panelWidth: 392
+    surfaceEdge: "#3aa3c2"
+    surfaceFill: "#f6000f1c"
+    surfaceBrackets: false
+    panelWidth: 432
     panelHeight: spec ? 50 + 16 + metricsHeight + 14 + listHeight + 14 + 58 + 44 : 300
 
     readonly property int metricsHeight: 68
@@ -98,13 +100,13 @@ ContextPanel {
             Item {
                 width: 40; height: 40
                 anchors.verticalCenter: parent.verticalCenter
-                SummaryIcon { anchors.centerIn: parent; icon: peek.spec ? peek.spec.icon : "tasks"; tint: "#e8f6ff"; scale: 1.7 }
+                SummaryIcon { anchors.centerIn: parent; icon: peek.spec ? peek.spec.icon : "tasks"; tint: "#eef8ff"; scale: 1.95 }
             }
             Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 2
-                Text { text: peek.spec ? peek.spec.title : ""; color: "#eef6fc"; font { family: Theme.font; pixelSize: 20; weight: Font.DemiBold } }
-                Text { text: peek.spec ? peek.spec.subtitle : ""; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 21; weight: Font.DemiBold } }
+                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#9fb6d4"; font { family: Theme.font; pixelSize: 13 } }
             }
         }
     }
@@ -122,14 +124,14 @@ ContextPanel {
                 Rectangle {
                     width: (parent.width - 10) / 2; height: parent.height; radius: 10
                     gradient: Gradient {
-                        GradientStop { position: 0; color: "#cc0f2639" }
-                        GradientStop { position: 1; color: Theme.alpha(Theme.bg1, 0.6) }
+                        GradientStop { position: 0; color: "#f0001c30" }
+                        GradientStop { position: 1; color: "#f0001523" }
                     }
-                    border.width: 1; border.color: Theme.alpha(Theme.accent, 0.32)
+                    border.width: 1; border.color: "#236a8c"
                     Rectangle { x: 10; y: 1; width: parent.width - 20; height: 1; color: "#24bfeaff" }
                     Column {
                         x: 14; anchors.verticalCenter: parent.verticalCenter; spacing: -2
-                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 30; weight: Font.DemiBold } }
+                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 32; weight: Font.DemiBold } }
                         Text { width: parent.parent.width - 28; elide: Text.ElideRight; text: modelData.label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
                     }
                 }
@@ -178,6 +180,13 @@ ContextPanel {
                     }
                 }
             }
+            // A designed inset well for the truthful empty state.
+            Rectangle {
+                visible: peek.rows.length === 0
+                anchors.fill: parent; radius: 10
+                color: "#b3001523"; border.width: 1; border.color: "#173e58"
+                Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#246fd2f5" }
+            }
             Column {
                 objectName: "summaryPeekEmpty"
                 visible: peek.rows.length === 0
@@ -200,8 +209,9 @@ ContextPanel {
         Rectangle {
             objectName: "summaryPeekAction"
             width: parent.width; height: 58; radius: 10
-            color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.1) : Theme.alpha(Theme.bg1, 0.62)
-            border.width: 1; border.color: actionHit.containsMouse ? Theme.alpha(Theme.accent, 0.6) : Theme.alpha(Theme.accent, 0.32)
+            color: actionHit.containsMouse ? "#f0002a44" : "#f0001828"
+            border.width: 1; border.color: actionHit.containsMouse ? "#5ccbeb" : "#2f7ea4"
+            Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#3a8fd8f5" }
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
             Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
             Accessible.role: Accessible.Button

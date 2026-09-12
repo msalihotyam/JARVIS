@@ -1224,6 +1224,28 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertTrue(self.item(root, "summaryRail").isVisible())
         self.assertEqual(0, self.execute_calls())
 
+    def test_conversation_surface_holds_the_reference_proportions(self) -> None:
+        """Phase 3.2: inside the fixed Phase 1 bounds the conversation takes the
+        approved helper's measured proportions - composer 94 % of the surface
+        and centred, the avatar column centred at 8.2 %, and the reference
+        layout at both desktop sizes."""
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in ((1920, 1080), (1536, 864)):
+            root.resize(width, height)
+            pump(700)
+            work = self.box(root, "canonicalWorkspace"); composer = self.box(root, "canonicalComposer")
+            feed = self.box(root, "conversationFeed")
+            surface = work[2] - work[0]
+            with self.subTest(size=(width, height)):
+                self.assertTrue(self.item(root, "conversationFeed").property("referenceLayout"))
+                self.assertAlmostEqual(94.0, 100 * (composer[2] - composer[0]) / surface, delta=1.0)
+                self.assertAlmostEqual(composer[0] - work[0], work[2] - composer[2], delta=2.0)
+                avatar_centre = feed[0] + self.item(root, "conversationFeed").property("avatarSize") / 2
+                self.assertAlmostEqual(8.2, 100 * (avatar_centre - work[0]) / surface, delta=1.0)
+                self.assertLessEqual(composer[3], work[3])
+        self.assertEqual(0, self.execute_calls())
+
     def test_peek_opens_anchored_switches_and_closes_every_way(self) -> None:
         from PySide6.QtCore import QPoint
         bridge = self.bridge()
