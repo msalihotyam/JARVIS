@@ -2,65 +2,94 @@ import QtQuick
 import "../theme"
 import "../components"
 
-// Canonical/Dark home: the conversation surface, reconstructed against the
-// approved conversation helper. The Phase 1 outer bounds are fixed; inside
-// them every inset is a fraction of the work-surface width, taken from the
-// helper at its own scale (its panel maps onto the 1096 px surface of the
-// 1920x1080 layout at 0.812):
-//   greeting 5.0 %, avatar centre 8.2 %, content 13.6 %,
-//   request 62 %, answer / workflow to 95 %, composer 94 % centred.
-GlassPanel {
+// Canonical/Dark home: the conversation-first work surface. Its shell rises
+// `lift` px above the panel line the right stack starts from, into the
+// header environment: the material fades in over the first `fade` px - no
+// top border, nothing bright under the reactor - and the text begins below
+// the fade. The reactor is not moved and the header does not grow.
+//
+// A genuinely empty conversation shows one lightweight welcome and nothing
+// else: no sample transcript, no invented workflow. The first entry the
+// application accepts replaces it, and the whole surface is the stream.
+Item {
     id: page
     objectName: "canonicalWorkspace"
-    level: 1; padding: 18; brackets: true
-    // 1.0 at the 1920x1080 reference; every inset below scales with it.
-    readonly property real sx: Math.max(0.6, width / 1096)
-    function at(v) { return Math.round(v * sx) }
+    property int lift: 37       // the material band: fully present at the panel line
+    property int fade: 48       // where the text begins, below the band
     readonly property bool roomy: width >= 700
+    readonly property bool empty: bridge.feed.length === 0
+    readonly property color fill: Theme.space ? "#f2000812" : Theme.surfaceWorkspace
+    readonly property color edge: Theme.space ? "#b33b83c6" : Theme.border
+    readonly property int shellRadius: Theme.radius
+    readonly property int inset: roomy ? 16 : 8
 
-    // Canonical Space: a deep blue-black glass over its own local
-    // atmosphere (a static decorative plate - no text, no data). The frame
-    // takes the helper's luminous cyan edge. Dark keeps its quieter panel.
-    color: Theme.space ? "#f2000812" : Theme.surfaceWorkspace
-    border.color: Theme.space ? "#b33b83c6" : Theme.border
-
-    Column {
-        id: heading
-        anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: page.roomy ? page.at(37) : 12; topMargin: page.at(15) }
-        spacing: page.at(6)
-        Text { text: (function() { var h = new Date().getHours(); return (h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening") + ", " + bridge.operatorName + "." })()
-               color: "#f4faff"; font { family: Theme.font; pixelSize: page.roomy ? Math.max(27, page.at(33)) : 26; weight: Font.DemiBold } }
-        Text { width: parent.width; wrapMode: Text.Wrap
-               text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "Execution is disabled. Re-enable it explicitly when ready." : "Here to help you think, plan, and get things done."
-               color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : "#b8ccef"
-               font { family: Theme.font; pixelSize: page.roomy ? 18 : 16 } }
+    // -- the shell material: plain rectangles, no effects -----------------------
+    // The fill appears over the fade band, then continues as a square-topped
+    // body; the side edges fade in with it; the bottom edge and its two
+    // corners are the lower half of a frame, clipped.
+    Rectangle {
+        x: 1; y: 0; width: parent.width - 2; height: page.lift + 1
+        gradient: Gradient { GradientStop { position: 0; color: "transparent" } GradientStop { position: 1; color: page.fill } }
     }
-    Item {
-        id: flow
-        anchors { left: parent.left; right: parent.right; top: heading.bottom; bottom: choices.top
-                  leftMargin: page.roomy ? page.at(41) : 8; rightMargin: page.roomy ? page.at(33) : 8
-                  topMargin: page.at(14); bottomMargin: page.at(10) }
-        Item { id: ready; visible: bridge.feed.length === 0; width: parent.width; height: 92
-            IconBox { glyph: "◎"; width: 60; height: 60; tint: Theme.accent; round: true }
-            Column { x: 90; y: 6; width: parent.width - 90; spacing: 8
-                Text { text: "JARVIS"; color: Theme.materialBlue; font { family: Theme.font; pixelSize: 17; letterSpacing: 0.5; weight: Font.Bold } }
-                Text { width: parent.width; wrapMode: Text.Wrap; text: bridge.configRefused ? "Configuration needs attention before any work can start." : !bridge.executionEnabled ? "Standing by. No new work will start while execution is disabled." : "Waiting for your request. I’ll help you plan the next step and ask before an action needs your permission."; color: "#f3f9ff"; font { family: Theme.font; pixelSize: 18 } }
+    Rectangle {
+        x: 0; y: page.lift; width: parent.width; height: parent.height - y
+        color: page.fill; radius: page.shellRadius; topLeftRadius: 0; topRightRadius: 0
+        // Material: a faint foot, as the other glass has.
+        Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 1 } height: Math.min(parent.height * 0.3, 140); radius: parent.radius - 1
+            gradient: Gradient { GradientStop { position: 0; color: "transparent" } GradientStop { position: 1; color: Qt.rgba(0, 0, 0, 0.16) } } }
+    }
+    Repeater {
+        model: 2
+        Rectangle {
+            x: index === 0 ? 0 : page.width - 1; y: 0; width: 1; height: page.height - page.shellRadius
+            gradient: Gradient {
+                GradientStop { position: 0; color: "transparent" }
+                GradientStop { position: Math.min(0.999, page.lift / Math.max(1, page.height - page.shellRadius)); color: page.edge }
+                GradientStop { position: 1; color: page.edge }
             }
         }
+    }
+    Item {
+        x: 0; y: page.height - page.shellRadius - 1; width: page.width; height: page.shellRadius + 1; clip: true
+        Rectangle { x: 0; y: -page.shellRadius - 1; width: parent.width; height: 2 * page.shellRadius + 2; radius: page.shellRadius
+            color: "transparent"; border.width: 1; border.color: page.edge }
+    }
+
+    // -- the stream, below the fade --------------------------------------------
+    Item {
+        id: flowArea
+        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: choices.top
+                  topMargin: page.fade; leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
         FeedView {
             objectName: "conversationFeed"
-            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; top: ready.visible ? ready.bottom : parent.top; topMargin: ready.visible ? 18 : 0 }
+            anchors.fill: parent
+            visible: !page.empty
             pipelineEnabled: true
             referenceLayout: page.roomy
-            layoutScale: Math.max(0.75, Math.min(1, page.sx))
-            footer: Component { Item { width: ListView.view ? ListView.view.width : flow.width; height: bridge.feed.length === 0 ? emptyPipeline.height + 8 : 0
-                StagePipeline { id: emptyPipeline; x: Math.round(98 * Math.max(0.75, Math.min(1, page.sx))); width: parent.width - x; reference: page.roomy; visible: bridge.feed.length === 0 }
-            } }
+            layoutScale: Math.max(0.75, Math.min(1, page.width / 1231))
+        }
+        // The welcome: the greeting and one real question. It carries the
+        // truthful execution state instead when that state needs attention.
+        Column {
+            id: welcome
+            objectName: "conversationWelcome"
+            visible: page.empty
+            anchors.centerIn: parent
+            anchors.verticalCenterOffset: -Math.round(parent.height * 0.06)
+            width: Math.min(parent.width - 40, 760)
+            spacing: page.roomy ? 12 : 8
+            Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                   text: (function() { var h = new Date().getHours(); return (h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening") + ", " + bridge.operatorName + "." })()
+                   color: "#f4faff"; font { family: Theme.font; pixelSize: page.roomy ? 34 : 26; weight: Font.DemiBold } }
+            Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                   text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "Execution is disabled. Re-enable it explicitly when ready." : "What would you like to work on?"
+                   color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : "#b8ccef"
+                   font { family: Theme.font; pixelSize: page.roomy ? 22 : 17 } }
         }
     }
     Column {
         id: choices
-        anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: flow.anchors.leftMargin + 90; rightMargin: 36; bottomMargin: visible ? 18 : 0 }
+        anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: flowArea.anchors.leftMargin + 68; rightMargin: 36; bottomMargin: visible ? 18 : 0 }
         visible: !!bridge.clarification.choices && bridge.clarification.choices.length > 0
         height: visible ? implicitHeight : 0; spacing: 10
         Text { text: "CHOOSE ONE"; color: Theme.accentSoft; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
@@ -69,9 +98,11 @@ GlassPanel {
             ActionButton { label: "Never mind"; onClicked: bridge.dismissClarification() }
         }
     }
-    // The composer: 94 % of the surface, centred, the surface's bottom anchor.
-    Composer { id: composer; objectName: "canonicalComposer"; height: page.roomy ? 79 : 66
+    // The composer: the surface's bottom anchor, growing upward with a draft
+    // to the smaller of 180 px and a quarter of the surface.
+    Composer { id: composer; objectName: "canonicalComposer"
+        maxHeight: Math.min(180, Math.round(page.height * 0.25))
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                  leftMargin: page.roomy ? page.at(15) : 8; rightMargin: page.roomy ? page.at(15) : 8; bottomMargin: 10 }
+                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: 12 }
     }
 }

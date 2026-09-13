@@ -187,7 +187,7 @@ class BootstrapTests(UiTestCase):
         bridge.setAmbientEffects(False)
         bridge.setTheme("neon")  # not a theme: ignored
         saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))
-        self.assertEqual(("dark", False, 2), (saved["theme"], saved["ambient_effects"], saved["version"]))
+        self.assertEqual(("dark", False, 3), (saved["theme"], saved["ambient_effects"], saved["version"]))
         again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
         self.assertEqual("dark", again.theme)
         self.assertFalse(again.ambientEffects)
@@ -807,16 +807,19 @@ class PresentationTests(UiTestCase):
         bridge.setFocusMode(False)
         self.assertEqual(saved, self.prefs_path.read_bytes())
         self.assertEqual(command, bridge.prefs.layout())
+        # MAIN and DARK share ONE macro layout: a change made in either is
+        # the other's too, and neither touches the Command preset's own.
         self.click(root, "package_dark")
         self.assertEqual("dark", bridge.theme)
-        bridge.setPanelShare("workflow", 0.64)
-        dark = deepcopy(bridge.prefs.layout())
-        self.click(root, "package_space")
         self.assertEqual(canonical, bridge.prefs.layout())
+        bridge.setPanelShare("workflow", 0.64)
+        shared = deepcopy(bridge.prefs.layout())
+        self.click(root, "package_space")
+        self.assertEqual(shared, bridge.prefs.layout())
         bridge.setTheme("command")
         self.assertEqual(command, bridge.prefs.layout())
         bridge.setTheme("dark")
-        self.assertEqual(dark, bridge.prefs.layout())
+        self.assertEqual(shared, bridge.prefs.layout())
         self.assertEqual(bridge.prefs.data, UiPreferences(self.prefs_path).data)
 
     def test_v1_migrates_without_losing_layout_and_invalid_packages_refuse(self):
@@ -826,9 +829,16 @@ class PresentationTests(UiTestCase):
         legacy["version"] = 1
         legacy["profiles"]["normal"]["panels"]["system"]["share"] = 0.54
         migrated = validate_preferences(legacy)
-        self.assertEqual(2, migrated["version"])
+        self.assertEqual(3, migrated["version"])
         self.assertEqual(legacy["profiles"], migrated["profiles"])
         self.assertEqual({"dark", "command"}, set(migrated["packages"]))
+        # Version 2 -> 3: the conversation-first grid replaces every layout;
+        # the person's theme, effects, lamp and page survive.
+        v2 = {**canonical_preferences(), "version": 2, "theme": "dark", "ambient_effects": False, "page": "tasks"}
+        v2["profiles"]["normal"]["column_width"] = 0.32
+        moved = validate_preferences(v2)
+        self.assertEqual((3, "dark", False, "tasks"), (moved["version"], moved["theme"], moved["ambient_effects"], moved["page"]))
+        self.assertEqual(canonical_preferences()["profiles"], moved["profiles"])
         for key, value in (("profile", "foreign"), ("profiles", {})):
             bad = deepcopy(migrated)
             bad["packages"]["command"][key] = value
@@ -1008,18 +1018,20 @@ class StatusIndicatorTests(UiTestCase):
 
 
 class MacroGeometryTests(UiTestCase):
-    """The Canonical Space macro composition, normalized to the viewport.
+    """The conversation-first macro composition, normalized to the viewport.
 
-    Targets measured from the approved 1536x864 reference; the same ratios
-    must hold at every supported size. Major boundaries +-1.5 pp, the core
-    centre +-1.0 pp.
+    The approved grid at 1920x1080: a 1231 px conversation, a 386 px right
+    stack, 20 px apart, inside the frozen rail / outer margins; the
+    conversation shell alone rises to 15.6 % of the height while the stack
+    keeps the 18.98 % panel line. The same ratios hold at every supported
+    size: major boundaries +-1.5 pp, the core centre +-1.0 pp.
     """
     item = PresentationTests.item
 
     REFERENCE = {
-        "central left": 12.83, "central width": 56.70, "central right": 69.53,
-        "column gap": 0.91, "stack left": 70.44, "stack width": 27.60, "stack right": 98.05,
-        "panel start Y": 18.98, "central bottom Y": 95.14, "stack bottom Y": 92.13,
+        "central left": 12.81, "central width": 64.11, "central right": 76.93,
+        "column gap": 1.04, "stack left": 77.97, "stack width": 20.10, "stack right": 98.07,
+        "shell top Y": 15.56, "panel start Y": 18.98, "central bottom Y": 95.14, "stack bottom Y": 92.13,
         "core centre X": 48.96, "core centre Y": 7.99,
     }
 
@@ -1047,7 +1059,8 @@ class MacroGeometryTests(UiTestCase):
                 "stack left": 100 * stack[0] / width,
                 "stack width": 100 * (stack[2] - stack[0]) / width,
                 "stack right": 100 * stack[2] / width,
-                "panel start Y": 100 * work[1] / height,
+                "shell top Y": 100 * work[1] / height,
+                "panel start Y": 100 * stack[1] / height,
                 "central bottom Y": 100 * work[3] / height,
                 "stack bottom Y": 100 * stack[3] / height,
                 "core centre X": 100 * (core[0] + core[2]) / 2 / width,
@@ -1065,6 +1078,34 @@ class MacroGeometryTests(UiTestCase):
                 self.assertLessEqual(work[3], height)
                 self.assertGreater(work[2] - work[0], stack[2] - stack[0],
                                    "the central work surface must dominate the right stack")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_main_and_dark_share_one_macro_layout(self) -> None:
+        """Switching between MAIN and DARK never moves the conversation, the
+        stack or the composer, at any size; the persisted layout is one."""
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.load(bridge)
+        root.showNormal()
+
+        def boxes():
+            out = []
+            for name in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "conversationFeed"):
+                it = self.item(root, name)
+                a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+                out.append(tuple(round(v, 1) for v in (a.x(), a.y(), b.x(), b.y())))
+            return out
+
+        for width, height in ((1920, 1080), (1280, 760)):
+            root.resize(width, height)
+            bridge.setTheme("space"); pump(760)
+            main = boxes()
+            bridge.setTheme("dark"); pump(760)
+            with self.subTest(size=(width, height)):
+                self.assertEqual(main, boxes())
+        bridge.setColumnWidth(0.30)
+        bridge.setTheme("space")
+        self.assertEqual(0.30, bridge.columnWidth)
         self.assertEqual(0, self.execute_calls())
 
     def test_command_preset_keeps_its_own_outer_geometry(self) -> None:
@@ -1306,14 +1347,14 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertTrue(self.item(root, "summaryRail").isVisible())
         self.assertEqual(0, self.execute_calls())
 
-    def test_conversation_surface_holds_the_reference_proportions(self) -> None:
-        """Phase 3.2: inside the fixed Phase 1 bounds the conversation takes the
-        approved helper's measured proportions - composer 94 % of the surface
-        and centred, the avatar column centred at 8.2 %, and the reference
-        layout at both desktop sizes."""
-        bridge = self.bridge()
+    def test_conversation_surface_is_conversation_first(self) -> None:
+        """The composer rests at 52 px, centred and nearly the full surface; the
+        text begins below the shell's fade band; JARVIS and system turns sit
+        on the left, the operator's on the right inside the reserved
+        scrollbar strip."""
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
         root = self.window(bridge)
-        for width, height in ((1920, 1080), (1536, 864)):
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
             root.resize(width, height)
             pump(700)
             work = self.box(root, "canonicalWorkspace"); composer = self.box(root, "canonicalComposer")
@@ -1321,11 +1362,103 @@ class ConversationSurfaceTests(UiTestCase):
             surface = work[2] - work[0]
             with self.subTest(size=(width, height)):
                 self.assertTrue(self.item(root, "conversationFeed").property("referenceLayout"))
-                self.assertAlmostEqual(94.0, 100 * (composer[2] - composer[0]) / surface, delta=1.0)
+                self.assertAlmostEqual(52, composer[3] - composer[1], delta=0.5)
+                self.assertGreaterEqual(100 * (composer[2] - composer[0]) / surface, 90)
                 self.assertAlmostEqual(composer[0] - work[0], work[2] - composer[2], delta=2.0)
-                avatar_centre = feed[0] + self.item(root, "conversationFeed").property("avatarSize") / 2
-                self.assertAlmostEqual(8.2, 100 * (avatar_centre - work[0]) / surface, delta=1.0)
                 self.assertLessEqual(composer[3], work[3])
+                self.assertGreaterEqual(feed[1], height * 0.2 - 1)
+        root.resize(1920, 1080); pump(400)
+        self.assertTrue(self.item(root, "conversationWelcome").isVisible())
+        bridge.submitText("Bu projeyi incele."); pump(500)
+        feed = self.box(root, "conversationFeed")
+        user = self.box(root, "feedCard_user"); system = self.box(root, "feedCard_system")
+        messageX = self.item(root, "conversationFeed").property("messageX")
+        self.assertAlmostEqual(feed[2] - 16, user[2], delta=1.5, msg="the operator's bubble is right-aligned")
+        self.assertGreater(user[0], feed[0] + (feed[2] - feed[0]) * 0.3)
+        self.assertAlmostEqual(feed[0] + messageX, system[0], delta=1.5, msg="assistant-side turns stay on the left")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_empty_state_welcome_gives_way_to_the_first_accepted_turn(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
+        root = self.window(bridge)
+        composer = self.item(root, "canonicalComposer")
+        welcome = self.item(root, "conversationWelcome"); feed = self.item(root, "conversationFeed")
+        self.assertTrue(welcome.isVisible()); self.assertFalse(feed.isVisible())
+        # Nothing invented for the empty surface: no sample transcript, no stage list.
+        inside = self.texts(self.item(root, "canonicalWorkspace"), [])
+        self.assertNotIn("Understanding your request", inside)
+        self.assertNotIn("Waiting for your request. I’ll help you plan the next step and ask before an action needs your permission.", inside)
+        # Typing alone keeps the welcome.
+        composer.setProperty("text", "Bu projeyi incele."); pump(200)
+        self.assertTrue(welcome.isVisible())
+        # The first accepted turn replaces it; the draft is cleared only then.
+        QMetaObject.invokeMethod(composer, "submit"); pump(400)
+        self.assertEqual("", composer.property("text"))
+        self.assertFalse(welcome.isVisible()); self.assertTrue(feed.isVisible())
+        self.assertEqual("user", bridge.feed[0]["kind"])
+        # A refused submission (an approval is pending) keeps the draft.
+        self.assertTrue(bridge.approvalPending)
+        composer.setProperty("text", "kept"); pump(100)
+        QMetaObject.invokeMethod(composer, "submit"); pump(100)
+        self.assertEqual("kept", composer.property("text"))
+        self.assertFalse(bridge.submitText("kept"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_composer_grows_upward_to_its_cap_and_collapses(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(600)
+        composer = self.item(root, "canonicalComposer")
+        rest = self.box(root, "canonicalComposer")
+        self.assertAlmostEqual(52, rest[3] - rest[1], delta=0.5)
+        composer.setProperty("text", "\n".join(["one line of a draft"] * 3)); pump(400)
+        grown = self.box(root, "canonicalComposer")
+        self.assertGreater(grown[3] - grown[1], 60)
+        self.assertAlmostEqual(rest[3], grown[3], delta=0.5, msg="the bottom edge stays anchored; growth is upward")
+        composer.setProperty("text", "\n".join(["line"] * 20)); pump(400)
+        capped = self.box(root, "canonicalComposer")
+        cap = min(180, round(self.item(root, "canonicalWorkspace").height() * 0.25))
+        self.assertAlmostEqual(cap, capped[3] - capped[1], delta=1)
+        self.assertGreater(composer.property("inputHeight"), capped[3] - capped[1], "beyond the cap the draft scrolls inside")
+        composer.setProperty("text", ""); pump(400)
+        back = self.box(root, "canonicalComposer")
+        self.assertAlmostEqual(52, back[3] - back[1], delta=0.5)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_conversation_scrolling_keeps_the_reading_position(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(600)
+        feed = self.item(root, "conversationFeed"); bar = self.item(root, "feedScrollBar")
+        bridge._say("user", "first"); pump(200)
+        self.assertFalse(feed.property("overflow")); self.assertFalse(bar.isVisible())
+        for i in range(40):
+            bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height at this width.")
+        pump(600)
+        end = feed.property("contentHeight") - feed.property("viewportHeight")
+        self.assertGreater(end, 300)
+        self.assertTrue(feed.property("overflow")); self.assertTrue(bar.isVisible())
+        self.assertAlmostEqual(end, feed.property("contentY"), delta=1, msg="a reader at the end follows new entries")
+        thumb = self.item(root, "feedScrollThumb")
+        self.assertAlmostEqual(bar.height() * feed.property("viewportHeight") / feed.property("contentHeight"), thumb.height(), delta=1.5)
+        self.assertAlmostEqual(bar.height() - thumb.height(), thumb.y(), delta=1.5, msg="the thumb reaches the end of its travel")
+        # Reading older content: new entries and composer growth leave the position alone.
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 120.0)); pump(200)
+        self.assertFalse(feed.property("followEnd"))
+        bridge._say("jarvis", "arrives while reading"); pump(400)
+        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
+        composer = self.item(root, "canonicalComposer")
+        composer.setProperty("text", "\n".join(["draft"] * 5)); pump(400)
+        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
+        composer.setProperty("text", ""); pump(400)
+        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
+        self.assertAlmostEqual(0, thumb.y(), delta=bar.height() * 0.1)
+        # Back at the end, following resumes.
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 1e9)); pump(200)
+        self.assertTrue(feed.property("followEnd"))
+        bridge._say("user", "and one more"); pump(400)
+        end = feed.property("contentHeight") - feed.property("viewportHeight")
+        self.assertAlmostEqual(end, feed.property("contentY"), delta=1)
         self.assertEqual(0, self.execute_calls())
 
     def test_peek_opens_anchored_switches_and_closes_every_way(self) -> None:

@@ -48,8 +48,14 @@ QtObject {
     // so nothing here is consumed on that path.
     readonly property real macroRail: 0.1283           // ambient rail width = central surface left edge
     readonly property real macroStackRight: 0.9805     // right stack right edge
-    readonly property real macroGap: 0.0091            // column gap
+    readonly property real macroGap: 0.0104            // column gap (20 px at 1920)
     readonly property real macroTopZone: 0.1898        // identity / core zone height = panels begin
+    // The conversation shell rises above that line into the header
+    // environment: its material starts at 0.1556 of the height and is fully
+    // present by 0.2000, where the text begins (168 / 216 px at 1080). The
+    // right stack keeps the panel line; nothing else moves.
+    readonly property real macroShellTop: 0.1556
+    readonly property real macroShellText: 0.2000
     readonly property real macroCentralBottom: 0.9514  // central surface bottom
     readonly property real macroStackBottom: 0.9213    // right stack bottom
     readonly property real macroStackGap: 0.030        // gap between stacked panels, of stack height
@@ -72,6 +78,8 @@ QtObject {
     function chipWidth(w) { return px(w * macroChip, 188, 300) }
     function stripSpacing(w) { return px(w * 0.0073, 8, 16) }
     function hudLine(h) { return px(h * macroHudLine, 132, 218) }
+    function shellLift(h) { return px(h * (macroTopZone - macroShellTop), 20, 44) }
+    function shellFade(h) { return px(h * (macroShellText - macroShellTop), 26, 56) }
 
     // -- command strip (Option 5 "Command") -------------------------------
     // Element heights are part of the frozen control language, so they are

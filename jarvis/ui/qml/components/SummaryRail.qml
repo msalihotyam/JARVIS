@@ -70,17 +70,17 @@ Item {
     readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
     readonly property string sessionsWord: bridge.sessions.length + (bridge.sessions.length === 1 ? " session" : " sessions")
     readonly property var modules: [
-        { key: "Tasks", page: "tasks", tone: "#1b7fe0", well: "#01417e", count: "#49b6ff", icon: "tasks",
+        { key: "Tasks", page: "tasks", icon: "tasks",
           line: (bridge.taskLive ? 1 : 0) + " active",
           note: rail.roomy ? rail.sessionsWord + " · " + rail.taskTotal + (rail.taskTotal === 1 ? " task" : " tasks") : rail.sessionsWord },
-        { key: "Updates", page: "history", tone: "#0f9e7e", well: "#015e4f", count: "#35d5a6", icon: "updates",
+        { key: "Updates", page: "history", icon: "updates",
           line: bridge.activity.length + " recent",
           note: rail.attention > 0 ? rail.attention + (rail.roomy ? (rail.attention === 1 ? " needs attention" : " need attention") : " to review") : "All clear" },
-        { key: "Focus", page: "memory", tone: "#b7801e", well: "#523a03", count: "#f2b94c", icon: "focus",
+        { key: "Focus", page: "memory", icon: "focus",
           line: bridge.projects.length + (bridge.projects.length === 1 ? " project" : " projects"),
           note: bridge.projects.length ? (rail.roomy ? "Active in memory" : "In memory")
                                        : (rail.roomy ? "No focus context yet" : rail.width < 180 ? "No context" : "No context yet") },
-        { key: "Plan", page: "automations", tone: "#7040c4", well: "#481e82", count: "#b89dff", icon: "plan",
+        { key: "Plan", page: "automations", icon: "plan",
           line: rail.enabledJobs.length + (rail.tight ? (rail.enabledJobs.length === 1 ? " job" : " jobs") : " scheduled"),
           note: rail.nextJob ? "Next " + rail.dueShort(rail.nextJob.next_due_at_utc)
                              : (rail.liveJobs.length ? (rail.roomy ? "Nothing enabled" : "None enabled") : (rail.roomy ? "Nothing scheduled" : "None yet")) }
@@ -173,22 +173,25 @@ Item {
                     }
                 }
 
-                // Icon tile: a solid tinted instrument with a drawn line icon.
+                // Icon tile: one cool-blue family for every module - a deep navy
+                // housing, a blue-cyan rim, a blue-white line icon. The modules keep
+                // their meanings and glyphs; no per-module branding colour.
                 Rectangle {
                     id: tile
                     x: rail.tight ? 9 : 13; anchors.verticalCenter: parent.verticalCenter
                     width: rail.tight ? 34 : rail.roomy ? 50 : 40; height: width; radius: rail.tight ? 9 : 13
                     gradient: Gradient {
-                        GradientStop { position: 0; color: Qt.lighter(modelData.well, 2.05) }
-                        GradientStop { position: 1; color: Qt.lighter(modelData.well, 1.2) }
+                        GradientStop { position: 0; color: card.active || card.hovered ? "#1a5f9e" : "#144f86" }
+                        GradientStop { position: 1; color: "#0a2a4c" }
                     }
-                    border.width: 1; border.color: Theme.alpha(Qt.lighter(modelData.well, 3.2), 0.55)
-                    // Soft tinted glow from the static sprite (one 80 px frame per module).
+                    border.width: 1; border.color: Theme.alpha("#37c4f0", card.active || card.hovered ? 0.8 : 0.55)
+                    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+                    // Soft blue glow from the static sprite's blue frame.
                     Image {
                         z: -1; anchors.centerIn: parent
                         width: 80 * tile.width / 44; height: width
                         source: "../assets/icon-well-glow.png"
-                        sourceClipRect: Qt.rect(index * 80, 0, 80, 80)
+                        sourceClipRect: Qt.rect(0, 0, 80, 80)
                         opacity: card.active || card.hovered ? 1 : 0.8
                     }
                     // Glossy upper half and a crisp top light.
@@ -198,7 +201,7 @@ Item {
                         gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.2) } GradientStop { position: 1; color: Qt.rgba(1, 1, 1, 0.02) } }
                     }
                     Rectangle { x: 7; y: 1; width: parent.width - 14; height: 1; color: Qt.rgba(1, 1, 1, 0.38) }
-                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#f4fbff"; scale: tile.width / 42 * 1.42 }
+                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#b8e7ff"; scale: tile.width / 42 * 1.42 }
                 }
 
                 Column {
@@ -209,7 +212,7 @@ Item {
                     spacing: rail.showNote ? 5 : 0
                     Text { width: parent.width; elide: Text.ElideRight; text: modelData.key; color: "#fafeff"
                            font { family: Theme.font; pixelSize: rail.roomy ? 18 : 15; weight: Font.DemiBold } }
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.line; color: modelData.count
+                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.line; color: "#37c4f0"
                            font { family: Theme.font; pixelSize: rail.roomy ? 15 : 13; weight: Font.DemiBold } }
                     Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: "#b3d2f0"
                            font { family: Theme.font; pixelSize: rail.roomy ? 13 : 12 } }

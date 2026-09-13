@@ -1,41 +1,45 @@
 import QtQuick
-import QtQuick.Controls.Basic
 import "../theme"
 
-// The conversation / task stream: an avatar column (the operator's initial
-// on a glossy disc / the JARVIS ring / a state marker), a name + time line,
-// then the body. Requests sit in a compact bounded glass block; JARVIS
-// answers sit on a lighter, quieter glass surface under their label;
-// system, error, unknown and approval entries carry their own colour. Long
-// content stays readable and selectable.
+// The conversation stream. JARVIS answers sit on the LEFT: the luminous ring
+// avatar, the name, the answer on its quieter glass surface, the time
+// beneath. The operator's turns sit on the RIGHT in bounded deep-navy
+// technical bubbles, the time beneath. System, error, unknown and approval
+// entries stay on the left in their own colour. Long content stays readable
+// and selectable; nothing is invented for the stream.
 //
-// `referenceLayout` (the Canonical Command Center) takes the approved
-// conversation helper's proportions: a 60 px avatar column, content at the
-// helper's inset, the request at ~69 % of the flow and answers to its right
-// edge. Without it (the Command preset) the earlier proportions hold.
-ListView {
+// Scrolling is a Flickable over one Column: every entry is laid out, so the
+// content height, the thumb size and the thumb travel are exact (a ListView
+// estimates them from the few delegates it has and drifts). Reading
+// position is the reader's: following the end is what happens while they
+// are at the end; once they scroll up to read older messages, a new entry,
+// a composer resize or any relayout leaves them exactly where they are.
+//
+// The scrollbar is transient: invisible at rest, shown at once on any
+// scroll, 2 px while scrolling and 3 px under the pointer or in a drag, held
+// one second after the last interaction and faded in 200 ms. Its 16 px
+// interaction strip is always reserved, so messages never shift when it
+// appears; no overflow, no scrollbar.
+Item {
     id: feed
-    model: bridge.feed
-    spacing: referenceLayout ? 20 : 18
     property bool pipelineEnabled: false
     property bool referenceLayout: false
-    // The avatar column scales with the surface, so its proportions hold at
-    // every reference size (1.0 at 1920x1080).
+    // The avatar column scales with the surface (1.0 at the 1920x1080 grid).
     property real layoutScale: 1
-    readonly property int avatarSize: referenceLayout ? Math.round(60 * layoutScale) : 50
-    readonly property int messageX: referenceLayout ? Math.round(90 * layoutScale) : 68
+    readonly property int avatarSize: referenceLayout ? Math.round(52 * layoutScale) : 50
+    readonly property int messageX: referenceLayout ? avatarSize + Math.round(16 * layoutScale) : 68
+    readonly property int strip: 16
     readonly property int pipelineIndex: {
         var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
         return first < 0 ? bridge.feed.length - 1 : first
     }
-    clip: true
-    boundsBehavior: Flickable.StopAtBounds
-    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-    property bool followEnd: true
-    onMovementEnded: followEnd = atYEnd
-    onCountChanged: { followEnd = true; Qt.callLater(function() { feed.positionViewAtEnd() }) }
-    onContentHeightChanged: if (followEnd && !moving) Qt.callLater(function() { feed.positionViewAtEnd() })
-    onHeightChanged: if (followEnd && !moving) Qt.callLater(function() { feed.positionViewAtEnd() })
+    // For inspection: the scroll state.
+    readonly property alias contentY: flick.contentY
+    readonly property alias contentHeight: flick.contentHeight
+    readonly property alias viewportHeight: flick.height
+    property alias followEnd: flick.followEnd
+    readonly property bool overflow: flick.contentHeight > flick.height + 1
+    function scrollTo(y) { flick.contentY = Math.max(0, Math.min(flick.endY, y)) }
 
     function railColor(kind) {
         switch (kind) {
@@ -64,149 +68,243 @@ ListView {
         }
     }
 
-    delegate: Item {
-        id: row
-        width: feed.width
-        height: Math.max(avatar.height, card.height) + (pipelineLoader.active ? pipelineLoader.height + pipelineLoader.gap : 0)
-        Loader {
-            id: pipelineLoader
-            readonly property int gap: feed.referenceLayout ? 13 : 22
-            x: feed.referenceLayout ? card.x + 8 : 68
-            y: Math.max(avatar.height, card.height) + gap; width: parent.width - x
-            active: feed.pipelineEnabled && index === feed.pipelineIndex
-            sourceComponent: Component { StagePipeline { notes: false; reference: feed.referenceLayout } }
+    Flickable {
+        id: flick
+        anchors.fill: parent
+        clip: true
+        contentWidth: width
+        contentHeight: stack.height
+        flickableDirection: Flickable.VerticalFlick
+        boundsBehavior: Flickable.StopAtBounds
+        maximumFlickVelocity: 2600
+        readonly property real endY: Math.max(0, contentHeight - height)
+        // True while the reader is at the end; updated from every change the
+        // reader makes (wheel, flick, drag, thumb), never from our own settling.
+        property bool followEnd: true
+        property bool settling: false
+        function remember() { followEnd = contentY >= endY - 6 }
+        onContentYChanged: if (!settling) remember()
+        // Content grew or the viewport changed: keep the end if the reader
+        // was there, otherwise leave the reading position exactly as it is
+        // (only pulling back inside the range when the range shrank).
+        function settle() {
+            settling = true
+            if (followEnd) contentY = endY
+            else if (contentY > endY) contentY = endY
+            settling = false
         }
-        readonly property string kind: modelData.kind
-        readonly property bool isUser: kind === "user"
-        readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
-        readonly property bool loud: kind === "error" || kind === "unknown" || kind === "approval"
-        readonly property bool boxed: isUser || loud
-        readonly property color tone: feed.railColor(kind)
-        // Appearance: fade + short slide, no bounce.
-        opacity: 0
-        transform: Translate { id: slide; y: 8 }
-        Component.onCompleted: { appear.start() }
-        ParallelAnimation {
-            id: appear
-            NumberAnimation { target: row; property: "opacity"; to: 1; duration: Theme.panelIn; easing.type: Easing.OutCubic }
-            NumberAnimation { target: slide; property: "y"; to: 0; duration: Theme.panelIn; easing.type: Easing.OutCubic }
-        }
+        onContentHeightChanged: Qt.callLater(settle)
+        onHeightChanged: Qt.callLater(settle)
+        Component.onCompleted: Qt.callLater(settle)
 
-        // -- avatar column ---------------------------------------------------
-        Item {
-            id: avatar
-            width: feed.avatarSize; height: width
-            readonly property real k: width / 60
-            // You: the operator's initial on a glossy blue sphere with a soft glow.
-            Rectangle { visible: row.isUser; anchors.centerIn: parent; width: 78 * avatar.k; height: width; radius: width / 2; color: "#2d7fd0"; opacity: 0.16 }
-            Rectangle {
-                visible: row.isUser
-                anchors.fill: parent; radius: width / 2
-                gradient: Gradient { GradientStop { position: 0; color: "#3a86c8" } GradientStop { position: 0.55; color: "#1c5796" } GradientStop { position: 1; color: "#0e3564" } }
-                border.width: 1; border.color: "#b36fb6e8"
-                Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 2 } height: parent.height * 0.46; radius: height
-                    gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.16) } GradientStop { position: 1; color: "transparent" } } }
-                Text { anchors.centerIn: parent; text: bridge.operatorName.charAt(0).toUpperCase(); color: "#f6fbff"; font { family: Theme.font; pixelSize: Math.round(23 * avatar.k); weight: Font.DemiBold } }
-            }
-            // JARVIS: the luminous ring - a thick bright cyan ring on a dark
-            // centre, a soft bloom and a thin calibration ring with nodes.
-            Item {
-                visible: row.isJarvis
-                anchors.fill: parent
-                Rectangle { anchors.centerIn: parent; width: 88 * avatar.k; height: width; radius: width / 2; color: Theme.accent; opacity: 0.12 }
-                Rectangle { anchors.centerIn: parent; width: 73 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#662fc6ee" }
-                Repeater { model: 4
-                    Rectangle { width: 3; height: 3; radius: 1.5; color: "#7fdcf5"
-                        x: avatar.width / 2 + 36.5 * avatar.k * Math.cos((index * 90 + 45) * Math.PI / 180) - 1.5
-                        y: avatar.height / 2 + 36.5 * avatar.k * Math.sin((index * 90 + 45) * Math.PI / 180) - 1.5 } }
-                Rectangle { anchors.centerIn: parent; width: 66 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 12 * avatar.k; border.color: Theme.accent; opacity: 0.22 }
-                Rectangle { anchors.centerIn: parent; width: 56 * avatar.k; height: width; radius: width / 2; color: "#000812"; border.width: Math.max(3, 6.5 * avatar.k); border.color: Theme.materialBlue }
-                Rectangle { anchors.centerIn: parent; width: 43 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: "#b09ff0ff" }
-                Rectangle { anchors.centerIn: parent; width: 38 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 4; border.color: "#2620c9f3" }
-            }
-            // Everything else: a state marker on the rail.
-            Rectangle {
-                visible: !row.isUser && !row.isJarvis
-                anchors.centerIn: parent; width: 30; height: 30; radius: 15
-                color: Theme.alpha(row.tone, 0.12); border.width: 1; border.color: Theme.alpha(row.tone, 0.5)
-                Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: row.tone }
-            }
-        }
+        Column {
+            id: stack
+            width: flick.width - feed.strip
+            spacing: feed.referenceLayout ? 18 : 16
+            Repeater {
+                model: bridge.feed
+                delegate: Item {
+                    id: row
+                    objectName: "feedRow_" + kind
+                    width: stack.width
+                    height: Math.max(row.isUser ? 0 : avatar.height, card.height + stamp.height + stamp.gap)
+                            + (pipelineLoader.active ? pipelineLoader.height + pipelineLoader.gap : 0)
+                    readonly property string kind: modelData.kind
+                    readonly property bool isUser: kind === "user"
+                    readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
+                    readonly property bool loud: kind === "error" || kind === "unknown" || kind === "approval"
+                    readonly property color tone: feed.railColor(kind)
+                    // Appearance: fade + short slide, no bounce.
+                    opacity: 0
+                    transform: Translate { id: slide; y: 8 }
+                    Component.onCompleted: appear.start()
+                    ParallelAnimation {
+                        id: appear
+                        NumberAnimation { target: row; property: "opacity"; to: 1; duration: Theme.panelIn; easing.type: Easing.OutCubic }
+                        NumberAnimation { target: slide; property: "y"; to: 0; duration: Theme.panelIn; easing.type: Easing.OutCubic }
+                    }
+                    // The existing four-stage lifecycle rides with the first JARVIS
+                    // turn (or the last entry before one): real state, never a plan.
+                    Loader {
+                        id: pipelineLoader
+                        readonly property int gap: feed.referenceLayout ? 12 : 22
+                        x: row.isUser ? 0 : card.x
+                        y: Math.max(row.isUser ? 0 : avatar.height, card.height + stamp.height + stamp.gap) + gap
+                        width: parent.width - x
+                        active: feed.pipelineEnabled && index === feed.pipelineIndex
+                        sourceComponent: Component { StagePipeline { notes: false; reference: feed.referenceLayout } }
+                    }
 
-        // -- body --------------------------------------------------------------
-        Rectangle {
-            id: card
-            x: feed.messageX
-            readonly property real pad: feed.referenceLayout ? 20 : 21
-            width: row.boxed
-                   ? (feed.referenceLayout ? Math.min(row.width - x, Math.max(360, row.width * 0.694))
-                                           : Math.min(row.width - x - 4, 625, Math.max(360, (row.width - x) * 0.66)))
-                   : row.width - x - (feed.referenceLayout ? 0 : 4)
-            readonly property real textWidth: row.boxed ? width - 2 * pad : (feed.referenceLayout ? width : Math.min(width - 4, 760))
-            height: body.height + (row.boxed ? (feed.referenceLayout ? 31 : 34) : 4)
-            radius: 12
-            // The request: a compact, clearly bounded deep-navy glass block
-            // with a thin cyan perimeter and a top highlight.
-            color: row.loud ? Theme.alpha(row.tone, 0.07) : "transparent"
-            gradient: row.isUser ? requestGlass : null
-            Gradient { id: requestGlass
-                GradientStop { position: 0; color: "#f0001a2e" }
-                GradientStop { position: 1; color: "#e8001322" } }
-            border.width: row.boxed ? 1 : 0
-            border.color: row.isUser ? "#327bb5" : Theme.alpha(row.isJarvis ? Theme.materialBlue : row.tone, 0.45)
-            Rectangle { visible: row.isUser; x: 14; y: 1; width: parent.width - 28; height: 1; color: "#5a6fd2f5" }
-            Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.45, 34); radius: 11
-                gradient: Gradient { GradientStop { position: 0; color: "#0f4fc3ff" } GradientStop { position: 1; color: "transparent" } } }
-            Column {
-                id: body
-                x: row.boxed ? card.pad : 0; y: row.boxed ? (feed.referenceLayout ? 15 : 16) : 2
-                width: card.textWidth
-                spacing: row.isJarvis && feed.referenceLayout ? 4 : (feed.referenceLayout ? 7 : 9)
-                Row {
-                    leftPadding: row.isJarvis && feed.referenceLayout ? 12 : 0
-                    spacing: 16
-                    // Labels outside a bubble can sit over the planet's bright
-                    // horizon: a soft dark outline keeps them legible anywhere.
-                    Text { text: feed.kindLabel(row.kind)
-                        style: row.isUser ? Text.Normal : Text.Outline; styleColor: "#b3000812"
-                        color: row.isUser ? "#f5faff" : row.isJarvis ? Theme.materialBlue : row.tone
-                        font { family: Theme.font; pixelSize: row.isUser ? (feed.referenceLayout ? 17 : 16) : row.isJarvis ? (feed.referenceLayout ? 18 : 17) : 10
-                               weight: row.isJarvis ? Font.Bold : Font.DemiBold
-                               letterSpacing: row.isUser ? 0.2 : (row.isJarvis ? 0.6 : 2.2) } }
-                    Text { anchors.baseline: parent.children[0].baseline; text: modelData.time; color: "#aac1e2"
-                           style: row.isUser ? Text.Normal : Text.Outline; styleColor: "#b3000812"
-                           font { family: Theme.font; pixelSize: feed.referenceLayout ? 16 : 15 } }
-                }
-                Item {
-                    width: parent.width
-                    height: message.height + (row.isJarvis ? (feed.referenceLayout ? 27 : 24) : 0)
-                    // JARVIS: a lighter, quieter glass surface under the answer.
-                    Rectangle {
-                        visible: row.isJarvis
-                        anchors.fill: parent; radius: 12
-                        gradient: Gradient {
-                            GradientStop { position: 0; color: "#c8001729" }
-                            GradientStop { position: 1; color: "#b0001120" }
+                    // -- avatar column (JARVIS and the state markers; not the operator) --
+                    Item {
+                        id: avatar
+                        visible: !row.isUser
+                        width: feed.avatarSize; height: width
+                        readonly property real k: width / 60
+                        // JARVIS: the luminous ring - a thick bright cyan ring on a dark
+                        // centre, a soft bloom and a thin calibration ring with nodes.
+                        Item {
+                            visible: row.isJarvis
+                            anchors.fill: parent
+                            Rectangle { anchors.centerIn: parent; width: 88 * avatar.k; height: width; radius: width / 2; color: Theme.accent; opacity: 0.12 }
+                            Rectangle { anchors.centerIn: parent; width: 73 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#662fc6ee" }
+                            Repeater { model: 4
+                                Rectangle { width: 3; height: 3; radius: 1.5; color: "#7fdcf5"
+                                    x: avatar.width / 2 + 36.5 * avatar.k * Math.cos((index * 90 + 45) * Math.PI / 180) - 1.5
+                                    y: avatar.height / 2 + 36.5 * avatar.k * Math.sin((index * 90 + 45) * Math.PI / 180) - 1.5 } }
+                            Rectangle { anchors.centerIn: parent; width: 66 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 12 * avatar.k; border.color: Theme.accent; opacity: 0.22 }
+                            Rectangle { anchors.centerIn: parent; width: 56 * avatar.k; height: width; radius: width / 2; color: "#000812"; border.width: Math.max(3, 6.5 * avatar.k); border.color: Theme.materialBlue }
+                            Rectangle { anchors.centerIn: parent; width: 43 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: "#b09ff0ff" }
+                            Rectangle { anchors.centerIn: parent; width: 38 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 4; border.color: "#2620c9f3" }
                         }
-                        border.width: 1; border.color: "#1f4a68"
-                        Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#2e6fd2f5" }
+                        // Everything else: a state marker on the rail.
+                        Rectangle {
+                            visible: !row.isJarvis
+                            anchors.centerIn: parent; width: 30; height: 30; radius: 15
+                            color: Theme.alpha(row.tone, 0.12); border.width: 1; border.color: Theme.alpha(row.tone, 0.5)
+                            Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: row.tone }
+                        }
                     }
-                    TextEdit {
-                        id: message
-                        x: row.isJarvis ? (feed.referenceLayout ? 18 : 18) : 0
-                        y: row.isJarvis ? (feed.referenceLayout ? 13 : 12) : 0
-                        width: feed.referenceLayout ? Math.min(parent.width - 2 * x, row.isJarvis ? 640 : 600) : parent.width - 2 * x
-                        text: modelData.text
-                        readOnly: true
-                        selectByMouse: true
-                        wrapMode: Text.Wrap
-                        color: row.kind === "system" ? Theme.textMuted : "#f7fcff"
-                        selectionColor: Theme.accentSoft
-                        font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : (feed.referenceLayout ? 20 : 17) }
-                        textFormat: TextEdit.PlainText
+
+                    // The operator's bubble is content-sized: measured unwrapped here,
+                    // bounded to the right part of the stream.
+                    Text { id: probe; visible: false; text: modelData.text; font: message.font }
+
+                    // -- body --------------------------------------------------------------
+                    Rectangle {
+                        id: card
+                        objectName: "feedCard_" + row.kind
+                        readonly property real pad: feed.referenceLayout ? 18 : 20
+                        readonly property real maxUser: Math.min(720, Math.max(280, row.width * 0.62))
+                        x: row.isUser ? row.width - width : feed.messageX
+                        width: row.isUser ? Math.min(maxUser, Math.ceil(probe.implicitWidth) + 2 * pad + 2)
+                             : row.loud ? Math.min(row.width - x, Math.max(360, row.width * 0.694))
+                             : row.width - x
+                        readonly property real textWidth: (row.isUser || row.loud) ? width - 2 * pad : width
+                        height: body.height + (row.isUser ? 2 * (feed.referenceLayout ? 13 : 14) : row.loud ? (feed.referenceLayout ? 31 : 34) : 4)
+                        radius: 12
+                        // The request: a compact, clearly bounded deep-navy technical
+                        // block with a thin cool-blue perimeter and a top highlight.
+                        color: row.loud ? Theme.alpha(row.tone, 0.07) : "transparent"
+                        gradient: row.isUser ? requestGlass : null
+                        Gradient { id: requestGlass
+                            GradientStop { position: 0; color: "#f0001a2e" }
+                            GradientStop { position: 1; color: "#e8001322" } }
+                        border.width: row.isUser || row.loud ? 1 : 0
+                        border.color: row.isUser ? "#327bb5" : Theme.alpha(row.tone, 0.45)
+                        Rectangle { visible: row.isUser; x: 14; y: 1; width: parent.width - 28; height: 1; color: "#5a6fd2f5" }
+                        Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.45, 34); radius: 11
+                            gradient: Gradient { GradientStop { position: 0; color: "#0f4fc3ff" } GradientStop { position: 1; color: "transparent" } } }
+                        Column {
+                            id: body
+                            x: row.isUser || row.loud ? card.pad : 0
+                            y: row.isUser ? (feed.referenceLayout ? 13 : 14) : row.loud ? (feed.referenceLayout ? 15 : 16) : 2
+                            width: card.textWidth
+                            spacing: row.isJarvis ? 0 : (feed.referenceLayout ? 7 : 9)
+                            // The label line: JARVIS carries its name inside its surface;
+                            // the operator's bubble needs none; the rest are labelled.
+                            Text { visible: row.loud || row.kind === "system" || row.kind === "scheduled" || row.kind === "data"
+                                   text: feed.kindLabel(row.kind)
+                                   style: Text.Outline; styleColor: "#b3000812"
+                                   color: row.tone
+                                   font { family: Theme.font; pixelSize: 10; weight: Font.DemiBold; letterSpacing: 2.2 } }
+                            Item {
+                                width: parent.width
+                                height: message.y + message.height + (row.isJarvis ? (feed.referenceLayout ? 13 : 12) : 0)
+                                // JARVIS: a lighter, quieter glass surface under the answer.
+                                Rectangle {
+                                    visible: row.isJarvis
+                                    anchors.fill: parent; radius: 12
+                                    gradient: Gradient {
+                                        GradientStop { position: 0; color: "#c8001729" }
+                                        GradientStop { position: 1; color: "#b0001120" }
+                                    }
+                                    border.width: 1; border.color: "#1f4a68"
+                                    Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#2e6fd2f5" }
+                                }
+                                Text { id: name; visible: row.isJarvis; x: 18; y: 11; text: feed.kindLabel(row.kind); color: Theme.materialBlue
+                                       font { family: Theme.font; pixelSize: feed.referenceLayout ? 13 : 12; weight: Font.Bold; letterSpacing: 1.4 } }
+                                TextEdit {
+                                    id: message
+                                    x: row.isJarvis ? 18 : 0
+                                    y: row.isJarvis ? name.y + name.height + 6 : 0
+                                    width: row.isJarvis ? Math.min(parent.width - 2 * x, 760) : parent.width
+                                    text: modelData.text
+                                    readOnly: true
+                                    selectByMouse: true
+                                    wrapMode: Text.Wrap
+                                    color: row.kind === "system" ? Theme.textMuted : "#f7fcff"
+                                    selectionColor: Theme.accentSoft
+                                    font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : (feed.referenceLayout ? 17 : 16) }
+                                    textFormat: TextEdit.PlainText
+                                }
+                            }
+                        }
+                    }
+                    // The time, beneath the turn: at the right under the operator's
+                    // bubble, at the left under JARVIS; a soft outline keeps it
+                    // legible over the planet's bright horizon.
+                    Text {
+                        id: stamp
+                        readonly property int gap: 5
+                        x: row.isUser ? row.width - width - 6 : card.x + (row.isJarvis ? 18 : 0)
+                        y: card.height + gap
+                        text: modelData.time; color: "#8fa8c8"
+                        style: Text.Outline; styleColor: "#b3000812"
+                        font { family: Theme.font; pixelSize: feed.referenceLayout ? 12 : 11 }
                     }
                 }
             }
+        }
+    }
+
+    // -- the transient scrollbar, in the reserved strip -------------------------
+    Item {
+        id: bar
+        objectName: "feedScrollBar"
+        x: feed.width - feed.strip; y: 0; width: feed.strip; height: feed.height
+        visible: feed.overflow
+        readonly property real thumbH: Math.max(24, Math.round(height * flick.height / Math.max(1, flick.contentHeight)))
+        readonly property real travel: Math.max(0, height - thumbH)
+        readonly property bool engaged: hit.pressed || hit.containsMouse
+        property bool recent: false
+        readonly property bool shown: engaged || flick.moving || recent
+        Timer { id: hold; interval: 1000; onTriggered: bar.recent = false }
+        function poke() { recent = true; hold.restart() }
+        // Any scroll the reader makes shows the bar at once; when the pointer
+        // leaves or the drag ends, hold, then fade.
+        Connections { target: flick; function onContentYChanged() { if (!flick.settling) bar.poke() } }
+        onEngagedChanged: if (!engaged) poke()
+        opacity: 0
+        onShownChanged: { if (shown) { fadeOut.stop(); opacity = 1 } else fadeOut.restart() }
+        NumberAnimation { id: fadeOut; target: bar; property: "opacity"; to: 0; duration: 200 }
+        Rectangle {
+            id: thumb
+            objectName: "feedScrollThumb"
+            anchors.right: parent.right; anchors.rightMargin: 6
+            width: bar.engaged ? 3 : 2
+            height: bar.thumbH
+            y: flick.endY > 0 ? bar.travel * Math.min(1, Math.max(0, flick.contentY / flick.endY)) : 0
+            radius: 1.5
+            color: bar.engaged ? "#5cc0f0" : "#3a9fdb"
+            Behavior on width { NumberAnimation { duration: 100 } }
+        }
+        MouseArea {
+            id: hit
+            anchors.fill: parent
+            hoverEnabled: true
+            preventStealing: true
+            property real grab: 0
+            function moveTo(py) {
+                var t = Math.min(1, Math.max(0, (py - grab) / Math.max(1, bar.travel)))
+                flick.contentY = t * flick.endY
+            }
+            onPressed: function(mouse) {
+                var onThumb = mouse.y >= thumb.y && mouse.y <= thumb.y + thumb.height
+                grab = onThumb ? mouse.y - thumb.y : thumb.height / 2
+                if (!onThumb) moveTo(mouse.y)
+            }
+            onPositionChanged: function(mouse) { if (pressed) moveTo(mouse.y) }
         }
     }
 }

@@ -6,124 +6,133 @@ import "../theme"
 // The natural-language composer. Text goes to bridge.submitText, which is
 // JarvisApp.submit_text; no JSON, no capability names, no grammar here.
 //
-// Built as the approved helper's layered instrument rather than a bordered
-// field: a soft outer bloom, a luminous outer ring, a deep glass shell with
-// a bright cyan rim (brightest along the bottom, where the helper's light
-// pools), a darker inset well for the prompt mark, and a vivid send key.
-// Only supported controls appear - no attachment, voice or web action is
-// faked; a real keyboard hint balances the space they would take.
+// A thin instrument: 52 px at rest, anchored by its bottom edge, growing
+// UPWARD with the draft (about 140 ms per step) to `maxHeight` and scrolling
+// inside beyond it; back to 52 px when an accepted submission clears the
+// draft or the field is emptied. A refused submission keeps the draft.
+// Enter sends, Shift+Enter breaks a line. Only supported controls appear:
+// the compact send key and, while a request is being understood, Stop. No
+// attachment, voice, web or menu control is faked.
 Rectangle {
     id: composer
-    height: 66
-    radius: 12
+    property int minHeight: 52
+    property int maxHeight: 180
+    readonly property int vpad: 8
+    implicitHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
+    Behavior on implicitHeight { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+    radius: 10
     gradient: Gradient {
         GradientStop { position: 0; color: "#f400192d" }
         GradientStop { position: 1; color: "#f4001220" }
     }
-    border.width: 1.5
-    border.color: input.activeFocus ? "#6fd8f5" : "#2aa0c9"
+    border.width: 1
+    border.color: input.activeFocus ? "#5cc6ee" : "#2a86b8"
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
     property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused
     property bool canSend: !blocked && input.text.trim() !== ""
     property alias text: input.text
-    readonly property real inner: height - 19          // well and key height
-    function submit() { if (canSend) { bridge.submitText(input.text); input.text = "" } }
+    readonly property alias inputHeight: input.implicitHeight
+    // Clear the draft only when the application really accepted it.
+    function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
 
-    // Second illumination layer around the shell, and a wide soft bloom.
-    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -8; radius: parent.radius + 8; color: "transparent"
-        border.width: 6; border.color: input.activeFocus ? "#1a1fb0dc" : "#0f1fb0dc" }
-    Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: "transparent"
-        border.width: 2; border.color: input.activeFocus ? "#7a1fb0dc" : "#4a1fb0dc"
-        Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } } }
-    // Shell depth: an inner shadow under the top rim, a faint sheen, and the
-    // bright pooled light along the bottom rim.
-    Rectangle { x: parent.radius; y: 2; width: parent.width - 2 * parent.radius; height: 1; color: "#80000000" }
-    Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 2 } height: parent.height * 0.42; radius: 10
-        gradient: Gradient { GradientStop { position: 0; color: "#0d6fd2f5" } GradientStop { position: 1; color: "transparent" } } }
-    Rectangle { x: parent.radius; y: parent.height - 1.5; width: parent.width - 2 * parent.radius; height: 1.5
-        gradient: Gradient { orientation: Gradient.Horizontal
-            GradientStop { position: 0; color: "#002aa0c9" } GradientStop { position: 0.2; color: "#cc5cc6e6" }
-            GradientStop { position: 0.8; color: "#cc5cc6e6" } GradientStop { position: 1; color: "#002aa0c9" } } }
+    // Material depth: a faint sheen under the top edge, nothing louder.
+    Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 26); radius: 9
+        gradient: Gradient { GradientStop { position: 0; color: "#0c6fd2f5" } GradientStop { position: 1; color: "transparent" } } }
 
-    // The prompt mark, in its own darker inset well.
-    Rectangle {
-        id: well
-        anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
-        width: Math.round(composer.inner * 1.15); height: composer.inner; radius: 10
-        color: "#f4000b15"; border.width: 1; border.color: "#1f4260"
-        Rectangle { x: 10; y: 1; width: parent.width - 20; height: 1; color: "#1f6fd2f5" }
-        Rectangle {
-            anchors.centerIn: parent
-            width: 26; height: 26; radius: 13; color: "transparent"; border.width: 1.6; border.color: input.activeFocus ? "#6fd8f5" : "#3b9fc4"
-            Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-            Rectangle { anchors.centerIn: parent; width: 7; height: 7; radius: 3.5; color: "#2cc9ea"; opacity: input.activeFocus ? 1 : 0.8 }
+    // The draft: a wrapping text area inside a flickable, so past the maximum
+    // height the text scrolls and the caret stays in view.
+    Flickable {
+        id: flick
+        anchors { left: parent.left; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
+                  leftMargin: 14; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height + 1
+        TextArea.flickable: TextArea {
+            id: input
+            objectName: "composerInput"
+            padding: 0
+            wrapMode: TextArea.Wrap
+            verticalAlignment: TextEdit.AlignVCenter
+            placeholderText: bridge.approvalPending ? "Answer the pending approval first"
+                            : bridge.configRefused ? "Configuration refused - repair it with: jarvis config reset --all"
+                            : (bridge.task.status === "awaiting_clarification" ? "Answer JARVIS's question…" : "Message JARVIS…")
+            placeholderTextColor: "#9db8dc"
+            color: "#f3f9ff"
+            font { family: Theme.font; pixelSize: 16 }
+            background: null
+            selectByMouse: true
+            enabled: !bridge.configRefused
+            Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
+            Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
+            // Real typing activity for the core: on while text is being entered,
+            // off 900 ms after the last edit or as soon as the field is empty.
+            onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
         }
-    }
-    TextField {
-        id: input
-        anchors { left: well.right; right: hint.visible ? hint.left : (bridge.busy ? stopButton.left : sendButton.left); verticalCenter: parent.verticalCenter
-                  leftMargin: composer.height >= 72 ? 22 : 14; rightMargin: 14 }
-        placeholderText: bridge.approvalPending ? "Answer the pending approval first"
-                        : bridge.configRefused ? "Configuration refused - repair it with: jarvis config reset --all"
-                        : (bridge.task.status === "awaiting_clarification" ? "Answer JARVIS's question…" : "Message JARVIS…")
-        placeholderTextColor: "#b1cdf1"
-        color: "#f3f9ff"
-        font { family: Theme.font; pixelSize: composer.height >= 72 ? 18 : 16 }
-        background: Item {}
-        selectByMouse: true
-        enabled: !bridge.configRefused
-        Keys.onReturnPressed: composer.submit()
-        Keys.onEnterPressed: composer.submit()
-        // Real typing activity for the core: on while text is being entered,
-        // off 900 ms after the last edit or as soon as the field is empty.
-        onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; width: 6 }
     }
     Timer { id: composingQuiet; interval: 900; onTriggered: bridge.setComposing(false) }
-    // A real affordance in the space the helper gives to tools this product
-    // does not have: Enter sends.
-    Text {
-        id: hint
-        visible: composer.width >= 720 && !bridge.busy && !composer.blocked && input.text === ""
-        anchors { right: sendButton.left; rightMargin: 22; verticalCenter: parent.verticalCenter }
-        text: "Enter  ↵  to send"
-        color: "#6f88ad"
-        font { family: Theme.font; pixelSize: 13; letterSpacing: 0.4 }
-    }
-    // Send: a vivid, flat cyan key.
-    Rectangle {
+
+    // Send: a compact technical key - a 34 px chamfered square of deep navy
+    // with a thin cool-blue perimeter and a pale-blue line glyph, inside a
+    // 44 px target. Dimmed and inert while nothing can be sent.
+    Item {
         id: sendButton
-        anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter
-        width: Math.round(composer.inner * 1.12); height: composer.inner; radius: 10
-        readonly property bool hovered: sendArea.containsMouse && composer.canSend
-        gradient: Gradient {
-            GradientStop { position: 0; color: composer.blocked ? Theme.alpha(Theme.accent, 0.25) : (sendButton.hovered ? "#52d3ff" : "#1ec0ff") }
-            GradientStop { position: 1; color: composer.blocked ? Theme.alpha(Theme.accentDeep, 0.25) : (sendArea.pressed ? Qt.darker(Theme.accentDeep, 1.2) : "#07a4ec") }
+        objectName: "composerSend"
+        anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
+        width: 44; height: 44
+        enabled: composer.canSend
+        opacity: composer.canSend ? 1 : 0.42
+        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: "Send message"
+        Accessible.onPressAction: composer.submit()
+        Keys.onReturnPressed: composer.submit()
+        Keys.onSpacePressed: composer.submit()
+        readonly property bool hovered: sendArea.containsMouse
+        readonly property bool pressed: sendArea.pressed
+        readonly property color rim: pressed ? "#2f7fb0" : hovered ? "#62c8f2" : "#3596cf"
+        readonly property color face: pressed ? "#03101d" : hovered ? "#0c2a48" : "#071c33"
+        Shape {
+            anchors.centerIn: parent; width: 34; height: 34
+            preferredRendererType: Shape.CurveRenderer
+            ShapePath {
+                strokeColor: sendButton.rim; strokeWidth: 1; fillColor: sendButton.face
+                joinStyle: ShapePath.MiterJoin
+                startX: 4.5; startY: 0.5
+                PathLine { x: 29.5; y: 0.5 } PathLine { x: 33.5; y: 4.5 } PathLine { x: 33.5; y: 29.5 }
+                PathLine { x: 29.5; y: 33.5 } PathLine { x: 4.5; y: 33.5 } PathLine { x: 0.5; y: 29.5 }
+                PathLine { x: 0.5; y: 4.5 } PathLine { x: 4.5; y: 0.5 }
+            }
+            Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
         }
-        border.width: 1; border.color: composer.blocked ? Theme.alpha(Theme.accent, 0.3) : "#8ce6f7ff"
-        scale: sendArea.pressed && composer.canSend ? 0.96 : 1
-        Behavior on scale { NumberAnimation { duration: 90 } }
-        Rectangle { z: -1; anchors.fill: parent; anchors.margins: -4; radius: 14; color: Theme.alpha(Theme.accent, composer.blocked ? 0 : (parent.hovered ? 0.3 : 0.12)); Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
-        Rectangle { x: 8; y: 1; width: parent.width - 16; height: 1; color: "#66ffffff" }
+        // Pressed: a darker inset along the top-left inside the perimeter.
+        Rectangle { visible: sendButton.pressed; anchors.centerIn: parent; anchors.horizontalCenterOffset: 0; width: 30; height: 30; color: "transparent"
+            border.width: 1; border.color: "#66000a14" }
+        // The glyph: an 18 px line send arrow.
         Shape {
             anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
-            width: 22; height: 20; scale: composer.inner / 60 * 1.42
+            width: 18; height: 18
             preferredRendererType: Shape.CurveRenderer
-            opacity: composer.blocked ? 0.45 : 1
             ShapePath {
-                strokeColor: "#ffffff"; strokeWidth: 1.7; fillColor: "transparent"
+                strokeColor: sendButton.hovered ? "#d6f1ff" : "#b8e7ff"; strokeWidth: 1.5; fillColor: "transparent"
                 joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
                 startX: 1.5; startY: 1.5
-                PathLine { x: 20.5; y: 10 } PathLine { x: 1.5; y: 18.5 } PathLine { x: 5; y: 10 } PathLine { x: 1.5; y: 1.5 }
-                PathMove { x: 5; y: 10 } PathLine { x: 12; y: 10 }
+                PathLine { x: 16.5; y: 9 } PathLine { x: 1.5; y: 16.5 } PathLine { x: 4; y: 9 } PathLine { x: 1.5; y: 1.5 }
+                PathMove { x: 4; y: 9 } PathLine { x: 10; y: 9 }
             }
         }
-        MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: composer.canSend ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: composer.submit() }
+        // Keyboard focus: a fine explicit outline around the face.
+        Rectangle { visible: sendButton.activeFocus; anchors.centerIn: parent; width: 40; height: 40; radius: 4; color: "transparent"
+            border.width: 1; border.color: "#6fd8f5" }
+        MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: composer.submit() }
     }
     // Cancel the running understanding call from the same spot.
     Rectangle {
         id: stopButton
-        anchors.right: sendButton.left; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter
-        width: stopRow.width + 24; height: 34; radius: Theme.radiusSmall
+        anchors.right: sendButton.left; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
+        width: stopRow.width + 24; height: 32; radius: Theme.radiusSmall
         visible: bridge.busy
         color: stopArea.containsMouse ? Theme.alpha(Theme.danger, 0.14) : Theme.alpha(Theme.text, 0.04); border.width: 1; border.color: stopArea.containsMouse ? Theme.alpha(Theme.danger, 0.6) : Theme.borderStrong
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }

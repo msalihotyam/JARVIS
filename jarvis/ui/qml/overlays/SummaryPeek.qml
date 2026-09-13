@@ -67,7 +67,7 @@ ContextPanel {
         }
         case "Updates":
             return { title: "Updates", subtitle: "This interface session", icon: "updates", tone: "#0f9e7e",
-                     metrics: [{ value: bridge.activity.length, label: "Recent updates", tone: Theme.teal },
+                     metrics: [{ value: bridge.activity.length, label: "Recent updates", tone: "#37c4f0" },
                                { value: r.attention, label: "Need attention", tone: r.attention > 0 ? Theme.danger : Theme.textLabel }],
                      rows: bridge.activity.map(function(a) {
                          return { title: a.text, sub: r.kindWord(a.kind) + " · " + a.time,
@@ -77,7 +77,7 @@ ContextPanel {
                      action: { label: "Open History", note: "This session's updates and durable sessions", page: "history" } }
         case "Focus":
             return { title: "Focus", subtitle: "Active projects in memory", icon: "focus", tone: "#b7801e",
-                     metrics: [{ value: bridge.projects.length, label: "Active projects", tone: Theme.warning },
+                     metrics: [{ value: bridge.projects.length, label: "Active projects", tone: "#37c4f0" },
                                { value: bridge.memoryItems.length,
                                  label: bridge.projects.length ? "Items in " + bridge.projects[0] : "Memory items", tone: Theme.textLabel }],
                      rows: bridge.projects.map(function(p, i) {
@@ -87,7 +87,7 @@ ContextPanel {
                      action: { label: "Open Memory", note: "Projects and reference data", page: "memory" } }
         case "Plan":
             return { title: "Plan", subtitle: "Scheduled work and next runs", icon: "plan", tone: "#7040c4",
-                     metrics: [{ value: r.enabledJobs.length, label: "Scheduled", tone: Theme.violet },
+                     metrics: [{ value: r.enabledJobs.length, label: "Scheduled", tone: "#37c4f0" },
                                { value: r.liveJobs.length - r.enabledJobs.length, label: "Paused", tone: Theme.textLabel }],
                      rows: r.liveJobs.map(function(j) {
                          return { title: j.label || j.id, sub: j.kind || "Job", pill: j.enabled ? "Scheduled" : "Paused",

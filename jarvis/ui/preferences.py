@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-PREFERENCES_VERSION = 2
+PREFERENCES_VERSION = 3
 THEMES = ("space", "dark", "command")
 #: Execution-status lamp skins: the canonical glass orb and the HUD variant.
 STATUS_INDICATORS = ("orb", "hud")
@@ -47,10 +47,10 @@ def _panel(visible: bool = True, pinned: bool = False, share: float = 0.33) -> d
 def canonical_profiles() -> dict[str, dict[str, Any]]:
     """Fresh canonical layouts. A new dict every call: never a shared default."""
     return {
-        # The canonical 1920x1080 composition: a 535 px column holding
-        # System status (185) / Active workflow (275) / Live feed (305).
+        # The conversation-first 1920x1080 composition: a 386 px column
+        # beside a 1231 px conversation, 20 px apart.
         "normal": {
-            "column_width": 0.32,
+            "column_width": 0.236,
             "order": list(PANEL_IDS),
             "panels": {
                 "system": _panel(share=0.16),
@@ -159,6 +159,11 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     # rejects malformed old fields; migration never writes product config.
     if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator"} == set(defaults) - {"packages", "status_indicator"}:
         candidate = {**candidate, "version": PREFERENCES_VERSION, "packages": defaults["packages"]}
+    # Version 2 -> 3: the conversation-first grid replaced every layout; the
+    # person's other choices are kept.
+    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) == set(defaults):
+        kept = {key: candidate[key] for key in ("theme", "ambient_effects", "status_indicator", "page")}
+        candidate = {**defaults, **kept}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
@@ -244,7 +249,9 @@ class UiPreferences:
         return self.package()["profiles"][profile or self.package()["profile"]]
 
     def package(self) -> dict[str, Any]:
-        return self.data if self.data["theme"] == "space" else self.data["packages"][self.data["theme"]]
+        # MAIN and DARK share ONE macro layout: switching between them never
+        # moves a panel. Only the Command preset keeps its own geometry.
+        return self.data["packages"]["command"] if self.data["theme"] == "command" else self.data
 
     def set_visible(self, panel: str, visible: bool) -> None:
         if panel in PANEL_IDS:

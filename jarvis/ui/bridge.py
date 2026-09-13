@@ -401,14 +401,16 @@ class Bridge(QObject):
 
     # -- slots: natural language ------------------------------------------
 
-    @Slot(str)
-    def submitText(self, text: str) -> None:
+    @Slot(str, result=bool)
+    def submitText(self, text: str) -> bool:
+        """Send one natural-language message. True when it was accepted and
+        is on its way; False when nothing was sent, so a draft is kept."""
         text = str(text)
         if not text.strip() or self._busy:
-            return
+            return False
         if self._ticket is not None:
             self._say("system", "Answer the pending approval first (Approve, Deny or Cancel).")
-            return
+            return False
         self._clarification = {}
         self.approvalChanged.emit()
         self._say("user", text)
@@ -419,13 +421,14 @@ class Bridge(QObject):
         if self._task.get("status") == "awaiting_clarification" and session_id and self._task.get("task_id"):
             task_id = self._task["task_id"]
             self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._apply_run)
-            return
+            return True
         self._task = {}
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id),
             lambda payload: self._apply_text(payload, text),
         )
+        return True
 
     @Slot(str)
     def chooseOption(self, label: str) -> None:

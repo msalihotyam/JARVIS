@@ -122,11 +122,14 @@ Window {
         readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
         readonly property int columnGap: command ? 16 : Theme.columnGap(root.width)
+        // The conversation shell alone rises into the header environment;
+        // the right stack and every other page keep the panel line.
+        readonly property int lift: command || !root.homePage ? 0 : Theme.shellLift(root.height)
 
         // Workspace: the page, with a restrained crossfade + slide on change.
         Item {
             id: workspace
-            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+            anchors { left: parent.left; top: parent.top; bottom: parent.bottom; topMargin: -content.lift }
             width: content.width - (content.showColumn ? content.columnWidth + content.columnGap : 0)
             Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Loader {
@@ -149,7 +152,7 @@ Window {
             }
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
-        Component { id: canonicalPackage; CommandCenter {} }
+        Component { id: canonicalPackage; CommandCenter { lift: content.lift; fade: Theme.shellFade(root.height) } }
         Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
         Component { id: tasksPage; TasksPage {} }
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
