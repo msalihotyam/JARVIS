@@ -117,6 +117,9 @@ QtObject {
     property color accent: space ? "#20c7f6" : command ? "#00d4ff" : "#1bbaff"
     property color accentSoft: space ? "#398fd0" : "#2b86c7"
     property color accentDeep: space ? "#007bbd" : "#0076ae"
+    // Structural Phase 3 glass only: never a success/status/module identity.
+    readonly property color materialBlue: "#36aaff"
+    readonly property color materialGlint: "#9dd8ff"
     Behavior on accent { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
     Behavior on accentSoft { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
     Behavior on accentDeep { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }

@@ -22,7 +22,7 @@ GlassPanel {
     // atmosphere (a static decorative plate - no text, no data). The frame
     // takes the helper's luminous cyan edge. Dark keeps its quieter panel.
     color: Theme.space ? "#f2000812" : Theme.surfaceWorkspace
-    border.color: Theme.space ? "#b3347a9b" : Theme.border
+    border.color: Theme.space ? "#b33b83c6" : Theme.border
     Image {
         parent: page
         z: -0.5
@@ -55,7 +55,7 @@ GlassPanel {
         Item { id: ready; visible: bridge.feed.length === 0; width: parent.width; height: 92
             IconBox { glyph: "◎"; width: 60; height: 60; tint: Theme.accent; round: true }
             Column { x: 90; y: 6; width: parent.width - 90; spacing: 8
-                Text { text: "JARVIS"; color: "#22c8ee"; font { family: Theme.font; pixelSize: 17; letterSpacing: 0.5; weight: Font.Bold } }
+                Text { text: "JARVIS"; color: Theme.materialBlue; font { family: Theme.font; pixelSize: 17; letterSpacing: 0.5; weight: Font.Bold } }
                 Text { width: parent.width; wrapMode: Text.Wrap; text: bridge.configRefused ? "Configuration needs attention before any work can start." : !bridge.executionEnabled ? "Standing by. No new work will start while execution is disabled." : "Waiting for your request. I’ll help you plan the next step and ask before an action needs your permission."; color: "#f3f9ff"; font { family: Theme.font; pixelSize: 18 } }
             }
         }

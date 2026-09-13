@@ -1208,6 +1208,16 @@ class ConversationSurfaceTests(UiTestCase):
                 previous_bottom = rail[1]
                 for key in self.SUMMARY:
                     card = self.box(root, "rail" + key)
+                    # Phase 3.3b: substantial modules within the frozen rail,
+                    # not the former 76 px navigation-sized cards.
+                    self.assertGreaterEqual(card[3] - card[1], 84)
+                    if width == 1920:
+                        self.assertGreaterEqual(card[2] - card[0], work[0] * 0.90)
+                        self.assertGreaterEqual(card[3] - card[1], 108)
+                        self.assertLessEqual(card[3] - card[1], 124)
+                    if key != "Tasks":
+                        self.assertGreaterEqual(card[1] - previous_bottom, 10)
+                        self.assertLessEqual(card[1] - previous_bottom, 14)
                     # In order, inside the Phase 1 rail, never over the work surface.
                     self.assertGreaterEqual(card[1], previous_bottom - 1)
                     self.assertLessEqual(card[2], work[0])

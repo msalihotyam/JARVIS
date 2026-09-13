@@ -19,7 +19,7 @@ ContextPanel {
     property Item rail: null
     surfaceName: "summaryPeek"
     // The peek is the stronger member of the rail family: a crisp cyan edge.
-    surfaceEdge: "#3aa3c2"
+    surfaceEdge: "#368ed1"
     surfaceFill: "#f5000e1a"
     surfaceBrackets: false
     surfaceShell: "../assets/peek-shell.png"
@@ -132,11 +132,11 @@ ContextPanel {
                         GradientStop { position: 0; color: "#f2002238" }
                         GradientStop { position: 1; color: "#f0001524" }
                     }
-                    border.width: 1; border.color: "#2f86ad"
+                    border.width: 1; border.color: "#367fbf"
                     Rectangle { z: -1; anchors.fill: parent; anchors.margins: -2; radius: 14; color: "transparent"; border.width: 2; border.color: "#1a3fb4e6" }
                     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: 26; radius: 11
                         gradient: Gradient { GradientStop { position: 0; color: "#1c3fc4f0" } GradientStop { position: 1; color: "transparent" } } }
-                    Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: "#5a8fe0ff" }
+                    Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: Theme.alpha(Theme.materialGlint, 0.35) }
                     Column {
                         x: 16; anchors.verticalCenter: parent.verticalCenter; spacing: -1
                         Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 34; weight: Font.DemiBold } }

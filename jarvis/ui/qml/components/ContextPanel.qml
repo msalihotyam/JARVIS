@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import "../theme"
 
 // Anchored context surface; the triggers remain above the outside-click
@@ -47,6 +48,8 @@ Item {
         // Above the body fill (a negative z would sit behind it); its centre is
         // transparent and the surface padding keeps it clear of the content.
         BorderImage { parent: panel; z: 0.5; visible: context.surfaceShell != ""; source: context.surfaceShell
+            layer.enabled: context.surfaceShell != ""
+            layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
             anchors.fill: parent; anchors.margins: -context.surfaceShellMargin
             border { left: context.surfaceShellBorder; top: context.surfaceShellBorder; right: context.surfaceShellBorder; bottom: context.surfaceShellBorder } }
         Rectangle { parent: panel; z: -1; visible: context.surfaceEdge.a > 0 && context.surfaceShell == ""; anchors.fill: parent; anchors.margins: -3; radius: panel.radius + 3

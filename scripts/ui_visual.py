@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--capture-name", default="preview")
     parser.add_argument("--size", default="1920x1080")
     parser.add_argument("--page", choices=("home", "tasks", "automations", "memory", "history"), default="home")
+    parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
@@ -36,7 +37,7 @@ def main() -> int:
     os.environ["JARVIS_UI_DEV_FIXTURE"] = "1" if args.fixture else "0"
     os.environ["JARVIS_UI_DEV_REFERENCE"] = args.reference
 
-    from PySide6.QtCore import QTimer, QMetaObject, qInstallMessageHandler
+    from PySide6.QtCore import QTimer, QMetaObject, Q_ARG, qInstallMessageHandler
     from PySide6.QtGui import QShortcut, QKeySequence
     from tests.test_ui import UiTestCase, _APP
 
@@ -52,6 +53,8 @@ def main() -> int:
     if (width, height) != (1920, 1080):
         window.showNormal()
         window.resize(width, height)
+    if args.peek:
+        QTimer.singleShot(300, lambda: QMetaObject.invokeMethod(window, "togglePeek", Q_ARG("QVariant", args.peek), Q_ARG("QVariant", 0)))
     # Presentation-only scenes in this isolated harness. There is no ticket,
     # task or approval authority behind the explicitly marked visual sample.
     if args.scene == "approval":

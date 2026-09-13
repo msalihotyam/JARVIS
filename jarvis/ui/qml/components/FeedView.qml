@@ -120,7 +120,7 @@ ListView {
                         x: avatar.width / 2 + 36.5 * avatar.k * Math.cos((index * 90 + 45) * Math.PI / 180) - 1.5
                         y: avatar.height / 2 + 36.5 * avatar.k * Math.sin((index * 90 + 45) * Math.PI / 180) - 1.5 } }
                 Rectangle { anchors.centerIn: parent; width: 66 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 12 * avatar.k; border.color: Theme.accent; opacity: 0.22 }
-                Rectangle { anchors.centerIn: parent; width: 56 * avatar.k; height: width; radius: width / 2; color: "#000812"; border.width: Math.max(3, 6.5 * avatar.k); border.color: "#20c9f3" }
+                Rectangle { anchors.centerIn: parent; width: 56 * avatar.k; height: width; radius: width / 2; color: "#000812"; border.width: Math.max(3, 6.5 * avatar.k); border.color: Theme.materialBlue }
                 Rectangle { anchors.centerIn: parent; width: 43 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: "#b09ff0ff" }
                 Rectangle { anchors.centerIn: parent; width: 38 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 4; border.color: "#2620c9f3" }
             }
@@ -153,7 +153,7 @@ ListView {
                 GradientStop { position: 0; color: "#f0001a2e" }
                 GradientStop { position: 1; color: "#e8001322" } }
             border.width: row.boxed ? 1 : 0
-            border.color: row.isUser ? "#2a6a92" : Theme.alpha(row.tone, 0.45)
+            border.color: row.isUser ? "#327bb5" : Theme.alpha(row.isJarvis ? Theme.materialBlue : row.tone, 0.45)
             Rectangle { visible: row.isUser; x: 14; y: 1; width: parent.width - 28; height: 1; color: "#5a6fd2f5" }
             Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.45, 34); radius: 11
                 gradient: Gradient { GradientStop { position: 0; color: "#0f4fc3ff" } GradientStop { position: 1; color: "transparent" } } }
@@ -169,7 +169,7 @@ ListView {
                     // horizon: a soft dark outline keeps them legible anywhere.
                     Text { text: feed.kindLabel(row.kind)
                         style: row.isUser ? Text.Normal : Text.Outline; styleColor: "#b3000812"
-                        color: row.isUser ? "#f5faff" : row.isJarvis ? "#22c8ee" : row.tone
+                        color: row.isUser ? "#f5faff" : row.isJarvis ? Theme.materialBlue : row.tone
                         font { family: Theme.font; pixelSize: row.isUser ? (feed.referenceLayout ? 17 : 16) : row.isJarvis ? (feed.referenceLayout ? 18 : 17) : 10
                                weight: row.isJarvis ? Font.Bold : Font.DemiBold
                                letterSpacing: row.isUser ? 0.2 : (row.isJarvis ? 0.6 : 2.2) } }

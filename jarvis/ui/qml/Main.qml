@@ -223,9 +223,9 @@ Window {
         id: summaryRail
         z: 420
         visible: root.presentation !== "command" && root.homePage
-        x: Math.max(10, Theme.px(root.width * 0.0163, 20, 34) - 6)
+        x: 10
         y: Math.round(root.height * 0.1980) + 76
-        width: Theme.railWidth(root.width) - x - 12
+        width: Theme.railWidth(root.width) - x - 10
         height: root.height - y - 64
         activeKey: peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
+import QtQuick.Effects
 import "../theme"
 
 // The left ambient rail's summary stack: Tasks, Updates, Focus, Plan. It is
@@ -69,10 +70,10 @@ Item {
     readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
     readonly property string sessionsWord: bridge.sessions.length + (bridge.sessions.length === 1 ? " session" : " sessions")
     readonly property var modules: [
-        { key: "Tasks", page: "tasks", tone: "#1b7fe0", well: "#01417e", count: "#45daeb", icon: "tasks",
+        { key: "Tasks", page: "tasks", tone: "#1b7fe0", well: "#01417e", count: "#49b6ff", icon: "tasks",
           line: (bridge.taskLive ? 1 : 0) + " active",
           note: rail.roomy ? rail.sessionsWord + " · " + rail.taskTotal + (rail.taskTotal === 1 ? " task" : " tasks") : rail.sessionsWord },
-        { key: "Updates", page: "history", tone: "#0f9e7e", well: "#015e4f", count: "#45daeb", icon: "updates",
+        { key: "Updates", page: "history", tone: "#0f9e7e", well: "#015e4f", count: "#35d5a6", icon: "updates",
           line: bridge.activity.length + " recent",
           note: rail.attention > 0 ? rail.attention + (rail.roomy ? (rail.attention === 1 ? " needs attention" : " need attention") : " to review") : "All clear" },
         { key: "Focus", page: "memory", tone: "#b7801e", well: "#523a03", count: "#f2b94c", icon: "focus",
@@ -86,11 +87,11 @@ Item {
     ]
 
     // -- layout budget: the secondary line goes first, then micro spacing ---
-    readonly property real cardFull: 76
+    readonly property real cardFull: Math.min(118, Math.max(84, width * 0.52))
     readonly property real cardCompact: 50
     readonly property bool showNote: 4 * cardFull + 30 <= height
     readonly property real cardHeight: showNote ? cardFull : cardCompact
-    readonly property real gap: 4 * cardHeight + 30 <= height ? 10 : 6
+    readonly property real gap: 4 * cardHeight + 36 <= height ? 12 : 6
 
     Column {
         width: rail.width
@@ -122,6 +123,8 @@ Item {
                 BorderImage {
                     anchors.fill: parent; anchors.margins: -12
                     source: "../assets/rail-card-shell.png"
+                    layer.enabled: true
+                    layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
                     border { left: 34; top: 34; right: 34; bottom: 34 }
                     opacity: card.active ? 0 : card.hovered ? 1 : 0.9
                     Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
@@ -129,6 +132,8 @@ Item {
                 BorderImage {
                     anchors.fill: parent; anchors.margins: -12
                     source: "../assets/rail-card-shell-active.png"
+                    layer.enabled: true
+                    layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
                     border { left: 34; top: 34; right: 34; bottom: 34 }
                     opacity: card.active ? 1 : card.hovered ? 0.35 : 0
                     visible: opacity > 0
@@ -138,7 +143,7 @@ Item {
                 Rectangle {
                     anchors.fill: parent; anchors.margins: 1; radius: 13
                     gradient: Gradient {
-                        GradientStop { position: 0; color: card.active ? "#2a1fb8e8" : "#1c1f7fc0" }
+                        GradientStop { position: 0; color: card.active ? "#363692ff" : "#243679d0" }
                         GradientStop { position: 0.55; color: "transparent" }
                     }
                 }
@@ -160,7 +165,7 @@ Item {
                         PathLine { x: 1.6; y: 0 } PathLine { x: 12; y: 11 } PathLine { x: 1.6; y: 22 } PathLine { x: 0; y: 22 } PathLine { x: 0; y: 0 }
                     }
                     ShapePath {
-                        strokeColor: "#8fe4fb"; strokeWidth: 1.2; fillColor: "transparent"
+                        strokeColor: Theme.materialGlint; strokeWidth: 1.2; fillColor: "transparent"
                         joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.FlatCap
                         startX: 1.6; startY: 0.5
                         PathLine { x: 11.5; y: 11 } PathLine { x: 1.6; y: 21.5 }
@@ -171,7 +176,7 @@ Item {
                 Rectangle {
                     id: tile
                     x: rail.tight ? 9 : 13; anchors.verticalCenter: parent.verticalCenter
-                    width: rail.tight ? 34 : rail.showNote ? 44 : 32; height: width; radius: rail.tight ? 9 : rail.showNote ? 12 : 8
+                    width: rail.tight ? 34 : rail.roomy ? 50 : 40; height: width; radius: rail.tight ? 9 : 13
                     gradient: Gradient {
                         GradientStop { position: 0; color: Qt.lighter(modelData.well, 2.05) }
                         GradientStop { position: 1; color: Qt.lighter(modelData.well, 1.2) }
@@ -200,13 +205,13 @@ Item {
                     x: tile.x + tile.width + (rail.tight ? 8 : 13)
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - x - (rail.tight ? 17 : 24)
-                    spacing: rail.showNote ? 1 : 0
+                    spacing: rail.showNote ? 5 : 0
                     Text { width: parent.width; elide: Text.ElideRight; text: modelData.key; color: "#fafeff"
-                           font { family: Theme.font; pixelSize: rail.tight ? 15 : 16; weight: Font.DemiBold } }
+                           font { family: Theme.font; pixelSize: rail.roomy ? 18 : 15; weight: Font.DemiBold } }
                     Text { width: parent.width; elide: Text.ElideRight; text: modelData.line; color: modelData.count
-                           font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold } }
+                           font { family: Theme.font; pixelSize: rail.roomy ? 15 : 13; weight: Font.DemiBold } }
                     Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: "#b3d2f0"
-                           font { family: Theme.font; pixelSize: 12 } }
+                           font { family: Theme.font; pixelSize: rail.roomy ? 13 : 12 } }
                 }
                 Shape {
                     visible: !card.active
@@ -214,7 +219,7 @@ Item {
                     width: 7; height: 12; scale: rail.tight ? 1 : 1.15
                     preferredRendererType: Shape.CurveRenderer
                     ShapePath {
-                        strokeColor: card.hovered ? "#7ae6f7" : "#39dbef"
+                        strokeColor: card.hovered ? "#91ceff" : "#36b1ff"
                         strokeWidth: 1.6; fillColor: "transparent"
                         capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
                         startX: 1; startY: 1
