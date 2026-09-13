@@ -143,7 +143,7 @@ Item {
                 Flickable {
                     id: bodyViewport
                     anchors.fill: parent
-                    contentHeight: Math.max(height, modelData.id === "workflow" ? 166 : modelData.id === "system" ? (column.commandMode ? 138 : 0) : 80)
+                    contentHeight: Math.max(height, modelData.id === "workflow" ? (column.commandMode ? 166 : 0) : modelData.id === "system" ? (column.commandMode ? 138 : 0) : 80)
                     clip: true; boundsBehavior: Flickable.StopAtBounds
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                     Loader {
@@ -207,25 +207,30 @@ Item {
     }
     // One row of the reference's workflow well: icon box, label, dot, status, handle.
     component WRow: Item {
-        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: Theme.textLabel; property bool empty: false; property bool last: false
+        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: "#9fb6d0"; property bool empty: false; property bool last: false
         width: parent.width; height: 41
-        Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: 30; height: 30; radius: 8
-            color: Theme.alpha(Theme.accentSoft, empty ? 0.16 : 0.32); border.width: 1; border.color: Theme.alpha(Theme.accentSoft, empty ? 0.3 : 0.55)
-            Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.textMuted : Theme.accent; font { family: Theme.font; pixelSize: 14 } } }
-        Text { x: 52; width: parent.width * 0.48 - 60; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.text; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
-        Rectangle { x: parent.width * 0.48 - 5; width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: empty ? Theme.textDim : tint; opacity: empty ? 0.6 : 1
-            Rectangle { visible: !empty; anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: tint; opacity: 0.25 } }
-        Text { anchors.left: parent.left; anchors.leftMargin: parent.width * 0.48 + 9; anchors.right: parent.right; anchors.rightMargin: 25; anchors.verticalCenter: parent.verticalCenter
-            text: v; color: empty ? Theme.textMuted : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
-        Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: "⁘"; color: Theme.textMuted; font.pixelSize: 13 }
-        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: Theme.border; opacity: 0.55 }
+        readonly property bool compact: height < 30
+        readonly property int tile: compact ? 18 : height >= 38 ? 28 : 24
+        readonly property int fs: compact ? (column.commandMode ? 12 : 13) : (column.commandMode ? 12 : 15)
+        readonly property real dotX: Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
+        Rectangle { x: 11; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: compact ? 5 : 7
+            color: empty ? "#122c48" : "#1b4a78"; border.width: 1; border.color: empty ? "#1d4468" : "#3487bd"
+            Text { anchors.centerIn: parent; text: glyph; color: empty ? "#5f86ad" : "#4fc3ef"; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
+        Text { x: 11 + tile + (compact ? 10 : 14); width: dotX - x - 10; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
+               color: empty ? "#cfdceb" : "#f2f8ff"; font { family: Theme.font; pixelSize: fs } }
+        Rectangle { x: dotX; width: compact ? 6 : 7; height: width; radius: width / 2; anchors.verticalCenter: parent.verticalCenter; color: empty ? "#4f6b8a" : tint
+            Rectangle { visible: !empty; anchors.centerIn: parent; width: parent.width + 8; height: width; radius: width / 2; color: tint; opacity: 0.22 } }
+        Text { anchors.left: parent.left; anchors.leftMargin: dotX + (compact ? 14 : 17); anchors.right: parent.right; anchors.rightMargin: 30; anchors.verticalCenter: parent.verticalCenter
+            text: v; color: empty ? "#8ea6c2" : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: fs } }
+        Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "⁘"; color: "#4f6b8a"; font.pixelSize: compact ? 11 : 13 }
+        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 11 + tile + (compact ? 10 : 14); rightMargin: 8 } height: 1; color: "#1a3f5e"; opacity: 0.85 }
     }
     // The inset well that holds rows (the reference's rounded inner frame).
     component Well: Rectangle {
         default property alias rows: inner.data
         property bool fill: false
         width: parent.width; height: fill ? parent.height : inner.height + 2
-        radius: 10; color: Theme.alpha(Theme.bg0, 0.28); border.width: 1; border.color: Theme.alpha(Theme.border, 0.8)
+        radius: 10; color: Theme.alpha(Theme.bg0, 0.16); border.width: 1; border.color: "#1c4262"
         Column { id: inner; x: 1; y: 1; width: parent.width - 2 }
     }
 
@@ -274,14 +279,16 @@ Item {
             id: workflowWell
             fill: true
             readonly property bool has: !!bridge.task.task_id
-            WRow { height: (workflowWell.height - 2) / 5; glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !workflowWell.has
+            readonly property real pitch: Math.floor((height - 2) / 5)
+            WRow { height: workflowWell.pitch; glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !workflowWell.has
+                vColor: bridge.coreState === "running" ? Theme.accent : "#cfdceb"
                 v: workflowWell.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
-            WRow { height: (workflowWell.height - 2) / 5; glyph: "⌘"; tint: Theme.success; k: "Connector"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
-            WRow { height: (workflowWell.height - 2) / 5; glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.capability || "—") : "Chosen by Core" }
-            WRow { height: (workflowWell.height - 2) / 5; glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !workflowWell.has; v: workflowWell.has ? (bridge.task.destination || "—") : "Granted destinations only" }
-            WRow { height: (workflowWell.height - 2) / 5; glyph: "◷"; k: "Outcome"; empty: !workflowWell.has; last: true
-                tint: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.success)
-                vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : (bridge.task.error_code ? Theme.danger : Theme.textLabel)
+            WRow { height: workflowWell.pitch; glyph: "⌘"; tint: Theme.accent; k: "Connector"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
+            WRow { height: workflowWell.pitch; glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : "Chosen by Core" }
+            WRow { height: workflowWell.pitch; glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : "Granted destinations only" }
+            WRow { height: workflowWell.pitch; glyph: "◷"; k: "Outcome"; empty: !workflowWell.has; last: true
+                tint: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : bridge.task.error_code ? Theme.danger : bridge.coreState === "completed" ? Theme.success : Theme.accentSoft
+                vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : bridge.task.error_code ? Theme.danger : bridge.coreState === "completed" ? Theme.success : "#cfdceb"
                 v: workflowWell.has ? (bridge.task.error_code || (bridge.task.run_status || "pending")) : "None yet" }
         }
     }
