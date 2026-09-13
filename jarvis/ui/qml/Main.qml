@@ -73,7 +73,8 @@ Window {
         auditionIndex = i; auditionLabel.opacity = 1; auditionFade.restart()
     }
     Background { anchors.fill: parent; active: root.active
-        imageSource: root.backgroundAudition && root.auditionIndex > 0 ? bridge.devBackgroundCandidates[root.auditionIndex - 1] : "" }
+        screenFocus: Qt.point(topBar.coreCx / Math.max(1, root.width), topBar.coreCy / Math.max(1, root.height))
+        overrideSource: root.backgroundAudition && root.auditionIndex > 0 ? bridge.devBackgroundCandidates[root.auditionIndex - 1] : "" }
 
     TopBar {
         id: topBar
@@ -148,7 +149,7 @@ Window {
             }
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
-        Component { id: canonicalPackage; CommandCenter { atmosphere: root.auditionIndex === 0 } }
+        Component { id: canonicalPackage; CommandCenter {} }
         Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
         Component { id: tasksPage; TasksPage {} }
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }

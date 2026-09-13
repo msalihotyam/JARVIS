@@ -17,27 +17,12 @@ GlassPanel {
     readonly property real sx: Math.max(0.6, width / 1096)
     function at(v) { return Math.round(v * sx) }
     readonly property bool roomy: width >= 700
-    // DEV background audition only: lets a full-screen candidate show without
-    // the conversation's own atmosphere plate on top of it. Always true otherwise.
-    property bool atmosphere: true
 
     // Canonical Space: a deep blue-black glass over its own local
     // atmosphere (a static decorative plate - no text, no data). The frame
     // takes the helper's luminous cyan edge. Dark keeps its quieter panel.
     color: Theme.space ? "#f2000812" : Theme.surfaceWorkspace
     border.color: Theme.space ? "#b33b83c6" : Theme.border
-    Image {
-        parent: page
-        z: -0.5
-        anchors.fill: parent; anchors.margins: 1
-        source: "../assets/conversation-atmosphere.png"
-        fillMode: Image.PreserveAspectCrop
-        horizontalAlignment: Image.AlignLeft; verticalAlignment: Image.AlignBottom
-        smooth: true; asynchronous: true; cache: true
-        opacity: Theme.space && page.atmosphere ? 1 : 0
-        visible: opacity > 0
-        Behavior on opacity { NumberAnimation { duration: Theme.themeMs } }
-    }
 
     Column {
         id: heading

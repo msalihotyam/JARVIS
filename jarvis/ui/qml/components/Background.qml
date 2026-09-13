@@ -2,19 +2,28 @@ import QtQuick
 import QtQuick.Shapes
 import "../theme"
 
-// The environment behind everything. STATIC by design: a gradient sky,
-// three pieces of atmospheric lighting (a crown of light behind the core,
-// a soft planetary limb low on the left, a vignette), a fixed star field,
-// and one image slot for the canonical Earth/space plate. The only motion
-// is the optional shimmer of three stars, and it pauses when inactive.
+// The environment behind everything. STATIC by design: a gradient sky, the
+// Earth/space plate, a crown of light behind the core and a vignette. When
+// no plate is loaded a drawn star field and planetary limb stand in. The
+// only motion is the optional shimmer of three stars, and it pauses when
+// inactive.
 Item {
     id: bg
     property bool active: true
-    // The canonical background asset slot. Empty until a clean, UI-free
-    // Earth/space plate is supplied; the lighting below is tuned so the
-    // plate replaces the limb and sits under the same crown and vignette.
-    property url imageSource: ""
-    readonly property bool hasImage: imageSource != ""
+    // The plate. Two production skins: "main" (the chosen Canonical Space
+    // plate) and "alternate". Each image carries its own drawn core, so the
+    // plate is placed with that core exactly under the live JARVIS core
+    // (`screenFocus`, set by the window) while still covering the window at
+    // every size - never stretched, only scaled and shifted.
+    property string skin: "main"
+    property url overrideSource: ""                 // DEV audition only
+    readonly property url imageSource: overrideSource != "" ? overrideSource
+                                     : skin === "alternate" ? Qt.resolvedUrl("../assets/background-space-alt.webp")
+                                     : Qt.resolvedUrl("../assets/background-space.webp")
+    readonly property point imageFocus: overrideSource != "" ? Qt.point(0.4985, 0.087)
+                                      : skin === "alternate" ? Qt.point(0.4991, 0.0914) : Qt.point(0.4979, 0.0824)
+    property point screenFocus: Qt.point(0.5, 0.08)
+    readonly property bool hasImage: plate.status === Image.Ready
 
     Rectangle {
         anchors.fill: parent
@@ -26,12 +35,24 @@ Item {
     }
 
     Image {
-        anchors.fill: parent
+        id: plate
         source: bg.imageSource
         visible: bg.hasImage
-        fillMode: Image.PreserveAspectCrop
         asynchronous: true
         cache: true
+        smooth: true
+        readonly property real iw: implicitWidth > 0 ? implicitWidth : 1
+        readonly property real ih: implicitHeight > 0 ? implicitHeight : 1
+        // The smallest scale that both covers the window and lets the drawn
+        // core land on the live one.
+        readonly property real k: Math.max(bg.width / iw, bg.height / ih,
+            bg.screenFocus.x * bg.width / (bg.imageFocus.x * iw),
+            (1 - bg.screenFocus.x) * bg.width / ((1 - bg.imageFocus.x) * iw),
+            bg.screenFocus.y * bg.height / (bg.imageFocus.y * ih),
+            (1 - bg.screenFocus.y) * bg.height / ((1 - bg.imageFocus.y) * ih))
+        width: Math.ceil(iw * k); height: Math.ceil(ih * k)
+        x: Math.round(bg.screenFocus.x * bg.width - bg.imageFocus.x * width)
+        y: Math.round(bg.screenFocus.y * bg.height - bg.imageFocus.y * height)
         opacity: Theme.space ? 1.0 : 0.35
         Behavior on opacity { NumberAnimation { duration: Theme.themeMs; easing.type: Easing.InOutCubic } }
     }
@@ -40,7 +61,8 @@ Item {
     Canvas {
         id: stars
         anchors.fill: parent
-        opacity: Theme.starOpacity * (bg.hasImage ? 0.4 : 1)
+        opacity: bg.hasImage ? 0 : Theme.starOpacity
+        visible: opacity > 0
         onWidthChanged: requestPaint()
         onHeightChanged: requestPaint()
         onPaint: {
