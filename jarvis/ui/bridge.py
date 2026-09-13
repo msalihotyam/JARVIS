@@ -75,6 +75,11 @@ class Bridge(QObject):
     prefsChanged = Signal()
     approvalChanged = Signal()
     quitRequested = Signal()
+    # UI events the core reacts to: they report what the application
+    # actually did, never a new backend state.
+    inputAccepted = Signal()      # a message or choice was accepted and sent on
+    modelApplied = Signal()       # the configured model / effort really changed
+    composingChanged = Signal()
 
     def __init__(
         self, backend: Backend, preferences: UiPreferences, *, sync: bool = False, parent: QObject | None = None
@@ -93,6 +98,8 @@ class Bridge(QObject):
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
         # -- state --
         self._busy = False
+        self._executing = False    # the current / last task run is an approved execution
+        self._composing = False
         self._core_state = "idle"
         self._session_id = ""
         self._task: dict[str, Any] = {}
@@ -116,12 +123,14 @@ class Bridge(QObject):
 
     # -- worker --------------------------------------------------------------
 
-    def _run(self, kind: str, fn: Callable[[], Any], on_done: Callable[[Any], None]) -> None:
+    def _run(self, kind: str, fn: Callable[[], Any], on_done: Callable[[Any], None],
+             executing: bool = False) -> None:
         sequence = self._sequence.get(kind, 0) + 1
         self._sequence[kind] = sequence
         self._handlers[(kind, sequence)] = on_done
         if kind == "task":
             self._busy = True
+            self._executing = executing
             self._refresh_core_state()
         if self.sync:
             self._on_finished(kind, sequence, _guarded(fn))
@@ -251,6 +260,24 @@ class Bridge(QObject):
     @Property(str, notify=stateChanged)
     def coreState(self) -> str:
         return self._core_state
+
+    @Property(bool, notify=stateChanged)
+    def executing(self) -> bool:
+        """The current (or most recent) task run is an approved execution or a
+        resume - as opposed to understanding a request, which may or may not
+        execute on its own. Read together with ``coreState``."""
+        return self._executing
+
+    @Property(bool, notify=composingChanged)
+    def composing(self) -> bool:
+        """The composer is being typed in right now (UI-only, never persisted)."""
+        return self._composing
+
+    @Slot(bool)
+    def setComposing(self, composing: bool) -> None:
+        if bool(composing) != self._composing:
+            self._composing = bool(composing)
+            self.composingChanged.emit()
 
     @Property(bool, notify=stateChanged)
     def executionEnabled(self) -> bool:
@@ -385,6 +412,7 @@ class Bridge(QObject):
         self._clarification = {}
         self.approvalChanged.emit()
         self._say("user", text)
+        self.inputAccepted.emit()
         session_id = self._session_id or None
         request_id = str(uuid4())
         self._request_id = request_id
@@ -411,6 +439,7 @@ class Bridge(QObject):
         self._clarification = {}
         self.approvalChanged.emit()
         self._say("user", label)
+        self.inputAccepted.emit()
         session_id = self._session_id or None
         request_id = str(uuid4())
         self._request_id = request_id
@@ -435,17 +464,17 @@ class Bridge(QObject):
 
     # -- slots: approval / task ------------------------------------------
 
-    def _decide(self, verb: Callable[[ApprovalTicket], dict]) -> None:
+    def _decide(self, verb: Callable[[ApprovalTicket], dict], executing: bool = False) -> None:
         ticket = self._ticket
         if ticket is None or self._busy:
             return
         self._ticket, self._approval = None, {}
         self.approvalChanged.emit()
-        self._run("task", lambda: verb(ticket), self._apply_run)
+        self._run("task", lambda: verb(ticket), self._apply_run, executing=executing)
 
     @Slot()
     def approve(self) -> None:
-        self._decide(self.backend.approve)
+        self._decide(self.backend.approve, executing=True)
 
     @Slot()
     def deny(self) -> None:
@@ -487,7 +516,7 @@ class Bridge(QObject):
         if self._busy:
             return
         self._session_id = str(session_id)
-        self._run("task", lambda: self.backend.resume(str(session_id), str(task_id)), self._apply_run)
+        self._run("task", lambda: self.backend.resume(str(session_id), str(task_id)), self._apply_run, executing=True)
 
     # -- slots: read-only data ---------------------------------------------
 
@@ -600,12 +629,15 @@ class Bridge(QObject):
 
     @Slot(str, str)
     def applyModel(self, model: str, effort: str) -> None:
+        before = (self._config.get("claude_model"), self._config.get("claude_effort"))
         payload: dict = {}
         for key, value in (("claude_model", str(model).strip()), ("claude_effort", str(effort).strip())):
             payload = self.backend.reset_config(key) if not value else self.backend.set_config(key, value)
             if payload.get("error") is not None:
                 break
         self._apply_config(payload)
+        if (self._config.get("claude_model"), self._config.get("claude_effort")) != before:
+            self.modelApplied.emit()
 
     # -- preferences / layout ------------------------------------------------
 

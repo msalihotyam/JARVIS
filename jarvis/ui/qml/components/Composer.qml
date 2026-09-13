@@ -74,7 +74,11 @@ Rectangle {
         enabled: !bridge.configRefused
         Keys.onReturnPressed: composer.submit()
         Keys.onEnterPressed: composer.submit()
+        // Real typing activity for the core: on while text is being entered,
+        // off 900 ms after the last edit or as soon as the field is empty.
+        onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
     }
+    Timer { id: composingQuiet; interval: 900; onTriggered: bridge.setComposing(false) }
     // A real affordance in the space the helper gives to tools this product
     // does not have: Enter sends.
     Text {

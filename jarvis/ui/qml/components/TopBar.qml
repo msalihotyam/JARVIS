@@ -270,12 +270,13 @@ Item {
         width: bar.coreDiameter; height: width
         state_: bridge.coreState
         active: Window.active
+        environment: !bar.narrow && !Theme.command
         Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
     }
     // The compact vertical status group, immediately right of the core and
     // clearly subordinate to it. Only states the installation genuinely
-    // reports are lit: there is no separate execution signal, so EXECUTING
-    // stays restrained rather than pretending activity.
+    // reports are lit: REASONING while a request is being understood,
+    // EXECUTING only while an approved execution or a resume is running.
     Item {
         id: ticker
         objectName: "coreStatusGroup"
@@ -290,7 +291,8 @@ Item {
                 model: ["LISTENING", "REASONING", "EXECUTING"]
                 Text {
                     readonly property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
-                                                || (modelData === "REASONING" && bridge.coreState === "running")
+                                                || (modelData === "REASONING" && bridge.coreState === "running" && !bridge.executing)
+                                                || (modelData === "EXECUTING" && bridge.coreState === "running" && bridge.executing)
                     text: modelData
                     color: lit ? "#eaf6ff" : Theme.textLabel
                     opacity: lit ? 1 : 0.7
