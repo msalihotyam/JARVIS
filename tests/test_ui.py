@@ -1169,6 +1169,74 @@ class CommandHeaderTests(UiTestCase):
         self.assertEqual("claude-opus-5", chip.property("modelName"))
         self.assertEqual(0, self.execute_calls())
 
+class LeftContextTests(UiTestCase):
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def test_clock_date_and_timezone_share_the_live_system_clock(self) -> None:
+        from PySide6.QtCore import QObject, QDate, QDateTime, QTime
+        root = self.window(self.bridge())
+        source = root.findChild(QObject, "systemClock")
+        context = self.item(root, "leftContextCard")
+        self.assertIsNotNone(source)
+        original = source.property("now")
+        pump(1150)
+        self.assertNotEqual(original, source.property("now"), "the system clock timer stopped")
+        for date, clock in ((QDate(2032, 12, 31), QTime(23, 59, 59)),
+                            (QDate(2033, 1, 1), QTime(0, 0, 0))):
+            instant = QDateTime(date, clock)
+            source.setProperty("now", instant)
+            pump(20)
+            self.assertEqual(instant.toString("HH:mm"), context.property("timeText"))
+            self.assertEqual(instant.toString("ddd, d MMM"), context.property("dateText"))
+            offset = instant.offsetFromUtc() // 60
+            zone = f"UTC{'-' if offset < 0 else '+'}{abs(offset) // 60:02}:{abs(offset) % 60:02}"
+            self.assertEqual(zone, context.property("zoneText"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_context_is_aligned_and_unclipped_at_supported_sizes(self) -> None:
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QFontDatabase
+        # Windows' offscreen plugin may expose no fonts at all and measure
+        # missing-glyph boxes. Real ink bounds are additionally exercised on
+        # the native Windows renderer; layout bounds remain portable.
+        native_fonts = bool(QFontDatabase.families())
+        root = self.window(self.bridge())
+        context = self.item(root, "leftContextCard")
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height); pump(500)
+            task = self.item(root, "railTasks")
+            a = context.mapToScene(QPointF(0, 0))
+            b = task.mapToScene(QPointF(0, 0))
+            with self.subTest(size=(width, height)):
+                self.assertTrue(context.isVisible())
+                self.assertEqual(a.x(), b.x())
+                self.assertEqual(context.width(), task.width())
+                self.assertAlmostEqual(12, b.y() - a.y() - context.height(), delta=1)
+                self.assertGreaterEqual(a.y(), 84)
+                self.assertGreaterEqual(context.height(), 130)
+                for name in ("contextClock", "contextDate", "contextTimeZone", "contextTemperature", "contextWeatherCondition"):
+                    text = self.item(root, name)
+                    pos = text.mapToItem(context, QPointF(0, 0))
+                    self.assertGreaterEqual(pos.x(), 0); self.assertGreaterEqual(pos.y(), 0)
+                    ink_width = text.property("contentWidth") if native_fonts else text.width()
+                    self.assertLessEqual(pos.x() + ink_width, context.width(), name)
+                    self.assertLessEqual(pos.y() + text.property("contentHeight"), context.height(), name)
+                clock = self.item(root, "contextClock")
+                weather = self.item(root, "contextWeather")
+                end = clock.mapToItem(context, QPointF(clock.property("contentWidth") if native_fonts else clock.width(), 0)).x()
+                self.assertLessEqual(end, weather.x())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_weather_remains_explicitly_unavailable_without_provider_or_city(self) -> None:
+        root = self.window(self.bridge())
+        self.assertEqual("--°", self.item(root, "contextTemperature").property("text"))
+        self.assertEqual("Not\nconnected", self.item(root, "contextWeatherCondition").property("text"))
+        context = self.item(root, "leftContextCard")
+        self.assertTrue(context.property("zoneText").startswith("UTC"))
+        self.assertEqual(0, self.execute_calls())
+
+
 class ConversationSurfaceTests(UiTestCase):
     """Phase 3: the summary modules leave the conversation for the left
     ambient rail, open anchored quick-look peeks, and the conversation and

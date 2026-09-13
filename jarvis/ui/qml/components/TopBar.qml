@@ -25,10 +25,7 @@ Item {
     signal closeRequested()
     signal openSettings()
     signal openModel()
-    property string clock: ""
-    property string meridiem: ""
-    property string date: ""
-    property string shortDate: ""
+    property date now: new Date()
     property bool fullscreen: true
     property bool settingsOpen: false
     property bool modelOpen: false
@@ -62,11 +59,6 @@ Item {
     readonly property bool tickerFits: !Theme.command && selectorMax >= 188
     readonly property real selectorWidth: tickerFits ? Math.min(Theme.chipWidth(width), selectorMax)
                                                      : Theme.chipWidth(width)
-
-    function tz() {
-        var m = -new Date().getTimezoneOffset(); var sign = m < 0 ? "-" : "+"; m = Math.abs(m)
-        return "UTC" + sign + ("0" + Math.floor(m / 60)).slice(-2) + ":" + ("0" + (m % 60)).slice(-2)
-    }
 
     // -- header linework ------------------------------------------------------
     // The reference runs one fine cyan line across the header, broken around
@@ -259,35 +251,14 @@ Item {
     Text { x: 120; y: 22; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 24; letterSpacing: 8.5; weight: Font.Normal } }
     Text { x: 122; y: 55; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 2.4 } }
 
-    Text {
-        visible: !Theme.command; x: bar.railInset + 2; y: Math.round(bar.viewportHeight * 0.1040)
-        width: bar.railWidth - bar.railInset - 10; elide: Text.ElideRight
-        // The rail keeps the real date; a tight rail abbreviates the month
-        // rather than eliding it.
-        text: bar.railWidth >= 190 ? bar.date : bar.shortDate
-        color: Theme.textLabel; font { family: Theme.font; pixelSize: 14; letterSpacing: 0.2 }
-    }
-    Row { visible: !Theme.command; x: bar.railInset; y: Math.round(bar.viewportHeight * 0.1185); spacing: 9
-        Text { text: bar.clock; color: "#9fdcff"; font { family: Theme.font; pixelSize: 40; weight: Font.Medium; letterSpacing: 0.4 } }
-        Text { text: bar.meridiem; color: "#9fdcff"; anchors.baseline: parent.children[0].baseline; font { family: Theme.font; pixelSize: 21; weight: Font.Medium; letterSpacing: 0.6 } }
-    }
-
-    // Local-context block (the reference's weather slot). No weather source
-    // exists, so it carries the real local time zone and says so.
-    Item {
-        id: contextBlock
-        x: bar.railInset; y: Math.round(bar.viewportHeight * 0.1980); width: bar.railWidth - bar.railInset - 8; height: 60
-        visible: !bar.narrow && !Theme.command
-        Item { id: contextMark; visible: bar.railWidth >= 220; width: 28; height: 28; y: 8
-            Rectangle { anchors.fill: parent; radius: 14; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.5) }
-            Rectangle { anchors.centerIn: parent; width: 14; height: 14; radius: 7; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.8) }
-            Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: Theme.accent }
-            Repeater { model: 8; Rectangle { width: 1; height: 4; color: Theme.accent; opacity: 0.7; x: 13.5; y: -2; transform: Rotation { origin.x: 0.5; origin.y: 16; angle: index * 45 } } }
-        }
-        Column { x: contextMark.visible ? 44 : 0; y: 2; width: parent.width - x; spacing: 3
-            Text { width: parent.width; elide: Text.ElideRight; text: bar.tz() + "  Local"; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
-            Text { width: parent.width; elide: Text.ElideRight; text: "Weather not connected"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
-        }
+    LeftContextCard {
+        visible: !Theme.command
+        x: 10
+        width: bar.railWidth - 20
+        // The accepted summary rail stays fixed; leave a deliberate 12 px gap.
+        height: Math.min(144, Math.round(bar.viewportHeight * 0.1980) + 76 - 12 - 84)
+        y: Math.round(bar.viewportHeight * 0.1980) + 76 - 12 - height
+        now: bar.now
     }
 
     // -- core + core-side status ----------------------------------------------

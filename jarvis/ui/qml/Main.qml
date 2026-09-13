@@ -62,7 +62,7 @@ Window {
     }
 
     Timer { interval: 1000; running: true; repeat: true; onTriggered: { clock.now = new Date() } }
-    QtObject { id: clock; property date now: new Date() }
+    QtObject { id: clock; objectName: "systemClock"; property date now: new Date() }
 
     Background { anchors.fill: parent; active: root.active }
 
@@ -75,10 +75,7 @@ Window {
         height: root.presentation === "command" ? 110 : Theme.topZone(root.height)
         railWidth: Theme.railWidth(root.width)
         viewportHeight: root.height
-        clock: Qt.formatTime(clock.now, "h:mm AP").split(" ")[0]
-        meridiem: Qt.formatTime(clock.now, "AP")
-        date: Qt.formatDate(clock.now, "ddd, d MMMM yyyy")
-        shortDate: Qt.formatDate(clock.now, "ddd, d MMM yyyy")
+        now: clock.now
         fullscreen: root.fullscreen
         settingsOpen: settings.open
         modelOpen: modelPanel.open
