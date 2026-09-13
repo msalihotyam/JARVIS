@@ -64,7 +64,16 @@ Window {
     Timer { interval: 1000; running: true; repeat: true; onTriggered: { clock.now = new Date() } }
     QtObject { id: clock; objectName: "systemClock"; property date now: new Date() }
 
-    Background { anchors.fill: parent; active: root.active }
+    // DEV background audition (JARVIS_UI_BACKGROUND_AUDITION=1 only): 0 is the
+    // production background; 1..4 put a candidate in the background image slot.
+    readonly property bool backgroundAudition: bridge.devBackgroundCandidates.length > 0
+    property int auditionIndex: 0
+    function audition(i) {
+        if (!backgroundAudition || i > bridge.devBackgroundCandidates.length) return
+        auditionIndex = i; auditionLabel.opacity = 1; auditionFade.restart()
+    }
+    Background { anchors.fill: parent; active: root.active
+        imageSource: root.backgroundAudition && root.auditionIndex > 0 ? bridge.devBackgroundCandidates[root.auditionIndex - 1] : "" }
 
     TopBar {
         id: topBar
@@ -139,7 +148,7 @@ Window {
             }
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
-        Component { id: canonicalPackage; CommandCenter {} }
+        Component { id: canonicalPackage; CommandCenter { atmosphere: root.auditionIndex === 0 } }
         Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
         Component { id: tasksPage; TasksPage {} }
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
@@ -256,10 +265,27 @@ Window {
     Shortcut { sequence: "Ctrl+Shift+F"; onActivated: bridge.setFocusMode(!bridge.focusMode) }
     Shortcut { sequence: "Ctrl+E"; onActivated: bridge.setEditMode(!bridge.editMode) }
     Shortcut { sequence: "Ctrl+M"; onActivated: root.toggleNav() }
-    Shortcut { sequence: "Ctrl+1"; onActivated: bridge.setPage("home") }
-    Shortcut { sequence: "Ctrl+2"; onActivated: bridge.setPage("tasks") }
-    Shortcut { sequence: "Ctrl+3"; onActivated: bridge.setPage("automations") }
-    Shortcut { sequence: "Ctrl+4"; onActivated: bridge.setPage("memory") }
+    // Ctrl+1..4 belong to the background audition while it is enabled.
+    Shortcut { sequence: "Ctrl+1"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("home") }
+    Shortcut { sequence: "Ctrl+2"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("tasks") }
+    Shortcut { sequence: "Ctrl+3"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("automations") }
+    Shortcut { sequence: "Ctrl+4"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("memory") }
+    Shortcut { sequence: "Ctrl+0"; enabled: root.backgroundAudition; onActivated: root.audition(0) }
+    Shortcut { sequence: "Ctrl+1"; enabled: root.backgroundAudition; onActivated: root.audition(1) }
+    Shortcut { sequence: "Ctrl+2"; enabled: root.backgroundAudition; onActivated: root.audition(2) }
+    Shortcut { sequence: "Ctrl+3"; enabled: root.backgroundAudition; onActivated: root.audition(3) }
+    Shortcut { sequence: "Ctrl+4"; enabled: root.backgroundAudition; onActivated: root.audition(4) }
+    Rectangle {
+        id: auditionLabel
+        visible: root.backgroundAudition && opacity > 0
+        opacity: 0; z: 9500; enabled: false
+        anchors { horizontalCenter: parent.horizontalCenter; top: parent.top; topMargin: 10 }
+        width: auditionText.width + 24; height: 26; radius: 6; color: "#d0000812"; border.width: 1; border.color: "#ff8080"
+        Text { id: auditionText; anchors.centerIn: parent; color: "#ff8080"
+            text: "DEV · " + (root.auditionIndex === 0 ? "CURRENT BACKGROUND" : "BACKGROUND " + root.auditionIndex + " / " + bridge.devBackgroundCandidates.length)
+            font { family: Theme.font; pixelSize: 11; letterSpacing: 1.5; weight: Font.DemiBold } }
+        SequentialAnimation { id: auditionFade; PauseAnimation { duration: 900 } NumberAnimation { target: auditionLabel; property: "opacity"; to: 0; duration: 250 } }
+    }
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
     Shortcut { sequence: "Ctrl+6"; onActivated: root.toggleSettings() }
     Shortcut { sequence: "Escape"; onActivated: {

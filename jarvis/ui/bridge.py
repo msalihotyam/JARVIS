@@ -299,6 +299,15 @@ class Bridge(QObject):
         path = os.environ.get("JARVIS_UI_DEV_REFERENCE", "").strip()
         return Path(path).resolve().as_uri() if path and Path(path).is_file() else ""
 
+    @Property("QVariantList", constant=True)
+    def devBackgroundCandidates(self) -> list:
+        """file:// URLs of the DEV background candidates, in order, when
+        JARVIS_UI_BACKGROUND_AUDITION=1; otherwise empty (audition off)."""
+        if os.environ.get("JARVIS_UI_BACKGROUND_AUDITION", "") != "1":
+            return []
+        folder = Path(__file__).resolve().parents[2] / "dev" / "background-candidates"
+        return [p.resolve().as_uri() for p in (folder / f"candidate-{i}.webp" for i in range(1, 5)) if p.is_file()]
+
     @Property(bool, constant=True)
     def devFixture(self) -> bool:
         """True when the DEV visual fixture (sample feed / activity text) is active."""
