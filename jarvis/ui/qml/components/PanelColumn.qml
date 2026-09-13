@@ -294,70 +294,61 @@ Item {
     }
     Component {
         id: activityPanel
-        Well {
-            fill: true
+        // The intelligence stream: one shared surface, a compact source
+        // glyph, the event, quieter metadata, the real relative time on the
+        // right, hairline separators between rows. Measured off the canonical
+        // reference: rows on a 48 px pitch at 1536 (60 at 1920), the text
+        // block 85 px in, the time 15 px from the edge. The model is the
+        // bridge's real activity list; when it is sparse the footer says so.
+        // The Loader sizes its root to the body, so the well sits inside a
+        // plain root and keeps its own height: whole rows only - it ends after
+        // its content when the stream is sparse and shows as many complete
+        // rows as fit when it is not.
+        Item {
+          id: feedRoot
+          Well {
+            id: feedWell
+            readonly property bool compact: column.commandMode || width < 380
+            readonly property int pitch: compact ? 46 : 56
+            readonly property int glyphD: compact ? 24 : 28
+            readonly property int rowsShown: bridge.activity.length + (bridge.activity.length < 4 ? 1 : 0)
+            readonly property int rowsFit: Math.max(1, Math.floor((feedRoot.height - 2) / pitch))
+            height: Math.min(rowsShown, rowsFit) * pitch + 2
             ListView {
-                width: parent.width; height: parent.parent.height - 2
+                width: parent.width; height: feedWell.height - 2
                 clip: true
                 model: bridge.activity
                 spacing: 0
                 delegate: Item {
-                    width: ListView.view.width; height: column.commandMode ? 47 : 60
-                    readonly property color tint: modelData.kind === "approval" ? "#c58a2a" : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : modelData.kind === "scheduled" ? "#22a877" : "#2f7fe0"
+                    width: ListView.view.width; height: feedWell.pitch
+                    readonly property bool semantic: modelData.kind === "approval" || modelData.kind === "unknown" || modelData.kind === "error"
+                    readonly property color tint: modelData.kind === "approval" ? Theme.warning : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : "#4fc3ef"
                     readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
-                    IconBox { x: 12; anchors.verticalCenter: parent.verticalCenter; width: 38; height: 38; glyph: parent.glyph; tint: parent.tint; solid: true; round: true; glyphSize: 16 }
-                    Column { anchors.left: parent.left; anchors.leftMargin: 62; anchors.right: timeText.left; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 2
-                        Text { text: modelData.text; color: Theme.text; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: column.commandMode ? 12 : 14 } }
-                        Text { text: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
+                    readonly property string source: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"
+                    // Source glyph: a small technical disc, blue unless the event itself is semantic.
+                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2
+                        color: semantic ? Theme.alpha(tint, 0.16) : "#143656"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : "#2a6a96"
+                        Text { anchors.centerIn: parent; text: glyph; color: tint; font { family: Theme.font; pixelSize: Math.round(feedWell.glyphD * 0.46); weight: Font.DemiBold } } }
+                    Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: timeText.left; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
+                        Text { text: modelData.text; color: "#f2f8ff"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
+                        Text { text: source; color: "#8ea6c2"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
                     }
-                    Text { id: timeText; anchors.right: parent.right; anchors.rightMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: column.ago(modelData.ts, modelData.time); color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
-                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: Theme.border; opacity: 0.55 }
+                    Text { id: timeText; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: column.ago(modelData.ts, modelData.time); color: "#8ea6c2"; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
+                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: "#1a3f5e"; opacity: 0.85 }
                 }
+                // Sparse and empty states share the row grammar, one step quieter.
                 footer: Item {
-                    width: ListView.view.width; height: bridge.activity.length < 4 ? 60 : 0
+                    width: ListView.view.width; height: visible ? feedWell.pitch : 0
                     visible: bridge.activity.length < 4
-                    Row { x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 12
-                        Rectangle { width: 38; height: 38; radius: 19; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.border, 0.9)
-                            Rectangle { anchors.centerIn: parent; width: 6; height: 6; radius: 3; color: Theme.textDim } }
-                        Column { anchors.verticalCenter: parent.verticalCenter; spacing: 2
-                            Text { text: "Nothing else yet"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 15 } }
-                            Text { text: "Approvals, outcomes and scheduled runs appear here"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
-                        }
+                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#1f4a6e"
+                        Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: "#4f6b8a" } }
+                    Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
+                        Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: "#cfdceb"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
+                        Text { text: "Approvals, outcomes and scheduled runs appear here"; color: "#6d88a6"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
                     }
                 }
             }
-        }
-    }
-    Component {
-        id: modelPanel
-        Item {
-            Row { id: identity; width: parent.width; spacing: 12
-                IconBox { width: 38; height: 38; tint: "#e9b777"; glyph: "AI"; solid: true }
-                Column { spacing: 3
-                    Text { text: bridge.config.claude_model || "Claude · CLI default"; color: Theme.text; font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
-                    Text { text: "Claude Code · subscription route"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
-                }
-            }
-            Column { anchors { left: parent.left; right: parent.right; top: identity.bottom; topMargin: 12 } spacing: 8
-                Repeater { model: [{k:"Execution",v:bridge.executionEnabled ? "Enabled" : "Disabled"},{k:"Effort",v:bridge.config.claude_effort || "CLI default"},{k:"Context window",v:"Not reported"}]
-                    Item { width: parent.width; height: 20
-                        Text { text: modelData.k; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
-                        Text { anchors.right: parent.right; text: modelData.v; color: modelData.k === "Execution" ? (bridge.executionEnabled ? Theme.success : Theme.danger) : Theme.textLabel; font { family: Theme.font; pixelSize: 12 } }
-                        Rectangle { width: parent.width; height: 1; y: 20; color: Theme.border }
-                    }
-                }
-            }
-        }
-    }
-    Component {
-        id: memoryPanel
-        Item {
-            Text { width: parent.width; wrapMode: Text.Wrap; visible: bridge.projects.length === 0; text: "No project memory loaded. Only explicit, stored reference data appears here."; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
-            Flow { width: parent.width; spacing: 8
-                Repeater { model: bridge.projects.slice(0, 8)
-                    Pill { text: modelData; tint: Theme.textMuted }
-                }
-            }
+          }
         }
     }
     Component {
