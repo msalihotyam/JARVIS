@@ -143,7 +143,7 @@ Item {
                 Flickable {
                     id: bodyViewport
                     anchors.fill: parent
-                    contentHeight: Math.max(height, modelData.id === "workflow" ? 166 : modelData.id === "system" ? (column.commandMode ? 138 : column.width < 400 ? 62 : 108) : 80)
+                    contentHeight: Math.max(height, modelData.id === "workflow" ? 166 : modelData.id === "system" ? (column.commandMode ? 138 : 0) : 80)
                     clip: true; boundsBehavior: Flickable.StopAtBounds
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                     Loader {
@@ -177,23 +177,32 @@ Item {
     // -- panel bodies -------------------------------------------------------
     // A quiet stat line: dot, key, value right-aligned (the reference's Uptime / Memory / Network list).
     component StatRow: Item {
-        property string k: ""; property string v: ""; property color tint: Theme.success; property color vColor: Theme.text
+        property string k: ""; property string v: ""; property color tint: Theme.accentSoft; property color vColor: "#f2f8ff"
+        property int size: 15
         width: parent.width; height: 30
-        Rectangle { width: 9; height: 9; radius: 4.5; color: tint; anchors.verticalCenter: parent.verticalCenter
-            Rectangle { anchors.centerIn: parent; width: 17; height: 17; radius: 8.5; color: tint; opacity: 0.22 } }
-        Text { x: 24; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.textLabel; font { family: Theme.font; pixelSize: 15 } }
-        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 96; horizontalAlignment: Text.AlignRight
-            text: v; color: vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
+        Rectangle { width: 7; height: 7; radius: 3.5; color: tint; anchors.verticalCenter: parent.verticalCenter
+            Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: tint; opacity: 0.2 } }
+        Text { x: 21; anchors.verticalCenter: parent.verticalCenter; text: k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: size } }
+        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 21 - kw.width - 10; horizontalAlignment: Text.AlignRight
+            text: v; color: vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: size; weight: Font.DemiBold } }
+        TextMetrics { id: kw; text: k; font.family: Theme.font; font.pixelSize: size }
     }
     // A gauge: the reference ring with the figure inside. Lit only when a real value exists.
     component Gauge: Item {
         property string label: ""; property string value: "—"; property real ratio: -1; property color tint: Theme.accent
-        width: 74; height: 74
-        Rectangle { anchors.fill: parent; radius: width / 2; color: Theme.alpha(Theme.bg0, 0.55); border.width: width < 60 ? 4 : 7; border.color: ratio < 0 ? Theme.alpha(Theme.textDim, 0.38) : Theme.alpha(tint, 0.9) }
-        Rectangle { anchors.fill: parent; anchors.margins: -3; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(tint, ratio < 0 ? 0.12 : 0.35) }
-        Column { anchors.centerIn: parent; spacing: -2
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? Theme.textMuted : Theme.text; font { family: Theme.font; pixelSize: column.width < 400 ? 13 : 20; weight: Font.DemiBold } }
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: Theme.textLabel; font { family: Theme.font; pixelSize: column.width < 400 ? 9 : 11; letterSpacing: 0.6 } }
+        width: 60; height: 60
+        readonly property real stroke: Math.max(3, Math.round(width * 0.085))
+        // Soft halo, then the track, then the dark glass disc and its edge light.
+        Rectangle { anchors.fill: parent; anchors.margins: -4; radius: width / 2; color: "transparent"; border.width: 1; border.color: ratio < 0 ? "#2a5f8f" : Theme.alpha(tint, 0.35); opacity: 0.6 }
+        Rectangle { anchors.fill: parent; radius: width / 2; color: "#0a1a2c"; border.width: stroke; border.color: ratio < 0 ? "#1c4a74" : Theme.alpha(tint, 0.9) }
+        Rectangle { anchors.fill: parent; anchors.margins: stroke; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#2a6a96"; opacity: 0.45 }
+        Rectangle { anchors.fill: parent; anchors.margins: stroke + 1; radius: width / 2
+            gradient: Gradient { GradientStop { position: 0; color: "#14102a44" } GradientStop { position: 1; color: "#00000000" } } }
+        // A calibration tick at 12 o'clock: instrument, not value.
+        Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 1; width: 2; height: stroke - 2; color: "#4d9fd2"; opacity: 0.8 }
+        Column { anchors.centerIn: parent; spacing: width < 48 ? -3 : -1
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? "#8fa8c4" : "#f2f8ff"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 12 : parent.parent.width < 56 ? 15 : 18; weight: Font.DemiBold } }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: "#c3d8ea"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 8 : 10; letterSpacing: 0.8 } }
         }
     }
     // One row of the reference's workflow well: icon box, label, dot, status, handle.
@@ -223,23 +232,39 @@ Item {
     Component {
         id: systemPanel
         Item {
+            id: sys
+            readonly property real bw: width
+            readonly property real bh: height
+            // Ring diameter from the width the body really has, then the
+            // cluster; the status list takes the rest when it has room.
+            readonly property int d: bw >= 460 ? 60 : bw >= 360 ? 48 : 40
+            readonly property int g: Math.round(d * (bw >= 360 ? 0.55 : 0.45))
+            readonly property int clusterW: 3 * d + 2 * g
+            readonly property bool list: bw - clusterW - 22 >= 135
+            readonly property int pitch: Math.max(20, Math.min(bh >= 110 ? 38 : 34, Math.floor(bh / 3)))
+            readonly property int fs: bw >= 460 ? 15 : 13
+            readonly property bool caption: bh >= d + 34
+            // The ring centre line: shared by the cluster and the list.
+            readonly property real cy: caption ? (bh - 16) / 2 : bh / 2
             Row {
                 id: gauges
-                anchors.left: parent.left; anchors.top: parent.top; anchors.leftMargin: 4; anchors.topMargin: column.width < 400 ? 3 : 6
-                spacing: column.width < 400 ? Math.max(10, (parent.width - 150) / 2) : 23
-                // Not measured by this build: unlit slots, said plainly below.
-                Gauge { label: "CPU"; width: column.width < 400 ? 44 : 74; height: width }
-                Gauge { label: "RAM"; width: column.width < 400 ? 44 : 74; height: width }
-                Gauge { label: "Disk"; width: column.width < 400 ? 44 : 74; height: width }
+                x: 2; y: Math.round(sys.cy - sys.d / 2)
+                spacing: sys.g
+                Gauge { label: "CPU"; width: sys.d; height: width }
+                Gauge { label: "RAM"; width: sys.d; height: width }
+                Gauge { label: "Disk"; width: sys.d; height: width }
             }
-            Text { anchors.left: parent.left; anchors.leftMargin: 4; anchors.top: gauges.bottom; anchors.topMargin: column.width < 400 ? 3 : 7; text: column.width < 400 ? "Telemetry not measured" : "CPU · RAM · Disk are not measured by this build"; color: Theme.textDim; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.4 } }
+            // Said plainly, once, beneath the cluster - the rings carry "—".
+            Text { visible: sys.caption; x: 4; y: gauges.y + sys.d + 9; width: sys.clusterW; horizontalAlignment: Text.AlignHCenter
+                   text: "Not measured by this build"; color: "#6d88a6"; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.8 } }
             Column {
-                anchors { left: gauges.right; right: parent.right; top: parent.top; leftMargin: 26; topMargin: 4 }
-                visible: parent.width >= 430
+                visible: sys.list
+                x: sys.clusterW + 22; width: sys.bw - x
+                y: Math.round(sys.cy - 1.5 * sys.pitch)
                 spacing: 0
-                StatRow { k: "Uptime"; v: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m" }
-                StatRow { k: "Execution"; v: bridge.configRefused ? "Refused" : (bridge.executionEnabled ? "Enabled" : "Disabled"); tint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success; vColor: tint }
-                StatRow { k: "Model"; v: bridge.config.claude_model || "CLI default" }
+                StatRow { height: sys.pitch; size: sys.fs; k: "Uptime"; v: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m" }
+                StatRow { height: sys.pitch; size: sys.fs; k: "Execution"; v: bridge.configRefused ? "Refused" : (bridge.executionEnabled ? "Enabled" : "Disabled"); tint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success; vColor: tint }
+                StatRow { height: sys.pitch; size: sys.fs; k: "Model"; v: bridge.config.claude_model || "CLI default" }
             }
         }
     }
