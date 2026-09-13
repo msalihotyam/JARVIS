@@ -134,8 +134,9 @@ Item {
     // -- provider identity in its own inset instrument frame ---------------
     Rectangle {
         id: badge
+        objectName: "selectorBadge"
         x: 12; anchors.verticalCenter: parent.verticalCenter
-        width: 34; height: 34; radius: 9
+        width: 30; height: 30; radius: 8
         color: Theme.surfaceDeep
         border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.34)
         Rectangle {
@@ -143,9 +144,10 @@ Item {
             color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.text, 0.05)
         }
         Text {
-            anchors.centerIn: parent; anchors.horizontalCenterOffset: -1
-            text: "A\\"; color: Theme.text
-            font { family: Theme.font; pixelSize: 17; weight: Font.DemiBold; letterSpacing: -1 }
+            objectName: "selectorLogo"
+            anchors.centerIn: parent
+            text: "AI"; color: Theme.text
+            font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold }
         }
     }
 
@@ -153,28 +155,30 @@ Item {
     Column {
         id: identity
         anchors.verticalCenter: parent.verticalCenter
-        x: badge.x + badge.width + 12
-        width: Math.max(40, chevron.x - x - 10)
+        x: badge.x + badge.width + 8
+        width: Math.max(40, chevron.x - x - 8)
         spacing: 1
         Text {
             width: parent.width; elide: Text.ElideRight
+            objectName: "selectorModelText"
             text: sel.modelName
             color: Theme.text
-            font { family: Theme.font; pixelSize: Theme.fsLead; weight: Font.Medium }
+            font { family: Theme.font; pixelSize: sel.width >= 240 ? Theme.fsLead : 14; weight: Font.Medium }
         }
         Text {
             visible: sel.metadata !== ""
             width: parent.width; elide: Text.ElideRight
-            text: sel.metadata
+            objectName: "selectorMetadataText"
+            text: sel.metadata.replace(/\s*\|\s*/g, " | ")
             color: Theme.textDim
-            font { family: Theme.font; pixelSize: Theme.fsLabel; letterSpacing: 1.5 }
+            font { family: Theme.font; pixelSize: sel.width >= 220 ? 10 : 9; letterSpacing: sel.width >= 240 ? 0.8 : 0 }
         }
     }
 
     // -- chevron: drawn, precise, rotates when open ------------------------
     Shape {
         id: chevron
-        x: sel.width - 20 - width; anchors.verticalCenter: parent.verticalCenter
+        x: sel.width - 16 - width; anchors.verticalCenter: parent.verticalCenter
         width: 14; height: 9
         preferredRendererType: Shape.CurveRenderer
         rotation: sel.open ? 180 : 0

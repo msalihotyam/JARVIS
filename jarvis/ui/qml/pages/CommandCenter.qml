@@ -84,6 +84,6 @@ GlassPanel {
     // The composer: 94 % of the surface, centred, the surface's bottom anchor.
     Composer { id: composer; objectName: "canonicalComposer"; height: page.roomy ? 79 : 66
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                  leftMargin: page.roomy ? page.at(15) : 6; rightMargin: page.roomy ? page.at(15) : 6; bottomMargin: page.roomy ? -page.at(3) : 6 }
+                  leftMargin: page.roomy ? page.at(15) : 8; rightMargin: page.roomy ? page.at(15) : 8; bottomMargin: 10 }
     }
 }

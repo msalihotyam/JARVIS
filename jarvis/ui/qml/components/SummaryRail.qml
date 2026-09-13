@@ -86,8 +86,9 @@ Item {
                              : (rail.liveJobs.length ? (rail.roomy ? "Nothing enabled" : "None enabled") : (rail.roomy ? "Nothing scheduled" : "None yet")) }
     ]
 
-    // -- layout budget: the secondary line goes first, then micro spacing ---
-    readonly property real cardFull: Math.min(118, Math.max(84, width * 0.52))
+    // Share the available height, which already excludes the lower HUD.
+    // Extra space is breathing room for real content, never invented rows.
+    readonly property real cardFull: Math.max(84, (height - 36) / 4)
     readonly property real cardCompact: 50
     readonly property bool showNote: 4 * cardFull + 30 <= height
     readonly property real cardHeight: showNote ? cardFull : cardCompact

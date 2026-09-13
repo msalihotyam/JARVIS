@@ -1281,8 +1281,8 @@ class ConversationSurfaceTests(UiTestCase):
                     self.assertGreaterEqual(card[3] - card[1], 84)
                     if width == 1920:
                         self.assertGreaterEqual(card[2] - card[0], work[0] * 0.90)
-                        self.assertGreaterEqual(card[3] - card[1], 108)
-                        self.assertLessEqual(card[3] - card[1], 124)
+                        self.assertGreaterEqual(card[3] - card[1], 150)
+                        self.assertLessEqual(card[3] - card[1], 190)
                     if key != "Tasks":
                         self.assertGreaterEqual(card[1] - previous_bottom, 10)
                         self.assertLessEqual(card[1] - previous_bottom, 14)
@@ -1292,6 +1292,10 @@ class ConversationSurfaceTests(UiTestCase):
                     self.assertGreaterEqual(card[0], 0)
                     self.assertLessEqual(card[3], height)
                     previous_bottom = card[3]
+                # Phase 3.4b: the four cards share the available height; the
+                # rail itself still reserves the existing lower HUD area.
+                self.assertAlmostEqual(previous_bottom, rail[3], delta=1)
+                self.assertGreaterEqual(height - previous_bottom, 60)
                 # The composer stays inside the work surface and on screen.
                 self.assertGreaterEqual(composer[0], work[0]); self.assertLessEqual(composer[2], work[2])
                 self.assertLessEqual(composer[3], work[3]); self.assertLessEqual(work[3], height)
@@ -1395,6 +1399,92 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertFalse(self.item(root, "summaryPeekEmpty").isVisible())
         self.assertIn("JARVIS interface started", self.texts(self.item(root, "summaryPeek"), []))
         self.assertEqual(0, self.execute_calls())
+
+class LocalFitTests(UiTestCase):
+    """Phase 3.4b: local fit and real pointer routing, no backend activity."""
+
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+    sizes = ((1920, 1080), (1536, 864), (1280, 760))
+
+    def test_settings_owns_clicks_above_visible_rail_and_keeps_blue_accent(self):
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in self.sizes:
+            root.resize(width, height); pump(450)
+            self.click(root, "settingsOrb")
+            panel = self.item(root, "settingsSurface")
+            self.assertTrue(self.item(root, "summaryRail").isVisible())
+            self.assertGreater(panel.parentItem().z(), self.item(root, "summaryRail").z())
+            self.assertEqual("#36aaff", panel.parentItem().property("surfaceEdge").name())
+            # Use a point inside BOTH a rail card and the Dark package choice,
+            # not its centre (which lies safely to the right of the rail).
+            choice = self.item(root, "package_dark")
+            for key in ("Tasks", "Updates", "Focus", "Plan"):
+                card = self.item(root, "rail" + key)
+                p = card.mapToScene(QPointF(0, 0))
+                q = choice.mapToScene(QPointF(0, 0))
+                left = max(p.x(), q.x()); right = min(p.x() + card.width(), q.x() + choice.width())
+                top = max(p.y(), q.y()); bottom = min(p.y() + card.height(), q.y() + choice.height())
+                if right - left > 8 and bottom - top > 8:
+                    QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPointF((left + right) / 2, (top + bottom) / 2).toPoint())
+                    break
+            else:
+                self.fail("Regression point must overlap a visible rail card")
+            pump(500)
+            self.assertEqual("dark", bridge.theme)
+            self.assertTrue(root.property("settingsOpen"))
+            self.assertFalse(root.property("peekOpen"))
+            QTest.keyClick(root, Qt.Key_Escape); pump(250)
+            self.assertFalse(root.property("settingsOpen"))
+            bridge.setTheme("space"); pump(500)
+            self.click(root, "settingsOrb")
+            self.click(root, "settingsSurfaceClose")
+            self.assertFalse(root.property("settingsOpen"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_entire_composer_rim_and_bloom_fit_every_clipping_ancestor(self):
+        from PySide6.QtCore import QPointF
+        root = self.window(self.bridge())
+        for width, height in self.sizes:
+            root.resize(width, height); pump(450)
+            composer = self.item(root, "canonicalComposer")
+            ancestor = composer.parentItem()
+            while ancestor:
+                if ancestor.clip():
+                    top = composer.mapToItem(ancestor, QPointF(-8, -8))
+                    bottom = composer.mapToItem(ancestor, QPointF(composer.width() + 8, composer.height() + 8))
+                    self.assertGreaterEqual(top.x(), -0.1)
+                    self.assertGreaterEqual(top.y(), -0.1)
+                    self.assertLessEqual(bottom.x(), ancestor.width() + 0.1)
+                    self.assertLessEqual(bottom.y(), ancestor.height() + 0.1)
+                ancestor = ancestor.parentItem()
+
+    def test_selector_internal_fit_with_real_effort_metadata(self):
+        from PySide6.QtGui import QFontDatabase
+        bridge = self.bridge()
+        bridge.applyModel("", "medium")
+        root = self.window(bridge)
+        native_fonts = bool(QFontDatabase.families())
+        for width, height in self.sizes:
+            root.resize(width, height); pump(450)
+            badge = self.item(root, "selectorBadge")
+            logo = self.item(root, "selectorLogo")
+            if native_fonts:
+                self.assertLessEqual(logo.width(), badge.width() - 6)
+            self.assertLessEqual(logo.height(), badge.height() - 6)
+            for name in ("selectorModelText", "selectorMetadataText"):
+                label = self.item(root, name)
+                self.assertTrue(label.isVisible())
+                self.assertGreater(label.width(), 90)
+                if native_fonts:
+                    self.assertLessEqual(label.property("contentWidth"), label.width(), (width, name, label.property("text")))
+                    self.assertFalse(label.property("truncated"), (width, name, label.property("text")))
+                self.assertLessEqual(label.parentItem().height(), self.item(root, "modelTrigger").height() - 12)
+        self.assertEqual(0, self.execute_calls())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -8,6 +8,7 @@ Rectangle {
     id: seg
     property var options: []
     property string value: ""
+    property color accent: Theme.accent
     signal picked(string value)
     implicitHeight: 34
     implicitWidth: row.width + 6
@@ -26,10 +27,10 @@ Rectangle {
                 readonly property bool on: modelData.value === seg.value
                 readonly property bool hovered: m.containsMouse && seg.enabled
                 width: t.width + 24; height: 28; radius: Theme.radiusSmall - 3
-                color: on ? Theme.alpha(Theme.accent, 0.18) : hovered ? Theme.alpha(Theme.text, 0.05) : "transparent"
-                border.width: 1; border.color: on ? Theme.alpha(Theme.accent, 0.6) : "transparent"
+                color: on ? Theme.alpha(seg.accent, 0.18) : hovered ? Theme.alpha(Theme.text, 0.05) : "transparent"
+                border.width: 1; border.color: on ? Theme.alpha(seg.accent, 0.6) : "transparent"
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                Text { id: t; anchors.centerIn: parent; text: modelData.label; color: on ? Theme.accent : (hovered ? Theme.text : Theme.textLabel)
+                Text { id: t; anchors.centerIn: parent; text: modelData.label; color: on ? seg.accent : (hovered ? Theme.text : Theme.textLabel)
                     font { family: Theme.font; pixelSize: 12; weight: on ? Font.DemiBold : Font.Normal } }
                 MouseArea { id: m; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: seg.picked(modelData.value) }
             }

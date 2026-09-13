@@ -9,6 +9,7 @@ Rectangle {
     property bool primary: false
     property bool danger: false
     property bool compact: false
+    property color accent: Theme.accent
     signal clicked()
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
@@ -17,7 +18,7 @@ Rectangle {
     Keys.onReturnPressed: if (enabled) clicked()
     Keys.onSpacePressed: if (enabled) clicked()
 
-    readonly property color tone: danger ? Theme.danger : Theme.accent
+    readonly property color tone: danger ? Theme.danger : accent
     readonly property bool hovered: area.containsMouse && enabled
     readonly property bool pressed: area.pressed && enabled
 
