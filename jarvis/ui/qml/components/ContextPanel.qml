@@ -67,7 +67,7 @@ Item {
         Item { id: heading; width: parent.width; height: context.header ? 50 : 34
             Text { visible: !context.header; anchors.verticalCenter: parent.verticalCenter; text: context.heading; color: Theme.text; font { family: Theme.font; pixelSize: 13; letterSpacing: 2.4; weight: Font.DemiBold } }
             Loader { active: !!context.header; sourceComponent: context.header; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 44 }
-            IconButton { objectName: context.surfaceName + "Close"; anchors.right: parent.right; glyph: "✕"; tip: "Close"; onClicked: context.open = false }
+            IconButton { objectName: context.surfaceName + "Close"; anchors.right: parent.right; glyph: "✕"; tip: qsTr("Close"); onClicked: context.open = false }
         }
         Rectangle { visible: !context.header; anchors.top: heading.bottom; width: parent.width; height: 1; color: Theme.border }
         Item { id: inner; anchors { left: parent.left; right: parent.right; top: heading.bottom; bottom: parent.bottom; topMargin: context.header ? 16 : 20 } }

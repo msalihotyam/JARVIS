@@ -50,17 +50,17 @@ Rectangle {
         spacing: 2
         visible: strip.items.length > 1
         width: visible ? implicitWidth : 0
-        IconButton { objectName: "attentionPrev"; glyph: "‹"; tip: "Previous item"; width: 30; height: 30; enabled: strip.current > 0; onClicked: strip.index = strip.current - 1 }
+        IconButton { objectName: "attentionPrev"; glyph: "‹"; tip: qsTr("Previous item"); width: 30; height: 30; enabled: strip.current > 0; onClicked: strip.index = strip.current - 1 }
         Text { objectName: "attentionCount"; anchors.verticalCenter: parent.verticalCenter; width: 48; horizontalAlignment: Text.AlignHCenter
-               text: (strip.current + 1) + " of " + strip.items.length; color: Theme.textLabel; font: Theme.metadata }
-        IconButton { objectName: "attentionNext"; glyph: "›"; tip: "Next item"; width: 30; height: 30; enabled: strip.current < strip.items.length - 1; onClicked: strip.index = strip.current + 1 }
+               text: qsTr("%1 of %2").arg(strip.current + 1).arg(strip.items.length); color: Theme.textLabel; font: Theme.metadata }
+        IconButton { objectName: "attentionNext"; glyph: "›"; tip: qsTr("Next item"); width: 30; height: 30; enabled: strip.current < strip.items.length - 1; onClicked: strip.index = strip.current + 1 }
     }
     ActionButton {
         id: reviewButton
         objectName: "attentionReview"
         anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
         height: 34; compact: true
-        label: "Review  ›"
+        label: qsTr("Review") + "  ›"
         onClicked: strip.review(strip.item.key)
     }
 }

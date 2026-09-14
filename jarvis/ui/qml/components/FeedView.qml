@@ -22,7 +22,6 @@ import "../theme"
 // appears; no overflow, no scrollbar.
 Item {
     id: feed
-    property bool pipelineEnabled: false
     property bool referenceLayout: false
     // The conversation-integrated safety cards, after the last entry (MAIN / DARK).
     property bool safetyCards: false
@@ -31,10 +30,6 @@ Item {
     readonly property int avatarSize: referenceLayout ? 36 : 50
     readonly property int messageX: referenceLayout ? avatarSize + 12 : 68
     readonly property int strip: 16
-    readonly property int pipelineIndex: {
-        var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
-        return first < 0 ? bridge.feed.length - 1 : first
-    }
     // For inspection: the scroll state.
     readonly property alias contentY: flick.contentY
     readonly property alias contentHeight: flick.contentHeight
@@ -72,15 +67,15 @@ Item {
     }
     function kindLabel(kind) {
         switch (kind) {
-        case "user": return "You"
+        case "user": return qsTr("You")
         case "jarvis": return "JARVIS"
-        case "error": return "ERROR"
-        case "unknown": return "OUTCOME UNKNOWN"
-        case "approval": return "APPROVAL"
-        case "clarify": return "JARVIS · needs one detail"
-        case "scheduled": return "SCHEDULED"
-        case "data": return "UNTRUSTED DATA"
-        default: return "SYSTEM"
+        case "error": return qsTr("ERROR")
+        case "unknown": return qsTr("OUTCOME UNKNOWN")
+        case "approval": return qsTr("APPROVAL")
+        case "clarify": return qsTr("JARVIS · needs one detail")
+        case "scheduled": return qsTr("SCHEDULED")
+        case "data": return qsTr("UNTRUSTED DATA")
+        default: return qsTr("SYSTEM")
         }
     }
 
@@ -124,7 +119,6 @@ Item {
                     objectName: "feedRow_" + kind
                     width: stack.width
                     height: Math.max(row.isUser ? 0 : avatar.height, card.height + stamp.height + stamp.gap)
-                            + (pipelineLoader.active ? pipelineLoader.height + pipelineLoader.gap : 0)
                     readonly property string kind: modelData.kind
                     readonly property bool isUser: kind === "user"
                     readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
@@ -139,18 +133,6 @@ Item {
                         NumberAnimation { target: row; property: "opacity"; to: 1; duration: Theme.panelIn; easing.type: Easing.OutCubic }
                         NumberAnimation { target: slide; property: "y"; to: 0; duration: Theme.panelIn; easing.type: Easing.OutCubic }
                     }
-                    // The existing four-stage lifecycle rides with the first JARVIS
-                    // turn (or the last entry before one): real state, never a plan.
-                    Loader {
-                        id: pipelineLoader
-                        readonly property int gap: feed.referenceLayout ? 12 : 22
-                        x: row.isUser ? 0 : card.x
-                        y: Math.max(row.isUser ? 0 : avatar.height, card.height + stamp.height + stamp.gap) + gap
-                        width: parent.width - x
-                        active: feed.pipelineEnabled && index === feed.pipelineIndex
-                        sourceComponent: Component { StagePipeline { notes: false; reference: feed.referenceLayout } }
-                    }
-
                     // -- avatar column (JARVIS and the state markers; not the operator) --
                     Item {
                         id: avatar

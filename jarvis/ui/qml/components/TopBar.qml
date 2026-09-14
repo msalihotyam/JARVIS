@@ -191,7 +191,7 @@ Item {
         readonly property bool hovered: orbArea.containsMouse
         readonly property bool lit: hovered || bar.settingsOpen
         activeFocusOnTab: true
-        Accessible.role: Accessible.Button; Accessible.name: "General Settings"
+        Accessible.role: Accessible.Button; Accessible.name: qsTr("General Settings")
         Keys.onReturnPressed: bar.openSettings()
         Keys.onSpacePressed: bar.openSettings()
         Rectangle { anchors.fill: parent; anchors.margins: -5; radius: width / 2; color: "transparent"; border.color: Theme.accent; visible: orb.activeFocus }
@@ -246,12 +246,12 @@ Item {
             visible: orb.hovered && !bar.settingsOpen
             anchors.top: parent.bottom; anchors.topMargin: 10; anchors.horizontalCenter: parent.horizontalCenter
             width: tipText.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
-            Text { id: tipText; anchors.centerIn: parent; text: "Settings"; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
+            Text { id: tipText; anchors.centerIn: parent; text: qsTr("Settings"); color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
         }
     }
     Text { objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
            lineHeightMode: Text.FixedHeight; lineHeight: 34 }
-    Text { objectName: "brandTagline"; x: 122; y: 55; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font: Theme.hudLabel
+    Text { objectName: "brandTagline"; x: 122; y: 55; text: qsTr("THINKS AHEAD FOR YOU"); color: Theme.textLabel; font: Theme.hudLabel
            lineHeightMode: Text.FixedHeight; lineHeight: 16 }
 
     LeftContextCard {
@@ -296,7 +296,7 @@ Item {
                     readonly property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
                                                 || (modelData === "REASONING" && bridge.coreState === "running" && !bridge.executing)
                                                 || (modelData === "EXECUTING" && bridge.coreState === "running" && bridge.executing)
-                    text: modelData
+                    text: ({ LISTENING: qsTr("LISTENING"), REASONING: qsTr("REASONING"), EXECUTING: qsTr("EXECUTING") })[modelData]
                     color: lit ? "#eaf6ff" : Theme.textLabel
                     opacity: lit ? 1 : 0.7
                     font: Theme.hudLabel
@@ -315,6 +315,62 @@ Item {
         color: Theme.stateColor(bridge.coreState)
         font: Theme.hudLabel
         Behavior on color { ColorAnimation { duration: 200 } }
+    }
+
+    // -- lifecycle progress ------------------------------------------------------
+    // The current request's four stages, quiet in the header between the
+    // wordmark and the core: filled when done, lit with a faint halo for the
+    // current stage, hollow and dim for what is still ahead. Projected by the
+    // bridge (bridge.progress) from authoritative state and shown only while
+    // there is real work - never a ghost at idle. No chrome, no motion.
+    Item {
+        id: progress
+        objectName: "hudProgress"
+        readonly property var stages: bridge.progress.stages || []
+        // Ends just short of the core; reaches toward the rail, at most 360 px.
+        readonly property real endX: bar.coreCx - bar.coreDiameter * 0.5 - bar.width * 0.02
+        visible: bridge.progress.active === true && stages.length === 4 && width >= 240
+        width: Math.max(0, Math.min(360, endX - bar.railWidth - 24)); height: 50
+        x: endX - width
+        y: bar.coreCy + Math.round(bar.viewportHeight * 0.03) - 6
+        readonly property real pitch: width / 4
+        Repeater {
+            model: 3
+            Rectangle { x: progress.pitch * (index + 0.5) + 10; y: 5.5; width: progress.pitch - 20; height: 1
+                        color: progress.stages[index] === "done" ? Theme.alpha(Theme.accent, 0.5) : Theme.alpha(Theme.hud, 0.3) }
+        }
+        Repeater {
+            model: 4
+            Item {
+                id: step
+                objectName: "hudStage_" + index
+                x: progress.pitch * index; width: progress.pitch; height: parent.height
+                readonly property string s: progress.stages[index] || "pending"
+                readonly property bool current: ["running", "waiting", "error", "unknown", "denied"].indexOf(s) >= 0
+                readonly property color tone: s === "waiting" ? Theme.warning : s === "unknown" ? Theme.unknownEdge
+                                              : s === "error" || s === "denied" ? Theme.danger : Theme.accent
+                Accessible.role: Accessible.StaticText
+                Accessible.name: label.text + ": " + ({ pending: qsTr("Pending"), waiting: qsTr("Awaiting you"), running: qsTr("Running"), done: qsTr("Completed"),
+                                                        error: qsTr("Failed"), unknown: qsTr("Outcome unknown"), denied: qsTr("Denied"), skipped: qsTr("Not run") })[s]
+                Rectangle { visible: step.current; x: (parent.width - width) / 2; y: -4; width: 20; height: 20; radius: 10; color: Theme.alpha(step.tone, 0.18) }
+                Rectangle {
+                    objectName: "hudStageNode_" + index
+                    x: (parent.width - width) / 2; y: 0; width: 12; height: 12; radius: 6
+                    color: step.s === "done" ? Theme.alpha(Theme.accent, 0.8) : step.current ? step.tone : "transparent"
+                    border.width: step.s === "done" || step.current ? 0 : 1.5
+                    border.color: Theme.alpha(Theme.textLabel, 0.5)
+                }
+                Text {
+                    id: label
+                    x: -5; y: 19; width: parent.width + 10
+                    horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                    text: [qsTr("Understanding your request"), qsTr("Authorization"), qsTr("Execution"), qsTr("Outcome")][index]
+                    color: step.current ? step.tone : step.s === "done" ? Theme.text : Theme.textLabel
+                    opacity: step.current || step.s === "done" ? 1 : 0.75
+                    font: Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: 15
+                }
+            }
+        }
     }
 
     // -- the command strip ----------------------------------------------------
@@ -339,7 +395,7 @@ Item {
             width: bar.selectorWidth; height: Theme.stripSelectorHeight
             open: bar.modelOpen
             // Real state: the configured model, or the CLI's own default.
-            modelName: bridge.config.claude_model ? bridge.config.claude_model : "CLI default"
+            modelName: bridge.config.claude_model ? bridge.config.claude_model : qsTr("CLI default")
             metadata: bar.selectorWidth >= 240 ? "ANTHROPIC  |  CLI" : "ANTHROPIC"
                       + (bridge.config.claude_effort ? "  |  " + String(bridge.config.claude_effort).toUpperCase() : "")
             onActivated: bar.openModel()
@@ -359,14 +415,14 @@ Item {
                 lit: bridge.executionState === "running"
                 skin: bridge.statusIndicator
                 Accessible.role: Accessible.Indicator
-                Accessible.name: bridge.executionState === "unconfirmed" ? "JARVIS status: unconfirmed" : bridge.configRefused ? "JARVIS status: configuration refused" : bridge.executionState === "frozen" ? "JARVIS status: frozen" : bridge.executionState === "freeze_requested" ? "JARVIS status: freeze requested" : (bridge.busy ? "JARVIS status: running an operation" : "JARVIS status: ready")
+                Accessible.name: bridge.executionState === "unconfirmed" ? qsTr("JARVIS status: unconfirmed") : bridge.configRefused ? qsTr("JARVIS status: configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS status: frozen") : bridge.executionState === "freeze_requested" ? qsTr("JARVIS status: freeze requested") : (bridge.busy ? qsTr("JARVIS status: running an operation") : qsTr("JARVIS status: ready"))
                 MouseArea { id: orbHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
                 Rectangle {
                     visible: orbHover.containsMouse
                     anchors.top: parent.bottom; anchors.topMargin: 2; anchors.horizontalCenter: parent.horizontalCenter
                     width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
                     Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font { family: Theme.font; pixelSize: 11 }
-                        text: bridge.executionState === "unconfirmed" ? "JARVIS state unconfirmed" : bridge.configRefused ? "Configuration refused" : bridge.executionState === "frozen" ? "JARVIS frozen" : bridge.executionState === "freeze_requested" ? "Freeze requested" : (bridge.busy ? "Running · operation in progress" : "Running") }
+                        text: bridge.executionState === "unconfirmed" ? qsTr("JARVIS state unconfirmed") : bridge.configRefused ? qsTr("Configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS frozen") : bridge.executionState === "freeze_requested" ? qsTr("Freeze requested") : (bridge.busy ? qsTr("Running · operation in progress") : qsTr("Running")) }
                 }
             }
         }
@@ -394,7 +450,7 @@ Item {
                 objectName: "killSwitchLabel"
                 anchors { horizontalCenter: killControl.horizontalCenter; top: killControl.bottom; topMargin: 5 }
                 horizontalAlignment: Text.AlignHCenter
-                text: ({ frozen: "FROZEN", freeze_requested: "FREEZING", resuming: "RESUMING", unconfirmed: "STATE\nUNCONFIRMED", refused: "FROZEN" })[bridge.executionState] || "FREEZE"
+                text: ({ frozen: qsTr("FROZEN"), freeze_requested: qsTr("FREEZING"), resuming: qsTr("RESUMING"), unconfirmed: qsTr("STATE\nUNCONFIRMED"), refused: qsTr("FROZEN") })[bridge.executionState] || qsTr("FREEZE")
                 color: bridge.executionState === "running" || bridge.executionState === "unknown" ? Theme.textLabel : Theme.danger
                 font { family: Theme.font; pixelSize: 8; letterSpacing: 1.1; weight: Font.DemiBold }
                 lineHeight: 0.95
@@ -405,7 +461,7 @@ Item {
             id: navigationTrigger
             objectName: "navigationTrigger"
             y: controls.mid - height / 2
-            tip: "Navigation"; width: 38; height: 38; onClicked: bar.menuRequested()
+            tip: qsTr("Navigation"); width: 38; height: 38; onClicked: bar.menuRequested()
             Grid { anchors.centerIn: parent; columns: 2; spacing: 4
                 Repeater { model: 4; Rectangle { width: 6; height: 6; radius: index === 3 ? 1 : 3; color: "transparent"; border.width: 1.4; border.color: Theme.accent } } }
         }
@@ -420,9 +476,9 @@ Item {
         Row {
             y: controls.mid - height / 2
             spacing: 2
-            IconButton { glyph: "–"; tip: "Minimize"; width: 34; height: 34; onClicked: bar.minimizeRequested() }
-            IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 34; height: 34; onClicked: bar.restoreRequested() }
-            IconButton { objectName: "windowCloseControl"; glyph: "✕"; tip: bridge.trayAvailable ? "Hide to tray - JARVIS keeps running" : "Close"; width: 34; height: 34; onClicked: bar.closeRequested() }
+            IconButton { glyph: "–"; tip: qsTr("Minimize"); width: 34; height: 34; onClicked: bar.minimizeRequested() }
+            IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? qsTr("Windowed") : qsTr("Full screen"); width: 34; height: 34; onClicked: bar.restoreRequested() }
+            IconButton { objectName: "windowCloseControl"; glyph: "✕"; tip: bridge.trayAvailable ? qsTr("Hide to tray - JARVIS keeps running") : qsTr("Close"); width: 34; height: 34; onClicked: bar.closeRequested() }
         }
     }
 
@@ -432,7 +488,7 @@ Item {
                   rightMargin: Math.round(bar.width * Theme.macroStripRight) + 8
                   topMargin: Math.round(bar.viewportHeight * 0.1130) }
         objectName: "editLayoutTrigger"
-        tip: bridge.editMode ? "Done editing" : "Edit workspace layout"
+        tip: bridge.editMode ? qsTr("Done editing") : qsTr("Edit workspace layout")
         active: bridge.editMode
         framed: true
         width: 34; height: 34

@@ -7,27 +7,27 @@ import "../components"
 // is not chat and grants no authority.
 SecondaryPage {
     id: page
-    title: "Memory"
+    title: qsTr("Memory")
     property string project: ""
     property bool includeInactive: false
     headerRight: [
-        ActionButton { label: page.includeInactive ? "Active only" : "Include superseded / retired"; onClicked: { page.includeInactive = !page.includeInactive; bridge.refreshMemory(page.project, page.includeInactive) } },
-        ActionButton { label: "Load"; primary: true; onClicked: bridge.refreshMemory(page.project, page.includeInactive) }
+        ActionButton { label: page.includeInactive ? qsTr("Active only") : qsTr("Include superseded / retired"); onClicked: { page.includeInactive = !page.includeInactive; bridge.refreshMemory(page.project, page.includeInactive) } },
+        ActionButton { label: qsTr("Load"); primary: true; onClicked: bridge.refreshMemory(page.project, page.includeInactive) }
     ]
     Component.onCompleted: bridge.refreshMemory(page.project, page.includeInactive)
 
     Column {
         anchors.fill: parent
         spacing: 12
-        Text { text: "Project memory is explicit reference data written only by you. It is shown as data: nothing here is an instruction to JARVIS."; color: Theme.textMuted; width: parent.width; wrapMode: Text.Wrap; font { family: Theme.font; pixelSize: 12 } }
+        Text { text: qsTr("Project memory is explicit reference data written only by you. It is shown as data: nothing here is an instruction to JARVIS."); color: Theme.textMuted; width: parent.width; wrapMode: Text.Wrap; font { family: Theme.font; pixelSize: 12 } }
         Row {
             spacing: 8
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "PROJECT"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("PROJECT"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             Repeater {
                 model: bridge.projects
                 ActionButton { label: modelData; primary: modelData === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData; bridge.refreshMemory(modelData, page.includeInactive) } }
             }
-            Text { visible: bridge.projects.length === 0; anchors.verticalCenter: parent.verticalCenter; text: "No project exists yet ('jarvis project create')."; color: Theme.textDim; font { family: Theme.font; pixelSize: 12 } }
+            Text { visible: bridge.projects.length === 0; anchors.verticalCenter: parent.verticalCenter; text: qsTr("No project exists yet (%1).").arg("'jarvis project create'"); color: Theme.textDim; font { family: Theme.font; pixelSize: 12 } }
         }
         ListView {
             width: parent.width; height: parent.height - 90; clip: true; spacing: 6

@@ -15,29 +15,29 @@ Item {
     z: 400
 
     readonly property var commands: [
-        { label: "New task (focus composer)", run: function() { bridge.setPage("home"); palette.focusComposer() } },
-        { label: "New session", run: function() { bridge.newSession(); bridge.setPage("home") } },
-        { label: "Open Command Center", run: function() { bridge.setPage("home") } },
-        { label: "Open Tasks", run: function() { bridge.setPage("tasks") } },
-        { label: "Open Automations", run: function() { bridge.setPage("automations") } },
-        { label: "Open Memory", run: function() { bridge.setPage("memory") } },
-        { label: "Open History", run: function() { bridge.setPage("history") } },
-        { label: "Open Settings (theme / model / effort / layout)", run: function() { palette.settingsRequested() } },
-        { label: "Toggle Focus Mode", run: function() { bridge.setFocusMode(!bridge.focusMode) } },
-        { label: "Toggle Edit Layout", run: function() { bridge.setEditMode(!bridge.editMode) } },
-        { label: "Reset layout", run: function() { bridge.resetLayout() } },
-        { label: "Layout profile: Normal", run: function() { bridge.setProfile("normal") } },
-        { label: "Layout profile: Focus", run: function() { bridge.setProfile("focus") } },
-        { label: "Layout profile: Monitoring", run: function() { bridge.setProfile("monitoring") } },
-        { label: "Theme: Canonical Space", run: function() { bridge.setTheme("space") } },
-        { label: "Theme: Dark", run: function() { bridge.setTheme("dark") } },
-        { label: "Ambient effects: toggle", run: function() { bridge.setAmbientEffects(!bridge.ambientEffects) } },
-        { label: "Cancel current task", run: function() { bridge.cancelTask() } },
-        { label: bridge.executionEnabled ? "Freeze JARVIS" : "Resume JARVIS", run: function() { palette.lifecycleRequested() } },
-        { label: "Refresh history", run: function() { bridge.refreshHistory() } },
-        { label: "Refresh automations", run: function() { bridge.refreshJobs(false) } },
+        { label: qsTr("New task (focus composer)"), run: function() { bridge.setPage("home"); palette.focusComposer() } },
+        { label: qsTr("New session"), run: function() { bridge.newSession(); bridge.setPage("home") } },
+        { label: qsTr("Open Command Center"), run: function() { bridge.setPage("home") } },
+        { label: qsTr("Open Tasks"), run: function() { bridge.setPage("tasks") } },
+        { label: qsTr("Open Automations"), run: function() { bridge.setPage("automations") } },
+        { label: qsTr("Open Memory"), run: function() { bridge.setPage("memory") } },
+        { label: qsTr("Open History"), run: function() { bridge.setPage("history") } },
+        { label: qsTr("Open Settings (theme / model / effort / layout)"), run: function() { palette.settingsRequested() } },
+        { label: qsTr("Toggle Focus Mode"), run: function() { bridge.setFocusMode(!bridge.focusMode) } },
+        { label: qsTr("Toggle Edit Layout"), run: function() { bridge.setEditMode(!bridge.editMode) } },
+        { label: qsTr("Reset layout"), run: function() { bridge.resetLayout() } },
+        { label: qsTr("Layout profile: Normal"), run: function() { bridge.setProfile("normal") } },
+        { label: qsTr("Layout profile: Focus"), run: function() { bridge.setProfile("focus") } },
+        { label: qsTr("Layout profile: Monitoring"), run: function() { bridge.setProfile("monitoring") } },
+        { label: qsTr("Theme: Canonical Space"), run: function() { bridge.setTheme("space") } },
+        { label: qsTr("Theme: Dark"), run: function() { bridge.setTheme("dark") } },
+        { label: qsTr("Ambient effects: toggle"), run: function() { bridge.setAmbientEffects(!bridge.ambientEffects) } },
+        { label: qsTr("Cancel current task"), run: function() { bridge.cancelTask() } },
+        { label: bridge.executionEnabled ? qsTr("Freeze JARVIS") : qsTr("Resume JARVIS"), run: function() { palette.lifecycleRequested() } },
+        { label: qsTr("Refresh history"), run: function() { bridge.refreshHistory() } },
+        { label: qsTr("Refresh automations"), run: function() { bridge.refreshJobs(false) } },
     ]
-    property var matches: commands.filter(function(c) { return c.label.toLowerCase().indexOf(search.text.toLowerCase()) >= 0 })
+    property var matches: commands.filter(function(c) { return c.label.toLocaleLowerCase(i18n.language).indexOf(search.text.toLocaleLowerCase(i18n.language)) >= 0 })
     signal focusComposer()
 
     function show() { open = true; search.text = ""; cursor = 0; search.forceActiveFocus() }
@@ -66,7 +66,7 @@ Item {
             Rectangle { width: parent.width; height: 44; radius: Theme.radiusSmall; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.6)
                 Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: Theme.radiusSmall + 3; color: Theme.alpha(Theme.accent, 0.1) }
                 Text { x: 14; anchors.verticalCenter: parent.verticalCenter; text: "›"; color: Theme.accent; font.pixelSize: 18 }
-                TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: "Type a command…"; placeholderTextColor: Theme.textDim; font { family: Theme.font; pixelSize: 15 }
+                TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: qsTr("Type a command…"); placeholderTextColor: Theme.textDim; font { family: Theme.font; pixelSize: 15 }
                     onTextChanged: palette.cursor = 0
                     Keys.onDownPressed: palette.cursor = Math.min(palette.cursor + 1, palette.matches.length - 1)
                     Keys.onUpPressed: palette.cursor = Math.max(palette.cursor - 1, 0)

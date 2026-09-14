@@ -7,15 +7,15 @@ import "../components"
 // listing. Bounded, read-only.
 SecondaryPage {
     id: page
-    title: "History"
-    headerRight: [ ActionButton { label: "Refresh"; onClicked: bridge.refreshHistory() } ]
+    title: qsTr("History")
+    headerRight: [ ActionButton { label: qsTr("Refresh"); onClicked: bridge.refreshHistory() } ]
 
     Row {
         anchors.fill: parent
         spacing: Theme.gap
         Column {
             width: parent.width * 0.5 - Theme.gap / 2; height: parent.height; spacing: 8
-            Text { text: "THIS INTERFACE SESSION"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { text: qsTr("THIS INTERFACE SESSION"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             ListView {
                 width: parent.width; height: parent.height - 24; clip: true; spacing: 6
                 model: bridge.activity
@@ -30,7 +30,7 @@ SecondaryPage {
         }
         Column {
             width: parent.width * 0.5 - Theme.gap / 2; height: parent.height; spacing: 8
-            Text { text: "DURABLE SESSIONS (most recent 20)"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { text: qsTr("DURABLE SESSIONS (most recent %1)").arg(20); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             ListView {
                 width: parent.width; height: parent.height - 24; clip: true; spacing: 4
                 model: bridge.sessions
@@ -40,7 +40,7 @@ SecondaryPage {
                     color: "transparent"; border.width: 1; border.color: Theme.border
                     Column { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 2
                         Text { text: modelData.session_id; color: Theme.text; font { family: Theme.mono; pixelSize: 11 } }
-                        Text { text: (modelData.updated_at || "") + "  ·  " + (modelData.task_count || 0) + " tasks  ·  active: " + (modelData.active_task_id || "none") + (modelData.readable === false ? "  ·  UNREADABLE" : ""); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
+                        Text { text: (modelData.updated_at || "") + "  ·  " + qsTr("%1 tasks").arg(modelData.task_count || 0) + "  ·  " + qsTr("active: %1").arg(modelData.active_task_id || qsTr("none")) + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : ""); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
                     }
                     MouseArea { anchors.fill: parent; onClicked: { bridge.useSession(modelData.session_id); bridge.setPage("home") } }
                 }

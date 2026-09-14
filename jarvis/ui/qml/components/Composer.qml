@@ -55,9 +55,9 @@ Rectangle {
             padding: 0
             wrapMode: TextArea.Wrap
             verticalAlignment: TextEdit.AlignVCenter
-            placeholderText: bridge.approvalPending ? "Answer the pending approval first"
-                            : bridge.configRefused ? "Configuration refused - repair it with: jarvis config reset --all"
-                            : (bridge.task.status === "awaiting_clarification" ? "Answer JARVIS's question…" : "Message JARVIS…")
+            placeholderText: bridge.approvalPending ? qsTr("Answer the pending approval first")
+                            : bridge.configRefused ? qsTr("Configuration refused - repair it with: %1").arg("jarvis config reset --all")
+                            : (bridge.task.status === "awaiting_clarification" ? qsTr("Answer JARVIS's question…") : qsTr("Message JARVIS…"))
             placeholderTextColor: Theme.textLabel
             color: Theme.text
             font: Theme.composerText
@@ -87,7 +87,7 @@ Rectangle {
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
-        Accessible.name: "Send message"
+        Accessible.name: qsTr("Send message")
         Accessible.onPressAction: composer.submit()
         Keys.onReturnPressed: composer.submit()
         Keys.onSpacePressed: composer.submit()
@@ -139,7 +139,7 @@ Rectangle {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         Row { id: stopRow; anchors.centerIn: parent; spacing: 8
             Rectangle { width: 8; height: 8; radius: 2; color: Theme.danger; anchors.verticalCenter: parent.verticalCenter }
-            Text { text: "Stop"; color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } } }
+            Text { text: qsTr("Stop"); color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } } }
         MouseArea { id: stopArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (!bridge.cancelText()) bridge.cancelTask() } }
     }
 }

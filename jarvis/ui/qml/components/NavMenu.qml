@@ -3,7 +3,7 @@ import "../theme"
 
 ContextPanel {
     id: nav
-    heading: "NAVIGATE"
+    heading: qsTr("NAVIGATE")
     surfaceName: "navSurface"
     panelWidth: 300; panelHeight: 326
     function go(page) { bridge.setPage(page); nav.open = false }
@@ -11,11 +11,11 @@ ContextPanel {
         width: parent.width; spacing: 4
         Repeater {
             model: [
-                { page: "home", label: "Command Center", key: "1", glyph: "⌂" },
-                { page: "tasks", label: "Tasks", key: "2", glyph: "◇" },
-                { page: "automations", label: "Automations", key: "3", glyph: "⟳" },
-                { page: "memory", label: "Memory", key: "4", glyph: "▤" },
-                { page: "history", label: "History", key: "5", glyph: "◷" }
+                { page: "home", label: qsTr("Command Center"), key: "1", glyph: "⌂" },
+                { page: "tasks", label: qsTr("Tasks"), key: "2", glyph: "◇" },
+                { page: "automations", label: qsTr("Automations"), key: "3", glyph: "⟳" },
+                { page: "memory", label: qsTr("Memory"), key: "4", glyph: "▤" },
+                { page: "history", label: qsTr("History"), key: "5", glyph: "◷" }
             ]
             Rectangle {
                 id: entry

@@ -23,7 +23,7 @@ Item {
     implicitHeight: Theme.stripSelectorHeight
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
-    Accessible.name: "Model and provider"
+    Accessible.name: qsTr("Model and provider")
     Accessible.description: sel.modelName + (sel.metadata ? ", " + sel.metadata : "")
     Keys.onReturnPressed: sel.activated()
     Keys.onSpacePressed: sel.activated()

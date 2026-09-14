@@ -257,14 +257,14 @@ QtObject {
     }
     function stateLabel(state) {
         switch (state) {
-        case "running": return "REASONING / EXECUTING"
-        case "awaiting_approval": return "AWAITING APPROVAL"
-        case "awaiting_input": return "AWAITING YOUR ANSWER"
-        case "completed": return "COMPLETED"
-        case "error": return "ERROR"
-        case "unknown": return "OUTCOME UNKNOWN"
-        case "disabled": return "JARVIS FROZEN"
-        default: return "IDLE"
+        case "running": return qsTr("REASONING / EXECUTING")
+        case "awaiting_approval": return qsTr("AWAITING APPROVAL")
+        case "awaiting_input": return qsTr("AWAITING YOUR ANSWER")
+        case "completed": return qsTr("COMPLETED")
+        case "error": return qsTr("ERROR")
+        case "unknown": return qsTr("OUTCOME UNKNOWN")
+        case "disabled": return qsTr("JARVIS FROZEN")
+        default: return qsTr("IDLE")
         }
     }
 }

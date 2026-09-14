@@ -7,14 +7,14 @@ import "../components"
 // with Resume for a task that is genuinely parked.
 SecondaryPage {
     id: page
-    title: "Tasks"
+    title: qsTr("Tasks")
     property string selectedSession: ""
     property string selectedTask: ""
     property var selectedTaskRow: null
     headerRight: [
-        ActionButton { label: "Refresh"; onClicked: bridge.refreshHistory() },
-        ActionButton { label: "Use this session"; enabled: page.selectedSession !== "" && !bridge.busy; onClicked: bridge.useSession(page.selectedSession) },
-        ActionButton { label: "Resume task"; primary: true
+        ActionButton { label: qsTr("Refresh"); onClicked: bridge.refreshHistory() },
+        ActionButton { label: qsTr("Use this session"); enabled: page.selectedSession !== "" && !bridge.busy; onClicked: bridge.useSession(page.selectedSession) },
+        ActionButton { label: qsTr("Resume task"); primary: true
             enabled: !bridge.busy && page.selectedTaskRow !== null && ["awaiting_approval", "awaiting_clarification", "awaiting_cost_override"].indexOf(page.selectedTaskRow.status) >= 0
             onClicked: { bridge.resumeTask(page.selectedSession, page.selectedTask); bridge.setPage("home") } }
     ]
@@ -24,7 +24,7 @@ SecondaryPage {
         spacing: Theme.gap
         Column {
             width: parent.width * 0.32; height: parent.height; spacing: 8
-            Text { text: "SESSIONS (most recent 20)"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { text: qsTr("SESSIONS (most recent %1)").arg(20); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             ListView {
                 width: parent.width; height: parent.height - 24; clip: true; spacing: 4
                 model: bridge.sessions
@@ -36,7 +36,7 @@ SecondaryPage {
                     border.width: 1; border.color: current ? Theme.accent : Theme.border
                     Column { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 2
                         Text { text: modelData.session_id; color: Theme.text; font { family: Theme.mono; pixelSize: 11 } width: parent.parent.width - 20; elide: Text.ElideMiddle }
-                        Text { text: (modelData.updated_at || "") + "  ·  " + (modelData.task_count || 0) + " tasks" + (modelData.readable === false ? "  ·  UNREADABLE" : ""); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
+                        Text { text: (modelData.updated_at || "") + "  ·  " + qsTr("%1 tasks").arg(modelData.task_count || 0) + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : ""); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
                     }
                     MouseArea { anchors.fill: parent; onClicked: { page.selectedSession = modelData.session_id; page.selectedTask = ""; page.selectedTaskRow = null; bridge.loadTasks(modelData.session_id) } }
                 }
@@ -44,7 +44,7 @@ SecondaryPage {
         }
         Column {
             width: parent.width * 0.30; height: parent.height; spacing: 8
-            Text { text: "TASKS"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { text: qsTr("TASKS"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             ListView {
                 width: parent.width; height: parent.height - 24; clip: true; spacing: 4
                 model: page.selectedSession !== "" ? bridge.tasks : []
@@ -65,7 +65,7 @@ SecondaryPage {
         }
         Column {
             width: parent.width - parent.width * 0.62 - Theme.gap * 2; height: parent.height; spacing: 8
-            Text { text: "SNAPSHOT"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+            Text { text: qsTr("SNAPSHOT"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
             ListView {
                 width: parent.width; height: parent.height - 24; clip: true; spacing: 10
                 model: page.selectedTask !== "" ? bridge.taskDetail : []

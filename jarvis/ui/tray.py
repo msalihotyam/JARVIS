@@ -16,6 +16,8 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Qt, Slot
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QWindow
 
+from jarvis.ui.i18n import QT_TRANSLATE_NOOP, tx
+
 #: Ring colours for the restrained state badge: normal, frozen, attention.
 _RING = {"running": "#3aa8f0", "frozen": "#ff5c6c", "attention": "#ffb347"}
 
@@ -33,10 +35,14 @@ class TrayController(QObject):
 
     def status_text(self) -> str:
         state = self.bridge.executionState
-        base = {"frozen": "Frozen", "freeze_requested": "Freeze requested", "resuming": "Resuming",
-                "unconfirmed": "State unconfirmed", "refused": "Configuration refused"}.get(state, "Running")
+        base = tx("Tray", {"frozen": QT_TRANSLATE_NOOP("Tray", "Frozen"),
+                           "freeze_requested": QT_TRANSLATE_NOOP("Tray", "Freeze requested"),
+                           "resuming": QT_TRANSLATE_NOOP("Tray", "Resuming"),
+                           "unconfirmed": QT_TRANSLATE_NOOP("Tray", "State unconfirmed"),
+                           "refused": QT_TRANSLATE_NOOP("Tray", "Configuration refused")}.get(state, QT_TRANSLATE_NOOP("Tray", "Running")))
+        attention = tx("Tray", QT_TRANSLATE_NOOP("Tray", "Attention required"))
         if self._attention():
-            return f"JARVIS — {base} · Attention required" if base != "Running" else "JARVIS — Attention required"
+            return f"JARVIS — {base} · {attention}" if state not in ("running", "unknown") else f"JARVIS — {attention}"
         return f"JARVIS — {base}"
 
     def badge(self) -> str:
@@ -47,8 +53,16 @@ class TrayController(QObject):
     def lifecycle_action(self) -> tuple[str, bool]:
         """The menu's Freeze / Resume entry: its label and whether it acts."""
         if self.bridge.executionState == "refused":
-            return "Frozen — configuration refused", False
-        return ("Freeze JARVIS", True) if self.bridge.executionEnabled else ("Resume JARVIS", True)
+            return tx("Tray", QT_TRANSLATE_NOOP("Tray", "Frozen — configuration refused")), False
+        return ((tx("Tray", QT_TRANSLATE_NOOP("Tray", "Freeze JARVIS")), True) if self.bridge.executionEnabled
+                else (tx("Tray", QT_TRANSLATE_NOOP("Tray", "Resume JARVIS")), True))
+
+    def menu_labels(self) -> tuple[str, str]:
+        """Open and Quit, in the current language."""
+        return tx("Tray", QT_TRANSLATE_NOOP("Tray", "Open JARVIS")), tx("Tray", QT_TRANSLATE_NOOP("Tray", "Quit JARVIS"))
+
+    def hidden_message(self) -> str:
+        return tx("Tray", QT_TRANSLATE_NOOP("Tray", "JARVIS is still running in the background."))
 
     @Slot()
     def open(self) -> None:
@@ -102,13 +116,17 @@ def install_tray(app, bridge, window):
     controller = TrayController(bridge, window, app)
     icon = QSystemTrayIcon(_icon("running"), app)
     menu = QMenu()
-    menu.addAction("Open JARVIS", controller.open)
-    lifecycle = menu.addAction("Freeze JARVIS", controller.toggle_lifecycle)
+    open_action = menu.addAction("", controller.open)
+    lifecycle = menu.addAction("", controller.toggle_lifecycle)
     menu.addSeparator()
-    menu.addAction("Quit JARVIS", controller.quit)
+    quit_action = menu.addAction("", controller.quit)
     icon.setContextMenu(menu)
 
     def refresh() -> None:
+        # Every label is re-read here, so a language switch reaches the menu too.
+        open_label, quit_label = controller.menu_labels()
+        open_action.setText(open_label)
+        quit_action.setText(quit_label)
         label, enabled = controller.lifecycle_action()
         lifecycle.setText(label)
         lifecycle.setEnabled(enabled)
@@ -120,11 +138,12 @@ def install_tray(app, bridge, window):
     def hidden() -> None:
         if not told:                             # once per run, never on every X
             told.append(True)
-            icon.showMessage("JARVIS", "JARVIS is still running in the background.",
+            icon.showMessage("JARVIS", controller.hidden_message(),
                              QSystemTrayIcon.MessageIcon.Information, 4000)
 
     icon.activated.connect(lambda reason: controller.open() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
     bridge.attentionChanged.connect(refresh)
+    bridge.languageChanged.connect(refresh)
     bridge.hiddenToTray.connect(hidden)
     app.aboutToQuit.connect(icon.hide)
     refresh()

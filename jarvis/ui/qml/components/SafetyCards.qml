@@ -22,6 +22,12 @@ Column {
              : key === "outcome" ? outcomeHeading : null
     }
 
+    // Core's side-effect codes as words; an unknown code stays as Core wrote it.
+    function effectWord(code) {
+        return ({ external_egress: qsTr("data leaves this computer"), local_write: qsTr("writes local files"), destructive: qsTr("destructive change"),
+                  billing: qsTr("may incur cost"), push_deploy_publish: qsTr("pushes, deploys or publishes"),
+                  financial_or_form_submit: qsTr("submits a form or payment"), read_only: qsTr("read only"), none: qsTr("no side effect") })[code] || code
+    }
     function toneColor(tone) {
         return tone === "danger" ? Theme.danger : tone === "warning" ? Theme.warning
              : tone === "success" ? Theme.success : tone === "unknown" ? Theme.unknownEdge : Theme.accentSoft
@@ -84,17 +90,17 @@ Column {
             id: executionBody
             x: 76; y: 16; width: parent.width - 96; spacing: 6
             Heading { id: executionHeading; objectName: "safetyHeading_execution"; width: parent.width; color: executionCard.tone
-                      text: ({ frozen: "JARVIS frozen", freeze_requested: "Freeze requested — waiting for the current operation",
-                               unconfirmed: "JARVIS state unconfirmed", refused: "Configuration refused — execution off" })[executionCard.st] || "" }
+                      text: ({ frozen: qsTr("JARVIS frozen"), freeze_requested: qsTr("Freeze requested — waiting for the current operation"),
+                               unconfirmed: qsTr("JARVIS state unconfirmed"), refused: qsTr("Configuration refused — execution off") })[executionCard.st] || "" }
             Text { objectName: "safetyExecutionText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
                    text: executionCard.st === "unconfirmed"
-                         ? "The last request to freeze or resume JARVIS was not confirmed, so JARVIS does not show it as running or frozen until a request is confirmed."
-                         : executionCard.st === "refused" ? "The stored configuration was refused, so execution stays off. Repair it with: jarvis config reset --all"
+                         ? qsTr("The last request to freeze or resume JARVIS was not confirmed, so JARVIS does not show it as running or frozen until a request is confirmed.")
+                         : executionCard.st === "refused" ? qsTr("The stored configuration was refused, so execution stays off. Repair it with: %1").arg("jarvis config reset --all")
                          : executionCard.st === "freeze_requested"
-                           ? "Nothing new can start. The operation that is running now stops at its next safe point, then JARVIS is frozen. A step that is already under way - such as a message being sent - is not interrupted."
-                           : "Nothing new can start, and paused work stays where it stopped. JARVIS stays open: your conversation, results and history are here, and you can still reject a pending approval." }
+                           ? qsTr("Nothing new can start. The operation that is running now stops at its next safe point, then JARVIS is frozen. A step that is already under way - such as a message being sent - is not interrupted.")
+                           : qsTr("Nothing new can start, and paused work stays where it stopped. JARVIS stays open: your conversation, results and history are here, and you can still reject a pending approval.") }
             Text { visible: executionCard.st === "frozen" || executionCard.st === "freeze_requested"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
-                   text: "Freezing does not undo anything already sent to its destination. Resume JARVIS from the red control or the tray." }
+                   text: qsTr("Freezing does not undo anything already sent to its destination. Resume JARVIS from the red control or the tray.") }
         }
     }
 
@@ -112,50 +118,50 @@ Column {
             id: approvalBody
             x: 76; y: 18; width: parent.width - 96; spacing: 8
             Heading { id: approvalHeading; objectName: "safetyHeading_approval"; width: parent.width; color: Theme.warning
-                      text: approvalCard.a.complete ? "Approval required" : "Approval details unavailable" }
+                      text: approvalCard.a.complete ? qsTr("Approval required") : qsTr("Approval details unavailable") }
             Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
-                   text: approvalCard.a.complete ? (approvalCard.a.summary || approvalCard.a.reason || "Review this action before authorizing it.")
-                                                 : "Core's request is missing details needed to approve it safely, so approval is unavailable." }
+                   text: approvalCard.a.complete ? (approvalCard.a.summary || approvalCard.a.reason || qsTr("Review this action before authorizing it."))
+                                                 : qsTr("Core's request is missing details needed to approve it safely, so approval is unavailable.") }
             Column {
                 width: parent.width
-                Field { k: "Action"; v: (approvalCard.a.action || "Not reported") + (approvalCard.a.target ? " — " + approvalCard.a.target : "") }
-                Field { k: "Connector"; v: approvalCard.a.connector || "Not reported" }
-                Field { k: "Capability"; v: approvalCard.a.capability || "Not reported" }
-                Field { k: "Destination"; v: approvalCard.a.destination || "Not reported"; vColor: Theme.accent }
-                Field { k: "Authority"; v: "This request only" + (approvalCard.a.data_classification ? " · " + approvalCard.a.data_classification + " data" : "") }
-                Field { visible: !!approvalCard.a.effect; k: "Consequence"
-                        v: (approvalCard.a.effect || "") + (approvalCard.a.reversible ? " · reversible" : " · not reversible") }
+                Field { k: qsTr("Action"); v: (approvalCard.a.action || qsTr("Not reported")) + (approvalCard.a.target ? " — " + approvalCard.a.target : "") }
+                Field { k: qsTr("Connector"); v: approvalCard.a.connector || qsTr("Not reported") }
+                Field { k: qsTr("Capability"); v: approvalCard.a.capability || qsTr("Not reported") }
+                Field { k: qsTr("Destination"); v: approvalCard.a.destination || qsTr("Not reported"); vColor: Theme.accent }
+                Field { k: qsTr("Authority"); v: approvalCard.a.data_classification ? qsTr("This request only · %1 data").arg(approvalCard.a.data_classification) : qsTr("This request only") }
+                Field { visible: !!approvalCard.a.effect; k: qsTr("Consequence")
+                        v: cards.effectWord(approvalCard.a.effect || "") + " · " + (approvalCard.a.reversible ? qsTr("reversible") : qsTr("not reversible")) }
             }
             // Review action details: what Core attached to the exact request.
             Item {
                 width: parent.width; height: 36
                 Text { id: detailsToggle; objectName: "approvalDetailsToggle"; anchors.verticalCenter: parent.verticalCenter
                        property bool open: false
-                       text: (open ? "Hide action details" : "Review action details") + "  ›"; color: Theme.accent; font: Theme.uiLabel
-                       activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: "Review action details"
+                       text: (open ? qsTr("Hide action details") : qsTr("Review action details")) + "  ›"; color: Theme.accent; font: Theme.uiLabel
+                       activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: qsTr("Review action details")
                        Keys.onReturnPressed: open = !open; Keys.onSpacePressed: open = !open
                        MouseArea { anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.PointingHandCursor; onClicked: detailsToggle.open = !detailsToggle.open } }
             }
             Column {
                 visible: detailsToggle.open; width: parent.width
-                Field { k: "Why"; v: approvalCard.a.reason || "Not reported" }
-                Field { visible: !!approvalCard.a.outbound_preview; k: "Outbound"; v: approvalCard.a.outbound_preview || "" }
-                Field { k: "Expires"; v: approvalCard.a.expires_at || "Not reported" }
-                Field { k: "Request"; v: (approvalCard.a.request_id || "Not reported") + "\n" + (approvalCard.a.fingerprint || "") ; vColor: Theme.textLabel }
+                Field { k: qsTr("Why"); v: approvalCard.a.reason || qsTr("Not reported") }
+                Field { visible: !!approvalCard.a.outbound_preview; k: qsTr("Outbound"); v: approvalCard.a.outbound_preview || "" }
+                Field { k: qsTr("Expires"); v: approvalCard.a.expires_at || qsTr("Not reported") }
+                Field { k: qsTr("Request"); v: (approvalCard.a.request_id || qsTr("Not reported")) + "\n" + (approvalCard.a.fingerprint || "") ; vColor: Theme.textLabel }
             }
             Text { visible: !!approvalCard.a.hold; width: parent.width; wrapMode: Text.Wrap; color: Theme.warning; font: Theme.uiLabel; text: approvalCard.a.hold || "" }
             Flow {
                 width: parent.width; spacing: 10
-                ActionButton { objectName: "approvalApprove"; label: "Approve action"; primary: true; accent: Theme.warning; height: 44
+                ActionButton { objectName: "approvalApprove"; label: qsTr("Approve action"); primary: true; accent: Theme.warning; height: 44
                     width: cards.narrow ? parent.width : implicitWidth + 12; enabled: approvalCard.a.actionable === true
                     onClicked: bridge.approveRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
-                ActionButton { objectName: "approvalDeny"; label: "Reject"; height: 44
+                ActionButton { objectName: "approvalDeny"; label: qsTr("Reject"); height: 44
                     // Rejecting executes nothing, so it stays available while JARVIS is frozen.
                     width: cards.narrow ? parent.width : implicitWidth + 24; enabled: approvalCard.a.rejectable === true
                     onClicked: bridge.rejectRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
             }
             Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
-                   text: "Approve authorizes the displayed request only. It is not a completion claim." }
+                   text: qsTr("Approve authorizes the displayed request only. It is not a completion claim.") }
         }
     }
 
@@ -177,7 +183,7 @@ Column {
                    text: decisionCard.d.label || "" }
             Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
                    text: [decisionCard.d.action, decisionCard.d.destination ? "→ " + decisionCard.d.destination : "", decisionCard.d.time].filter(function(x) { return !!x }).join("  ·  ")
-                         + (decisionCard.d.state === "recorded" ? "\nExecution and its outcome are reported separately." : "")
+                         + (decisionCard.d.state === "recorded" ? "\n" + qsTr("Execution and its outcome are reported separately.") : "")
                          // Why a decision was not recorded; a recorded one's execution report belongs to the outcome.
                          + (decisionCard.d.message && decisionCard.d.state !== "recorded" ? "\n" + decisionCard.d.message : "") }
         }
@@ -200,37 +206,38 @@ Column {
             id: outcomeBody
             x: 76; y: 16; width: parent.width - 96; spacing: 6
             Heading { id: outcomeHeading; objectName: "safetyHeading_outcome"; width: parent.width; color: outcomeCard.tone
-                      text: ({ unknown: "Outcome unknown", in_progress: "Outcome not established yet", failed: "Failed", blocked: "Blocked", paused: "Paused by Freeze",
-                               completed: "Completed", cancelled: outcomeCard.o.run_status === "cancelling" ? "Cancellation requested" : "Cancelled" })[outcomeCard.kind] || "" }
+                      text: ({ unknown: qsTr("Outcome unknown"), in_progress: qsTr("Outcome not established yet"), failed: qsTr("Failed"), blocked: qsTr("Blocked"), paused: qsTr("Paused by Freeze"),
+                               completed: qsTr("Completed"), cancelled: outcomeCard.o.run_status === "cancelling" ? qsTr("Cancellation requested") : qsTr("Cancelled") })[outcomeCard.kind] || "" }
             Text { objectName: "safetyOutcomeText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
-                   text: outcomeCard.kind === "unknown" ? "JARVIS could not verify whether the action completed."
-                       : outcomeCard.kind === "in_progress" ? "This action is in progress elsewhere; its outcome is not known yet. Do not repeat it."
-                       : outcomeCard.kind === "paused" ? "JARVIS froze at a safe point between this task's steps. It was not failed or cancelled; Resume JARVIS continues it from where it stopped."
-                       : outcomeCard.kind === "blocked" ? "This attempt did not proceed." + (outcomeCard.o.message ? " " + outcomeCard.o.message : "")
-                       : outcomeCard.kind === "failed" ? (outcomeCard.o.message || "Core reported a failure.")
-                       : outcomeCard.kind === "completed" ? "Core confirmed completion" + (outcomeCard.o.capability ? " of " + outcomeCard.o.capability : "") + "."
-                       : outcomeCard.o.run_status === "cancelling" ? "Core recorded the cancellation request; the running action has not confirmed it yet." : "This task was cancelled." }
+                   text: outcomeCard.kind === "unknown" ? qsTr("JARVIS could not verify whether the action completed.")
+                       : outcomeCard.kind === "in_progress" ? qsTr("This action is in progress elsewhere; its outcome is not known yet. Do not repeat it.")
+                       : outcomeCard.kind === "paused" ? qsTr("JARVIS froze at a safe point between this task's steps. It was not failed or cancelled; Resume JARVIS continues it from where it stopped.")
+                       // Core's own detail is appended as written: technical detail, not rewritten.
+                       : outcomeCard.kind === "blocked" ? qsTr("This attempt did not proceed.") + (outcomeCard.o.message ? " " + outcomeCard.o.message : "")
+                       : outcomeCard.kind === "failed" ? (outcomeCard.o.message || qsTr("Core reported a failure."))
+                       : outcomeCard.kind === "completed" ? (outcomeCard.o.capability ? qsTr("Core confirmed completion of %1.").arg(outcomeCard.o.capability) : qsTr("Core confirmed completion."))
+                       : outcomeCard.o.run_status === "cancelling" ? qsTr("Core recorded the cancellation request; the running action has not confirmed it yet.") : qsTr("This task was cancelled.") }
             Text { visible: outcomeCard.kind === "unknown" || outcomeCard.kind === "failed"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
-                   text: outcomeCard.kind === "unknown" ? "Unverified result. JARVIS does not repeat it automatically - repeating it may duplicate its effects."
-                                                        : "A confirmed failure does not prove there were no external effects." }
+                   text: outcomeCard.kind === "unknown" ? qsTr("Unverified result. JARVIS does not repeat it automatically - repeating it may duplicate its effects.")
+                                                        : qsTr("A confirmed failure does not prove there were no external effects.") }
             Item {
                 visible: outcomeCard.kind !== "completed" && outcomeCard.kind !== "cancelled" && outcomeCard.kind !== "paused"; width: parent.width; height: visible ? 36 : 0
                 Text { id: outcomeToggle; objectName: "outcomeDetailsToggle"; anchors.verticalCenter: parent.verticalCenter
                        property bool open: false
-                       text: (open ? "Hide details" : outcomeCard.kind === "unknown" ? "Review outcome" : "View details") + "  ›"; color: Theme.accent; font: Theme.uiLabel
+                       text: (open ? qsTr("Hide details") : outcomeCard.kind === "unknown" ? qsTr("Review outcome") : qsTr("View details")) + "  ›"; color: Theme.accent; font: Theme.uiLabel
                        activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: text
                        Keys.onReturnPressed: open = !open; Keys.onSpacePressed: open = !open
                        MouseArea { anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.PointingHandCursor; onClicked: outcomeToggle.open = !outcomeToggle.open } }
             }
             Column {
                 visible: outcomeToggle.open && outcomeToggle.parent.visible; width: parent.width
-                Field { k: "Action"; v: outcomeCard.o.capability || "Not reported" }
-                Field { k: "Connector"; v: outcomeCard.o.connector || "Not reported" }
-                Field { k: "Destination"; v: outcomeCard.o.destination || "Not reported" }
-                Field { k: "Task"; v: outcomeCard.o.task_id || "Not reported"; vColor: Theme.textLabel }
-                Field { k: "Core report"; v: [outcomeCard.o.code, outcomeCard.o.message].filter(function(x) { return !!x }).join(": ") || "Not reported" }
-                Field { visible: outcomeCard.kind === "unknown"; k: "Resolution"
-                        v: "Verify at the destination first. Operator resolution uses 'jarvis task orphan' / 'jarvis task resolve'; there is no retry here." }
+                Field { k: qsTr("Action"); v: outcomeCard.o.capability || qsTr("Not reported") }
+                Field { k: qsTr("Connector"); v: outcomeCard.o.connector || qsTr("Not reported") }
+                Field { k: qsTr("Destination"); v: outcomeCard.o.destination || qsTr("Not reported") }
+                Field { k: qsTr("Task"); v: outcomeCard.o.task_id || qsTr("Not reported"); vColor: Theme.textLabel }
+                Field { k: qsTr("Core report"); v: [outcomeCard.o.code, outcomeCard.o.message].filter(function(x) { return !!x }).join(": ") || qsTr("Not reported") }
+                Field { visible: outcomeCard.kind === "unknown"; k: qsTr("Resolution")
+                        v: qsTr("Verify at the destination first. Operator resolution uses %1 / %2; there is no retry here.").arg("'jarvis task orphan'").arg("'jarvis task resolve'") }
             }
         }
     }
@@ -238,6 +245,6 @@ Column {
     Text {
         visible: cards.s.fixture === true
         x: cards.inset; width: cards.cardWidth; wrapMode: Text.Wrap; color: Theme.danger; font: Theme.metadata
-        text: "DEV FIXTURE · placeholder fields, not a live request or outcome (Ctrl+Shift+S cycles scenarios)"
+        text: qsTr("DEV FIXTURE · placeholder fields, not a live request or outcome (Ctrl+Shift+S cycles scenarios)")
     }
 }

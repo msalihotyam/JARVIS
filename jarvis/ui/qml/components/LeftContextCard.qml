@@ -13,8 +13,9 @@ Rectangle {
     readonly property bool tight: width < 155
     readonly property int inset: tight ? 9 : 13
     readonly property real weatherWidth: tight ? 49 : compact ? 57 : 68
-    readonly property string timeText: Qt.formatTime(now, "HH:mm")
-    readonly property string dateText: Qt.formatDate(now, tight ? "d MMM yyyy" : "ddd, d MMM")
+    // Formatted in the interface language's locale; the time itself is never reinterpreted.
+    readonly property string timeText: now.toLocaleTimeString(Qt.locale(i18n.qtLocale), "HH:mm")
+    readonly property string dateText: now.toLocaleDateString(Qt.locale(i18n.qtLocale), tight ? "d MMM yyyy" : "ddd, d MMM")
     readonly property string zoneText: {
         var minutes = -now.getTimezoneOffset()
         var sign = minutes < 0 ? "-" : "+"
@@ -24,7 +25,7 @@ Rectangle {
     radius: 14
     color: Theme.glassSecondaryShell
     Accessible.role: Accessible.Pane
-    Accessible.name: timeText + ", " + dateText + ", Local time, " + zoneText + ". Weather not connected."
+    Accessible.name: qsTr("%1, %2, Local time, %3. Weather not connected.").arg(timeText).arg(dateText).arg(zoneText)
 
     BorderImage {
         anchors.fill: parent; anchors.margins: -12
@@ -96,7 +97,7 @@ Rectangle {
         }
         Column {
             x: pin.visible ? 21 : 0; width: parent.width - x; spacing: 2
-            Text { text: context.compact ? "Local" : "Local time"; color: Theme.text; font { family: Theme.font; pixelSize: context.compact ? 12 : 14 } }
+            Text { text: context.compact ? qsTr("Local") : qsTr("Local time"); color: Theme.text; font { family: Theme.font; pixelSize: context.compact ? 12 : 14 } }
             Text { objectName: "contextTimeZone"; text: context.zoneText; color: Theme.textLabel; font { family: Theme.font; pixelSize: context.tight ? 10 : 11 } }
         }
     }
@@ -124,8 +125,8 @@ Rectangle {
         Text {
             objectName: "contextWeatherCondition"
             width: parent.width; horizontalAlignment: Text.AlignHCenter
-            text: "Not\nconnected"; wrapMode: Text.WordWrap
-            Accessible.name: "Weather not connected"
+            text: qsTr("Not\nconnected"); wrapMode: Text.WordWrap
+            Accessible.name: qsTr("Weather not connected")
             color: "#acc8df"; font { family: Theme.font; pixelSize: context.tight ? 10 : context.compact ? 11 : 12 }
         }
     }

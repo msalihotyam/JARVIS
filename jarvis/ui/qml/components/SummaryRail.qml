@@ -36,22 +36,23 @@ Item {
     function ago(ts) {
         if (!ts) return ""
         var s = Math.max(0, Math.round(rail.now / 1000 - ts))
-        return s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s / 60) + "m ago"
-             : s < 86400 ? Math.floor(s / 3600) + "h ago" : Math.floor(s / 86400) + "d ago"
+        return s < 60 ? qsTr("%1s ago").arg(s) : s < 3600 ? qsTr("%1m ago").arg(Math.floor(s / 60))
+             : s < 86400 ? qsTr("%1h ago").arg(Math.floor(s / 3600)) : qsTr("%1d ago").arg(Math.floor(s / 86400))
     }
     function dueShort(iso) {
         if (!iso) return ""
         var d = new Date(iso)
         if (isNaN(d.getTime())) return ""
-        return d.toDateString() === new Date(rail.now).toDateString() ? Qt.formatTime(d, "HH:mm") : Qt.formatDate(d, "ddd d MMM")
+        var loc = Qt.locale(i18n.qtLocale)
+        return d.toDateString() === new Date(rail.now).toDateString() ? d.toLocaleTimeString(loc, "HH:mm") : d.toLocaleDateString(loc, "ddd d MMM")
     }
     function statusWord(s) {
-        return ({ running: "Running", awaiting_approval: "Awaiting you", awaiting_clarification: "Needs a detail",
-                  completed: "Completed", failed: "Failed", rejected: "Denied", cancelled: "Cancelled" })[s] || (s || "")
+        return ({ running: qsTr("Running"), awaiting_approval: qsTr("Awaiting you"), awaiting_clarification: qsTr("Needs a detail"),
+                  completed: qsTr("Completed"), failed: qsTr("Failed"), rejected: qsTr("Denied"), cancelled: qsTr("Cancelled") })[s] || (s || "")
     }
     function kindWord(k) {
-        return ({ system: "System", scheduled: "Scheduled", approval: "Approval", error: "Error",
-                  unknown: "Outcome unknown", data: "Data" })[k] || "Update"
+        return ({ system: qsTr("System"), scheduled: qsTr("Scheduled"), approval: qsTr("Approval"), error: qsTr("Error"),
+                  unknown: qsTr("Outcome unknown"), data: qsTr("Data") })[k] || qsTr("Update")
     }
     function isAlert(k) { return k === "error" || k === "unknown" || k === "approval" }
 
@@ -73,26 +74,28 @@ Item {
     readonly property bool roomy: width >= 200
     readonly property bool tight: width < 150
     readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
-    readonly property string sessionsWord: bridge.sessions.length + (bridge.sessions.length === 1 ? " session" : " sessions")
+    readonly property string sessionsWord: bridge.sessions.length === 1 ? qsTr("1 session") : qsTr("%1 sessions").arg(bridge.sessions.length)
     readonly property var modules: [
-        { id: "tasks", key: "Tasks", page: "tasks", icon: "tasks",
-          line: (bridge.taskLive ? 1 : 0) + " active",
-          note: rail.roomy ? rail.sessionsWord + " · " + rail.taskTotal + (rail.taskTotal === 1 ? " task" : " tasks") : rail.sessionsWord },
-        { id: "updates", key: "Updates", page: "history", icon: "updates",
-          line: bridge.activity.length + " recent",
-          note: rail.attention > 0 ? rail.attention + (rail.roomy ? (rail.attention === 1 ? " needs attention" : " need attention") : " to review") : "All clear" },
-        { id: "focus", key: "Focus", page: "memory", icon: "focus",
-          line: bridge.projects.length + (bridge.projects.length === 1 ? " project" : " projects"),
-          note: bridge.projects.length ? (rail.roomy ? "Active in memory" : "In memory")
-                                       : (rail.roomy ? "No focus context yet" : rail.width < 180 ? "No context" : "No context yet") },
-        { id: "plan", key: "Plan", page: "automations", icon: "plan",
-          line: rail.enabledJobs.length + (rail.tight ? (rail.enabledJobs.length === 1 ? " job" : " jobs") : " scheduled"),
-          note: rail.nextJob ? "Next " + rail.dueShort(rail.nextJob.next_due_at_utc)
-                             : (rail.liveJobs.length ? (rail.roomy ? "Nothing enabled" : "None enabled") : (rail.roomy ? "Nothing scheduled" : "None yet")) },
+        // `key` is the stable id (object names, the peek); `title` is what is shown.
+        // A count line always begins with its number (translations keep it first).
+        { id: "tasks", key: "Tasks", title: qsTr("Tasks"), page: "tasks", icon: "tasks",
+          line: qsTr("%1 active").arg(bridge.taskLive ? 1 : 0),
+          note: rail.roomy ? rail.sessionsWord + " · " + (rail.taskTotal === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(rail.taskTotal)) : rail.sessionsWord },
+        { id: "updates", key: "Updates", title: qsTr("Updates"), page: "history", icon: "updates",
+          line: qsTr("%1 recent").arg(bridge.activity.length),
+          note: rail.attention > 0 ? (rail.roomy ? (rail.attention === 1 ? qsTr("1 needs attention") : qsTr("%1 need attention").arg(rail.attention)) : qsTr("%1 to review").arg(rail.attention)) : qsTr("All clear") },
+        { id: "focus", key: "Focus", title: qsTr("Focus"), page: "memory", icon: "focus",
+          line: bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length),
+          note: bridge.projects.length ? (rail.roomy ? qsTr("Active in memory") : qsTr("In memory"))
+                                       : (rail.roomy ? qsTr("No focus context yet") : rail.width < 180 ? qsTr("No context") : qsTr("No context yet")) },
+        { id: "plan", key: "Plan", title: qsTr("Plan"), page: "automations", icon: "plan",
+          line: rail.tight ? (rail.enabledJobs.length === 1 ? qsTr("1 job") : qsTr("%1 jobs").arg(rail.enabledJobs.length)) : qsTr("%1 scheduled").arg(rail.enabledJobs.length),
+          note: rail.nextJob ? qsTr("Next %1").arg(rail.dueShort(rail.nextJob.next_due_at_utc))
+                             : (rail.liveJobs.length ? (rail.roomy ? qsTr("Nothing enabled") : qsTr("None enabled")) : (rail.roomy ? qsTr("Nothing scheduled") : qsTr("None yet"))) },
         // A status, not a count: the whole line is the status word.
-        { id: "memory", key: "Memory", page: "", icon: "memory", status: true,
-          line: bridge.memoryStatus,
-          note: "Persistent across sessions", shortNote: "Persistent" }
+        { id: "memory", key: "Memory", title: qsTr("Memory"), page: "", icon: "memory", status: true,
+          line: ({ "Available": qsTr("Available"), "Unavailable": qsTr("Unavailable"), "Status unavailable": qsTr("Status unavailable") })[bridge.memoryStatus] || bridge.memoryStatus,
+          note: qsTr("Persistent across sessions"), shortNote: qsTr("Persistent") }
     ]
     readonly property var shownModules: {
         var byId = {}
@@ -133,7 +136,7 @@ Item {
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
                 activeFocusOnTab: card.navigable
                 Accessible.role: card.navigable ? Accessible.Button : Accessible.StaticText
-                Accessible.name: modelData.key + ": " + modelData.line
+                Accessible.name: modelData.title + ": " + modelData.line
                 Keys.onReturnPressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
                 Keys.onSpacePressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
 
@@ -227,7 +230,7 @@ Item {
                     spacing: rail.showNote ? 2 : 0
                     readonly property int tier: Theme.tier(card.Window.width)
                     // Title, then the count numeral with its unit on one baseline, then the detail.
-                    Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.key; color: Theme.text
+                    Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.title; color: Theme.text
                            font: Theme.railTitle(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railTitleLine(labels.tier) }
                     Row {
                         width: parent.width; spacing: count === "" ? 0 : 5
@@ -280,7 +283,7 @@ Item {
                     // Narrow rails keep the title clear with a slimmer target.
                     anchors { right: parent.right; top: parent.top; rightMargin: rail.width < 180 ? 2 : 4; topMargin: rail.showNote ? 4 : Math.max(0, (parent.height - height) / 2) }
                     width: rail.width < 180 ? 26 : 36; height: rail.showNote ? 32 : 36
-                    glyph: "•••"; tip: modelData.key + " layout options"
+                    glyph: "•••"; tip: qsTr("%1 layout options").arg(modelData.title)
                     onClicked: rail.menuRequested(modelData.id, menuButton, index > 0, index < rail.shownModules.length - 1)
                 }
             }

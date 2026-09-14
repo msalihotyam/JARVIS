@@ -16,7 +16,7 @@ import "../components"
 // still routes every change through the one authoritative applyModel call.
 ContextPanel {
     id: modelPanel
-    heading: "MODEL & PROVIDER"
+    heading: qsTr("MODEL & PROVIDER")
     surfaceName: "modelSurface"
     panelWidth: 430; panelHeight: 476
     onOpenChanged: if (open) { modelField.text = bridge.config.claude_model || ""; effortPick.value = bridge.config.claude_effort || "" }
@@ -36,20 +36,20 @@ ContextPanel {
             }
             Column { spacing: 3
                 Text { text: "Anthropic"; color: Theme.text; font { family: Theme.font; pixelSize: 17; weight: Font.DemiBold } }
-                Text { text: "Claude Code CLI · subscription route"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                Text { text: qsTr("Claude Code CLI · subscription route"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
             }
         }
         Rectangle { width: parent.width; height: 1; color: Theme.border }
 
-        Text { text: "MODEL"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+        Text { text: qsTr("MODEL"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
 
         // -- the real rows --------------------------------------------------
         Column {
             width: parent.width; spacing: 4
             Repeater {
-                model: modelPanel.current ? [{ value: "", label: "CLI default", meta: "Whatever the Claude Code CLI selects" },
-                                             { value: modelPanel.current, label: modelPanel.current, meta: "ANTHROPIC  |  CONFIGURED HERE" }]
-                                          : [{ value: "", label: "CLI default", meta: "Whatever the Claude Code CLI selects" }]
+                model: modelPanel.current ? [{ value: "", label: qsTr("CLI default"), meta: qsTr("Whatever the Claude Code CLI selects") },
+                                             { value: modelPanel.current, label: modelPanel.current, meta: qsTr("ANTHROPIC  |  CONFIGURED HERE") }]
+                                          : [{ value: "", label: qsTr("CLI default"), meta: qsTr("Whatever the Claude Code CLI selects") }]
                 Rectangle {
                     width: parent.width; height: 46; radius: Theme.radiusSmall
                     readonly property bool selected: modelData.value === modelPanel.current
@@ -99,20 +99,20 @@ ContextPanel {
             }
         }
 
-        Text { text: "OTHER MODEL"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+        Text { text: qsTr("OTHER MODEL"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
         TextField {
             id: modelField; objectName: "modelField"
             width: parent.width; height: 38; leftPadding: 12; rightPadding: 12
-            placeholderText: "CLI default"; placeholderTextColor: Theme.textDim; color: Theme.text
+            placeholderText: qsTr("CLI default"); placeholderTextColor: Theme.textDim; color: Theme.text
             selectByMouse: true; font { family: Theme.font; pixelSize: 14 }
             background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                     border.color: modelField.activeFocus ? Theme.commandEdge : Theme.border }
         }
-        Text { text: "EFFORT"; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
-        Segmented { value: effortPick.value; onPicked: function(v) { effortPick.value = v }; options: [{value:"",label:"Default"}].concat(bridge.effortChoices.map(function(e) { return {value:e,label:e} })) }
+        Text { text: qsTr("EFFORT"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+        Segmented { value: effortPick.value; onPicked: function(v) { effortPick.value = v }; options: [{value:"",label:qsTr("Default")}].concat(bridge.effortChoices.map(function(e) { return {value:e,label:e} })) }
         Row { spacing: 12
-            ActionButton { objectName: "applyModelButton"; label: "Apply model / effort"; primary: true; onClicked: bridge.applyModel(modelField.text, effortPick.value) }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "Validated configuration"; color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
+            ActionButton { objectName: "applyModelButton"; label: qsTr("Apply model / effort"); primary: true; onClicked: bridge.applyModel(modelField.text, effortPick.value) }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Validated configuration"); color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
         }
     }
 }

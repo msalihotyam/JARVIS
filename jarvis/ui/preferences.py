@@ -39,6 +39,8 @@ PANEL_IDS = ("system", "workflow", "activity", "automations")
 CONTEXTUAL_PANELS = frozenset({"workflow"})
 #: The left rail's summary cards, in canonical order.
 RAIL_IDS = ("tasks", "updates", "focus", "plan", "memory")
+#: Interface languages, as stable locale ids (never the visible option name).
+LANGUAGES = ("en-US", "tr-TR")
 
 #: Bounds, in fractions of the content area. The stack's height shares are
 #: normalized on render, so a share is a proportion, not a pixel count.
@@ -109,6 +111,8 @@ def canonical_preferences() -> dict[str, Any]:
         "status_indicator": "orb",
         "profile": "normal",
         "page": "home",
+        # An application preference, not layout: Reset layout never touches it.
+        "language": "en-US",
         "rail": canonical_rail(),
         "profiles": canonical_profiles(),
         "packages": {name: {"profile": "normal", "profiles": package_profiles(name)}
@@ -177,11 +181,11 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     defaults = canonical_preferences()
     # Preserve only a complete, valid v1 document. Validation below still
     # rejects malformed old fields; migration never writes product config.
-    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator"} == set(defaults) - {"packages", "status_indicator", "rail"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator", "language"} == set(defaults) - {"packages", "status_indicator", "rail", "language"}:
         candidate = {**candidate, "version": 3, "packages": defaults["packages"]}
     # Version 2 -> 3: the conversation-first grid replaced every layout; the
     # person's other choices are kept.
-    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) == set(defaults) - {"rail"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) - {"language"} == set(defaults) - {"rail", "language"}:
         kept = {key: candidate[key] for key in ("theme", "ambient_effects", "status_indicator", "page")}
         candidate = {**defaults, **kept, "version": 3}
         candidate.pop("rail")
@@ -189,6 +193,10 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     # saved is kept; Memory arrives hidden, restorable from Cards.
     if isinstance(candidate, dict) and candidate.get("version") == 3 and "rail" not in candidate:
         candidate = {**candidate, "version": PREFERENCES_VERSION, "rail": legacy_rail()}
+    # A document from before the language setting keeps every choice and gains
+    # English: an existing installation never switches language on its own.
+    if isinstance(candidate, dict) and "version" in candidate and "language" not in candidate:
+        candidate = {**candidate, "language": defaults["language"]}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
@@ -204,6 +212,8 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     if candidate["page"] in _RETIRED_PAGES:
         candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
     if candidate["profile"] not in PROFILES or candidate["page"] not in PAGES:
+        return defaults
+    if candidate["language"] not in LANGUAGES:
         return defaults
     rail = candidate["rail"]
     if (not isinstance(rail, dict) or set(rail) != {"order", "visible"}
@@ -241,6 +251,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "status_indicator": candidate["status_indicator"],
         "profile": candidate["profile"],
         "page": candidate["page"],
+        "language": candidate["language"],
         "rail": {"order": list(rail["order"]), "visible": dict(rail["visible"])},
         "profiles": validated,
         "packages": validated_packages,

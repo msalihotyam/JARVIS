@@ -21,8 +21,10 @@ MAIN_QML = QML_DIR / "Main.qml"
 
 def create_engine(bridge: Bridge):
     """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml."""
+    from PySide6.QtCore import QCoreApplication
     from PySide6.QtQml import QQmlApplicationEngine
 
+    from jarvis.ui.i18n import localization
     from jarvis.ui.typography import Typography, load_fonts
 
     engine = QQmlApplicationEngine()
@@ -32,6 +34,14 @@ def create_engine(bridge: Bridge):
     # resolves the real family names from the first frame.
     engine._typography = Typography(load_fonts(), engine)
     engine.rootContext().setContextProperty("typography", engine._typography)
+    # The one localization path: the persisted language is applied before the
+    # first frame, and a later choice retranslates QML and every bridge text.
+    i18n = localization(QCoreApplication.instance())
+    i18n.attach(engine)
+    i18n.apply(bridge.language)
+    engine.rootContext().setContextProperty("i18n", i18n)
+    bridge.languageChanged.connect(lambda: i18n.apply(bridge.language))
+    i18n.languageChanged.connect(bridge.retranslated)
     engine.load(str(MAIN_QML))
     return engine
 

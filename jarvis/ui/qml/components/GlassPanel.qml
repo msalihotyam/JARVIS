@@ -105,7 +105,7 @@ Rectangle {
             Text {
                 objectName: panel.title !== "" ? "panelTitle_" + panel.title : ""
                 anchors.verticalCenter: parent.verticalCenter
-                text: panel.title.toUpperCase()
+                text: i18n.upper(panel.title)
                 readonly property real room: Math.max(0, header.width - headerTail.width - (panel.closable ? 42 : 0) - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8)
                 // Section heading 13 / 18 Semibold, +0.06 em. A tight title
                 // loses its tracking first; only then does it wrap (opt-in) or elide.
@@ -119,8 +119,8 @@ Rectangle {
                 elide: Text.ElideRight
                 color: "#cfeaff"
                 font: tight ? Theme.tracked(Theme.sectionHeading, 0) : Theme.sectionHeading
-                TextMetrics { id: titleMetrics; text: panel.title.toUpperCase(); font: Theme.sectionHeading }
-                TextMetrics { id: tightMetrics; text: panel.title.toUpperCase(); font.family: Theme.font; font.pixelSize: 13; font.weight: Font.DemiBold }
+                TextMetrics { id: titleMetrics; text: i18n.upper(panel.title); font: Theme.sectionHeading }
+                TextMetrics { id: tightMetrics; text: i18n.upper(panel.title); font.family: Theme.font; font.pixelSize: 13; font.weight: Font.DemiBold }
             }
             Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }
@@ -133,7 +133,7 @@ Rectangle {
             objectName: panel.closable ? "secondaryPageClose" : ""
             visible: panel.closable
             anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-            width: 28; height: 28; glyph: "✕"; tip: "Back to Command Center"
+            width: 28; height: 28; glyph: "✕"; tip: qsTr("Back to Command Center")
             onClicked: panel.closeRequested()
         }
     }

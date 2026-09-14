@@ -40,7 +40,7 @@ ContextPanel {
     function shortDate(v) {
         if (!v) return ""
         var d = new Date(v)
-        return isNaN(d.getTime()) ? String(v).slice(0, 10) : Qt.formatDate(d, "d MMM")
+        return isNaN(d.getTime()) ? String(v).slice(0, 10) : d.toLocaleDateString(Qt.locale(i18n.qtLocale), "d MMM")
     }
 
     readonly property var spec: {
@@ -50,50 +50,50 @@ ContextPanel {
         case "Tasks": {
             var rows = []
             if (bridge.taskLive)
-                rows.push({ title: bridge.task.capability || "Current request",
-                            sub: bridge.task.stage ? "Stage: " + bridge.task.stage : (bridge.task.connector || "Live task"),
-                            pill: r.statusWord(bridge.task.status) || "Running", meta: "Now",
+                rows.push({ title: bridge.task.capability || qsTr("Current request"),
+                            sub: bridge.task.stage ? qsTr("Stage: %1").arg(bridge.task.stage) : (bridge.task.connector || qsTr("Live task")),
+                            pill: r.statusWord(bridge.task.status) || qsTr("Running"), meta: qsTr("Now"),
                             dot: bridge.coreState === "awaiting_approval" ? "warn" : (bridge.coreState === "error" || bridge.coreState === "unknown") ? "alert" : "live" })
             bridge.sessions.forEach(function(s) {
-                rows.push({ title: (s.task_count || 0) + ((s.task_count || 0) === 1 ? " task" : " tasks"),
-                            sub: s.session_id, pill: s.active_task_id ? "Active task" : "",
+                rows.push({ title: (s.task_count || 0) === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(s.task_count || 0),
+                            sub: s.session_id, pill: s.active_task_id ? qsTr("Active task") : "",
                             meta: peek.shortDate(s.updated_at), dot: s.active_task_id ? "live" : "quiet" })
             })
-            return { title: "Tasks", subtitle: "The live task and recorded sessions", icon: "tasks", tone: "#1b7fe0",
-                     metrics: [{ value: bridge.taskLive ? 1 : 0, label: "Active task", tone: Theme.accent },
-                               { value: r.taskTotal, label: "Tasks recorded", tone: Theme.textLabel }],
-                     rows: rows, empty: "No tasks recorded yet.", emptyNote: "Ask JARVIS from the composer; tasks appear here.",
-                     action: { label: "Open Tasks", note: "Go to the full tasks page", page: "tasks" } }
+            return { title: qsTr("Tasks"), subtitle: qsTr("The live task and recorded sessions"), icon: "tasks", tone: "#1b7fe0",
+                     metrics: [{ value: bridge.taskLive ? 1 : 0, label: qsTr("Active task"), tone: Theme.accent },
+                               { value: r.taskTotal, label: qsTr("Tasks recorded"), tone: Theme.textLabel }],
+                     rows: rows, empty: qsTr("No tasks recorded yet."), emptyNote: qsTr("Ask JARVIS from the composer; tasks appear here."),
+                     action: { label: qsTr("Open Tasks"), note: qsTr("Go to the full tasks page"), page: "tasks" } }
         }
         case "Updates":
-            return { title: "Updates", subtitle: "This interface session", icon: "updates", tone: "#0f9e7e",
-                     metrics: [{ value: bridge.activity.length, label: "Recent updates", tone: "#37c4f0" },
-                               { value: r.attention, label: "Need attention", tone: r.attention > 0 ? Theme.danger : Theme.textLabel }],
+            return { title: qsTr("Updates"), subtitle: qsTr("This interface session"), icon: "updates", tone: "#0f9e7e",
+                     metrics: [{ value: bridge.activity.length, label: qsTr("Recent updates"), tone: "#37c4f0" },
+                               { value: r.attention, label: qsTr("Need attention"), tone: r.attention > 0 ? Theme.danger : Theme.textLabel }],
                      rows: bridge.activity.map(function(a) {
                          return { title: a.text, sub: r.kindWord(a.kind) + " · " + a.time,
-                                  pill: r.isAlert(a.kind) ? "Attention" : "", meta: r.ago(a.ts),
+                                  pill: r.isAlert(a.kind) ? qsTr("Attention") : "", meta: r.ago(a.ts),
                                   dot: r.isAlert(a.kind) ? "alert" : a.kind === "scheduled" ? "live" : "quiet" } }),
-                     empty: "No updates in this session yet.", emptyNote: "Notes from JARVIS and the scheduler appear here.",
-                     action: { label: "Open History", note: "This session's updates and durable sessions", page: "history" } }
+                     empty: qsTr("No updates in this session yet."), emptyNote: qsTr("Notes from JARVIS and the scheduler appear here."),
+                     action: { label: qsTr("Open History"), note: qsTr("This session's updates and durable sessions"), page: "history" } }
         case "Focus":
-            return { title: "Focus", subtitle: "Active projects in memory", icon: "focus", tone: "#b7801e",
-                     metrics: [{ value: bridge.projects.length, label: "Active projects", tone: "#37c4f0" },
+            return { title: qsTr("Focus"), subtitle: qsTr("Active projects in memory"), icon: "focus", tone: "#b7801e",
+                     metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
                                { value: bridge.memoryItems.length,
-                                 label: bridge.projects.length ? "Items in " + bridge.projects[0] : "Memory items", tone: Theme.textLabel }],
+                                 label: bridge.projects.length ? qsTr("Items in %1").arg(bridge.projects[0]) : qsTr("Memory items"), tone: Theme.textLabel }],
                      rows: bridge.projects.map(function(p, i) {
-                         return { title: p, sub: i === 0 ? bridge.memoryItems.length + " memory items" : "Active project",
+                         return { title: p, sub: i === 0 ? qsTr("%1 memory items").arg(bridge.memoryItems.length) : qsTr("Active project"),
                                   pill: "", meta: "", dot: "live" } }),
-                     empty: "No active focus context yet.", emptyNote: "Projects appear here once memory holds one.",
-                     action: { label: "Open Memory", note: "Projects and reference data", page: "memory" } }
+                     empty: qsTr("No active focus context yet."), emptyNote: qsTr("Projects appear here once memory holds one."),
+                     action: { label: qsTr("Open Memory"), note: qsTr("Projects and reference data"), page: "memory" } }
         case "Plan":
-            return { title: "Plan", subtitle: "Scheduled work and next runs", icon: "plan", tone: "#7040c4",
-                     metrics: [{ value: r.enabledJobs.length, label: "Scheduled", tone: "#37c4f0" },
-                               { value: r.liveJobs.length - r.enabledJobs.length, label: "Paused", tone: Theme.textLabel }],
+            return { title: qsTr("Plan"), subtitle: qsTr("Scheduled work and next runs"), icon: "plan", tone: "#7040c4",
+                     metrics: [{ value: r.enabledJobs.length, label: qsTr("Scheduled"), tone: "#37c4f0" },
+                               { value: r.liveJobs.length - r.enabledJobs.length, label: qsTr("Paused"), tone: Theme.textLabel }],
                      rows: r.liveJobs.map(function(j) {
-                         return { title: j.label || j.id, sub: j.kind || "Job", pill: j.enabled ? "Scheduled" : "Paused",
+                         return { title: j.label || j.id, sub: j.kind || qsTr("Job"), pill: j.enabled ? qsTr("Scheduled") : qsTr("Paused"),
                                   meta: j.enabled ? r.dueShort(j.next_due_at_utc) : "", dot: j.enabled ? "live" : "quiet" } }),
-                     empty: "Nothing scheduled yet.", emptyNote: "Scheduled work appears here once a job exists.",
-                     action: { label: "Open Automations", note: "Scheduled jobs and their next runs", page: "automations" } }
+                     empty: qsTr("Nothing scheduled yet."), emptyNote: qsTr("Scheduled work appears here once a job exists."),
+                     action: { label: qsTr("Open Automations"), note: qsTr("Scheduled jobs and their next runs"), page: "automations" } }
         }
         return null
     }

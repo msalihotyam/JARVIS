@@ -33,7 +33,7 @@ Item {
     function ago(ts, fallback) {
         if (!ts) return fallback
         var s = Math.max(0, column.nowSec - ts)
-        return s < 60 ? "just now" : s < 3600 ? Math.floor(s / 60) + " min ago" : s < 86400 ? Math.floor(s / 3600) + " h ago" : fallback
+        return s < 60 ? qsTr("just now") : s < 3600 ? qsTr("%1 min ago").arg(Math.floor(s / 60)) : s < 86400 ? qsTr("%1 h ago").arg(Math.floor(s / 3600)) : fallback
     }
 
     // Every shown panel gets its minimum first; the remainder is split by
@@ -57,6 +57,13 @@ Item {
         return out
     }
     // Stages of the current task that are complete (the reference's "4/6").
+    // A task status code as words; unknown codes stay as Core wrote them.
+    function statusWord(s) {
+        return ({ pending: qsTr("pending"), running: qsTr("running"), verifying: qsTr("verifying"), awaiting_approval: qsTr("awaiting approval"),
+                  awaiting_clarification: qsTr("awaiting clarification"), awaiting_cost_override: qsTr("awaiting cost override"),
+                  completed: qsTr("completed"), failed: qsTr("failed"), rejected: qsTr("rejected"),
+                  cancel_requested: qsTr("cancellation requested"), cancelled: qsTr("cancelled") })[s] || s
+    }
     function stagesDone() {
         var t = bridge.task, cs = bridge.coreState, has = !!t.task_id
         if (!has) return 0
@@ -87,27 +94,27 @@ Item {
             Column {
                 id: stateCol
                 x: 22; anchors.verticalCenter: parent.verticalCenter; spacing: 0
-                Text { text: chrome.narrow ? "EDIT" : "EDIT LAYOUT"; color: Theme.accent; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.4; weight: Font.DemiBold } }
+                Text { text: chrome.narrow ? qsTr("EDIT") : qsTr("EDIT LAYOUT"); color: Theme.accent; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.4; weight: Font.DemiBold } }
                 Text { objectName: "layoutSaveState"; visible: text !== ""
-                       text: bridge.layoutSaveState === "saved" ? "Saved" : bridge.layoutSaveState === "failed" ? "Not saved" : ""
+                       text: bridge.layoutSaveState === "saved" ? qsTr("Saved") : bridge.layoutSaveState === "failed" ? qsTr("Not saved") : ""
                        color: bridge.layoutSaveState === "failed" ? Theme.warning : Theme.textMuted; font: Theme.metadata }
             }
         }
         Row {
             anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
             spacing: chrome.narrow ? 4 : 8
-            ActionButton { id: cardsButton; objectName: "layoutCards"; label: "Cards ▾"; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
+            ActionButton { id: cardsButton; objectName: "layoutCards"; label: qsTr("Cards") + " ▾"; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
                 onClicked: column.cardsRequested(cardsButton) }
-            IconButton { id: resetButton; objectName: "layoutReset"; glyph: "↺"; tip: "Reset layout"; framed: true; width: 36; height: 36
+            IconButton { id: resetButton; objectName: "layoutReset"; glyph: "↺"; tip: qsTr("Reset layout"); framed: true; width: 36; height: 36
                 onClicked: column.resetRequested(resetButton) }
-            ActionButton { objectName: "layoutDone"; label: "Done"; primary: true; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
+            ActionButton { objectName: "layoutDone"; label: qsTr("Done"); primary: true; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
                 onClicked: bridge.setEditMode(false) }
         }
     }
     Text {
         visible: bridge.editMode && bridge.layoutSaveState === "failed"
         y: chrome.height; width: parent.width; elide: Text.ElideRight
-        text: "Change wasn’t saved. Previous layout restored."; color: Theme.warning; font: Theme.metadata
+        text: qsTr("Change wasn’t saved. Previous layout restored."); color: Theme.warning; font: Theme.metadata
     }
 
     // -- the stack ----------------------------------------------------------
@@ -137,10 +144,11 @@ Item {
                 brackets: true
                 shadow: column.commandMode      // no black plates under secondary glass
                 padding: column.width < 400 ? 12 : column.commandMode ? 16 : 20
-                title: (column.commandMode ? {system:"Model & execution",workflow:"Active task",activity:"Recent actions",automations:"Memory context"} : { system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
-                badge: modelData.id === "system" ? (bridge.executionState === "unconfirmed" ? "unconfirmed" : bridge.configRefused ? "config refused" : bridge.executionState === "freeze_requested" ? "freezing" : (bridge.executionEnabled ? "running" : "frozen"))
-                     : modelData.id === "activity" ? "live"
-                     : modelData.id === "automations" ? (column.commandMode ? bridge.projects.length + " projects" : bridge.jobs.length + " job" + (bridge.jobs.length === 1 ? "" : "s"))
+                title: (column.commandMode ? {system: qsTr("Model & execution"), workflow: qsTr("Active task"), activity: qsTr("Recent actions"), automations: qsTr("Memory context")}
+                                           : { system: qsTr("System status"), workflow: qsTr("Active workflow"), activity: qsTr("Live intelligence feed"), automations: qsTr("Automations") })[modelData.id]
+                badge: modelData.id === "system" ? (bridge.executionState === "unconfirmed" ? qsTr("unconfirmed") : bridge.configRefused ? qsTr("config refused") : bridge.executionState === "freeze_requested" ? qsTr("freezing") : (bridge.executionEnabled ? qsTr("running") : qsTr("frozen")))
+                     : modelData.id === "activity" ? qsTr("live")
+                     : modelData.id === "automations" ? (column.commandMode ? qsTr("%1 projects").arg(bridge.projects.length) : (bridge.jobs.length === 1 ? qsTr("1 job") : qsTr("%1 jobs").arg(bridge.jobs.length)))
                      : ""
                 badgeRight: !column.commandMode || modelData.id !== "system"
                 titleWrap: !column.commandMode
@@ -155,18 +163,18 @@ Item {
                         Row {
                             id: handles
                             visible: bridge.editMode
-                            IconButton { id: panelMenu; objectName: "stackMenu_" + modelData.id; glyph: "•••"; tip: glass.title + " layout options"; width: 36; height: 30; y: -3
+                            IconButton { id: panelMenu; objectName: "stackMenu_" + modelData.id; glyph: "•••"; tip: qsTr("%1 layout options").arg(glass.title); width: 36; height: 30; y: -3
                                 onClicked: column.menuRequested(modelData.id, panelMenu, slot.index > 0, slot.index < column.shown.length - 1) }
                         }
                         Row {
                             id: workflowHead
                             spacing: 8
                             visible: !bridge.editMode && modelData.id === "workflow"
-                            ActionButton { label: "Cancel"; danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
-                            ActionButton { label: "New session"; compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
+                            ActionButton { label: qsTr("Cancel"); danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
+                            ActionButton { label: qsTr("New session"); compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
                             Text { objectName: "workflowCounter"; text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font: Theme.counter }
                         }
-                        Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: "PINNED"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
+                        Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: qsTr("PINNED"); color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
                     }
                 ]
                 Flickable {
@@ -207,17 +215,19 @@ Item {
     // A quiet stat line: dot, key, value right-aligned (the reference's Uptime / Memory / Network list).
     component StatRow: Item {
         property string k: ""; property string v: ""; property color tint: Theme.accentSoft; property color vColor: Theme.text
+        property string label: k                              // shown; `k` stays the stable key
         property int size: 14
         property int labelX: 21
         property font valueFont: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size, weight: Font.DemiBold }) : Theme.uiValue
         width: parent.width; height: 30
         Rectangle { x: 0; width: 7; height: 7; radius: 3.5; color: tint; anchors.verticalCenter: parent.verticalCenter
             Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: tint; opacity: 0.2 } }
-        Text { x: labelX; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.textLabel
+        Text { x: labelX; anchors.verticalCenter: parent.verticalCenter; text: label; color: Theme.textLabel
                font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size }) : Theme.uiLabel }
         Text { objectName: "statValue_" + k; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - labelX - kw.width - 8; horizontalAlignment: Text.AlignRight
-            text: v; color: vColor; elide: Text.ElideRight; font: valueFont }
-        TextMetrics { id: kw; text: k; font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size }) : Theme.uiLabel }
+            // A longer translation steps down (to 11 px at most) before it elides; English fits at its role size.
+            text: v; color: vColor; elide: Text.ElideRight; font: valueFont; fontSizeMode: Text.HorizontalFit; minimumPixelSize: 11 }
+        TextMetrics { id: kw; text: label; font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size }) : Theme.uiLabel }
     }
     // A gauge: the reference ring with the figure inside. Lit only when a real value exists.
     component Gauge: Item {
@@ -248,7 +258,7 @@ Item {
     // One row of the workflow well: icon well, label, state dot, value, trailing indicator.
     component WRow: Item {
         id: wrow
-        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: "#9fb6d0"; property bool empty: false; property bool last: false
+        property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string label: k; property string v: ""; property color vColor: "#9fb6d0"; property bool empty: false; property bool last: false
         width: parent.width; height: 41
         readonly property bool compact: height < 30
         readonly property int slot: height >= 38 ? 28 : 24
@@ -261,11 +271,13 @@ Item {
         readonly property real dotX: column.commandMode ? Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
                                                         : Math.ceil(textX + widest.advanceWidth + (compact ? 8 : 12))
         readonly property int trail: 10                      // the trailing indicator's own slot
-        TextMetrics { id: widest; text: "Destination"; font: wrow.labelFont }
+        // The widest of the five workflow labels, in the interface language.
+        TextMetrics { id: widest; font: wrow.labelFont
+            text: [qsTr("Status"), qsTr("Connector"), qsTr("Capability"), qsTr("Destination"), qsTr("Outcome")].reduce(function(a, b) { return b.length > a.length ? b : a }) }
         Rectangle { x: column.gridA + (slot - tile) / 2; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: tile < 24 ? 5 : 7
             color: empty ? "#0b2036" : "#0e2f4e"; border.width: 1; border.color: Theme.alpha(column.structure, empty ? 0.4 : 0.75)
             Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.alpha(column.structure, 0.8) : column.highlight; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
-        Text { x: textX; width: dotX - x - 8; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
+        Text { x: textX; width: dotX - x - 8; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: label
                color: empty ? Theme.textLabel : Theme.text; font: wrow.labelFont }
         Rectangle { x: dotX; width: compact ? 6 : 7; height: width; radius: width / 2; anchors.verticalCenter: parent.verticalCenter; color: empty ? "#4f6b8a" : tint
             Rectangle { visible: !empty; anchors.centerIn: parent; width: parent.width + 8; height: width; radius: width / 2; color: tint; opacity: 0.22 } }
@@ -308,9 +320,9 @@ Item {
             readonly property real cy: side ? (caption ? (bh - 16) / 2 : bh / 2) : d / 2
             readonly property real listY: Math.max(3, Math.min(Math.round(cy - 1.5 * pitch), bh - 3 - 3 * pitch))
             readonly property string uptime: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m"
-            readonly property string execution: bridge.executionState === "unconfirmed" ? "Unconfirmed" : bridge.configRefused ? "Refused" : bridge.executionState === "freeze_requested" ? "Freezing" : (bridge.executionEnabled ? "Running" : "Frozen")
+            readonly property string execution: bridge.executionState === "unconfirmed" ? qsTr("Unconfirmed") : bridge.configRefused ? qsTr("Refused") : bridge.executionState === "freeze_requested" ? qsTr("Freezing") : (bridge.executionEnabled ? qsTr("Running") : qsTr("Frozen"))
             readonly property color executionTint: bridge.executionState === "unconfirmed" || bridge.executionState === "freeze_requested" ? Theme.warning : bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
-            readonly property string model: bridge.config.claude_model || "CLI default"
+            readonly property string model: bridge.config.claude_model || qsTr("CLI default")
             Row {
                 id: gauges
                 objectName: "systemGauges"
@@ -318,7 +330,7 @@ Item {
                 spacing: sys.g
                 Gauge { label: "CPU"; width: sys.d; height: width }
                 Gauge { label: "RAM"; width: sys.d; height: width }
-                Gauge { label: "Disk"; width: sys.d; height: width }
+                Gauge { label: qsTr("Disk"); width: sys.d; height: width }
             }
             // Said plainly, once, on one deliberate baseline beneath the rings.
             Text { objectName: "systemNote"; visible: sys.caption
@@ -326,10 +338,10 @@ Item {
                    // Compact: the note takes the room up to the metadata list, untracked, so it stays whole.
                    width: !sys.side ? sys.bw - 4 : sys.bw >= 340 ? sys.clusterW : sys.listX - 10
                    horizontalAlignment: sys.side ? Text.AlignHCenter : Text.AlignLeft
-                   text: "Not measured by this build"; color: Theme.textMuted; elide: Text.ElideRight
+                   text: qsTr("Not measured by this build"); color: Theme.textMuted; elide: Text.ElideRight
                    // Supporting metadata 12 / 18; the compact cluster keeps the smaller step it needs to stay whole.
                    font { family: Theme.font; pixelSize: noteMetrics.advanceWidth <= width ? 12 : 10; letterSpacing: 0 }
-                   TextMetrics { id: noteMetrics; text: "Not measured by this build"; font: Theme.metadata } }
+                   TextMetrics { id: noteMetrics; text: qsTr("Not measured by this build"); font: Theme.metadata } }
             // Beside the rings: three rows - one dot axis, labels left, values right.
             Rectangle { visible: sys.side; x: sys.listX - 8; width: sys.bw - x; radius: 10
                 y: sys.listY - 4; height: 3 * sys.pitch + 8; color: Theme.glassSecondaryReading }
@@ -339,9 +351,9 @@ Item {
                 x: sys.listX; width: sys.bw - x - 6
                 y: sys.listY
                 spacing: 0
-                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Uptime"; v: sys.uptime; valueFont: Theme.uptimeValue }
-                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Execution"; v: sys.execution; tint: sys.executionTint; vColor: tint }
-                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Model"; v: sys.model }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Uptime"; label: qsTr("Uptime"); v: sys.uptime; valueFont: Theme.uptimeValue }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Execution"; label: qsTr("Execution"); v: sys.execution; tint: sys.executionTint; vColor: tint }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Model"; label: qsTr("Model"); v: sys.model }
             }
             // Reflowed: the three fields side by side beneath the note - each a
             // dot and label over its value - so all three stay inside the height.
@@ -351,13 +363,13 @@ Item {
                 visible: !sys.side
                 x: 6; y: sys.d + 20; width: sys.bw - 12
                 Repeater {
-                    model: [{ k: "Uptime", v: sys.uptime, tint: Theme.accentSoft, vc: "#f2f8ff" },
-                            { k: "Execution", v: sys.execution, tint: sys.executionTint, vc: sys.executionTint },
-                            { k: "Model", v: sys.model, tint: Theme.accentSoft, vc: "#f2f8ff" }]
+                    model: [{ k: "Uptime", label: qsTr("Uptime"), v: sys.uptime, tint: Theme.accentSoft, vc: "#f2f8ff" },
+                            { k: "Execution", label: qsTr("Execution"), v: sys.execution, tint: sys.executionTint, vc: sys.executionTint },
+                            { k: "Model", label: qsTr("Model"), v: sys.model, tint: Theme.accentSoft, vc: "#f2f8ff" }]
                     Item {
                         width: (sys.bw - 12) / 3; height: sys.bh - sys.d - 20
                         Rectangle { x: 0; y: 5; width: 6; height: 6; radius: 3; color: modelData.tint }
-                        Text { x: 10; y: 0; width: parent.width - 12; elide: Text.ElideRight; text: modelData.k; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; weight: Font.Medium } }
+                        Text { x: 10; y: 0; width: parent.width - 12; elide: Text.ElideRight; text: modelData.label; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; weight: Font.Medium } }
                         Text { x: 10; y: 13; width: parent.width - 12; elide: Text.ElideRight; text: modelData.v; color: modelData.vc
                                font { family: modelData.k === "Uptime" ? Theme.display : Theme.font; pixelSize: 12; weight: modelData.k === "Uptime" ? Font.Medium : Font.DemiBold
                                       variableAxes: modelData.k === "Uptime" ? Theme.semibold600 : ({}); features: modelData.k === "Uptime" ? Theme.tabular : ({}) } }
@@ -377,22 +389,22 @@ Item {
             // reported them. Global execution state never rewrites them.
             readonly property bool approvalShown: bridge.approvalPending && workflowWell.has
             readonly property var outcome: bridge.safety.fixture ? ({}) : (bridge.safety.outcome || ({}))
-            WRow { height: workflowWell.pitch; glyph: "◇"; k: "Status"; empty: !workflowWell.has
+            WRow { height: workflowWell.pitch; glyph: "◇"; k: "Status"; label: qsTr("Status"); empty: !workflowWell.has
                 tint: workflowWell.approvalShown ? Theme.warning : Theme.stateColor(bridge.coreState)
                 vColor: workflowWell.approvalShown ? Theme.warning : bridge.coreState === "running" ? Theme.accent : "#cfdceb"
-                v: workflowWell.approvalShown ? "Approval required" : workflowWell.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
-            WRow { height: workflowWell.pitch; glyph: "⌘"; tint: Theme.accent; k: "Connector"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
-            WRow { height: workflowWell.pitch; glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : "Chosen by Core" }
-            WRow { height: workflowWell.pitch; glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : "Granted destinations only" }
-            WRow { height: workflowWell.pitch; glyph: "◷"; k: "Outcome"; empty: !workflowWell.has; last: true
+                v: workflowWell.approvalShown ? qsTr("Approval required") : workflowWell.has ? (column.statusWord(bridge.task.status) || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : qsTr("No active task") }
+            WRow { height: workflowWell.pitch; glyph: "⌘"; tint: Theme.accent; k: "Connector"; label: qsTr("Connector"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : qsTr("Waiting for your request…") }
+            WRow { height: workflowWell.pitch; glyph: "✦"; tint: Theme.accent; k: "Capability"; label: qsTr("Capability"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : qsTr("Chosen by Core") }
+            WRow { height: workflowWell.pitch; glyph: "➶"; tint: Theme.accent; k: "Destination"; label: qsTr("Destination"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : qsTr("Granted destinations only") }
+            WRow { height: workflowWell.pitch; glyph: "◷"; k: "Outcome"; label: qsTr("Outcome"); empty: !workflowWell.has; last: true
                 readonly property string kind: workflowWell.outcome.kind || ""
                 tint: kind === "unknown" || kind === "in_progress" ? Theme.unknownEdge : kind === "failed" ? Theme.danger : kind === "blocked" ? Theme.warning
                     : kind === "completed" ? Theme.success : Theme.accentSoft
                 vColor: kind === "unknown" || kind === "in_progress" ? Theme.unknownEdge : kind === "failed" ? Theme.danger : kind === "blocked" ? Theme.warning
                       : kind === "completed" ? Theme.success : "#cfdceb"
-                v: !workflowWell.has ? "None yet"
-                   : ({ unknown: "Outcome unknown", in_progress: "Not established yet", failed: "Failed", blocked: "Blocked", completed: "Completed", cancelled: "Cancelled", paused: "Paused by Freeze" })[kind]
-                     || bridge.task.run_status || "pending" }
+                v: !workflowWell.has ? qsTr("None yet")
+                   : ({ unknown: qsTr("Outcome unknown"), in_progress: qsTr("Not established yet"), failed: qsTr("Failed"), blocked: qsTr("Blocked"), completed: qsTr("Completed"), cancelled: qsTr("Cancelled"), paused: qsTr("Paused by Freeze") })[kind]
+                     || column.statusWord(bridge.task.run_status) || qsTr("pending") }
         }
     }
     Component {
@@ -419,7 +431,7 @@ Item {
             readonly property real textX: column.gridA + glyphD + 8
             // D: a stable, unwrapped timestamp column (~56 px) at the shared right inset.
             readonly property real timeW: Math.max(56, Math.ceil(stamp.advanceWidth))
-            TextMetrics { id: stamp; text: "00 min ago"; font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.timestamp }
+            TextMetrics { id: stamp; text: qsTr("%1 min ago").arg("00"); font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.timestamp }
             readonly property int rowsShown: bridge.activity.length + (bridge.activity.length < 4 ? 1 : 0)
             readonly property int rowsFit: Math.max(1, Math.floor((feedRoot.height - 2) / pitch))
             height: Math.min(rowsShown, rowsFit) * pitch + 2
@@ -433,7 +445,7 @@ Item {
                     readonly property bool semantic: modelData.kind === "approval" || modelData.kind === "unknown" || modelData.kind === "error"
                     readonly property color tint: modelData.kind === "approval" ? Theme.warning : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : column.highlight
                     readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
-                    readonly property string source: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"
+                    readonly property string source: modelData.kind === "approval" ? qsTr("Authorization") : modelData.kind === "unknown" ? qsTr("Outcome unknown") : modelData.kind === "error" ? qsTr("Error") : modelData.kind === "scheduled" ? qsTr("Scheduled run") : qsTr("Interface")
                     // Source glyph: a small technical disc, blue unless the event itself is semantic.
                     Rectangle { x: column.gridA; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2
                         color: semantic ? Theme.alpha(tint, 0.16) : "#0e2f4e"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : Theme.alpha(column.structure, 0.75)
@@ -457,9 +469,9 @@ Item {
                     Rectangle { x: column.gridA; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(column.structure, 0.4)
                         Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: "#4f6b8a" } }
                     Column { anchors.left: parent.left; anchors.leftMargin: feedWell.textX; anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter; spacing: 1
-                        Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: Theme.textLabel; width: parent.width; elide: Text.ElideRight
+                        Text { text: bridge.activity.length === 0 ? qsTr("Nothing yet") : qsTr("Nothing else yet"); color: Theme.textLabel; width: parent.width; elide: Text.ElideRight
                                font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 13 }) : Theme.uiLabel; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 17 : 20 }
-                        Text { text: "Approvals, outcomes and scheduled runs appear here"; color: Theme.textMuted; width: parent.width; elide: Text.ElideRight
+                        Text { text: qsTr("Approvals, outcomes and scheduled runs appear here"); color: Theme.textMuted; width: parent.width; elide: Text.ElideRight
                                font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 15 : 18 }
                     }
                 }
@@ -470,12 +482,12 @@ Item {
     Component {
         id: automationsPanel
         Well {
-            WRow { visible: bridge.jobs.length === 0; glyph: "⟳"; k: "Jobs"; empty: true; last: true; v: "No jobs defined" }
+            WRow { visible: bridge.jobs.length === 0; glyph: "⟳"; k: "Jobs"; label: qsTr("Jobs"); empty: true; last: true; v: qsTr("No jobs defined") }
             Repeater {
                 model: bridge.jobs.slice(0, 5)
                 WRow { glyph: "⟳"; tint: modelData.enabled ? Theme.success : Theme.textDim; last: index === Math.min(bridge.jobs.length, 5) - 1
-                    k: modelData.readable ? (modelData.label.length > 12 ? modelData.label.substring(0, 12) + "…" : modelData.label) : "(unreadable)"
-                    v: modelData.next_due_at_utc ? "next " + modelData.next_due_at_utc.substring(5, 16) + "Z" : "—" }
+                    k: modelData.readable ? (modelData.label.length > 12 ? modelData.label.substring(0, 12) + "…" : modelData.label) : qsTr("(unreadable)")
+                    v: modelData.next_due_at_utc ? qsTr("next %1").arg(modelData.next_due_at_utc.substring(5, 16) + "Z") : "—" }
             }
         }
     }

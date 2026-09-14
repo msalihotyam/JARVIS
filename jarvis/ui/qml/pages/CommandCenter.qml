@@ -20,7 +20,7 @@ Item {
     readonly property bool empty: bridge.feed.length === 0 && !bridge.safety.cards
     // Primary content glass: the shell lets the space through in its unused
     // areas; every message and structured block sits on its own darker
-    // reading island (FeedView, StagePipeline).
+    // reading island (FeedView).
     readonly property color fill: Theme.glassPrimaryShell
     readonly property color edge: Theme.glassEdge
     readonly property int shellRadius: Theme.radius
@@ -69,7 +69,6 @@ Item {
             safetyCards: true
             anchors.fill: parent
             visible: !page.empty
-            pipelineEnabled: true
             referenceLayout: page.roomy
             layoutScale: Math.max(0.75, Math.min(1, page.width / 1231))
         }
@@ -85,11 +84,11 @@ Item {
             spacing: page.roomy ? 8 : 6
             readonly property int tier: Theme.tier(page.Window.width)
             Text { objectName: "welcomeGreeting"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
-                   text: (function() { var h = new Date().getHours(); return (h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening") + ", " + bridge.operatorName + "." })()
+                   text: (function() { var h = new Date().getHours(); return (h < 12 ? qsTr("Good morning, %1.") : h < 18 ? qsTr("Good afternoon, %1.") : qsTr("Good evening, %1.")).arg(bridge.operatorName) })()
                    color: Theme.text; font: Theme.greeting(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingLine(welcome.tier) }
             Text { objectName: "welcomeSupport"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
-                   text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "JARVIS is frozen. Resume it from the red control or the tray when ready." : "What would you like to work on?"
+                   text: bridge.configRefused ? qsTr("Configuration refused — execution is off.") : !bridge.executionEnabled ? qsTr("JARVIS is frozen. Resume it from the red control or the tray when ready.") : qsTr("What would you like to work on?")
                    color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.textLabel
                    font: Theme.greetingSupport(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingSupportLine(welcome.tier) }
@@ -107,10 +106,10 @@ Item {
         anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: flowArea.anchors.leftMargin + 68; rightMargin: 36; bottomMargin: visible ? 18 : 0 }
         visible: !!bridge.clarification.choices && bridge.clarification.choices.length > 0
         height: visible ? implicitHeight : 0; spacing: 10
-        Text { text: "CHOOSE ONE"; color: Theme.accentSoft; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+        Text { text: qsTr("CHOOSE ONE"); color: Theme.accentSoft; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
         Flow { width: parent.width; spacing: 10
             Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
-            ActionButton { label: "Never mind"; onClicked: bridge.dismissClarification() }
+            ActionButton { label: qsTr("Never mind"); onClicked: bridge.dismissClarification() }
         }
     }
     // The composer: the surface's bottom anchor, growing upward with a draft

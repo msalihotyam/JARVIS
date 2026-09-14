@@ -16,8 +16,8 @@ Item {
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
     // Freeze / Resume JARVIS for the whole installation - not close, not quit, not cancel task.
-    Accessible.name: engaged ? "Resume JARVIS" : "Freeze JARVIS"
-    Accessible.description: engaged ? "JARVIS is frozen. Resuming asks for confirmation." : "Freeze JARVIS: nothing new can start; running work pauses at its next safe point."
+    Accessible.name: engaged ? qsTr("Resume JARVIS") : qsTr("Freeze JARVIS")
+    Accessible.description: engaged ? qsTr("JARVIS is frozen. Resuming asks for confirmation.") : qsTr("Freeze JARVIS: nothing new can start; running work pauses at its next safe point.")
     Accessible.onPressAction: if (enabled) clicked()
     Keys.onReturnPressed: if (enabled) clicked()
     Keys.onSpacePressed: if (enabled) clicked()

@@ -76,7 +76,7 @@ Window {
         // From the tray: the same confirmations the window uses.
         function onResumeConfirmRequested() { root.closeContexts(); resumeConfirm.open = true }
         function onQuitConfirmRequested() {
-            confirm.ask("Quit JARVIS?", bridge.quitWarning, "Quit JARVIS", false, function() { bridge.confirmQuit() }, "Cancel")
+            confirm.ask(qsTr("Quit JARVIS?"), bridge.quitWarning, qsTr("Quit JARVIS"), false, function() { bridge.confirmQuit() }, qsTr("Cancel"))
         }
     }
 
@@ -179,7 +179,7 @@ Window {
             onCardsRequested: function(anchor) { layoutMenus.toggle("cards", anchor) }
             onResetRequested: function(anchor) { layoutMenus.toggle("reset", anchor) } } }
         Component { id: tasksPage; TasksPage {} }
-        Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
+        Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask(qsTr("Archive job"), qsTr("Archive '%1'? There is no un-archive.").arg(job.label), qsTr("Archive"), true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
         Component { id: memoryPage; MemoryPage {} }
         Component { id: historyPage; HistoryPage {} }
 
@@ -219,21 +219,21 @@ Window {
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: 24 }
         height: 30
         Row { anchors { left: parent.left; leftMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font: Theme.hudLabel }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("INTELLIGENCE AMPLIFIES POTENTIAL"); color: Theme.textDim; font: Theme.hudLabel }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
         }
         Row { anchors { right: parent.right; rightMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "SAME HIGHER FURTHER"; color: Theme.textDim; font: Theme.hudLabel }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("SAME HIGHER FURTHER"); color: Theme.textDim; font: Theme.hudLabel }
         }
     }
     // Focus-mode badge: a tiny reminder that the arrangement is temporary.
     Pill {
         visible: bridge.focusMode
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 8 }
-        text: "Focus mode · Ctrl+Shift+F to leave"; tint: Theme.accent
+        text: qsTr("Focus mode · %1 to leave").arg("Ctrl+Shift+F"); tint: Theme.accent
     }
 
     NavMenu { id: nav; anchorPoint: Qt.point(topBar.navAnchor.x - panelWidth, topBar.navAnchor.y) }
@@ -267,16 +267,16 @@ Window {
             Column {
                 id: reBody
                 x: 18; y: 18; width: parent.width - 36; spacing: 10
-                Text { text: "Resume JARVIS?"; color: Theme.text; font: Theme.uiValue; activeFocusOnTab: true
+                Text { text: qsTr("Resume JARVIS?"); color: Theme.text; font: Theme.uiValue; activeFocusOnTab: true
                        Accessible.role: Accessible.Heading; Accessible.name: text }
                 Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.metadata
                        text: bridge.executionState === "freeze_requested"
-                             ? "An operation is still on its way to a safe point. Resuming lets it and new work continue."
-                             : "New work can start again, and a task Freeze paused continues from where it stopped. Nothing failed, cancelled or with an unknown outcome is repeated. This is not an approval." }
+                             ? qsTr("An operation is still on its way to a safe point. Resuming lets it and new work continue.")
+                             : qsTr("New work can start again, and a task Freeze paused continues from where it stopped. Nothing failed, cancelled or with an unknown outcome is repeated. This is not an approval.") }
                 Row {
                     width: parent.width; spacing: 8
-                    ActionButton { objectName: "keepFrozen"; label: "Keep frozen"; height: 40; width: (parent.width - 8) / 2; onClicked: resumeConfirm.open = false }
-                    ActionButton { objectName: "resumeJarvis"; label: "Resume JARVIS"; primary: true; height: 40; width: (parent.width - 8) / 2
+                    ActionButton { objectName: "keepFrozen"; label: qsTr("Keep frozen"); height: 40; width: (parent.width - 8) / 2; onClicked: resumeConfirm.open = false }
+                    ActionButton { objectName: "resumeJarvis"; label: qsTr("Resume JARVIS"); primary: true; height: 40; width: (parent.width - 8) / 2
                         onClicked: { resumeConfirm.open = false; bridge.resumeJarvis() } }
                 }
             }
@@ -323,14 +323,14 @@ Window {
         fillMode: Image.Stretch
         enabled: false
         Rectangle { anchors { right: parent.right; top: parent.top; margins: 8 } width: devLabel.width + 16; height: 22; radius: 6; color: "#c0000000"
-            Text { id: devLabel; anchors.centerIn: parent; text: "DEV REFERENCE OVERLAY " + Math.round(devReference.opacity * 100) + " %"; color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
+            Text { id: devLabel; anchors.centerIn: parent; text: qsTr("DEV REFERENCE OVERLAY %1 %").arg(Math.round(devReference.opacity * 100)); color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
     }
     Shortcut { sequence: "Ctrl+Shift+R"; enabled: bridge.devReference !== ""; onActivated: devReference.opacity = devReference.opacity === 0 ? 0.5 : (devReference.opacity === 0.5 ? 1 : 0) }
     Shortcut { sequence: "Ctrl+Shift+A"; enabled: bridge.devFixture && !bridge.approvalPending; onActivated: { root.closeContexts(); root.devApprovalVisible = !root.devApprovalVisible
         bridge.setDevSafetyScenario(root.devApprovalVisible ? "approval" : "") } }
     // DEV FIXTURE: cycle display-only safety scenarios (approval, missing details, unknown, failed, blocked, completed).
     Shortcut { sequence: "Ctrl+Shift+S"; enabled: bridge.devFixture; onActivated: bridge.nextDevSafetyScenario() }
-    Pill { visible: bridge.devFixture; z: 8000; text: "Dev fixture · sample text, not real activity"; tint: Theme.danger
+    Pill { visible: bridge.devFixture; z: 8000; text: qsTr("Dev fixture · sample text, not real activity"); tint: Theme.danger
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 26 } }
 
     // -- shortcuts -----------------------------------------------------------
@@ -356,7 +356,7 @@ Window {
         anchors { horizontalCenter: parent.horizontalCenter; top: parent.top; topMargin: 10 }
         width: auditionText.width + 24; height: 26; radius: 6; color: "#d0000812"; border.width: 1; border.color: "#ff8080"
         Text { id: auditionText; anchors.centerIn: parent; color: "#ff8080"
-            text: "DEV · " + (root.auditionIndex === 0 ? "CURRENT BACKGROUND" : "BACKGROUND " + root.auditionIndex + " / " + bridge.devBackgroundCandidates.length)
+            text: "DEV · " + (root.auditionIndex === 0 ? qsTr("CURRENT BACKGROUND") : qsTr("BACKGROUND %1 / %2").arg(root.auditionIndex).arg(bridge.devBackgroundCandidates.length))
             font { family: Theme.font; pixelSize: 11; letterSpacing: 1.5; weight: Font.DemiBold } }
         SequentialAnimation { id: auditionFade; PauseAnimation { duration: 900 } NumberAnimation { target: auditionLabel; property: "opacity"; to: 0; duration: 250 } }
     }

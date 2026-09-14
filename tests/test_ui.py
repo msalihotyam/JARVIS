@@ -127,6 +127,10 @@ class UiTestCase(unittest.TestCase):
         self.engine = create_engine(bridge)
         self.addCleanup(self.engine.deleteLater)
         roots = self.engine.rootObjects()
+        # deleteLater never runs under pump(), so a finished test's window would
+        # stay shown and load every later test's frames: hide it first.
+        for window in roots:
+            self.addCleanup(window.hide)
         self.assertEqual(1, len(roots), "Main.qml did not load")
         pump(50)
         return roots[0]
@@ -2437,6 +2441,232 @@ class SafetyUxTests(UiTestCase):
         self.assertEqual("recorded", bridge.safety["decision"]["state"])
         self.assertFalse(strip.isVisible())
         self.assertEqual(1, self.execute_calls())
+
+
+class LocalizationTests(UiTestCase):
+    """One localization path: a persisted locale id, one catalog, live switching.
+    Presentation only - domain state stays canonical in every language."""
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+    pending = AuthorityTests.pending
+
+    def setUp(self) -> None:
+        super().setUp()
+        from jarvis.ui.i18n import localization
+        # The translator is application-wide: every test leaves it English.
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+
+    def text(self, root, name) -> str:
+        return self.item(root, name).property("text")
+
+    def test_language_preference_defaults_migrates_and_persists(self) -> None:
+        from copy import deepcopy
+        self.assertEqual("en-US", canonical_preferences()["language"])
+        # An installation saved before the setting keeps every choice and gets English.
+        before = canonical_preferences(); before.pop("language"); before["theme"] = "dark"
+        before["rail"]["visible"]["plan"] = False
+        migrated = validate_preferences(before)
+        self.assertEqual(("en-US", "dark", False), (migrated["language"], migrated["theme"], migrated["rail"]["visible"]["plan"]))
+        bad = deepcopy(canonical_preferences()); bad["language"] = "Türkçe"     # a visible label is never a stored value
+        self.assertEqual(canonical_preferences(), validate_preferences(bad))
+        bridge = self.bridge()
+        bridge.setLanguage("tr-TR")
+        self.assertEqual("tr-TR", json.loads(self.prefs_path.read_text(encoding="utf-8"))["language"])
+        self.assertEqual("tr-TR", UiPreferences(self.prefs_path).data["language"])
+        bridge.setCardVisible("rail", "memory", False)
+        bridge.resetLayout()                                                   # layout only
+        self.assertEqual("tr-TR", UiPreferences(self.prefs_path).data["language"])
+        bridge.setLanguage("fr-FR")                                            # not offered: ignored
+        self.assertEqual("tr-TR", bridge.language)
+        bridge.setLanguage("en-US")
+        self.assertEqual("en-US", UiPreferences(self.prefs_path).data["language"])
+
+    def test_turkish_catalog_covers_every_marked_string(self) -> None:
+        import re, shutil, subprocess
+        import xml.etree.ElementTree as ElementTree
+        from jarvis.ui import i18n
+        path = i18n.catalog_path("tr-TR")
+        root = ElementTree.parse(path).getroot()
+        messages = [(c.findtext("name"), m) for c in root.iter("context") for m in c.iter("message")]
+        self.assertGreater(len(messages), 500)
+        for context, message in messages:
+            source, translation = message.findtext("source"), message.find("translation")
+            with self.subTest(context=context, source=source[:60]):
+                self.assertNotIn(translation.get("type"), ("unfinished", "vanished", "obsolete"))
+                self.assertTrue((translation.text or "").strip())
+                self.assertEqual(sorted(re.findall(r"%\d", source)), sorted(re.findall(r"%\d", translation.text)))
+        # The gate for new strings: re-extract from the sources; nothing may be new or untranslated.
+        lupdate, lrelease = i18n.linguist_tool("lupdate"), i18n.linguist_tool("lrelease")
+        if not (lupdate.exists() and lrelease.exists()):
+            self.skipTest("the PySide6 Linguist tools are not installed")
+        work = Path(self.temp.name) / "catalog.ts"
+        shutil.copyfile(path, work)
+        sources = [str(p) for p in sorted(i18n.UI_DIR.rglob("*.qml"))] + [str(p) for p in sorted(i18n.UI_DIR.glob("*.py")) if p.name != "i18n.py"]
+        subprocess.run([str(lupdate), *sources, "-ts", str(work), "-locations", "none", "-no-obsolete"], check=True, capture_output=True)
+        fresh = ElementTree.parse(work).getroot()
+        untranslated = [(c.findtext("name"), m.findtext("source")) for c in fresh.iter("context") for m in c.iter("message")
+                        if m.find("translation").get("type") == "unfinished" or not (m.find("translation").text or "").strip()]
+        self.assertEqual([], untranslated, "Marked strings without a Turkish translation: run 'python -m jarvis.ui.i18n' and translate them")
+        # And what ships is that catalog, compiled.
+        compiled = Path(self.temp.name) / "catalog.qm"
+        subprocess.run([str(lrelease), str(path), "-qm", str(compiled)], check=True, capture_output=True)
+        self.assertEqual(compiled.read_bytes(), i18n.compiled_path("tr-TR").read_bytes(), "Stale .qm: run 'python -m jarvis.ui.i18n'")
+
+    def test_fallback_is_english_never_empty_or_a_key(self) -> None:
+        from jarvis.ui import i18n
+        from jarvis.ui.i18n import fill, localization, render, tx
+        localization(_APP).apply("tr-TR")
+        self.assertEqual("JARVIS'i Aç", tx("Tray", "Open JARVIS"))
+        self.assertEqual("Not in the catalog", tx("Tray", "Not in the catalog"))              # missing -> source
+        self.assertEqual("Nothing matches here", tx("NoSuchContext", "Nothing matches here"))
+        localization(_APP).apply("en-US")
+        self.assertEqual("Open JARVIS", tx("Tray", "Open JARVIS"))
+        # A missing compiled catalog is English, not empty text.
+        from unittest.mock import patch
+        with patch.object(i18n, "compiled_path", lambda language: Path(self.temp.name) / "absent.qm"):
+            bare = i18n.Localization(_APP)
+            bare.apply("tr-TR")
+            self.addCleanup(bare.apply, "en-US")
+            self.assertEqual(("tr-TR", "Open JARVIS"), (bare.language, tx("Tray", "Open JARVIS")))
+        self.assertEqual("3 of 5 %3", fill("%1 of %2 %3", (3, 5)))
+        self.assertEqual("REFUSED [x]: y\nNothing was executed.", render(("Present", "REFUSED [%1]: %2\nNothing was executed.", ("x", "y"))))
+        self.assertEqual("typed by a person", render("typed by a person"))
+
+    def test_live_switch_translates_everything_and_changes_no_state(self) -> None:
+        from jarvis.ui.i18n import localization
+        from jarvis.ui.tray import TrayController
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.submitText("Bu projeyi incele."); pump(400)
+        state = (bridge._ticket, dict(bridge.task), bridge.executionState, bridge.coreState, json.dumps(bridge.prefs.data["rail"]),
+                 [(e["kind"]) for e in bridge.feed], bridge.approval["request_id"])
+        english = (self.text(root, "railTitleTasks"), self.text(root, "attentionLabel"), self.text(root, "safetyHeading_approval"))
+        self.assertEqual(("Tasks", "Your approval is required", "Approval required"), english)
+        bridge.setLanguage("tr-TR"); pump(300)
+        self.assertEqual("tr-TR", localization(_APP).language)
+        self.assertEqual("Görevler", self.text(root, "railTitleTasks"))
+        self.assertEqual("Hafıza", self.text(root, "railTitleMemory"))
+        self.assertEqual("Onayınız gerekiyor", self.text(root, "attentionLabel"))
+        self.assertEqual("Onay gerekli", self.text(root, "safetyHeading_approval"))
+        self.assertEqual("İşlemi onayla", self.item(root, "approvalApprove").property("label"))
+        self.assertEqual("Reddet", self.item(root, "approvalDeny").property("label"))
+        self.assertIn("ONAY GEREKLİ - yetkilendirme kartını inceleyin.", self.feed_text(bridge))  # an earlier notice, re-rendered
+        self.assertIn("Bu projeyi incele.", self.feed_text(bridge))                               # the person's words, as written
+        bridge.setEditMode(True); pump(200)
+        self.assertEqual("Bitti", self.item(root, "layoutDone").property("label"))
+        self.assertEqual("DÜZENİ DÜZENLE", self.item(root, "layoutToolbar").childItems()[0].childItems()[1].childItems()[0].property("text"))
+        bridge.setEditMode(False); pump(100)
+        tray = TrayController(bridge, root)
+        self.assertEqual(("JARVIS'i Aç", "JARVIS'ten Çık"), tray.menu_labels())
+        self.assertEqual(("JARVIS'i Dondur", True), tray.lifecycle_action())
+        self.assertEqual("JARVIS — Dikkat gerekiyor", tray.status_text())
+        self.assertEqual("JARVIS arka planda çalışmaya devam ediyor.", tray.hidden_message())
+        # Nothing but presentation moved: the same ticket, task, gate, layout and entries.
+        self.assertEqual(state, (bridge._ticket, dict(bridge.task), bridge.executionState, bridge.coreState, json.dumps(bridge.prefs.data["rail"]),
+                                 [(e["kind"]) for e in bridge.feed], bridge.approval["request_id"]))
+        self.assertEqual("awaiting_approval", bridge.task["status"])                             # canonical, untranslated
+        self.assertEqual("approval", bridge.safety["attention"][0]["key"])
+        # And back: no Turkish left behind.
+        bridge.setLanguage("en-US"); pump(300)
+        self.assertEqual(english, (self.text(root, "railTitleTasks"), self.text(root, "attentionLabel"), self.text(root, "safetyHeading_approval")))
+        self.assertEqual(("Open JARVIS", "Quit JARVIS"), tray.menu_labels())
+        self.assertIn("APPROVAL REQUIRED - review the authorization card.", self.feed_text(bridge))
+
+    def test_turkish_safety_states_stay_distinct_and_dates_follow_the_locale(self) -> None:
+        from PySide6.QtCore import QLocale, QDate
+        from jarvis.ui.i18n import load_catalog, catalog_path
+        table = load_catalog(catalog_path("tr-TR"))
+        distinct = ["Approval required", "Your decision is needed", "Blocked", "Failed", "Outcome unknown",
+                    "Paused by Freeze", "Frozen", "Cancelled", "JARVIS state unconfirmed", "Reject", "Cancel task",
+                    "Freeze JARVIS", "Quit JARVIS"]
+        words = {source: next(v for (c, s), v in table.items() if s == source) for source in distinct}
+        self.assertEqual(len(distinct), len(set(words.values())), words)
+        self.assertEqual("Sonuç bilinmiyor", words["Outcome unknown"])
+        self.raising_connector = SafetyUxTests.raising_connector.__get__(self)
+        self.raising_connector()
+        bridge = self.pending()
+        root = self.window(bridge)
+        bridge.setLanguage("tr-TR"); pump(200)
+        bridge.approve(); pump(400)
+        self.assertEqual("Sonuç bilinmiyor", self.text(root, "safetyHeading_outcome"))
+        self.assertEqual("JARVIS işlemin tamamlanıp tamamlanmadığını doğrulayamadı.", self.text(root, "safetyOutcomeText"))
+        self.assertEqual("unknown", bridge.safety["outcome"]["kind"])                             # canonical kind
+        bridge.freezeJarvis(); pump(300)
+        self.assertEqual("DONDURULDU", self.text(root, "killSwitchLabel"))
+        self.assertEqual("JARVIS donduruldu", self.text(root, "safetyHeading_execution"))
+        self.assertEqual("frozen", bridge.executionState)
+        # The rail date is the selected locale's, from Qt's own locale data.
+        date = self.text(root, "contextDate")
+        today = QDate.currentDate()
+        self.assertIn(date, (QLocale("tr_TR").toString(today, "ddd, d MMM"), QLocale("tr_TR").toString(today, "d MMM yyyy")))
+        bridge.setLanguage("en-US"); pump(200)
+        self.assertEqual("FROZEN", self.text(root, "killSwitchLabel"))
+        self.assertIn(self.text(root, "contextDate"), (QLocale("en_US").toString(today, "ddd, d MMM"), QLocale("en_US").toString(today, "d MMM yyyy")))
+
+
+
+class HudProgressTests(UiTestCase):
+    """The four lifecycle stages live in the header as a quiet indicator,
+    projected by the bridge and shown only while there is real work; the
+    conversation carries no stage block."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    texts = ConversationSurfaceTests.texts
+    STAGES = ("Understanding your request", "Authorization", "Execution", "Outcome")
+
+    def nodes(self, root) -> list:
+        return [self.item(root, f"hudStageNode_{i}") for i in range(4)]
+
+    def test_progress_is_projected_from_authoritative_state_and_idle_projects_nothing(self) -> None:
+        from jarvis.ui.present import task_progress
+        self.assertEqual({"active": False, "stages": []}, task_progress({}, "idle", False))
+        self.assertEqual({"active": False, "stages": []}, task_progress({"task_id": "t", "status": "completed"}, "completed", False))
+        self.assertEqual(["running", "pending", "pending", "pending"], task_progress({}, "running", True)["stages"])
+        waiting = {"task_id": "t", "status": "awaiting_approval", "run_status": "awaiting_approval"}
+        self.assertEqual(["done", "waiting", "pending", "pending"], task_progress(waiting, "awaiting_approval", False)["stages"])
+        self.assertEqual(["done", "done", "running", "pending"], task_progress({**waiting, "status": "running"}, "running", True)["stages"])
+        self.assertEqual(["done", "denied", "skipped", "skipped"], task_progress({"task_id": "t", "status": "rejected"}, "running", True)["stages"])
+
+    def test_header_indicator_follows_the_active_task_and_the_chat_has_no_stage_block(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
+        root = self.window(bridge)
+        hud = self.item(root, "hudProgress")
+        self.assertFalse(hud.isVisible())                                          # idle: no ghost pipeline
+        bridge.submitText("Bu projeyi incele."); pump(500)
+        self.assertEqual("awaiting_approval", bridge.task["status"])
+        self.assertTrue(hud.isVisible())
+        self.assertEqual(bridge.progress["stages"], [n.parent().property("s") for n in self.nodes(root)])
+        self.assertEqual(["done", "waiting", "pending", "pending"], bridge.progress["stages"])
+        labels = self.texts(hud, [])
+        self.assertEqual(list(self.STAGES), labels)
+        # Borderless, beside the core in the header, clear of the wordmark.
+        top = self.item(root, "jarvisCore")
+        self.assertLess(hud.mapToScene(hud.boundingRect().topRight()).x(), top.mapToScene(top.boundingRect().topLeft()).x())
+        self.assertGreater(hud.mapToScene(hud.boundingRect().topLeft()).y(), self.item(root, "brandTagline").mapToScene(self.item(root, "brandTagline").boundingRect().bottomLeft()).y())
+        # The conversation carries no stage list while the task is active.
+        inside = self.texts(self.item(root, "conversationFeed"), [])
+        for stage in self.STAGES:
+            self.assertNotIn(stage, inside)
+        # Resolved: the task is terminal and the header is calm again.
+        bridge.approve(); pump(600)
+        self.assertIn(bridge.task["status"], ("completed", "failed"))
+        self.assertFalse(hud.isVisible())
+
+    def test_turkish_capability_is_yetkinlik(self) -> None:
+        from jarvis.ui.i18n import catalog_path, load_catalog, localization
+        table = load_catalog(catalog_path("tr-TR"))
+        self.assertEqual({"Yetkinlik"}, {v for (c, s), v in table.items() if s == "Capability"})
+        self.assertFalse([v for v in table.values() if "yetenek" in v.lower()])
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.setLanguage("tr-TR"); pump(200)
+        bridge.submitText("Bu projeyi incele."); pump(500)
+        shown = self.texts(root.contentItem(), [])
+        self.assertIn("Yetkinlik", shown)
+        self.assertNotIn("Yetenek", shown)
+        self.assertEqual(["İsteğiniz anlaşılıyor", "Yetkilendirme", "Yürütme", "Sonuç"], self.texts(self.item(root, "hudProgress"), []))
 
 
 if __name__ == "__main__":  # pragma: no cover

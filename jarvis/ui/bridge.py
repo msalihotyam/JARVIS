@@ -20,9 +20,10 @@ from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import Property, QObject, QThreadPool, Signal, Slot
+from PySide6.QtCore import Property, QDateTime, QLocale, QObject, QThreadPool, Signal, Slot
 
 from jarvis.ui.backend import ApprovalTicket, Backend, approval_ticket, redact_text
+from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui.preferences import (
     CONTEXTUAL_PANELS,
     PAGES,
@@ -42,6 +43,7 @@ from jarvis.ui.present import (
     run_entries,
     show_entries,
     task_outcome,
+    task_progress,
     task_status,
     text_entries,
 )
@@ -181,23 +183,48 @@ class Bridge(QObject):
             # (at its next safe point, or finished): now JARVIS is frozen.
             self._freeze_waiting = False
             if not self.executionEnabled:
-                self._say("system", "JARVIS frozen. The operation that was running has returned; nothing new can start.")
-                self._note("JARVIS frozen", "system")
+                self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen. The operation that was running has returned; nothing new can start."))
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"), ()), "system")
         self._refresh_core_state()
 
     # -- feed ---------------------------------------------------------------
 
-    def _say(self, kind: str, text: str) -> None:
-        self._feed.append({"kind": kind, "text": redact_text(str(text)),
-                           "time": datetime.now().strftime("%I:%M %p").lstrip("0")})
+    # Entries keep a MESSAGE: plain text for what people and models wrote, or a
+    # JARVIS-owned (context, source, args) rendered in the current language
+    # whenever it is read - see jarvis.ui.i18n. Everything is redacted on entry.
+
+    @staticmethod
+    def _redacted(message: Any) -> Any:
+        if isinstance(message, tuple) and len(message) == 3:
+            context, source, args = message
+            return (context, source, tuple(Bridge._redacted(a) for a in args))
+        return redact_text(str(message))
+
+    def _say(self, kind: str, message: Any) -> None:
+        self._feed.append({"kind": kind, "msg": self._redacted(message), "ts": time.time()})
         del self._feed[:-FEED_LIMIT]
         self.feedChanged.emit()
 
-    def _note(self, text: str, kind: str = "system") -> None:
-        self._activity.insert(0, {"kind": kind, "text": redact_text(str(text)),
+    def _tell(self, kind: str, source: str, *args: Any) -> None:
+        """Say a JARVIS-owned notice (a ``Bridge`` catalog source)."""
+        self._say(kind, ("Bridge", source, tuple(args)))
+
+    def _note(self, message: Any, kind: str = "system") -> None:
+        self._activity.insert(0, {"kind": kind, "msg": self._redacted(message),
                                   "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time()})
         del self._activity[ACTIVITY_LIMIT:]
         self.dataChanged.emit()
+
+    @staticmethod
+    def _rendered(entries: list[dict], clock: bool = False) -> list[dict]:
+        out = []
+        for entry in entries:
+            row = {k: v for k, v in entry.items() if k != "msg"}
+            row["text"] = render(entry["msg"])
+            if clock:
+                row["time"] = QLocale().toString(QDateTime.fromSecsSinceEpoch(int(entry["ts"])).time(), QLocale.FormatType.ShortFormat)
+            out.append(row)
+        return out
 
     # -- core state ----------------------------------------------------------
 
@@ -241,11 +268,13 @@ class Bridge(QObject):
         self._approval = approval_card(payload)
         self._last_outcome = outcome_kind(payload)
         if self._ticket is not None:
-            self._note(f"Approval required: {self._approval.get('action')} -> {self._approval.get('destination')}", "approval")
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Approval required: %1 -> %2"),
+                        (self._approval.get("action"), self._approval.get("destination"))), "approval")
         elif self._last_outcome == "unknown":
-            self._note(f"OUTCOME UNKNOWN for task {self._task.get('task_id')}", "unknown")
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "OUTCOME UNKNOWN for task %1"), (self._task.get("task_id"),)), "unknown")
         elif self._task:
-            self._note(f"Task {self._task.get('task_id')[:8]} {self._task.get('run_status')}", "system")
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 %2"),
+                        (self._task.get("task_id")[:8], self._task.get("run_status"))), "system")
         self.approvalChanged.emit()
         self.dataChanged.emit()
 
@@ -271,10 +300,10 @@ class Bridge(QObject):
                 "choices": choices,
             }
         elif status == "scheduled":
-            self._note(f"Scheduled job {((payload.get('job') or {}).get('label'))}", "scheduled")
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduled job %1"), ((payload.get("job") or {}).get("label"),)), "scheduled")
             self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
         else:
-            self._note(f"Intent {status}", "error" if status != "scheduled" else "system")
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Intent %1"), (status,)), "error" if status != "scheduled" else "system")
         self._task = task_status(None, intent) if status != "structured" else self._task
         self._last_outcome = outcome_kind(None, status)
         self.approvalChanged.emit()
@@ -347,6 +376,11 @@ class Bridge(QObject):
     def task(self) -> dict:
         return dict(self._task)
 
+    @Property("QVariantMap", notify=stateChanged)
+    def progress(self) -> dict:
+        """The header's four lifecycle stages, projected in present.task_progress."""
+        return task_progress(self._task, self._core_state, self._busy)
+
     @Property(bool, notify=stateChanged)
     def taskLive(self) -> bool:
         return bool(self._session_id) and (self._busy or (
@@ -388,12 +422,15 @@ class Bridge(QObject):
         """Display-only sample conversation for side-by-side reconstruction
         against the reference. Feed and activity text only: no task, no
         ticket, no config, no persistence. The UI shows a DEV FIXTURE badge."""
-        self._say("user", "Can you review my open tasks, check for any important updates, and help me plan the next steps for today?")
-        self._say("jarvis", "I’ll review your open tasks, check for relevant updates across your tools, and create a focused plan for today.")
-        self._say("jarvis", "Here’s what I found and a recommended plan for today. This takes into account your tasks, recent updates, and key priorities.")
-        for kind, text in (("system", "3 relevant documents found"), ("scheduled", "Calendar update"),
-                           ("system", "Claude Opus 5 ready"), ("system", "New research insight available")):
-            self._note(text, kind)
+        # Sample turns are fixture copy, not anyone's words: they follow the language.
+        self._tell("user", QT_TRANSLATE_NOOP("Bridge", "Can you review my open tasks, check for any important updates, and help me plan the next steps for today?"))
+        self._tell("jarvis", QT_TRANSLATE_NOOP("Bridge", "I’ll review your open tasks, check for relevant updates across your tools, and create a focused plan for today."))
+        self._tell("jarvis", QT_TRANSLATE_NOOP("Bridge", "Here’s what I found and a recommended plan for today. This takes into account your tasks, recent updates, and key priorities."))
+        for kind, text in (("system", QT_TRANSLATE_NOOP("Bridge", "3 relevant documents found")),
+                           ("scheduled", QT_TRANSLATE_NOOP("Bridge", "Calendar update")),
+                           ("system", QT_TRANSLATE_NOOP("Bridge", "Claude Opus 5 ready")),
+                           ("system", QT_TRANSLATE_NOOP("Bridge", "New research insight available"))):
+            self._note(("Bridge", text, ()), kind)
 
     @Property("QVariantList", notify=stateChanged)
     def effortChoices(self) -> list:
@@ -401,11 +438,11 @@ class Bridge(QObject):
 
     @Property("QVariantList", notify=feedChanged)
     def feed(self) -> list:
-        return list(self._feed)
+        return self._rendered(self._feed, clock=True)
 
     @Property("QVariantList", notify=dataChanged)
     def activity(self) -> list:
-        return list(self._activity)
+        return self._rendered(self._activity)
 
     @Property("QVariantMap", notify=approvalChanged)
     def approval(self) -> dict:
@@ -429,7 +466,7 @@ class Bridge(QObject):
 
     @Property("QVariantList", notify=dataChanged)
     def taskDetail(self) -> list:
-        return list(self._task_detail)
+        return [{**entry, "text": render(entry["text"])} for entry in self._task_detail]
 
     @Property("QVariantList", notify=dataChanged)
     def jobs(self) -> list:
@@ -453,7 +490,7 @@ class Bridge(QObject):
         if not text.strip() or self._busy:
             return False
         if self._ticket is not None:
-            self._say("system", "Answer the pending approval first (Approve, Deny or Cancel).")
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Answer the pending approval first (Approve, Deny or Cancel)."))
             return False
         self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
@@ -522,7 +559,8 @@ class Bridge(QObject):
             return False
         shown = self._approval
         self._ticket, self._approval = None, {}
-        self._decision = {"state": "submitting", "verb": verb, "label": "Submitting decision…",
+        # Labels are kept as catalog sources and rendered by ``safety``.
+        self._decision = {"state": "submitting", "verb": verb, "label": QT_TRANSLATE_NOOP("Bridge", "Submitting decision…"),
                           "action": shown.get("action", ""), "destination": shown.get("destination", ""),
                           "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
@@ -537,21 +575,21 @@ class Bridge(QObject):
         error = payload.get("error") if isinstance(payload, dict) else None
         code = str(error.get("code") or "") if isinstance(error, dict) else ""
         if not isinstance(payload, dict):
-            state, label = "unknown", "Decision status unknown"
+            state, label = "unknown", QT_TRANSLATE_NOOP("Bridge", "Decision status unknown")
         elif code in ("invalid_grant", "stale_grant", "task_not_found"):
-            state, label = "invalidated", "Request changed, expired or was resolved elsewhere — decision not recorded"
+            state, label = "invalidated", QT_TRANSLATE_NOOP("Bridge", "Request changed, expired or was resolved elsewhere — decision not recorded")
         elif code == "execution_disabled":
-            state, label = "not_recorded", "JARVIS is frozen — approval not recorded; the request stays pending"
+            state, label = "not_recorded", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen — approval not recorded; the request stays pending")
         elif code in REFUSED_CODES and code != "approval_rejected":
-            state, label = "not_recorded", "Decision not recorded"
+            state, label = "not_recorded", QT_TRANSLATE_NOOP("Bridge", "Decision not recorded")
         elif verb == "reject":
-            state, label = ("rejected", "Request rejected") if payload.get("run_status") == "rejected" \
-                else ("unknown", "Decision status unknown")
+            state, label = ("rejected", QT_TRANSLATE_NOOP("Bridge", "Request rejected")) if payload.get("run_status") == "rejected" \
+                else ("unknown", QT_TRANSLATE_NOOP("Bridge", "Decision status unknown"))
         else:
-            state, label = "recorded", "Approval recorded"
+            state, label = "recorded", QT_TRANSLATE_NOOP("Bridge", "Approval recorded")
         self._decision = {**self._decision, "state": state, "label": label, "code": code,
                           "message": str(error.get("message") or "") if isinstance(error, dict) else "",
-                          "time": datetime.now().strftime("%H:%M")}
+                          "ts": time.time()}
         self._apply_run(payload)
         if code == "execution_disabled" and ticket is not None and self._ticket is None:
             # Core refused the decision before touching the request, which is
@@ -587,7 +625,7 @@ class Bridge(QObject):
         task_id = (self.backend.active_task_id(session_id) if self._busy and session_id
                    else self._task.get("task_id"))
         if not session_id or not task_id:
-            self._say("system", "No cancellable task is registered yet.")
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "No cancellable task is registered yet."))
             return
         self._ticket, self._approval = None, {}
         self.approvalChanged.emit()
@@ -600,7 +638,7 @@ class Bridge(QObject):
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
         self._decision = {}
         self._last_outcome = "idle"
-        self._say("system", "New session: the next message starts a fresh session.")
+        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "New session: the next message starts a fresh session."))
         self.approvalChanged.emit()
         self._refresh_core_state()
 
@@ -608,7 +646,7 @@ class Bridge(QObject):
     def useSession(self, session_id: str) -> None:
         if session_id and not self._busy:
             self._session_id, self._task, self._ticket, self._approval, self._decision = str(session_id), {}, None, {}, {}
-            self._say("system", f"Using session {session_id}.")
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), session_id)
             self.approvalChanged.emit()
             self._refresh_core_state()
 
@@ -686,7 +724,7 @@ class Bridge(QObject):
     def runSweep(self) -> None:
         if self._busy:
             return
-        self._say("system", "Running one scheduler sweep...")
+        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Running one scheduler sweep..."))
         self._run("task", self.backend.scheduler_once, self._apply_run)
 
     @Slot(str, bool)
@@ -739,19 +777,25 @@ class Bridge(QObject):
         self._execution_request = "" if confirmed else "unconfirmed"
         self._freeze_waiting = confirmed and not want and self._busy
         if not confirmed:
-            self._say("error", f"JARVIS state unconfirmed: the request to {'resume' if want else 'freeze'} JARVIS "
-                               f"was not confirmed. The store reports execution "
-                               f"{'running' if self.executionEnabled else 'frozen'}.")
-            self._note("JARVIS state unconfirmed", "error")
+            if want:
+                source = (QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed: the request to resume JARVIS was not confirmed. The store reports execution running.")
+                          if self.executionEnabled else
+                          QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed: the request to resume JARVIS was not confirmed. The store reports execution frozen."))
+            else:
+                source = (QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed: the request to freeze JARVIS was not confirmed. The store reports execution running.")
+                          if self.executionEnabled else
+                          QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed: the request to freeze JARVIS was not confirmed. The store reports execution frozen."))
+            self._tell("error", source)
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed"), ()), "error")
         elif not want and self._freeze_waiting:
-            self._say("system", "Freeze requested. Nothing new can start. The operation that is running now "
-                                "stops at its next safe point; a step already sent to its destination is not "
-                                "stopped or undone.")
-            self._note("Freeze requested", "system")
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Freeze requested. Nothing new can start. The operation that is running now "
+                                                             "stops at its next safe point; a step already sent to its destination is not "
+                                                             "stopped or undone."))
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Freeze requested"), ()), "system")
         elif not want:
-            self._say("system", "JARVIS frozen. Nothing new can start; JARVIS stays open. "
-                                "Resume JARVIS from the red control or the tray when ready.")
-            self._note("JARVIS frozen", "system")
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen. Nothing new can start; JARVIS stays open. "
+                                                             "Resume JARVIS from the red control or the tray when ready."))
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"), ()), "system")
         self._refresh_core_state()
         return confirmed
 
@@ -767,9 +811,9 @@ class Bridge(QObject):
         if not self._set_gate(True):
             return
         paused = task_outcome(self._task).get("kind") == "paused"
-        self._say("system", "JARVIS resumed." + (" Continuing the paused task from where it stopped."
-                                                 if paused else " Nothing else restarts by itself."))
-        self._note("JARVIS resumed", "system")
+        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed. Continuing the paused task from where it stopped.")
+                   if paused else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed. Nothing else restarts by itself."))
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed"), ()), "system")
         if paused and self._session_id:
             self.resumeTask(self._session_id, self._task["task_id"])
 
@@ -828,13 +872,13 @@ class Bridge(QObject):
     def quitWarning(self) -> str:
         """Why quitting now needs a confirmation, from real state - or ""."""
         if self._busy:
-            return ("JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: "
-                    "the operation may keep running until it returns, and anything already sent to its "
-                    "destination is not stopped or undone.")
+            return tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: "
+                                                            "the operation may keep running until it returns, and anything already sent to its "
+                                                            "destination is not stopped or undone."))
         outcome = task_outcome(self._task)
         if outcome.get("kind") in ("unknown", "in_progress") or outcome.get("run_status") == "cancelling":
-            return ("JARVIS has work whose outcome is not established. Quitting does not resolve or stop it; "
-                    "it stays recorded in History, and anything already sent to its destination is not undone.")
+            return tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS has work whose outcome is not established. Quitting does not resolve or stop it; "
+                                                            "it stays recorded in History, and anything already sent to its destination is not undone."))
         return ""
 
     @Slot()
@@ -870,29 +914,45 @@ class Bridge(QObject):
             # executes nothing, so Core accepts it while frozen.
             approval["actionable"] = decidable and self.executionEnabled
             approval["rejectable"] = decidable
-            approval["hold"] = ("Approval details unavailable" if not approval.get("complete") or self._ticket is None
-                                else "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."
+            approval["hold"] = (tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Approval details unavailable"))
+                                if not approval.get("complete") or self._ticket is None
+                                else tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."))
                                 if not self.executionEnabled else "")
         outcome = task_outcome(self._task)
         items: list[dict[str, Any]] = []
         if execution in ("frozen", "freeze_requested", "resuming", "refused", "unconfirmed"):
-            items.append({"key": "execution", "level": 1, "tone": "danger", "label": {
-                "frozen": "JARVIS frozen", "refused": "Configuration refused — execution off",
-                "unconfirmed": "JARVIS state unconfirmed", "resuming": "Resuming JARVIS…",
-                "freeze_requested": "Freeze requested — waiting for the current operation"}[execution]})
+            items.append({"key": "execution", "level": 1, "tone": "danger", "label": tx("Bridge", {
+                "frozen": QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"),
+                "refused": QT_TRANSLATE_NOOP("Bridge", "Configuration refused — execution off"),
+                "unconfirmed": QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed"),
+                "resuming": QT_TRANSLATE_NOOP("Bridge", "Resuming JARVIS…"),
+                "freeze_requested": QT_TRANSLATE_NOOP("Bridge", "Freeze requested — waiting for the current operation")}[execution])})
         if approval:
-            items.append({"key": "approval", "level": 2, "tone": "warning", "label": "Your approval is required"})
+            items.append({"key": "approval", "level": 2, "tone": "warning", "label": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Your approval is required"))})
         if self._clarification or self._task.get("status") == "awaiting_clarification":
-            items.append({"key": "decision", "level": 2, "tone": "warning", "label": "Your decision is needed"})
-        attention = {"unknown": (3, "unknown", "Outcome unknown"), "in_progress": (3, "unknown", "Outcome not established yet"),
-                     "blocked": (4, "warning", "Action blocked"), "failed": (4, "danger", "Action failed")}.get(outcome.get("kind", ""))
+            items.append({"key": "decision", "level": 2, "tone": "warning", "label": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Your decision is needed"))})
+        attention = self._outcome_attention(outcome.get("kind", ""))
         if attention:
             items.append({"key": "outcome", "level": attention[0], "tone": attention[1], "label": attention[2]})
         items.sort(key=lambda item: item["level"])       # stable: equal levels keep their order
+        decision = dict(self._decision)
+        if decision:
+            decision["label"] = tx("Bridge", decision["label"])
+            decision["time"] = (QLocale().toString(QDateTime.fromSecsSinceEpoch(int(decision["ts"])).time(), QLocale.FormatType.ShortFormat)
+                                if decision.get("ts") else "")
         return {"fixture": False, "execution": execution, "running": self._busy, "approval": approval,
-                "decision": dict(self._decision), "outcome": outcome, "attention": items,
+                "decision": decision, "outcome": outcome, "attention": items,
                 "cards": bool(approval or self._decision or outcome
                               or execution in ("frozen", "freeze_requested", "refused", "unconfirmed"))}
+
+    @staticmethod
+    def _outcome_attention(kind: str) -> tuple | None:
+        """(level, tone, label) for an outcome that needs attention, else None."""
+        entry = {"unknown": (3, "unknown", QT_TRANSLATE_NOOP("Bridge", "Outcome unknown")),
+                 "in_progress": (3, "unknown", QT_TRANSLATE_NOOP("Bridge", "Outcome not established yet")),
+                 "blocked": (4, "warning", QT_TRANSLATE_NOOP("Bridge", "Action blocked")),
+                 "failed": (4, "danger", QT_TRANSLATE_NOOP("Bridge", "Action failed"))}.get(kind)
+        return (entry[0], entry[1], tx("Bridge", entry[2])) if entry else None
 
     @Property(str, notify=attentionChanged)
     def devSafetyScenario(self) -> str:
@@ -915,23 +975,30 @@ class Bridge(QObject):
     @staticmethod
     def _dev_safety_projection(name: str) -> dict:
         """Placeholder fields only, flagged ``fixture``: nothing here can be approved."""
-        sample = {"task_id": "DEV-FIXTURE", "connector": "[Connector]", "capability": "[Capability]",
-                  "destination": "[Exact destination]", "run_status": "", "code": "", "message": "[Core-reported detail]"}
+        def ph(source: str) -> str:
+            return tx("Bridge", source)
+        sample = {"task_id": "DEV-FIXTURE", "connector": ph(QT_TRANSLATE_NOOP("Bridge", "[Connector]")),
+                  "capability": ph(QT_TRANSLATE_NOOP("Bridge", "[Capability]")),
+                  "destination": ph(QT_TRANSLATE_NOOP("Bridge", "[Exact destination]")), "run_status": "", "code": "",
+                  "message": ph(QT_TRANSLATE_NOOP("Bridge", "[Core-reported detail]"))}
         approval, outcome, items = {}, {}, []
         if name.startswith("approval"):
             complete = name == "approval"
-            approval = {"summary": "[Action summary]", "action": "[Action]" if complete else "", "target": "[Target]",
-                        "connector": "[Connector]" if complete else "", "capability": "[Capability]",
-                        "destination": "[Exact destination]", "data_classification": "[classification]",
-                        "effect": "[effect]", "reversible": False, "reason": "[Why approval is required]",
-                        "expires_at": "[expiry]", "request_id": "DEV-FIXTURE", "fingerprint": "DEV-FIXTURE",
-                        "outbound_preview": "[Outbound preview]", "complete": complete, "actionable": False,
-                        "hold": "DEV FIXTURE · not a live approval request" if complete else "Approval details unavailable"}
-            items.append({"key": "approval", "level": 2, "tone": "warning", "label": "Your approval is required"})
+            approval = {"summary": ph(QT_TRANSLATE_NOOP("Bridge", "[Action summary]")),
+                        "action": ph(QT_TRANSLATE_NOOP("Bridge", "[Action]")) if complete else "",
+                        "target": ph(QT_TRANSLATE_NOOP("Bridge", "[Target]")),
+                        "connector": sample["connector"] if complete else "", "capability": sample["capability"],
+                        "destination": sample["destination"], "data_classification": ph(QT_TRANSLATE_NOOP("Bridge", "[classification]")),
+                        "effect": ph(QT_TRANSLATE_NOOP("Bridge", "[effect]")), "reversible": False,
+                        "reason": ph(QT_TRANSLATE_NOOP("Bridge", "[Why approval is required]")),
+                        "expires_at": ph(QT_TRANSLATE_NOOP("Bridge", "[expiry]")), "request_id": "DEV-FIXTURE", "fingerprint": "DEV-FIXTURE",
+                        "outbound_preview": ph(QT_TRANSLATE_NOOP("Bridge", "[Outbound preview]")), "complete": complete, "actionable": False,
+                        "hold": ph(QT_TRANSLATE_NOOP("Bridge", "DEV FIXTURE · not a live approval request")) if complete
+                                else ph(QT_TRANSLATE_NOOP("Bridge", "Approval details unavailable"))}
+            items.append({"key": "approval", "level": 2, "tone": "warning", "label": ph(QT_TRANSLATE_NOOP("Bridge", "Your approval is required"))})
         else:
             outcome = {**sample, "kind": name, "run_status": "completed" if name == "completed" else "failed"}
-            level = {"unknown": (3, "unknown", "Outcome unknown"), "failed": (4, "danger", "Action failed"),
-                     "blocked": (4, "warning", "Action blocked")}.get(name)
+            level = Bridge._outcome_attention(name)
             if level:
                 items.append({"key": "outcome", "level": level[0], "tone": level[1], "label": level[2]})
         return {"fixture": True, "execution": "running", "running": False, "approval": approval, "decision": {},
@@ -983,6 +1050,35 @@ class Bridge(QObject):
             self.prefs.data["status_indicator"] = skin
             self.prefs.save()
             self.prefsChanged.emit()
+
+    # -- interface language ---------------------------------------------------
+
+    languageChanged = Signal()
+
+    @Property(str, notify=languageChanged)
+    def language(self) -> str:
+        """The chosen interface language as a stable locale id (en-US / tr-TR).
+
+        Also the seam for later conversation features: it is the DEFAULT
+        response language (an explicit language in the request still wins)."""
+        return self.prefs.data["language"]
+
+    @Slot(str)
+    def setLanguage(self, language: str) -> None:
+        """Persist the choice; the application's Localization applies it live."""
+        if language in LANGUAGES and language != self.prefs.data["language"]:
+            self.prefs.data["language"] = language
+            self.prefs.save()
+            self.languageChanged.emit()
+
+    @Slot()
+    def retranslated(self) -> None:
+        """The running language changed: every projected text re-renders.
+        State itself is untouched - only its presentation is read again."""
+        self.feedChanged.emit()
+        self.dataChanged.emit()
+        self.stateChanged.emit()
+        self.approvalChanged.emit()
 
     @Property(str, notify=prefsChanged)
     def profile(self) -> str:
@@ -1127,7 +1223,7 @@ class Bridge(QObject):
         self.refreshHistory()
         self.refreshJobs(False)
         self.refreshMemory("", False)
-        self._note("JARVIS interface started", "system")
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS interface started"), ()), "system")
         if self.devFixture:
             self._seed_dev_fixture()
 

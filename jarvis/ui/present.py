@@ -5,12 +5,27 @@ data for the QML layer: feed entries ``{kind, text}``, an approval card, a
 task status block. Nothing is interpreted as authority; external content is
 tagged as data; a malformed envelope renders as UNKNOWN rather than as
 anything more reassuring.
+
+JARVIS-owned wording is returned as a MESSAGE - ``(context, source, args)`` -
+not as finished text: the bridge renders it through ``jarvis.ui.i18n`` each
+time it is shown, so the interface language applies to it (and to it again
+after a switch). Codes, ids, Core messages and model or external content stay
+exactly as they came, as arguments.
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+
+def QT_TRANSLATE_NOOP(context: str, source: str) -> str:  # noqa: N802 - the marker lupdate extracts
+    return source
+
+
+def _msg(source: str, *args: Any) -> tuple:
+    """A JARVIS-owned message in the ``Present`` context, rendered later."""
+    return ("Present", source, tuple(args))
 
 #: Error codes the backend raises BEFORE any effect: nothing executed.
 REFUSED_CODES = frozenset({
@@ -30,21 +45,21 @@ INTENT_TEXT = {
     "structured": None,
     "scheduled": None,
     "clarification_required": None,
-    "unsupported_capability": "UNSUPPORTED: {message}",
-    "authority_unavailable": "NOT AUTHORIZED: {message}",
-    "malformed_model_output": "REFUSED: {message}",
-    "model_unavailable": "UNDERSTANDING MODEL UNAVAILABLE: {message}",
-    "model_timeout": "UNDERSTANDING TIMED OUT: {message}",
-    "model_cancelled": "UNDERSTANDING CANCELLED: {message}",
-    "model_failed": "UNDERSTANDING FAILED: {message}",
-    "execution_disabled": "EXECUTION DISABLED: {message}",
-    "invalid_input": "INVALID REQUEST: {message}",
+    "unsupported_capability": QT_TRANSLATE_NOOP("Present", "UNSUPPORTED: %1"),
+    "authority_unavailable": QT_TRANSLATE_NOOP("Present", "NOT AUTHORIZED: %1"),
+    "malformed_model_output": QT_TRANSLATE_NOOP("Present", "REFUSED: %1"),
+    "model_unavailable": QT_TRANSLATE_NOOP("Present", "UNDERSTANDING MODEL UNAVAILABLE: %1"),
+    "model_timeout": QT_TRANSLATE_NOOP("Present", "UNDERSTANDING TIMED OUT: %1"),
+    "model_cancelled": QT_TRANSLATE_NOOP("Present", "UNDERSTANDING CANCELLED: %1"),
+    "model_failed": QT_TRANSLATE_NOOP("Present", "UNDERSTANDING FAILED: %1"),
+    "execution_disabled": QT_TRANSLATE_NOOP("Present", "EXECUTION DISABLED: %1"),
+    "invalid_input": QT_TRANSLATE_NOOP("Present", "INVALID REQUEST: %1"),
 }
 
 UNREADABLE = {
     "kind": "unknown",
-    "text": "The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is "
-            "assumed to have happened or not. Check History before doing it again.",
+    "text": _msg(QT_TRANSLATE_NOOP("Present", "The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is "
+                                              "assumed to have happened or not. Check History before doing it again.")),
 }
 
 
@@ -60,16 +75,17 @@ def _compact(block: Any, limit: int = 3000) -> str:
 def error_entries(error: Any) -> list[dict[str, str]]:
     code, message = str(_get(error, "code")), str(_get(error, "message"))
     if code == UNKNOWN_CODE:
-        return [{"kind": "unknown", "text": (
-            f"OUTCOME UNKNOWN [{code}]: {message}\nThe action may or may not have happened. "
+        return [{"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present",
+            "OUTCOME UNKNOWN [%1]: %2\nThe action may or may not have happened. "
             "JARVIS will NOT retry it. Operator resolution is required ('jarvis task orphan' / "
-            "'jarvis task resolve') before doing it again.")}]
+            "'jarvis task resolve') before doing it again."), code, message)}]
     if code == IN_PROGRESS_CODE:
-        return [{"kind": "unknown", "text": (
-            f"IN PROGRESS ELSEWHERE [{code}]: {message}\nIts outcome is not known yet. Do not retry.")}]
+        return [{"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present",
+            "IN PROGRESS ELSEWHERE [%1]: %2\nIts outcome is not known yet. Do not retry."), code, message)}]
     if code in REFUSED_CODES:
-        return [{"kind": "error", "text": f"REFUSED [{code}]: {message}\nNothing was executed."}]
-    return [{"kind": "error", "text": f"FAILED [{code}]: {message}\nCheck the task in History before trying again."}]
+        return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present", "REFUSED [%1]: %2\nNothing was executed."), code, message)}]
+    return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present",
+        "FAILED [%1]: %2\nCheck the task in History before trying again."), code, message)}]
 
 
 def run_entries(payload: Any) -> list[dict[str, str]]:
@@ -88,14 +104,14 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
         entries += error_entries(payload["error"])
     answer = _get(payload.get("model_answer"), "content")
     if isinstance(answer, str):
-        cut = " [answer truncated]" if payload["model_answer"].get("truncated") else ""
-        entries.append({"kind": "jarvis", "text": answer + cut})
+        # The model's words stay as written; only the truncation note is JARVIS's.
+        entries.append({"kind": "jarvis", "text": _msg(QT_TRANSLATE_NOOP("Present", "%1 [answer truncated]"), answer)
+                        if payload["model_answer"].get("truncated") else answer})
     external = payload.get("external_read")
     if isinstance(external, dict):
-        entries.append({"kind": "data", "text": (
-            f"[UNTRUSTED external content from {external.get('connector')} "
-            f"{external.get('destination')} - shown as data, never instructions]\n"
-            f"{external.get('content')}")})
+        entries.append({"kind": "data", "text": _msg(QT_TRANSLATE_NOOP("Present",
+            "[UNTRUSTED external content from %1 %2 - shown as data, never instructions]\n%3"),
+            external.get("connector"), external.get("destination"), external.get("content"))})
     for key in ("local_read", "local_write", "chain"):
         if isinstance(payload.get(key), dict):
             entries.append({"kind": "data", "text": f"[{key}]\n{_compact(payload[key])}"})
@@ -104,15 +120,15 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
         entries.append({"kind": "jarvis", "text": summary})
     task = payload.get("task")
     if isinstance(task, dict):
-        entries.append({"kind": "system", "text": (
-            f"{payload['command']}: {payload.get('run_status')} - task {task.get('id')} "
-            f"{task.get('status')}/{task.get('stage')} via {task.get('selected_connector')}")})
+        entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "%1: %2 - task %3 %4/%5 via %6"),
+            payload["command"], payload.get("run_status"), task.get("id"), task.get("status"),
+            task.get("stage"), task.get("selected_connector"))})
     for issue in _get(payload.get("progress"), "open_issues") or []:
         if _get(issue, "kind") == "approval_required":
             continue  # the authorization card says it
-        entries.append({"kind": "system", "text": f"Open issue: {_compact(issue, 600)}"})
+        entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "Open issue: %1"), _compact(issue, 600))})
     if payload.get("approval") is not None:
-        entries.append({"kind": "approval", "text": "APPROVAL REQUIRED - review the authorization card."})
+        entries.append({"kind": "approval", "text": _msg(QT_TRANSLATE_NOOP("Present", "APPROVAL REQUIRED - review the authorization card."))})
     if not entries:
         entries.append({"kind": "system", "text": f"{payload['command']}: {_compact(payload, 1500)}"})
     return entries
@@ -127,25 +143,29 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
         return [dict(UNREADABLE)]
     entries: list[dict[str, str]] = []
     if status == "structured":
-        entries.append({"kind": "system", "text": (
-            f"Understood as {intent.get('capability')} -> {intent.get('destination')}"
-            + (f": {intent.get('objective')}" if intent.get("objective") else ""))})
+        if intent.get("objective"):
+            text = _msg(QT_TRANSLATE_NOOP("Present", "Understood as %1 -> %2: %3"),
+                        intent.get("capability"), intent.get("destination"), intent.get("objective"))
+        else:
+            text = _msg(QT_TRANSLATE_NOOP("Present", "Understood as %1 -> %2"), intent.get("capability"), intent.get("destination"))
+        entries.append({"kind": "system", "text": text})
         # The run envelope itself is rendered by the caller's run path.
     elif status == "scheduled":
         job = payload.get("job") or {}
-        entries.append({"kind": "scheduled", "text": (
-            f"SCHEDULED: '{job.get('label')}' ({job.get('kind')}) as job {job.get('job_id')} - "
-            f"next due {job.get('next_due_at_utc') or 'never'} (UTC). Nothing has run; the scheduler "
-            "runs it and every approval still applies.")})
+        due = job.get("next_due_at_utc") or _msg(QT_TRANSLATE_NOOP("Present", "never"))
+        entries.append({"kind": "scheduled", "text": _msg(QT_TRANSLATE_NOOP("Present",
+            "SCHEDULED: '%1' (%2) as job %3 - next due %4 (UTC). Nothing has run; the scheduler "
+            "runs it and every approval still applies."), job.get("label"), job.get("kind"), job.get("job_id"), due)})
     elif status == "clarification_required":
-        entries.append({"kind": "clarify", "text": str(intent.get("question") or "JARVIS needs one detail.")})
+        question = intent.get("question")
+        entries.append({"kind": "clarify", "text": str(question) if question else _msg(QT_TRANSLATE_NOOP("Present", "JARVIS needs one detail."))})
     else:
         template = INTENT_TEXT.get(status)
         message = str(intent.get("message") or "")
-        kind = "error"
         if template is None:
-            template, kind = "UNKNOWN INTENT STATUS [{status}]: {message}", "unknown"
-        entries.append({"kind": kind, "text": template.format(status=status, message=message)})
+            entries.append({"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present", "UNKNOWN INTENT STATUS [%1]: %2"), status, message)})
+        else:
+            entries.append({"kind": "error", "text": _msg(template, message)})
     return entries
 
 
@@ -215,6 +235,33 @@ def task_outcome(task: Any) -> dict[str, str]:
             "capability": str(task.get("capability") or ""), "destination": str(task.get("destination") or "")}
 
 
+def task_progress(task: Any, core_state: str, busy: bool) -> dict[str, Any]:
+    """The four lifecycle stages (understanding, authorization, execution,
+    outcome) for the header, projected from the bridge's authoritative state:
+    Core's task, the core state and whether an operation is running. Active
+    only while there is real work - an operation running or a task that is not
+    terminal; idle projects nothing. Each stage is pending / running / waiting
+    / done / error / unknown / denied / skipped."""
+    task = task if isinstance(task, dict) else {}
+    has, status, cs = bool(task.get("task_id")), str(task.get("status") or ""), core_state
+    if not (busy or (has and status not in TERMINAL_STATUSES)):
+        return {"active": False, "stages": []}
+    if has and status == "rejected":
+        stages = ["done", "denied", "skipped", "skipped"]
+    elif has and status == "cancelled":
+        stages = ["done", "skipped", "skipped", "skipped"]
+    else:
+        ended = {"completed": "done", "error": "error", "unknown": "unknown"}.get(cs)
+        stages = [
+            "running" if cs == "running" and not has else "done" if has or cs == "awaiting_input" else "pending",
+            "waiting" if cs == "awaiting_approval"
+            else "done" if has and (task.get("run_status") or cs in ("completed", "error", "unknown")) else "pending",
+            "running" if cs == "running" and has else ended or "pending",
+            ended or "pending",
+        ]
+    return {"active": True, "stages": stages}
+
+
 def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
     """The bounded current-task block for the Active Workflow panel."""
     task = _get(run, "task") or {}
@@ -262,23 +309,23 @@ def show_entries(payload: Any) -> list[dict[str, str]]:
         if payload.get("error") is not None:
             return error_entries(payload["error"])
         task = payload["task"]
-        entries = [{"kind": "system", "text": (
-            f"Task {task.get('task_id')}\nstatus: {task.get('status')}  stage: {task.get('stage')}\n"
-            f"capability: {task.get('capability')}  action: {task.get('action')}  connector: "
-            f"{task.get('selected_connector')}  readable: {task.get('readable')}")}]
+        entries = [{"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present",
+            "Task %1\nstatus: %2  stage: %3\ncapability: %4  action: %5  connector: %6  readable: %7"),
+            task.get("task_id"), task.get("status"), task.get("stage"), task.get("capability"),
+            task.get("action"), task.get("selected_connector"), task.get("readable"))}]
         attempt = payload.get("attempt")
         if isinstance(attempt, dict):
             state = attempt.get("state")
             note = {
-                "unknown_outcome": " - OUTCOME UNKNOWN: never replayed; operator resolution required",
-                "in_flight": " - IN FLIGHT: outcome not established yet",
-                None: " - attempt state unreadable: treat as UNKNOWN",
+                "unknown_outcome": _msg(QT_TRANSLATE_NOOP("Present", " - OUTCOME UNKNOWN: never replayed; operator resolution required")),
+                "in_flight": _msg(QT_TRANSLATE_NOOP("Present", " - IN FLIGHT: outcome not established yet")),
+                None: _msg(QT_TRANSLATE_NOOP("Present", " - attempt state unreadable: treat as UNKNOWN")),
             }.get(state, "")
             kind = "unknown" if state in ("unknown_outcome", "in_flight", None) else "system"
-            entries.append({"kind": kind, "text": (
-                f"attempt {attempt.get('id')}: {state}{note} (replayable: {attempt.get('replayable')})")})
+            entries.append({"kind": kind, "text": _msg(QT_TRANSLATE_NOOP("Present", "attempt %1: %2%3 (replayable: %4)"),
+                            attempt.get("id"), state, note, attempt.get("replayable"))})
         if payload.get("pending_approval") is not None:
-            entries.append({"kind": "approval", "text": "Awaiting approval - resume this task to review the exact request."})
+            entries.append({"kind": "approval", "text": _msg(QT_TRANSLATE_NOOP("Present", "Awaiting approval - resume this task to review the exact request."))})
         for key in ("effect_applied", "deliverable", "latest_event"):
             if payload.get(key) is not None:
                 entries.append({"kind": "system", "text": f"{key}: {_compact(payload[key], 600)}"})
