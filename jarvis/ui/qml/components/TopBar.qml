@@ -248,8 +248,10 @@ Item {
             Text { id: tipText; anchors.centerIn: parent; text: "Settings"; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
         }
     }
-    Text { x: 120; y: 22; text: "JARVIS"; color: Theme.text; font { family: Theme.font; pixelSize: 24; letterSpacing: 8.5; weight: Font.Normal } }
-    Text { x: 122; y: 55; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 2.4 } }
+    Text { objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
+           lineHeightMode: Text.FixedHeight; lineHeight: 34 }
+    Text { objectName: "brandTagline"; x: 122; y: 55; text: "THINKS AHEAD FOR YOU"; color: Theme.textLabel; font: Theme.hudLabel
+           lineHeightMode: Text.FixedHeight; lineHeight: 16 }
 
     LeftContextCard {
         visible: !Theme.command
@@ -296,7 +298,7 @@ Item {
                     text: modelData
                     color: lit ? "#eaf6ff" : Theme.textLabel
                     opacity: lit ? 1 : 0.7
-                    font { family: Theme.font; pixelSize: 10; letterSpacing: 2.2; weight: Font.DemiBold }
+                    font: Theme.hudLabel
                     Behavior on color { ColorAnimation { duration: 200 } }
                     Behavior on opacity { NumberAnimation { duration: 200 } }
                 }
@@ -306,9 +308,11 @@ Item {
     Text {
         visible: ticker.visible && bridge.coreState !== "idle"
         x: ticker.x; y: ticker.y + ticker.height + 12
+        // Never under the selector: the caption stops short of the strip.
+        width: Math.max(0, controls.x - x - 12); elide: Text.ElideRight
         text: Theme.stateLabel(bridge.coreState)
         color: Theme.stateColor(bridge.coreState)
-        font { family: Theme.font; pixelSize: 9; letterSpacing: 2.6; weight: Font.DemiBold }
+        font: Theme.hudLabel
         Behavior on color { ColorAnimation { duration: 200 } }
     }
 

@@ -1749,6 +1749,73 @@ class RightStackCohesionTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class TypographyTests(UiTestCase):
+    """The bundled IBM Plex Sans / Space Grotesk system: the real files load,
+    every required weight resolves, Turkish needs no fallback face, numerals
+    are tabular where asked, and the roles bind at the 1920 baseline."""
+
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def test_bundled_faces_weights_turkish_and_numerals(self) -> None:
+        from PySide6.QtGui import QFont, QFontDatabase, QFontInfo, QFontMetricsF, QTextLayout
+        from jarvis.ui.typography import FONT_DIR, load_fonts
+        families = load_fonts()
+        self.assertEqual({"sans": "IBM Plex Sans", "display": "Space Grotesk"}, families)
+        for name in ("IBMPlexSans-LICENSE.txt", "SpaceGrotesk-OFL.txt"):
+            self.assertIn("SIL Open Font License", (FONT_DIR / name).read_text(encoding="utf-8"))
+        self.assertTrue({"Regular", "Medium", "SemiBold"} <= set(QFontDatabase.styles("IBM Plex Sans")))
+        for weight, style in ((400, "Regular"), (500, "Medium"), (600, "SemiBold")):
+            font = QFont("IBM Plex Sans"); font.setPixelSize(20); font.setWeight(QFont.Weight(weight))
+            self.assertEqual(style, QFontInfo(font).styleName())
+        # Space Grotesk 600 is the variable axis on the Medium face - no synthetic bold.
+        widths = []
+        for weight, axis in ((400, None), (500, None), (500, 600.0)):
+            font = QFont("Space Grotesk"); font.setPixelSize(40); font.setWeight(QFont.Weight(weight))
+            if axis:
+                font.setVariableAxis(QFont.Tag("wght"), axis)
+            widths.append(QFontMetricsF(font).horizontalAdvance("Hamburgefonstiv"))
+        self.assertLessEqual(abs(widths[2] - widths[1]), 6, "a real 600 instance, not an emboldened copy")
+        turkish = "çÇ ğĞ ıI iİ öÖ şŞ üÜ Çok güzel İstanbul"
+        for family in ("IBM Plex Sans", "Space Grotesk"):
+            layout = QTextLayout(turkish, QFont(family)); layout.beginLayout(); layout.createLine(); layout.endLayout()
+            self.assertEqual({family}, {run.rawFont().familyName() for run in layout.glyphRuns()}, family)
+        tabular = QFont("Space Grotesk"); tabular.setPixelSize(20); tabular.setFeature(QFont.Tag("tnum"), 1)
+        metrics = QFontMetricsF(tabular)
+        self.assertEqual(1, len({round(metrics.horizontalAdvance(d), 2) for d in "0123456789"}))
+
+    def test_roles_bind_at_the_baseline_and_geometry_holds(self) -> None:
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(700)
+
+        def font(name):
+            return self.item(root, name).property("font")
+
+        brand = font("brandWordmark")
+        self.assertEqual(("Space Grotesk", 28), (brand.family(), brand.pixelSize()))
+        greeting = font("welcomeGreeting")
+        self.assertEqual(("Space Grotesk", 44), (greeting.family(), greeting.pixelSize()))
+        self.assertEqual(("IBM Plex Sans", 20), (font("welcomeSupport").family(), font("welcomeSupport").pixelSize()))
+        self.assertEqual(("IBM Plex Sans", 18, 600), (font("selectorModelText").family(), font("selectorModelText").pixelSize(), font("selectorModelText").weight()))
+        self.assertEqual(("Space Grotesk", 16), (font("workflowCounter").family(), font("workflowCounter").pixelSize()))
+        self.assertEqual(("Space Grotesk", 22), (font("railCountTasks").family(), font("railCountTasks").pixelSize()))
+        self.assertEqual(("IBM Plex Sans", 18, 600), (font("railTitleTasks").family(), font("railTitleTasks").pixelSize(), font("railTitleTasks").weight()))
+        self.assertEqual("Space Grotesk", font("contextClock").family())
+        bridge._say("user", "Bu projeyi incele."); bridge._say("jarvis", "Hangi projeyi inceleyeyim?\nIkinci paragraf."); pump(400)
+        body = font("feedMessage_jarvis")
+        self.assertEqual(("IBM Plex Sans", 18, 400), (body.family(), body.pixelSize(), body.weight()))
+        message = self.item(root, "feedMessage_jarvis")
+        self.assertAlmostEqual(28 * message.property("lineCount") + 12, message.property("contentHeight"), delta=2)
+        # Typography moved no region.
+        work = self.item(root, "canonicalWorkspace"); stack = self.item(root, "panelColumn")
+        a = work.mapToScene(QPointF(0, 0)); b = stack.mapToScene(QPointF(0, 0))
+        self.assertEqual((246.0, 168.0, 1231.0), (round(a.x(), 1), round(a.y(), 1), round(work.width(), 1)))
+        self.assertEqual((1497.0, 205.0, 386.0), (round(b.x(), 1), round(b.y(), 1), round(stack.width(), 1)))
+        self.assertEqual(0, self.execute_calls())
+
+
 class LocalFitTests(UiTestCase):
     """Phase 3.4b: local fit and real pointer routing, no backend activity."""
 

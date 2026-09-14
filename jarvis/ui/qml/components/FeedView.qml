@@ -207,7 +207,7 @@ Item {
                                    text: feed.kindLabel(row.kind)
                                    style: Text.Outline; styleColor: "#b3000812"
                                    color: row.tone
-                                   font { family: Theme.font; pixelSize: 10; weight: Font.DemiBold; letterSpacing: 2.2 } }
+                                   font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 2.2 }) }
                             Item {
                                 width: parent.width
                                 height: message.y + message.height + (row.isJarvis ? (feed.referenceLayout ? 13 : 12) : 0)
@@ -220,7 +220,8 @@ Item {
                                     Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#2e6fd2f5" }
                                 }
                                 Text { id: name; visible: row.isJarvis; x: 18; y: 11; text: feed.kindLabel(row.kind); color: Theme.materialBlue
-                                       font { family: Theme.font; pixelSize: feed.referenceLayout ? 13 : 12; weight: Font.Bold; letterSpacing: 1.4 } }
+                                       font: feed.referenceLayout ? Theme.messageIdentity : Qt.font({ family: Theme.font, pixelSize: 12, weight: Font.Bold, letterSpacing: 1.4 })
+                                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
                                 TextEdit {
                                     id: message
                                     x: row.isJarvis ? 18 : 0
@@ -230,10 +231,17 @@ Item {
                                     readOnly: true
                                     selectByMouse: true
                                     wrapMode: Text.Wrap
-                                    color: row.kind === "system" ? Theme.textMuted : "#f7fcff"
+                                    objectName: "feedMessage_" + row.kind
+                                    color: row.kind === "system" ? Theme.textMuted : Theme.text
                                     selectionColor: Theme.accentSoft
-                                    font { family: row.kind === "data" ? Theme.mono : Theme.font; pixelSize: row.kind === "data" ? 12 : (feed.referenceLayout ? 17 : 16) }
+                                    font: row.kind === "data" ? Qt.font({ family: Theme.mono, pixelSize: 12 })
+                                          : feed.referenceLayout ? Theme.conversationBody : Qt.font({ family: Theme.font, pixelSize: 16 })
                                     textFormat: TextEdit.PlainText
+                                    // 18 / 28 reading rhythm, paragraphs ~12 px apart (TextEdit has no lineHeight).
+                                    // Applied once: a feed entry's text never changes after the row exists
+                                    // (a new feed rebuilds the rows), and the formatting edit itself would
+                                    // otherwise re-trigger a text-change handler.
+                                    Component.onCompleted: if (feed.referenceLayout && row.kind !== "data" && typeof typography !== "undefined") typography.setLineHeight(textDocument, 28, 12)
                                 }
                             }
                         }
@@ -246,9 +254,10 @@ Item {
                         readonly property int gap: 5
                         x: row.isUser ? row.width - width - 6 : card.x + (row.isJarvis ? 18 : 0)
                         y: card.height + gap
-                        text: modelData.time; color: "#8fa8c8"
+                        text: modelData.time; color: Theme.textMuted
                         style: Text.Outline; styleColor: "#b3000812"
-                        font { family: Theme.font; pixelSize: feed.referenceLayout ? 12 : 11 }
+                        font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
+                        lineHeightMode: Text.FixedHeight; lineHeight: 16
                     }
                 }
             }

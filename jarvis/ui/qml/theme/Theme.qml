@@ -28,9 +28,13 @@ QtObject {
     readonly property int easeInOut: Easing.InOutCubic
 
     // -- typography -----------------------------------------------------
-    // System faces only: nothing here depends on a font that may be absent.
-    // BRAND 25 tracked / HUD 10-11 tracked caps / TITLE 34 / BODY 15 / META 12 / STATUS 10-11.
-    readonly property string font: "Segoe UI"
+    // Two bundled families (jarvis/ui/typography.py registers them; the
+    // names are the ones Qt reports): IBM Plex Sans for the interface and the
+    // conversation, Space Grotesk for the wordmark, the greeting and the
+    // instrument numerals. `font` is the interface family every text uses.
+    readonly property string sans: typeof typography !== "undefined" && typography.sans !== "" ? typography.sans : "Segoe UI"
+    readonly property string display: typeof typography !== "undefined" && typography.display !== "" ? typography.display : sans
+    readonly property string font: sans
     readonly property string mono: "Cascadia Mono"
     readonly property int fsMicro: 9
     readonly property int fsLabel: 11
@@ -40,6 +44,42 @@ QtObject {
     readonly property int fsTitle: 20
     readonly property int fsHero: 34
     readonly property real labelSpacing: 2.4
+
+    // -- typographic roles (1920x1080 baseline; size / line height / weight) --
+    // Space Grotesk's 600 is its variable weight axis on the Medium face -
+    // asking Qt for weight 600 directly would synthesise bold. Numerals that
+    // must not jitter use the font's tabular figures (tnum).
+    readonly property var semibold600: ({ "wght": 600 })
+    readonly property var tabular: ({ "tnum": 1 })
+    readonly property font brand: Qt.font({ family: display, pixelSize: 28, weight: Font.Medium, variableAxes: semibold600, letterSpacing: 3.92 })   // 28/34, +0.14 em
+    readonly property font sectionHeading: Qt.font({ family: sans, pixelSize: 13, weight: Font.DemiBold, letterSpacing: 0.78 })                    // 13/18, +0.06 em
+    readonly property font conversationBody: Qt.font({ family: sans, pixelSize: 18, weight: Font.Normal })                                        // 18/28
+    readonly property font messageIdentity: Qt.font({ family: sans, pixelSize: 12, weight: Font.DemiBold })                                       // 12/16
+    readonly property font uiLabel: Qt.font({ family: sans, pixelSize: 14, weight: Font.Medium })                                                 // 14/20
+    readonly property font uiValue: Qt.font({ family: sans, pixelSize: 14, weight: Font.DemiBold })                                               // 14/20
+    readonly property font metadata: Qt.font({ family: sans, pixelSize: 12, weight: Font.Normal })                                                // 12/18
+    readonly property font timestamp: Qt.font({ family: display, pixelSize: 12, weight: Font.Medium, features: tabular })                         // 12/16
+    readonly property font counter: Qt.font({ family: display, pixelSize: 16, weight: Font.Medium, variableAxes: semibold600, features: tabular }) // 16/20
+    readonly property font uptimeValue: Qt.font({ family: display, pixelSize: 14, weight: Font.Medium, variableAxes: semibold600, features: tabular }) // 14/20
+    readonly property font modelName: Qt.font({ family: sans, pixelSize: 18, weight: Font.DemiBold })                                             // 18/24
+    readonly property font composerText: Qt.font({ family: sans, pixelSize: 18, weight: Font.Normal })                                            // 18/24
+    readonly property font hudLabel: Qt.font({ family: sans, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.32 })                              // 11/16, +0.12 em
+    readonly property font dateText: Qt.font({ family: sans, pixelSize: 13, weight: Font.Medium })                                                // 13/18
+    // A role with different tracking (e.g. a tight heading losing its +0.06 em).
+    function tracked(f, spacing) { return Qt.font({ family: f.family, pixelSize: f.pixelSize, weight: f.weight, letterSpacing: spacing, variableAxes: f.variableAxes, features: f.features }) }
+    // Role-specific responsive sizes. Tier 0 = 1920x1080, 1 = 1536x864, 2 = 1280x760.
+    function tier(w) { return w >= 1728 ? 0 : w >= 1408 ? 1 : 2 }
+    function greeting(t) { var s = [44, 38, 34][t]; return Qt.font({ family: display, pixelSize: s, weight: Font.Medium, variableAxes: semibold600, letterSpacing: -0.02 * s }) }
+    function greetingLine(t) { return [56, 48, 44][t] }
+    function greetingSupport(t) { return Qt.font({ family: sans, pixelSize: [20, 18, 18][t], weight: Font.Normal }) }
+    function greetingSupportLine(t) { return [28, 26, 26][t] }
+    function clockSize(t) { return [44, 40, 36][t] }
+    function clockLine(t) { return [48, 44, 42][t] }
+    function clock(px) { return Qt.font({ family: display, pixelSize: px, weight: Font.Medium, features: tabular }) }
+    function railTitle(t) { return Qt.font({ family: sans, pixelSize: [18, 17, 16][t], weight: Font.DemiBold }) }
+    function railTitleLine(t) { return [24, 22, 22][t] }
+    function railCount(t) { return Qt.font({ family: display, pixelSize: [22, 20, 20][t], weight: Font.Medium, variableAxes: semibold600, features: tabular }) }
+    function railCountLine(t) { return [28, 26, 26][t] }
 
     // -- macro geometry ---------------------------------------------------
     // The Canonical Space composition, normalized to the viewport and
@@ -178,9 +218,9 @@ QtObject {
     readonly property color glassInnerHighlight: ambient ? "#2449bdfa" : "#0049bdfa"
 
     // -- stage 5: text and state accents (260-420 ms) -------------------
-    property color text: space ? "#daeaf5" : "#dfebf2"
-    property color textLabel: space ? "#a9c5da" : "#a5c0d1"
-    property color textMuted: space ? "#7899b4" : "#7792a5"
+    property color text: space ? "#eaf4ff" : "#dfebf2"            // primary
+    property color textLabel: space ? "#acc2d8" : "#a5c0d1"       // secondary
+    property color textMuted: space ? "#8faac2" : "#7792a5"       // metadata
     property color textDim: space ? "#526f85" : "#506776"
     Behavior on text { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
     Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }

@@ -192,14 +192,14 @@ Window {
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: 24 }
         height: 30
         Row { anchors { left: parent.left; leftMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMicro; letterSpacing: 3.2 } }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "INTELLIGENCE AMPLIFIES POTENTIAL"; color: Theme.textDim; font: Theme.hudLabel }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
         }
         Row { anchors { right: parent.right; rightMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "SAME HIGHER FURTHER"; color: Theme.textDim; font { family: Theme.font; pixelSize: Theme.fsMicro; letterSpacing: 3.2 } }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "SAME HIGHER FURTHER"; color: Theme.textDim; font: Theme.hudLabel }
         }
     }
     // Focus-mode badge: a tiny reminder that the arrangement is temporary.

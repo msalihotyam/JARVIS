@@ -107,16 +107,20 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 text: panel.title.toUpperCase()
                 readonly property real room: Math.max(0, header.width - headerTail.width - (panel.closable ? 42 : 0) - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8)
-                readonly property bool wraps: panel.titleWrap && titleMetrics.advanceWidth > room
-                width: !panel.titleWrap ? Math.min(implicitWidth, room) : wraps ? room : Math.min(Math.ceil(titleMetrics.advanceWidth) + 2, room)
+                // Section heading 13 / 18 Semibold, +0.06 em. A tight title
+                // loses its tracking first; only then does it wrap (opt-in) or elide.
+                readonly property bool tight: titleMetrics.advanceWidth > room
+                readonly property bool wraps: panel.titleWrap && tightMetrics.advanceWidth > room
+                width: !panel.titleWrap ? Math.min(implicitWidth, room) : wraps ? room : Math.min(Math.ceil((tight ? tightMetrics : titleMetrics).advanceWidth) + 2, room)
                 wrapMode: wraps ? Text.WordWrap : Text.NoWrap
                 maximumLineCount: wraps ? 2 : 1
                 lineHeightMode: wraps ? Text.FixedHeight : Text.ProportionalHeight
                 lineHeight: wraps ? 14 : 1
                 elide: Text.ElideRight
                 color: "#cfeaff"
-                font { family: Theme.font; pixelSize: 12; letterSpacing: 1.6; weight: Font.DemiBold }
-                TextMetrics { id: titleMetrics; text: panel.title.toUpperCase(); font.family: Theme.font; font.pixelSize: 12; font.letterSpacing: 1.6; font.weight: Font.DemiBold }
+                font: tight ? Theme.tracked(Theme.sectionHeading, 0) : Theme.sectionHeading
+                TextMetrics { id: titleMetrics; text: panel.title.toUpperCase(); font: Theme.sectionHeading }
+                TextMetrics { id: tightMetrics; text: panel.title.toUpperCase(); font.family: Theme.font; font.pixelSize: 13; font.weight: Font.DemiBold }
             }
             Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }

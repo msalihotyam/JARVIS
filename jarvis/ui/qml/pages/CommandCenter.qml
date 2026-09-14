@@ -80,14 +80,17 @@ Item {
             anchors.centerIn: parent
             anchors.verticalCenterOffset: -Math.round(parent.height * 0.06)
             width: Math.min(parent.width - 40, 760)
-            spacing: page.roomy ? 12 : 8
-            Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+            spacing: page.roomy ? 8 : 6
+            readonly property int tier: Theme.tier(page.Window.width)
+            Text { objectName: "welcomeGreeting"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
                    text: (function() { var h = new Date().getHours(); return (h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening") + ", " + bridge.operatorName + "." })()
-                   color: "#f4faff"; font { family: Theme.font; pixelSize: page.roomy ? 34 : 26; weight: Font.DemiBold } }
-            Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                   color: Theme.text; font: Theme.greeting(welcome.tier)
+                   lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingLine(welcome.tier) }
+            Text { objectName: "welcomeSupport"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
                    text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "Execution is disabled. Re-enable it explicitly when ready." : "What would you like to work on?"
-                   color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : "#b8ccef"
-                   font { family: Theme.font; pixelSize: page.roomy ? 22 : 17 } }
+                   color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.textLabel
+                   font: Theme.greetingSupport(welcome.tier)
+                   lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingSupportLine(welcome.tier) }
         }
     }
     Column {

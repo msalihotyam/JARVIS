@@ -45,16 +45,25 @@ Rectangle {
         x: context.inset; y: context.compact ? 10 : 12
         width: parent.width - x - context.weatherWidth - context.inset
         spacing: context.compact ? 2 : 4
+        // Clock: Space Grotesk Medium with tabular figures, at the role size for
+        // the viewport - capped to the clock column the card really has, so a
+        // narrow rail never pushes the time into the weather instrument.
+        readonly property int tier: Theme.tier(context.Window.width)
+        TextMetrics { id: clockMetrics; text: "00:00"; font: Theme.clock(Theme.clockSize(timeGroup.tier)) }
+        // The room the clock really has: its own column, which ends before the
+        // weather column (the card's accepted rule - the time never crosses it).
+        readonly property real clockRoom: width
         Text {
             objectName: "contextClock"
-            width: parent.width
-            text: context.timeText; color: "#d2edff"
-            font { family: Theme.font; pixelSize: context.tight ? 29 : context.compact ? 34 : 38; weight: Font.Medium }
+            width: timeGroup.clockRoom
+            text: context.timeText; color: Theme.text
+            font: Theme.clock(Math.min(Theme.clockSize(timeGroup.tier), Math.floor(Theme.clockSize(timeGroup.tier) * width / Math.max(1, clockMetrics.advanceWidth))))
+            lineHeightMode: Text.FixedHeight; lineHeight: Theme.clockLine(timeGroup.tier)
         }
         Text {
             objectName: "contextDate"
-            width: parent.width; text: context.dateText; color: "#b3d2f0"
-            font { family: Theme.font; pixelSize: context.tight ? 11 : 13 }
+            width: parent.width; text: context.dateText; color: Theme.textLabel; elide: Text.ElideRight
+            font: Theme.dateText; lineHeightMode: Text.FixedHeight; lineHeight: 18
         }
     }
     Item {
@@ -100,8 +109,8 @@ Rectangle {
         Text {
             objectName: "contextTemperature"
             width: parent.width; horizontalAlignment: Text.AlignHCenter
-            text: "--°"; color: "#d2edff"
-            font { family: Theme.font; pixelSize: context.compact ? 25 : 31; weight: Font.Medium }
+            text: "--°"; color: Theme.text
+            font { family: Theme.display; pixelSize: context.compact ? 25 : 31; weight: Font.Medium }
         }
         Text {
             objectName: "contextWeatherCondition"

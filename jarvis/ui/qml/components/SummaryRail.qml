@@ -204,13 +204,21 @@ Item {
                     x: tile.x + tile.width + (rail.tight ? 8 : 13)
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - x - (rail.tight ? 17 : 24)
-                    spacing: rail.showNote ? 5 : 0
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.key; color: "#fafeff"
-                           font { family: Theme.font; pixelSize: rail.roomy ? 18 : 15; weight: Font.DemiBold } }
-                    Text { width: parent.width; elide: Text.ElideRight; text: modelData.line; color: "#37c4f0"
-                           font { family: Theme.font; pixelSize: rail.roomy ? 15 : 13; weight: Font.DemiBold } }
-                    Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: "#b3d2f0"
-                           font { family: Theme.font; pixelSize: rail.roomy ? 13 : 12 } }
+                    spacing: rail.showNote ? 2 : 0
+                    readonly property int tier: Theme.tier(card.Window.width)
+                    // Title, then the count numeral with its unit on one baseline, then the detail.
+                    Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.key; color: Theme.text
+                           font: Theme.railTitle(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railTitleLine(labels.tier) }
+                    Row {
+                        width: parent.width; spacing: 5
+                        readonly property string count: modelData.line.split(" ")[0]
+                        Text { id: countText; objectName: "railCount" + modelData.key; text: parent.count; color: "#37c4f0"
+                               font: Theme.railCount(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railCountLine(labels.tier) }
+                        Text { anchors.baseline: countText.baseline; width: parent.width - countText.width - parent.spacing; elide: Text.ElideRight
+                               text: modelData.line.substring(parent.count.length + 1); color: "#37c4f0"; font: Theme.uiLabel }
+                    }
+                    Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: Theme.textLabel
+                           font: Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
                 }
                 Shape {
                     visible: !card.active

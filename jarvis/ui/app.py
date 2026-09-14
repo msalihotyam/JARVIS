@@ -23,9 +23,15 @@ def create_engine(bridge: Bridge):
     """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml."""
     from PySide6.QtQml import QQmlApplicationEngine
 
+    from jarvis.ui.typography import Typography, load_fonts
+
     engine = QQmlApplicationEngine()
     engine.addImportPath(str(QML_DIR))
     engine.rootContext().setContextProperty("bridge", bridge)
+    # The bundled typefaces are registered before any QML exists, so the theme
+    # resolves the real family names from the first frame.
+    engine._typography = Typography(load_fonts(), engine)
+    engine.rootContext().setContextProperty("typography", engine._typography)
     engine.load(str(MAIN_QML))
     return engine
 

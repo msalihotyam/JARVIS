@@ -107,16 +107,26 @@ Item {
             width: parent.width; elide: Text.ElideRight
             objectName: "selectorModelText"
             text: sel.modelName
-            color: "#eef7ff"
-            font { family: Theme.font; pixelSize: sel.width >= 240 ? Theme.fsLead : 14; weight: Font.Medium }
+            color: Theme.text
+            font: Theme.modelName
+            lineHeightMode: Text.FixedHeight; lineHeight: 24
         }
         Text {
             visible: sel.metadata !== ""
             width: parent.width; elide: Text.ElideRight
+            id: metaText
             objectName: "selectorMetadataText"
             text: sel.metadata.replace(/\s*\|\s*/g, " | ")
             color: Theme.textMuted
-            font { family: Theme.font; pixelSize: sel.width >= 220 ? 10 : 9; letterSpacing: sel.width >= 240 ? 0.8 : 0 }
+            // 11 / 16 Medium, +0.04 em; where the real route text does not fit,
+            // the tracking goes first, then the size steps down - never below 9.
+            readonly property real fit: Math.min(1, width / Math.max(1, metaFull.advanceWidth))
+            font.family: Theme.font; font.weight: Font.Medium
+            font.letterSpacing: fit < 1 ? 0 : 0.44
+            font.pixelSize: fit < 1 ? Math.max(9, Math.floor(11 * width / Math.max(1, metaTight.advanceWidth))) : 11
+            lineHeightMode: Text.FixedHeight; lineHeight: 16
+            TextMetrics { id: metaFull; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium; font.letterSpacing: 0.44 }
+            TextMetrics { id: metaTight; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium }
         }
     }
 

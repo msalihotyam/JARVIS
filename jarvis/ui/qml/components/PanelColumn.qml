@@ -145,7 +145,7 @@ Item {
                             visible: !bridge.editMode && modelData.id === "workflow"
                             ActionButton { label: "Cancel"; danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
                             ActionButton { label: "New session"; compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
-                            Text { text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold; letterSpacing: 0.5 } }
+                            Text { objectName: "workflowCounter"; text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font: Theme.counter }
                         }
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: "PINNED"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
                     }
@@ -187,16 +187,18 @@ Item {
     // -- panel bodies -------------------------------------------------------
     // A quiet stat line: dot, key, value right-aligned (the reference's Uptime / Memory / Network list).
     component StatRow: Item {
-        property string k: ""; property string v: ""; property color tint: Theme.accentSoft; property color vColor: "#f2f8ff"
-        property int size: 15
+        property string k: ""; property string v: ""; property color tint: Theme.accentSoft; property color vColor: Theme.text
+        property int size: 14
         property int labelX: 21
+        property font valueFont: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size, weight: Font.DemiBold }) : Theme.uiValue
         width: parent.width; height: 30
         Rectangle { x: 0; width: 7; height: 7; radius: 3.5; color: tint; anchors.verticalCenter: parent.verticalCenter
             Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: tint; opacity: 0.2 } }
-        Text { x: labelX; anchors.verticalCenter: parent.verticalCenter; text: k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: size } }
-        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - labelX - kw.width - 10; horizontalAlignment: Text.AlignRight
-            text: v; color: vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: size; weight: Font.DemiBold } }
-        TextMetrics { id: kw; text: k; font.family: Theme.font; font.pixelSize: size }
+        Text { x: labelX; anchors.verticalCenter: parent.verticalCenter; text: k; color: Theme.textLabel
+               font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size }) : Theme.uiLabel }
+        Text { objectName: "statValue_" + k; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - labelX - kw.width - 8; horizontalAlignment: Text.AlignRight
+            text: v; color: vColor; elide: Text.ElideRight; font: valueFont }
+        TextMetrics { id: kw; text: k; font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: size }) : Theme.uiLabel }
     }
     // A gauge: the reference ring with the figure inside. Lit only when a real value exists.
     component Gauge: Item {
@@ -212,7 +214,8 @@ Item {
         // A calibration tick at 12 o'clock: instrument, not value.
         Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 1; width: 2; height: stroke - 2; color: column.highlight; opacity: 0.8 }
         Column { anchors.centerIn: parent; spacing: width < 48 ? -3 : -1
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? "#8fa8c4" : "#f2f8ff"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 12 : parent.parent.width < 56 ? 15 : 18; weight: Font.DemiBold } }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? Theme.textMuted : Theme.text
+                   font { family: Theme.display; pixelSize: parent.parent.width < 48 ? 12 : 16; weight: Font.Medium; variableAxes: Theme.semibold600; features: Theme.tabular } }
             Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: "#c3d8ea"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 8 : 10; letterSpacing: 0.8 } }
         }
     }
@@ -231,24 +234,26 @@ Item {
         readonly property bool compact: height < 30
         readonly property int slot: height >= 38 ? 28 : 24
         readonly property int tile: Math.min(slot, height - 4)
-        readonly property int fs: compact ? (column.commandMode ? 12 : 13) : (column.commandMode ? 12 : 15)
+        readonly property int fs: column.commandMode ? 12 : 14
+        readonly property font labelFont: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: fs }) : Theme.uiLabel
+        readonly property font valueFont: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: fs }) : Theme.uiValue
         readonly property real textX: column.gridA + slot + 8
         // C: every label keeps its full width - the column is set by the widest field.
         readonly property real dotX: column.commandMode ? Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
                                                         : Math.ceil(textX + widest.advanceWidth + (compact ? 8 : 12))
         readonly property int trail: 10                      // the trailing indicator's own slot
-        TextMetrics { id: widest; text: "Destination"; font.family: Theme.font; font.pixelSize: wrow.fs }
+        TextMetrics { id: widest; text: "Destination"; font: wrow.labelFont }
         Rectangle { x: column.gridA + (slot - tile) / 2; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: tile < 24 ? 5 : 7
             color: empty ? "#0b2036" : "#0e2f4e"; border.width: 1; border.color: Theme.alpha(column.structure, empty ? 0.4 : 0.75)
             Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.alpha(column.structure, 0.8) : column.highlight; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
         Text { x: textX; width: dotX - x - 8; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
-               color: empty ? "#cfdceb" : "#f2f8ff"; font { family: Theme.font; pixelSize: fs } }
+               color: empty ? Theme.textLabel : Theme.text; font: wrow.labelFont }
         Rectangle { x: dotX; width: compact ? 6 : 7; height: width; radius: width / 2; anchors.verticalCenter: parent.verticalCenter; color: empty ? "#4f6b8a" : tint
             Rectangle { visible: !empty; anchors.centerIn: parent; width: parent.width + 8; height: width; radius: width / 2; color: tint; opacity: 0.22 } }
         // The value stops before the trailing slot; it never reaches the indicator.
         Text { objectName: "workflowValue_" + k
             anchors.left: parent.left; anchors.leftMargin: dotX + (compact ? 12 : 15); anchors.right: parent.right; anchors.rightMargin: column.gridD + trail + 8; anchors.verticalCenter: parent.verticalCenter
-            text: v; color: empty ? "#8ea6c2" : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: fs } }
+            text: v; color: empty ? Theme.textMuted : vColor; elide: Text.ElideRight; font: wrow.valueFont }
         Text { anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter; width: trail; horizontalAlignment: Text.AlignHCenter
                text: "⁘"; color: "#4f6b8a"; font.pixelSize: compact ? 11 : 13 }
         Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: textX; rightMargin: column.gridD } height: 1; color: Theme.alpha(column.structure, 0.26) }
@@ -276,8 +281,8 @@ Item {
             readonly property int d: side ? (bw >= 460 ? 60 : bw >= 340 ? 48 : 34) : 32
             readonly property int g: side ? (bw >= 340 ? Math.round(d * 0.55) : 10) : 12
             readonly property int clusterW: 3 * d + 2 * g
-            readonly property real listX: side ? clusterW + (bw >= 340 ? 22 : 14) : 0
-            readonly property int fs: bw >= 460 ? 15 : 13
+            readonly property real listX: side ? clusterW + 14 : 0
+            readonly property int fs: 14
             readonly property int pitch: Math.max(20, Math.min(bh >= 110 ? 38 : 34, Math.floor((bh - 6) / 3)))
             readonly property bool caption: !side || bh >= d + 34
             // The ring centre line; the list centres on it wherever the body allows.
@@ -302,8 +307,10 @@ Item {
                    // Compact: the note takes the room up to the metadata list, untracked, so it stays whole.
                    width: !sys.side ? sys.bw - 4 : sys.bw >= 340 ? sys.clusterW : sys.listX - 10
                    horizontalAlignment: sys.side ? Text.AlignHCenter : Text.AlignLeft
-                   text: "Not measured by this build"; color: "#6d88a6"; elide: Text.ElideRight
-                   font { family: Theme.font; pixelSize: 10; letterSpacing: sys.side && sys.bw < 340 ? 0 : 0.8 } }
+                   text: "Not measured by this build"; color: Theme.textMuted; elide: Text.ElideRight
+                   // Supporting metadata 12 / 18; the compact cluster keeps the smaller step it needs to stay whole.
+                   font { family: Theme.font; pixelSize: noteMetrics.advanceWidth <= width ? 12 : 10; letterSpacing: 0 }
+                   TextMetrics { id: noteMetrics; text: "Not measured by this build"; font: Theme.metadata } }
             // Beside the rings: three rows - one dot axis, labels left, values right.
             Rectangle { visible: sys.side; x: sys.listX - 8; width: sys.bw - x; radius: 10
                 y: sys.listY - 4; height: 3 * sys.pitch + 8; color: Theme.glassSecondaryReading }
@@ -313,9 +320,9 @@ Item {
                 x: sys.listX; width: sys.bw - x - 6
                 y: sys.listY
                 spacing: 0
-                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Uptime"; v: sys.uptime }
-                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Execution"; v: sys.execution; tint: sys.executionTint; vColor: tint }
-                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Model"; v: sys.model }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Uptime"; v: sys.uptime; valueFont: Theme.uptimeValue }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Execution"; v: sys.execution; tint: sys.executionTint; vColor: tint }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: 15; k: "Model"; v: sys.model }
             }
             // Reflowed: the three fields side by side beneath the note - each a
             // dot and label over its value - so all three stay inside the height.
@@ -331,8 +338,10 @@ Item {
                     Item {
                         width: (sys.bw - 12) / 3; height: sys.bh - sys.d - 20
                         Rectangle { x: 0; y: 5; width: 6; height: 6; radius: 3; color: modelData.tint }
-                        Text { x: 10; y: 0; width: parent.width - 12; elide: Text.ElideRight; text: modelData.k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: 10 } }
-                        Text { x: 10; y: 13; width: parent.width - 12; elide: Text.ElideRight; text: modelData.v; color: modelData.vc; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } }
+                        Text { x: 10; y: 0; width: parent.width - 12; elide: Text.ElideRight; text: modelData.k; color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; weight: Font.Medium } }
+                        Text { x: 10; y: 13; width: parent.width - 12; elide: Text.ElideRight; text: modelData.v; color: modelData.vc
+                               font { family: modelData.k === "Uptime" ? Theme.display : Theme.font; pixelSize: 12; weight: modelData.k === "Uptime" ? Font.Medium : Font.DemiBold
+                                      variableAxes: modelData.k === "Uptime" ? Theme.semibold600 : ({}); features: modelData.k === "Uptime" ? Theme.tabular : ({}) } }
                     }
                 }
             }
@@ -381,7 +390,7 @@ Item {
             readonly property real textX: column.gridA + glyphD + 8
             // D: a stable, unwrapped timestamp column (~56 px) at the shared right inset.
             readonly property real timeW: Math.max(56, Math.ceil(stamp.advanceWidth))
-            TextMetrics { id: stamp; text: "00 min ago"; font.family: Theme.font; font.pixelSize: feedWell.compact ? 11 : 12 }
+            TextMetrics { id: stamp; text: "00 min ago"; font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.timestamp }
             readonly property int rowsShown: bridge.activity.length + (bridge.activity.length < 4 ? 1 : 0)
             readonly property int rowsFit: Math.max(1, Math.floor((feedRoot.height - 2) / pitch))
             height: Math.min(rowsShown, rowsFit) * pitch + 2
@@ -401,12 +410,15 @@ Item {
                         color: semantic ? Theme.alpha(tint, 0.16) : "#0e2f4e"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : Theme.alpha(column.structure, 0.75)
                         Text { anchors.centerIn: parent; text: glyph; color: tint; font { family: Theme.font; pixelSize: Math.round(feedWell.glyphD * 0.46); weight: Font.DemiBold } } }
                     Column { anchors.left: parent.left; anchors.leftMargin: feedWell.textX; anchors.right: timeText.left; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; spacing: 1
-                        Text { text: modelData.text; color: "#f2f8ff"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
-                        Text { text: source; color: "#8ea6c2"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
+                        Text { objectName: "feedTitle"; text: modelData.text; color: Theme.text; width: parent.width; elide: Text.ElideRight
+                               font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 13 }) : Theme.uiLabel; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 17 : 20 }
+                        Text { text: source; color: Theme.textMuted; width: parent.width; elide: Text.ElideRight
+                               font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 15 : 18 }
                     }
                     Text { id: timeText; objectName: "feedTime"; anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter
                            width: feedWell.timeW; horizontalAlignment: Text.AlignRight; elide: Text.ElideLeft
-                           text: column.ago(modelData.ts, modelData.time); color: "#8ea6c2"; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
+                           text: column.ago(modelData.ts, modelData.time); color: Theme.textMuted
+                           font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.timestamp }
                     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: feedWell.textX; rightMargin: column.gridD } height: 1; color: Theme.alpha(column.structure, 0.26) }
                 }
                 // Sparse and empty states share the row grammar, one step quieter.
@@ -416,8 +428,10 @@ Item {
                     Rectangle { x: column.gridA; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(column.structure, 0.4)
                         Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: "#4f6b8a" } }
                     Column { anchors.left: parent.left; anchors.leftMargin: feedWell.textX; anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter; spacing: 1
-                        Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: "#cfdceb"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
-                        Text { text: "Approvals, outcomes and scheduled runs appear here"; color: "#6d88a6"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
+                        Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: Theme.textLabel; width: parent.width; elide: Text.ElideRight
+                               font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 13 }) : Theme.uiLabel; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 17 : 20 }
+                        Text { text: "Approvals, outcomes and scheduled runs appear here"; color: Theme.textMuted; width: parent.width; elide: Text.ElideRight
+                               font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: column.commandMode ? 15 : 18 }
                     }
                 }
             }

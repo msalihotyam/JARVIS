@@ -58,9 +58,9 @@ Rectangle {
             placeholderText: bridge.approvalPending ? "Answer the pending approval first"
                             : bridge.configRefused ? "Configuration refused - repair it with: jarvis config reset --all"
                             : (bridge.task.status === "awaiting_clarification" ? "Answer JARVIS's question…" : "Message JARVIS…")
-            placeholderTextColor: "#9db8dc"
-            color: "#f3f9ff"
-            font { family: Theme.font; pixelSize: 16 }
+            placeholderTextColor: Theme.textLabel
+            color: Theme.text
+            font: Theme.composerText
             background: null
             selectByMouse: true
             enabled: !bridge.configRefused
