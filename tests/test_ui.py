@@ -1,4 +1,4 @@
-"""The PySide6 / QML interface: the bridge drives the REAL application path.
+﻿"""The PySide6 / QML interface: the bridge drives the REAL application path.
 
 Every test composes the ordinary application from fake connectors, a
 scripted understanding model and temporary config / database / preference
@@ -187,7 +187,7 @@ class BootstrapTests(UiTestCase):
         bridge.setAmbientEffects(False)
         bridge.setTheme("neon")  # not a theme: ignored
         saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))
-        self.assertEqual(("dark", False, 3), (saved["theme"], saved["ambient_effects"], saved["version"]))
+        self.assertEqual(("dark", False, 4), (saved["theme"], saved["ambient_effects"], saved["version"]))
         again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
         self.assertEqual("dark", again.theme)
         self.assertFalse(again.ambientEffects)
@@ -826,18 +826,20 @@ class PresentationTests(UiTestCase):
         from copy import deepcopy
         legacy = canonical_preferences()
         legacy.pop("packages")
+        legacy.pop("rail")
         legacy["version"] = 1
         legacy["profiles"]["normal"]["panels"]["system"]["share"] = 0.54
         migrated = validate_preferences(legacy)
-        self.assertEqual(3, migrated["version"])
+        self.assertEqual(4, migrated["version"])
         self.assertEqual(legacy["profiles"], migrated["profiles"])
         self.assertEqual({"dark", "command"}, set(migrated["packages"]))
         # Version 2 -> 3: the conversation-first grid replaces every layout;
         # the person's theme, effects, lamp and page survive.
         v2 = {**canonical_preferences(), "version": 2, "theme": "dark", "ambient_effects": False, "page": "tasks"}
+        v2.pop("rail")
         v2["profiles"]["normal"]["column_width"] = 0.32
         moved = validate_preferences(v2)
-        self.assertEqual((3, "dark", False, "tasks"), (moved["version"], moved["theme"], moved["ambient_effects"], moved["page"]))
+        self.assertEqual((4, "dark", False, "tasks"), (moved["version"], moved["theme"], moved["ambient_effects"], moved["page"]))
         self.assertEqual(canonical_preferences()["profiles"], moved["profiles"])
         for key, value in (("profile", "foreign"), ("profiles", {})):
             bad = deepcopy(migrated)
@@ -1293,6 +1295,10 @@ class ConversationSurfaceTests(UiTestCase):
     window = PresentationTests.window
     SUMMARY = ("Tasks", "Updates", "Focus", "Plan")
 
+    def shown_rail(self, bridge) -> tuple:
+        """The rail cards the layout shows, in order, by their titles."""
+        return tuple(c["id"].capitalize() for c in bridge.railCards if c["visible"])
+
     def box(self, root, name):
         from PySide6.QtCore import QPointF
         it = self.item(root, name)
@@ -1320,14 +1326,19 @@ class ConversationSurfaceTests(UiTestCase):
             composer = self.box(root, "canonicalComposer")
             with self.subTest(size=(width, height)):
                 previous_bottom = rail[1]
-                for key in self.SUMMARY:
+                shown = self.shown_rail(bridge)
+                self.assertEqual(self.SUMMARY + ("Memory",), shown)      # the default rail: all five cards
+                # The cards share the rail height evenly: n cards, n - 1 gaps of 10-14 px.
+                share = (rail[3] - rail[1] - 12 * (len(shown) - 1)) / len(shown)
+                for key in shown:
                     card = self.box(root, "rail" + key)
                     # Phase 3.3b: substantial modules within the frozen rail,
                     # not the former 76 px navigation-sized cards.
                     self.assertGreaterEqual(card[3] - card[1], 84)
+                    self.assertAlmostEqual(card[3] - card[1], max(84, share), delta=3)
                     if width == 1920:
                         self.assertGreaterEqual(card[2] - card[0], work[0] * 0.90)
-                        self.assertGreaterEqual(card[3] - card[1], 150)
+                        self.assertGreaterEqual(card[3] - card[1], 120)
                         self.assertLessEqual(card[3] - card[1], 190)
                     if key != "Tasks":
                         self.assertGreaterEqual(card[1] - previous_bottom, 10)
@@ -1338,8 +1349,9 @@ class ConversationSurfaceTests(UiTestCase):
                     self.assertGreaterEqual(card[0], 0)
                     self.assertLessEqual(card[3], height)
                     previous_bottom = card[3]
-                # Phase 3.4b: the four cards share the available height; the
-                # rail itself still reserves the existing lower HUD area.
+                # Phase 3.4b: the shown cards share the available height, so the
+                # LAST shown card reaches the rail's end; the rail itself still
+                # reserves the existing lower HUD area.
                 self.assertAlmostEqual(previous_bottom, rail[3], delta=1)
                 self.assertGreaterEqual(height - previous_bottom, 60)
                 # The composer stays inside the work surface and on screen.
@@ -1390,11 +1402,12 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertLess(avatar[2], card[0])
         # The rail socket: 36 px, flush inside the card, centred; the card's
         # size and hit area are what they were.
-        for key in self.SUMMARY:
+        for key in self.shown_rail(bridge):
             sock = self.box(root, "railSocket" + key); rail_card = self.box(root, "rail" + key)
             self.assertAlmostEqual(36, sock[2] - sock[0], delta=0.6)
             self.assertAlmostEqual((sock[1] + sock[3]) / 2, (rail_card[1] + rail_card[3]) / 2, delta=1.0)
-            self.assertGreater(sock[0], rail_card[0]); self.assertGreaterEqual(rail_card[3] - rail_card[1], 150)
+            # Five cards at 1920: each keeps a substantial height (~136 px), not the 4-card 172.
+            self.assertGreater(sock[0], rail_card[0]); self.assertGreaterEqual(rail_card[3] - rail_card[1], 120)
         self.assertEqual(0, self.execute_calls())
 
     def test_empty_state_welcome_gives_way_to_the_first_accepted_turn(self) -> None:
@@ -1950,6 +1963,160 @@ class LocalFitTests(UiTestCase):
                     self.assertLessEqual(label.property("contentWidth"), label.width(), (width, name, label.property("text")))
                     self.assertFalse(label.property("truncated"), (width, name, label.property("text")))
                 self.assertLessEqual(label.parentItem().height(), self.item(root, "modelTrigger").height() - 12)
+        self.assertEqual(0, self.execute_calls())
+
+
+class LayoutEditorTests(UiTestCase):
+    """One global layout editor for the rail and the stack. Layout only."""
+    sizes = ((1920, 1080), (1536, 864), (1280, 760))
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+
+    def rail(self, bridge):
+        return [(c["id"], c["visible"]) for c in bridge.railCards]
+
+    def test_one_edit_state_drives_both_regions_and_escape_closes_popover_first(self):
+        bridge = self.bridge()
+        root = self.window(bridge)
+        rail_menu, stack_menu, toolbar = (self.item(root, n) for n in ("railMenuMemory", "stackMenu_system", "layoutToolbar"))
+        self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)])
+        self.click(root, "editLayoutTrigger")
+        self.assertTrue(bridge.editMode)
+        self.assertTrue(all(i.isVisible() for i in (rail_menu, stack_menu, toolbar)))
+        # Editing suppresses card navigation: a rail card click opens no peek.
+        self.click(root, "railTasks")
+        self.assertFalse(root.property("peekOpen"))
+        menus = self.item(root, "layoutMenus")
+        self.click(root, "layoutCards")
+        self.assertEqual("cards", menus.property("mode"))
+        QTest.keyClick(root, Qt.Key_Escape); pump(60)
+        self.assertEqual("", menus.property("mode"))
+        self.assertTrue(bridge.editMode)
+        QTest.keyClick(root, Qt.Key_Escape); pump(300)
+        self.assertFalse(bridge.editMode)
+        self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)])
+        # Done exits too, and is not a save: nothing is written by it.
+        bridge.setEditMode(True); pump(60)
+        self.click(root, "layoutDone")
+        self.assertFalse(bridge.editMode)
+        self.assertFalse(self.prefs_path.exists())
+
+    def test_hide_restore_and_move_in_both_regions_persist(self):
+        bridge = self.bridge()
+        self.assertEqual([(n, True) for n in ("tasks", "updates", "focus", "plan", "memory")], self.rail(bridge))
+        bridge.setCardVisible("rail", "memory", False)
+        bridge.setCardVisible("stack", "activity", False)
+        self.assertEqual("saved", bridge.layoutSaveState)
+        reloaded = UiPreferences(self.prefs_path)
+        self.assertFalse(reloaded.data["rail"]["visible"]["memory"])
+        self.assertFalse(reloaded.layout()["panels"]["activity"]["visible"])
+        # Moves swap with the nearest VISIBLE neighbour; hidden cards keep their place.
+        bridge.setCardVisible("rail", "updates", False)
+        bridge.moveCard("rail", "focus", -1)
+        self.assertEqual(["focus", "updates", "tasks", "plan", "memory"], [c for c, _ in self.rail(bridge)])
+        bridge.moveCard("rail", "focus", -1)                 # already the first visible card
+        bridge.moveCard("rail", "plan", 1)                   # already the last visible card
+        self.assertEqual(["focus", "updates", "tasks", "plan", "memory"], [c for c, _ in self.rail(bridge)])
+        bridge.moveCard("rail", "updates", 1)                # a hidden card does not move
+        bridge.moveCard("stack", "workflow", -1)
+        self.assertEqual(["workflow", "system", "activity", "automations"], bridge.prefs.layout()["order"])
+        # Restoring returns a card to its retained position.
+        bridge.setCardVisible("rail", "updates", True)
+        bridge.setCardVisible("stack", "activity", True)
+        self.assertEqual(("updates", True), self.rail(bridge)[1])
+        self.assertEqual(["workflow", "system", "activity"], [p["id"] for p in bridge.panels if p["shown"]])
+        for bogus in (("rail", "system"), ("stack", "memory"), ("nowhere", "tasks")):
+            bridge.setCardVisible(*bogus, False)
+        self.assertEqual(bridge.prefs.data, UiPreferences(self.prefs_path).data)
+
+    def test_layout_edits_and_reset_never_touch_capability_state(self):
+        bridge = self.bridge()
+        bridge.setTheme("dark"); bridge.setAmbientEffects(False)
+        config_before = (self.root / "config.json").read_bytes()
+        state_before = (bridge.executionEnabled, bridge.memoryStatus, bridge.config, bridge.task, bridge.jobs, bridge.projects)
+        for region, card in (("rail", "memory"), ("rail", "tasks"), ("stack", "workflow"), ("stack", "system"), ("stack", "activity")):
+            bridge.setCardVisible(region, card, False)
+        bridge.moveCard("rail", "plan", -1)
+        bridge.resetLayout()
+        self.assertEqual(canonical_preferences()["rail"], bridge.prefs.data["rail"])
+        self.assertEqual(canonical_preferences()["profiles"]["normal"], bridge.prefs.layout())
+        self.assertEqual(("dark", False), (bridge.theme, bridge.ambientEffects))
+        self.assertEqual(config_before, (self.root / "config.json").read_bytes())
+        self.assertEqual(state_before, (bridge.executionEnabled, bridge.memoryStatus, bridge.config, bridge.task, bridge.jobs, bridge.projects))
+
+    def test_memory_status_comes_only_from_backend_signals(self):
+        bridge = Bridge(Backend(self.store, self.factory), UiPreferences(self.prefs_path), sync=True)
+        self.assertEqual("Status unavailable", bridge.memoryStatus)   # nothing reported yet
+        bridge.refreshConfig()
+        self.assertEqual("Available", bridge.memoryStatus)            # the store reported its schema
+        bridge._status = {}
+        self.assertEqual("Status unavailable", bridge.memoryStatus)   # a broken store reads as unknown
+        (self.root / "config.json").write_text("{not json", encoding="utf-8")
+        bridge.refreshConfig()
+        self.assertTrue(bridge.configRefused)
+        self.assertEqual("Unavailable", bridge.memoryStatus)
+        # Hiding the card is not a state: the status is unchanged by layout.
+        bridge.setCardVisible("rail", "memory", False)
+        self.assertEqual("Unavailable", bridge.memoryStatus)
+
+    def test_v3_document_keeps_its_layout_and_memory_waits_in_cards(self):
+        v3 = canonical_preferences()
+        v3.pop("rail"); v3["version"] = 3
+        v3["profiles"]["normal"]["order"] = ["activity", "system", "workflow", "automations"]
+        self.prefs_path.write_text(json.dumps(v3), encoding="utf-8")
+        prefs = UiPreferences(self.prefs_path)
+        self.assertEqual(4, prefs.data["version"])
+        self.assertEqual(v3["profiles"], prefs.data["profiles"])
+        self.assertEqual({"tasks": True, "updates": True, "focus": True, "plan": True, "memory": False}, prefs.data["rail"]["visible"])
+        broken = canonical_preferences(); broken["rail"]["order"] = ["tasks"]
+        self.assertEqual(canonical_preferences(), validate_preferences(broken))
+
+    def test_failed_save_restores_previous_layout_and_never_claims_saved(self):
+        bridge = self.bridge()
+        bridge.setCardVisible("rail", "plan", False)
+        on_disk = self.prefs_path.read_bytes()
+        bridge.prefs.path = self.root                        # a directory: the write fails
+        bridge.moveCard("stack", "activity", -1)
+        bridge.setCardVisible("rail", "tasks", False)
+        self.assertEqual("failed", bridge.layoutSaveState)
+        self.assertEqual(["system", "workflow", "activity", "automations"], bridge.prefs.layout()["order"])
+        self.assertTrue(bridge.prefs.data["rail"]["visible"]["tasks"])
+        self.assertFalse(bridge.prefs.data["rail"]["visible"]["plan"])
+        self.assertEqual(on_disk, self.prefs_path.read_bytes())
+        bridge.prefs.path = self.prefs_path
+        bridge.setCardVisible("rail", "plan", True)
+        self.assertEqual("saved", bridge.layoutSaveState)
+
+    def test_cards_inventory_and_reset_confirmation_in_the_window(self):
+        bridge = self.bridge()
+        root = self.window(bridge)
+        menus = self.item(root, "layoutMenus")
+        for width, height in self.sizes:
+            with self.subTest(size=(width, height)):
+                root.resize(width, height); pump(450)
+                bridge.setEditMode(True); pump(250)
+                self.click(root, "railMenuMemory")
+                self.assertEqual(("card", "rail", "memory"), tuple(menus.property(k) for k in ("mode", "region", "card")))
+                self.assertFalse(self.item(root, "menuMoveDown").isEnabled())   # the last card
+                self.click(root, "menuHide")
+                self.assertFalse(bridge.railCards[-1]["visible"])
+                self.click(root, "layoutCards")
+                popover = self.item(root, "layoutPopover")
+                self.assertEqual("7 visible · 2 hidden", self.item(root, "inventoryCount").property("text"))
+                top_left = popover.mapToScene(popover.boundingRect().topLeft())
+                self.assertGreaterEqual(top_left.x(), 0); self.assertGreaterEqual(top_left.y(), 0)
+                self.assertLessEqual(top_left.x() + popover.width(), width)
+                self.assertLessEqual(top_left.y() + popover.height(), height)
+                self.click(root, "addToLayout_memory")
+                self.assertTrue(bridge.railCards[-1]["visible"])
+                self.assertEqual("cards", menus.property("mode"))                # stays open
+                QTest.keyClick(root, Qt.Key_Escape); pump(60)
+                self.click(root, "layoutReset")
+                self.assertEqual("reset", menus.property("mode"))
+                self.click(root, "resetConfirm")
+                self.assertEqual("", menus.property("mode"))
+                bridge.setEditMode(False); pump(150)
         self.assertEqual(0, self.execute_calls())
 
 

@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 
-// The four summary line icons (tasks / updates / focus / plan), drawn at
+// The summary line icons (tasks / updates / focus / plan / memory), drawn at
 // 18 px so the rail cards and their peek panels share one set.
 Shape {
     id: glyph
@@ -46,5 +46,15 @@ Shape {
         PathLine { x: 14.5; y: 1.5 } PathLine { x: 14.5; y: 16.5 } PathLine { x: 9; y: 12.5 } PathLine { x: 3.5; y: 16.5 } PathLine { x: 3.5; y: 1.5 }
         PathMove { x: 9; y: 4.8 } PathLine { x: 9; y: 8.6 }
         PathMove { x: 7.1; y: 6.7 } PathLine { x: 10.9; y: 6.7 }
+    }
+    // Memory: stacked records - a lidded cylinder with one seam.
+    ShapePath {
+        strokeColor: glyph.icon === "memory" ? glyph.tint : "transparent"; strokeWidth: 1.6; fillColor: "transparent"
+        joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
+        PathAngleArc { centerX: 9; centerY: 4; radiusX: 6.5; radiusY: 2.5; startAngle: 0; sweepAngle: 360; moveToStart: true }
+        PathMove { x: 2.5; y: 4 } PathLine { x: 2.5; y: 14 }
+        PathMove { x: 15.5; y: 4 } PathLine { x: 15.5; y: 14 }
+        PathAngleArc { centerX: 9; centerY: 9; radiusX: 6.5; radiusY: 2.5; startAngle: 0; sweepAngle: 180; moveToStart: true }
+        PathAngleArc { centerX: 9; centerY: 14; radiusX: 6.5; radiusY: 2.5; startAngle: 0; sweepAngle: 180; moveToStart: true }
     }
 }

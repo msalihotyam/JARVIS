@@ -119,6 +119,7 @@ class Bridge(QObject):
         self._projects: list[str] = []
         self._focus_mode = False
         self._edit_mode = False
+        self._layout_save = ""     # "", "saved" or "failed": this session's last layout write
         self._last_error = ""
 
     # -- worker --------------------------------------------------------------
@@ -294,6 +295,21 @@ class Bridge(QObject):
     @Property("QVariantMap", notify=stateChanged)
     def statusInfo(self) -> dict:
         return dict(self._status)
+
+    @Property(str, notify=stateChanged)
+    def memoryStatus(self) -> str:
+        """The Memory card's status, from what the backend actually reported.
+
+        "Unavailable" when the configuration was refused (every memory call is
+        refused with it); "Available" only when the local memory store opened
+        and reported its schema; otherwise "Status unavailable". Nothing here
+        claims saved information exists or is empty - no such signal exists.
+        """
+        if self._config and self._config_refused():
+            return "Unavailable"
+        if type(self._status.get("schema_version")) is int:
+            return "Available"
+        return "Status unavailable"
 
     @Property(str, notify=stateChanged)
     def sessionId(self) -> str:
@@ -745,9 +761,41 @@ class Bridge(QObject):
         layout = self.prefs.layout()
         return [name for name in layout["order"] if not layout["panels"][name]["visible"]]
 
+    @Property("QVariantList", notify=prefsChanged)
+    def railCards(self) -> list:
+        """The left rail's cards in stored order, each with its visible flag."""
+        rail = self.prefs.data["rail"]
+        return [{"id": name, "visible": rail["visible"][name]} for name in rail["order"]]
+
+    @Property(str, notify=prefsChanged)
+    def layoutSaveState(self) -> str:
+        """"saved" once a layout change is on disk, "failed" when the last one
+        could not be written (the previous layout is back), "" before any."""
+        return self._layout_save
+
     def _layout_changed(self) -> None:
-        self.prefs.save()
+        if self.prefs.save():
+            self._layout_save = "saved"
+        else:
+            self.prefs.restore_last_layout()
+            self._layout_save = "failed"
         self.prefsChanged.emit()
+
+    @Slot(str, str, bool)
+    def setCardVisible(self, region: str, card: str, visible: bool) -> None:
+        """Hide a card from the layout or add it back. Presentation only."""
+        if region == "rail":
+            self.prefs.set_rail_visible(str(card), bool(visible))
+        elif region == "stack":
+            self.prefs.set_visible(str(card), bool(visible))
+        else:
+            return
+        self._layout_changed()
+
+    @Slot(str, str, int)
+    def moveCard(self, region: str, card: str, step: int) -> None:
+        self.prefs.move_card(str(region), str(card), int(step))
+        self._layout_changed()
 
     @Slot(str, bool)
     def setPanelVisible(self, panel: str, visible: bool) -> None:

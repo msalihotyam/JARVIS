@@ -4,15 +4,20 @@ import "../theme"
 
 // The right-side information column: an ordered stack of real panels.
 // Heights come from the persisted shares, reflow is animated, and Edit Mode
-// adds handles (hide, pin, move, resize) plus the hidden-panel tray and
-// Reset Layout. All geometry is derived, so nothing can leave the screen.
+// adds the workspace layout toolbar (state, Cards, Reset layout, Done), one
+// layout menu per panel and the resize grips. The toolbar edits the whole
+// workspace - this stack and the left rail - and its popovers live in Main.
+// All geometry is derived, so nothing can leave the screen.
 Item {
     id: column
     property bool commandMode: false
     property var panels: bridge.panels
     property var shown: panels.filter(function(p) { return p.shown })
     property real totalShare: shown.reduce(function(sum, p) { return sum + p.share }, 0)
-    property real editChrome: bridge.editMode ? 54 : 0
+    property real editChrome: bridge.editMode ? (bridge.layoutSaveState === "failed" ? 72 : 54) : 0
+    signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
+    signal cardsRequested(Item anchor)
+    signal resetRequested(Item anchor)
     property real usable: height - editChrome - Math.max(0, shown.length - 1) * gapPx
     readonly property int minPanelHeight: 120
     // One structural palette for the stack: deep navy surface, cool-blue
@@ -65,27 +70,44 @@ Item {
     // -- edit chrome --------------------------------------------------------
     Item {
         id: chrome
+        objectName: "layoutToolbar"
         width: parent.width; height: 44
         opacity: bridge.editMode ? 1 : 0
         visible: opacity > 0
-        Behavior on opacity { NumberAnimation { duration: Theme.editMs; easing.type: Easing.OutCubic } }
-        Row {
-            spacing: 8
-            anchors.verticalCenter: parent.verticalCenter
-            Pill { text: "Edit layout"; tint: Theme.accent; anchors.verticalCenter: parent.verticalCenter }
-            Repeater {
-                model: bridge.hiddenPanels
-                Rectangle {
-                    height: 26; width: chipText.width + 22; radius: 13
-                    color: chipArea.containsMouse ? Theme.alpha(Theme.accent, 0.12) : Theme.surfaceRaised; border.width: 1; border.color: chipArea.containsMouse ? Theme.alpha(Theme.accent, 0.5) : Theme.border
-                    anchors.verticalCenter: parent.verticalCenter
-                    Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                    Text { id: chipText; anchors.centerIn: parent; text: "+ " + modelData; color: Theme.textLabel; font { family: Theme.font; pixelSize: 11 } }
-                    MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setPanelVisible(modelData, true) }
-                }
+        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs; easing.type: Easing.OutCubic } }
+        readonly property bool narrow: width < 300
+        // Edit state: a blue dot, the label, and the truthful save state beneath.
+        Rectangle {
+            id: stateChip
+            anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+            height: 36; width: stateCol.x + stateCol.width + 12; radius: Theme.radiusSmall
+            color: Theme.alpha(Theme.accent, 0.08); border.width: 1; border.color: Theme.alpha(Theme.accent, 0.4)
+            Rectangle { id: stateDot; x: 10; anchors.verticalCenter: parent.verticalCenter; width: 6; height: 6; radius: 3
+                color: bridge.layoutSaveState === "failed" ? Theme.warning : Theme.accent }
+            Column {
+                id: stateCol
+                x: 22; anchors.verticalCenter: parent.verticalCenter; spacing: 0
+                Text { text: chrome.narrow ? "EDIT" : "EDIT LAYOUT"; color: Theme.accent; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.4; weight: Font.DemiBold } }
+                Text { objectName: "layoutSaveState"; visible: text !== ""
+                       text: bridge.layoutSaveState === "saved" ? "Saved" : bridge.layoutSaveState === "failed" ? "Not saved" : ""
+                       color: bridge.layoutSaveState === "failed" ? Theme.warning : Theme.textMuted; font: Theme.metadata }
             }
         }
-        ActionButton { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; label: "Reset layout"; compact: true; onClicked: bridge.resetLayout() }
+        Row {
+            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            spacing: chrome.narrow ? 4 : 8
+            ActionButton { id: cardsButton; objectName: "layoutCards"; label: "Cards ▾"; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
+                onClicked: column.cardsRequested(cardsButton) }
+            IconButton { id: resetButton; objectName: "layoutReset"; glyph: "↺"; tip: "Reset layout"; framed: true; width: 36; height: 36
+                onClicked: column.resetRequested(resetButton) }
+            ActionButton { objectName: "layoutDone"; label: "Done"; primary: true; height: 36; width: implicitWidth - (chrome.narrow ? 8 : 0)
+                onClicked: bridge.setEditMode(false) }
+        }
+    }
+    Text {
+        visible: bridge.editMode && bridge.layoutSaveState === "failed"
+        y: chrome.height; width: parent.width; elide: Text.ElideRight
+        text: "Change wasn’t saved. Previous layout restored."; color: Theme.warning; font: Theme.metadata
     }
 
     // -- the stack ----------------------------------------------------------
@@ -132,12 +154,9 @@ Item {
                         height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowHead.width : (pinned.visible ? pinned.width : 0))
                         Row {
                             id: handles
-                            spacing: 2
                             visible: bridge.editMode
-                            IconButton { glyph: "▲"; tip: "Move up"; width: 24; height: 24; onClicked: bridge.movePanel(modelData.id, -1) }
-                            IconButton { glyph: "▼"; tip: "Move down"; width: 24; height: 24; onClicked: bridge.movePanel(modelData.id, 1) }
-                            IconButton { glyph: "⊙"; tip: modelData.pinned ? "Unpin" : "Pin"; active: modelData.pinned; width: 24; height: 24; onClicked: bridge.setPanelPinned(modelData.id, !modelData.pinned) }
-                            IconButton { glyph: "✕"; tip: "Hide"; width: 24; height: 24; onClicked: bridge.setPanelVisible(modelData.id, false) }
+                            IconButton { id: panelMenu; objectName: "stackMenu_" + modelData.id; glyph: "•••"; tip: glass.title + " layout options"; width: 36; height: 30; y: -3
+                                onClicked: column.menuRequested(modelData.id, panelMenu, slot.index > 0, slot.index < column.shown.length - 1) }
                         }
                         Row {
                             id: workflowHead

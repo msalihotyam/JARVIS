@@ -57,7 +57,7 @@ Window {
     }
     Connections {
         target: bridge
-        function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects }
+        function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects; if (bridge.editMode) peek.open = false }
         function onApprovalChanged() { if (bridge.approvalPending) { root.closeContexts(); bridge.setPage("home") } }
     }
 
@@ -153,7 +153,10 @@ Window {
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
         Component { id: canonicalPackage; CommandCenter { lift: content.lift; fade: Theme.shellFade(root.height) } }
-        Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
+        Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false
+            onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("stack", card, anchor, canUp, canDown) }
+            onCardsRequested: function(anchor) { layoutMenus.toggle("cards", anchor) }
+            onResetRequested: function(anchor) { layoutMenus.toggle("reset", anchor) } } }
         Component { id: tasksPage; TasksPage {} }
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask("Archive job", "Archive '" + job.label + "'? There is no un-archive.", "Archive", true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
         Component { id: memoryPage; MemoryPage {} }
@@ -182,6 +185,9 @@ Window {
             width: content.columnWidth
             visible: content.showColumn
             opacity: content.showColumn ? 1 : 0
+            onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("stack", card, anchor, canUp, canDown) }
+            onCardsRequested: function(anchor) { layoutMenus.toggle("cards", anchor) }
+            onResetRequested: function(anchor) { layoutMenus.toggle("reset", anchor) }
             Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Behavior on opacity { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
         }
@@ -239,7 +245,10 @@ Window {
         height: root.height - y - 64
         activeKey: peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
+        onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
     }
+    // Edit Mode's popovers for both regions: over the rail, under approvals.
+    LayoutMenus { id: layoutMenus; z: 445; railShown: summaryRail.visible; commandMode: root.presentation === "command" }
     CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 
@@ -298,6 +307,7 @@ Window {
         else if (settings.open) settings.open = false
         else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
+        else if (layoutMenus.open) layoutMenus.close()
         else if (peek.open) peek.open = false
         else if (!root.homePage && pageLoader.item) pageLoader.item.closePage()
         else if (bridge.editMode) bridge.setEditMode(false) } }

@@ -415,7 +415,8 @@ Item {
         anchors { right: parent.right; top: parent.top
                   rightMargin: Math.round(bar.width * Theme.macroStripRight) + 8
                   topMargin: Math.round(bar.viewportHeight * 0.1130) }
-        tip: bridge.editMode ? "Done editing" : "Edit layout"
+        objectName: "editLayoutTrigger"
+        tip: bridge.editMode ? "Done editing" : "Edit workspace layout"
         active: bridge.editMode
         framed: true
         width: 34; height: 34

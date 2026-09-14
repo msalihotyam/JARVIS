@@ -10,6 +10,9 @@ Item {
     objectName: "commandPreset"
     property bool fixtureApproval: false
     signal dismissFixture()
+    signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
+    signal cardsRequested(Item anchor)
+    signal resetRequested(Item anchor)
     readonly property bool wide: width >= 1400
     readonly property bool showBay: wide && !bridge.focusMode
     readonly property real navWidth: bridge.focusMode ? 0 : wide ? 204 : 60
@@ -69,6 +72,9 @@ Item {
     PanelColumn {
         id: rail; objectName: "commandPanelColumn"
         commandMode: true
+        onMenuRequested: function(card, anchor, canUp, canDown) { cockpit.menuRequested(card, anchor, canUp, canDown) }
+        onCardsRequested: function(anchor) { cockpit.cardsRequested(anchor) }
+        onResetRequested: function(anchor) { cockpit.resetRequested(anchor) }
         anchors { top: parent.top; right: parent.right; bottom: composer.top; bottomMargin: 20 }
         width: cockpit.railWidth; visible: width > 0
     }

@@ -10,15 +10,20 @@ The layout model is deliberately simple and deterministic: the right column
 is an ORDERED STACK of panels, each with a height share, a visible flag and
 a pin flag, plus one column-width fraction. A stack cannot overlap, cannot
 leave the screen and reflows by itself when a panel is hidden.
+
+The left rail is the same idea without sizes: an ordered list of summary
+cards and a visible flag each. Hiding a card, on either side, is layout only:
+nothing here can disable Memory, stop a task or touch any backend data.
 """
 
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-PREFERENCES_VERSION = 3
+PREFERENCES_VERSION = 4
 THEMES = ("space", "dark", "command")
 #: Execution-status lamp skins: the canonical glass orb and the HUD variant.
 STATUS_INDICATORS = ("orb", "hud")
@@ -32,6 +37,8 @@ _RETIRED_PAGES = {"settings": "home"}
 PANEL_IDS = ("system", "workflow", "activity", "automations")
 #: Panels that appear only when they have something to show, unless pinned.
 CONTEXTUAL_PANELS = frozenset({"workflow"})
+#: The left rail's summary cards, in canonical order.
+RAIL_IDS = ("tasks", "updates", "focus", "plan", "memory")
 
 #: Bounds, in fractions of the content area. The stack's height shares are
 #: normalized on render, so a share is a proportion, not a pixel count.
@@ -82,6 +89,18 @@ def canonical_profiles() -> dict[str, dict[str, Any]]:
     }
 
 
+def canonical_rail() -> dict[str, Any]:
+    return {"order": list(RAIL_IDS), "visible": {name: True for name in RAIL_IDS}}
+
+
+def legacy_rail() -> dict[str, Any]:
+    """The rail for a document saved before Memory existed: the four cards
+    that person always had, Memory waiting in the Cards inventory."""
+    rail = canonical_rail()
+    rail["visible"]["memory"] = False
+    return rail
+
+
 def canonical_preferences() -> dict[str, Any]:
     return {
         "version": PREFERENCES_VERSION,
@@ -90,6 +109,7 @@ def canonical_preferences() -> dict[str, Any]:
         "status_indicator": "orb",
         "profile": "normal",
         "page": "home",
+        "rail": canonical_rail(),
         "profiles": canonical_profiles(),
         "packages": {name: {"profile": "normal", "profiles": package_profiles(name)}
                      for name in THEMES if name != "space"},
@@ -157,13 +177,18 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     defaults = canonical_preferences()
     # Preserve only a complete, valid v1 document. Validation below still
     # rejects malformed old fields; migration never writes product config.
-    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator"} == set(defaults) - {"packages", "status_indicator"}:
-        candidate = {**candidate, "version": PREFERENCES_VERSION, "packages": defaults["packages"]}
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator"} == set(defaults) - {"packages", "status_indicator", "rail"}:
+        candidate = {**candidate, "version": 3, "packages": defaults["packages"]}
     # Version 2 -> 3: the conversation-first grid replaced every layout; the
     # person's other choices are kept.
-    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) == set(defaults):
+    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) == set(defaults) - {"rail"}:
         kept = {key: candidate[key] for key in ("theme", "ambient_effects", "status_indicator", "page")}
-        candidate = {**defaults, **kept}
+        candidate = {**defaults, **kept, "version": 3}
+        candidate.pop("rail")
+    # Version 3 -> 4: the rail became editable and gained Memory. Everything
+    # saved is kept; Memory arrives hidden, restorable from Cards.
+    if isinstance(candidate, dict) and candidate.get("version") == 3 and "rail" not in candidate:
+        candidate = {**candidate, "version": PREFERENCES_VERSION, "rail": legacy_rail()}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
@@ -179,6 +204,12 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     if candidate["page"] in _RETIRED_PAGES:
         candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
     if candidate["profile"] not in PROFILES or candidate["page"] not in PAGES:
+        return defaults
+    rail = candidate["rail"]
+    if (not isinstance(rail, dict) or set(rail) != {"order", "visible"}
+            or not isinstance(rail["order"], list) or sorted(rail["order"]) != sorted(RAIL_IDS)
+            or not isinstance(rail["visible"], dict) or set(rail["visible"]) != set(RAIL_IDS)
+            or any(type(flag) is not bool for flag in rail["visible"].values())):
         return defaults
     profiles = candidate["profiles"]
     if not isinstance(profiles, dict) or set(profiles) != set(PROFILES):
@@ -210,6 +241,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "status_indicator": candidate["status_indicator"],
         "profile": candidate["profile"],
         "page": candidate["page"],
+        "rail": {"order": list(rail["order"]), "visible": dict(rail["visible"])},
         "profiles": validated,
         "packages": validated_packages,
     }
@@ -225,6 +257,8 @@ class UiPreferences:
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_preferences_path()
         self.data = self.load()
+        # The last arrangement known to be good: what a failed save restores.
+        self._last_good = deepcopy(self.data)
 
     def load(self) -> dict[str, Any]:
         try:
@@ -241,7 +275,14 @@ class UiPreferences:
             self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
         except OSError:
             return False
+        self._last_good = deepcopy(self.data)
         return True
+
+    def restore_last_layout(self) -> None:
+        """Put back the layout (rail, stacks, profiles) of the last good
+        document, after a save failed. Other choices are left as they are."""
+        for key in ("rail", "profiles", "packages"):
+            self.data[key] = deepcopy(self._last_good[key])
 
     # -- layout mutations: every one bounded, snapped and deterministic -------
 
@@ -277,9 +318,36 @@ class UiPreferences:
     def set_column_width(self, width: float) -> None:
         self.layout()["column_width"] = clamp(snap(float(width)), MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
 
+    def set_rail_visible(self, card: str, visible: bool) -> None:
+        if card in RAIL_IDS:
+            self.data["rail"]["visible"][card] = bool(visible)
+
+    def move_card(self, region: str, card: str, step: int) -> None:
+        """Swap a card with its nearest VISIBLE neighbour in one direction,
+        inside its own region. Hidden cards keep their stored places; at
+        either end nothing moves."""
+        if region == "rail":
+            order, shown = self.data["rail"]["order"], self.data["rail"]["visible"]
+        elif region == "stack":
+            layout = self.layout()
+            order, shown = layout["order"], {k: p["visible"] for k, p in layout["panels"].items()}
+        else:
+            return
+        if card not in order or not shown[card] or step == 0:
+            return
+        index = order.index(card)
+        others = range(index - 1, -1, -1) if step < 0 else range(index + 1, len(order))
+        target = next((i for i in others if shown[order[i]]), None)
+        if target is not None:
+            order[index], order[target] = order[target], order[index]
+
     def reset_layout(self, profile: str | None = None) -> None:
         name = profile or self.package()["profile"]
         self.package()["profiles"][name] = package_profiles(self.data["theme"])[name]
+        # The rail belongs to the MAIN / DARK workspace; the Command preset
+        # has none, so its reset leaves the rail alone.
+        if self.data["theme"] != "command":
+            self.data["rail"] = canonical_rail()
 
     def reset_all_layouts(self) -> None:
         self.package()["profiles"] = package_profiles(self.data["theme"])

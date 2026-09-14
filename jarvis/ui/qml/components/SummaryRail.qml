@@ -3,11 +3,11 @@ import QtQuick.Shapes
 import QtQuick.Effects
 import "../theme"
 
-// The left ambient rail's summary stack: Tasks, Updates, Focus, Plan. It is
-// contextual information, not navigation chrome. Each card is one glance at
-// real state and never expands in the rail; a click opens a quick-look peek
+// The left ambient rail's summary stack: Tasks, Updates, Focus, Plan, Memory.
+// It is contextual information, not navigation chrome. Each card is one glance
+// at real state and never expands in the rail; a click opens a quick-look peek
 // anchored to its right (SummaryPeek), and the full page stays one step
-// further for deeper work.
+// further for deeper work. Memory is informational only: no peek, no route.
 //
 // Every figure comes from a bridge listing; nothing is invented to fill the
 // approved layout:
@@ -16,6 +16,10 @@ import "../theme"
 //              whose "this interface session" list is exactly these notes)
 //   Focus   -> the active memory projects                  (Memory page)
 //   Plan    -> the scheduled automation jobs               (Automations page)
+//   Memory  -> the backend's reported memory status        (no page)
+//
+// Order and visibility are the persisted layout (bridge.railCards). In Edit
+// Mode the card bodies stop navigating and each card offers its layout menu.
 //
 // The shaping helpers live here so the peek reads the same derived state.
 Item {
@@ -23,6 +27,7 @@ Item {
     objectName: "summaryRail"
     property string activeKey: ""
     signal picked(string key, real cardY, real cardHeight)
+    signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
 
     // A slow clock so relative ages stay honest without per-second redraws.
     property real now: Date.now()
@@ -70,38 +75,52 @@ Item {
     readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
     readonly property string sessionsWord: bridge.sessions.length + (bridge.sessions.length === 1 ? " session" : " sessions")
     readonly property var modules: [
-        { key: "Tasks", page: "tasks", icon: "tasks",
+        { id: "tasks", key: "Tasks", page: "tasks", icon: "tasks",
           line: (bridge.taskLive ? 1 : 0) + " active",
           note: rail.roomy ? rail.sessionsWord + " · " + rail.taskTotal + (rail.taskTotal === 1 ? " task" : " tasks") : rail.sessionsWord },
-        { key: "Updates", page: "history", icon: "updates",
+        { id: "updates", key: "Updates", page: "history", icon: "updates",
           line: bridge.activity.length + " recent",
           note: rail.attention > 0 ? rail.attention + (rail.roomy ? (rail.attention === 1 ? " needs attention" : " need attention") : " to review") : "All clear" },
-        { key: "Focus", page: "memory", icon: "focus",
+        { id: "focus", key: "Focus", page: "memory", icon: "focus",
           line: bridge.projects.length + (bridge.projects.length === 1 ? " project" : " projects"),
           note: bridge.projects.length ? (rail.roomy ? "Active in memory" : "In memory")
                                        : (rail.roomy ? "No focus context yet" : rail.width < 180 ? "No context" : "No context yet") },
-        { key: "Plan", page: "automations", icon: "plan",
+        { id: "plan", key: "Plan", page: "automations", icon: "plan",
           line: rail.enabledJobs.length + (rail.tight ? (rail.enabledJobs.length === 1 ? " job" : " jobs") : " scheduled"),
           note: rail.nextJob ? "Next " + rail.dueShort(rail.nextJob.next_due_at_utc)
-                             : (rail.liveJobs.length ? (rail.roomy ? "Nothing enabled" : "None enabled") : (rail.roomy ? "Nothing scheduled" : "None yet")) }
+                             : (rail.liveJobs.length ? (rail.roomy ? "Nothing enabled" : "None enabled") : (rail.roomy ? "Nothing scheduled" : "None yet")) },
+        // A status, not a count: the whole line is the status word.
+        { id: "memory", key: "Memory", page: "", icon: "memory", status: true,
+          line: bridge.memoryStatus,
+          note: "Persistent across sessions", shortNote: "Persistent" }
     ]
+    readonly property var shownModules: {
+        var byId = {}
+        rail.modules.forEach(function(m) { byId[m.id] = m })
+        return bridge.railCards.filter(function(c) { return c.visible }).map(function(c) { return byId[c.id] })
+    }
+    readonly property int count: Math.max(1, shownModules.length)
 
-    // Share the available height, which already excludes the lower HUD.
-    // Extra space is breathing room for real content, never invented rows.
-    readonly property real cardFull: Math.max(84, (height - 36) / 4)
+    // Share the available height, which already excludes the lower HUD, among
+    // the cards shown. Extra space is breathing room for real content, never
+    // invented rows; a fifth card takes blank space, not text size.
+    readonly property real cardFull: Math.max(84, (height - 12 * (count - 1)) / count)
     readonly property real cardCompact: 50
-    readonly property bool showNote: 4 * cardFull + 30 <= height
+    readonly property bool showNote: count * cardFull + 10 * (count - 1) <= height
     readonly property real cardHeight: showNote ? cardFull : cardCompact
-    readonly property real gap: 4 * cardHeight + 36 <= height ? 12 : 6
+    readonly property real gap: count * cardHeight + 12 * (count - 1) <= height ? 12 : 6
 
     Column {
         width: rail.width
         spacing: rail.gap
         Repeater {
-            model: rail.modules
+            model: rail.shownModules
             Rectangle {
                 id: card
                 objectName: "rail" + modelData.key
+                readonly property bool editing: bridge.editMode
+                // Memory has no peek or page: outside editing it is read, not pressed.
+                readonly property bool navigable: !editing && !modelData.status
                 readonly property bool active: rail.activeKey === modelData.key
                 readonly property bool hovered: hit.containsMouse
                 width: rail.width
@@ -112,11 +131,11 @@ Item {
                 color: active ? rail.activeFill : hovered ? "#b6051a30" : Theme.glassSecondaryShell
                 border.width: 0
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                activeFocusOnTab: true
-                Accessible.role: Accessible.Button
+                activeFocusOnTab: card.navigable
+                Accessible.role: card.navigable ? Accessible.Button : Accessible.StaticText
                 Accessible.name: modelData.key + ": " + modelData.line
-                Keys.onReturnPressed: rail.picked(modelData.key, card.y, card.height)
-                Keys.onSpacePressed: rail.picked(modelData.key, card.y, card.height)
+                Keys.onReturnPressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
+                Keys.onSpacePressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
 
                 // The shell: a static nine-slice of light - soft outer glow, a
                 // cyan rim brightest where light catches the upper left, and a
@@ -203,25 +222,29 @@ Item {
                     id: labels
                     x: tile.x + tile.width + (rail.tight ? 8 : 13)
                     anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - x - (rail.tight ? 17 : 24)
+                    // The right reserve is the chevron's; Memory has none.
+                    width: parent.width - x - (modelData.status ? 12 : rail.tight ? 17 : 24)
                     spacing: rail.showNote ? 2 : 0
                     readonly property int tier: Theme.tier(card.Window.width)
                     // Title, then the count numeral with its unit on one baseline, then the detail.
                     Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.key; color: Theme.text
                            font: Theme.railTitle(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railTitleLine(labels.tier) }
                     Row {
-                        width: parent.width; spacing: 5
-                        readonly property string count: modelData.line.split(" ")[0]
-                        Text { id: countText; objectName: "railCount" + modelData.key; text: parent.count; color: "#37c4f0"
+                        width: parent.width; spacing: count === "" ? 0 : 5
+                        readonly property string count: modelData.status ? "" : modelData.line.split(" ")[0]
+                        // A status card keeps the count's line box (1 px wide: a Row skips zero-width items) so its rhythm matches.
+                        Text { id: countText; objectName: "railCount" + modelData.key; text: parent.count === "" ? " " : parent.count; width: parent.count === "" ? 1 : implicitWidth; color: "#37c4f0"
                                font: Theme.railCount(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railCountLine(labels.tier) }
-                        Text { anchors.baseline: countText.baseline; width: parent.width - countText.width - parent.spacing; elide: Text.ElideRight
-                               text: modelData.line.substring(parent.count.length + 1); color: "#37c4f0"; font: Theme.uiLabel }
+                        Text { objectName: "railLine" + modelData.key; anchors.baseline: countText.baseline; width: parent.width - countText.width - parent.spacing; elide: Text.ElideRight
+                               text: parent.count === "" ? modelData.line : modelData.line.substring(parent.count.length + 1); color: "#37c4f0"; font: Theme.uiLabel }
                     }
-                    Text { visible: rail.showNote; width: parent.width; elide: Text.ElideRight; text: modelData.note; color: Theme.textLabel
-                           font: Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
+                    Text { objectName: "railNote" + modelData.key; visible: rail.showNote; width: parent.width; elide: Text.ElideRight; color: Theme.textLabel
+                           text: modelData.shortNote && noteMetrics.advanceWidth > width ? modelData.shortNote : modelData.note
+                           font: Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: 18
+                           TextMetrics { id: noteMetrics; text: modelData.note; font: Theme.metadata } }
                 }
                 Shape {
-                    visible: !card.active
+                    visible: !card.active && card.navigable
                     x: parent.width - (rail.tight ? 14 : 19); y: labels.y + (rail.showNote ? 4 : 2)
                     width: 7; height: 12; scale: rail.tight ? 1 : 1.15
                     preferredRendererType: Shape.CurveRenderer
@@ -239,8 +262,26 @@ Item {
                     id: hit
                     anchors.fill: parent
                     hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: rail.picked(modelData.key, card.y, card.height)
+                    cursorShape: card.navigable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
+                }
+
+                // Edit Mode: a restrained blue outline and the card's layout menu.
+                Rectangle {
+                    anchors.fill: parent; radius: parent.radius
+                    color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.55)
+                    opacity: card.editing ? 1 : 0; visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+                }
+                IconButton {
+                    id: menuButton
+                    objectName: "railMenu" + modelData.key
+                    visible: card.editing
+                    // Narrow rails keep the title clear with a slimmer target.
+                    anchors { right: parent.right; top: parent.top; rightMargin: rail.width < 180 ? 2 : 4; topMargin: rail.showNote ? 4 : Math.max(0, (parent.height - height) / 2) }
+                    width: rail.width < 180 ? 26 : 36; height: rail.showNote ? 32 : 36
+                    glyph: "•••"; tip: modelData.key + " layout options"
+                    onClicked: rail.menuRequested(modelData.id, menuButton, index > 0, index < rail.shownModules.length - 1)
                 }
             }
         }
