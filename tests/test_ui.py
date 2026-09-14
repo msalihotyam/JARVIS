@@ -2120,5 +2120,324 @@ class LayoutEditorTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class SafetyUxTests(UiTestCase):
+    """Safety state is Core's: approvals, outcomes and execution authority
+    are projected, never invented, and each keeps its own meaning."""
+    item = PresentationTests.item
+    click = PresentationTests.click
+    window = PresentationTests.window
+    pending = AuthorityTests.pending
+
+    def raising_connector(self) -> None:
+        class Raising(StubConnector):
+            def execute(self, task, session):
+                self.execute_calls += 1
+                raise RuntimeError("socket died")
+        self.claude = Raising("claude-code-plan", ("code_analysis", "code_planning"),
+                              side_effect=SideEffect.EXTERNAL_EGRESS, always_requires_approval=True)
+
+    def keys(self, bridge) -> list[str]:
+        return [item["key"] for item in bridge.safety["attention"]]
+
+    def test_approval_needs_its_authoritative_details(self) -> None:
+        from jarvis.ui.present import approval_card
+        bridge = self.pending()
+        approval = bridge.safety["approval"]
+        self.assertTrue(approval["complete"] and approval["actionable"])
+        self.assertEqual(("claude-code-plan", "code_analysis"), (approval["connector"], approval["capability"]))
+        self.assertEqual("", approval["hold"])
+        # A request missing its connector and binding reads as unavailable and cannot be approved.
+        envelope = {"command": "run", "session": {"id": bridge.sessionId}, "task": {"id": bridge.task["task_id"]},
+                    "run_status": "awaiting_approval", "approval": {"scope": {"action": "analyse"}, "reason": "r"}}
+        self.assertFalse(approval_card(envelope)["complete"])
+        bridge._apply_run(envelope)
+        self.assertFalse(bridge.approvalPending)
+        self.assertEqual("Approval details unavailable", bridge.safety["approval"]["hold"])
+        self.assertFalse(bridge.safety["approval"]["actionable"])
+        bridge.approve()
+        self.assertEqual(0, self.execute_calls())
+        self.assertIn("approval", self.keys(bridge))
+
+    def test_decision_binds_to_the_displayed_request_and_submits_once(self) -> None:
+        bridge = self.pending()
+        shown = bridge.approval
+        self.assertFalse(bridge.approveRequest("another-request", shown["fingerprint"]))   # a newer / other revision
+        self.assertFalse(bridge.approveRequest(shown["request_id"], "0" * 64))
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual(0, self.execute_calls())
+        seen = {}
+        real_approve = self.backend.approve
+
+        def approve(ticket):
+            seen["state"] = bridge.safety["decision"]["state"]
+            seen["again"] = bridge.approveRequest(shown["request_id"], shown["fingerprint"])   # a double click
+            return real_approve(ticket)
+
+        self.backend.approve = approve
+        self.assertTrue(bridge.approveRequest(shown["request_id"], shown["fingerprint"]))
+        self.assertEqual(("submitting", False), (seen["state"], seen["again"]))
+        self.assertEqual("recorded", bridge.safety["decision"]["state"])
+        self.assertEqual(1, self.execute_calls())
+        self.assertFalse(bridge.approveRequest(shown["request_id"], shown["fingerprint"]))
+        self.assertEqual(1, self.execute_calls())
+
+    def test_approve_is_not_success_and_unknown_is_not_failed_or_retried(self) -> None:
+        from jarvis.ui.present import task_outcome
+        self.raising_connector()
+        bridge = self.pending()
+        shown = bridge.approval
+        bridge.approveRequest(shown["request_id"], shown["fingerprint"])
+        self.assertEqual("recorded", bridge.safety["decision"]["state"])      # the approval was recorded ...
+        outcome = bridge.safety["outcome"]
+        self.assertEqual("unknown", outcome["kind"])                          # ... and the outcome is unknown, not success
+        self.assertNotEqual("completed", bridge.coreState)
+        self.assertEqual(["outcome"], self.keys(bridge))
+        self.assertEqual("Outcome unknown", bridge.safety["attention"][0]["label"])
+        # Nothing repeats it: an explicit resume re-reports the doubt, the connector runs once.
+        bridge.resumeTask(bridge.sessionId, outcome["task_id"])
+        self.assertEqual(1, self.claude.execute_calls)
+        self.assertEqual("unknown", bridge.safety["outcome"]["kind"])
+        # The kinds stay distinct.
+        base = {"task_id": "t", "run_status": "failed"}
+        self.assertEqual("unknown", task_outcome({**base, "error_code": "execution_unknown_outcome"})["kind"])
+        self.assertEqual("failed", task_outcome({**base, "error_code": "connector_failed"})["kind"])
+        self.assertEqual("blocked", task_outcome({**base, "error_code": "execution_disabled"})["kind"])
+        self.assertEqual("in_progress", task_outcome({**base, "error_code": "execution_in_progress"})["kind"])
+        self.assertEqual("completed", task_outcome({"task_id": "t", "run_status": "completed"})["kind"])
+        self.assertEqual({}, task_outcome({"task_id": "t", "run_status": "rejected", "error_code": "approval_rejected"}))
+
+    def test_reject_and_cancel_never_touch_the_freeze_gate(self) -> None:
+        bridge = self.pending()
+        shown = bridge.approval
+        bridge.rejectRequest(shown["request_id"], shown["fingerprint"])
+        self.assertEqual("rejected", bridge.safety["decision"]["state"])
+        self.assertEqual(0, self.execute_calls())
+        self.assertEqual("running", bridge.executionState)
+        self.assertTrue(self.store.load().settings.execution_enabled)
+        bridge.submitText("Bu projeyi incele.")                              # a new request clears the receipt
+        self.assertEqual({}, bridge.safety["decision"])
+        bridge.cancelTask()
+        self.assertEqual("running", bridge.executionState)
+        self.assertTrue(self.store.load().settings.execution_enabled)
+        self.assertNotIn("execution", self.keys(bridge))
+
+    def test_history_never_drives_current_safety_state(self) -> None:
+        bridge = self.bridge()
+        bridge._note("JARVIS frozen", "system")
+        bridge._note("OUTCOME UNKNOWN for task old", "unknown")
+        bridge._say("error", "FAILED [connector_failed]: an old failure")
+        self.assertEqual([], bridge.safety["attention"])
+        self.assertEqual(("running", "idle"), (bridge.executionState, bridge.coreState))
+        self.assertFalse(bridge.safety["cards"])
+
+    def test_freeze_is_immediate_and_reject_still_works_while_frozen(self) -> None:
+        bridge = self.pending()
+        task_before = bridge.task
+        seen = {}
+        real_set = self.backend.set_config
+
+        def set_config(key, raw):
+            seen[raw] = (bridge.executionState, bridge.coreState)
+            return real_set(key, raw)
+
+        self.backend.set_config = set_config
+        bridge.freezeJarvis()
+        # Requested is not frozen: nothing is dormant before the store confirms.
+        self.assertEqual(("freeze_requested", "awaiting_approval"), seen["false"])
+        self.assertEqual(("frozen", "disabled"), (bridge.executionState, bridge.coreState))
+        self.assertFalse(self.store.load().settings.execution_enabled)
+        self.assertEqual(["execution", "approval"], self.keys(bridge))
+        self.assertEqual("JARVIS frozen", bridge.safety["attention"][0]["label"])
+        self.assertEqual(task_before, bridge.task)                          # Freeze never rewrites the task
+        approval = bridge.safety["approval"]
+        self.assertEqual((False, True), (approval["actionable"], approval["rejectable"]))
+        # Approve cannot start work while frozen - in the UI, and in Core when a decision gets there anyway.
+        ticket = bridge._ticket
+        self.assertFalse(bridge.approveRequest(ticket.request_id, ticket.fingerprint))
+        bridge.approve()
+        self.assertEqual("not_recorded", bridge.safety["decision"]["state"])
+        self.assertEqual(0, self.execute_calls())
+        self.assertTrue(bridge.approvalPending)                             # the request still stands
+        self.assertIsNotNone(SQLiteMemoryStore(self.database).load_pending_approval(ticket.task_id, ticket.session_id))
+        # A stale / mismatched rejection is still refused while frozen.
+        bridge._ticket = replace(ticket, fingerprint="0" * 64)
+        bridge.deny()
+        self.assertEqual("invalidated", bridge.safety["decision"]["state"])
+        self.assertIsNotNone(SQLiteMemoryStore(self.database).load_pending_approval(ticket.task_id, ticket.session_id))
+        # The exact rejection works while frozen: nothing executes, JARVIS stays frozen.
+        bridge._ticket, bridge._approval = ticket, dict(approval)
+        self.assertTrue(bridge.rejectRequest(ticket.request_id, ticket.fingerprint))
+        self.assertEqual("rejected", bridge.safety["decision"]["state"])
+        self.assertEqual("rejected", SQLiteMemoryStore(self.database).load_task(ticket.task_id).status.value)
+        self.assertEqual(0, self.execute_calls())
+        self.assertEqual(("frozen", "disabled"), (bridge.executionState, bridge.coreState))
+        self.assertFalse(self.store.load().settings.execution_enabled)
+        # A freeze the store does not confirm: unconfirmed, never quietly running, never dormant.
+        bridge.resumeJarvis()
+        self.assertEqual("running", bridge.executionState)
+        self.backend.set_config = lambda key, raw: {"command": "config-set", "error": {"code": "config_io_failed", "message": "store is busy"}}
+        bridge.freezeJarvis()
+        self.assertEqual("unconfirmed", bridge.executionState)
+        self.assertNotEqual("disabled", bridge.coreState)
+        self.assertTrue(self.store.load().settings.execution_enabled)
+        self.assertEqual("JARVIS state unconfirmed", bridge.safety["attention"][0]["label"])
+
+    def test_freeze_pauses_running_work_at_a_safe_point_and_resume_continues_it(self) -> None:
+        test = self
+        states = {}
+
+        class FreezesMidRun(StubConnector):
+            def execute(self, task, session):
+                # Freeze arrives while the atomic step is under way: it is not interrupted.
+                test.current.freezeJarvis()
+                states["during"] = (test.current.executionState, test.current.coreState)
+                return super().execute(task, session)
+
+        self.claude = FreezesMidRun("claude-code-plan", ("code_analysis", "code_planning"),
+                                    side_effect=SideEffect.EXTERNAL_EGRESS, always_requires_approval=True)
+        bridge = self.current = self.pending()
+        task_id = bridge._ticket.task_id
+        bridge.approve()
+        self.assertEqual(("freeze_requested", "running"), states["during"])   # FREEZE_REQUESTED != FROZEN
+        self.assertEqual(1, self.claude.execute_calls)
+        # The loop stopped at the next stage boundary: frozen, the task paused - not failed, not cancelled.
+        self.assertEqual(("frozen", "disabled"), (bridge.executionState, bridge.coreState))
+        self.assertEqual("paused", bridge.safety["outcome"]["kind"])
+        stored = SQLiteMemoryStore(self.database).load_task(task_id)
+        self.assertNotIn(stored.status.value, ("failed", "cancelled", "completed"))
+        self.assertIn("JARVIS frozen", self.feed_text(bridge))
+        # Resume continues the paused task from its stage; the executed step is never run again.
+        bridge.resumeJarvis()
+        self.assertEqual("running", bridge.executionState)
+        self.assertEqual("completed", SQLiteMemoryStore(self.database).load_task(task_id).status.value)
+        self.assertEqual(1, self.claude.execute_calls)
+        self.assertEqual("completed", bridge.safety["outcome"]["kind"])
+
+    def test_resume_never_replays_unknown_outcomes_and_scheduler_claims_nothing_while_frozen(self) -> None:
+        self.raising_connector()
+        bridge = self.pending()
+        bridge.approve()
+        self.assertEqual("unknown", bridge.safety["outcome"]["kind"])
+        bridge.freezeJarvis()
+        self.assertEqual("frozen", bridge.executionState)
+        bridge.resumeJarvis()
+        self.assertEqual("running", bridge.executionState)
+        self.assertEqual("unknown", bridge.safety["outcome"]["kind"])
+        self.assertEqual(1, self.claude.execute_calls)
+        # The live gate reaches an application built while JARVIS was running.
+        app = self.backend._app(self.store.load().settings)
+        self.assertTrue(app.settings.execution_enabled)
+        bridge.freezeJarvis()
+        report = app.run_scheduler(once=True).payload
+        self.assertTrue(report["claims_suspended"])
+        self.assertFalse(app.core.execution_allowed())
+
+    def test_freeze_control_is_immediate_and_resume_is_confirmed_in_the_window(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        prefs_before = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
+        lamp, label, control = self.item(root, "statusOrb"), self.item(root, "killSwitchLabel"), self.item(root, "killSwitchControl")
+        self.assertEqual(("FREEZE", False), (label.property("text"), control.property("engaged")))
+        self.click(root, "killSwitchControl")                                  # no confirmation before Freeze
+        self.assertEqual("frozen", bridge.executionState)
+        self.assertFalse(self.store.load().settings.execution_enabled)
+        self.assertEqual("FROZEN", label.property("text"))
+        self.assertFalse(lamp.property("lit"))
+        self.assertTrue(self.item(root, "safetyCard_execution").isVisible())
+        confirm = self.item(root, "resumeConfirm")
+        self.click(root, "killSwitchControl")
+        self.assertTrue(confirm.property("open"))
+        self.assertEqual("frozen", bridge.executionState)                     # the question resumes nothing
+        self.click(root, "keepFrozen")
+        self.assertFalse(confirm.property("open"))
+        self.assertFalse(self.store.load().settings.execution_enabled)
+        self.click(root, "killSwitchControl")
+        self.click(root, "resumeJarvis")
+        self.assertEqual("running", bridge.executionState)
+        self.assertTrue(self.store.load().settings.execution_enabled)
+        self.assertTrue(lamp.property("lit"))
+        self.assertEqual("FREEZE", label.property("text"))
+        self.assertEqual(prefs_before, self.prefs_path.read_bytes() if self.prefs_path.exists() else None)
+
+    def test_window_x_hides_to_tray_and_tray_uses_the_same_paths(self) -> None:
+        from jarvis.ui.tray import TrayController
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.setTrayAvailable(True)
+        quits = []
+        bridge.quitRequested.connect(lambda: quits.append(True))
+        tray = TrayController(bridge, root)
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        feed_before = list(bridge.feed)
+        # X hides: the window goes, the application, session and pending approval stay.
+        self.click(root, "windowCloseControl")
+        self.assertFalse(root.isVisible())
+        self.assertEqual((False, []), (bridge.quitting, quits))
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual("JARVIS — Attention required", tray.status_text())
+        tray.open(); pump(300)
+        self.assertTrue(root.isVisible())
+        self.assertEqual(feed_before, bridge.feed)
+        self.assertTrue(self.item(root, "attentionStrip").isVisible())
+        # Freeze / Resume from the tray: the same bridge path; Resume is confirmed in the window.
+        self.assertEqual(("Freeze JARVIS", True), tray.lifecycle_action())
+        tray.toggle_lifecycle(); pump(100)
+        self.assertEqual("frozen", bridge.executionState)
+        self.assertEqual(("Resume JARVIS", True), tray.lifecycle_action())
+        self.assertTrue(tray.status_text().startswith("JARVIS — Frozen"))
+        tray.toggle_lifecycle(); pump(100)
+        self.assertTrue(self.item(root, "resumeConfirm").property("open"))
+        self.assertEqual("frozen", bridge.executionState)
+        self.click(root, "resumeJarvis")
+        self.assertEqual("running", bridge.executionState)
+        # Quit with active work asks first; its warning promises no cancellation.
+        bridge._busy = True
+        tray.quit(); pump(200)
+        self.assertEqual([], quits)
+        self.assertIn("not stopped or undone", bridge.quitWarning)
+        self.assertNotIn("cancels", bridge.quitWarning)
+        self.click(root, "confirmCancel")
+        self.assertEqual([], quits)
+        tray.quit(); pump(200)
+        self.click(root, "confirmAccept")
+        self.assertEqual([True], quits)
+        self.assertTrue(bridge.quitting)
+        bridge._busy = False
+        # Idle quit goes straight through the orderly path.
+        idle = self.bridge()
+        idle_quits = []
+        idle.quitRequested.connect(lambda: idle_quits.append(True))
+        TrayController(idle, root).quit()
+        self.assertEqual(([True], True), (idle_quits, idle.quitting))
+
+    def test_strip_survives_hidden_workflow_and_keyboard_never_decides(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.setCardVisible("stack", "workflow", False)
+        bridge.submitText("Bu projeyi incele."); pump(400)
+        self.assertTrue(bridge.approvalPending)
+        strip = self.item(root, "attentionStrip")
+        self.assertTrue(strip.isVisible())
+        self.assertEqual("Your approval is required", self.item(root, "attentionLabel").property("text"))
+        # Enter in the composer and Escape never approve or reject.
+        composer = self.item(root, "composerInput")
+        composer.forceActiveFocus(); pump(50)
+        composer.setProperty("text", "yes"); pump(50)
+        QTest.keyClick(root, Qt.Key_Return); pump(100)
+        QTest.keyClick(root, Qt.Key_Escape); pump(100)
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual(0, self.execute_calls())
+        # Review focuses the card heading, not the Approve button.
+        self.click(root, "attentionReview")
+        self.assertTrue(self.item(root, "safetyHeading_approval").hasActiveFocus())
+        self.assertFalse(self.item(root, "approvalApprove").hasActiveFocus())
+        self.assertTrue(bridge.approvalPending)
+        # Resolution returns to calm; the receipt stays in the conversation.
+        self.click(root, "approvalApprove")
+        self.assertEqual("recorded", bridge.safety["decision"]["state"])
+        self.assertFalse(strip.isVisible())
+        self.assertEqual(1, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

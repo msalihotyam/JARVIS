@@ -138,13 +138,13 @@ Item {
                 shadow: column.commandMode      // no black plates under secondary glass
                 padding: column.width < 400 ? 12 : column.commandMode ? 16 : 20
                 title: (column.commandMode ? {system:"Model & execution",workflow:"Active task",activity:"Recent actions",automations:"Memory context"} : { system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
-                badge: modelData.id === "system" ? (bridge.configRefused ? "config refused" : (bridge.executionEnabled ? "enabled" : "disabled"))
+                badge: modelData.id === "system" ? (bridge.executionState === "unconfirmed" ? "unconfirmed" : bridge.configRefused ? "config refused" : bridge.executionState === "freeze_requested" ? "freezing" : (bridge.executionEnabled ? "running" : "frozen"))
                      : modelData.id === "activity" ? "live"
                      : modelData.id === "automations" ? (column.commandMode ? bridge.projects.length + " projects" : bridge.jobs.length + " job" + (bridge.jobs.length === 1 ? "" : "s"))
                      : ""
                 badgeRight: !column.commandMode || modelData.id !== "system"
                 titleWrap: !column.commandMode
-                badgeColor: modelData.id === "system" ? (bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success)
+                badgeColor: modelData.id === "system" ? (bridge.executionState === "unconfirmed" || bridge.executionState === "freeze_requested" ? Theme.warning : bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success)
                           : modelData.id === "activity" ? Theme.success : Theme.accent
                 color: column.commandMode ? Theme.surface : column.surface
                 accentColor: column.commandMode ? Theme.accent : column.highlight
@@ -308,8 +308,8 @@ Item {
             readonly property real cy: side ? (caption ? (bh - 16) / 2 : bh / 2) : d / 2
             readonly property real listY: Math.max(3, Math.min(Math.round(cy - 1.5 * pitch), bh - 3 - 3 * pitch))
             readonly property string uptime: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m"
-            readonly property string execution: bridge.configRefused ? "Refused" : (bridge.executionEnabled ? "Enabled" : "Disabled")
-            readonly property color executionTint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
+            readonly property string execution: bridge.executionState === "unconfirmed" ? "Unconfirmed" : bridge.configRefused ? "Refused" : bridge.executionState === "freeze_requested" ? "Freezing" : (bridge.executionEnabled ? "Running" : "Frozen")
+            readonly property color executionTint: bridge.executionState === "unconfirmed" || bridge.executionState === "freeze_requested" ? Theme.warning : bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
             readonly property string model: bridge.config.claude_model || "CLI default"
             Row {
                 id: gauges
@@ -373,16 +373,26 @@ Item {
             fill: true
             readonly property bool has: !!bridge.task.task_id
             readonly property real pitch: Math.floor((height - 2) / 5)
-            WRow { height: workflowWell.pitch; glyph: "◇"; tint: Theme.stateColor(bridge.coreState); k: "Status"; empty: !workflowWell.has
-                vColor: bridge.coreState === "running" ? Theme.accent : "#cfdceb"
-                v: workflowWell.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
+            // Projections only: the task's own status and outcome as Core
+            // reported them. Global execution state never rewrites them.
+            readonly property bool approvalShown: bridge.approvalPending && workflowWell.has
+            readonly property var outcome: bridge.safety.fixture ? ({}) : (bridge.safety.outcome || ({}))
+            WRow { height: workflowWell.pitch; glyph: "◇"; k: "Status"; empty: !workflowWell.has
+                tint: workflowWell.approvalShown ? Theme.warning : Theme.stateColor(bridge.coreState)
+                vColor: workflowWell.approvalShown ? Theme.warning : bridge.coreState === "running" ? Theme.accent : "#cfdceb"
+                v: workflowWell.approvalShown ? "Approval required" : workflowWell.has ? (bridge.task.status || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : "No active task" }
             WRow { height: workflowWell.pitch; glyph: "⌘"; tint: Theme.accent; k: "Connector"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : "Waiting for your request…" }
             WRow { height: workflowWell.pitch; glyph: "✦"; tint: Theme.accent; k: "Capability"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : "Chosen by Core" }
             WRow { height: workflowWell.pitch; glyph: "➶"; tint: Theme.accent; k: "Destination"; empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : "Granted destinations only" }
             WRow { height: workflowWell.pitch; glyph: "◷"; k: "Outcome"; empty: !workflowWell.has; last: true
-                tint: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : bridge.task.error_code ? Theme.danger : bridge.coreState === "completed" ? Theme.success : Theme.accentSoft
-                vColor: bridge.task.error_code === "execution_unknown_outcome" ? Theme.unknownEdge : bridge.task.error_code ? Theme.danger : bridge.coreState === "completed" ? Theme.success : "#cfdceb"
-                v: workflowWell.has ? (bridge.task.error_code || (bridge.task.run_status || "pending")) : "None yet" }
+                readonly property string kind: workflowWell.outcome.kind || ""
+                tint: kind === "unknown" || kind === "in_progress" ? Theme.unknownEdge : kind === "failed" ? Theme.danger : kind === "blocked" ? Theme.warning
+                    : kind === "completed" ? Theme.success : Theme.accentSoft
+                vColor: kind === "unknown" || kind === "in_progress" ? Theme.unknownEdge : kind === "failed" ? Theme.danger : kind === "blocked" ? Theme.warning
+                      : kind === "completed" ? Theme.success : "#cfdceb"
+                v: !workflowWell.has ? "None yet"
+                   : ({ unknown: "Outcome unknown", in_progress: "Not established yet", failed: "Failed", blocked: "Blocked", completed: "Completed", cancelled: "Cancelled", paused: "Paused by Freeze" })[kind]
+                     || bridge.task.run_status || "pending" }
         }
     }
     Component {

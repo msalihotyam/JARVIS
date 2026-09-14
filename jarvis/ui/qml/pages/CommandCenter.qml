@@ -17,7 +17,7 @@ Item {
     property int lift: 37       // the material band: fully present at the panel line
     property int fade: 48       // where the text begins, below the band
     readonly property bool roomy: width >= 700
-    readonly property bool empty: bridge.feed.length === 0
+    readonly property bool empty: bridge.feed.length === 0 && !bridge.safety.cards
     // Primary content glass: the shell lets the space through in its unused
     // areas; every message and structured block sits on its own darker
     // reading island (FeedView, StagePipeline).
@@ -61,10 +61,12 @@ Item {
     // -- the stream, below the fade --------------------------------------------
     Item {
         id: flowArea
-        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: choices.top
+        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: attention.top
                   topMargin: page.fade; leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
         FeedView {
+            id: conversation
             objectName: "conversationFeed"
+            safetyCards: true
             anchors.fill: parent
             visible: !page.empty
             pipelineEnabled: true
@@ -87,11 +89,18 @@ Item {
                    color: Theme.text; font: Theme.greeting(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingLine(welcome.tier) }
             Text { objectName: "welcomeSupport"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
-                   text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "Execution is disabled. Re-enable it explicitly when ready." : "What would you like to work on?"
+                   text: bridge.configRefused ? "Configuration refused — execution is off." : !bridge.executionEnabled ? "JARVIS is frozen. Resume it from the red control or the tray when ready." : "What would you like to work on?"
                    color: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.textLabel
                    font: Theme.greetingSupport(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingSupportLine(welcome.tier) }
         }
+    }
+    // The one attention strip, immediately above the choices and the composer.
+    AttentionStrip {
+        id: attention
+        anchors { left: parent.left; right: parent.right; bottom: choices.top
+                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: visible ? 10 : 0 }
+        onReview: function(key) { conversation.reveal(key) }
     }
     Column {
         id: choices

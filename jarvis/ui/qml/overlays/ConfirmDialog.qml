@@ -16,8 +16,10 @@ Item {
     visible: open || dim.opacity > 0
     z: 500
 
-    function ask(title, message, confirmLabel, danger, fn) {
-        dialog.title = title; dialog.message = message; dialog.confirmLabel = confirmLabel; dialog.danger = danger; dialog.onConfirm = fn; dialog.open = true
+    property string cancelLabel: "Back"
+    function ask(title, message, confirmLabel, danger, fn, cancelLabel) {
+        dialog.title = title; dialog.message = message; dialog.confirmLabel = confirmLabel; dialog.danger = danger; dialog.onConfirm = fn
+        dialog.cancelLabel = cancelLabel || "Back"; dialog.open = true
     }
 
     Rectangle { id: dim; anchors.fill: parent; color: "#000000"; opacity: dialog.open ? 0.5 : 0
@@ -42,8 +44,8 @@ Item {
             }
             Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font { family: Theme.font; pixelSize: 14 } }
             Row { spacing: 10; anchors.right: parent.right
-                ActionButton { label: "Back"; onClicked: dialog.open = false }
-                ActionButton { label: dialog.confirmLabel; primary: true; danger: dialog.danger; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }
+                ActionButton { objectName: "confirmCancel"; label: dialog.cancelLabel; onClicked: dialog.open = false }
+                ActionButton { objectName: "confirmAccept"; label: dialog.confirmLabel; primary: true; danger: dialog.danger; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }
             }
         }
     }

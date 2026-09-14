@@ -24,6 +24,8 @@ Item {
     id: feed
     property bool pipelineEnabled: false
     property bool referenceLayout: false
+    // The conversation-integrated safety cards, after the last entry (MAIN / DARK).
+    property bool safetyCards: false
     // The avatar column scales with the surface (1.0 at the 1920x1080 grid).
     property real layoutScale: 1
     readonly property int avatarSize: referenceLayout ? 36 : 50
@@ -40,6 +42,20 @@ Item {
     property alias followEnd: flick.followEnd
     readonly property bool overflow: flick.contentHeight > flick.height + 1
     function scrollTo(y) { flick.contentY = Math.max(0, Math.min(flick.endY, y)) }
+    // Review: bring the card for an attention key into view and move focus to
+    // its heading (never to a decision button). "decision" answers happen in
+    // the choices / composer below the stream, so the end is shown.
+    function reveal(key) {
+        var heading = safetyLoader.item ? safetyLoader.item.headingFor(key) : null
+        if (heading && heading.visible) {
+            var card = heading.parent.parent
+            scrollTo(safetyLoader.y + card.y - 12)
+            flick.followEnd = flick.contentY >= flick.endY - 6
+            heading.forceActiveFocus()
+        } else {
+            scrollTo(flick.endY); flick.followEnd = true
+        }
+    }
 
     function railColor(kind) {
         switch (kind) {
@@ -260,6 +276,15 @@ Item {
                         lineHeightMode: Text.FixedHeight; lineHeight: 16
                     }
                 }
+            }
+            Loader {
+                id: safetyLoader
+                width: stack.width
+                active: feed.safetyCards
+                // No visible binding on its own height: an invisible parent would
+                // hide the cards and so collapse that height. Empty is zero-sized,
+                // which the stack skips.
+                sourceComponent: Component { SafetyCards { width: stack.width; inset: feed.messageX } }
             }
         }
     }

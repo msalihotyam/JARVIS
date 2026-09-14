@@ -3082,7 +3082,7 @@ class JarvisApp:
             reason = intent_text_refusal(previous_text)
         if reason is not None:
             return refused(IntentStatus.INVALID_INPUT, f"The request was refused: {reason}.")
-        if not self.settings.execution_enabled:
+        if not self.core.execution_allowed():
             # THE barrier, ahead of the model: understanding is the first
             # step of starting work, and nothing may start work.
             return refused(IntentStatus.EXECUTION_DISABLED, _EXECUTION_DISABLED_MESSAGE)
@@ -3336,7 +3336,7 @@ class JarvisApp:
                     # Stated rather than implied: a sweep that did nothing
                     # because execution is off must not read as "nothing due".
                     "claims_suspended": (
-                        not self.settings.execution_enabled
+                        not self.core.execution_allowed()
                         if last is None
                         else last.claims_suspended
                     ),

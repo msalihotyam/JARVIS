@@ -34,6 +34,20 @@ Window {
     readonly property string presentation: bridge.theme
     readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
     property bool devApprovalVisible: false
+    // How the window was shown when it went to the tray; Open JARVIS restores it.
+    property int restoreVisibility: Window.FullScreen
+
+    // Window X hides JARVIS to the system tray: the process, the session and
+    // any work keep running (unless JARVIS is frozen separately). Only Quit
+    // JARVIS in the tray ends the application; without a tray, closing quits.
+    onClosing: function(close) {
+        if (bridge.quitting || !bridge.trayAvailable) return
+        close.accepted = false
+        root.restoreVisibility = root.visibility === Window.Minimized || root.visibility === Window.Hidden ? Window.Windowed : root.visibility
+        root.closeContexts()
+        root.hide()
+        bridge.noteHiddenToTray()
+    }
 
     function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; peek.open = false }
     // One summary peek at a time: the same card again closes it, another
@@ -59,6 +73,11 @@ Window {
         target: bridge
         function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects; if (bridge.editMode) peek.open = false }
         function onApprovalChanged() { if (bridge.approvalPending) { root.closeContexts(); bridge.setPage("home") } }
+        // From the tray: the same confirmations the window uses.
+        function onResumeConfirmRequested() { root.closeContexts(); resumeConfirm.open = true }
+        function onQuitConfirmRequested() {
+            confirm.ask("Quit JARVIS?", bridge.quitWarning, "Quit JARVIS", false, function() { bridge.confirmQuit() }, "Cancel")
+        }
     }
 
     Timer { interval: 1000; running: true; repeat: true; onTriggered: { clock.now = new Date() } }
@@ -90,7 +109,7 @@ Window {
         settingsOpen: settings.open
         modelOpen: modelPanel.open
         onMenuRequested: root.toggleNav()
-        onKillSwitchRequested: root.askKillSwitch()
+        onLifecycleRequested: root.toggleLifecycle()
         onEditRequested: bridge.setEditMode(!bridge.editMode)
         onMinimizeRequested: root.showMinimized()
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
@@ -99,11 +118,13 @@ Window {
         onOpenModel: root.toggleModel()
     }
 
-    function askKillSwitch() {
-        if (bridge.executionEnabled)
-            confirm.ask("Kill switch", "Disable execution for this installation? No new work can start until it is re-enabled. Running work is stopped with Cancel.", "Disable execution", true, function() { bridge.setExecutionEnabled(false) })
-        else
-            confirm.ask("Re-enable execution", "Allow JARVIS to start work again? Every approval still applies.", "Re-enable", false, function() { bridge.setExecutionEnabled(true) })
+    // The red control: Freeze JARVIS is sent AT ONCE - no confirmation, no
+    // delay, whatever is open. When the gate is closed (frozen, or a freeze
+    // still waiting for its operation) it offers Resume, which asks first.
+    function toggleLifecycle() {
+        if (!bridge.executionEnabled && bridge.executionState !== "refused") { resumeConfirm.open = !resumeConfirm.open; return }
+        resumeConfirm.open = false
+        bridge.freezeJarvis()
     }
 
     // -- content: the macro regions. Canonical / Dark take the normalized
@@ -216,7 +237,9 @@ Window {
     }
 
     NavMenu { id: nav; anchorPoint: Qt.point(topBar.navAnchor.x - panelWidth, topBar.navAnchor.y) }
-    Loader { anchors.fill: parent; z: 450; active: !root.inlineApproval
+    // MAIN / DARK decide approvals in the conversation card; only the Command
+    // preset (V2) keeps its own authorization surfaces.
+    Loader { anchors.fill: parent; z: 450; active: root.presentation === "command" && !root.inlineApproval
         sourceComponent: Component { ApprovalOverlay { fixture: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false } }
     }
 
@@ -224,6 +247,41 @@ Window {
     // core and HUD stay behind floating glass, never across its text.
     Item { id: topControls; anchors.fill: parent; z: 500 }
     SettingsDrawer { id: settings; anchorPoint: topBar.settingsAnchor }
+
+    // Resume JARVIS? - compact, anchored under the red control. Running
+    // visuals follow only what the store confirms afterwards.
+    Item {
+        id: resumeConfirm
+        objectName: "resumeConfirm"
+        property bool open: false
+        anchors.fill: parent; z: 520
+        visible: open
+        Connections { target: bridge; function onStateChanged() { if (bridge.executionEnabled) resumeConfirm.open = false } }
+        MouseArea { anchors.fill: parent; onClicked: resumeConfirm.open = false }
+        Rectangle {
+            width: Math.min(330, root.width - 32); height: reBody.height + 36
+            x: Math.max(16, Math.min(topBar.killAnchor.x - width + 40, root.width - width - 16))
+            y: topBar.killAnchor.y
+            radius: 12; color: Theme.glassMenu; border.width: 1; border.color: Theme.alpha(Theme.danger, 0.55)
+            MouseArea { anchors.fill: parent }
+            Column {
+                id: reBody
+                x: 18; y: 18; width: parent.width - 36; spacing: 10
+                Text { text: "Resume JARVIS?"; color: Theme.text; font: Theme.uiValue; activeFocusOnTab: true
+                       Accessible.role: Accessible.Heading; Accessible.name: text }
+                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.metadata
+                       text: bridge.executionState === "freeze_requested"
+                             ? "An operation is still on its way to a safe point. Resuming lets it and new work continue."
+                             : "New work can start again, and a task Freeze paused continues from where it stopped. Nothing failed, cancelled or with an unknown outcome is repeated. This is not an approval." }
+                Row {
+                    width: parent.width; spacing: 8
+                    ActionButton { objectName: "keepFrozen"; label: "Keep frozen"; height: 40; width: (parent.width - 8) / 2; onClicked: resumeConfirm.open = false }
+                    ActionButton { objectName: "resumeJarvis"; label: "Resume JARVIS"; primary: true; height: 40; width: (parent.width - 8) / 2
+                        onClicked: { resumeConfirm.open = false; bridge.resumeJarvis() } }
+                }
+            }
+        }
+    }
     ModelPanel { id: modelPanel; anchorPoint: topBar.modelAnchor }
 
     // -- the left ambient rail's summary stack and its quick-look peek ------
@@ -249,7 +307,7 @@ Window {
     }
     // Edit Mode's popovers for both regions: over the rail, under approvals.
     LayoutMenus { id: layoutMenus; z: 445; railShown: summaryRail.visible; commandMode: root.presentation === "command" }
-    CommandPalette { id: palette; onKillSwitchRequested: root.askKillSwitch(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
+    CommandPalette { id: palette; onLifecycleRequested: root.toggleLifecycle(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 
     // -- DEVELOPMENT ONLY: reconstruction aids. Both exist only when the
@@ -268,7 +326,10 @@ Window {
             Text { id: devLabel; anchors.centerIn: parent; text: "DEV REFERENCE OVERLAY " + Math.round(devReference.opacity * 100) + " %"; color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
     }
     Shortcut { sequence: "Ctrl+Shift+R"; enabled: bridge.devReference !== ""; onActivated: devReference.opacity = devReference.opacity === 0 ? 0.5 : (devReference.opacity === 0.5 ? 1 : 0) }
-    Shortcut { sequence: "Ctrl+Shift+A"; enabled: bridge.devFixture && !bridge.approvalPending; onActivated: { root.closeContexts(); root.devApprovalVisible = !root.devApprovalVisible } }
+    Shortcut { sequence: "Ctrl+Shift+A"; enabled: bridge.devFixture && !bridge.approvalPending; onActivated: { root.closeContexts(); root.devApprovalVisible = !root.devApprovalVisible
+        bridge.setDevSafetyScenario(root.devApprovalVisible ? "approval" : "") } }
+    // DEV FIXTURE: cycle display-only safety scenarios (approval, missing details, unknown, failed, blocked, completed).
+    Shortcut { sequence: "Ctrl+Shift+S"; enabled: bridge.devFixture; onActivated: bridge.nextDevSafetyScenario() }
     Pill { visible: bridge.devFixture; z: 8000; text: "Dev fixture · sample text, not real activity"; tint: Theme.danger
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 26 } }
 
@@ -304,6 +365,7 @@ Window {
     Shortcut { sequence: "Escape"; onActivated: {
         if (palette.open) palette.hide()
         else if (confirm.open) confirm.open = false
+        else if (resumeConfirm.open) resumeConfirm.open = false
         else if (settings.open) settings.open = false
         else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false

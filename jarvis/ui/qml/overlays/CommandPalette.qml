@@ -9,7 +9,7 @@ Item {
     anchors.fill: parent
     property bool open: false
     property int cursor: 0
-    signal killSwitchRequested()
+    signal lifecycleRequested()
     signal settingsRequested()
     visible: open || dim.opacity > 0
     z: 400
@@ -33,7 +33,7 @@ Item {
         { label: "Theme: Dark", run: function() { bridge.setTheme("dark") } },
         { label: "Ambient effects: toggle", run: function() { bridge.setAmbientEffects(!bridge.ambientEffects) } },
         { label: "Cancel current task", run: function() { bridge.cancelTask() } },
-        { label: "Kill switch", run: function() { palette.killSwitchRequested() } },
+        { label: bridge.executionEnabled ? "Freeze JARVIS" : "Resume JARVIS", run: function() { palette.lifecycleRequested() } },
         { label: "Refresh history", run: function() { bridge.refreshHistory() } },
         { label: "Refresh automations", run: function() { bridge.refreshJobs(false) } },
     ]

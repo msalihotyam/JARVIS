@@ -72,7 +72,7 @@ ContextPanel {
             Rectangle { width: parent.width; height: 1; color: Theme.border }
             Row { spacing: 12
                 Label { text: "EXECUTION"; anchors.verticalCenter: parent.verticalCenter }
-                Pill { text: bridge.configRefused ? "config refused" : bridge.executionEnabled ? "enabled" : "disabled"; tint: bridge.executionEnabled ? Theme.success : Theme.danger }
+                Pill { text: bridge.configRefused ? "config refused" : bridge.executionEnabled ? "running" : "frozen"; tint: bridge.executionEnabled ? Theme.success : Theme.danger }
             }
             Text { width: parent.width; wrapMode: Text.Wrap; text: "Permission mode: " + (bridge.config.permission_mode || "unavailable") + ". The red power control always asks for confirmation."; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
         }

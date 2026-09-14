@@ -156,7 +156,8 @@ class SchedulerRunner:
         cannot half-observe an operator flipping it mid-pass.
         """
         now = self._clock()
-        claims_suspended = not self.core.settings.execution_enabled
+        # The live gate too, so a frozen installation materializes and claims nothing.
+        claims_suspended = not self.core.execution_allowed()
         jobs = self.core.memory.list_jobs(self.job_budget)
         actions: list[RunnerAction] = []
         for job in jobs:

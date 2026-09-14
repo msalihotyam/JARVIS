@@ -7,7 +7,7 @@ import json
 import threading
 from dataclasses import replace
 from decimal import Decimal
-from typing import AbstractSet, Any
+from typing import AbstractSet, Any, Callable
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
@@ -604,6 +604,12 @@ class AgentCore:
         self.memory = memory
         self.settings = settings or Settings()
         self.verifier = verifier
+        # FREEZE: an optional LIVE execution gate a composer may install (the
+        # desktop app reads the persisted switch through it). It is consulted
+        # together with the settings snapshot, so it can only narrow what the
+        # snapshot allows, and it is re-read at every stage boundary - which is
+        # what lets a freeze stop running work at its next safe point.
+        self.execution_gate: Callable[[], bool] = lambda: True
         # The closed (connector, capability, destination) authorization table
         # this build runs under. It is COMPOSITION state, fixed here and never
         # touched again: no connector, task, chain declaration or model answer
@@ -953,7 +959,7 @@ class AgentCore:
         # or UNKNOWN_OUTCOME keeps its own H2 in-doubt verdict. Switching
         # execution off is a statement about the future, not a way to
         # relabel work whose outcome is already recorded.
-        barrier = self._execution_barrier(session, task)
+        barrier = self._execution_barrier(session, task, grant)
         if barrier is not None:
             return barrier
         # P1-2: bind a filesystem target to its canonical identity ONCE, at
@@ -994,6 +1000,18 @@ class AgentCore:
                 clear_issues(task, *NON_FAILURE_ISSUE_KINDS)
                 self._checkpoint(session, task, "task_cancelled")
                 return AgentRun(RunStatus.CANCELLED, session, task)
+
+            # FREEZE SAFE POINT. The barrier is asked again at every stage
+            # boundary, after the last checkpoint and before the next stage
+            # does anything: a freeze that arrived while this loop was running
+            # stops it HERE, with the task persisted exactly at its stage and
+            # status, resumable later through ``resume``. Nothing is failed,
+            # cancelled or rewritten. An atomic stage already under way (a
+            # connector call inside EXECUTE) is never interrupted; the loop
+            # stops at the boundary after it.
+            barrier = self._execution_barrier(session, task, active_grant)
+            if barrier is not None:
+                return barrier
 
             if task.stage is LoopStage.UNDERSTAND:
                 if not task.objective.strip() or not task.capability.strip() or not task.scope.action.strip():
@@ -3040,8 +3058,30 @@ class AgentCore:
             None,
         )
 
+    def execution_allowed(self) -> bool:
+        """The settings snapshot AND the live gate: both must allow execution."""
+        return bool(self.settings.execution_enabled) and bool(self.execution_gate())
+
+    @staticmethod
+    def _pure_rejection(task: Task, grant: PermissionGrant | None) -> bool:
+        """A REJECTING grant for a task waiting at its own decision stage.
+
+        The only thing such a pass can do is resolve that request: at
+        RISK_PERMISSION / COST_PREFLIGHT the waiting task's handler either
+        rejects it (terminally, in one transaction) or refuses the grant. It
+        reaches no connector execution - if the stage needs no decision the
+        loop continues, and the barrier stops it at the very next boundary."""
+        return (
+            grant is not None
+            and not grant.approved
+            and (
+                (task.stage is LoopStage.RISK_PERMISSION and task.status is TaskStatus.AWAITING_APPROVAL)
+                or (task.stage is LoopStage.COST_PREFLIGHT and task.status is TaskStatus.AWAITING_COST_OVERRIDE)
+            )
+        )
+
     def _execution_barrier(
-        self, session: SessionState, task: Task
+        self, session: SessionState, task: Task, grant: PermissionGrant | None = None
     ) -> AgentRun | None:
         """Refuse everything that could start work while execution is off.
 
@@ -3056,8 +3096,13 @@ class AgentCore:
         ordinary H2 path - so the switch never rewrites a task, a checkpoint or
         an attempt, and never replays anything. Turning execution back on
         starts nothing either; only a later explicit run or resume can.
+
+        One narrow exception, for a frozen installation: rejecting a pending
+        request (``_pure_rejection``) passes, because a rejection executes
+        nothing and a person must be able to say no while JARVIS is frozen.
+        Approving never passes.
         """
-        if self.settings.execution_enabled:
+        if self.execution_allowed() or self._pure_rejection(task, grant):
             return None
         terminal = self._terminal_run(session, task)
         if terminal is not None:
@@ -4912,7 +4957,7 @@ class AgentCore:
         # verdict - terminal reported, in-doubt reported as in doubt, and an
         # ordinary bound task refused as disabled. Nothing here inspects the
         # registry or a connector on the way.
-        if not self.settings.execution_enabled:
+        if not self.execution_allowed():
             bound = chain.step_task_ids[index] if index < len(chain.step_task_ids) else ""
             if bound:
                 return self.resume(session.id, bound), "blocked"

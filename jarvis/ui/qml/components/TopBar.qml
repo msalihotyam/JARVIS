@@ -7,7 +7,7 @@ import "../theme"
 // context) whose geometry comes from the Phase 1 macro map. Centre: the
 // JARVIS core, the dominant element, with its lateral connector lines and
 // the core-side status group. Right: the Option 5 command strip -
-// selector, status instrument, kill switch, navigation grid, window
+// selector, status instrument, Freeze control, navigation grid, window
 // controls - anchored to the right edge and bound to real state only.
 Item {
     id: bar
@@ -18,7 +18,7 @@ Item {
     // The rail's own left inset, proportional like the rail itself.
     readonly property real railInset: Theme.px(bar.width * 0.0163, 20, 34)
     signal menuRequested()
-    signal killSwitchRequested()
+    signal lifecycleRequested()      // the red control: Freeze / Resume JARVIS
     signal editRequested()
     signal minimizeRequested()
     signal restoreRequested()
@@ -32,7 +32,8 @@ Item {
     property Item controlLayer: null
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
     readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
-    readonly property point navAnchor: Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
+    readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
+    readonly property point navAnchor:Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
     // Degradation, in the required order: decorative linework goes first,
     // then secondary metadata, then micro spacing - never hit targets and
     // never the authoritative controls.
@@ -354,17 +355,18 @@ Item {
                 objectName: "statusOrb"
                 anchors.centerIn: parent
                 diameter: Theme.stripStatus
-                lit: bridge.executionEnabled && !bridge.configRefused
+                // An unconfirmed change never shows the reassuring enabled glow.
+                lit: bridge.executionState === "running"
                 skin: bridge.statusIndicator
                 Accessible.role: Accessible.Indicator
-                Accessible.name: bridge.configRefused ? "Execution status: configuration refused" : (bridge.executionEnabled ? (bridge.busy ? "Execution status: running" : "Execution status: ready") : "Execution status: disabled")
+                Accessible.name: bridge.executionState === "unconfirmed" ? "JARVIS status: unconfirmed" : bridge.configRefused ? "JARVIS status: configuration refused" : bridge.executionState === "frozen" ? "JARVIS status: frozen" : bridge.executionState === "freeze_requested" ? "JARVIS status: freeze requested" : (bridge.busy ? "JARVIS status: running an operation" : "JARVIS status: ready")
                 MouseArea { id: orbHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
                 Rectangle {
                     visible: orbHover.containsMouse
                     anchors.top: parent.bottom; anchors.topMargin: 2; anchors.horizontalCenter: parent.horizontalCenter
                     width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
                     Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font { family: Theme.font; pixelSize: 11 }
-                        text: bridge.configRefused ? "Configuration refused" : (bridge.executionEnabled ? (bridge.busy ? "Execution ready · running" : "Execution ready") : "Execution disabled") }
+                        text: bridge.executionState === "unconfirmed" ? "JARVIS state unconfirmed" : bridge.configRefused ? "Configuration refused" : bridge.executionState === "frozen" ? "JARVIS frozen" : bridge.executionState === "freeze_requested" ? "Freeze requested" : (bridge.busy ? "Running · operation in progress" : "Running") }
                 }
             }
         }
@@ -373,15 +375,29 @@ Item {
         // deliberately smaller than the status instrument and unmistakably
         // an action rather than a state.
         Item {
+            id: killSlot
             width: Theme.stripKill; height: Theme.stripHeight
             y: controls.mid - height / 2
             PowerControl {
+                id: killControl
                 objectName: "killSwitchControl"
                 anchors.centerIn: parent
                 diameter: Theme.stripKill
                 enabled: !bridge.configRefused
-                engaged: !bridge.executionEnabled
-                onClicked: bar.killSwitchRequested()
+                // Latched only when the store confirmed execution is off.
+                engaged: bridge.executionState === "frozen"
+                onClicked: bar.lifecycleRequested()
+            }
+            // Its meaning, in words: Freeze / Resume JARVIS - not close, not quit, not cancel.
+            // A micro-label under the control; it does not move the strip.
+            Text {
+                objectName: "killSwitchLabel"
+                anchors { horizontalCenter: killControl.horizontalCenter; top: killControl.bottom; topMargin: 5 }
+                horizontalAlignment: Text.AlignHCenter
+                text: ({ frozen: "FROZEN", freeze_requested: "FREEZING", resuming: "RESUMING", unconfirmed: "STATE\nUNCONFIRMED", refused: "FROZEN" })[bridge.executionState] || "FREEZE"
+                color: bridge.executionState === "running" || bridge.executionState === "unknown" ? Theme.textLabel : Theme.danger
+                font { family: Theme.font; pixelSize: 8; letterSpacing: 1.1; weight: Font.DemiBold }
+                lineHeight: 0.95
             }
         }
 
@@ -406,7 +422,7 @@ Item {
             spacing: 2
             IconButton { glyph: "–"; tip: "Minimize"; width: 34; height: 34; onClicked: bar.minimizeRequested() }
             IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? "Windowed" : "Full screen"; width: 34; height: 34; onClicked: bar.restoreRequested() }
-            IconButton { glyph: "✕"; tip: "Close"; width: 34; height: 34; onClicked: bar.closeRequested() }
+            IconButton { objectName: "windowCloseControl"; glyph: "✕"; tip: bridge.trayAvailable ? "Hide to tray - JARVIS keeps running" : "Close"; width: 34; height: 34; onClicked: bar.closeRequested() }
         }
     }
 

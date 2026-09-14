@@ -232,7 +232,9 @@ QtObject {
     readonly property color warning: "#ffb347"
     readonly property color danger: "#ff5c6c"
     readonly property color unknown: "#ffd166"
-    readonly property color unknownEdge: "#ff8a3d"
+    // Outcome unknown: a pale ice-blue structure - never amber (blocked /
+    // approval), red (failed) or green (completed).
+    readonly property color unknownEdge: "#a8dcff"
     readonly property color info: "#4fd8ff"
     readonly property color violet: "#9b7bff"
     readonly property color teal: "#35d0b0"
@@ -261,7 +263,7 @@ QtObject {
         case "completed": return "COMPLETED"
         case "error": return "ERROR"
         case "unknown": return "OUTCOME UNKNOWN"
-        case "disabled": return "EXECUTION DISABLED"
+        case "disabled": return "JARVIS FROZEN"
         default: return "IDLE"
         }
     }

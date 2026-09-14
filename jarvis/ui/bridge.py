@@ -33,6 +33,7 @@ from jarvis.ui.preferences import (
     STATUS_INDICATORS,
 )
 from jarvis.ui.present import (
+    REFUSED_CODES,
     TERMINAL_STATUSES,
     approval_card,
     error_entries,
@@ -40,6 +41,7 @@ from jarvis.ui.present import (
     rows,
     run_entries,
     show_entries,
+    task_outcome,
     task_status,
     text_entries,
 )
@@ -49,6 +51,9 @@ FEED_LIMIT = 200
 ACTIVITY_LIMIT = 50
 CORE_STATES = ("idle", "running", "awaiting_approval", "awaiting_input", "completed",
                "error", "unknown", "disabled")
+#: DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for
+#: visual review. They never create a ticket, a task or a decision.
+DEV_SAFETY_SCENARIOS = ("", "approval", "approval_incomplete", "unknown", "failed", "blocked", "completed")
 
 
 class _Emitter(QObject):
@@ -80,6 +85,7 @@ class Bridge(QObject):
     inputAccepted = Signal()      # a message or choice was accepted and sent on
     modelApplied = Signal()       # the configured model / effort really changed
     composingChanged = Signal()
+    attentionChanged = Signal()   # the safety projection may have changed
 
     def __init__(
         self, backend: Backend, preferences: UiPreferences, *, sync: bool = False, parent: QObject | None = None
@@ -121,6 +127,17 @@ class Bridge(QObject):
         self._edit_mode = False
         self._layout_save = ""     # "", "saved" or "failed": this session's last layout write
         self._last_error = ""
+        # The operator's last approval decision, as Core answered it ({} when none).
+        self._decision: dict[str, str] = {}
+        # "", "disable_requested", "enable_requested" or "unconfirmed": an
+        # execution change the UI asked for that Core has not (yet) confirmed.
+        self._execution_request = ""
+        self._freeze_waiting = False      # Freeze confirmed while an operation was still running
+        self._quitting = False            # the one orderly quit is under way
+        self._tray_available = False      # set by the application when a tray icon exists
+        self._dev_safety = ""
+        for signal in (self.stateChanged, self.approvalChanged, self.dataChanged):
+            signal.connect(self.attentionChanged)
 
     # -- worker --------------------------------------------------------------
 
@@ -159,6 +176,13 @@ class Bridge(QObject):
         if kind == "task":
             self._busy = False
         handler(result)
+        if kind == "task" and self._freeze_waiting and not self._busy:
+            # The operation that was running when Freeze arrived has returned
+            # (at its next safe point, or finished): now JARVIS is frozen.
+            self._freeze_waiting = False
+            if not self.executionEnabled:
+                self._say("system", "JARVIS frozen. The operation that was running has returned; nothing new can start.")
+                self._note("JARVIS frozen", "system")
         self._refresh_core_state()
 
     # -- feed ---------------------------------------------------------------
@@ -178,7 +202,9 @@ class Bridge(QObject):
     # -- core state ----------------------------------------------------------
 
     def _refresh_core_state(self) -> None:
-        if self._config_refused() or self._config.get("execution_enabled") is False:
+        # Dormant only when frozen is REAL: the gate is closed and no operation
+        # of this application is still running toward its next safe point.
+        if self._config_refused() or (self._config.get("execution_enabled") is False and not self._busy):
             state = "disabled"
         elif self._busy:
             state = "running"
@@ -210,7 +236,9 @@ class Bridge(QObject):
             if isinstance(payload.get("task"), dict) and isinstance(payload["task"].get("id"), str):
                 self._task = task_status(payload, intent)
         self._ticket = approval_ticket(payload)
-        self._approval = approval_card(payload) if self._ticket is not None else {}
+        # Shown whenever Core sent a request - incomplete ones included, so a
+        # request missing its binding reads as unavailable, never as absent.
+        self._approval = approval_card(payload)
         self._last_outcome = outcome_kind(payload)
         if self._ticket is not None:
             self._note(f"Approval required: {self._approval.get('action')} -> {self._approval.get('destination')}", "approval")
@@ -427,7 +455,7 @@ class Bridge(QObject):
         if self._ticket is not None:
             self._say("system", "Answer the pending approval first (Approve, Deny or Cancel).")
             return False
-        self._clarification = {}
+        self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
         self._say("user", text)
         self.inputAccepted.emit()
@@ -483,21 +511,74 @@ class Bridge(QObject):
 
     # -- slots: approval / task ------------------------------------------
 
-    def _decide(self, verb: Callable[[ApprovalTicket], dict], executing: bool = False) -> None:
+    def _decide(self, verb: str, request_id: str | None = None, fingerprint: str | None = None) -> bool:
+        """Submit one decision for the request ON SCREEN. With an identity, it
+        must still be the current request - a newer revision is never decided
+        with an older rendering. Core re-proves the ticket either way."""
         ticket = self._ticket
-        if ticket is None or self._busy:
-            return
+        if ticket is None or self._busy or not self._approval.get("complete"):
+            return False
+        if request_id is not None and (str(request_id), str(fingerprint)) != (ticket.request_id, ticket.fingerprint):
+            return False
+        shown = self._approval
         self._ticket, self._approval = None, {}
+        self._decision = {"state": "submitting", "verb": verb, "label": "Submitting decision…",
+                          "action": shown.get("action", ""), "destination": shown.get("destination", ""),
+                          "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
-        self._run("task", lambda: verb(ticket), self._apply_run, executing=executing)
+        call = self.backend.approve if verb == "approve" else self.backend.reject
+        self._run("task", lambda: call(ticket), lambda payload: self._apply_decision(payload, verb, ticket, shown),
+                  executing=verb == "approve")
+        return True
+
+    def _apply_decision(self, payload: Any, verb: str, ticket: ApprovalTicket | None = None,
+                        shown: dict | None = None) -> None:
+        """What Core did with the decision - recorded only when it said so."""
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = str(error.get("code") or "") if isinstance(error, dict) else ""
+        if not isinstance(payload, dict):
+            state, label = "unknown", "Decision status unknown"
+        elif code in ("invalid_grant", "stale_grant", "task_not_found"):
+            state, label = "invalidated", "Request changed, expired or was resolved elsewhere — decision not recorded"
+        elif code == "execution_disabled":
+            state, label = "not_recorded", "JARVIS is frozen — approval not recorded; the request stays pending"
+        elif code in REFUSED_CODES and code != "approval_rejected":
+            state, label = "not_recorded", "Decision not recorded"
+        elif verb == "reject":
+            state, label = ("rejected", "Request rejected") if payload.get("run_status") == "rejected" \
+                else ("unknown", "Decision status unknown")
+        else:
+            state, label = "recorded", "Approval recorded"
+        self._decision = {**self._decision, "state": state, "label": label, "code": code,
+                          "message": str(error.get("message") or "") if isinstance(error, dict) else "",
+                          "time": datetime.now().strftime("%H:%M")}
+        self._apply_run(payload)
+        if code == "execution_disabled" and ticket is not None and self._ticket is None:
+            # Core refused the decision before touching the request, which is
+            # still pending exactly as it was: keep showing it.
+            self._ticket, self._approval = ticket, dict(shown or {})
+            self.approvalChanged.emit()
 
     @Slot()
     def approve(self) -> None:
-        self._decide(self.backend.approve, executing=True)
+        self._decide("approve")
 
     @Slot()
     def deny(self) -> None:
-        self._decide(self.backend.reject)
+        self._decide("reject")
+
+    @Slot(str, str, result=bool)
+    def approveRequest(self, request_id: str, fingerprint: str) -> bool:
+        """Approve exactly the displayed request (its id and fingerprint). Not
+        while frozen: approving starts work (Core refuses it too)."""
+        if not self.executionEnabled:
+            return False
+        return self._decide("approve", request_id, fingerprint)
+
+    @Slot(str, str, result=bool)
+    def rejectRequest(self, request_id: str, fingerprint: str) -> bool:
+        """Reject exactly the displayed request. Nothing else is cancelled or disabled."""
+        return self._decide("reject", request_id, fingerprint)
 
     @Slot()
     def cancelTask(self) -> None:
@@ -517,6 +598,7 @@ class Bridge(QObject):
         if self._busy:
             return
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
+        self._decision = {}
         self._last_outcome = "idle"
         self._say("system", "New session: the next message starts a fresh session.")
         self.approvalChanged.emit()
@@ -525,7 +607,7 @@ class Bridge(QObject):
     @Slot(str)
     def useSession(self, session_id: str) -> None:
         if session_id and not self._busy:
-            self._session_id, self._task, self._ticket, self._approval = str(session_id), {}, None, {}
+            self._session_id, self._task, self._ticket, self._approval, self._decision = str(session_id), {}, None, {}, {}
             self._say("system", f"Using session {session_id}.")
             self.approvalChanged.emit()
             self._refresh_core_state()
@@ -637,14 +719,223 @@ class Bridge(QObject):
         self._status = self.backend.status()
         self._refresh_core_state()
 
+    # -- Freeze / Resume JARVIS -------------------------------------------------
+    #
+    # Freeze closes the persisted execution gate AT ONCE, on this thread (never
+    # queued behind running work). Core re-reads that gate at every stage
+    # boundary, so an operation already running stops at its next safe point
+    # with its task persisted where it was; an atomic step (a connector call)
+    # is never interrupted. JARVIS is FROZEN only once the gate is confirmed
+    # closed AND nothing of this application is still running. Resume opens
+    # the gate again and continues only a task Freeze paused - never a failed,
+    # cancelled, rejected or unknown one; Core's journal never replays.
+
+    def _set_gate(self, want: bool) -> bool:
+        self._execution_request = "resume" if want else "freeze"
+        self.stateChanged.emit()
+        payload = self.backend.set_config("execution_enabled", "true" if want else "false")
+        self._apply_config(payload)
+        confirmed = bool(self._config) and self.executionEnabled == want
+        self._execution_request = "" if confirmed else "unconfirmed"
+        self._freeze_waiting = confirmed and not want and self._busy
+        if not confirmed:
+            self._say("error", f"JARVIS state unconfirmed: the request to {'resume' if want else 'freeze'} JARVIS "
+                               f"was not confirmed. The store reports execution "
+                               f"{'running' if self.executionEnabled else 'frozen'}.")
+            self._note("JARVIS state unconfirmed", "error")
+        elif not want and self._freeze_waiting:
+            self._say("system", "Freeze requested. Nothing new can start. The operation that is running now "
+                                "stops at its next safe point; a step already sent to its destination is not "
+                                "stopped or undone.")
+            self._note("Freeze requested", "system")
+        elif not want:
+            self._say("system", "JARVIS frozen. Nothing new can start; JARVIS stays open. "
+                                "Resume JARVIS from the red control or the tray when ready.")
+            self._note("JARVIS frozen", "system")
+        self._refresh_core_state()
+        return confirmed
+
+    @Slot()
+    def freezeJarvis(self) -> None:
+        """The red control and the tray: close the execution gate now. No confirmation."""
+        self._set_gate(False)
+
+    @Slot()
+    def resumeJarvis(self) -> None:
+        """Called after the person confirmed Resume. Opens the gate; a task that
+        Freeze paused continues from its persisted stage, nothing else starts."""
+        if not self._set_gate(True):
+            return
+        paused = task_outcome(self._task).get("kind") == "paused"
+        self._say("system", "JARVIS resumed." + (" Continuing the paused task from where it stopped."
+                                                 if paused else " Nothing else restarts by itself."))
+        self._note("JARVIS resumed", "system")
+        if paused and self._session_id:
+            self.resumeTask(self._session_id, self._task["task_id"])
+
     @Slot(bool)
     def setExecutionEnabled(self, enabled: bool) -> None:
-        """THE kill switch: the persisted ``execution_enabled`` barrier."""
-        payload = self.backend.set_config("execution_enabled", "true" if enabled else "false")
-        self._say("system", "Execution re-enabled." if enabled else
-                  "KILL SWITCH ON: no new work may start. Running work is stopped with Cancel.")
-        self._note("Execution enabled" if enabled else "KILL SWITCH engaged", "system")
-        self._apply_config(payload)
+        """The persisted execution gate: False freezes, True resumes."""
+        if enabled:
+            self.resumeJarvis()
+        else:
+            self.freezeJarvis()
+
+    @Property(str, notify=stateChanged)
+    def executionState(self) -> str:
+        """JARVIS lifecycle as established: running / freeze_requested (gate
+        closed, an operation still on its way to a safe point) / frozen,
+        resuming while the gate write is under way, unconfirmed when a request
+        was not confirmed, refused, or unknown before any read."""
+        if self._execution_request == "unconfirmed":
+            return "unconfirmed"
+        if self._execution_request == "resume":
+            return "resuming"
+        if self._execution_request == "freeze":
+            return "freeze_requested"
+        if not self._config:
+            return "unknown"
+        if self._config_refused():
+            return "refused"
+        if self.executionEnabled:
+            return "running"
+        return "freeze_requested" if self._busy else "frozen"
+
+    # -- window, tray and quit ---------------------------------------------------
+
+    trayChanged = Signal()
+    hiddenToTray = Signal()           # the window went to the tray (the tray may say so once)
+    resumeConfirmRequested = Signal() # the tray asks the window to confirm Resume
+    quitConfirmRequested = Signal()   # the tray asks the window to confirm Quit
+
+    @Property(bool, notify=trayChanged)
+    def trayAvailable(self) -> bool:
+        return self._tray_available
+
+    def setTrayAvailable(self, available: bool) -> None:
+        self._tray_available = bool(available)
+        self.trayChanged.emit()
+
+    @Property(bool, notify=trayChanged)
+    def quitting(self) -> bool:
+        return self._quitting
+
+    @Slot()
+    def noteHiddenToTray(self) -> None:
+        self.hiddenToTray.emit()
+
+    @Property(str, notify=attentionChanged)
+    def quitWarning(self) -> str:
+        """Why quitting now needs a confirmation, from real state - or ""."""
+        if self._busy:
+            return ("JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: "
+                    "the operation may keep running until it returns, and anything already sent to its "
+                    "destination is not stopped or undone.")
+        outcome = task_outcome(self._task)
+        if outcome.get("kind") in ("unknown", "in_progress") or outcome.get("run_status") == "cancelling":
+            return ("JARVIS has work whose outcome is not established. Quitting does not resolve or stop it; "
+                    "it stays recorded in History, and anything already sent to its destination is not undone.")
+        return ""
+
+    @Slot()
+    def requestQuit(self) -> None:
+        """Quit JARVIS (tray): at once when nothing is active, otherwise ask first."""
+        if self.quitWarning:
+            self.quitConfirmRequested.emit()
+        else:
+            self.confirmQuit()
+
+    @Slot()
+    def confirmQuit(self) -> None:
+        """The orderly quit. The window accepts its close from here on."""
+        self._quitting = True
+        self.trayChanged.emit()
+        self.quitRequested.emit()
+
+    # -- the safety projection: cards + the one attention strip ---------------
+
+    @Property("QVariantMap", notify=attentionChanged)
+    def safety(self) -> dict:
+        """Current safety state for the conversation cards and the attention
+        strip, projected only from Core-reported state. Priority orders the
+        attention items; it never removes one. History plays no part."""
+        if self._dev_safety:
+            return self._dev_safety_projection(self._dev_safety)
+        execution = self.executionState
+        approval = dict(self._approval)
+        if approval:
+            decidable = self._ticket is not None and bool(approval.get("complete")) and not self._busy
+            approval["capability"] = str(self._task.get("capability") or "")
+            # Frozen: approving would start work, so it waits for Resume; rejecting
+            # executes nothing, so Core accepts it while frozen.
+            approval["actionable"] = decidable and self.executionEnabled
+            approval["rejectable"] = decidable
+            approval["hold"] = ("Approval details unavailable" if not approval.get("complete") or self._ticket is None
+                                else "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."
+                                if not self.executionEnabled else "")
+        outcome = task_outcome(self._task)
+        items: list[dict[str, Any]] = []
+        if execution in ("frozen", "freeze_requested", "resuming", "refused", "unconfirmed"):
+            items.append({"key": "execution", "level": 1, "tone": "danger", "label": {
+                "frozen": "JARVIS frozen", "refused": "Configuration refused — execution off",
+                "unconfirmed": "JARVIS state unconfirmed", "resuming": "Resuming JARVIS…",
+                "freeze_requested": "Freeze requested — waiting for the current operation"}[execution]})
+        if approval:
+            items.append({"key": "approval", "level": 2, "tone": "warning", "label": "Your approval is required"})
+        if self._clarification or self._task.get("status") == "awaiting_clarification":
+            items.append({"key": "decision", "level": 2, "tone": "warning", "label": "Your decision is needed"})
+        attention = {"unknown": (3, "unknown", "Outcome unknown"), "in_progress": (3, "unknown", "Outcome not established yet"),
+                     "blocked": (4, "warning", "Action blocked"), "failed": (4, "danger", "Action failed")}.get(outcome.get("kind", ""))
+        if attention:
+            items.append({"key": "outcome", "level": attention[0], "tone": attention[1], "label": attention[2]})
+        items.sort(key=lambda item: item["level"])       # stable: equal levels keep their order
+        return {"fixture": False, "execution": execution, "running": self._busy, "approval": approval,
+                "decision": dict(self._decision), "outcome": outcome, "attention": items,
+                "cards": bool(approval or self._decision or outcome
+                              or execution in ("frozen", "freeze_requested", "refused", "unconfirmed"))}
+
+    @Property(str, notify=attentionChanged)
+    def devSafetyScenario(self) -> str:
+        return self._dev_safety
+
+    @Slot()
+    def nextDevSafetyScenario(self) -> None:
+        """DEV FIXTURE only: cycle the display-only safety scenarios."""
+        if not self.devFixture:
+            return
+        self._dev_safety = DEV_SAFETY_SCENARIOS[(DEV_SAFETY_SCENARIOS.index(self._dev_safety) + 1) % len(DEV_SAFETY_SCENARIOS)]
+        self.attentionChanged.emit()
+
+    @Slot(str)
+    def setDevSafetyScenario(self, name: str) -> None:
+        if self.devFixture and name in DEV_SAFETY_SCENARIOS:
+            self._dev_safety = name
+            self.attentionChanged.emit()
+
+    @staticmethod
+    def _dev_safety_projection(name: str) -> dict:
+        """Placeholder fields only, flagged ``fixture``: nothing here can be approved."""
+        sample = {"task_id": "DEV-FIXTURE", "connector": "[Connector]", "capability": "[Capability]",
+                  "destination": "[Exact destination]", "run_status": "", "code": "", "message": "[Core-reported detail]"}
+        approval, outcome, items = {}, {}, []
+        if name.startswith("approval"):
+            complete = name == "approval"
+            approval = {"summary": "[Action summary]", "action": "[Action]" if complete else "", "target": "[Target]",
+                        "connector": "[Connector]" if complete else "", "capability": "[Capability]",
+                        "destination": "[Exact destination]", "data_classification": "[classification]",
+                        "effect": "[effect]", "reversible": False, "reason": "[Why approval is required]",
+                        "expires_at": "[expiry]", "request_id": "DEV-FIXTURE", "fingerprint": "DEV-FIXTURE",
+                        "outbound_preview": "[Outbound preview]", "complete": complete, "actionable": False,
+                        "hold": "DEV FIXTURE · not a live approval request" if complete else "Approval details unavailable"}
+            items.append({"key": "approval", "level": 2, "tone": "warning", "label": "Your approval is required"})
+        else:
+            outcome = {**sample, "kind": name, "run_status": "completed" if name == "completed" else "failed"}
+            level = {"unknown": (3, "unknown", "Outcome unknown"), "failed": (4, "danger", "Action failed"),
+                     "blocked": (4, "warning", "Action blocked")}.get(name)
+            if level:
+                items.append({"key": "outcome", "level": level[0], "tone": level[1], "label": level[2]})
+        return {"fixture": True, "execution": "running", "running": False, "approval": approval, "decision": {},
+                "outcome": outcome, "attention": items, "cards": True}
 
     @Slot(str, str)
     def applyModel(self, model: str, effort: str) -> None:

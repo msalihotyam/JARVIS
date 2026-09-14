@@ -98,6 +98,18 @@ class Backend:
 
     # -- plumbing -------------------------------------------------------------
 
+    def execution_gate(self) -> bool:
+        """The persisted switch as it is NOW (a refused store reads as closed)."""
+        loaded = self.store.load()
+        return loaded.usable and loaded.settings.execution_enabled is True
+
+    def _app(self, settings: Settings) -> JarvisApp:
+        """One application whose Core re-reads the switch at every stage
+        boundary, so Freeze reaches work that is already running."""
+        app = self.app_factory(settings)
+        app.core.execution_gate = self.execution_gate
+        return app
+
     def _call(self, command: str, action: Callable[[Settings], Any]) -> dict:
         loaded = self.store.load()
         mode = loaded.settings.permission_mode
@@ -162,7 +174,7 @@ class Backend:
         request_id = request_id or str(uuid4())
 
         def run(settings: Settings) -> Any:
-            app = self.app_factory(settings)
+            app = self._app(settings)
             self._text_app = app
             try:
                 return app.submit_text(
@@ -180,23 +192,23 @@ class Backend:
     # -- tasks ----------------------------------------------------------------
 
     def approve(self, ticket: ApprovalTicket) -> dict:
-        return self._call("approve", lambda s: self.app_factory(s).approve(
+        return self._call("approve", lambda s: self._app(s).approve(
             ticket.session_id, ticket.task_id, ticket.request_id, ticket.fingerprint
         ))
 
     def reject(self, ticket: ApprovalTicket) -> dict:
-        return self._call("reject", lambda s: self.app_factory(s).reject(
+        return self._call("reject", lambda s: self._app(s).reject(
             ticket.session_id, ticket.task_id, ticket.request_id, ticket.fingerprint
         ))
 
     def cancel(self, session_id: str, task_id: str) -> dict:
-        return self._call("cancel", lambda s: self.app_factory(s).cancel(session_id, task_id))
+        return self._call("cancel", lambda s: self._app(s).cancel(session_id, task_id))
 
     def clarify(self, session_id: str, task_id: str, text: str) -> dict:
-        return self._call("clarify", lambda s: self.app_factory(s).clarify(session_id, task_id, text))
+        return self._call("clarify", lambda s: self._app(s).clarify(session_id, task_id, text))
 
     def resume(self, session_id: str, task_id: str) -> dict:
-        return self._call("resume", lambda s: self.app_factory(s).resume(session_id, task_id))
+        return self._call("resume", lambda s: self._app(s).resume(session_id, task_id))
 
     def active_task_id(self, session_id: str) -> str | None:
         """Storage's answer to "which task is this session running now"."""
@@ -241,7 +253,7 @@ class Backend:
         return self._call("job-archive", lambda s: job_archive_result(self._memory(s), s, job_id, revision))
 
     def scheduler_once(self) -> dict:
-        return self._call("scheduler-run", lambda s: self.app_factory(s).run_scheduler(once=True))
+        return self._call("scheduler-run", lambda s: self._app(s).run_scheduler(once=True))
 
     # -- memory ---------------------------------------------------------------
 

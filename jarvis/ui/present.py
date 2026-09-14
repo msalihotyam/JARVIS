@@ -156,7 +156,9 @@ def approval_card(payload: Any) -> dict[str, Any]:
         return {}
     scope = approval.get("scope") or {}
     effect = approval.get("side_effect") or {}
-    return {
+    preview = approval.get("outbound_preview")
+    card = {
+        "summary": str(_get(preview, "summary") or ""),
         "action": str(_get(scope, "action") or ""),
         "target": str(_get(scope, "target") or ""),
         "destination": str(_get(scope, "destination") or "(local)"),
@@ -176,6 +178,41 @@ def approval_card(payload: Any) -> dict[str, Any]:
         "task_id": str(_get(_get(payload, "task"), "id") or ""),
         "session_id": str(_get(_get(payload, "session"), "id") or ""),
     }
+    # Approvable only with everything that binds and explains the request:
+    # what is done, through which connector, and the exact request identity.
+    card["complete"] = all(card[k] for k in ("action", "connector", "request_id", "fingerprint", "task_id", "session_id"))
+    return card
+
+
+def task_outcome(task: Any) -> dict[str, str]:
+    """The current task's outcome as Core reported it, or ``{}`` while there
+    is none. Kinds stay distinct: ``blocked`` (refused before any effect -
+    this attempt did not proceed), ``failed`` (Core reported failure),
+    ``unknown`` (completion cannot be verified), ``in_progress`` (running
+    elsewhere, not established yet), ``completed``. Nothing is inferred from
+    history or from the execution switch."""
+    if not isinstance(task, dict) or not task.get("task_id"):
+        return {}
+    code, status = str(task.get("error_code") or ""), str(task.get("run_status") or "")
+    task_state = str(task.get("status") or "")
+    # Paused by Freeze: Core's barrier stopped a REGISTERED task at a stage
+    # boundary and left it exactly where it was - not terminal, not waiting on
+    # a person, past the first stage (a refusal before registration persists
+    # nothing, so there is nothing to continue).
+    paused = (code == "execution_disabled" and task_state not in TERMINAL_STATUSES
+              and task_state not in WAITING_STATUSES and str(task.get("stage") or "") not in ("", "understand"))
+    kind = ("unknown" if code == UNKNOWN_CODE else "in_progress" if code == IN_PROGRESS_CODE
+            else "paused" if paused
+            else "" if status == "rejected"          # a decision, shown by its receipt
+            else "cancelled" if status in ("cancelled", "cancelling")
+            else "blocked" if code in REFUSED_CODES
+            else "failed" if code or status == "failed"
+            else "completed" if status == "completed" else "")
+    if not kind:
+        return {}
+    return {"kind": kind, "run_status": status, "code": code, "message": str(task.get("error_message") or ""),
+            "task_id": str(task["task_id"]), "connector": str(task.get("connector") or ""),
+            "capability": str(task.get("capability") or ""), "destination": str(task.get("destination") or "")}
 
 
 def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
@@ -193,6 +230,7 @@ def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
         "provider": str(usage.get("provider") or ""),
         "model": str(usage.get("model") or ""),
         "error_code": str(error.get("code") or ""),
+        "error_message": str(error.get("message") or ""),
         "intent_status": str(_get(intent, "status") or ""),
         "capability": str(_get(intent, "capability") or ""),
         "destination": str(_get(intent, "destination") or ""),

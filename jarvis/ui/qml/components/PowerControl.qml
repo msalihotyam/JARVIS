@@ -15,8 +15,9 @@ Item {
     readonly property bool hovered: hit.containsMouse
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
-    Accessible.name: "Kill Switch"
-    Accessible.description: engaged ? "Re-enable JARVIS execution" : "Disable JARVIS execution"
+    // Freeze / Resume JARVIS for the whole installation - not close, not quit, not cancel task.
+    Accessible.name: engaged ? "Resume JARVIS" : "Freeze JARVIS"
+    Accessible.description: engaged ? "JARVIS is frozen. Resuming asks for confirmation." : "Freeze JARVIS: nothing new can start; running work pauses at its next safe point."
     Accessible.onPressAction: if (enabled) clicked()
     Keys.onReturnPressed: if (enabled) clicked()
     Keys.onSpacePressed: if (enabled) clicked()
@@ -34,15 +35,17 @@ Item {
         gradient: Gradient { GradientStop { position: 0; color: "#6b2032" } GradientStop { position: 0.48; color: "#2b0c17" } GradientStop { position: 1; color: "#12060c" } }
     }
     Rectangle { anchors.fill: parent; anchors.margins: 4 * power.k; radius: width / 2; color: power.engaged ? "#40211320" : "transparent"; border.width: 1; border.color: "#7dff5f76" }
+    // The glyph says what the press does: pause bars to Freeze, a play
+    // triangle to Resume. Never a power symbol - JARVIS is not switched off.
     Shape { anchors.centerIn: parent; width: 20; height: 22; scale: power.k; preferredRendererType: Shape.CurveRenderer
-        ShapePath { strokeColor: "#ff8593"; strokeWidth: 2; fillColor: "transparent"; capStyle: ShapePath.RoundCap
-            PathAngleArc { centerX: 10; centerY: 12; radiusX: 7.5; radiusY: 7.5; startAngle: -50; sweepAngle: 280 }
-        }
-        ShapePath { strokeColor: "#ffa3ad"; strokeWidth: 2; fillColor: "transparent"; capStyle: ShapePath.RoundCap; startX: 10; startY: 2; PathLine { x: 10; y: 11 } }
+        ShapePath { strokeColor: power.engaged ? "transparent" : "#ffa3ad"; strokeWidth: 2.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+            startX: 7; startY: 5; PathLine { x: 7; y: 17 } PathMove { x: 13; y: 5 } PathLine { x: 13; y: 17 } }
+        ShapePath { strokeColor: power.engaged ? "#ffa3ad" : "transparent"; strokeWidth: 2; fillColor: "transparent"; joinStyle: ShapePath.RoundJoin
+            startX: 7; startY: 5; PathLine { x: 16.5; y: 11 } PathLine { x: 7; y: 17 } PathLine { x: 7; y: 5 } }
     }
     Rectangle { anchors.fill: parent; anchors.margins: -4; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#ffb1bb"; visible: power.activeFocus }
     MouseArea { id: hit; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { power.forceActiveFocus(); power.clicked() } }
     ToolTip.visible: hovered
     ToolTip.delay: 500
-    ToolTip.text: Accessible.description
+    ToolTip.text: Accessible.name
 }
