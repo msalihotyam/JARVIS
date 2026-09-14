@@ -22,11 +22,11 @@ Rectangle {
     Behavior on implicitHeight { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
     radius: 10
     gradient: Gradient {
-        GradientStop { position: 0; color: "#f400192d" }
-        GradientStop { position: 1; color: "#f4001220" }
+        GradientStop { position: 0; color: Theme.glassInteractiveTop }
+        GradientStop { position: 1; color: Theme.glassInteractive }
     }
     border.width: 1
-    border.color: input.activeFocus ? "#5cc6ee" : "#2a86b8"
+    border.color: input.activeFocus ? Theme.glassEdgeStrong : Theme.glassEdge
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
     property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused
     property bool canSend: !blocked && input.text.trim() !== ""
@@ -35,9 +35,10 @@ Rectangle {
     // Clear the draft only when the application really accepted it.
     function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
 
-    // Material depth: a faint sheen under the top edge, nothing louder.
+    // Material depth: a restrained upper-edge reflection; focus adds a fine
+    // inner highlight and nothing larger.
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 26); radius: 9
-        gradient: Gradient { GradientStop { position: 0; color: "#0c6fd2f5" } GradientStop { position: 1; color: "transparent" } } }
+        gradient: Gradient { GradientStop { position: 0; color: input.activeFocus ? Theme.glassInnerHighlight : Theme.glassReflection } GradientStop { position: 1; color: "transparent" } } }
 
     // The draft: a wrapping text area inside a flickable, so past the maximum
     // height the text scrolls and the caret stays in view.

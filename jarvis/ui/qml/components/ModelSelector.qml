@@ -51,8 +51,8 @@ Item {
             joinStyle: ShapePath.MiterJoin
             fillGradient: LinearGradient {
                 x1: 0; y1: 0; x2: 0; y2: frame.h
-                GradientStop { position: 0; color: "#f40a2038" }
-                GradientStop { position: 1; color: "#f4061424" }
+                GradientStop { position: 0; color: Theme.glassInteractiveTop }
+                GradientStop { position: 1; color: Theme.glassInteractive }
             }
             startX: frame.c + 0.5; startY: 0.5
             PathLine { x: frame.w - frame.c - 0.5; y: 0.5 }

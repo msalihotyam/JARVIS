@@ -43,7 +43,7 @@ Item {
         raised: true; brackets: context.surfaceBrackets; padding: 22
         radius: context.surfaceRadius > 0 ? context.surfaceRadius : Theme.radius
         border.color: context.surfaceShell != "" ? "transparent" : context.surfaceEdge.a > 0 ? context.surfaceEdge : Theme.border
-        color: context.surfaceFill.a > 0 ? context.surfaceFill : Theme.surfaceRaised
+        color: context.surfaceFill.a > 0 ? context.surfaceFill : Theme.glassMenu
         // A luminous halo around a strong edge.
         // Above the body fill (a negative z would sit behind it); its centre is
         // transparent and the surface padding keeps it clear of the content.

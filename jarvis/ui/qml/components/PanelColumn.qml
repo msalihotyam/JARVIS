@@ -18,7 +18,7 @@ Item {
     // One structural palette for the stack: deep navy surface, cool-blue
     // borders and default glyphs, blue-cyan local highlights. Green, red and
     // amber remain semantic only.
-    readonly property color surface: "#f4071521"
+    readonly property color surface: Theme.glassSecondaryShell
     readonly property color structure: "#278dce"
     readonly property color highlight: "#49bdfa"
     // Gap between stacked panels: proportional to the stack, as in the reference.
@@ -113,6 +113,7 @@ Item {
                 id: glass
                 anchors.fill: parent
                 brackets: true
+                shadow: column.commandMode      // no black plates under secondary glass
                 padding: column.width < 400 ? 12 : column.commandMode ? 16 : 20
                 title: (column.commandMode ? {system:"Model & execution",workflow:"Active task",activity:"Recent actions",automations:"Memory context"} : { system: "System status", workflow: "Active workflow", activity: "Live intelligence feed", automations: "Automations" })[modelData.id]
                 badge: modelData.id === "system" ? (bridge.configRefused ? "config refused" : (bridge.executionEnabled ? "enabled" : "disabled"))
@@ -238,7 +239,7 @@ Item {
         default property alias rows: inner.data
         property bool fill: false
         width: parent.width; height: fill ? parent.height : inner.height + 2
-        radius: 10; color: "#7a06121f"; border.width: 1; border.color: Theme.alpha(column.structure, 0.3)
+        radius: 10; color: Theme.glassSecondaryReading; border.width: 1; border.color: Theme.alpha(column.structure, 0.3)
         Column { id: inner; x: 1; y: 1; width: parent.width - 2 }
     }
 
@@ -270,6 +271,8 @@ Item {
             // Said plainly, once, beneath the cluster - the rings carry "—".
             Text { visible: sys.caption; x: 4; y: gauges.y + sys.d + 9; width: sys.clusterW; horizontalAlignment: Text.AlignHCenter
                    text: "Not measured by this build"; color: "#6d88a6"; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.8 } }
+            Rectangle { visible: sys.list; x: sys.clusterW + 12; width: sys.bw - x + 4; radius: 10
+                y: Math.round(sys.cy - 1.5 * sys.pitch) - 6; height: 3 * sys.pitch + 12; color: Theme.glassSecondaryReading }
             Column {
                 visible: sys.list
                 x: sys.clusterW + 22; width: sys.bw - x

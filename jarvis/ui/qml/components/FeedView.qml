@@ -185,11 +185,11 @@ Item {
                         radius: 12
                         // The request: a compact, clearly bounded deep-navy technical
                         // block with a thin cool-blue perimeter and a top highlight.
-                        color: row.loud ? Theme.alpha(row.tone, 0.07) : "transparent"
+                        color: row.loud ? Theme.glassPrimaryReading : "transparent"
                         gradient: row.isUser ? requestGlass : null
                         Gradient { id: requestGlass
-                            GradientStop { position: 0; color: "#f0001a2e" }
-                            GradientStop { position: 1; color: "#e8001322" } }
+                            GradientStop { position: 0; color: Theme.glassUserReading }
+                            GradientStop { position: 1; color: Theme.glassPrimaryReading } }
                         border.width: row.isUser || row.loud ? 1 : 0
                         border.color: row.isUser ? "#327bb5" : Theme.alpha(row.tone, 0.45)
                         Rectangle { visible: row.isUser; x: 14; y: 1; width: parent.width - 28; height: 1; color: "#5a6fd2f5" }
@@ -215,11 +215,8 @@ Item {
                                 Rectangle {
                                     visible: row.isJarvis
                                     anchors.fill: parent; radius: 12
-                                    gradient: Gradient {
-                                        GradientStop { position: 0; color: "#c8001729" }
-                                        GradientStop { position: 1; color: "#b0001120" }
-                                    }
-                                    border.width: 1; border.color: "#1f4a68"
+                                    color: Theme.glassPrimaryReading
+                                    border.width: 1; border.color: Theme.glassSeparator
                                     Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#2e6fd2f5" }
                                 }
                                 Text { id: name; visible: row.isJarvis; x: 18; y: 11; text: feed.kindLabel(row.kind); color: Theme.materialBlue

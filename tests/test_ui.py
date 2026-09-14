@@ -1650,6 +1650,47 @@ class ReactorStateTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class GlassMaterialTests(UiTestCase):
+    """Global Glass: the shells are translucent theme tiers, the reading
+    surfaces stay protected, ambient-off closes the shells, and none of it
+    moves a pixel of geometry."""
+
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def alpha(self, item, prop="color"):
+        from PySide6.QtGui import QColor
+        return QColor(item.property(prop)).alphaF()
+
+    def test_material_tiers_bind_to_theme_tokens_without_moving_geometry(self) -> None:
+        from PySide6.QtCore import QPointF
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(700)
+
+        def box(name):
+            it = self.item(root, name)
+            a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+            return tuple(round(v, 1) for v in (a.x(), a.y(), b.x(), b.y()))
+
+        before = [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "modelTrigger", "railTasks", "jarvisCore")]
+        # Primary shell ~54 %, secondary shell ~66 %; the composer (interactive) ~89 %.
+        self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
+        self.assertAlmostEqual(0.66, self.alpha(self.item(root, "railTasks")), delta=0.03)
+        self.assertAlmostEqual(0.66, self.alpha(self.item(root, "leftContextCard")), delta=0.03)
+        # Reading islands stay dark: the assistant surface and a user bubble are ~88 %.
+        bridge._say("user", "a request"); bridge._say("jarvis", "an answer"); pump(300)
+        self.assertGreaterEqual(self.alpha(self.item(root, "feedCard_user"), "color"), 0.0)   # gradient-backed; the stops are tokens
+        # Reduced transparency: ambient off closes the shells, geometry identical.
+        bridge.setAmbientEffects(False); pump(300)
+        self.assertGreaterEqual(self.alpha(self.item(root, "canonicalWorkspace"), "fill"), 0.88)
+        self.assertGreaterEqual(self.alpha(self.item(root, "railTasks")), 0.88)
+        self.assertEqual(before, [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "modelTrigger", "railTasks", "jarvisCore")])
+        bridge.setAmbientEffects(True); pump(300)
+        self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
+        self.assertEqual(0, self.execute_calls())
+
+
 class LocalFitTests(UiTestCase):
     """Phase 3.4b: local fit and real pointer routing, no backend activity."""
 

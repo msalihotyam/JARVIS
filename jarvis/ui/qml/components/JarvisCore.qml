@@ -664,16 +664,19 @@ Item {
         readonly property real inset: thin ? 0 : bezelPx / Math.max(1, r) * 180 / Math.PI
         readonly property real a0: angle - span / 2 + inset
         readonly property real sweep: span - 2 * inset
-        // Very restrained local bloom: one bezel past the face, never further.
-        ShapePath { strokeColor: Theme.alpha(tint, 0.16); strokeWidth: face + 2 * bezelPx; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+        // Restrained local bloom: one bezel past the face, never further.
+        ShapePath { strokeColor: Theme.alpha(tint, 0.22); strokeWidth: face + 2 * bezelPx; fillColor: "transparent"; capStyle: ShapePath.FlatCap
             PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 - 0.5; sweepAngle: sweep + 1 } }
-        // The inset emitting face.
-        ShapePath { strokeColor: Theme.alpha(tint, 0.66); strokeWidth: face; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+        // The inset emissive body.
+        ShapePath { strokeColor: Theme.alpha(tint, 0.62); strokeWidth: face; fillColor: "transparent"; capStyle: ShapePath.FlatCap
             PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0; sweepAngle: sweep } }
+        // Brighter internal energy through the middle of the body.
+        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.22), 0.72); strokeWidth: face * 0.46; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 + inset * 0.6; sweepAngle: sweep - inset * 1.2 } }
         // Narrow edge highlights along the face's inner and outer contours.
-        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.3), 0.9); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.35), 0.95); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
             PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r - face / 2 + 0.5; radiusY: r - face / 2 + 0.5; startAngle: a0; sweepAngle: sweep } }
-        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.3), 0.8); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.35), 0.85); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
             PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r + face / 2 - 0.5; radiusY: r + face / 2 - 0.5; startAngle: a0; sweepAngle: sweep } }
     }
 
@@ -698,8 +701,7 @@ Item {
             rotation: index * 60
             // Listening lights only the opposite pair (sectors 0 and 3).
             readonly property real lit: (core.listening && index !== 0 && index !== 3) ? 0 : (index % 2 === 0 ? core.litA : core.litB)
-            readonly property real blue: [core.blue0, core.blue1, core.blue2, core.blue3, core.blue4, core.blue5][index]
-            opacity: Math.max(lit, blue) * core.ringEnergy
+            opacity: lit * core.ringEnergy
             visible: opacity > 0.01
         }
     }
@@ -748,6 +750,13 @@ Item {
         MicroFace { radius: (geo.sectorInner + geo.sectorOuter) / 2; band: geo.sectorOuter - geo.sectorInner
                     angle: geo.sectorCentres[index]; span: geo.sectorSpan; tint: core.sigTint
                     level: Math.max([core.sig0, core.sig1, core.sig2, core.sig3, core.sig4, core.sig5][index], core.hold) * core.ringEnergy }
+    }
+    // Blue information: the same rich emitting faces, in the structural blue.
+    Repeater {
+        model: 6
+        MicroFace { radius: (geo.sectorInner + geo.sectorOuter) / 2; band: geo.sectorOuter - geo.sectorInner
+                    angle: geo.sectorCentres[index]; span: geo.sectorSpan; tint: "#4fb8ff"
+                    level: [core.blue0, core.blue1, core.blue2, core.blue3, core.blue4, core.blue5][index] * core.ringEnergy }
     }
     // Event light: the wave (scaled outward), the retune ring, the packet.
     Image { id: wave; source: "../assets/core-wave.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true; opacity: 0; visible: opacity > 0.01 }

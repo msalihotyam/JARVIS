@@ -22,7 +22,7 @@ Rectangle {
         return "UTC" + sign + ("0" + Math.floor(minutes / 60)).slice(-2) + ":" + ("0" + minutes % 60).slice(-2)
     }
     radius: 14
-    color: "#ec00111f"
+    color: Theme.glassSecondaryShell
     Accessible.role: Accessible.Pane
     Accessible.name: timeText + ", " + dateText + ", Local time, " + zoneText + ". Weather not connected."
 
@@ -36,7 +36,7 @@ Rectangle {
     Rectangle {
         anchors.fill: parent; anchors.margins: 1; radius: 13
         gradient: Gradient {
-            GradientStop { position: 0; color: "#283679d0" }
+            GradientStop { position: 0; color: Theme.glassMicro }
             GradientStop { position: 0.65; color: "transparent" }
         }
     }

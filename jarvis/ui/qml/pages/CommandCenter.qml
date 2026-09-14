@@ -18,8 +18,11 @@ Item {
     property int fade: 48       // where the text begins, below the band
     readonly property bool roomy: width >= 700
     readonly property bool empty: bridge.feed.length === 0
-    readonly property color fill: Theme.space ? "#f2000812" : Theme.surfaceWorkspace
-    readonly property color edge: Theme.space ? "#b33b83c6" : Theme.border
+    // Primary content glass: the shell lets the space through in its unused
+    // areas; every message and structured block sits on its own darker
+    // reading island (FeedView, StagePipeline).
+    readonly property color fill: Theme.glassPrimaryShell
+    readonly property color edge: Theme.glassEdge
     readonly property int shellRadius: Theme.radius
     readonly property int inset: roomy ? 16 : 8
 

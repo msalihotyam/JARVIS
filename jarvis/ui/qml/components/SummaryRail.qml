@@ -109,7 +109,7 @@ Item {
                 radius: 14
                 // Closed: controlled glass. Active: a restrained cyan
                 // treatment - brighter edge and a slight lift, no glow bloom.
-                color: active ? rail.activeFill : hovered ? "#f0001a2e" : "#ec00111f"
+                color: active ? rail.activeFill : hovered ? "#b6051a30" : Theme.glassSecondaryShell
                 border.width: 0
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
                 activeFocusOnTab: true
@@ -144,7 +144,7 @@ Item {
                 Rectangle {
                     anchors.fill: parent; anchors.margins: 1; radius: 13
                     gradient: Gradient {
-                        GradientStop { position: 0; color: card.active ? "#363692ff" : "#243679d0" }
+                        GradientStop { position: 0; color: card.active ? "#363692ff" : Theme.glassMicro }
                         GradientStop { position: 0.55; color: "transparent" }
                     }
                 }
@@ -192,6 +192,13 @@ Item {
                     SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#b8e7ff"; scale: (rail.tight ? 20 : 22) / 18 }
                 }
 
+                // Darker protection beneath the labels; the space stays visible
+                // around them.
+                Rectangle {
+                    x: tile.x - 5; width: parent.width - x - 8; radius: 9
+                    anchors.verticalCenter: parent.verticalCenter; height: Math.max(tile.height, labels.height) + 16
+                    color: Theme.glassSecondaryReading
+                }
                 Column {
                     id: labels
                     x: tile.x + tile.width + (rail.tight ? 8 : 13)

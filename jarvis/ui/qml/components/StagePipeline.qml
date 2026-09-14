@@ -27,11 +27,8 @@ Rectangle {
     implicitHeight: headHeight + rowHeight * 4 + (reference ? 8 : 8)
     height: implicitHeight
     radius: 12
-    gradient: Gradient {
-        GradientStop { position: 0; color: "#e6001829" }
-        GradientStop { position: 1; color: "#e0001221" }
-    }
-    border.width: 1; border.color: "#24557a"
+    color: Theme.glassPrimaryReading
+    border.width: 1; border.color: Theme.glassEdge
 
     function stage(i) {
         var t = bridge.task, has = hasTask, cs = pipeline.cs

@@ -154,6 +154,29 @@ QtObject {
     Behavior on hud { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
     Behavior on hudOpacity { SequentialAnimation { PauseAnimation { duration: 180 } NumberAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
 
+    // -- Global Glass: the material tiers ---------------------------------
+    // Values are approximate EFFECTIVE navy coverage over the background
+    // once layers combine: primary shell ~54 % with reading islands ~88 %;
+    // secondary shell ~66 % with data regions ~86 %; interactive ~89 %;
+    // menus ~97 %; micro ~24 %. Text, icons and focus rings are never
+    // faded with a parent: they stay opaque on their own. With ambient
+    // effects off (the reduced-transparency path) the shells close up and
+    // the reflections go; geometry never changes.
+    readonly property color glassPrimaryShell: ambient ? "#8a040f1e" : "#e6040f1e"
+    readonly property color glassPrimaryReading: "#e0031020"
+    readonly property color glassUserReading: "#e0041b31"           // subtly bluer
+    readonly property color glassSecondaryShell: ambient ? "#a8040f1e" : "#ea040f1e"
+    readonly property color glassSecondaryReading: "#99051324"      // inside a secondary shell: ~86 % combined
+    readonly property color glassInteractive: "#e3061424"
+    readonly property color glassInteractiveTop: "#e30a2038"
+    readonly property color glassMenu: "#f7061424"
+    readonly property color glassMicro: "#3d1a4f88"
+    readonly property color glassEdge: "#80278dce"                  // the ~1 px structural perimeter
+    readonly property color glassEdgeStrong: "#c049bdfa"
+    readonly property color glassSeparator: "#38278dce"
+    readonly property color glassReflection: ambient ? "#129dd8ff" : "#009dd8ff"       // ~5 % upper-edge highlight
+    readonly property color glassInnerHighlight: ambient ? "#2449bdfa" : "#0049bdfa"
+
     // -- stage 5: text and state accents (260-420 ms) -------------------
     property color text: space ? "#daeaf5" : "#dfebf2"
     property color textLabel: space ? "#a9c5da" : "#a5c0d1"
