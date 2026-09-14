@@ -1691,6 +1691,64 @@ class GlassMaterialTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class RightStackCohesionTests(UiTestCase):
+    """Phase 4D: the three panels share one header system and alignment grid,
+    keep every real field at every supported size, and do not move."""
+
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def walk(self, node, out):
+        out.append(node)
+        for child in node.childItems():
+            self.walk(child, out)
+        return out
+
+    def box(self, it):
+        from PySide6.QtCore import QPointF
+        a = it.mapToScene(QPointF(0, 0)); b = it.mapToScene(QPointF(it.width(), it.height()))
+        return a.x(), a.y(), b.x(), b.y()
+
+    def test_shared_headers_grid_and_fields_hold_at_every_size(self) -> None:
+        from PySide6.QtGui import QFontDatabase
+        bridge = self.bridge()
+        for _ in range(3):
+            bridge._note("Intent unsupported_capability", "error")   # historical rows stay local
+        root = self.window(bridge)
+        native_fonts = bool(QFontDatabase.families())
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height); pump(700)
+            column = self.item(root, "panelColumn")
+            nodes = self.walk(column, [])
+            titles = {n.objectName()[11:]: n for n in nodes if n.objectName().startswith("panelTitle_") and n.isVisible()}
+            with self.subTest(size=(width, height)):
+                self.assertEqual({"System status", "Active workflow", "Live intelligence feed"}, set(titles))
+                for key, title in titles.items():
+                    panel = title.parentItem().parentItem().parentItem()
+                    p = self.box(panel)
+                    self.assertAlmostEqual(12, self.box(title)[0] - p[0], delta=1.5, msg=key)
+                    self.assertLessEqual(self.box(title)[1] + title.height(), p[1] + 44, msg=f"{key} stays inside its header")
+                    if native_fonts:
+                        self.assertFalse(title.property("truncated"), key)
+                    # ENABLED / 0/4 / LIVE share one right-hand boundary, 12 px in.
+                    right = [self.box(n) for n in self.walk(panel, []) if n.isVisible()
+                             and ("Pill" in n.metaObject().className() or n.property("text") == "0/4") and self.box(n)[1] < p[1] + 44]
+                    self.assertTrue(right, key)
+                    self.assertAlmostEqual(12, p[2] - max(r[2] for r in right), delta=1.5, msg=key)
+                # All five lifecycle labels whole; values stop before the trailing slot.
+                labels = [n for n in nodes if n.isVisible() and n.property("text") in ("Status", "Connector", "Capability", "Destination", "Outcome")
+                          and n.property("truncated") is not None]
+                self.assertEqual(5, len(labels))
+                if native_fonts:
+                    self.assertFalse(any(n.property("truncated") for n in labels))
+                # Uptime / Execution / Model are never hidden: beside the rings or reflowed.
+                side = self.item(root, "systemMetadata"); compact = self.item(root, "systemMetadataCompact")
+                self.assertTrue(side.isVisible() != compact.isVisible())
+                # Historical errors are local rows; the stack itself is not a fault state.
+                self.assertEqual("idle", bridge.coreState)
+        self.assertEqual(0, self.execute_calls())
+
+
 class LocalFitTests(UiTestCase):
     """Phase 3.4b: local fit and real pointer routing, no backend activity."""
 

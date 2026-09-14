@@ -20,6 +20,9 @@ Rectangle {
     property bool shadow: true
     property bool brackets: false
     property bool closable: false
+    // Opt-in: a title that does not fit on one line wraps deliberately onto
+    // two (baselines ~20 / ~34 px) inside the same header allocation.
+    property bool titleWrap: false
     // The colour of the panel's edge light and brackets (structural, not semantic).
     property color accentColor: Theme.accent
     signal closeRequested()
@@ -100,12 +103,20 @@ Rectangle {
             anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
             spacing: 14
             Text {
+                objectName: panel.title !== "" ? "panelTitle_" + panel.title : ""
                 anchors.verticalCenter: parent.verticalCenter
                 text: panel.title.toUpperCase()
-                width: Math.min(implicitWidth, Math.max(0, header.width - headerTail.width - (panel.closable ? 42 : 0) - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8))
+                readonly property real room: Math.max(0, header.width - headerTail.width - (panel.closable ? 42 : 0) - (leftBadge.visible ? leftBadge.width + 14 : 0) - 8)
+                readonly property bool wraps: panel.titleWrap && titleMetrics.advanceWidth > room
+                width: !panel.titleWrap ? Math.min(implicitWidth, room) : wraps ? room : Math.min(Math.ceil(titleMetrics.advanceWidth) + 2, room)
+                wrapMode: wraps ? Text.WordWrap : Text.NoWrap
+                maximumLineCount: wraps ? 2 : 1
+                lineHeightMode: wraps ? Text.FixedHeight : Text.ProportionalHeight
+                lineHeight: wraps ? 14 : 1
                 elide: Text.ElideRight
                 color: "#cfeaff"
                 font { family: Theme.font; pixelSize: 12; letterSpacing: 1.6; weight: Font.DemiBold }
+                TextMetrics { id: titleMetrics; text: panel.title.toUpperCase(); font.family: Theme.font; font.pixelSize: 12; font.letterSpacing: 1.6; font.weight: Font.DemiBold }
             }
             Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }

@@ -120,7 +120,8 @@ Item {
                      : modelData.id === "activity" ? "live"
                      : modelData.id === "automations" ? (column.commandMode ? bridge.projects.length + " projects" : bridge.jobs.length + " job" + (bridge.jobs.length === 1 ? "" : "s"))
                      : ""
-                badgeRight: modelData.id !== "system"
+                badgeRight: !column.commandMode || modelData.id !== "system"
+                titleWrap: !column.commandMode
                 badgeColor: modelData.id === "system" ? (bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success)
                           : modelData.id === "activity" ? Theme.success : Theme.accent
                 color: column.commandMode ? Theme.surface : column.surface
@@ -128,7 +129,7 @@ Item {
                 border.color: bridge.editMode ? Theme.alpha(Theme.accent, 0.7) : column.commandMode ? Theme.border : Theme.alpha(column.structure, 0.5)
                 headerRight: [
                     Item {
-                        height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowHead.width : pinned.width)
+                        height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowHead.width : (pinned.visible ? pinned.width : 0))
                         Row {
                             id: handles
                             spacing: 2
@@ -188,11 +189,12 @@ Item {
     component StatRow: Item {
         property string k: ""; property string v: ""; property color tint: Theme.accentSoft; property color vColor: "#f2f8ff"
         property int size: 15
+        property int labelX: 21
         width: parent.width; height: 30
-        Rectangle { width: 7; height: 7; radius: 3.5; color: tint; anchors.verticalCenter: parent.verticalCenter
+        Rectangle { x: 0; width: 7; height: 7; radius: 3.5; color: tint; anchors.verticalCenter: parent.verticalCenter
             Rectangle { anchors.centerIn: parent; width: 15; height: 15; radius: 7.5; color: tint; opacity: 0.2 } }
-        Text { x: 21; anchors.verticalCenter: parent.verticalCenter; text: k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: size } }
-        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 21 - kw.width - 10; horizontalAlignment: Text.AlignRight
+        Text { x: labelX; anchors.verticalCenter: parent.verticalCenter; text: k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: size } }
+        Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: parent.width - labelX - kw.width - 10; horizontalAlignment: Text.AlignRight
             text: v; color: vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: size; weight: Font.DemiBold } }
         TextMetrics { id: kw; text: k; font.family: Theme.font; font.pixelSize: size }
     }
@@ -214,32 +216,49 @@ Item {
             Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: "#c3d8ea"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 8 : 10; letterSpacing: 0.8 } }
         }
     }
-    // One row of the reference's workflow well: icon box, label, dot, status, handle.
+    // The stack's shared alignment grid, inside a well (px from the well's
+    // inner left / right edges): A icon column at 12, B text after the icon
+    // slot (+8), C the value column after the widest field label, D the
+    // trailing slot at 12 from the right. The icon slot is 28 px on desktop
+    // rhythm and 24 px compact; a smaller tile centres inside it so B holds.
+    readonly property int gridA: 12
+    readonly property int gridD: 12
+    // One row of the workflow well: icon well, label, state dot, value, trailing indicator.
     component WRow: Item {
+        id: wrow
         property string glyph: "◇"; property color tint: Theme.accent; property string k: ""; property string v: ""; property color vColor: "#9fb6d0"; property bool empty: false; property bool last: false
         width: parent.width; height: 41
         readonly property bool compact: height < 30
-        readonly property int tile: compact ? 18 : height >= 38 ? 28 : 24
+        readonly property int slot: height >= 38 ? 28 : 24
+        readonly property int tile: Math.min(slot, height - 4)
         readonly property int fs: compact ? (column.commandMode ? 12 : 13) : (column.commandMode ? 12 : 15)
-        readonly property real dotX: Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
-        Rectangle { x: 11; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: compact ? 5 : 7
+        readonly property real textX: column.gridA + slot + 8
+        // C: every label keeps its full width - the column is set by the widest field.
+        readonly property real dotX: column.commandMode ? Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
+                                                        : Math.ceil(textX + widest.advanceWidth + (compact ? 8 : 12))
+        readonly property int trail: 10                      // the trailing indicator's own slot
+        TextMetrics { id: widest; text: "Destination"; font.family: Theme.font; font.pixelSize: wrow.fs }
+        Rectangle { x: column.gridA + (slot - tile) / 2; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: tile < 24 ? 5 : 7
             color: empty ? "#0b2036" : "#0e2f4e"; border.width: 1; border.color: Theme.alpha(column.structure, empty ? 0.4 : 0.75)
             Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.alpha(column.structure, 0.8) : column.highlight; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
-        Text { x: 11 + tile + (compact ? 10 : 14); width: dotX - x - 10; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
+        Text { x: textX; width: dotX - x - 8; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
                color: empty ? "#cfdceb" : "#f2f8ff"; font { family: Theme.font; pixelSize: fs } }
         Rectangle { x: dotX; width: compact ? 6 : 7; height: width; radius: width / 2; anchors.verticalCenter: parent.verticalCenter; color: empty ? "#4f6b8a" : tint
             Rectangle { visible: !empty; anchors.centerIn: parent; width: parent.width + 8; height: width; radius: width / 2; color: tint; opacity: 0.22 } }
-        Text { anchors.left: parent.left; anchors.leftMargin: dotX + (compact ? 14 : 17); anchors.right: parent.right; anchors.rightMargin: 30; anchors.verticalCenter: parent.verticalCenter
+        // The value stops before the trailing slot; it never reaches the indicator.
+        Text { objectName: "workflowValue_" + k
+            anchors.left: parent.left; anchors.leftMargin: dotX + (compact ? 12 : 15); anchors.right: parent.right; anchors.rightMargin: column.gridD + trail + 8; anchors.verticalCenter: parent.verticalCenter
             text: v; color: empty ? "#8ea6c2" : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: fs } }
-        Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "⁘"; color: "#4f6b8a"; font.pixelSize: compact ? 11 : 13 }
-        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 11 + tile + (compact ? 10 : 14); rightMargin: 8 } height: 1; color: Theme.alpha(column.structure, 0.26) }
+        Text { anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter; width: trail; horizontalAlignment: Text.AlignHCenter
+               text: "⁘"; color: "#4f6b8a"; font.pixelSize: compact ? 11 : 13 }
+        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: textX; rightMargin: column.gridD } height: 1; color: Theme.alpha(column.structure, 0.26) }
     }
     // The inset well that holds rows (the reference's rounded inner frame).
     component Well: Rectangle {
         default property alias rows: inner.data
         property bool fill: false
         width: parent.width; height: fill ? parent.height : inner.height + 2
-        radius: 10; color: Theme.glassSecondaryReading; border.width: 1; border.color: Theme.alpha(column.structure, 0.3)
+        radius: 10; color: Theme.glassSecondaryReading; border.width: 1; border.color: Theme.alpha(column.structure, 0.22)
         Column { id: inner; x: 1; y: 1; width: parent.width - 2 }
     }
 
@@ -249,38 +268,73 @@ Item {
             id: sys
             readonly property real bw: width
             readonly property real bh: height
-            // Ring diameter from the width the body really has, then the
-            // cluster; the status list takes the rest when it has room.
-            readonly property int d: bw >= 460 ? 60 : bw >= 360 ? 48 : 40
-            readonly property int g: Math.round(d * (bw >= 360 ? 0.55 : 0.45))
+            // Metrics beside the metadata while the body is wide enough (the
+            // desktop arrangement, with local gaps reduced first); otherwise the
+            // local reflow inside the same panel height: the rings across the
+            // top, the note beneath, then the three metadata fields.
+            readonly property bool side: bw >= 260
+            readonly property int d: side ? (bw >= 460 ? 60 : bw >= 340 ? 48 : 34) : 32
+            readonly property int g: side ? (bw >= 340 ? Math.round(d * 0.55) : 10) : 12
             readonly property int clusterW: 3 * d + 2 * g
-            readonly property bool list: bw - clusterW - 22 >= 135
-            readonly property int pitch: Math.max(20, Math.min(bh >= 110 ? 38 : 34, Math.floor(bh / 3)))
+            readonly property real listX: side ? clusterW + (bw >= 340 ? 22 : 14) : 0
             readonly property int fs: bw >= 460 ? 15 : 13
-            readonly property bool caption: bh >= d + 34
-            // The ring centre line: shared by the cluster and the list.
-            readonly property real cy: caption ? (bh - 16) / 2 : bh / 2
+            readonly property int pitch: Math.max(20, Math.min(bh >= 110 ? 38 : 34, Math.floor((bh - 6) / 3)))
+            readonly property bool caption: !side || bh >= d + 34
+            // The ring centre line; the list centres on it wherever the body allows.
+            readonly property real cy: side ? (caption ? (bh - 16) / 2 : bh / 2) : d / 2
+            readonly property real listY: Math.max(3, Math.min(Math.round(cy - 1.5 * pitch), bh - 3 - 3 * pitch))
+            readonly property string uptime: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m"
+            readonly property string execution: bridge.configRefused ? "Refused" : (bridge.executionEnabled ? "Enabled" : "Disabled")
+            readonly property color executionTint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
+            readonly property string model: bridge.config.claude_model || "CLI default"
             Row {
                 id: gauges
+                objectName: "systemGauges"
                 x: 2; y: Math.round(sys.cy - sys.d / 2)
                 spacing: sys.g
                 Gauge { label: "CPU"; width: sys.d; height: width }
                 Gauge { label: "RAM"; width: sys.d; height: width }
                 Gauge { label: "Disk"; width: sys.d; height: width }
             }
-            // Said plainly, once, beneath the cluster - the rings carry "—".
-            Text { visible: sys.caption; x: 4; y: gauges.y + sys.d + 9; width: sys.clusterW; horizontalAlignment: Text.AlignHCenter
-                   text: "Not measured by this build"; color: "#6d88a6"; font { family: Theme.font; pixelSize: 10; letterSpacing: 0.8 } }
-            Rectangle { visible: sys.list; x: sys.clusterW + 12; width: sys.bw - x + 4; radius: 10
-                y: Math.round(sys.cy - 1.5 * sys.pitch) - 6; height: 3 * sys.pitch + 12; color: Theme.glassSecondaryReading }
+            // Said plainly, once, on one deliberate baseline beneath the rings.
+            Text { objectName: "systemNote"; visible: sys.caption
+                   x: sys.side ? 2 : 2; y: gauges.y + sys.d + (sys.side ? 9 : 3)
+                   // Compact: the note takes the room up to the metadata list, untracked, so it stays whole.
+                   width: !sys.side ? sys.bw - 4 : sys.bw >= 340 ? sys.clusterW : sys.listX - 10
+                   horizontalAlignment: sys.side ? Text.AlignHCenter : Text.AlignLeft
+                   text: "Not measured by this build"; color: "#6d88a6"; elide: Text.ElideRight
+                   font { family: Theme.font; pixelSize: 10; letterSpacing: sys.side && sys.bw < 340 ? 0 : 0.8 } }
+            // Beside the rings: three rows - one dot axis, labels left, values right.
+            Rectangle { visible: sys.side; x: sys.listX - 8; width: sys.bw - x; radius: 10
+                y: sys.listY - 4; height: 3 * sys.pitch + 8; color: Theme.glassSecondaryReading }
             Column {
-                visible: sys.list
-                x: sys.clusterW + 22; width: sys.bw - x
-                y: Math.round(sys.cy - 1.5 * sys.pitch)
+                objectName: "systemMetadata"
+                visible: sys.side
+                x: sys.listX; width: sys.bw - x - 6
+                y: sys.listY
                 spacing: 0
-                StatRow { height: sys.pitch; size: sys.fs; k: "Uptime"; v: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m" }
-                StatRow { height: sys.pitch; size: sys.fs; k: "Execution"; v: bridge.configRefused ? "Refused" : (bridge.executionEnabled ? "Enabled" : "Disabled"); tint: bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success; vColor: tint }
-                StatRow { height: sys.pitch; size: sys.fs; k: "Model"; v: bridge.config.claude_model || "CLI default" }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Uptime"; v: sys.uptime }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Execution"; v: sys.execution; tint: sys.executionTint; vColor: tint }
+                StatRow { height: sys.pitch; size: sys.fs; labelX: sys.bw >= 340 ? 21 : 15; k: "Model"; v: sys.model }
+            }
+            // Reflowed: the three fields side by side beneath the note - each a
+            // dot and label over its value - so all three stay inside the height.
+            Rectangle { visible: !sys.side; x: 0; width: sys.bw; y: sys.d + 19; height: sys.bh - y; radius: 7; color: Theme.glassSecondaryReading }
+            Row {
+                objectName: "systemMetadataCompact"
+                visible: !sys.side
+                x: 6; y: sys.d + 20; width: sys.bw - 12
+                Repeater {
+                    model: [{ k: "Uptime", v: sys.uptime, tint: Theme.accentSoft, vc: "#f2f8ff" },
+                            { k: "Execution", v: sys.execution, tint: sys.executionTint, vc: sys.executionTint },
+                            { k: "Model", v: sys.model, tint: Theme.accentSoft, vc: "#f2f8ff" }]
+                    Item {
+                        width: (sys.bw - 12) / 3; height: sys.bh - sys.d - 20
+                        Rectangle { x: 0; y: 5; width: 6; height: 6; radius: 3; color: modelData.tint }
+                        Text { x: 10; y: 0; width: parent.width - 12; elide: Text.ElideRight; text: modelData.k; color: "#b3cbe0"; font { family: Theme.font; pixelSize: 10 } }
+                        Text { x: 10; y: 13; width: parent.width - 12; elide: Text.ElideRight; text: modelData.v; color: modelData.vc; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } }
+                    }
+                }
             }
         }
     }
@@ -321,7 +375,13 @@ Item {
             id: feedWell
             readonly property bool compact: column.commandMode || width < 380
             readonly property int pitch: compact ? 46 : 56
-            readonly property int glyphD: compact ? 24 : 28
+            // The icon slot follows the shared grid (28 desktop, 24 compact);
+            // the typography stays as it was.
+            readonly property int glyphD: column.commandMode ? 24 : (width >= 340 ? 28 : 24)
+            readonly property real textX: column.gridA + glyphD + 8
+            // D: a stable, unwrapped timestamp column (~56 px) at the shared right inset.
+            readonly property real timeW: Math.max(56, Math.ceil(stamp.advanceWidth))
+            TextMetrics { id: stamp; text: "00 min ago"; font.family: Theme.font; font.pixelSize: feedWell.compact ? 11 : 12 }
             readonly property int rowsShown: bridge.activity.length + (bridge.activity.length < 4 ? 1 : 0)
             readonly property int rowsFit: Math.max(1, Math.floor((feedRoot.height - 2) / pitch))
             height: Math.min(rowsShown, rowsFit) * pitch + 2
@@ -337,23 +397,25 @@ Item {
                     readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
                     readonly property string source: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"
                     // Source glyph: a small technical disc, blue unless the event itself is semantic.
-                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2
+                    Rectangle { x: column.gridA; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2
                         color: semantic ? Theme.alpha(tint, 0.16) : "#0e2f4e"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : Theme.alpha(column.structure, 0.75)
                         Text { anchors.centerIn: parent; text: glyph; color: tint; font { family: Theme.font; pixelSize: Math.round(feedWell.glyphD * 0.46); weight: Font.DemiBold } } }
-                    Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: timeText.left; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
+                    Column { anchors.left: parent.left; anchors.leftMargin: feedWell.textX; anchors.right: timeText.left; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                         Text { text: modelData.text; color: "#f2f8ff"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
                         Text { text: source; color: "#8ea6c2"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
                     }
-                    Text { id: timeText; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: column.ago(modelData.ts, modelData.time); color: "#8ea6c2"; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
-                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: Theme.alpha(column.structure, 0.26) }
+                    Text { id: timeText; objectName: "feedTime"; anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter
+                           width: feedWell.timeW; horizontalAlignment: Text.AlignRight; elide: Text.ElideLeft
+                           text: column.ago(modelData.ts, modelData.time); color: "#8ea6c2"; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
+                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: feedWell.textX; rightMargin: column.gridD } height: 1; color: Theme.alpha(column.structure, 0.26) }
                 }
                 // Sparse and empty states share the row grammar, one step quieter.
                 footer: Item {
                     width: ListView.view.width; height: visible ? feedWell.pitch : 0
                     visible: bridge.activity.length < 4
-                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(column.structure, 0.4)
+                    Rectangle { x: column.gridA; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(column.structure, 0.4)
                         Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: "#4f6b8a" } }
-                    Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
+                    Column { anchors.left: parent.left; anchors.leftMargin: feedWell.textX; anchors.right: parent.right; anchors.rightMargin: column.gridD; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                         Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: "#cfdceb"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
                         Text { text: "Approvals, outcomes and scheduled runs appear here"; color: "#6d88a6"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
                     }
