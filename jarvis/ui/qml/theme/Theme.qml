@@ -63,7 +63,7 @@ QtObject {
     readonly property real macroCoreY: 0.0799
     readonly property real macroCoreSize: 0.1580       // core diameter, of viewport width (reference 15.4)
     readonly property real macroStripRight: 0.0143     // command-strip right margin
-    readonly property real macroChip: 0.1458           // Option 5 selector envelope (280 px at 1920)
+    readonly property real macroChip: 0.1583           // model selector envelope (304 px at 1920)
     readonly property real macroHudLine: 0.1725         // header linework baseline, of viewport height
     // The rail shrinks before the work surface does, and never disappears.
     function px(v, lo, hi) { return Math.round(Math.max(lo, Math.min(hi, v))) }
@@ -75,7 +75,7 @@ QtObject {
     function columnGap(w) { return px(w * macroGap, 12, 26) }
     function stackGap(stackHeight) { return px(stackHeight * macroStackGap, 10, 30) }
     function coreSize(w) { return px(w * macroCoreSize, 175, 330) }
-    function chipWidth(w) { return px(w * macroChip, 188, 300) }
+    function chipWidth(w) { return px(w * macroChip, 188, 324) }
     function stripSpacing(w) { return px(w * 0.0073, 8, 16) }
     function hudLine(h) { return px(h * macroHudLine, 132, 218) }
     function shellLift(h) { return px(h * (macroTopZone - macroShellTop), 20, 44) }

@@ -1152,9 +1152,10 @@ class CommandHeaderTests(UiTestCase):
                 root, "jarvisCore", "commandStrip", "modelTrigger", "statusOrb",
                 "killSwitchControl", "navigationTrigger")
             with self.subTest(size=(width, height)):
-                # The core is the dominant header element and keeps its centre.
+                # The core is the dominant header element and keeps its centre
+                # (the selector is +24 px wide by design; the core still dwarfs it).
                 self.assertAlmostEqual(48.90, 100 * (core[0] + core[2]) / 2 / width, delta=1.0)
-                self.assertGreater(core[2] - core[0], chip[2] - chip[0])
+                self.assertGreater((core[2] - core[0]) * (core[3] - core[1]), 3 * (chip[2] - chip[0]) * (chip[3] - chip[1]))
                 self.assertGreater(core[3] - core[1], 3.5 * (chip[3] - chip[1]))
                 self.assertGreater(core[2] - core[0], 3 * (lamp[2] - lamp[0]))
                 self.assertGreater(core[2] - core[0], 3 * (kill[2] - kill[0]))
@@ -1168,8 +1169,12 @@ class CommandHeaderTests(UiTestCase):
                 for left, right in zip(order, order[1:]):
                     self.assertLessEqual(left[2], right[0] + 1)
                 # Degradation never shrinks a control or the selector below a
-                # usable width.
+                # usable width; at the 1920 contract the selector is 304 px
+                # (the approved +24 px, taken to the left).
                 self.assertGreaterEqual(chip[2] - chip[0], 188)
+                if width == 1920:
+                    self.assertAlmostEqual(304, chip[2] - chip[0], delta=0.6)
+                    self.assertAlmostEqual(1562, chip[2], delta=1.0, msg="the selector's right edge stays where it was")
                 self.assertGreaterEqual(lamp[2] - lamp[0], 56)
                 self.assertGreaterEqual(kill[2] - kill[0], 44)
                 self.assertGreaterEqual(nav[2] - nav[0], 34)
@@ -1376,6 +1381,20 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertAlmostEqual(feed[2] - 16, user[2], delta=1.5, msg="the operator's bubble is right-aligned")
         self.assertGreater(user[0], feed[0] + (feed[2] - feed[0]) * 0.3)
         self.assertAlmostEqual(feed[0] + messageX, system[0], delta=1.5, msg="assistant-side turns stay on the left")
+        # The assistant avatar: a 32 px mark inside a 36 px reserve, unclipped,
+        # its top on the identity row.
+        bridge._say("jarvis", "An assistant turn for the avatar."); pump(400)
+        avatar = self.box(root, "feedAvatar_jarvis"); card = self.box(root, "feedCard_jarvis")
+        self.assertAlmostEqual(32, avatar[2] - avatar[0], delta=0.6)
+        self.assertGreaterEqual(avatar[0] - 2, feed[0]); self.assertGreaterEqual(avatar[1] - 2, card[1] - 2)
+        self.assertLess(avatar[2], card[0])
+        # The rail socket: 36 px, flush inside the card, centred; the card's
+        # size and hit area are what they were.
+        for key in self.SUMMARY:
+            sock = self.box(root, "railSocket" + key); rail_card = self.box(root, "rail" + key)
+            self.assertAlmostEqual(36, sock[2] - sock[0], delta=0.6)
+            self.assertAlmostEqual((sock[1] + sock[3]) / 2, (rail_card[1] + rail_card[3]) / 2, delta=1.0)
+            self.assertGreater(sock[0], rail_card[0]); self.assertGreaterEqual(rail_card[3] - rail_card[1], 150)
         self.assertEqual(0, self.execute_calls())
 
     def test_empty_state_welcome_gives_way_to_the_first_accepted_turn(self) -> None:
@@ -1532,6 +1551,104 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertFalse(self.item(root, "summaryPeekEmpty").isVisible())
         self.assertIn("JARVIS interface started", self.texts(self.item(root, "summaryPeek"), []))
         self.assertEqual(0, self.execute_calls())
+
+class ReactorStateTests(UiTestCase):
+    """The core's semantic light follows the real state only; confirmed OFF is
+    dormant; shutdown and re-enable are visual confirmations of a state that
+    has already changed, and rapid toggles cancel obsolete transitions."""
+
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def levels(self, core, prefix):
+        return [core.property(prefix + str(k)) for k in range(6)]
+
+    def force(self, bridge, state):
+        bridge._busy = state == "running"
+        bridge._ticket = object() if state == "awaiting_approval" else None
+        bridge._clarification = {}
+        bridge._last_outcome = state if state in ("completed", "error", "unknown") else "idle"
+        bridge._refresh_core_state()
+
+    def test_full_circumference_signals_follow_the_real_state_only(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(2800)
+        core = self.item(root, "jarvisCore")
+        self.assertTrue(core.property("alive")); self.assertTrue(core.property("booted"))
+        # Blue information: every sector housing takes part, then it is over.
+        bridge._note("An ordinary event", "system"); pump(330)
+        lit = self.levels(core, "blue")
+        self.assertGreater(max(lit), 0.3); self.assertGreater(len([v for v in lit if v > 0.05]), 1)
+        pump(900)
+        self.assertLess(max(self.levels(core, "blue")), 0.02)
+        self.assertLess(core.property("hold"), 0.01)
+        # Blocked: muted amber travels, then all six hold while attention is required.
+        self.force(bridge, "awaiting_approval"); pump(300)
+        self.assertGreater(max(self.levels(core, "sig")), 0.3)
+        pump(1200)
+        self.assertAlmostEqual(0.38, core.property("hold"), delta=0.02)
+        self.assertEqual("#ffb347", core.property("sigTint").name())
+        self.force(bridge, "idle"); pump(600)
+        self.assertLess(core.property("hold"), 0.01)
+        # Confirmed failure: the strongest response, then a controlled hold.
+        self.force(bridge, "error"); pump(1500)
+        self.assertAlmostEqual(0.5, core.property("hold"), delta=0.02)
+        self.assertEqual("#ff5c6c", core.property("sigTint").name())
+        # A historical error in the feed never forces fault state.
+        self.force(bridge, "idle"); pump(600)
+        bridge._note("Intent model_cancelled", "error"); pump(500)
+        self.assertEqual("idle", bridge.coreState); self.assertLess(core.property("hold"), 0.01)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_confirmed_off_is_dormant_and_re_enable_reuses_the_startup(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        root.resize(1920, 1080); pump(2800)
+        core = self.item(root, "jarvisCore")
+        # OFF is real at 0 ms; the 720 ms confirmation drains circulation,
+        # ring, nucleus, then the last emission.
+        bridge.setExecutionEnabled(False)
+        self.assertEqual("disabled", bridge.coreState); self.assertFalse(bridge.executionEnabled)
+        pump(250)
+        self.assertEqual(0, core.property("circulation")); self.assertGreater(core.property("nucleus"), 0.9)
+        pump(700)
+        for name in ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual"):
+            self.assertEqual(0, core.property(name), name)
+        self.assertTrue(core.property("booted"))
+        # Nothing semantic while dormant, and no pulse of any kind.
+        bridge._note("Event while off", "system"); pump(400)
+        self.assertLess(max(self.levels(core, "blue")), 0.01)
+        self.assertEqual(1, core.property("breath"))
+        # Re-enable: the existing awakening, from dormant to living.
+        bridge.setExecutionEnabled(True)
+        self.assertEqual("idle", bridge.coreState)
+        pump(500)
+        self.assertGreater(core.property("bootFocus"), 0.5); self.assertLess(core.property("spin"), 1)
+        pump(2300)
+        for name in ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual"):
+            self.assertEqual(1, core.property(name), name)
+        self.assertTrue(core.property("booted"))
+        # Rapid toggles cancel obsolete transitions instead of queuing them.
+        bridge.setExecutionEnabled(False); pump(120); bridge.setExecutionEnabled(True); pump(2800)
+        for name in ("spin", "circulation", "ringEnergy", "nucleus", "residual"):
+            self.assertEqual(1, core.property(name), name)
+        bridge.setExecutionEnabled(False); pump(300); bridge.setExecutionEnabled(True); pump(150); bridge.setExecutionEnabled(False); pump(1200)
+        for name in ("spin", "circulation", "ringEnergy", "nucleus", "residual"):
+            self.assertEqual(0, core.property(name), name)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_launching_disabled_renders_dormant_at_once(self) -> None:
+        bridge = self.bridge()
+        bridge.setExecutionEnabled(False)
+        root = self.window(bridge)
+        pump(120)
+        core = self.item(root, "jarvisCore")
+        self.assertTrue(core.property("dormant")); self.assertTrue(core.property("booted"))
+        for name in ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual"):
+            self.assertEqual(0, core.property(name), name)
+        self.assertEqual(0, self.execute_calls())
+
 
 class LocalFitTests(UiTestCase):
     """Phase 3.4b: local fit and real pointer routing, no backend activity."""

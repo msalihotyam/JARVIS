@@ -15,6 +15,12 @@ Item {
     property real editChrome: bridge.editMode ? 54 : 0
     property real usable: height - editChrome - Math.max(0, shown.length - 1) * gapPx
     readonly property int minPanelHeight: 120
+    // One structural palette for the stack: deep navy surface, cool-blue
+    // borders and default glyphs, blue-cyan local highlights. Green, red and
+    // amber remain semantic only.
+    readonly property color surface: "#f4071521"
+    readonly property color structure: "#278dce"
+    readonly property color highlight: "#49bdfa"
     // Gap between stacked panels: proportional to the stack, as in the reference.
     readonly property int gapPx: Theme.stackGap(height)
     property real nowSec: Date.now() / 1000
@@ -116,7 +122,9 @@ Item {
                 badgeRight: modelData.id !== "system"
                 badgeColor: modelData.id === "system" ? (bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success)
                           : modelData.id === "activity" ? Theme.success : Theme.accent
-                border.color: bridge.editMode ? Theme.alpha(Theme.accent, 0.7) : Theme.border
+                color: column.commandMode ? Theme.surface : column.surface
+                accentColor: column.commandMode ? Theme.accent : column.highlight
+                border.color: bridge.editMode ? Theme.alpha(Theme.accent, 0.7) : column.commandMode ? Theme.border : Theme.alpha(column.structure, 0.5)
                 headerRight: [
                     Item {
                         height: 24; width: bridge.editMode ? handles.width : (modelData.id === "workflow" ? workflowHead.width : pinned.width)
@@ -135,7 +143,7 @@ Item {
                             visible: !bridge.editMode && modelData.id === "workflow"
                             ActionButton { label: "Cancel"; danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
                             ActionButton { label: "New session"; compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
-                            Text { text: column.stagesDone() + "/4"; color: Theme.accent; anchors.verticalCenter: parent.verticalCenter; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold; letterSpacing: 0.5 } }
+                            Text { text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold; letterSpacing: 0.5 } }
                         }
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: "PINNED"; color: Theme.textDim; font { family: Theme.font; pixelSize: 9; letterSpacing: 1.5 } }
                     }
@@ -193,13 +201,13 @@ Item {
         width: 60; height: 60
         readonly property real stroke: Math.max(3, Math.round(width * 0.085))
         // Soft halo, then the track, then the dark glass disc and its edge light.
-        Rectangle { anchors.fill: parent; anchors.margins: -4; radius: width / 2; color: "transparent"; border.width: 1; border.color: ratio < 0 ? "#2a5f8f" : Theme.alpha(tint, 0.35); opacity: 0.6 }
-        Rectangle { anchors.fill: parent; radius: width / 2; color: "#0a1a2c"; border.width: stroke; border.color: ratio < 0 ? "#1c4a74" : Theme.alpha(tint, 0.9) }
-        Rectangle { anchors.fill: parent; anchors.margins: stroke; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#2a6a96"; opacity: 0.45 }
+        Rectangle { anchors.fill: parent; anchors.margins: -4; radius: width / 2; color: "transparent"; border.width: 1; border.color: ratio < 0 ? Theme.alpha(column.structure, 0.45) : Theme.alpha(tint, 0.35); opacity: 0.6 }
+        Rectangle { anchors.fill: parent; radius: width / 2; color: "#081a2c"; border.width: stroke; border.color: ratio < 0 ? Theme.alpha(column.structure, 0.62) : Theme.alpha(tint, 0.9) }
+        Rectangle { anchors.fill: parent; anchors.margins: stroke; radius: width / 2; color: "transparent"; border.width: 1; border.color: column.structure; opacity: 0.4 }
         Rectangle { anchors.fill: parent; anchors.margins: stroke + 1; radius: width / 2
             gradient: Gradient { GradientStop { position: 0; color: "#14102a44" } GradientStop { position: 1; color: "#00000000" } } }
         // A calibration tick at 12 o'clock: instrument, not value.
-        Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 1; width: 2; height: stroke - 2; color: "#4d9fd2"; opacity: 0.8 }
+        Rectangle { anchors.horizontalCenter: parent.horizontalCenter; y: 1; width: 2; height: stroke - 2; color: column.highlight; opacity: 0.8 }
         Column { anchors.centerIn: parent; spacing: width < 48 ? -3 : -1
             Text { anchors.horizontalCenter: parent.horizontalCenter; text: value; color: ratio < 0 ? "#8fa8c4" : "#f2f8ff"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 12 : parent.parent.width < 56 ? 15 : 18; weight: Font.DemiBold } }
             Text { anchors.horizontalCenter: parent.horizontalCenter; text: label; color: "#c3d8ea"; font { family: Theme.font; pixelSize: parent.parent.width < 48 ? 8 : 10; letterSpacing: 0.8 } }
@@ -214,8 +222,8 @@ Item {
         readonly property int fs: compact ? (column.commandMode ? 12 : 13) : (column.commandMode ? 12 : 15)
         readonly property real dotX: Math.round(parent.width * (parent.width < 340 ? 0.39 : 0.42))
         Rectangle { x: 11; anchors.verticalCenter: parent.verticalCenter; width: tile; height: tile; radius: compact ? 5 : 7
-            color: empty ? "#122c48" : "#1b4a78"; border.width: 1; border.color: empty ? "#1d4468" : "#3487bd"
-            Text { anchors.centerIn: parent; text: glyph; color: empty ? "#5f86ad" : "#4fc3ef"; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
+            color: empty ? "#0b2036" : "#0e2f4e"; border.width: 1; border.color: Theme.alpha(column.structure, empty ? 0.4 : 0.75)
+            Text { anchors.centerIn: parent; text: glyph; color: empty ? Theme.alpha(column.structure, 0.8) : column.highlight; font { family: Theme.font; pixelSize: Math.round(tile * 0.5) } } }
         Text { x: 11 + tile + (compact ? 10 : 14); width: dotX - x - 10; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter; text: k
                color: empty ? "#cfdceb" : "#f2f8ff"; font { family: Theme.font; pixelSize: fs } }
         Rectangle { x: dotX; width: compact ? 6 : 7; height: width; radius: width / 2; anchors.verticalCenter: parent.verticalCenter; color: empty ? "#4f6b8a" : tint
@@ -223,14 +231,14 @@ Item {
         Text { anchors.left: parent.left; anchors.leftMargin: dotX + (compact ? 14 : 17); anchors.right: parent.right; anchors.rightMargin: 30; anchors.verticalCenter: parent.verticalCenter
             text: v; color: empty ? "#8ea6c2" : vColor; elide: Text.ElideRight; font { family: Theme.font; pixelSize: fs } }
         Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "⁘"; color: "#4f6b8a"; font.pixelSize: compact ? 11 : 13 }
-        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 11 + tile + (compact ? 10 : 14); rightMargin: 8 } height: 1; color: "#1a3f5e"; opacity: 0.85 }
+        Rectangle { visible: !last; anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 11 + tile + (compact ? 10 : 14); rightMargin: 8 } height: 1; color: Theme.alpha(column.structure, 0.26) }
     }
     // The inset well that holds rows (the reference's rounded inner frame).
     component Well: Rectangle {
         default property alias rows: inner.data
         property bool fill: false
         width: parent.width; height: fill ? parent.height : inner.height + 2
-        radius: 10; color: Theme.alpha(Theme.bg0, 0.16); border.width: 1; border.color: "#1c4262"
+        radius: 10; color: "#7a06121f"; border.width: 1; border.color: Theme.alpha(column.structure, 0.3)
         Column { id: inner; x: 1; y: 1; width: parent.width - 2 }
     }
 
@@ -322,25 +330,25 @@ Item {
                 delegate: Item {
                     width: ListView.view.width; height: feedWell.pitch
                     readonly property bool semantic: modelData.kind === "approval" || modelData.kind === "unknown" || modelData.kind === "error"
-                    readonly property color tint: modelData.kind === "approval" ? Theme.warning : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : "#4fc3ef"
+                    readonly property color tint: modelData.kind === "approval" ? Theme.warning : modelData.kind === "unknown" ? Theme.unknownEdge : modelData.kind === "error" ? Theme.danger : column.highlight
                     readonly property string glyph: modelData.kind === "approval" ? "⚑" : modelData.kind === "unknown" ? "?" : modelData.kind === "error" ? "!" : modelData.kind === "scheduled" ? "⟳" : "◈"
                     readonly property string source: modelData.kind === "approval" ? "Authorization" : modelData.kind === "unknown" ? "Outcome unknown" : modelData.kind === "error" ? "Error" : modelData.kind === "scheduled" ? "Scheduled run" : "Interface"
                     // Source glyph: a small technical disc, blue unless the event itself is semantic.
                     Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2
-                        color: semantic ? Theme.alpha(tint, 0.16) : "#143656"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : "#2a6a96"
+                        color: semantic ? Theme.alpha(tint, 0.16) : "#0e2f4e"; border.width: 1; border.color: semantic ? Theme.alpha(tint, 0.55) : Theme.alpha(column.structure, 0.75)
                         Text { anchors.centerIn: parent; text: glyph; color: tint; font { family: Theme.font; pixelSize: Math.round(feedWell.glyphD * 0.46); weight: Font.DemiBold } } }
                     Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: timeText.left; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                         Text { text: modelData.text; color: "#f2f8ff"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }
                         Text { text: source; color: "#8ea6c2"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
                     }
                     Text { id: timeText; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: column.ago(modelData.ts, modelData.time); color: "#8ea6c2"; font { family: Theme.font; pixelSize: feedWell.compact ? 11 : 12 } }
-                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: "#1a3f5e"; opacity: 0.85 }
+                    Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: 10; rightMargin: 10 } height: 1; color: Theme.alpha(column.structure, 0.26) }
                 }
                 // Sparse and empty states share the row grammar, one step quieter.
                 footer: Item {
                     width: ListView.view.width; height: visible ? feedWell.pitch : 0
                     visible: bridge.activity.length < 4
-                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#1f4a6e"
+                    Rectangle { x: 12; anchors.verticalCenter: parent.verticalCenter; width: feedWell.glyphD; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.alpha(column.structure, 0.4)
                         Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 2.5; color: "#4f6b8a" } }
                     Column { anchors.left: parent.left; anchors.leftMargin: 12 + feedWell.glyphD + 13; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                         Text { text: bridge.activity.length === 0 ? "Nothing yet" : "Nothing else yet"; color: "#cfdceb"; width: parent.width; elide: Text.ElideRight; font { family: Theme.font; pixelSize: feedWell.compact ? 13 : 15 } }

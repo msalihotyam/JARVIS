@@ -173,35 +173,23 @@ Item {
                     }
                 }
 
-                // Icon tile: one cool-blue family for every module - a deep navy
-                // housing, a blue-cyan rim, a blue-white line icon. The modules keep
-                // their meanings and glyphs; no per-module branding colour.
+                // Icon socket: a compact recessed optical socket, nearly flush
+                // with the card - deep navy, restrained cool-blue edge accents,
+                // one blue-white line glyph. One family for every module; the
+                // card, its labels and its whole hit area are unchanged.
                 Rectangle {
                     id: tile
+                    objectName: "railSocket" + modelData.key
                     x: rail.tight ? 9 : 13; anchors.verticalCenter: parent.verticalCenter
-                    width: rail.tight ? 34 : rail.roomy ? 50 : 40; height: width; radius: rail.tight ? 9 : 13
-                    gradient: Gradient {
-                        GradientStop { position: 0; color: card.active || card.hovered ? "#1a5f9e" : "#144f86" }
-                        GradientStop { position: 1; color: "#0a2a4c" }
-                    }
-                    border.width: 1; border.color: Theme.alpha("#37c4f0", card.active || card.hovered ? 0.8 : 0.55)
+                    width: rail.tight ? 32 : 36; height: width; radius: rail.tight ? 8 : 9
+                    color: "#0a1f36"
+                    border.width: 1; border.color: Theme.alpha("#299ddf", card.active || card.hovered ? 0.7 : 0.42)
                     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-                    // Soft blue glow from the static sprite's blue frame.
-                    Image {
-                        z: -1; anchors.centerIn: parent
-                        width: 80 * tile.width / 44; height: width
-                        source: "../assets/icon-well-glow.png"
-                        sourceClipRect: Qt.rect(0, 0, 80, 80)
-                        opacity: card.active || card.hovered ? 1 : 0.8
-                    }
-                    // Glossy upper half and a crisp top light.
-                    Rectangle {
-                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
-                        height: parent.height * 0.5; radius: parent.radius - 1
-                        gradient: Gradient { GradientStop { position: 0; color: Qt.rgba(1, 1, 1, 0.2) } GradientStop { position: 1; color: Qt.rgba(1, 1, 1, 0.02) } }
-                    }
-                    Rectangle { x: 7; y: 1; width: parent.width - 14; height: 1; color: Qt.rgba(1, 1, 1, 0.38) }
-                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#b8e7ff"; scale: tile.width / 42 * 1.42 }
+                    // The recess: a darker upper half, a faint light along the lower edge.
+                    Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: parent.height * 0.5; radius: parent.radius - 1
+                        gradient: Gradient { GradientStop { position: 0; color: "#3a000a14" } GradientStop { position: 1; color: "transparent" } } }
+                    Rectangle { x: 7; y: parent.height - 2; width: parent.width - 14; height: 1; color: Theme.alpha("#49bdfa", 0.3) }
+                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#b8e7ff"; scale: (rail.tight ? 20 : 22) / 18 }
                 }
 
                 Column {

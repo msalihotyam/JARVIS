@@ -2,14 +2,16 @@ import QtQuick
 import QtQuick.Shapes
 import "../theme"
 
-// The approved "Option 5 - Command" model selector: a chamfered, layered
-// dark-glass instrument with a fine cyan perimeter, an inset provider frame,
-// the selected model as primary text, real metadata beneath it, and a drawn
-// chevron. It belongs to the same machine as the JARVIS core - it is not a
-// ComboBox and carries no Controls styling.
+// The model / provider selector: a clean technical instrument - a deep navy
+// body with one fine cool-blue perimeter and shallow corner cuts, one
+// restrained upper-edge highlight, a 28 px provider socket, the selected
+// model as primary text with the real metadata quieter beneath it, and a
+// 12 px drawn chevron. Hover brightens the perimeter a step; keyboard focus
+// adds a distinct fine outline; open keeps the silhouette and reverses the
+// chevron. It is not a ComboBox and carries no Controls styling.
 //
-// Content is real state only: the configured model (or the CLI default) and
-// the metadata the installation actually knows. Nothing is invented.
+// Content is real state only: the configured model (or the CLI default)
+// and the metadata the installation actually knows. Nothing is invented.
 Item {
     id: sel
     property bool open: false
@@ -17,7 +19,7 @@ Item {
     property string metadata: ""
     signal activated()
 
-    implicitWidth: 280
+    implicitWidth: 304
     implicitHeight: Theme.stripSelectorHeight
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
@@ -28,141 +30,84 @@ Item {
 
     readonly property bool hovered: hit.containsMouse
     readonly property bool active: hovered || open || activeFocus
-    readonly property int chamfer: Theme.stripChamfer
-    // One progression drives every stroke, so the state hierarchy is
-    // unmistakable: idle is a restrained technical perimeter, hover is a
-    // step brighter, open (or keyboard focus) is the full accent. Weight
-    // never changes, so the silhouette stays crisp.
-    property real edge: (sel.open || sel.activeFocus) ? 1 : (sel.hovered ? 0.55 : 0.26)
+    readonly property int cut: 6                         // shallow corner cuts
+    readonly property color blue: "#278dce"              // structural cool blue
+    readonly property color glint: "#49bdfa"             // local highlight
+    // One progression drives the perimeter: restrained at rest, a step
+    // brighter under the pointer or while open. Weight never changes.
+    property real edge: (sel.open || sel.hovered) ? 1 : 0.5
     Behavior on edge { NumberAnimation { duration: Theme.hoverMs } }
 
-    // -- layered glass body, chamfered ------------------------------------
+    // -- body: deep navy, one fine perimeter with corner cuts -----------------
     Shape {
         id: frame
         anchors.fill: parent
         preferredRendererType: Shape.CurveRenderer
         readonly property real w: sel.width
         readonly property real h: sel.height
-        readonly property real c: sel.chamfer
-        // Body: the inner octagon, dark glass with a top-down gradient.
+        readonly property real c: sel.cut
         ShapePath {
-            strokeWidth: -1
+            strokeColor: Theme.alpha(sel.blue, 0.42 + 0.5 * sel.edge); strokeWidth: 1
+            joinStyle: ShapePath.MiterJoin
             fillGradient: LinearGradient {
-                x1: 0; y1: 4; x2: 0; y2: frame.h - 4
-                GradientStop { position: 0; color: Theme.commandGlass0 }
-                GradientStop { position: 1; color: Theme.commandGlass1 }
+                x1: 0; y1: 0; x2: 0; y2: frame.h
+                GradientStop { position: 0; color: "#f40a2038" }
+                GradientStop { position: 1; color: "#f4061424" }
             }
-            startX: 4 + frame.c; startY: 4
-            PathLine { x: frame.w - 4 - frame.c; y: 4 }
-            PathLine { x: frame.w - 4; y: 4 + frame.c }
-            PathLine { x: frame.w - 4; y: frame.h - 4 - frame.c }
-            PathLine { x: frame.w - 4 - frame.c; y: frame.h - 4 }
-            PathLine { x: 4 + frame.c; y: frame.h - 4 }
-            PathLine { x: 4; y: frame.h - 4 - frame.c }
-            PathLine { x: 4; y: 4 + frame.c }
-            PathLine { x: 4 + frame.c; y: 4 }
+            startX: frame.c + 0.5; startY: 0.5
+            PathLine { x: frame.w - frame.c - 0.5; y: 0.5 }
+            PathLine { x: frame.w - 0.5; y: frame.c + 0.5 }
+            PathLine { x: frame.w - 0.5; y: frame.h - frame.c - 0.5 }
+            PathLine { x: frame.w - frame.c - 0.5; y: frame.h - 0.5 }
+            PathLine { x: frame.c + 0.5; y: frame.h - 0.5 }
+            PathLine { x: 0.5; y: frame.h - frame.c - 0.5 }
+            PathLine { x: 0.5; y: frame.c + 0.5 }
+            PathLine { x: frame.c + 0.5; y: 0.5 }
         }
-        // Outer perimeter: a single fine hairline, one step dimmer.
+        // One restrained upper-edge highlight, fading out before the middle.
         ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdgeDim, 0.24 + 0.52 * sel.edge)
-            strokeWidth: 1; fillColor: "transparent"; joinStyle: ShapePath.MiterJoin
-            startX: frame.c; startY: 0.5
-            PathLine { x: frame.w - frame.c; y: 0.5 }
-            PathLine { x: frame.w - 0.5; y: frame.c }
-            PathLine { x: frame.w - 0.5; y: frame.h - frame.c }
-            PathLine { x: frame.w - frame.c; y: frame.h - 0.5 }
-            PathLine { x: frame.c; y: frame.h - 0.5 }
-            PathLine { x: 0.5; y: frame.h - frame.c }
-            PathLine { x: 0.5; y: frame.c }
-            PathLine { x: frame.c; y: 0.5 }
-        }
-        // Inner perimeter: the illuminated frame proper.
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.15 + 0.62 * sel.edge)
-            strokeWidth: 1.4; fillColor: "transparent"; joinStyle: ShapePath.MiterJoin
-            startX: 4 + frame.c; startY: 4
-            PathLine { x: frame.w - 4 - frame.c; y: 4 }
-            PathLine { x: frame.w - 4; y: 4 + frame.c }
-            PathLine { x: frame.w - 4; y: frame.h - 4 - frame.c }
-            PathLine { x: frame.w - 4 - frame.c; y: frame.h - 4 }
-            PathLine { x: 4 + frame.c; y: frame.h - 4 }
-            PathLine { x: 4; y: frame.h - 4 - frame.c }
-            PathLine { x: 4; y: 4 + frame.c }
-            PathLine { x: 4 + frame.c; y: 4 }
-        }
-        // Thin illuminated edge fragments: a bright run top-right, one
-        // bottom-left, as in the reference.
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.10 + 0.80 * sel.edge); strokeWidth: 1.6
-            fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            startX: frame.w * 0.52; startY: 4.2
-            PathLine { x: frame.w - 8 - frame.c; y: 4.2 }
-        }
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.10 + 0.80 * sel.edge); strokeWidth: 1.6
-            fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            startX: 8 + frame.c; startY: frame.h - 4.2
-            PathLine { x: frame.w * 0.48; y: frame.h - 4.2 }
-        }
-        // Small technical accents just inside the chamfered ends.
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.18 + 0.52 * sel.edge); strokeWidth: 1; fillColor: "transparent"
-            startX: 4.5; startY: 4 + frame.c + 4
-            PathLine { x: 4.5; y: frame.h - 4 - frame.c - 4 }
-        }
-        ShapePath {
-            strokeColor: Theme.alpha(Theme.commandEdge, 0.18 + 0.52 * sel.edge); strokeWidth: 1; fillColor: "transparent"
-            startX: frame.w - 4.5; startY: 4 + frame.c + 4
-            PathLine { x: frame.w - 4.5; y: frame.h - 4 - frame.c - 4 }
+            strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
+            strokeColor: Theme.alpha(sel.glint, 0.22 + 0.3 * sel.edge)
+            startX: frame.c + 6; startY: 1.5
+            PathLine { x: frame.w * 0.58; y: 1.5 }
         }
     }
-    // Restrained inner highlight: one soft sheen across the upper body.
-    Rectangle {
-        x: 6; y: 5; width: sel.width - 12; height: Math.round((sel.height - 10) * 0.45)
-        opacity: 0.35 + 0.65 * sel.edge
-        gradient: Gradient {
-            GradientStop { position: 0; color: Theme.alpha(Theme.commandEdge, 0.07) }
-            GradientStop { position: 1; color: "transparent" }
-        }
-    }
+    // Keyboard focus: a distinct fine outline outside the perimeter.
     Rectangle {
         anchors.fill: parent; anchors.margins: -3; radius: 4
-        color: "transparent"; border.color: Theme.alpha(Theme.accent, 0.7)
+        color: "transparent"; border.width: 1; border.color: Theme.alpha(sel.glint, 0.85)
         visible: sel.activeFocus
     }
 
-    // -- provider identity in its own inset instrument frame ---------------
+    // -- provider socket ---------------------------------------------------------
     Rectangle {
         id: badge
         objectName: "selectorBadge"
         x: 12; anchors.verticalCenter: parent.verticalCenter
-        width: 30; height: 30; radius: 8
-        color: Theme.surfaceDeep
-        border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.34)
-        Rectangle {
-            anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1
-            color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.text, 0.05)
-        }
+        width: 28; height: 28; radius: 7
+        color: "#0a2238"
+        border.width: 1; border.color: Theme.alpha(sel.blue, 0.55)
+        Rectangle { x: 5; y: 1; width: parent.width - 10; height: 1; color: Theme.alpha(sel.glint, 0.22) }
         Text {
             objectName: "selectorLogo"
             anchors.centerIn: parent
-            text: "AI"; color: Theme.text
-            font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold }
+            text: "AI"; color: "#dbeeff"
+            font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold }
         }
     }
 
-    // -- model identity ----------------------------------------------------
+    // -- model identity ----------------------------------------------------------
     Column {
         id: identity
         anchors.verticalCenter: parent.verticalCenter
-        x: badge.x + badge.width + 8
+        x: badge.x + badge.width + 10
         width: Math.max(40, chevron.x - x - 8)
         spacing: 1
         Text {
             width: parent.width; elide: Text.ElideRight
             objectName: "selectorModelText"
             text: sel.modelName
-            color: Theme.text
+            color: "#eef7ff"
             font { family: Theme.font; pixelSize: sel.width >= 240 ? Theme.fsLead : 14; weight: Font.Medium }
         }
         Text {
@@ -170,25 +115,25 @@ Item {
             width: parent.width; elide: Text.ElideRight
             objectName: "selectorMetadataText"
             text: sel.metadata.replace(/\s*\|\s*/g, " | ")
-            color: Theme.textDim
+            color: Theme.textMuted
             font { family: Theme.font; pixelSize: sel.width >= 220 ? 10 : 9; letterSpacing: sel.width >= 240 ? 0.8 : 0 }
         }
     }
 
-    // -- chevron: drawn, precise, rotates when open ------------------------
+    // -- chevron: 12 px, drawn, reversed when open --------------------------------
     Shape {
         id: chevron
-        x: sel.width - 16 - width; anchors.verticalCenter: parent.verticalCenter
-        width: 14; height: 9
+        x: sel.width - 12 - width; anchors.verticalCenter: parent.verticalCenter
+        width: 12; height: 7
         preferredRendererType: Shape.CurveRenderer
         rotation: sel.open ? 180 : 0
         Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
         ShapePath {
-            strokeColor: sel.active ? Theme.text : Theme.textLabel
-            strokeWidth: 1.8; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
-            startX: 0.9; startY: 1
-            PathLine { x: 7; y: 8 }
-            PathLine { x: 13.1; y: 1 }
+            strokeColor: sel.active ? "#dbeeff" : Theme.alpha(sel.glint, 0.85)
+            strokeWidth: 1.6; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            startX: 0.8; startY: 0.8
+            PathLine { x: 6; y: 6.2 }
+            PathLine { x: 11.2; y: 0.8 }
         }
     }
 

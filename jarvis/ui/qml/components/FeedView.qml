@@ -26,8 +26,8 @@ Item {
     property bool referenceLayout: false
     // The avatar column scales with the surface (1.0 at the 1920x1080 grid).
     property real layoutScale: 1
-    readonly property int avatarSize: referenceLayout ? Math.round(52 * layoutScale) : 50
-    readonly property int messageX: referenceLayout ? avatarSize + Math.round(16 * layoutScale) : 68
+    readonly property int avatarSize: referenceLayout ? 36 : 50
+    readonly property int messageX: referenceLayout ? avatarSize + 12 : 68
     readonly property int strip: 16
     readonly property int pipelineIndex: {
         var first = bridge.feed.findIndex(function(entry) { return entry.kind === "jarvis" })
@@ -141,21 +141,21 @@ Item {
                         visible: !row.isUser
                         width: feed.avatarSize; height: width
                         readonly property real k: width / 60
-                        // JARVIS: the luminous ring - a thick bright cyan ring on a dark
-                        // centre, a soft bloom and a thin calibration ring with nodes.
+                        // JARVIS: the simplified Reactor-derived identity mark - a dark
+                        // circular housing, one controlled blue annulus with three
+                        // subdued radial cuts, a dark optical centre. 32 px, minimal
+                        // bloom, inside a 36 px reserve so nothing clips.
                         Item {
+                            objectName: row.isJarvis ? "feedAvatar_jarvis" : ""
                             visible: row.isJarvis
-                            anchors.fill: parent
-                            Rectangle { anchors.centerIn: parent; width: 88 * avatar.k; height: width; radius: width / 2; color: Theme.accent; opacity: 0.12 }
-                            Rectangle { anchors.centerIn: parent; width: 73 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1; border.color: "#662fc6ee" }
-                            Repeater { model: 4
-                                Rectangle { width: 3; height: 3; radius: 1.5; color: "#7fdcf5"
-                                    x: avatar.width / 2 + 36.5 * avatar.k * Math.cos((index * 90 + 45) * Math.PI / 180) - 1.5
-                                    y: avatar.height / 2 + 36.5 * avatar.k * Math.sin((index * 90 + 45) * Math.PI / 180) - 1.5 } }
-                            Rectangle { anchors.centerIn: parent; width: 66 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 12 * avatar.k; border.color: Theme.accent; opacity: 0.22 }
-                            Rectangle { anchors.centerIn: parent; width: 56 * avatar.k; height: width; radius: width / 2; color: "#000812"; border.width: Math.max(3, 6.5 * avatar.k); border.color: Theme.materialBlue }
-                            Rectangle { anchors.centerIn: parent; width: 43 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 1.5; border.color: "#b09ff0ff" }
-                            Rectangle { anchors.centerIn: parent; width: 38 * avatar.k; height: width; radius: width / 2; color: "transparent"; border.width: 4; border.color: "#2620c9f3" }
+                            anchors.centerIn: parent; width: 32; height: 32
+                            Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: Theme.alpha("#36aaff", 0.09) }
+                            Rectangle { anchors.fill: parent; radius: 16; color: "#061424"; border.width: 1; border.color: "#2a5f8f" }
+                            Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
+                            Repeater { model: 3
+                                Rectangle { width: 1.5; height: 8; color: "#061424"; x: 16 - 0.75; y: 16 - 11.5
+                                    transform: Rotation { origin.x: 0.75; origin.y: 11.5; angle: 90 + index * 120 } } }
+                            Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" }
                         }
                         // Everything else: a state marker on the rail.
                         Rectangle {

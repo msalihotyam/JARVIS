@@ -16,11 +16,15 @@ import "../theme"
 //   points  ·  L8 fixed ticks and event light.
 // Every layer is a pre-rendered raster (dev/assets/reactor_core.py) that is
 // only rotated, faded or scaled. Semantic light (blue information, amber
-// attention, red failure, the brief green of a success) is a few small
-// emitting faces INSET into existing housings - the same centre, radius,
-// band, angles and rotation parent as the housing, read from the generated
-// ReactorGeometry - distributed around the machine, never a whole ring. No
-// shaders, no per-frame drawing, no offscreen effect chain.
+// attention, red failure, the brief green of a success) is emitting faces
+// INSET into the six sector housings - the same centre, radius, band,
+// angles and transform as the housing, read from the generated
+// ReactorGeometry. A response travels round the whole circumference,
+// housing by housing with a short overlap, so the machine answers as one;
+// the dark separators, the blue chassis and the blue nucleus always remain.
+// Confirmed OFF is dormant: nothing turns, sweeps, breathes or glows - the
+// dark hardware stays with faint static edges. No shaders, no per-frame
+// drawing, no offscreen effect chain.
 //
 // Motion is one 16 ms clock advancing a handful of angles at constant
 // angular speed. State changes retune speed and light through eased
@@ -95,8 +99,72 @@ Item {
         else if (st === "running" && bridge.executing && was !== "running") fire("launch")
     }
     onState_Changed: applyState()
-    Component.onCompleted: { applyState(); if (alive) awaken.start(); else if (!Theme.ambient) settleBoot() }
-    onAliveChanged: { if (alive && !booted) awaken.start(); if (!alive) stopEvent() }
+    Component.onCompleted: { applyState(); if (dormant) settleDormant(); else if (alive) awaken.start(); else if (!Theme.ambient) settleBoot() }
+    onAliveChanged: { if (alive && !booted && !dormant) awaken.start(); if (!alive) stopEvent() }
+
+    // -- power: confirmed OFF is dormant; the visual is confirmation only --------
+    // The real disabled state is already in effect when these start; nothing
+    // waits for them. A toggle cancels whatever transition was running.
+    property real circulation: 1                // sweep, points, chamber light, breath
+    property real ringEnergy: 1                 // ring / sector illumination
+    property real nucleus: 1                    // the focus and the chamber's light
+    property real residual: 1                   // halo, tick glow: the last emission
+    readonly property real ringFloor: 0.16      // faint static edges of dormant hardware
+    onDormantChanged: power(dormant)
+    function power(off) {
+        awaken.stop(); shutdown.stop(); shutdownQuick.stop(); wakeQuick.stop()
+        stopEvent()
+        if (off) { if (Theme.ambient) shutdown.start(); else shutdownQuick.start() }
+        else if (Theme.ambient) wake()
+        else wakeQuick.start()
+    }
+    // Re-enable reuses the startup: dormant -> nucleus ignition -> mechanical
+    // energisation -> the accepted living motion. It grants nothing.
+    function wake() {
+        circulation = 1; ringEnergy = 1; nucleus = 1; residual = 1
+        bootFocus = 0; bootRim = 0; bootGlow = 0; spin = 0; spin2 = 0; booted = false
+        if (alive) awaken.start()
+    }
+    function settleDormant() { booted = true; bootFocus = 1; bootRim = 1; bootGlow = 0; spin = 0; spin2 = 0; circulation = 0; ringEnergy = 0; nucleus = 0; residual = 0 }
+    SequentialAnimation {
+        id: shutdown
+        // 0-180 ms: circulation decelerates and stops; the sweep and the moving points go out.
+        ParallelAnimation {
+            NumberAnimation { target: core; property: "spin"; to: 0; duration: 180; easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "spin2"; to: 0; duration: 180; easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "circulation"; to: 0; duration: 180; easing.type: Easing.OutCubic }
+        }
+        // 180-360: the segmented ring illumination drains.
+        NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        // 360-540: the nucleus fades.
+        NumberAnimation { target: core; property: "nucleus"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        // 540-720: the remaining emission disappears; the dark hardware stays.
+        NumberAnimation { target: core; property: "residual"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        ScriptAction { script: core.booted = true }
+    }
+    // Reduced motion (ambient effects off): a brief energy fade, no choreography.
+    SequentialAnimation {
+        id: shutdownQuick
+        PropertyAction { target: core; property: "spin"; value: 0 }
+        PropertyAction { target: core; property: "spin2"; value: 0 }
+        ParallelAnimation {
+            NumberAnimation { target: core; property: "circulation"; to: 0; duration: 250 }
+            NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: 250 }
+            NumberAnimation { target: core; property: "nucleus"; to: 0; duration: 250 }
+            NumberAnimation { target: core; property: "residual"; to: 0; duration: 250 }
+        }
+        ScriptAction { script: core.booted = true }
+    }
+    SequentialAnimation {
+        id: wakeQuick
+        ScriptAction { script: { core.bootFocus = 1; core.bootRim = 1; core.bootGlow = 0; core.spin = 1; core.spin2 = 1; core.booted = true } }
+        ParallelAnimation {
+            NumberAnimation { target: core; property: "circulation"; to: 1; duration: 250 }
+            NumberAnimation { target: core; property: "ringEnergy"; to: 1; duration: 250 }
+            NumberAnimation { target: core; property: "nucleus"; to: 1; duration: 250 }
+            NumberAnimation { target: core; property: "residual"; to: 1; duration: 250 }
+        }
+    }
 
     // Typing: +3 % at the centre, +10 % on the micro highlight, 180 ms in,
     // 450 ms back after the composer's own 900 ms quiet time.
@@ -132,18 +200,18 @@ Item {
             core.clockT += dt
             mainRing.rotation = (mainRing.rotation + core.mainSpeed * core.spin * dt) % 360
             secondRing.rotation = (secondRing.rotation + core.secondSpeed * core.spin2 * dt + 360) % 360
-            core.sweepAngle = (core.sweepAngle + core.sweepSpeed * core.sweepGain * (1 + 0.1 * core.typeBoost) * dt) % 360
-            chamberLight.rotation = (chamberLight.rotation + 360 / 53 * dt) % 360
-            markerA.rotation = (markerA.rotation + 360 / 29 * core.markerGain * dt) % 360
-            markerB.rotation = (markerB.rotation - 360 / 47 * core.markerGain * dt + 360) % 360
-            core.orbitPhase = (core.orbitPhase + 360 / 61 * core.markerGain * dt) % 360
-            core.breath = 1 + 0.05 * Math.sin(core.clockT * 2 * Math.PI / 6.7)
-            core.rimPulse = 0.7 + 0.3 * Math.sin(core.clockT * 2 * Math.PI / 11.3 + 2.1)
+            core.sweepAngle = (core.sweepAngle + core.sweepSpeed * core.sweepGain * core.circulation * (1 + 0.1 * core.typeBoost) * dt) % 360
+            chamberLight.rotation = (chamberLight.rotation + 360 / 53 * core.circulation * dt) % 360
+            markerA.rotation = (markerA.rotation + 360 / 29 * core.markerGain * core.circulation * dt) % 360
+            markerB.rotation = (markerB.rotation - 360 / 47 * core.markerGain * core.circulation * dt + 360) % 360
+            core.orbitPhase = (core.orbitPhase + 360 / 61 * core.markerGain * core.circulation * dt) % 360
+            core.breath = 1 + 0.05 * core.nucleus * Math.sin(core.clockT * 2 * Math.PI / 6.7)
+            core.rimPulse = 0.7 + 0.3 * core.nucleus * Math.sin(core.clockT * 2 * Math.PI / 11.3 + 2.1)
             core.pointA = 0.675 + 0.225 * Math.sin(core.clockT * 2 * Math.PI / 13 + 0.8)
         }
     }
     // A low-energy radial wave now and then, gone within 900 ms.
-    Timer { interval: 23000; repeat: true; running: core.alive && !core.calm && core.booted; onTriggered: core.fire("ambient") }
+    Timer { interval: 23000; repeat: true; running: core.alive && !core.calm && core.booted && !core.dormant; onTriggered: core.fire("ambient") }
 
     // -- startup: 2.2 s from dormant structure to stable life -------------------
     property bool booted: false
@@ -255,7 +323,7 @@ Item {
     property string strong: ""
     property double lastActivity: 0
     function fire(kind) {
-        if (!alive) return
+        if (!alive || dormant) return
         var now = Date.now()
         if (rank[kind]) {
             if (strong !== "" && rank[strong] > rank[kind]) return
@@ -275,14 +343,27 @@ Item {
         for (var i = 0; i < eventAnims.length; i++) eventAnims[i].stop()
         strong = ""; eventLevel = 0; focusBoost = 0; jolt = 0; squeeze = 1
         wave.opacity = 0; packet.opacity = 0; ringWave.opacity = 0; rimPass.opacity = 0
-        sigA = 0; sigB = 0; sigC = 0; sigD = 0; infoA = 0; infoB = 0; infoC = 0; infoD = 0; okLevel = 0
+        sig0 = 0; sig1 = 0; sig2 = 0; sig3 = 0; sig4 = 0; sig5 = 0
+        blue0 = 0; blue1 = 0; blue2 = 0; blue3 = 0; blue4 = 0; blue5 = 0; okLevel = 0
     }
-    // Micro-signal levels: four sector regions (amber attention / red
-    // failure, tinted per event) and four main-ring regions (blue
-    // information), plus the one small green success face.
-    property real sigA: 0; property real sigB: 0; property real sigC: 0; property real sigD: 0
-    property color sigTint: Theme.warning
-    property real infoA: 0; property real infoB: 0; property real infoC: 0; property real infoD: 0
+    // Semantic levels per sector housing: the amber / red faces (sig*, tinted
+    // by the real state) and the blue information faces (blue*), plus the one
+    // small green success face on the main ring. While a blocked or failed
+    // state is current every sector holds a restrained level after the
+    // propagation, and crossfades away when the state resolves.
+    property real sig0: 0; property real sig1: 0; property real sig2: 0; property real sig3: 0; property real sig4: 0; property real sig5: 0
+    property real blue0: 0; property real blue1: 0; property real blue2: 0; property real blue3: 0; property real blue4: 0; property real blue5: 0
+    readonly property color sigTint: state_ === "error" ? Theme.danger : Theme.warning
+    // The persistent level arrives after the propagation has gone round
+    // (so the travel reads first) and crossfades away when the state resolves.
+    readonly property real holdTarget: state_ === "error" ? 0.5 : blocked ? 0.38 : 0
+    property real hold: 0
+    onHoldTargetChanged: holdAnim.restart()
+    SequentialAnimation {
+        id: holdAnim
+        PauseAnimation { duration: core.holdTarget > 0 ? 520 : 0 }
+        NumberAnimation { target: core; property: "hold"; to: core.holdTarget; duration: 350; easing.type: Easing.InOutCubic }
+    }
     property real okLevel: 0
     readonly property var eventAnims: [successAnim, majorAnim, errorAnim, blockedAnim, modelAnim, modelLocalAnim, sentAnim, activityAnim, focusAnim, ambientAnim, launchAnim]
     property real squeeze: 1                    // the nucleus's 1 % compression
@@ -409,27 +490,32 @@ Item {
         }
         ScriptAction { script: core.strong = "" }
     }
-    // ERROR: four small red faces around the machine light in sequence,
-    // hold together, and are gone within 350 ms; 2-3 degrees of highlight
-    // misalignment; the centre dips 100 ms and returns to blue. ~800 ms.
-    // The structural blue reactor stays dominant throughout.
+    // One full-circumference propagation over the six sector housings:
+    // each face rises as the previous one is still lit, so the response
+    // reads as one connected machine, then falls back to whatever the state
+    // holds. Used by the amber and red responses (the sig faces) and, on the
+    // blue rasters, by ordinary information.
+    component Travel: ParallelAnimation {
+        property string prefix: "sig"
+        property real peak: 1
+        property int step: 70
+        property int rise: 110
+        property int fall: 260
+        SequentialAnimation { NumberAnimation { target: core; property: prefix + "0"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "0"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: step } NumberAnimation { target: core; property: prefix + "1"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "1"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: 2 * step } NumberAnimation { target: core; property: prefix + "2"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "2"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: 3 * step } NumberAnimation { target: core; property: prefix + "3"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "3"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: 4 * step } NumberAnimation { target: core; property: prefix + "4"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "4"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: 5 * step } NumberAnimation { target: core; property: prefix + "5"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "5"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+    }
+    // ERROR: the strongest response - red travels the full circumference,
+    // then the six faces hold a controlled red while the failure is current;
+    // 2-3 degrees of highlight misalignment; the centre dips 100 ms and
+    // returns to blue. The nucleus and the chassis stay blue.
     SequentialAnimation {
         id: errorAnim
-        ScriptAction { script: core.sigTint = Theme.danger }
         ParallelAnimation {
-            SequentialAnimation {
-                NumberAnimation { target: core; property: "sigA"; to: 1; duration: 50 }
-                NumberAnimation { target: core; property: "sigC"; to: 1; duration: 50 }
-                NumberAnimation { target: core; property: "sigB"; to: 1; duration: 50 }
-                NumberAnimation { target: core; property: "sigD"; to: 1; duration: 50 }
-                PauseAnimation { duration: 40 }
-                ParallelAnimation {
-                    NumberAnimation { target: core; property: "sigA"; to: 0; duration: 160; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "sigB"; to: 0; duration: 160; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "sigC"; to: 0; duration: 160; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "sigD"; to: 0; duration: 160; easing.type: Easing.InCubic }
-                }
-            }
+            Travel { prefix: "sig"; peak: 1; step: 70; rise: 110; fall: 300 }
             SequentialAnimation {
                 NumberAnimation { target: core; property: "jolt"; to: 2.6; duration: 110; easing.type: Easing.OutCubic }
                 NumberAnimation { target: core; property: "jolt"; to: 0; duration: 560; easing.type: Easing.InOutCubic }
@@ -439,26 +525,15 @@ Item {
                 NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 420; easing.type: Easing.InOutCubic }
             }
         }
-        PauseAnimation { duration: 130 }
         ScriptAction { script: core.strong = "" }
     }
-    // BLOCKED: four muted amber faces light in turn, hold together briefly
-    // and fade - all within 450 ms - while outward motion stops; then the
-    // calm blue wait the state itself provides. No ring, no amber nucleus.
+    // BLOCKED: muted technical amber travels the full circumference while
+    // outward motion stops; then the six faces hold a restrained amber for
+    // as long as attention is genuinely required. No neon ring, no amber
+    // nucleus, no flashing; the state's own calm blue wait continues under it.
     SequentialAnimation {
         id: blockedAnim
-        ScriptAction { script: core.sigTint = Theme.warning }
-        NumberAnimation { target: core; property: "sigA"; to: 0.75; duration: 70 }
-        NumberAnimation { target: core; property: "sigB"; to: 0.75; duration: 70 }
-        NumberAnimation { target: core; property: "sigC"; to: 0.75; duration: 70 }
-        NumberAnimation { target: core; property: "sigD"; to: 0.75; duration: 70 }
-        PauseAnimation { duration: 60 }
-        ParallelAnimation {
-            NumberAnimation { target: core; property: "sigA"; to: 0; duration: 180; easing.type: Easing.InCubic }
-            NumberAnimation { target: core; property: "sigB"; to: 0; duration: 180; easing.type: Easing.InCubic }
-            NumberAnimation { target: core; property: "sigC"; to: 0; duration: 180; easing.type: Easing.InCubic }
-            NumberAnimation { target: core; property: "sigD"; to: 0; duration: 180; easing.type: Easing.InCubic }
-        }
+        Travel { prefix: "sig"; peak: 0.85; step: 70; rise: 110; fall: 260 }
         ScriptAction { script: core.strong = "" }
     }
     // MODEL APPLIED: highlights separate in phase, the centre eases 6 %
@@ -520,20 +595,12 @@ Item {
         id: activityAnim
         ScriptAction { script: core.packetIn(core.environment ? -0.53 : -0.42, -0.12, 380) }
         ParallelAnimation {
-            // Blue information acknowledged around the ring: the four faces
-            // light one after another, overlap briefly, and fade.
+            // Blue information acknowledged by the whole machine: the six
+            // sector faces light in turn round the circumference, overlapping
+            // briefly, then the accepted living motion continues.
             SequentialAnimation {
-                PauseAnimation { duration: 120 }
-                NumberAnimation { target: core; property: "infoA"; to: 0.8; duration: 70 }
-                NumberAnimation { target: core; property: "infoB"; to: 0.8; duration: 70 }
-                NumberAnimation { target: core; property: "infoC"; to: 0.8; duration: 70 }
-                NumberAnimation { target: core; property: "infoD"; to: 0.8; duration: 70 }
-                ParallelAnimation {
-                    NumberAnimation { target: core; property: "infoA"; to: 0; duration: 220; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "infoB"; to: 0; duration: 220; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "infoC"; to: 0; duration: 220; easing.type: Easing.InCubic }
-                    NumberAnimation { target: core; property: "infoD"; to: 0; duration: 220; easing.type: Easing.InCubic }
-                }
+                PauseAnimation { duration: 100 }
+                Travel { prefix: "blue"; peak: 0.8; step: 60; rise: 90; fall: 260 }
             }
             SequentialAnimation {
                 PauseAnimation { duration: 300 }
@@ -593,73 +660,73 @@ Item {
         readonly property real bezelPx: Math.max(1.5, geo.bezel * core.s)
         readonly property bool thin: band * core.s < 4 * bezelPx
         readonly property real face: thin ? Math.max(1.5, band * core.s) : band * core.s - 2 * bezelPx
-        readonly property real a0: angle - span / 2
+        // The same bezel angularly, so the face sits inside the housing's end walls too.
+        readonly property real inset: thin ? 0 : bezelPx / Math.max(1, r) * 180 / Math.PI
+        readonly property real a0: angle - span / 2 + inset
+        readonly property real sweep: span - 2 * inset
         // Very restrained local bloom: one bezel past the face, never further.
         ShapePath { strokeColor: Theme.alpha(tint, 0.16); strokeWidth: face + 2 * bezelPx; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 - 0.5; sweepAngle: span + 1 } }
+            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 - 0.5; sweepAngle: sweep + 1 } }
         // The inset emitting face.
         ShapePath { strokeColor: Theme.alpha(tint, 0.66); strokeWidth: face; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0; sweepAngle: span } }
+            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0; sweepAngle: sweep } }
         // Narrow edge highlights along the face's inner and outer contours.
         ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.3), 0.9); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r - face / 2 + 0.5; radiusY: r - face / 2 + 0.5; startAngle: a0; sweepAngle: span } }
+            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r - face / 2 + 0.5; radiusY: r - face / 2 + 0.5; startAngle: a0; sweepAngle: sweep } }
         ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.3), 0.8); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r + face / 2 - 0.5; radiusY: r + face / 2 - 0.5; startAngle: a0; sweepAngle: span } }
+            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r + face / 2 - 0.5; radiusY: r + face / 2 - 0.5; startAngle: a0; sweepAngle: sweep } }
     }
 
     // ======================= the layer stack ==================================
     // Restrained halo: the level lifts it a little; it never becomes a fog.
     Image { source: "../assets/core-halo.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: (0.45 + 0.6 * (core.lvl - 0.22) + 0.3 * core.bootGlow) * (core.dormant ? 0.5 : 1) }
+            opacity: (0.45 + 0.6 * (core.lvl - 0.22) + 0.3 * core.bootGlow) * core.residual }
     // L1: the dark bed. Present from the first frame: the plate's globe never shows.
     Image { source: "../assets/core-bed.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true }
     // L8 (static part): fixed tick groups.
     Image { source: "../assets/core-ticks.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: (0.3 + 0.5 * core.bootRim) * (core.dormant ? 0.6 : 1) }
-    // L3: the six-sector mechanical structure, and its light.
+            opacity: (0.3 + 0.5 * core.bootRim) * (0.25 + 0.75 * core.residual) }
+    // L3: the six-sector mechanical structure (dark hardware, kept when
+    // dormant) and its light: the state rhythms (litA / litB) and the blue
+    // information faces share the same inset rasters, one per housing.
     Image { source: "../assets/core-sectors.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: 0.4 + 0.6 * core.bootRim }
+            opacity: (0.4 + 0.6 * core.bootRim) * (0.55 + 0.45 * core.ringEnergy) }
     Repeater {
         model: 6
         Image {
             source: "../assets/core-sector-lit.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
             rotation: index * 60
-            readonly property real lit: index % 2 === 0 ? core.litA : core.litB
             // Listening lights only the opposite pair (sectors 0 and 3).
-            visible: lit > 0.01 && (!core.listening || index === 0 || index === 3)
-            opacity: lit
+            readonly property real lit: (core.listening && index !== 0 && index !== 3) ? 0 : (index % 2 === 0 ? core.litA : core.litB)
+            readonly property real blue: [core.blue0, core.blue1, core.blue2, core.blue3, core.blue4, core.blue5][index]
+            opacity: Math.max(lit, blue) * core.ringEnergy
+            visible: opacity > 0.01
         }
     }
     // L5: the second ring - thinner, dimmer, counter-clockwise, its own segments.
     Image { id: secondRing; source: "../assets/core-ring-secondary.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: 37; opacity: (0.3 + 0.7 * core.bootRim) * (0.72 + 0.4 * (core.lvl - 0.22)) * (core.dormant ? 0.55 : 1) }
+            rotation: 37; opacity: (0.3 + 0.7 * core.bootRim) * (0.72 + 0.4 * (core.lvl - 0.22)) * (core.ringFloor + (1 - core.ringFloor) * core.ringEnergy) }
     // L4: the main ring - the most legible motion, clockwise. Its blue
     // information faces and the green success face are its own children:
     // same centre, same radius and band, angles in its frame, turning with it.
     Image { id: mainRing; source: "../assets/core-ring-main.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: 0; opacity: (0.3 + 0.7 * core.bootRim) * Math.min(1, 0.86 + 0.5 * (core.lvl - 0.22)) * (core.dormant ? 0.55 : 1)
-        Repeater {
-            model: 4
-            MicroFace { radius: geo.mainRadius; band: geo.mainBand; tint: "#4fb8ff"
-                        // Inside main arcs 0, 2, 4 and 6: four housings spread around the ring.
-                        angle: geo.mainArcs[index * 2][0] + geo.mainArcs[index * 2][1] / 2
-                        level: [core.infoA, core.infoB, core.infoC, core.infoD][index] }
-        }
+            rotation: 0; opacity: (0.3 + 0.7 * core.bootRim) * Math.min(1, 0.86 + 0.5 * (core.lvl - 0.22)) * (core.ringFloor + (1 - core.ringFloor) * core.ringEnergy)
+        // The one small green success face rides on the ring's first arc.
         MicroFace { radius: geo.mainRadius; band: geo.mainBand; tint: Theme.success
                     angle: geo.mainArcs[0][0] + 12; level: core.okLevel }
     }
     // L6: the energy sweep, a 28 degree highlight travelling over the rings.
     Image { id: sweep; source: "../assets/core-sweep.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
             rotation: core.sweepAngle + core.jolt
-            opacity: (0.5 + 1.0 * (core.lvl - 0.22)) * core.sweepGain * core.bootRim; visible: opacity > 0.01 }
+            opacity: (0.5 + 1.0 * (core.lvl - 0.22)) * core.sweepGain * core.bootRim * core.circulation; visible: opacity > 0.01 }
     // L7: two energy points on the ring tracks (their carriers turn), and
     // one packet on the header's horizontal orbit.
     Item { id: markerA; anchors.centerIn: parent; width: core.s; height: width; rotation: 250
            Image { source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
-                   x: core.c + core.s * 0.33 - width / 2; y: core.c - height / 2; opacity: core.pointA * core.bootRim } }
+                   x: core.c + core.s * 0.33 - width / 2; y: core.c - height / 2; opacity: core.pointA * core.bootRim * core.circulation } }
     Item { id: markerB; anchors.centerIn: parent; width: core.s; height: width; rotation: 95
            Image { source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
-                   x: core.c + core.s * 0.37 - width / 2; y: core.c - height / 2; opacity: 0.55 * core.bootRim } }
+                   x: core.c + core.s * 0.37 - width / 2; y: core.c - height / 2; opacity: 0.55 * core.bootRim * core.circulation } }
     Image {
         id: orbitPacket
         source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
@@ -670,16 +737,17 @@ Item {
         readonly property real rad: core.orbitPhase * Math.PI / 180
         x: core.c - core.s * 0.292 + core.s * 0.699 * Math.cos(rad) - width / 2
         y: core.c + core.s * 0.123 * Math.sin(rad) - height / 2
-        opacity: 0.75 * core.bootRim * Math.max(0, Math.min(1, (core.orbitPhase - 78) / 14, (282 - core.orbitPhase) / 14))
+        opacity: 0.75 * core.bootRim * core.circulation * Math.max(0, Math.min(1, (core.orbitPhase - 78) / 14, (282 - core.orbitPhase) / 14))
     }
-    // Attention / failure: four small faces inset into the static sector
-    // housings at the top, lower right, bottom and upper left - distributed,
-    // never a ring, never the nucleus. Amber or red per event.
+    // Attention / failure: one emitting face inset into each of the six
+    // sector housings (the same band, centres and span the housings were
+    // drawn with). Muted amber or controlled red per the real state; the
+    // dark separators between them and the blue nucleus always remain.
     Repeater {
-        model: 4
+        model: 6
         MicroFace { radius: (geo.sectorInner + geo.sectorOuter) / 2; band: geo.sectorOuter - geo.sectorInner
-                    angle: geo.sectorCentres[[0, 2, 3, 5][index]]; tint: core.sigTint
-                    level: [core.sigA, core.sigB, core.sigC, core.sigD][index] }
+                    angle: geo.sectorCentres[index]; span: geo.sectorSpan; tint: core.sigTint
+                    level: Math.max([core.sig0, core.sig1, core.sig2, core.sig3, core.sig4, core.sig5][index], core.hold) * core.ringEnergy }
     }
     // Event light: the wave (scaled outward), the retune ring, the packet.
     Image { id: wave; source: "../assets/core-wave.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true; opacity: 0; visible: opacity > 0.01 }
@@ -690,15 +758,15 @@ Item {
     Item {
         anchors.centerIn: parent; width: core.s * 0.5; height: width
         scale: (1 + 0.16 * (core.breath - 1)) * core.squeeze
-        Image { source: "../assets/core-chamber.png"; anchors.fill: parent; mipmap: true }
+        Image { source: "../assets/core-chamber.png"; anchors.fill: parent; mipmap: true; opacity: 0.45 + 0.55 * core.nucleus }
         Image { id: chamberLight; source: "../assets/core-chamber-light.png"; anchors.fill: parent; mipmap: true; rotation: 40
-                opacity: 0.85 * core.bootFocus * (core.dormant ? 0.4 : 1) }
+                opacity: 0.85 * core.bootFocus * core.nucleus }
         Image { source: "../assets/core-rim-hi.png"; anchors.fill: parent; mipmap: true
-                opacity: (core.rimPulse * 0.8 + 0.2 * core.bootGlow) * core.bootRim * (core.dormant ? 0.4 : 1) }
+                opacity: (core.rimPulse * 0.8 + 0.2 * core.bootGlow) * core.bootRim * core.nucleus }
         Image { id: rimPass; source: "../assets/core-rim-hi.png"; anchors.fill: parent; mipmap: true; opacity: 0; visible: opacity > 0.01 }
         Image { source: "../assets/core-focus-glow.png"; anchors.centerIn: parent; width: core.s * 0.4; height: width; mipmap: true
-                opacity: Math.min(1, (0.34 + 1.1 * (core.lvl - 0.22) + core.focusBoost + 0.35 * core.bootGlow) * core.breath) * core.bootFocus }
+                opacity: Math.min(1, (0.34 + 1.1 * (core.lvl - 0.22) + core.focusBoost + 0.35 * core.bootGlow) * core.breath) * core.bootFocus * core.nucleus }
         Image { source: "../assets/core-focus.png"; anchors.centerIn: parent; width: core.s * 0.2; height: width; mipmap: true
-                opacity: Math.min(1, (0.9 + 0.9 * core.focusBoost + 0.3 * (core.lvl - 0.22)) * core.breath) * core.bootFocus * (core.dormant ? 0.55 : 1) }
+                opacity: Math.min(1, (0.9 + 0.9 * core.focusBoost + 0.3 * (core.lvl - 0.22)) * core.breath) * core.bootFocus * core.nucleus }
     }
 }

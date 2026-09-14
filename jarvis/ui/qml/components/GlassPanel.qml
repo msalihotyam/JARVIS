@@ -20,6 +20,8 @@ Rectangle {
     property bool shadow: true
     property bool brackets: false
     property bool closable: false
+    // The colour of the panel's edge light and brackets (structural, not semantic).
+    property color accentColor: Theme.accent
     signal closeRequested()
 
     radius: Theme.radius
@@ -31,8 +33,8 @@ Rectangle {
     Rectangle { z: -2; visible: panel.shadow; anchors.fill: parent; anchors.margins: -2; anchors.topMargin: 6; radius: panel.radius + 2; color: "#000000"; opacity: 0.22 }
     Rectangle { z: -1; visible: panel.shadow; anchors.fill: parent; anchors.topMargin: 3; radius: panel.radius; color: "#000000"; opacity: 0.30 }
     // A faint outer cyan haze along the top edge (the reference's glowing rim).
-    Rectangle { z: -1; visible: panel.raised; anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.radius; rightMargin: panel.width * 0.4; topMargin: -2 } height: 4; radius: 2; color: Theme.alpha(Theme.accent, 0.06) }
-    Rectangle { anchors.fill: parent; anchors.margins: 5; radius: Math.max(2, panel.radius - 4); color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, panel.level === 1 ? 0.09 : 0.045) }
+    Rectangle { z: -1; visible: panel.raised; anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.radius; rightMargin: panel.width * 0.4; topMargin: -2 } height: 4; radius: 2; color: Theme.alpha(panel.accentColor, 0.06) }
+    Rectangle { anchors.fill: parent; anchors.margins: 5; radius: Math.max(2, panel.radius - 4); color: "transparent"; border.width: 1; border.color: Theme.alpha(panel.accentColor, panel.level === 1 ? 0.09 : 0.045) }
 
     // Material: a top sheen, a faint left light, a darker foot.
     Rectangle {
@@ -48,7 +50,7 @@ Rectangle {
         width: Math.min(parent.width * 0.45, 260); radius: panel.radius - 1
         gradient: Gradient {
             orientation: Gradient.Horizontal
-            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.035) }
+            GradientStop { position: 0.0; color: Theme.alpha(panel.accentColor, 0.035) }
             GradientStop { position: 1.0; color: "transparent" }
         }
     }
@@ -65,16 +67,16 @@ Rectangle {
         x: panel.radius; y: 0; height: 1; width: parent.width - panel.radius * 2
         gradient: Gradient {
             orientation: Gradient.Horizontal
-            GradientStop { position: 0.00; color: Theme.alpha(Theme.accent, 0.38) }
-            GradientStop { position: 0.20; color: Theme.alpha(Theme.accent, 0.08) }
-            GradientStop { position: 0.75; color: Theme.alpha(Theme.accent, 0.04) }
-            GradientStop { position: 1.00; color: Theme.alpha(Theme.accent, 0.26) }
+            GradientStop { position: 0.00; color: Theme.alpha(panel.accentColor, 0.38) }
+            GradientStop { position: 0.20; color: Theme.alpha(panel.accentColor, 0.08) }
+            GradientStop { position: 0.75; color: Theme.alpha(panel.accentColor, 0.04) }
+            GradientStop { position: 1.00; color: Theme.alpha(panel.accentColor, 0.26) }
         }
     }
     Rectangle {
         x: 0; y: panel.radius; width: 1; height: Math.min(parent.height * 0.45, 260)
         gradient: Gradient {
-            GradientStop { position: 0.0; color: Theme.alpha(Theme.accent, 0.28) }
+            GradientStop { position: 0.0; color: Theme.alpha(panel.accentColor, 0.28) }
             GradientStop { position: 1.0; color: "transparent" }
         }
     }
@@ -82,11 +84,11 @@ Rectangle {
     Item {
         visible: panel.brackets
         anchors.fill: parent
-        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 14; height: 1; color: Theme.accent; opacity: 0.55 }
-        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 1; height: 14; color: Theme.accent; opacity: 0.55 }
-        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 14; height: 1; color: Theme.accent; opacity: 0.4 }
-        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 1; height: 14; color: Theme.accent; opacity: 0.4 }
-        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 6; anchors.topMargin: 6; width: 3; height: 3; radius: 1.5; color: Theme.accent; opacity: 0.9 }
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 14; height: 1; color: panel.accentColor; opacity: 0.55 }
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 8; anchors.topMargin: 8; width: 1; height: 14; color: panel.accentColor; opacity: 0.55 }
+        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 14; height: 1; color: panel.accentColor; opacity: 0.4 }
+        Rectangle { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.leftMargin: 8; anchors.bottomMargin: 8; width: 1; height: 14; color: panel.accentColor; opacity: 0.4 }
+        Rectangle { anchors.right: parent.right; anchors.top: parent.top; anchors.rightMargin: 6; anchors.topMargin: 6; width: 3; height: 3; radius: 1.5; color: panel.accentColor; opacity: 0.9 }
     }
 
     Item {
