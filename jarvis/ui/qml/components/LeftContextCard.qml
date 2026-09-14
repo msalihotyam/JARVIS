@@ -53,11 +53,20 @@ Rectangle {
         // The room the clock really has: its own column, which ends before the
         // weather column (the card's accepted rule - the time never crosses it).
         readonly property real clockRoom: width
+        // The role size, capped to the room the column has. Until the column
+        // and the metrics have a real width (the first bindings run before
+        // layout, when the column is 0 or negative) the role size stands, so
+        // the size is never 0 or negative.
+        readonly property int clockPx: {
+            var role = Theme.clockSize(tier)
+            if (clockRoom <= 0 || clockMetrics.advanceWidth <= 0) return role
+            return Math.max(1, Math.min(role, Math.floor(role * clockRoom / clockMetrics.advanceWidth)))
+        }
         Text {
             objectName: "contextClock"
             width: timeGroup.clockRoom
             text: context.timeText; color: Theme.text
-            font: Theme.clock(Math.min(Theme.clockSize(timeGroup.tier), Math.floor(Theme.clockSize(timeGroup.tier) * width / Math.max(1, clockMetrics.advanceWidth))))
+            font: Theme.clock(timeGroup.clockPx)
             lineHeightMode: Text.FixedHeight; lineHeight: Theme.clockLine(timeGroup.tier)
         }
         Text {

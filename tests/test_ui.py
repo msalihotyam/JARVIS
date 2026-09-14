@@ -1784,6 +1784,57 @@ class TypographyTests(UiTestCase):
         metrics = QFontMetricsF(tabular)
         self.assertEqual(1, len({round(metrics.horizontalAdvance(d), 2) for d in "0123456789"}))
 
+    def test_normal_launch_path_is_clean(self) -> None:
+        """The real launch path imports only what jarvis.ui.app imports (this
+        test module's own QtQuick import would hide a missing one), so it runs
+        in a fresh interpreter: with conversation rows present, no Python
+        traceback, no textDocument error and no non-positive font size."""
+        import subprocess, sys, textwrap
+        script = textwrap.dedent("""
+            import sys, tempfile
+            from dataclasses import replace
+            from pathlib import Path
+            from PySide6.QtCore import QTimer
+            from PySide6.QtGui import QGuiApplication
+            app = QGuiApplication(sys.argv[:1])
+            from jarvis.settings import ConfigStore
+            from jarvis.ui.app import create_engine
+            from jarvis.ui.backend import Backend
+            from jarvis.ui.bridge import Bridge
+            from jarvis.ui.preferences import UiPreferences
+            tmp = Path(tempfile.mkdtemp(prefix="jarvis-launch-"))
+            store = ConfigStore(tmp / "config.json"); store.mutate(lambda s: replace(s, memory_database=tmp / "jarvis.db"))
+            bridge = Bridge(Backend(store), UiPreferences(tmp / "prefs.json"))
+            engine = create_engine(bridge)
+            rows = [0]
+            def done():
+                try:
+                    window = engine.rootObjects()[0]      # keep the wrapper alive while walking
+                    pending = [window.contentItem()]
+                    while pending:
+                        item = pending.pop()
+                        try:
+                            rows[0] += item.objectName() == "feedMessage_jarvis"
+                            pending.extend(item.childItems())
+                        except RuntimeError:     # an item QML has already recycled
+                            pass
+                    print("ROWS", rows[0], flush=True)
+                finally:
+                    app.quit()
+            QTimer.singleShot(1500, done)
+            app.exec()
+        """)
+        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_FORCE_STDERR_LOGGING": "1", "JARVIS_UI_DEV_FIXTURE": "1"}
+        env.pop("ANTHROPIC_BASE_URL", None)
+        root = Path(__file__).resolve().parents[1]
+        run = subprocess.run([sys.executable, "-c", script], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        output = run.stdout + run.stderr
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("textDocument", output)
+        self.assertNotIn("Pixel size <= 0", output)
+        self.assertEqual(0, run.returncode, output[-2000:])
+        self.assertRegex(run.stdout, r"ROWS [1-9]", "the fixture rows must exist for the check to mean anything")
+
     def test_roles_bind_at_the_baseline_and_geometry_holds(self) -> None:
         from PySide6.QtCore import QPointF
         bridge = self.bridge()

@@ -15,8 +15,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import shiboken6
 from PySide6.QtCore import Property, QObject, Slot
 from PySide6.QtGui import QFontDatabase, QTextBlockFormat, QTextCursor
+# Imported here, not left to chance: PySide only hands a QML object to Python
+# as its real wrapper type when that type's module is loaded. The normal launch
+# (python -m jarvis.ui) never imports QtQuick, so without this a TextEdit's
+# textDocument arrives as a plain QObject with no textDocument().
+from PySide6.QtQuick import QQuickTextDocument
 
 FONT_DIR = Path(__file__).resolve().parent / "qml" / "fonts"
 FACES = {
@@ -25,6 +31,18 @@ FACES = {
 }
 
 _families: dict[str, str] | None = None
+
+
+def _as_quick_text_document(document: QObject | None) -> QQuickTextDocument | None:
+    """The QQuickTextDocument behind a TextEdit's ``textDocument``, whatever
+    wrapper PySide chose for it; None for anything else."""
+    if document is None:
+        return None
+    if isinstance(document, QQuickTextDocument):
+        return document
+    if isinstance(document, QObject) and document.inherits("QQuickTextDocument"):
+        return shiboken6.wrapInstance(shiboken6.getCppPointer(document)[0], QQuickTextDocument)
+    return None
 
 
 def load_fonts() -> dict[str, str]:
@@ -67,7 +85,8 @@ class Typography(QObject):
         """Give every paragraph of a QQuickTextDocument a fixed line height and
         the spacing that follows it. Read-only text only: the change is a
         formatting edit of the document."""
-        text_document = document.textDocument() if document is not None else None
+        quick_document = _as_quick_text_document(document)
+        text_document = quick_document.textDocument() if quick_document is not None else None
         if text_document is None:
             return
         cursor = QTextCursor(text_document)
