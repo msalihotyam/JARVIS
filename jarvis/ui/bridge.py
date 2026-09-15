@@ -107,6 +107,9 @@ class Bridge(QObject):
         # -- state --
         self._busy = False
         self._executing = False    # the current / last task run is an approved execution
+        # The running request began while frozen: it can start no work (Core
+        # refuses anything authoritative), so nothing is on its way to a safe point.
+        self._started_frozen = False
         self._composing = False
         self._core_state = "idle"
         self._session_id = ""
@@ -151,6 +154,7 @@ class Bridge(QObject):
         if kind == "task":
             self._busy = True
             self._executing = executing
+            self._started_frozen = self._config.get("execution_enabled") is False
             self._refresh_core_state()
         if self.sync:
             self._on_finished(kind, sequence, _guarded(fn))
@@ -200,10 +204,21 @@ class Bridge(QObject):
             return (context, source, tuple(Bridge._redacted(a) for a in args))
         return redact_text(str(message))
 
-    def _say(self, kind: str, message: Any) -> None:
-        self._feed.append({"kind": kind, "msg": self._redacted(message), "ts": time.time()})
+    def _say(self, kind: str, message: Any, chat: bool = False) -> None:
+        entry = {"kind": kind, "msg": self._redacted(message), "ts": time.time()}
+        if chat:
+            entry["chat"] = True         # a General Chat reply: part of the conversation window
+        self._feed.append(entry)
         del self._feed[:-FEED_LIMIT]
         self.feedChanged.emit()
+
+    def _conversation(self) -> tuple:
+        """The recent chat of this window for a follow-up: what the person typed
+        and General Chat's replies, as written - never notices, approvals,
+        errors, task results or fixtures. Core bounds it (intent.conversation_window)."""
+        return tuple({"role": "user" if entry["kind"] == "user" else "assistant", "text": entry["msg"]}
+                     for entry in self._feed
+                     if isinstance(entry["msg"], str) and (entry["kind"] == "user" or entry.get("chat")))
 
     def _tell(self, kind: str, source: str, *args: Any) -> None:
         """Say a JARVIS-owned notice (a ``Bridge`` catalog source)."""
@@ -284,7 +299,7 @@ class Bridge(QObject):
             intent = None
         status = str((intent or {}).get("status") or "")
         for entry in text_entries(payload):
-            self._say(entry["kind"], entry["text"])
+            self._say(entry["kind"], entry["text"], chat=status == "conversation")
         self._clarification = {}
         if status == "structured":
             self._apply_run(payload.get("run"), intent)
@@ -302,6 +317,8 @@ class Bridge(QObject):
         elif status == "scheduled":
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduled job %1"), ((payload.get("job") or {}).get("label"),)), "scheduled")
             self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
+        elif status == "conversation":
+            pass                                # General Chat: the reply is the whole result
         else:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Intent %1"), (status,)), "error" if status != "scheduled" else "system")
         self._task = task_status(None, intent) if status != "structured" else self._task
@@ -494,6 +511,7 @@ class Bridge(QObject):
             return False
         self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
+        conversation = self._conversation()   # before this turn: the window is what came earlier
         self._say("user", text)
         self.inputAccepted.emit()
         session_id = self._session_id or None
@@ -504,9 +522,11 @@ class Bridge(QObject):
             self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._apply_run)
             return True
         self._task = {}
+        language = self.language           # the default reply language for General Chat
         self._run(
             "task",
-            lambda: self.backend.submit_text(text, session_id, request_id=request_id),
+            lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
+                                             conversation=conversation),
             lambda payload: self._apply_text(payload, text),
         )
         return True
@@ -522,14 +542,17 @@ class Bridge(QObject):
         previous = clarification["previous_text"]
         self._clarification = {}
         self.approvalChanged.emit()
+        conversation = self._conversation()
         self._say("user", label)
         self.inputAccepted.emit()
         session_id = self._session_id or None
         request_id = str(uuid4())
         self._request_id = request_id
+        language = self.language
         self._run(
             "task",
-            lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id),
+            lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
+                                             response_language=language, conversation=conversation),
             lambda payload: self._apply_text(payload, label),
         )
 
@@ -843,7 +866,7 @@ class Bridge(QObject):
             return "refused"
         if self.executionEnabled:
             return "running"
-        return "freeze_requested" if self._busy else "frozen"
+        return "freeze_requested" if self._busy and not self._started_frozen else "frozen"
 
     # -- window, tray and quit ---------------------------------------------------
 

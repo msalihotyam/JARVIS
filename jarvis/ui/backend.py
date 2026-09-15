@@ -169,7 +169,8 @@ class Backend:
     # -- natural language -----------------------------------------------------
 
     def submit_text(
-        self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = ""
+        self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = "",
+        response_language: str = "", conversation: tuple = (),
     ) -> dict:
         request_id = request_id or str(uuid4())
 
@@ -178,7 +179,8 @@ class Backend:
             self._text_app = app
             try:
                 return app.submit_text(
-                    text, session_id, previous_text=previous_text, request_id=request_id
+                    text, session_id, previous_text=previous_text, request_id=request_id,
+                    response_language=response_language, conversation=conversation,
                 )
             finally:
                 self._text_app = None

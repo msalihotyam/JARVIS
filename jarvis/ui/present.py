@@ -56,6 +56,15 @@ INTENT_TEXT = {
     "invalid_input": QT_TRANSLATE_NOOP("Present", "INVALID REQUEST: %1"),
 }
 
+#: JARVIS's own explanation of an ESTABLISHED failure cause, keyed by the
+#: stable reason code the envelope carries. Shown instead of the provider's
+#: generic diagnostic; every other failure keeps its truthful generic text.
+#: The key is ``jarvis.intent.CLAUDE_NOT_LOGGED_IN``; this module imports nothing.
+REASON_TEXT = {
+    "claude_not_logged_in": QT_TRANSLATE_NOOP("Present", "Claude Code CLI is not logged in. Run `claude auth login` in a normal "
+                                                       "PowerShell, complete the Claude subscription login, then restart JARVIS."),
+}
+
 UNREADABLE = {
     "kind": "unknown",
     "text": _msg(QT_TRANSLATE_NOOP("Present", "The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is "
@@ -156,9 +165,16 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
         entries.append({"kind": "scheduled", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "SCHEDULED: '%1' (%2) as job %3 - next due %4 (UTC). Nothing has run; the scheduler "
             "runs it and every approval still applies."), job.get("label"), job.get("kind"), job.get("job_id"), due)})
+    elif status == "conversation":
+        # General Chat: the model's words, shown as JARVIS's turn, as written.
+        reply = intent.get("reply")
+        entries.append({"kind": "jarvis", "text": str(reply)} if reply else dict(UNREADABLE))
     elif status == "clarification_required":
         question = intent.get("question")
         entries.append({"kind": "clarify", "text": str(question) if question else _msg(QT_TRANSLATE_NOOP("Present", "JARVIS needs one detail."))})
+    elif REASON_TEXT.get(str(intent.get("reason") or "")):
+        # An established cause: JARVIS explains it in the interface language.
+        entries.append({"kind": "error", "text": _msg(REASON_TEXT[str(intent["reason"])])})
     else:
         template = INTENT_TEXT.get(status)
         message = str(intent.get("message") or "")
@@ -239,24 +255,25 @@ def task_progress(task: Any, core_state: str, busy: bool) -> dict[str, Any]:
     """The four lifecycle stages (understanding, authorization, execution,
     outcome) for the header, projected from the bridge's authoritative state:
     Core's task, the core state and whether an operation is running. Active
-    only while there is real work - an operation running or a task that is not
-    terminal; idle projects nothing. Each stage is pending / running / waiting
-    / done / error / unknown / denied / skipped."""
+    only once Core has registered a task, while it runs or is not terminal. A
+    message still being understood - General Chat included - has no task and
+    projects nothing (the status group says REASONING). Each stage is pending
+    / running / waiting / done / error / unknown / denied / skipped."""
     task = task if isinstance(task, dict) else {}
-    has, status, cs = bool(task.get("task_id")), str(task.get("status") or ""), core_state
-    if not (busy or (has and status not in TERMINAL_STATUSES)):
+    status, cs = str(task.get("status") or ""), core_state
+    if not task.get("task_id") or not (busy or status not in TERMINAL_STATUSES):
         return {"active": False, "stages": []}
-    if has and status == "rejected":
+    if status == "rejected":
         stages = ["done", "denied", "skipped", "skipped"]
-    elif has and status == "cancelled":
+    elif status == "cancelled":
         stages = ["done", "skipped", "skipped", "skipped"]
     else:
         ended = {"completed": "done", "error": "error", "unknown": "unknown"}.get(cs)
         stages = [
-            "running" if cs == "running" and not has else "done" if has or cs == "awaiting_input" else "pending",
+            "done",
             "waiting" if cs == "awaiting_approval"
-            else "done" if has and (task.get("run_status") or cs in ("completed", "error", "unknown")) else "pending",
-            "running" if cs == "running" and has else ended or "pending",
+            else "done" if task.get("run_status") or cs in ("completed", "error", "unknown") else "pending",
+            "running" if cs == "running" else ended or "pending",
             ended or "pending",
         ]
     return {"active": True, "stages": stages}
@@ -287,7 +304,7 @@ def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
 def outcome_kind(run: Any, intent_status: str = "") -> str:
     """The core-state word one envelope earns: completed / error / unknown / waiting / idle."""
     if intent_status and intent_status not in ("structured",):
-        return "idle" if intent_status in ("scheduled", "clarification_required") else "error"
+        return "idle" if intent_status in ("scheduled", "clarification_required", "conversation") else "error"
     code = str(_get(_get(run, "error"), "code") or "")
     if code in (UNKNOWN_CODE, IN_PROGRESS_CODE):
         return "unknown"

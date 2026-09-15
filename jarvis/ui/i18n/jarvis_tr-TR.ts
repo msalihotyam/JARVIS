@@ -1590,6 +1590,11 @@ değil</translation>
         <translation>GEÇERSİZ İSTEK: %1</translation>
     </message>
     <message>
+        <source>Claude Code CLI is not logged in. Run `claude auth login` in a normal PowerShell, complete the Claude subscription login, then restart JARVIS.</source>
+        <extracomment>JARVIS&apos;s own explanation of an ESTABLISHED failure cause, keyed by the stable reason code the envelope carries. Shown instead of the provider&apos;s generic diagnostic; every other failure keeps its truthful generic text. The key is ``jarvis.intent.CLAUDE_NOT_LOGGED_IN``; this module imports nothing.</extracomment>
+        <translation>Claude Code CLI oturumu açık değil. Normal PowerShell'de `claude auth login` komutunu çalıştırın, Claude abonelik girişini tamamlayın ve ardından JARVIS'i yeniden başlatın.</translation>
+    </message>
+    <message>
         <source>The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is assumed to have happened or not. Check History before doing it again.</source>
         <translation>Arka uç yanıtı okunamadı. SONUCU BİLİNMİYOR - bir şeyin olduğu ya da olmadığı varsayılmaz. Tekrar yapmadan önce Geçmiş&apos;i kontrol edin.</translation>
     </message>

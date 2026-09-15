@@ -160,6 +160,9 @@ _EGRESS_MEMORY_KINDS = frozenset(
 
 #: Non-secret ``claude auth status --json`` values that together prove an
 #: OAuth, subscription-backed route with no incremental monetary charge.
+#: The one route failure with an established, actionable cause: the CLI says
+#: it is logged out. A stable, non-secret tag a caller may specialize on.
+AUTH_NOT_LOGGED_IN_EVIDENCE = "claude_auth_status:not_logged_in"
 _OAUTH_AUTH_METHODS = frozenset({"claude.ai"})
 _FIRST_PARTY_PROVIDERS = frozenset({"firstparty", "first_party"})
 _SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
@@ -354,7 +357,7 @@ class ClaudeCodeConnector(BaseConnector):
         if status is None:
             return BillingClass.UNKNOWN, "claude_auth_status:unavailable"
         if status.get("loggedIn") is not True:
-            return BillingClass.UNKNOWN, "claude_auth_status:not_logged_in"
+            return BillingClass.UNKNOWN, AUTH_NOT_LOGGED_IN_EVIDENCE
         auth_method = str(status.get("authMethod") or "").strip().casefold()
         provider = str(status.get("apiProvider") or "").strip().casefold()
         subscription = str(status.get("subscriptionType") or "").strip().casefold()

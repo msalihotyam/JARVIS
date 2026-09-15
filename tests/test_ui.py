@@ -30,7 +30,7 @@ from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
 from PySide6.QtTest import QTest  # noqa: E402
 
 from jarvis.app import create_app  # noqa: E402
-from jarvis.contracts import ProjectRecord, SideEffect  # noqa: E402
+from jarvis.contracts import ErrorCode, ProjectRecord, SideEffect, StructuredError  # noqa: E402
 from jarvis.destinations import CLAUDE_CODE_DESTINATION, DestinationGrant  # noqa: E402
 from jarvis.gmail import GMAIL_CONNECTOR, GMAIL_ENABLED_CAPABILITIES, GmailIdentityBinding  # noqa: E402
 from jarvis.memory import SQLiteMemoryStore  # noqa: E402
@@ -383,18 +383,21 @@ class AuthorityTests(UiTestCase):
         self.assertEqual("unknown", bridge.activity[0]["kind"])
 
     def test_kill_switch_is_the_persisted_barrier(self) -> None:
-        bridge = self.bridge(task_proposal("code_analysis"))
+        bridge = self.bridge(task_proposal("code_analysis"), task_proposal("code_analysis"))
         bridge.setExecutionEnabled(False)
         self.assertFalse(self.store.load().settings.execution_enabled)
         self.assertEqual("disabled", bridge.coreState)
         self.assertFalse(bridge.executionEnabled)
         bridge.submitText("Bu projeyi incele.")
         self.assertIn("EXECUTION DISABLED", self.feed_text(bridge))
-        self.assertEqual([], self.model.calls)
+        # Understood (the tool-less call may run), never started: no task, no approval.
+        self.assertEqual(1, len(self.model.calls))
+        self.assertFalse(bridge.task.get("task_id")); self.assertFalse(bridge.approvalPending)
         bridge.setExecutionEnabled(True)
         self.assertTrue(self.store.load().settings.execution_enabled)
         bridge.submitText("Bu projeyi incele.")
-        self.assertEqual(1, len(self.model.calls))
+        self.assertEqual(2, len(self.model.calls))
+        self.assertTrue(bridge.approvalPending)                                  # resumed: real work, gated
 
     def test_stale_worker_completion_never_overwrites_a_newer_operation(self) -> None:
         bridge = self.bridge()
@@ -2622,7 +2625,7 @@ class HudProgressTests(UiTestCase):
         from jarvis.ui.present import task_progress
         self.assertEqual({"active": False, "stages": []}, task_progress({}, "idle", False))
         self.assertEqual({"active": False, "stages": []}, task_progress({"task_id": "t", "status": "completed"}, "completed", False))
-        self.assertEqual(["running", "pending", "pending", "pending"], task_progress({}, "running", True)["stages"])
+        self.assertEqual({"active": False, "stages": []}, task_progress({}, "running", True))   # understanding: no task yet
         waiting = {"task_id": "t", "status": "awaiting_approval", "run_status": "awaiting_approval"}
         self.assertEqual(["done", "waiting", "pending", "pending"], task_progress(waiting, "awaiting_approval", False)["stages"])
         self.assertEqual(["done", "done", "running", "pending"], task_progress({**waiting, "status": "running"}, "running", True)["stages"])
@@ -2667,6 +2670,171 @@ class HudProgressTests(UiTestCase):
         self.assertIn("Yetkinlik", shown)
         self.assertNotIn("Yetenek", shown)
         self.assertEqual(["İsteğiniz anlaşılıyor", "Yetkilendirme", "Yürütme", "Sonuç"], self.texts(self.item(root, "hudProgress"), []))
+
+
+
+class GeneralChatUiTests(UiTestCase):
+    """General Chat on the existing conversation surface: the reply is JARVIS's
+    turn; no task, no approval, no task-progress stages, no execution."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def chat(self, reply: str) -> str:
+        return proposal(kind="chat", reply=reply)
+
+    def test_a_chat_reply_is_a_jarvis_turn_with_no_task_or_progress(self) -> None:
+        bridge = self.bridge(self.chat("İyiyim, teşekkürler! Size nasıl yardımcı olabilirim?"))
+        root = self.window(bridge)
+        self.assertTrue(bridge.submitText("Merhaba, nasılsın?")); pump(400)
+        self.assertEqual(["user", "jarvis"], self.kinds(bridge))
+        self.assertEqual("İyiyim, teşekkürler! Size nasıl yardımcı olabilirim?", bridge.feed[-1]["text"])  # as written
+        self.assertEqual({"active": False, "stages": []}, bridge.progress)
+        self.assertFalse(self.item(root, "hudProgress").isVisible())
+        self.assertFalse(bridge.task.get("task_id"))
+        self.assertFalse(bridge.approvalPending)
+        self.assertEqual("idle", bridge.coreState)
+        self.assertEqual([], [a for a in bridge.activity if a["kind"] == "error"])
+        self.assertEqual(0, self.execute_calls())
+        # An actionable request afterwards still becomes a real task with its approval.
+        self.model.answers = [task_proposal("code_analysis", objective="Bu projeyi incele.")]
+        bridge.submitText("Bu projeyi incele."); pump(400)
+        self.assertTrue(bridge.approvalPending)
+        self.assertTrue(bridge.progress["active"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_the_interface_language_is_sent_as_the_default_reply_language(self) -> None:
+        from jarvis.ui.i18n import localization
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        bridge = self.bridge(self.chat("Merhaba!"), self.chat("Hello!"))
+        bridge.setLanguage("tr-TR")
+        bridge.submitText("Hello there"); pump(300)
+        bridge.setLanguage("en-US")
+        bridge.submitText("Selam"); pump(300)
+        self.assertEqual(["tr-TR", "en-US"], [call.context["response_language"] for call in self.model.calls])
+        # The words themselves are never translated by JARVIS.
+        self.assertEqual(["Hello there", "Merhaba!", "Selam", "Hello!"], [e["text"] for e in bridge.feed])
+
+    def test_a_chat_backend_failure_is_shown_as_a_failure_not_a_reply(self) -> None:
+        bridge = self.bridge()
+        self.model.error = StructuredError(ErrorCode.CONNECTOR_UNAVAILABLE, "Claude Code CLI is not available")
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual(["user", "error"], self.kinds(bridge))
+        self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"])
+        self.assertEqual({"active": False, "stages": []}, bridge.progress)
+        self.assertEqual(1, len(self.model.calls))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_frozen_jarvis_still_chats_but_starts_no_work(self) -> None:
+        bridge = self.bridge(self.chat("Buradayım, dondurulmuş olsam da sohbet edebiliriz."), task_proposal("code_analysis"))
+        root = self.window(bridge)
+        bridge.freezeJarvis(); pump(100)
+        during = []
+        self.model.on_complete = lambda task: during.append(bridge.executionState)
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual(["frozen"], during)                   # a chat is not work on its way to a safe point
+        self.model.on_complete = None
+        self.assertEqual("jarvis", self.kinds(bridge)[-1])
+        self.assertEqual("Buradayım, dondurulmuş olsam da sohbet edebiliriz.", bridge.feed[-1]["text"])
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        self.assertEqual("error", self.kinds(bridge)[-1])
+        self.assertIn("EXECUTION DISABLED", bridge.feed[-1]["text"])
+        self.assertIn("understood but not started", bridge.feed[-1]["text"])
+        self.assertEqual(2, len(self.model.calls))
+        self.assertFalse(bridge.task.get("task_id")); self.assertFalse(bridge.approvalPending)
+        self.assertFalse(self.item(root, "hudProgress").isVisible())
+        self.assertEqual(("frozen", False), (bridge.executionState, self.store.load().settings.execution_enabled))
+        self.assertEqual(0, self.execute_calls())
+        # Resume: the same request becomes real work again, with its approval.
+        bridge.resumeJarvis(); pump(100)
+        self.model.answers = [task_proposal("code_analysis")]
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_no_task_stages_while_a_message_is_understood(self) -> None:
+        bridge = self.bridge(self.chat("Merhaba!"), task_proposal("code_analysis"))
+        root = self.window(bridge)
+        hud = self.item(root, "hudProgress")
+        during = []
+        self.model.on_complete = lambda task: during.append((bridge.busy, bridge.progress["active"], hud.isVisible()))
+        bridge.submitText("Merhaba"); pump(300)
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        # Busy (REASONING) during both calls; no stages for either until a task exists.
+        self.assertEqual([(True, False, False), (True, False, False)], during)
+        self.assertTrue(bridge.approvalPending)
+        self.assertTrue(bridge.progress["active"]); self.assertTrue(hud.isVisible())       # a real task now
+
+    def test_a_follow_up_carries_the_recent_chat_and_nothing_else(self) -> None:
+        bridge = self.bridge(self.chat("Process ayrı bellekte çalışır; thread aynı süreci paylaşır."),
+                             task_proposal("code_analysis"), self.chat("CPU ağırlıklı işte process."))
+        bridge.submitText("Python'da process ve thread farkı nedir?"); pump(300)
+        bridge.submitText("Bu projeyi incele."); pump(300)                              # a real task and its approval notices
+        bridge.deny(); pump(300)
+        bridge.submitText("Peki hangisi CPU ağırlıklı işlerde daha mantıklı?"); pump(300)
+        self.assertEqual([], self.model.calls[0].context["conversation"])
+        self.assertEqual([
+            {"role": "user", "text": "Python'da process ve thread farkı nedir?"},
+            {"role": "assistant", "text": "Process ayrı bellekte çalışır; thread aynı süreci paylaşır."},
+            {"role": "user", "text": "Bu projeyi incele."},
+        ], self.model.calls[2].context["conversation"])
+        # The feed around it held notices, an approval and a decision; none of them is in the window.
+        self.assertTrue({"system", "approval"} & set(self.kinds(bridge)))
+        # Bounded: a long chat keeps only the most recent turns.
+        from jarvis.intent import CONVERSATION_MAX_TURNS
+        self.model.answers = [self.chat(f"yanıt {i}") for i in range(8)]
+        for i in range(8):
+            bridge.submitText(f"soru {i}"); pump(50)
+        window = self.model.calls[-1].context["conversation"]
+        self.assertEqual(CONVERSATION_MAX_TURNS, len(window))
+        self.assertEqual({"role": "assistant", "text": "yanıt 6"}, window[-1])
+
+
+class ClaudeAuthMessageTests(UiTestCase):
+    """A logged-out Claude Code CLI reads as JARVIS's own instruction, in the
+    interface language - never as a provider diagnostic or an evidence tag."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    ENGLISH = ("Claude Code CLI is not logged in. Run `claude auth login` in a normal "
+               "PowerShell, complete the Claude subscription login, then restart JARVIS.")
+    TURKISH = ("Claude Code CLI oturumu açık değil. Normal PowerShell'de `claude auth login` komutunu "
+               "çalıştırın, Claude abonelik girişini tamamlayın ve ardından JARVIS'i yeniden başlatın.")
+
+    def test_the_message_is_jarvis_own_copy_in_both_languages(self) -> None:
+        from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE
+        from jarvis.intent import CLAUDE_NOT_LOGGED_IN
+        from jarvis.ui.i18n import localization
+        from jarvis.ui.present import REASON_TEXT
+        self.assertIn(CLAUDE_NOT_LOGGED_IN, REASON_TEXT)                      # the two constants agree
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        bridge = self.bridge()
+        self.window(bridge)                                                   # the engine applies the language live
+        self.model.error = StructuredError(
+            ErrorCode.BILLING_ROUTE_UNKNOWN,
+            "Billing route could not be established; the Claude model call was not started.",
+            {"billing_evidence": AUTH_NOT_LOGGED_IN_EVIDENCE})
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual("error", self.kinds(bridge)[-1])
+        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
+        # Nothing of the probe's internals reaches the person.
+        for internal in ("claude_auth_status", "billing_evidence", "Billing route could not be established"):
+            self.assertNotIn(internal, self.feed_text(bridge))
+        bridge.setLanguage("tr-TR"); pump(200)
+        self.assertEqual(self.TURKISH, bridge.feed[-1]["text"])               # the stored notice re-renders
+        bridge.setLanguage("en-US"); pump(200)
+        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_other_route_failures_keep_the_truthful_generic_text(self) -> None:
+        bridge = self.bridge()
+        self.model.error = StructuredError(
+            ErrorCode.BILLING_ROUTE_UNKNOWN,
+            "Billing route could not be established; the Claude model call was not started.",
+            {"billing_evidence": "claude_env:prohibited_metered_credential_present"})
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"])
+        self.assertIn("Billing route could not be established", bridge.feed[-1]["text"])
+        self.assertNotIn(self.ENGLISH, self.feed_text(bridge))
+        self.assertNotIn("claude_env", self.feed_text(bridge))
 
 
 if __name__ == "__main__":  # pragma: no cover

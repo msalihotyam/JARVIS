@@ -20,7 +20,7 @@ import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AbstractSet, Any, Iterable
+from typing import AbstractSet, Any, Iterable, Mapping
 from uuid import uuid4
 
 from jarvis.connectors.base import BaseConnector
@@ -173,7 +173,10 @@ from jarvis.intent import (
     intent_text_refusal,
     model_failure_status,
     parse_proposal,
+    conversation_window,
+    model_failure_reason,
     resolve_proposal,
+    response_language_hint,
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
@@ -2965,12 +2968,12 @@ _INTENT_EXIT: dict[IntentStatus, tuple[int, ErrorCode | None]] = {
     IntentStatus.INVALID_INPUT: (EXIT_INVALID_INPUT, ErrorCode.INVALID_TASK),
 }
 
-#: The message the execution barrier prints, reused verbatim so a refused
-#: natural-language request reads exactly like a refused structured one.
-_EXECUTION_DISABLED_MESSAGE = (
-    "Execution is disabled for this installation. No connector was called "
-    "and nothing was changed. Re-enable it with "
-    "'jarvis config set execution_enabled true'."
+#: The execution barrier on the free-text entry: the request was understood,
+#: and nothing authoritative followed.
+_FROZEN_UNDERSTOOD_MESSAGE = (
+    "JARVIS is frozen, so this request was understood but not started: no "
+    "task or job was created and nothing was queued. Resume JARVIS and send "
+    "it again to run it."
 )
 
 
@@ -2984,6 +2987,8 @@ def text_result(
     capability: str = "",
     destination: str = "",
     objective: str = "",
+    reply: str = "",
+    reason: str = "",
     choices: Iterable[dict[str, str]] = (),
     run: dict[str, Any] | None = None,
     job: dict[str, Any] | None = None,
@@ -3014,6 +3019,12 @@ def text_result(
             "capability": capability or None,
             "destination": destination or None,
             "objective": objective or None,
+            # General Chat: the model's conversational text, when the verdict
+            # is ``conversation``. Something to show, never something done.
+            "reply": reply or None,
+            # A stable, non-secret code for an ESTABLISHED failure cause, so the
+            # interface can explain it in the person's language. Never prose.
+            "reason": reason or None,
             # The configured destinations a clarification asks the user to
             # choose between, each with the exact text that selects it. Built
             # from the grant rows only; empty when no choice is pending.
@@ -3055,6 +3066,8 @@ class JarvisApp:
         *,
         previous_text: str = "",
         request_id: str | None = None,
+        response_language: str = "",
+        conversation: Iterable[Mapping[str, str]] = (),
     ) -> CommandResult:
         """Free text in, the authoritative envelope out.
 
@@ -3070,22 +3083,31 @@ class JarvisApp:
         answering a clarification; the seam is stateless on purpose, so a
         stale clarification can never mutate a later task or session.
         ``request_id`` is the caller's handle for ``cancel_text``.
+
+        The same call is General Chat: a message that asks for nothing to be
+        done comes back as a ``conversation`` verdict carrying the model's
+        reply - no task, job, grant or connector, and nothing to approve.
+        ``response_language`` (a language tag, e.g. the interface language)
+        is only the default for that reply; the user's own language wins.
+        ``conversation`` is the caller's recent chat turns (user / assistant
+        text only), bounded by ``conversation_window`` so a follow-up can be
+        understood. It is data: only the CURRENT turn can select a destination.
         """
         request_id = request_id or str(uuid4())
         mode = self.settings.permission_mode
 
-        def refused(status: IntentStatus, message: str) -> CommandResult:
-            return text_result(mode, status, request_id, message=message)
+        def refused(status: IntentStatus, message: str, reason: str = "") -> CommandResult:
+            return text_result(mode, status, request_id, message=message, reason=reason)
 
         reason = intent_text_refusal(text)
         if reason is None and previous_text:
             reason = intent_text_refusal(previous_text)
         if reason is not None:
             return refused(IntentStatus.INVALID_INPUT, f"The request was refused: {reason}.")
-        if not self.core.execution_allowed():
-            # THE barrier, ahead of the model: understanding is the first
-            # step of starting work, and nothing may start work.
-            return refused(IntentStatus.EXECUTION_DISABLED, _EXECUTION_DISABLED_MESSAGE)
+        # Freeze gates AUTHORITATIVE work, not conversation: the understanding
+        # call may run while execution is disabled (it has no tools and no
+        # authority), and the barrier stands after the verdict, ahead of
+        # anything that would create a task or a job.
         session = None
         if session_id is not None:
             session = self.memory.load_session(session_id)
@@ -3120,6 +3142,8 @@ class JarvisApp:
             scope=ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION),
             context={
                 "previous_request": previous_text,
+                "response_language": response_language_hint(response_language),
+                "conversation": conversation_window(list(conversation)),
                 "local_time": catalog.local_time,
                 "catalog": catalog.to_dict(),
             },
@@ -3139,7 +3163,7 @@ class JarvisApp:
         if not result.ok:
             status = model_failure_status(result, cancelled)
             detail = result.error.message if result.error is not None else result.summary
-            return refused(status, sanitize_diagnostic_text(detail, 240))
+            return refused(status, sanitize_diagnostic_text(detail, 240), model_failure_reason(result))
         if cancelled:
             return refused(IntentStatus.MODEL_CANCELLED, "The understanding call was cancelled.")
         answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
@@ -3158,6 +3182,15 @@ class JarvisApp:
         # Only the user's CURRENT turn may choose among several configured
         # destinations - never the model, and never an earlier turn.
         resolution = resolve_proposal(proposal, catalog, now, text)
+        if resolution.status in (IntentStatus.STRUCTURED, IntentStatus.SCHEDULED) and not self.core.execution_allowed():
+            # THE barrier: understood, but nothing is created, queued or started.
+            return text_result(
+                mode, IntentStatus.EXECUTION_DISABLED, request_id,
+                message=_FROZEN_UNDERSTOOD_MESSAGE,
+                capability=resolution.capability,
+                destination=resolution.destination,
+                objective=resolution.objective,
+            )
         if resolution.status is IntentStatus.STRUCTURED:
             try:
                 task = decode_task_json(json.dumps(resolution.task_document))
@@ -3177,6 +3210,9 @@ class JarvisApp:
                 run=build_envelope("run", mode, run),
                 exit_code=self._exit_code(run),
             )
+        if resolution.status is IntentStatus.CONVERSATION:
+            # Text to show. Nothing was created and nothing can run from it.
+            return text_result(mode, IntentStatus.CONVERSATION, request_id, reply=resolution.reply)
         if resolution.status is IntentStatus.SCHEDULED:
             created = job_create_result(
                 self.memory, self.settings, json.dumps(resolution.job_document)
