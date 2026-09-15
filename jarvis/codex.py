@@ -1,0 +1,315 @@
+"""OpenAI Codex as a General Chat / understanding provider - ChatGPT subscription only.
+
+The official standalone Codex CLI (``@openai/codex``) is used in exactly two
+ways, both without any JARVIS credential:
+
+* ``codex app-server`` JSON-RPC, read-only: ``account/read`` proves the
+  route is a ChatGPT sign-in (never an API key), ``account/rateLimits/read``
+  reports the plan's usage windows, and ``codex debug models`` lists the
+  models the account is offered. None of these is a model call.
+* ``codex exec`` for one understanding call, with every tool surface this
+  build can name turned off. The call is refused before any process starts
+  unless the route is a ChatGPT sign-in, the model is one whose tools all run
+  through the code-mode host (which is disabled here, so any tool call fails
+  closed at the CLI), and no API-key variable is present in the environment.
+
+It proposes exactly what the Claude understanding call proposes, and the
+proposal is judged by the same deterministic code: choosing this provider
+changes who INTERPRETS a request, never what JARVIS may do.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any
+
+from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.contracts import (
+    MODEL_ANSWER_RESULT_KEY,
+    Availability,
+    ErrorCode,
+    OutcomeStatus,
+    SessionState,
+    StructuredError,
+    Task,
+    ToolResult,
+    build_model_answer,
+    redact_credentials,
+)
+
+#: Variables that could route the CLI to metered API billing. Only presence is
+#: ever checked; values are never read.
+CODEX_PROHIBITED_ENV_VARS = (
+    "OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID", "AZURE_OPENAI_API_KEY",
+)
+CODEX_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "max", "ultra")
+CODEX_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+#: Every feature that can put a tool, an app, a plugin, memory or a hook in
+#: front of the model. Disabled on every call.
+CODEX_DISABLED_FEATURES = (
+    "shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+    "computer_use", "image_generation", "multi_agent", "view_image", "hooks", "plugins", "memories", "goals",
+    "sleep_tool", "skill_search", "tool_suggest", "in_app_browser", "code_mode_host", "workspace_dependencies",
+    "shell_snapshot", "remote_plugin", "skill_mcp_dependency_install", "tool_call_mcp_elicitation",
+    "guardian_approval",
+)
+#: The catalog tool mode under which EVERY tool goes through the code-mode host.
+CODEX_SAFE_TOOL_MODE = "code_mode_only"
+CODEX_TIMEOUT_SECONDS = 120
+CODEX_PROBE_TIMEOUT_SECONDS = 20
+CODEX_NOT_LOGGED_IN = "codex_not_logged_in"
+CODEX_API_KEY_ROUTE = "codex_api_key_route"
+
+
+def codex_executable() -> str | None:
+    """The native Codex binary. The npm launcher is a script; the binary it
+    starts is run directly so no shell ever parses an argument."""
+    found = shutil.which("codex")
+    if found is None:
+        return None
+    path = Path(found)
+    if path.suffix.lower() in (".cmd", ".ps1", "") and not path.name.lower().endswith(".exe"):
+        vendor = path.parent / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai" / "codex-win32-x64" / "vendor"
+        binaries = sorted(vendor.glob("*/bin/codex.exe")) if vendor.is_dir() else []
+        return str(binaries[0]) if binaries else (None if os.name == "nt" else found)
+    return found
+
+
+def cli_reason(message: Any) -> str:
+    """A Codex CLI error message fit to show: one line, bounded, credential-redacted."""
+    if type(message) is not str:
+        return ""
+    line = " ".join("".join(ch for ch in message if ch >= " " or ch == "\n").split())
+    if len(line) > 200:
+        line = line[:199] + "…"
+    return str(redact_credentials(line)[0])
+
+
+def _environment() -> dict[str, str]:
+    prohibited = {name.upper() for name in CODEX_PROHIBITED_ENV_VARS}
+    return {key: value for key, value in os.environ.items() if key.upper() not in prohibited}
+
+
+def prohibited_env_present() -> bool:
+    present = {key.upper() for key in os.environ}
+    return any(name in present for name in CODEX_PROHIBITED_ENV_VARS)
+
+
+def _app_server(executable: str, calls: list[tuple[str, dict | None]], timeout: float) -> dict[str, Any]:
+    """Answers of a short read-only app-server session, keyed by method."""
+    process = subprocess.Popen([executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                               env=_environment(), shell=False)
+    replies: dict[int, dict] = {}
+    done = threading.Event()
+
+    def reader() -> None:
+        for line in process.stdout:  # type: ignore[union-attr]
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and type(message.get("id")) is int:
+                replies[message["id"]] = message
+                if all(i in replies for i in range(1, len(calls) + 1)):
+                    done.set()
+                    return
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        messages = [{"id": 0, "method": "initialize", "params": {"clientInfo": {"name": "jarvis", "version": "1"}}},
+                    {"method": "initialized"}]
+        messages += [{"id": i, "method": method, **({"params": params} if params is not None else {})}
+                     for i, (method, params) in enumerate(calls, 1)]
+        for message in messages:
+            process.stdin.write(json.dumps(message) + "\n")  # type: ignore[union-attr]
+        process.stdin.flush()  # type: ignore[union-attr]
+        done.wait(timeout)
+    except OSError:
+        pass
+    finally:
+        process.kill()
+    return {method: (replies.get(i) or {}).get("result") for i, (method, _) in enumerate(calls, 1)}
+
+
+def _catalog(executable: str) -> list[dict[str, Any]]:
+    try:
+        completed = subprocess.run([executable, "debug", "models"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=CODEX_PROBE_TIMEOUT_SECONDS, env=_environment(), shell=False)
+        models = json.loads(completed.stdout).get("models")
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return []
+    return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else []
+
+
+def _window(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    used, minutes, resets = value.get("usedPercent"), value.get("windowDurationMins"), value.get("resetsAt")
+    if type(used) not in (int, float) or type(minutes) is not int or type(resets) is not int:
+        return None
+    return {"used_percent": float(used), "window_minutes": minutes, "resets_at": resets}
+
+
+def codex_state() -> dict[str, Any]:
+    """What is REALLY known about the Codex route, from local non-model calls.
+
+    ``status``: available / not_installed / not_logged_in / api_key_route /
+    unavailable. ``models``: the account's listed models whose tools all fail
+    closed here (id, name, efforts, default effort). ``quota``: the plan's
+    usage windows as the service reported them, or absent."""
+    executable = codex_executable()
+    if executable is None:
+        return {"status": "not_installed", "models": []}
+    if prohibited_env_present():
+        return {"status": "api_key_route", "models": []}
+    answers = _app_server(executable, [("account/read", {}), ("account/rateLimits/read", None)], CODEX_PROBE_TIMEOUT_SECONDS)
+    account = (answers.get("account/read") or {}).get("account")
+    if not isinstance(account, dict):
+        return {"status": "not_logged_in" if answers.get("account/read") is not None else "unavailable", "models": []}
+    if account.get("type") != "chatgpt":
+        return {"status": "api_key_route", "models": []}
+    state: dict[str, Any] = {"status": "available", "plan": str(account.get("planType") or "")[:32], "models": []}
+    limits = (answers.get("account/rateLimits/read") or {}).get("rateLimits")
+    if isinstance(limits, dict):
+        quota = {name: window for name in ("primary", "secondary") if (window := _window(limits.get(name)))}
+        credits = limits.get("credits") if isinstance(limits.get("credits"), dict) else {}
+        if type(credits.get("hasCredits")) is bool:
+            quota["has_credits"] = credits["hasCredits"]
+        if limits.get("rateLimitReachedType") is not None:
+            quota["limit_reached"] = True
+        if quota:
+            state["quota"] = quota
+    for model in _catalog(executable):
+        slug = model.get("slug")
+        if (model.get("visibility") != "list" or model.get("tool_mode") != CODEX_SAFE_TOOL_MODE
+                or type(slug) is not str or not CODEX_MODEL_PATTERN.match(slug)):
+            continue
+        efforts = [level.get("effort") for level in model.get("supported_reasoning_levels") or []
+                   if isinstance(level, dict) and level.get("effort") in CODEX_EFFORT_VALUES]
+        state["models"].append({"id": slug, "name": str(model.get("display_name") or slug)[:64], "efforts": efforts,
+                                "default_effort": model.get("default_reasoning_level") if model.get("default_reasoning_level") in efforts else ""})
+    return state
+
+
+class CodexIntentAdapter:
+    """The understanding / General Chat call through Codex. A ``ModelAdapter``."""
+
+    name = "codex-intent"
+    provider = "openai"
+
+    def __init__(self, system_prompt: str, model: str, effort: str = "", state: Any = codex_state) -> None:
+        self.system_prompt = system_prompt
+        self.model = model
+        self.effort = effort
+        self._state = state
+        self.reported: dict[str, dict[str, Any]] = {}
+        self.observed: dict[str, dict[str, Any]] = {}
+        self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._lock = threading.Lock()
+
+    def availability(self) -> Availability:
+        if codex_executable() is None:
+            return Availability(False, "The Codex CLI is not installed.")
+        return Availability(True)
+
+    def cancel(self, task_id: str) -> bool:
+        with self._lock:
+            process = self._processes.get(task_id)
+        if process is None or process.poll() is not None:
+            return False
+        process.terminate()
+        return True
+
+    def _refused(self, message: str, code: ErrorCode = ErrorCode.BILLING_ROUTE_UNKNOWN, reason: str = "") -> ToolResult:
+        # Every failure names the provider and the model the person chose.
+        message = f"Codex · {self.model or 'no model'}: {message}"
+        details = {"billing_evidence": reason} if reason else {}
+        return ToolResult(outcome=OutcomeStatus.ERROR, summary=message, error=StructuredError(code, message, details))
+
+    def complete(self, task: Task, session: SessionState) -> ToolResult:
+        executable = codex_executable()
+        if executable is None:
+            return self._refused("The Codex CLI is not installed.", ErrorCode.CONNECTOR_UNAVAILABLE)
+        state = self._state()
+        if state.get("status") != "available":
+            reason = CODEX_NOT_LOGGED_IN if state.get("status") == "not_logged_in" else CODEX_API_KEY_ROUTE if state.get("status") == "api_key_route" else ""
+            return self._refused("Codex has no verified ChatGPT subscription route; the call was not started.", reason=reason)
+        models = {m["id"]: m for m in state.get("models") or []}
+        chosen = models.get(self.model)
+        if chosen is None:
+            return self._refused(f"The Codex model '{self.model}' is not offered to this account with tools disabled; nothing was sent.",
+                                 ErrorCode.CONNECTOR_UNAVAILABLE)
+        if self.effort and self.effort not in chosen["efforts"]:
+            return self._refused(f"The Codex model '{self.model}' does not support effort '{self.effort}'; nothing was sent.",
+                                 ErrorCode.CONNECTOR_UNAVAILABLE)
+        if (state.get("quota") or {}).get("limit_reached"):
+            return self._refused("The Codex plan limit is reached; nothing was sent so no credits can be used.",
+                                 ErrorCode.CONNECTOR_UNAVAILABLE)
+        payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": task.context})
+        prompt = (self.system_prompt + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
+                  + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        workdir = tempfile.mkdtemp(prefix="jarvis-codex-")
+        command = [executable, "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                   "--skip-git-repo-check", "-s", "read-only", "-C", workdir, "-m", self.model,
+                   "-c", "approval_policy=never", "-c", "forced_login_method=chatgpt", "-c", "web_search_mode=disabled"]
+        if self.effort:
+            command += ["-c", f"model_reasoning_effort={self.effort}"]
+        for feature in CODEX_DISABLED_FEATURES:
+            command += ["--disable", feature]
+        command.append("-")
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, encoding="utf-8", errors="replace", env=_environment(), shell=False)
+        except OSError:
+            return self._refused("The Codex CLI could not be started.", ErrorCode.CONNECTOR_UNAVAILABLE)
+        with self._lock:
+            self._processes[task.id] = process
+        try:
+            stdout, _ = process.communicate(prompt, timeout=CODEX_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return self._refused("Codex did not finish before the timeout.", ErrorCode.CONNECTOR_FAILED)
+        finally:
+            with self._lock:
+                self._processes.pop(task.id, None)
+            shutil.rmtree(workdir, ignore_errors=True)
+        text, usage, failed, notes = "", {}, False, []
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            if item.get("type") == "agent_message" and type(item.get("text")) is str:
+                text = item["text"]
+            elif event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            elif event.get("type") == "turn.failed":
+                failed = True
+                error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                notes.append(error.get("message"))
+            elif event.get("type") == "error":
+                # Also transient notices (a reconnect that then succeeds): a reason, not a verdict.
+                notes.append(event.get("message"))
+        # The CLI names no answering model in its event stream: only the model
+        # it was asked to use is known, and it is reported as requested.
+        self.reported[task.id] = {**{key: usage[key] for key in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens")
+                                     if type(usage.get(key)) is int and usage[key] >= 0}}
+        self.observed[task.id] = {"requested_model": self.model, "quota": state.get("quota") or {}}
+        if process.returncode != 0 or failed or not text.strip():
+            reason = next((cli_reason(note) for note in reversed(notes) if cli_reason(note)), "")
+            return self._refused(f"Codex reported: {reason}" if reason else "Codex returned no answer.", ErrorCode.CONNECTOR_FAILED)
+        return ToolResult(outcome=OutcomeStatus.SUCCESS, summary="Codex answered.",
+                          data={MODEL_ANSWER_RESULT_KEY: build_model_answer(text)})

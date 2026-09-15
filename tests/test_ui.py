@@ -1,4 +1,4 @@
-﻿"""The PySide6 / QML interface: the bridge drives the REAL application path.
+"""The PySide6 / QML interface: the bridge drives the REAL application path.
 
 Every test composes the ordinary application from fake connectors, a
 scripted understanding model and temporary config / database / preference
@@ -26,6 +26,7 @@ os.environ.pop("ANTHROPIC_BASE_URL", None)
 
 from PySide6.QtCore import QMetaObject, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
+from PySide6.QtQml import QQmlProperty  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
 from PySide6.QtTest import QTest  # noqa: E402
 
@@ -118,7 +119,18 @@ class UiTestCase(unittest.TestCase):
 
     def bridge(self, *answers, sync: bool = True) -> Bridge:
         self.model.answers = list(answers)
-        self.backend = Backend(self.store, self.factory)
+        # Provider probes are local processes in production: fixed answers here.
+        self.codex = ScriptedModel()
+        self.codex.provider = "openai"
+        self.codex_routes: list[tuple] = []
+
+        def codex_factory(prompt, model, effort):
+            self.codex_routes.append((model, effort))
+            return self.codex
+        self.backend = Backend(self.store, self.factory, codex_factory=codex_factory,
+                               codex_state=lambda: {"status": "not_installed", "models": []}, claude_catalog=lambda: [],
+                               google_state=lambda: {"id": "google", "vendor": "Google", "name": "Antigravity",
+                                                     "status": "not_installed", "models": [], "research": False})
         bridge = Bridge(self.backend, UiPreferences(self.prefs_path), sync=sync)
         bridge.refreshConfig()
         return bridge
@@ -224,8 +236,12 @@ class ComposerTests(UiTestCase):
         bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
         bridge.submitText("Bu projeyi incele.")
         self.assertEqual("Bu projeyi incele.", self.model.calls[0].objective)
-        self.assertEqual(["user", "system", "system", "approval"], self.kinds(bridge), self.feed_text(bridge))
-        self.assertIn("Understood as code_analysis -> anthropic/claude-code", self.feed_text(bridge))
+        # The conversation holds what the person wrote; the understood action,
+        # the run status and the request itself are on the approval card, in
+        # Active Workflow and in the live feed - not repeated as chat lines.
+        self.assertEqual(["user"], self.kinds(bridge), self.feed_text(bridge))
+        self.assertEqual(("code_analysis", CLAUDE_CODE_DESTINATION), (bridge.task["capability"], bridge.task["destination"]))
+        self.assertEqual("approval", bridge.activity[0]["kind"])
         self.assertTrue(bridge.approvalPending)
         self.assertEqual("awaiting_approval", bridge.coreState)
         self.assertEqual("awaiting_approval", bridge.task["run_status"])
@@ -288,10 +304,12 @@ class ComposerTests(UiTestCase):
 
     def test_every_intent_status_renders_without_executing(self) -> None:
         bridge = self.bridge()
-        for status, kind in (("unsupported_capability", "error"), ("authority_unavailable", "error"),
+        # Expected limitations read as a light notice; failures stay errors.
+        for status, kind in (("unsupported_capability", "notice"), ("authority_unavailable", "notice"),
                              ("malformed_model_output", "error"), ("model_unavailable", "error"),
                              ("model_timeout", "error"), ("model_cancelled", "error"), ("model_failed", "error"),
-                             ("execution_disabled", "error"), ("invalid_input", "error"), ("bogus", "unknown")):
+                             ("execution_disabled", "notice"), ("invalid_input", "notice"), ("research_unavailable", "notice"),
+                             ("research_failed", "error"), ("bogus", "unknown")):
             with self.subTest(status=status):
                 bridge._apply_text({"command": "text", "intent": {"status": status, "message": "m", "request_id": "r", "choices": []},
                                     "run": None, "job": None, "error": None}, "t")
@@ -1218,7 +1236,7 @@ class CommandHeaderTests(UiTestCase):
 
         QMetaObject.invokeMethod(self.item(root, "modelField"), "insert",
                                  Q_ARG(int, 0), Q_ARG(str, "claude-opus-5"))
-        self.click(root, "applyModelButton")
+        QMetaObject.invokeMethod(self.item(root, "applyModelButton"), "clicked")   # below the fold of the scrolling panel
         pump(250)
         self.assertEqual("claude-opus-5", self.store.load().settings.claude_model)
         self.assertEqual("claude-opus-5", chip.property("modelName"))
@@ -1394,6 +1412,7 @@ class ConversationSurfaceTests(UiTestCase):
         root.resize(1920, 1080); pump(400)
         self.assertTrue(self.item(root, "conversationWelcome").isVisible())
         bridge.submitText("Bu projeyi incele."); pump(500)
+        bridge._tell("system", "Answer the pending approval first (Approve, Deny or Cancel)."); pump(400)
         feed = self.box(root, "conversationFeed")
         user = self.box(root, "feedCard_user"); system = self.box(root, "feedCard_system")
         messageX = self.item(root, "conversationFeed").property("messageX")
@@ -2312,7 +2331,9 @@ class SafetyUxTests(UiTestCase):
         self.assertEqual("paused", bridge.safety["outcome"]["kind"])
         stored = SQLiteMemoryStore(self.database).load_task(task_id)
         self.assertNotIn(stored.status.value, ("failed", "cancelled", "completed"))
-        self.assertIn("JARVIS frozen", self.feed_text(bridge))
+        # Lifecycle is a live-feed note and a safety projection, not a chat line.
+        self.assertIn("JARVIS frozen", [entry["text"] for entry in bridge.activity])
+        self.assertNotIn("JARVIS frozen", self.feed_text(bridge))
         # Resume continues the paused task from its stage; the executed step is never run again.
         bridge.resumeJarvis()
         self.assertEqual("running", bridge.executionState)
@@ -2554,7 +2575,7 @@ class LocalizationTests(UiTestCase):
         self.assertEqual("Onay gerekli", self.text(root, "safetyHeading_approval"))
         self.assertEqual("İşlemi onayla", self.item(root, "approvalApprove").property("label"))
         self.assertEqual("Reddet", self.item(root, "approvalDeny").property("label"))
-        self.assertIn("ONAY GEREKLİ - yetkilendirme kartını inceleyin.", self.feed_text(bridge))  # an earlier notice, re-rendered
+        self.assertEqual("Onay gerekli: analyse -> anthropic/claude-code", bridge.activity[0]["text"])  # an earlier note, re-rendered
         self.assertIn("Bu projeyi incele.", self.feed_text(bridge))                               # the person's words, as written
         bridge.setEditMode(True); pump(200)
         self.assertEqual("Bitti", self.item(root, "layoutDone").property("label"))
@@ -2574,7 +2595,7 @@ class LocalizationTests(UiTestCase):
         bridge.setLanguage("en-US"); pump(300)
         self.assertEqual(english, (self.text(root, "railTitleTasks"), self.text(root, "attentionLabel"), self.text(root, "safetyHeading_approval")))
         self.assertEqual(("Open JARVIS", "Quit JARVIS"), tray.menu_labels())
-        self.assertIn("APPROVAL REQUIRED - review the authorization card.", self.feed_text(bridge))
+        self.assertEqual("Approval required: analyse -> anthropic/claude-code", bridge.activity[0]["text"])
 
     def test_turkish_safety_states_stay_distinct_and_dates_follow_the_locale(self) -> None:
         from PySide6.QtCore import QLocale, QDate
@@ -2736,7 +2757,7 @@ class GeneralChatUiTests(UiTestCase):
         self.assertEqual("jarvis", self.kinds(bridge)[-1])
         self.assertEqual("Buradayım, dondurulmuş olsam da sohbet edebiliriz.", bridge.feed[-1]["text"])
         bridge.submitText("Bu projeyi incele."); pump(300)
-        self.assertEqual("error", self.kinds(bridge)[-1])
+        self.assertEqual("notice", self.kinds(bridge)[-1])                          # a limitation, nothing executed
         self.assertIn("EXECUTION DISABLED", bridge.feed[-1]["text"])
         self.assertIn("understood but not started", bridge.feed[-1]["text"])
         self.assertEqual(2, len(self.model.calls))
@@ -2777,8 +2798,8 @@ class GeneralChatUiTests(UiTestCase):
             {"role": "assistant", "text": "Process ayrı bellekte çalışır; thread aynı süreci paylaşır."},
             {"role": "user", "text": "Bu projeyi incele."},
         ], self.model.calls[2].context["conversation"])
-        # The feed around it held notices, an approval and a decision; none of them is in the window.
-        self.assertTrue({"system", "approval"} & set(self.kinds(bridge)))
+        # Around it there was an approval and a decision (live feed and cards); none of them is in the window.
+        self.assertTrue({"approval"} & {note["kind"] for note in bridge.activity})
         # Bounded: a long chat keeps only the most recent turns.
         from jarvis.intent import CONVERSATION_MAX_TURNS
         self.model.answers = [self.chat(f"yanıt {i}") for i in range(8)]
@@ -3122,6 +3143,558 @@ class GmailReadPresentationTests(UiTestCase):
         broken = self.listing(); broken["external_read"]["content"] = "not json"
         bridge._apply_run(broken)
         self.assertIn("[UNTRUSTED external content from gmail-cli", self.feed_text(bridge))
+
+
+class StateProjectionTests(UiTestCase):
+    """Operational panels project real state; the scheduler's real actions reach the live feed."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    click = PresentationTests.click
+
+    def test_active_workflow_is_idle_until_core_registers_a_task(self) -> None:
+        bridge = self.bridge(self.chat_reply(), task_proposal("code_analysis"))
+        root = self.window(bridge)
+        value = lambda key: self.item(root, "workflowValue_" + key).property("text")
+        self.assertEqual(("No active task", "None yet"), (value("Status"), value("Outcome")))
+        bridge.submitText("Merhaba"); pump(300)                                     # General Chat: still no workflow
+        self.assertEqual(("No active task", "None yet"), (value("Status"), value("Outcome")))
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        self.assertEqual(("Approval required", "claude-code-plan", "code_analysis"),
+                         (value("Status"), value("Connector"), value("Capability")))
+        self.assertEqual(CLAUDE_CODE_DESTINATION, value("Destination"))
+
+    def chat_reply(self) -> str:
+        return proposal(kind="chat", reply="Merhaba!")
+
+    def test_the_scheduler_s_real_actions_reach_the_live_feed_and_idle_sweeps_add_nothing(self) -> None:
+        bridge = self.bridge()
+        before = list(bridge.activity)
+        bridge.sweepDueWork(); pump(100)                                              # nothing due: nothing noted
+        self.assertEqual(before, list(bridge.activity))
+        bridge.backend.scheduler_once = lambda: {"command": "scheduler-run", "claims_suspended": False, "retry_authorized": False,
+                                                  "actions": [{"job_id": "job-7", "run_id": "r1", "action": "parked", "reason": "", "verdict": ""}]}
+        bridge.sweepDueWork(); pump(100)
+        self.assertEqual(("scheduled", "Scheduled job job-7: parked"), (bridge.activity[0]["kind"], bridge.activity[0]["text"]))
+        self.assertEqual([], self.kinds(bridge))                                     # a background event, not a chat line
+
+
+class ProviderSelectionTests(UiTestCase):
+    """The model selector shows real route state and real reported usage - no invented quota."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    click = PresentationTests.click
+
+    def providers_with(self, billing):
+        from unittest.mock import patch
+        from jarvis.connectors.claude_code import ClaudeCodeConnector
+        with patch.object(ClaudeCodeConnector, "billing_route", return_value=billing):
+            return self.bridge().backend.providers()
+
+    def invoke(self, root, name, signal):
+        """A panel row may sit below the fold of its scrolling list: fire the signal a click fires."""
+        QMetaObject.invokeMethod(self.item(root, name), signal)
+        pump(150)
+
+    CLAUDE_MODELS = [{"id": "default", "name": "Default", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "high"]},
+                     {"id": "haiku", "name": "Haiku", "resolved": "claude-haiku-4-5-20251001", "description": "", "efforts": []},
+                     {"id": "opus[1m]", "name": "Opus", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "high", "max"]}]
+    CODEX = {"status": "available", "plan": "plus", "quota": {"primary": {"used_percent": 4.0, "window_minutes": 300, "resets_at": 1789492870}},
+             "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low", "medium"], "default_effort": "medium"}]}
+
+    def test_every_line_reports_its_real_route_and_only_verified_routes_are_offered(self) -> None:
+        from jarvis.contracts import BillingClass
+        from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE
+        bridge = self.bridge()
+        bridge.backend.claude_catalog = lambda: self.CLAUDE_MODELS
+        bridge.backend.codex_state = lambda: self.CODEX
+        from unittest.mock import patch
+        from jarvis.connectors.claude_code import ClaudeCodeConnector
+        with patch.object(ClaudeCodeConnector, "billing_route", return_value=(BillingClass.SUBSCRIPTION_INCLUDED, "ok")):
+            verified = bridge.backend.providers()
+        self.assertEqual(["claude", "codex", "google", "qwen"], [p["id"] for p in verified])
+        self.assertEqual(("available", self.CLAUDE_MODELS, True), (verified[0]["status"], verified[0]["models"], verified[0]["research"]))
+        self.assertEqual(("available", "plus", self.CODEX["quota"], False), (verified[1]["status"], verified[1]["plan"], verified[1]["quota"], verified[1]["research"]))
+        self.assertEqual(("not_installed", [], False), (verified[2]["status"], verified[2]["models"], verified[2]["research"]))
+        bridge.backend.google_state = lambda: (_ for _ in ()).throw(OSError("agy crashed"))
+        with patch.object(ClaudeCodeConnector, "billing_route", return_value=(BillingClass.SUBSCRIPTION_INCLUDED, "ok")):
+            self.assertEqual("unavailable", bridge.backend.providers()[2]["status"])   # an unreadable check establishes nothing
+        self.assertEqual(("deferred", []), (verified[3]["status"], verified[3]["models"]))
+        for billing, status in (((BillingClass.UNKNOWN, AUTH_NOT_LOGGED_IN_EVIDENCE), "not_logged_in"),
+                                ((BillingClass.UNKNOWN, "claude_env:prohibited_metered_credential_present"), "unavailable"),
+                                ((BillingClass.METERED_MONETARY, "x"), "unavailable")):                # metered is not a route
+            self.assertEqual((status, []), (self.providers_with(billing)[0]["status"], self.providers_with(billing)[0]["models"]))
+        self.assertEqual([], self.model.calls)
+
+    GOOGLE_GROUPS = [
+        {"name": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro",
+         "buckets": [{"window": "weekly", "remaining_fraction": 0.7923486828804016, "reset_time": "2026-09-17T23:02:31Z"},
+                     {"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]},
+        {"name": "Claude and GPT models", "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+         "buckets": [{"window": "weekly", "remaining_fraction": 1.0, "reset_time": "2026-09-22T20:56:18Z"},
+                     {"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]
+
+    def open_panel(self, bridge, billing="available"):
+        bridge.backend.providers = lambda: [
+            {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": billing, "models": self.CLAUDE_MODELS, "research": True},
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", **self.CODEX, "research": False},
+            {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False,
+             "quota": {"groups": self.GOOGLE_GROUPS}},
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+        root = self.window(bridge)
+        self.click(root, "modelTrigger"); pump(400)
+        return root
+
+    def test_claude_model_and_effort_are_manual_and_the_answering_model_is_shown_apart(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Merhaba!"))
+        root = self.open_panel(bridge)
+        self.assertEqual("Answered the last call: no Claude call yet", self.item(root, "actualModelLine").property("text"))
+        self.assertIn("shown after the first Claude call", self.item(root, "quotaLine").property("text"))
+        self.assertEqual("Connected - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
+        self.assertFalse(self.item(root, "providerRow_google").property("selectable"))
+        # Two pools, each exactly as reported - never merged.
+        gemini, third_party = (self.item(root, f"googleQuota_{i}").property("text") for i in (0, 1))
+        self.assertTrue(gemini.startswith("Gemini Models: weekly 79% remaining · resets "), gemini)
+        self.assertIn("5-hour 100% remaining · resets ", gemini)
+        self.assertTrue(third_party.startswith("Claude and GPT models: weekly 100% remaining · resets "), third_party)
+        bridge.setChatProvider("google")
+        self.assertEqual("claude", bridge.chatProvider)                                   # not selectable in any way
+        self.invoke(root, "claudeModel_haiku", "chosen")
+        self.invoke(root, "applyModelButton", "clicked")
+        self.assertEqual(("haiku", None), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
+        self.assertEqual("Configured model: haiku · effort: Default", self.item(root, "configuredModelLine").property("text"))
+        self.model.reported, self.model.observed = {}, {}
+        def report(task):
+            self.model.reported[task.id] = {"model": "claude-haiku-4-5-20251001", "input_tokens": 3, "output_tokens": 41}
+            self.model.observed[task.id] = {"rate_limits": {"status": "allowed", "overage_status": "rejected", "using_overage": False,
+                                                            "windows": {"five_hour": {"utilization": 0.25, "resets_at": 1789482600}}}}
+        self.model.on_complete = report
+        self.model.provider = "anthropic"
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual("Answered the last call: claude-haiku-4-5-20251001", self.item(root, "actualModelLine").property("text"))
+        self.assertTrue(self.item(root, "claudeLimit_five_hour").property("text").startswith("Current session (5 h): 25% used · resets "))
+        self.assertIn("extra paid usage: off", self.item(root, "quotaLine").property("text"))
+        self.assertEqual("Last call tokens: 3 input · — cache read · — cache write · 41 output", self.item(root, "usageLine").property("text"))
+        self.invoke(root, "claudeModel_opus[1m]", "chosen")
+        self.assertTrue(self.item(root, "claudeEffort").property("enabled"))
+        QMetaObject.invokeMethod(self.item(root, "claudeEffort"), "picked", Q_ARG(str, "max")); pump(50)
+        self.invoke(root, "applyModelButton", "clicked")
+        self.assertEqual(("opus[1m]", "max"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
+
+    def test_choosing_codex_persists_routes_calls_there_and_changes_no_authority(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.open_panel(bridge)
+        self.invoke(root, "providerRow_codex", "chosen")
+        self.assertEqual(("codex", "gpt-5.6-luna", "medium"), (bridge.chatProvider, bridge.codexModel, bridge.codexEffort))
+        saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))["chat"]
+        self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium"}, saved)
+        bridge.setCodexModel("gpt-5.6-luna", "low")
+        trigger = self.item(root, "modelTrigger")                                        # the header names the real choice
+        self.assertEqual(("gpt-5.6-luna", "OPENAI  |  CODEX  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
+        self.assertTrue(self.item(root, "codexQuota_primary").property("text").startswith("5-hour window: 4% used · resets "))
+        self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("text"))
+        # Codex interprets the SAME request into the SAME gated task: approval and destination unchanged.
+        self.codex.answers = [task_proposal("code_analysis")]
+        bridge.submitText("Bu projeyi incele."); pump(300)
+        self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes)
+        self.assertEqual((1, 0), (len(self.codex.calls), len(self.model.calls)))
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual((CLAUDE_CODE_DESTINATION, 0), (bridge.approval["destination"], self.execute_calls()))
+        self.assertEqual("session", bridge.permissionMode)                             # untouched by the provider
+        bridge.deny(); pump(200)
+        # Research is refused with Codex - never re-routed to Claude.
+        self.codex.answers = [proposal(kind="research", query="hava")]
+        bridge.submitText("İstanbul'da hava kaç derece?"); pump(300)
+        self.assertEqual("notice", self.kinds(bridge)[-1])
+        self.assertIn("Web Research is not available with the selected chat provider", bridge.feed[-1]["text"])
+        self.assertEqual(0, len(self.model.calls))                                      # Claude was never called
+        # Back to Claude: Codex keeps its own choice.
+        bridge.setChatProvider("claude")
+        self.assertEqual(("claude", "gpt-5.6-luna", "low"), (bridge.chatProvider, bridge.codexModel, bridge.codexEffort))
+        again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+        self.assertEqual(("claude", "gpt-5.6-luna", "low"), (again.chatProvider, again.codexModel, again.codexEffort))
+
+    def test_listed_is_not_usable_until_a_real_call_and_a_failure_is_clean_with_no_fallback(self) -> None:
+        sol = {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "efforts": ["low", "medium"], "default_effort": "low"}
+        bridge = self.bridge(proposal(kind="chat", reply="Claude must not answer this."))
+        bridge.backend.codex_state = lambda: {**self.CODEX, "models": [sol]}
+        bridge.backend.claude_catalog = lambda: []
+        from unittest.mock import patch
+        from jarvis.contracts import BillingClass
+        from jarvis.connectors.claude_code import ClaudeCodeConnector
+        with patch.object(ClaudeCodeConnector, "billing_route", return_value=(BillingClass.SUBSCRIPTION_INCLUDED, "ok")):
+            bridge._set_providers(bridge.backend.providers())
+        root = self.window(bridge)
+        bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-sol", "medium")
+        self.click(root, "modelTrigger"); pump(400)
+        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Listed by Codex - not tried yet"))
+        self.click(root, "modelTrigger"); pump(300)
+        # A real failure: named provider, model and reason; no raw output; nothing falls back to Claude.
+        self.codex.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.")
+        bridge.submitText("Merhaba, kısaca kendini tanıt."); pump(300)
+        self.assertEqual("error", self.kinds(bridge)[-1])
+        self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"])
+        self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes))
+        self.click(root, "modelTrigger"); pump(400)
+        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Failed this session: "))
+        self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
+        self.click(root, "modelTrigger"); pump(300)
+        # The same model answering later is recorded as usable.
+        self.codex.error, self.codex.answers = None, [proposal(kind="chat", reply="Merhaba! Ben JARVIS.")]
+        bridge.submitText("Merhaba, kısaca kendini tanıt."); pump(300)
+        self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState))
+        self.click(root, "modelTrigger"); pump(400)
+        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Answered this session"))
+        self.assertEqual(0, len(self.model.calls))
+
+
+class ConversationUxTests(UiTestCase):
+    """Smooth movement to new content, Copy / Quote on conversational turns only."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def feed(self, root):
+        return self.item(root, "conversationFeed")
+
+    def fill(self, bridge, count=30):
+        for i in range(count):
+            bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height at this width.")
+        pump(800)
+
+    def test_a_new_reply_glides_once_to_the_end_and_idle_does_not_move(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge); feed = self.feed(root)
+        self.fill(bridge)
+        count = feed.property("glideCount")
+        bridge._say("jarvis", "Yeni yanıt geldi ✅", chat=True); pump(120)
+        self.assertTrue(feed.property("gliding"))                                     # animated, not a jump
+        self.assertLess(feed.property("contentY"), feed.property("contentHeight") - feed.property("viewportHeight") - 1)
+        pump(600)
+        self.assertEqual(count + 1, feed.property("glideCount"))                      # one logical glide
+        self.assertAlmostEqual(feed.property("contentHeight") - feed.property("viewportHeight"), feed.property("contentY"), delta=1)
+        settled = feed.property("glideCount"); pump(1000)
+        self.assertEqual(settled, feed.property("glideCount"))                        # idle: no movement
+        self.assertFalse(feed.property("gliding"))
+
+    def end_gap(self, feed):
+        return feed.property("contentHeight") - feed.property("viewportHeight") - feed.property("contentY")
+
+    def test_at_the_end_an_approval_card_glides_into_view_without_an_arrow(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge); feed = self.feed(root)
+        self.fill(bridge)
+        count = feed.property("glideCount")
+        bridge.submitText("Bu projeyi incele."); pump(900)
+        self.assertTrue(feed.property("approvalCardShown"))
+        self.assertEqual(count + 1, feed.property("glideCount"))
+        self.assertAlmostEqual(0, self.end_gap(feed), delta=1)
+        self.assertFalse(feed.property("jumpVisible"))
+
+    def test_reading_older_content_is_kept_and_the_arrow_leads_to_the_newest(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge); feed = self.feed(root); jump = self.item(root, "jumpToLatest")
+        self.fill(bridge)
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 100.0)); pump(200)
+        self.assertFalse(feed.property("jumpVisible"))                                  # nothing new yet
+        count = feed.property("glideCount")
+        bridge._say("jarvis", "arrives while reading", chat=True); pump(600)
+        self.assertEqual((count, 100.0), (feed.property("glideCount"), round(feed.property("contentY"))))   # no force-scroll
+        self.assertTrue(feed.property("jumpVisible")); self.assertTrue(jump.isVisible())
+        # An approval arriving while reading is not lost: position kept, the arrow stays, the card waits below.
+        payload = bridge.backend.submit_text("Bu projeyi incele.", None)
+        bridge._apply_text(payload, "Bu projeyi incele."); pump(900)
+        self.assertTrue(feed.property("approvalCardShown"))
+        self.assertEqual((count, 100.0), (feed.property("glideCount"), round(feed.property("contentY"))))
+        self.assertTrue(feed.property("jumpVisible"))
+        from PySide6.QtCore import QPointF
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, jump.mapToScene(QPointF(jump.width() / 2, jump.height() / 2)).toPoint()); pump(40)
+        self.assertTrue(feed.property("gliding"))                                        # smooth, not a teleport
+        pump(700)
+        self.assertEqual(count + 1, feed.property("glideCount"))
+        self.assertAlmostEqual(0, self.end_gap(feed), delta=1)                          # the exact end
+        self.assertFalse(feed.property("jumpVisible"))
+        pump(800); self.assertFalse(jump.isVisible())
+        self.assertEqual(count + 1, feed.property("glideCount"))                        # no loop afterwards
+
+    def test_a_scroll_gesture_stops_a_glide_and_sending_returns_to_the_end(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge); feed = self.feed(root)
+        self.fill(bridge)
+        bridge._say("jarvis", "yeni", chat=True); pump(120)
+        self.assertTrue(feed.property("gliding"))
+        QTest.mouseMove(root); feed_item = feed
+        from PySide6.QtCore import QPoint, QPointF
+        center = feed_item.mapToScene(QPointF(feed_item.width() / 2, feed_item.height() / 2)).toPoint()
+        from PySide6.QtGui import QWheelEvent
+        wheel = QWheelEvent(QPointF(center), QPointF(center), QPoint(0, 0), QPoint(0, 240), Qt.NoButton, Qt.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        QGuiApplication.sendEvent(root, wheel); pump(400)
+        self.assertFalse(feed.property("gliding"))
+        self.assertGreater(self.end_gap(feed), 6)                                        # the reader took over
+        bridge.submitText("Tamam mı?"); pump(900)
+        self.assertAlmostEqual(0, self.end_gap(feed), delta=1)
+        self.assertFalse(feed.property("jumpVisible"))
+
+    def test_selected_text_is_quoted_alone_and_the_whole_message_quote_remains(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("user", "soru")
+        bridge._say("jarvis", "İlk paragraf: şöyle.\nİkinci satır ✅ burada.", chat=True)
+        bridge._say("error", "FAILED [x]: y")
+        pump(300)
+        rows = [item for item in self.all_items(root) if item.objectName() == "feedMessage_jarvis"]
+        reply = rows[0]
+        self.assertFalse(self.item(root, "messageQuoteSelection_1").property("visible"))   # nothing selected
+        QMetaObject.invokeMethod(reply, "select", Q_ARG(int, 14), Q_ARG(int, 35)); pump(50)
+        self.assertEqual("şöyle.\nİkinci satır ✅", reply.property("selectedText"))          # only the selection, lines as newlines
+        self.assertTrue(self.item(root, "messageQuoteSelection_1").property("visible"))
+        QMetaObject.invokeMethod(self.item(root, "messageQuoteSelection_1"), "activated"); pump(100)
+        self.assertEqual("> şöyle.\n> İkinci satır ✅\n\n", self.item(root, "composerInput").property("text"))
+        self.assertTrue(self.item(root, "messageQuote_1").property("visible"))           # whole-message Quote still offered
+        self.assertFalse(self.item(root, "messageActions_2").property("visible"))       # never on an error card
+        self.assertEqual(([], False, 0), (self.model.calls, bridge.approvalPending, self.execute_calls()))
+
+    def all_items(self, root):
+        found, stack = [], [root.contentItem()]
+        while stack:
+            node = stack.pop()
+            found.append(node)
+            stack.extend(node.childItems())
+        return found
+
+    def test_copy_and_quote_only_on_conversational_turns_as_plain_text(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("user", "Şu satırı düzelt: “merhaba” 👋")
+        bridge._say("jarvis", "Tabii — işte düzeltme:\nMerhaba!", chat=True)
+        bridge._say("system", "Answer the pending approval first (Approve, Deny or Cancel).")
+        bridge._say("data", "[UNTRUSTED external content]")
+        bridge._say("error", "FAILED [x]: y")
+        bridge._say("jarvis", "Read page from browser/https://example.com.")      # a task result, not chat
+        pump(300)
+        visible = [self.item(root, f"messageActions_{i}").property("visible") for i in range(6)]
+        self.assertEqual([True, True, False, False, False, False], visible)
+        QMetaObject.invokeMethod(self.item(root, "messageCopy_1"), "activated"); pump(50)
+        self.assertEqual("Tabii — işte düzeltme:\nMerhaba!", QGuiApplication.clipboard().text())
+        QMetaObject.invokeMethod(self.item(root, "messageQuote_0"), "activated"); pump(100)
+        draft = self.item(root, "composerInput").property("text")
+        self.assertEqual("> Şu satırı düzelt: “merhaba” 👋\n\n", draft)
+        QMetaObject.invokeMethod(self.item(root, "messageQuote_1"), "activated"); pump(100)
+        self.assertEqual("> Şu satırı düzelt: “merhaba” 👋\n\n> Tabii — işte düzeltme:\n> Merhaba!\n\n",
+                         self.item(root, "composerInput").property("text"))
+        # Quoting only fills the draft: nothing is sent, understood or authorized.
+        self.assertEqual(([], False, 0), (self.model.calls, bridge.approvalPending, self.execute_calls()))
+
+
+class ConversationCleanlinessTests(UiTestCase):
+    """Duplicate technical lines leave the conversation; every truth stays where it lives."""
+
+    def test_an_approval_request_is_the_card_not_three_chat_lines(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
+        bridge.submitText("Bu projeyi incele.")
+        self.assertEqual(["user"], self.kinds(bridge))
+        for gone in ("Understood as", "- task ", "APPROVAL REQUIRED"):
+            self.assertNotIn(gone, self.feed_text(bridge))
+        # Still true, where it lives: card, workflow, live feed, and Core's task record.
+        self.assertTrue(bridge.approvalPending)
+        self.assertEqual("code_analysis", bridge.task["capability"])
+        self.assertEqual("approval", bridge.activity[0]["kind"])
+        self.assertEqual("awaiting_approval", SQLiteMemoryStore(self.database).load_task(bridge.task["task_id"]).status.value)
+
+    def test_errors_results_and_data_still_show_and_nothing_dumps_the_envelope(self) -> None:
+        from jarvis.ui.present import run_entries
+        failed = {"command": "approve", "run_status": "failed", "task": {"id": "t"}, "approval": None,
+                  "error": {"code": "connector_failed", "message": "boom", "retryable": False}, "result": {"summary": "boom"}}
+        self.assertEqual(["error", "jarvis"], [e["kind"] for e in run_entries(failed)])
+        answered = {"command": "approve", "run_status": "completed", "task": {"id": "t"}, "model_answer": {"content": "Sonuç burada."}}
+        self.assertEqual([("jarvis", "Sonuç burada.")], [(e["kind"], e["text"]) for e in run_entries(answered)])
+        waiting = {"command": "run", "run_status": "awaiting_approval", "task": {"id": "t"}, "approval": {"request_id": "r"}}
+        self.assertEqual([], run_entries(waiting))                                   # the card says it; no JSON dump
+        self.assertEqual("system", run_entries({"command": "status", "note": "x"})[0]["kind"])   # an unknown shape still shows
+
+    def test_lifecycle_chatter_goes_to_the_live_feed_and_safety_truth_stays(self) -> None:
+        bridge = self.bridge()
+        bridge.freezeJarvis(); bridge.resumeJarvis(); bridge.newSession(); bridge.useSession("s-1")
+        bridge.backend.scheduler_once = lambda: {"command": "scheduler-run", "claims_suspended": False, "actions": []}
+        bridge.runSweep()
+        self.assertEqual([], self.kinds(bridge), self.feed_text(bridge))
+        notes = [entry["text"] for entry in bridge.activity]
+        for note in ("JARVIS frozen", "JARVIS resumed", "New session: the next message starts a fresh session.",
+                     "Using session s-1.", "Running one scheduler sweep...", "Scheduler sweep: nothing was due"):
+            self.assertIn(note, notes)
+        # An unconfirmed lifecycle change is safety truth: it stays in the conversation.
+        bridge.backend.set_config = lambda key, raw: {"error": {"code": "config_io_failed", "message": "disk"}}
+        bridge.freezeJarvis()
+        self.assertIn("JARVIS state unconfirmed", self.feed_text(bridge))
+        # A refused sweep still reaches the conversation.
+        bridge.backend.scheduler_once = lambda: {"command": "scheduler-run", "error": {"code": "config_invalid", "message": "bad"}}
+        bridge.runSweep()
+        self.assertIn("REFUSED [config_invalid]", self.feed_text(bridge))
+
+
+class ChatPresentationTests(UiTestCase):
+    """Ordinary replies read like conversation; cards stay for what needs them."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def test_a_reply_has_no_card_chrome_and_keeps_a_readable_measure(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("jarvis", "Uzun bir yanıt. " * 60, chat=True)
+        bridge._say("error", "FAILED [connector_failed]: boom")
+        bridge._say("notice", "UNSUPPORTED: nothing executed")
+        pump(400)
+        reply, error = self.item(root, "feedCard_jarvis"), self.item(root, "feedCard_error")
+        self.assertEqual((0, 0.0), (QQmlProperty.read(reply, "border.width"), QColor(reply.property("color")).alphaF()))
+        self.assertLessEqual(self.item(root, "feedMessage_jarvis").width(), 760)
+        self.assertEqual(1, QQmlProperty.read(error, "border.width"))                   # a true failure keeps its card
+        notice = self.item(root, "feedCard_notice")
+        self.assertEqual(0, QQmlProperty.read(notice, "border.width"))                  # a limitation is light
+
+    def test_untrusted_data_and_user_text_stay_plain(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("user", "<b>kalın değil</b> **yıldız**")
+        bridge._say("data", "<img src=x> [link](http://x)")
+        pump(300)
+        # Plain text shows markup as the characters it is: nothing is interpreted,
+        # so the displayed length is the source length (rich text would drop the tags).
+        for name, source in (("feedMessage_user", "<b>kalın değil</b> **yıldız**"), ("feedMessage_data", "<img src=x> [link](http://x)")):
+            item = self.item(root, name)
+            self.assertEqual((source, len(source)), (item.property("text"), item.property("length")))
+
+
+class WebResearchUiTests(UiTestCase):
+    """A researched answer is a conversational reply with its sources; nothing asks for approval."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def test_a_research_answer_shows_sources_and_offers_copy_and_quote(self) -> None:
+        from tests.test_intent import ScriptedResearch, research_answer
+        links = [{"title": "MGM", "url": "https://www.mgm.gov.tr/"}, {"title": "Sun", "url": "https://www.timeanddate.com/sun/"}]
+        bridge = self.bridge(proposal(kind="research", query="İstanbul hava"))
+        research = ScriptedResearch(research_answer("22°C, gün batımı 19:28.", links[1]["url"]), links=links)
+        factory = self.factory
+        def with_research(settings):
+            app = factory(settings); app.research_model = research; return app
+        bridge.backend.app_factory = with_research
+        root = self.window(bridge)
+        bridge.submitText("İstanbul'da hava kaç derece ve bugün güneş kaçta batacak?"); pump(500)
+        self.assertEqual(["user", "jarvis"], self.kinds(bridge))
+        entry = bridge.feed[-1]
+        self.assertEqual(("22°C, gün batımı 19:28.", True, [links[1]], True), (entry["text"], entry["chat"], entry["sources"], entry["sources_cited"]))
+        shown = [i for i in ConversationUxTests.all_items(self, root) if i.objectName() == "feedSources" and i.isVisible()]
+        self.assertEqual(1, len(shown))                                                  # only under the research reply
+        self.assertIn("timeanddate.com", self.item(root, "feedSource_0").property("text"))
+        self.assertTrue(self.item(root, "messageQuote_1").property("visible"))
+        self.assertEqual((False, "idle", 0), (bridge.approvalPending, bridge.coreState, self.execute_calls()))
+        self.assertIn("Web Research answered with 1 sources", [a["text"] for a in bridge.activity])
+        self.assertEqual("22°C, gün batımı 19:28.", bridge._conversation()[-1]["text"])      # part of the conversation window
+
+    def test_today_then_tomorrow_render_the_same_clean_structure(self) -> None:
+        from tests.test_intent import ScriptedResearch
+        links = [{"title": "MGM", "url": "https://www.mgm.gov.tr/"}, {"title": "Sun", "url": "https://www.timeanddate.com/sun/"}]
+        today = json.dumps({"answer": "Bugün 22°C; gün batımı 19:28.", "sources": [links[1]["url"]]}, ensure_ascii=False)
+        tomorrow = ("I'll provide the best available answer given the search limitations.\n\n"
+                    + json.dumps({"answer": "Yarın 23°C, sağanak; gün batımı 19:26.\n\nKaynaklar:\n- https://www.mgm.gov.tr/",
+                                  "sources": [links[0]["url"], "https://invented.example/"]}, ensure_ascii=False))
+        bridge = self.bridge(proposal(kind="research", query="bugün hava"), proposal(kind="research", query="yarın hava"))
+        research = ScriptedResearch(today, tomorrow, links=links)
+        factory = self.factory
+        def with_research(settings):
+            app = factory(settings); app.research_model = research; return app
+        bridge.backend.app_factory = with_research
+        root = self.window(bridge)
+        bridge.submitText("İstanbul'da hava kaç derece ve bugün güneş kaçta batacak?"); pump(300)
+        bridge.submitText("Yarın İstanbul'da hava kaç derece olacak ve güneş kaçta batacak?"); pump(400)
+        replies = [entry for entry in bridge.feed if entry["kind"] == "jarvis"]
+        self.assertEqual(["Bugün 22°C; gün batımı 19:28.", "Yarın 23°C, sağanak; gün batımı 19:26."], [r["text"] for r in replies])
+        self.assertEqual([[links[1]], [links[0]]], [r["sources"] for r in replies])      # verified only, once each
+        for text in (self.feed_text(bridge),):
+            for leak in ("{", "\"answer\"", "I'll provide", "Kaynaklar", "invented.example"):
+                self.assertNotIn(leak, text)
+        shown = [i for i in ConversationUxTests.all_items(self, root) if i.objectName() == "feedSources" and i.isVisible()]
+        self.assertEqual(2, len(shown))                                                  # one source section per answer
+        self.assertEqual((False, "idle", 0), (bridge.approvalPending, bridge.coreState, self.execute_calls()))
+
+    def test_a_failed_research_is_still_an_error(self) -> None:
+        from tests.test_intent import ScriptedResearch
+        bridge = self.bridge(proposal(kind="research", query="hava"))
+        research = ScriptedResearch("x", error=StructuredError(ErrorCode.CONNECTOR_FAILED, "search failed"))
+        factory = self.factory
+        def with_research(settings):
+            app = factory(settings); app.research_model = research; return app
+        bridge.backend.app_factory = with_research
+        bridge.submitText("İstanbul'da hava?")
+        self.assertEqual(("error", "error"), (self.kinds(bridge)[-1], bridge.coreState))
+        self.assertIn("Web Research failed", bridge.feed[-1]["text"])
+
+
+class PermissionModeTests(UiTestCase):
+    """The composer's permission control shows and changes Core's real policy."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    click = PresentationTests.click
+
+    def test_the_control_projects_the_stored_mode_and_a_change_is_core_policy(self) -> None:
+        (self.root / "notes.txt").write_text("hello", encoding="utf-8")
+        bridge = self.bridge(task_proposal("file_read", target="notes.txt"), task_proposal("file_read", target="notes.txt"),
+                             task_proposal("code_analysis"))
+        root = self.window(bridge)
+        self.assertEqual(("session", "Session"), (bridge.permissionMode, self.item(root, "permissionModeLabel").property("text")))
+        self.click(root, "permissionModeControl"); pump(200)
+        self.click(root, "permissionMode_strict"); pump(200)
+        self.assertEqual("strict", self.store.load().settings.permission_mode.value)          # written through Core's config
+        self.assertEqual("Ask", self.item(root, "permissionModeLabel").property("text"))
+        bridge.submitText("notes.txt dosyasını oku"); pump(200)
+        self.assertTrue(bridge.approvalPending)                                          # STRICT: even a local read asks
+        self.assertEqual(0, self.reader.execute_calls)
+        bridge.deny(); pump(100)
+        self.assertTrue(bridge.setPermissionMode("smart_auto"))
+        bridge.submitText("notes.txt dosyasını oku"); pump(200)
+        self.assertEqual((False, "completed", 1), (bridge.approvalPending, bridge.task["run_status"], self.reader.execute_calls))
+        bridge.submitText("Bu projeyi incele."); pump(200)
+        self.assertTrue(bridge.approvalPending)                                          # the always-approval boundary holds
+        self.assertEqual(0, self.claude.execute_calls)
+        self.assertFalse(bridge.setPermissionMode("bypass"))                            # no invented mode
+        self.assertEqual("smart_auto", self.store.load().settings.permission_mode.value)
+        self.assertTrue(self.store.load().settings.execution_enabled)                    # Freeze is independent
+
+
+class WindowStateTests(UiTestCase):
+    """Minimize, the tray and focus changes never overwrite full screen / maximized / windowed."""
+
+    def restore(self, root):
+        root.setWindowStates(root.windowStates() & ~Qt.WindowState.WindowMinimized)      # what the taskbar does
+        pump(150)
+
+    def test_every_non_minimized_state_survives_minimize_tray_and_focus_changes(self) -> None:
+        from PySide6.QtGui import QWindow
+        from jarvis.ui.tray import TrayController
+        bridge = self.bridge()
+        root = self.load(bridge)
+        bridge.setTrayAvailable(True)
+        tray = TrayController(bridge, root)
+        other = QWindow(); other.resize(200, 200); self.addCleanup(other.destroy)
+        for enter, name in ((root.showFullScreen, "FullScreen"), (root.showMaximized, "Maximized"), (root.showNormal, "Windowed")):
+            with self.subTest(state=name):
+                enter(); pump(200)
+                self.assertEqual(name, QWindow.Visibility(root.property("restoreVisibility")).name)
+                bridge.minimizeWindow(root); pump(150)
+                self.assertEqual("Minimized", root.visibility().name)
+                self.restore(root)
+                self.assertEqual(name, root.visibility().name)                           # minimize -> restore
+                root.close(); pump(150)
+                self.assertFalse(root.isVisible())
+                tray.open(); pump(200)
+                self.assertEqual(name, root.visibility().name)                           # tray -> Open JARVIS
+                other.show(); other.requestActivate(); pump(100)
+                root.requestActivate(); pump(100)
+                self.assertEqual(name, root.visibility().name)                           # focus away and back
+                bridge.minimizeWindow(root); pump(100)
+                root.close(); pump(100)                                                  # X while minimized
+                tray.open(); pump(200)
+                self.assertEqual(name, root.visibility().name)
+        other.hide()
 
 
 if __name__ == "__main__":  # pragma: no cover

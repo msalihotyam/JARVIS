@@ -56,7 +56,14 @@ INTENT_TEXT = {
     "model_failed": QT_TRANSLATE_NOOP("Present", "UNDERSTANDING FAILED: %1"),
     "execution_disabled": QT_TRANSLATE_NOOP("Present", "EXECUTION DISABLED: %1"),
     "invalid_input": QT_TRANSLATE_NOOP("Present", "INVALID REQUEST: %1"),
+    "research_unavailable": QT_TRANSLATE_NOOP("Present", "Web Research unavailable: %1"),
+    "research_failed": QT_TRANSLATE_NOOP("Present", "Web Research failed: %1"),
 }
+
+#: Verdicts that are an expected limitation, not a failure: nothing executed
+#: and nothing went wrong, so they read as a light notice rather than an error card.
+NOTICE_STATUSES = frozenset({"unsupported_capability", "authority_unavailable", "execution_disabled",
+                             "research_unavailable", "invalid_input"})
 
 #: JARVIS's own explanation of an ESTABLISHED failure cause, keyed by the
 #: stable reason code the envelope carries. Shown instead of the provider's
@@ -65,6 +72,13 @@ INTENT_TEXT = {
 REASON_TEXT = {
     "claude_not_logged_in": QT_TRANSLATE_NOOP("Present", "Claude Code CLI is not logged in. Run `claude auth login` in a normal "
                                                        "PowerShell, complete the Claude subscription login, then restart JARVIS."),
+    "research_provider_unsupported": QT_TRANSLATE_NOOP("Present", "Web Research is not available with the selected chat provider. "
+                                                                 "It runs on the Claude subscription route; choose Claude in the model "
+                                                                 "panel to research this. Nothing was searched."),
+    "codex_not_logged_in": QT_TRANSLATE_NOOP("Present", "Codex CLI is not signed in with ChatGPT. Run `codex login` in a normal "
+                                                      "PowerShell and choose Sign in with ChatGPT. Nothing was sent."),
+    "codex_api_key_route": QT_TRANSLATE_NOOP("Present", "Codex is set up with an API key, which would be billed per use. JARVIS uses "
+                                                      "only the ChatGPT subscription sign-in, so nothing was sent."),
 }
 
 #: JARVIS's own explanation of an established connector failure, keyed by
@@ -255,17 +269,16 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
     if isinstance(summary, str) and not isinstance(answer, str) and not explained:
         entries.append({"kind": "jarvis", "text": summary})
     task = payload.get("task")
-    if isinstance(task, dict):
-        entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "%1: %2 - task %3 %4/%5 via %6"),
-            payload["command"], payload.get("run_status"), task.get("id"), task.get("status"),
-            task.get("stage"), task.get("selected_connector"))})
+    # The run's technical status line (command, run status, task id, stage,
+    # connector) is not conversation: Active Workflow projects it, the live
+    # feed notes it, and History / the task record keep every field.
     for issue in _get(payload.get("progress"), "open_issues") or []:
         if _get(issue, "kind") == "approval_required":
             continue  # the authorization card says it
         entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "Open issue: %1"), _compact(issue, 600))})
-    if payload.get("approval") is not None:
-        entries.append({"kind": "approval", "text": _msg(QT_TRANSLATE_NOOP("Present", "APPROVAL REQUIRED - review the authorization card."))})
-    if not entries:
+    # A pending approval is the authorization card itself (plus the attention
+    # strip and a live-feed note) - no duplicate line in the conversation.
+    if not entries and not isinstance(task, dict) and payload.get("approval") is None:
         entries.append({"kind": "system", "text": f"{payload['command']}: {_compact(payload, 1500)}"})
     return entries
 
@@ -279,13 +292,10 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
         return [dict(UNREADABLE)]
     entries: list[dict[str, str]] = []
     if status == "structured":
-        if intent.get("objective"):
-            text = _msg(QT_TRANSLATE_NOOP("Present", "Understood as %1 -> %2: %3"),
-                        intent.get("capability"), intent.get("destination"), intent.get("objective"))
-        else:
-            text = _msg(QT_TRANSLATE_NOOP("Present", "Understood as %1 -> %2"), intent.get("capability"), intent.get("destination"))
-        entries.append({"kind": "system", "text": text})
-        # The run envelope itself is rendered by the caller's run path.
+        # No routing line: what was understood is on the approval card and in
+        # Active Workflow; the envelope and the task record keep it. The run
+        # envelope itself is rendered by the caller's run path.
+        pass
     elif status == "scheduled":
         job = payload.get("job") or {}
         due = job.get("next_due_at_utc") or _msg(QT_TRANSLATE_NOOP("Present", "never"))
@@ -296,19 +306,28 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
         # General Chat: the model's words, shown as JARVIS's turn, as written.
         reply = intent.get("reply")
         entries.append({"kind": "jarvis", "text": str(reply)} if reply else dict(UNREADABLE))
+    elif status == "research":
+        # Web Research: the answer as written, and the public pages behind it -
+        # untrusted links, redacted, shown as plain data.
+        reply = intent.get("reply")
+        sources = [{"title": str(s.get("title") or ""), "url": str(s.get("url"))}
+                   for s in intent.get("sources") or [] if isinstance(s, dict) and s.get("url")]
+        entries.append({"kind": "jarvis", "text": str(reply), "sources": sources,
+                        "sources_cited": bool(intent.get("sources_cited"))} if reply else dict(UNREADABLE))
     elif status == "clarification_required":
         question = intent.get("question")
         entries.append({"kind": "clarify", "text": str(question) if question else _msg(QT_TRANSLATE_NOOP("Present", "JARVIS needs one detail."))})
     elif REASON_TEXT.get(str(intent.get("reason") or "")):
         # An established cause: JARVIS explains it in the interface language.
-        entries.append({"kind": "error", "text": _msg(REASON_TEXT[str(intent["reason"])])})
+        entries.append({"kind": "notice" if intent["reason"] == "research_provider_unsupported" else "error",
+                        "text": _msg(REASON_TEXT[str(intent["reason"])])})
     else:
         template = INTENT_TEXT.get(status)
         message = str(intent.get("message") or "")
         if template is None:
             entries.append({"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present", "UNKNOWN INTENT STATUS [%1]: %2"), status, message)})
         else:
-            entries.append({"kind": "error", "text": _msg(template, message)})
+            entries.append({"kind": "notice" if status in NOTICE_STATUSES else "error", "text": _msg(template, message)})
     return entries
 
 
@@ -431,7 +450,7 @@ def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
 def outcome_kind(run: Any, intent_status: str = "") -> str:
     """The core-state word one envelope earns: completed / error / unknown / waiting / idle."""
     if intent_status and intent_status not in ("structured",):
-        return "idle" if intent_status in ("scheduled", "clarification_required", "conversation") else "error"
+        return "idle" if intent_status in ("scheduled", "clarification_required", "conversation", "research") else "error"
     code = str(_get(_get(run, "error"), "code") or "")
     if code in (UNKNOWN_CODE, IN_PROGRESS_CODE):
         return "unknown"

@@ -753,7 +753,7 @@ class CliTests(IntentTestCase):
         self.assertEqual({"command", "effective_permission_mode", "intent", "run", "job", "error"}, set(payload))
         self.assertEqual(
             {"status", "request_id", "message", "question", "capability", "destination", "objective", "reply",
-             "reason", "choices"},
+             "reason", "usage", "sources", "sources_cited", "choices"},
             set(payload["intent"]),
         )
         self.assertEqual("text", payload["command"])
@@ -1247,6 +1247,421 @@ class BrowserCatalogueHintTests(IntentTestCase):
         self.assertTrue(set(browser) <= set(BROWSER_ENABLED_CAPABILITIES))
         self.assertTrue(all(entry["destinations"] == [ORIGIN] for entry in browser.values()), browser)
         self.assertEqual(0, self.execute_calls())
+
+
+class TokenUsageFoundationTests(IntentTestCase):
+    """The understanding call's usage as the provider REPORTED it, plus measured sizes. Nothing estimated."""
+
+    def test_reported_usage_is_kept_exactly_and_sizes_are_measured(self) -> None:
+        model = ScriptedModel(chat_proposal("hi"))
+        model.reported = {}
+        model.on_complete = lambda task: model.reported.update({task.id: {"model": "claude-fable-5-1", "output_tokens": 9}})
+        earlier = [{"role": "user", "text": "önceki soru"}, {"role": "assistant", "text": "önceki yanıt"}]
+        usage = self.build(model).submit_text("Merhaba", conversation=earlier).payload["intent"]["usage"]
+        self.assertEqual({"model": "claude-fable-5-1", "output_tokens": 9}, usage["reported"])   # no zero-filled fields
+        self.assertEqual((7, len("önceki soru") + len("önceki yanıt")), (usage["request_chars"], usage["conversation_chars"]))
+        self.assertGreater(usage["context_chars"], 0)
+
+    def test_a_model_that_reports_nothing_gets_no_invented_numbers(self) -> None:
+        payload = self.build(ScriptedModel(chat_proposal("hi"))).submit_text("Merhaba").payload
+        self.assertEqual({}, payload["intent"]["usage"]["reported"])
+        refused = self.build(ScriptedModel()).submit_text("").payload                  # refused before any call
+        self.assertIsNone(refused["intent"]["usage"])
+
+    def test_the_claude_adapter_records_what_claude_reported(self) -> None:
+        from jarvis.intent import reported_usage
+        adapter = ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        task = Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target=""))
+        adapter._usage(task, {"usage": {"input_tokens": 3, "output_tokens": 41, "cache_read_input_tokens": 18000, "service_tier": "x"},
+                              "modelUsage": {"claude-fable-5-1[1m]": {}}})
+        self.assertEqual({"input_tokens": 3, "output_tokens": 41, "cache_read_input_tokens": 18000, "model": "claude-fable-5-1[1m]"},
+                         adapter.reported[task.id])
+        self.assertEqual({}, reported_usage({"usage": {"input_tokens": -1, "output_tokens": "5"}, "modelUsage": {"bad model;": {}}}))
+
+    def test_the_answering_model_is_the_answer_s_model_never_a_helper_listed_first(self) -> None:
+        from jarvis.intent import reported_usage
+        helpers = {"modelUsage": {"claude-haiku-4-5-20251001": {}, "claude-opus-5[1m]": {}}}
+        self.assertNotIn("model", reported_usage(helpers))                              # ambiguous: not guessed
+        self.assertEqual("claude-opus-5", reported_usage(helpers, "claude-opus-5")["model"])
+        adapter = ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        stream = "\n".join(json.dumps(e) for e in (
+            {"type": "system", "subtype": "init", "model": "claude-opus-5[1m]"},
+            {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.25,
+                                                             "resetsAt": 1789482600, "overageStatus": "rejected", "isUsingOverage": False,
+                                                             "unifiedWindows": {"seven_day": {"utilization": 0.69, "resetsAt": 1789671600}}}},
+            {"type": "assistant", "message": {"model": "claude-opus-5", "content": [{"type": "text", "text": "x"}]}},
+            {"type": "result", "result": "x", "usage": {"output_tokens": 5}, "modelUsage": helpers["modelUsage"]}))
+        task = Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target=""))
+        payload = adapter._parse_payload(stream)
+        adapter._usage(task, payload)
+        self.assertEqual({"output_tokens": 5, "model": "claude-opus-5"}, adapter.reported[task.id])
+        self.assertEqual({"status": "allowed", "overage_status": "rejected", "using_overage": False,
+                          "windows": {"five_hour": {"utilization": 0.25, "resets_at": 1789482600},
+                                      "seven_day": {"utilization": 0.69, "resets_at": 1789671600}}},
+                         adapter.observed[task.id]["rate_limits"])
+
+    def test_rate_limits_keep_only_well_typed_fields(self) -> None:
+        from jarvis.intent import reported_rate_limits
+        self.assertEqual({}, reported_rate_limits({"status": "fine", "utilization": "25%", "resetsAt": "soon", "isUsingOverage": "no"}))
+        self.assertEqual({}, reported_rate_limits(None))
+        self.assertEqual({"windows": {"five_hour": {"utilization": 1.0, "resets_at": 5}}},
+                         reported_rate_limits({"rateLimitType": "five_hour", "utilization": 1, "resetsAt": 5, "unifiedWindows": {"x": 3}}))
+
+    def test_the_understanding_call_streams_with_every_safety_flag_kept(self) -> None:
+        adapter = ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd(), model="opus[1m]")
+        command = adapter._command("prompt")
+        self.assertEqual("stream-json", command[command.index("--output-format") + 1])
+        self.assertIn("--verbose", command)
+        for flag in ("--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-chrome", "--no-session-persistence"):
+            self.assertIn(flag, command)
+        self.assertEqual(("", "plan", "opus[1m]"), (command[command.index("--tools") + 1],
+                                                   command[command.index("--permission-mode") + 1], command[command.index("--model") + 1]))
+
+
+def research_answer(answer: str, *sources: str) -> str:
+    return json.dumps({"answer": answer, "sources": list(sources)})
+
+
+class ScriptedResearch(ScriptedModel):
+    """A research ``ModelAdapter``: a fixed answer plus the links a search 'returned'."""
+
+    def __init__(self, *answers, links=(), **kwargs):
+        super().__init__(*answers, **kwargs)
+        self.links = list(links)
+
+    def complete(self, task, session):
+        result = super().complete(task, session)
+        return replace(result, data={**result.data, "search_links": self.links}) if result.ok else result
+
+
+class WebResearchTests(IntentTestCase):
+    """Current / public questions are answered from a read-only search, with real sources. Nothing is authorized."""
+
+    LINKS = [{"title": "MGM İstanbul", "url": "https://www.mgm.gov.tr/tahmin/il-ve-ilceler.aspx?il=ISTANBUL"},
+             {"title": "Sunset", "url": "https://www.timeanddate.com/sun/turkey/istanbul"}]
+
+    def research_app(self, answer, links=None, **settings):
+        app = self.build(ScriptedModel(proposal(kind="research", query="İstanbul hava ve gün batımı")),
+                         settings=replace(self.settings, **settings) if settings else None)
+        app.research_model = ScriptedResearch(answer, links=self.LINKS if links is None else links)
+        return app
+
+    def test_a_current_question_is_researched_with_only_really_returned_sources(self) -> None:
+        answer = research_answer("İstanbul 22°C; gün batımı 19:28.", self.LINKS[1]["url"], "https://fabricated.example/source")
+        app = self.research_app(answer)
+        result = app.submit_text("İstanbul'da hava kaç derece ve bugün güneş kaçta batacak?", response_language="tr-TR")
+        intent = result.payload["intent"]
+        self.assertEqual((EXIT_OK, "research", "İstanbul 22°C; gün batımı 19:28."), (result.exit_code, intent["status"], intent["reply"]))
+        self.assertEqual([self.LINKS[1]], intent["sources"])                          # the invented link is dropped
+        self.assertTrue(intent["sources_cited"])
+        research = app.research_model.calls[0]
+        self.assertEqual(("İstanbul hava ve gün batımı", "tr-TR"), (research.objective, research.context["response_language"]))
+        self.assertEqual((None, 0, []), (result.payload["run"], self.execute_calls(), self.memory.list_sessions(10)))
+
+    def test_an_answer_naming_no_returned_page_lists_the_results_as_uncited(self) -> None:
+        intent = self.research_app(research_answer("22°C.")).submit_text("bugün hava?").payload["intent"]
+        self.assertEqual(("22°C.", self.LINKS, False), (intent["reply"], intent["sources"], intent["sources_cited"]))
+
+    def test_the_presentation_contract_answer_text_only_and_verified_sources_once(self) -> None:
+        from jarvis.intent import parse_research
+        tr = "Yarın İstanbul'da hava 23°C, sağanak bekleniyor.\nGün batımı 19:26 civarı. Şişli, Üsküdar ✅"
+        verified, invented = self.LINKS[1]["url"], "https://invented.example/forecast"
+        exact = json.dumps({"answer": tr, "sources": [verified]}, ensure_ascii=False)
+        cases = {
+            "A exact JSON": exact,
+            "B prose prefix": "I'll provide the best available answer given the search limitations.\n\n" + exact,
+            "C fenced": "```json\n" + exact + "\n```",
+            "B+C prose around a fence": "Here is the result:\n```json\n" + exact + "\n```\nHope this helps.",
+            "structured object": {"answer": tr, "sources": [verified]},
+        }
+        for name, reply in cases.items():
+            with self.subTest(name):
+                self.assertEqual((tr, [self.LINKS[1]], True), parse_research(reply, self.LINKS))
+        # D malformed / no structured result: nothing to show - the caller reports a clean failure.
+        for bad in ('{"answer": "cut off', "Just prose, no JSON.", '{"text": "x"}', '{"answer": 5}', None, ""):
+            with self.subTest(bad=bad):
+                self.assertEqual(("", [], False), parse_research(bad, self.LINKS))
+        # E a human-written source section inside the answer is removed; F an invented URL never appears.
+        duplicated = {"answer": tr + "\n\nKaynaklar:\n- [MGM](https://www.mgm.gov.tr/)\n- https://invented.example/forecast",
+                      "sources": [invented, verified, verified]}
+        self.assertEqual((tr, [self.LINKS[1]], True), parse_research(duplicated, self.LINKS))
+        linked = {"answer": tr + "\n\n**Sources:**\n1. [Sunset](https://www.timeanddate.com/sun/turkey/istanbul)", "sources": [invented]}
+        answer, sources, cited = parse_research(linked, self.LINKS)
+        self.assertEqual((tr, False), (answer, cited))                                 # only returned results, marked uncited
+        self.assertNotIn(invented, json.dumps(sources))
+
+    def test_an_unreadable_research_result_is_a_clean_failure_never_raw_output(self) -> None:
+        raw = "I'll provide the best available answer. {\"answer\": \"cut"
+        intent = self.research_app(raw).submit_text("yarın hava?").payload["intent"]
+        self.assertEqual("research_failed", intent["status"])
+        self.assertNotIn("answer", intent["message"]); self.assertNotIn("I'll", intent["message"])
+        self.assertIsNone(intent["reply"])
+        failed = self.research_app("x")
+        failed.research_model.error = StructuredError(ErrorCode.CONNECTOR_FAILED, '{"answer": "partial"}', {"subtype": "error_max_turns", "redacted_items": 0})
+        message = failed.submit_text("yarın hava?").payload["intent"]["message"]
+        self.assertEqual("The web search did not finish with an answer.", message)   # provider text on a failed turn is never shown
+
+    def test_the_schema_validated_object_is_preferred_and_the_cli_enforces_the_schema(self) -> None:
+        from jarvis.intent import RESEARCH_OUTPUT_TOOL, ClaudeResearchAdapter
+        app = self.research_app("I'll explain first, then: nothing parseable")
+        structured = {"answer": "Bugün 22°C.", "sources": [self.LINKS[0]["url"]]}
+        original = app.research_model.complete
+        def with_structured(task, session):
+            result = original(task, session)
+            return replace(result, data={**result.data, "structured": structured})
+        app.research_model.complete = with_structured
+        intent = app.submit_text("bugün hava?").payload["intent"]
+        self.assertEqual(("research", "Bugün 22°C.", [self.LINKS[0]]), (intent["status"], intent["reply"], intent["sources"]))
+        adapter = ClaudeResearchAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        command = adapter._command("q")
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual((["answer", "sources"], False), (schema["required"], schema["additionalProperties"]))
+        task = Task(objective="q", capability="web_research", scope=ActionScope(action="research", target=""))
+        stream = "\n".join(json.dumps(e) for e in (
+            {"type": "assistant", "message": {"model": "m", "content": [{"type": "tool_use", "name": "WebSearch"},
+                                                                         {"type": "tool_use", "name": RESEARCH_OUTPUT_TOOL}]}},
+            {"type": "result", "result": "{}", "usage": {}, "structured_output": structured}))
+        adapter.execute = lambda t, s: (adapter._usage(t, adapter._parse_payload(stream)),
+                                        ToolResult(outcome=OutcomeStatus.SUCCESS, summary="ok", data={}))[1]
+        result = adapter.complete(task, SessionState(objective="q"))
+        self.assertEqual((True, structured), (result.ok, result.data["structured"]))  # the CLI's own output step is not a foreign tool
+
+    def test_research_is_refused_truthfully_when_the_provider_has_no_route_and_never_rerouted(self) -> None:
+        app = self.build(ScriptedModel(proposal(kind="research", query="hava")))
+        intent = app.submit_text("hava nasıl?").payload["intent"]
+        self.assertEqual(("research_unavailable", "research_provider_unsupported"), (intent["status"], intent["reason"]))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_a_failed_search_is_a_research_failure_and_frozen_still_answers_like_chat(self) -> None:
+        app = self.research_app("x")
+        app.research_model.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "boom")
+        self.assertEqual("research_failed", app.submit_text("hava?").payload["intent"]["status"])
+        frozen = self.research_app(research_answer("22°C", self.LINKS[0]["url"]), execution_enabled=False)
+        self.assertEqual("research", frozen.submit_text("hava?").payload["intent"]["status"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_only_public_http_links_count_and_search_text_is_parsed_exactly(self) -> None:
+        from jarvis.intent import public_source_url, search_result_links
+        for bad in ("http://localhost:8080/x", "http://127.0.0.1/", "http://10.0.0.5/a", "http://192.168.1.1/",
+                    "http://[::1]/", "https://user:pw@example.com/", "file:///c:/x", "javascript:alert(1)", "http://intranet/"):
+            self.assertEqual("", public_source_url(bad), bad)
+        self.assertEqual("https://example.com/a?b=1", public_source_url("https://example.com/a?b=1"))
+        text = 'Web search results for query: "x"\n\nLinks: [{"title":"A","url":"https://a.example/"},{"title":"L","url":"http://localhost/"}]\n\nmore'
+        self.assertEqual([{"title": "A", "url": "https://a.example/"}], search_result_links(text))
+
+    def test_the_research_call_grants_exactly_websearch_and_refuses_any_other_tool(self) -> None:
+        from jarvis.intent import ClaudeResearchAdapter
+        adapter = ClaudeResearchAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        command = adapter._command("q")
+        self.assertEqual(("WebSearch", "WebSearch", "dontAsk"), (command[command.index("--tools") + 1],
+                         command[command.index("--allowedTools") + 1], command[command.index("--permission-mode") + 1]))
+        for flag in ("--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-chrome", "--no-session-persistence"):
+            self.assertIn(flag, command)
+        self.assertNotIn("WebFetch", " ".join(command))
+        task = Task(objective="q", capability="web_research", scope=ActionScope(action="research", target=""))
+        stream = "\n".join(json.dumps(e) for e in (
+            {"type": "assistant", "message": {"model": "m", "content": [{"type": "tool_use", "name": "Bash"}]}},
+            {"type": "result", "result": "{}", "usage": {}}))
+        adapter.execute = lambda t, s: (adapter._usage(t, adapter._parse_payload(stream)), ToolResult(outcome=OutcomeStatus.SUCCESS, summary="ok"))[1]
+        self.assertFalse(adapter.complete(task, SessionState(objective="q")).ok)
+        self.assertIn("research", INTENT_SYSTEM_PROMPT)
+
+    def test_the_research_kind_is_parsed_strictly(self) -> None:
+        self.assertEqual("hava", parse_proposal(proposal(kind="research", query="hava")).query)
+        for bad in (proposal(kind="research"), proposal(kind="research", query=""), proposal(kind="research", query="x", url="http://a")):
+            with self.assertRaises(ProposalError):
+                parse_proposal(bad)
+
+
+class CodexProviderTests(IntentTestCase):
+    """Codex interprets through a ChatGPT subscription route only; every refusal happens before a process exists."""
+
+    STATE = {"status": "available", "plan": "plus", "quota": {"primary": {"used_percent": 4.0, "window_minutes": 300, "resets_at": 9}},
+             "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low", "medium"], "default_effort": "medium"}]}
+
+    def adapter(self, state, model="gpt-5.6-luna", effort="low"):
+        from jarvis.codex import CodexIntentAdapter
+        return CodexIntentAdapter(INTENT_SYSTEM_PROMPT, model, effort, state=lambda: state)
+
+    def test_refusals_start_no_process(self) -> None:
+        from unittest.mock import patch
+        import jarvis.codex as codex
+        task = Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target=""))
+        cases = [({"status": "not_logged_in"}, "gpt-5.6-luna", "low", "codex_not_logged_in"),
+                 ({"status": "api_key_route"}, "gpt-5.6-luna", "low", "codex_api_key_route"),
+                 (self.STATE, "gpt-5.5", "low", ""), (self.STATE, "gpt-5.6-luna", "ultra", ""),
+                 ({**self.STATE, "quota": {"limit_reached": True}}, "gpt-5.6-luna", "low", "")]
+        with patch.object(codex, "codex_executable", return_value="codex.exe"), patch.object(codex.subprocess, "Popen") as popen:
+            for state, model, effort, reason in cases:
+                with self.subTest(model=model, effort=effort, status=state.get("status")):
+                    result = self.adapter(state, model, effort).complete(task, SessionState(objective="hi"))
+                    self.assertFalse(result.ok)
+                    self.assertEqual(reason, result.error.details.get("billing_evidence", ""))
+            popen.assert_not_called()
+
+    def test_the_call_disables_every_tool_surface_and_strips_api_key_variables(self) -> None:
+        from unittest.mock import patch, MagicMock
+        import jarvis.codex as codex
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("\n".join(json.dumps(e) for e in (
+            {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("merhaba")}},
+            {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 2}})), "")
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "x"}), patch.object(codex, "codex_executable", return_value="codex.exe"), \
+                patch.object(codex.subprocess, "Popen", return_value=process) as popen:
+            app = self.build(self.adapter(self.STATE))
+            intent = app.submit_text("Merhaba").payload["intent"]
+        self.assertEqual(("conversation", "merhaba", "openai"), (intent["status"], intent["reply"], intent["usage"]["provider"]))
+        self.assertEqual({"input_tokens": 7, "output_tokens": 2}, intent["usage"]["reported"])        # no model invented
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        for feature in codex.CODEX_DISABLED_FEATURES:
+            self.assertIn(feature, argv)
+        for pair in (["-s", "read-only"], ["-m", "gpt-5.6-luna"], ["-c", "forced_login_method=chatgpt"], ["-c", "approval_policy=never"],
+                     ["-c", "web_search_mode=disabled"]):                               # the CLI's real key: no native web tool in chat
+            self.assertIn(pair, [argv[i:i + 2] for i in range(len(argv) - 1)])
+        self.assertIn("--ignore-user-config", argv)
+        self.assertNotIn("OPENAI_API_KEY", {k.upper() for k in kwargs["env"]})
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(0, self.execute_calls())
+
+    SOL = {**STATE, "models": [{"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                                "default_effort": "low"}]}
+
+    def run_stream(self, events, returncode=0, effort="medium"):
+        from unittest.mock import patch, MagicMock
+        import jarvis.codex as codex
+        process = MagicMock(returncode=returncode)
+        process.communicate.return_value = ("\n".join(json.dumps(e) for e in events), "")
+        with patch.object(codex, "codex_executable", return_value="codex.exe"), \
+                patch.object(codex.subprocess, "Popen", return_value=process) as popen:
+            app = self.build(self.adapter(self.SOL, "gpt-5.6-sol", effort))
+            app.research_model = None
+            intent = app.submit_text("Merhaba, kısaca kendini tanıt.").payload["intent"]
+        return intent, popen.call_args[0][0]
+
+    def test_sol_reaches_the_cli_as_chosen_and_a_transient_notice_is_not_a_failure(self) -> None:
+        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("Merhaba! Ben JARVIS.")}}
+        notices = [{"type": "item.completed", "item": {"type": "error", "message": "Code Mode is unavailable because code-mode host is disabled."}},
+                   {"type": "error", "message": "Reconnecting... 1/5"}]
+        for effort in ("low", "medium", "ultra"):
+            with self.subTest(effort=effort):
+                intent, argv = self.run_stream(notices + [answer, {"type": "turn.completed", "usage": {"output_tokens": 5}}], effort=effort)
+                self.assertEqual(("conversation", "Merhaba! Ben JARVIS."), (intent["status"], intent["reply"]))
+                self.assertIn(["-m", "gpt-5.6-sol"], [argv[i:i + 2] for i in range(len(argv) - 1)])
+                self.assertIn(["-c", f"model_reasoning_effort={effort}"], [argv[i:i + 2] for i in range(len(argv) - 1)])
+
+    def test_a_failed_codex_turn_is_a_clean_message_naming_provider_model_and_reason(self) -> None:
+        failed = [{"type": "turn.started"},
+                  {"type": "turn.failed", "error": {"message": "The model `gpt-5.6-sol` is not available for your plan.\n{\"detail\":\"x\"}"}}]
+        intent, _ = self.run_stream(failed, returncode=1)
+        self.assertEqual("model_failed", intent["status"])
+        self.assertTrue(intent["message"].startswith("Codex · gpt-5.6-sol: Codex reported: The model `gpt-5.6-sol` is not available for your plan."))
+        self.assertNotIn("\n", intent["message"])
+        silent, _ = self.run_stream([{"type": "turn.completed", "usage": {}}], returncode=1)
+        self.assertEqual("Codex · gpt-5.6-sol: Codex returned no answer.", silent["message"])
+        from jarvis.codex import CodexIntentAdapter
+        refused = CodexIntentAdapter(INTENT_SYSTEM_PROMPT, "gpt-5.6-sol", "bogus", state=lambda: self.SOL)
+        from unittest.mock import patch
+        import jarvis.codex as codex
+        with patch.object(codex, "codex_executable", return_value="codex.exe"):
+            result = refused.complete(Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target="")),
+                                      SessionState(objective="hi"))
+        self.assertEqual("Codex · gpt-5.6-sol: The Codex model 'gpt-5.6-sol' does not support effort 'bogus'; nothing was sent.", result.error.message)
+
+    def test_state_offers_only_listed_code_mode_models_and_refuses_an_api_key_account(self) -> None:
+        from unittest.mock import patch
+        import jarvis.codex as codex
+        catalog = [{"slug": "gpt-5.6-luna", "visibility": "list", "tool_mode": "code_mode_only", "display_name": "Luna",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "bogus"}], "default_reasoning_level": "low"},
+                   {"slug": "gpt-5.5", "visibility": "list", "tool_mode": None, "supported_reasoning_levels": []},
+                   {"slug": "hidden", "visibility": "hide", "tool_mode": "code_mode_only"}]
+        answers = {"account/read": {"account": {"type": "chatgpt", "planType": "plus"}},
+                   "account/rateLimits/read": {"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300, "resetsAt": 9},
+                                                              "credits": {"hasCredits": False}}}}
+        with patch.object(codex, "codex_executable", return_value="codex.exe"), patch.dict(os.environ, {}, clear=False), \
+                patch.object(codex, "prohibited_env_present", return_value=False), \
+                patch.object(codex, "_app_server", return_value=answers), patch.object(codex, "_catalog", return_value=catalog):
+            state = codex.codex_state()
+            self.assertEqual(("available", ["gpt-5.6-luna"], ["low"]), (state["status"], [m["id"] for m in state["models"]], state["models"][0]["efforts"]))
+            self.assertEqual({"primary": {"used_percent": 4.0, "window_minutes": 300, "resets_at": 9}, "has_credits": False}, state["quota"])
+            answers["account/read"] = {"account": {"type": "apiKey"}}
+            self.assertEqual("api_key_route", codex.codex_state()["status"])
+            answers["account/read"] = {"account": None}
+            self.assertEqual("not_logged_in", codex.codex_state()["status"])
+
+
+class AntigravityStatusTests(unittest.TestCase):
+    """Google in V1: never a prompt - only the CLI's read-only /usage, pools kept exactly as reported."""
+
+    USAGE = {"status": "SUCCESS", "num_turns": 0, "usage": {"total_tokens": 0}, "command": {"name": "usage", "data": {"groups": [
+        {"name": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro", "buckets": [
+            {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.7923486828804016, "reset_time": "2026-09-17T23:02:31Z"},
+            {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "2026-09-16T01:56:18Z"}]},
+        {"name": "Claude and GPT models", "buckets": [
+            {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1, "reset_time": "2026-09-22T20:56:18Z"},
+            {"id": "3p-bad", "window": "daily", "remaining_fraction": 1, "reset_time": "x"},
+            {"id": "3p-5h", "window": "5h", "remaining_fraction": "100%", "reset_time": "2026-09-16T01:56:18Z"}]}]}}}
+
+    def run_state(self, payload, returncode=0, executable="agy.exe"):
+        from unittest.mock import patch, MagicMock
+        import jarvis.antigravity as antigravity
+        completed = MagicMock(returncode=returncode, stdout=json.dumps(payload))
+        with patch.object(antigravity, "agy_executable", return_value=executable), \
+                patch.dict(os.environ, {"GEMINI_API_KEY": "x", "GOOGLE_CLOUD_PROJECT": "p"}), \
+                patch.object(antigravity.subprocess, "run", return_value=completed) as run:
+            return antigravity.antigravity_state(), run
+
+    def test_quota_pools_are_exact_and_separate_and_only_the_read_only_command_runs(self) -> None:
+        state, run = self.run_state(self.USAGE)
+        self.assertEqual(("chat_unavailable", [], False), (state["status"], state["models"], state["research"]))
+        gemini, third_party = state["quota"]["groups"]
+        self.assertEqual(("Gemini Models", [("weekly", 0.7923486828804016, "2026-09-17T23:02:31Z"), ("5h", 1.0, "2026-09-16T01:56:18Z")]),
+                         (gemini["name"], [(b["window"], b["remaining_fraction"], b["reset_time"]) for b in gemini["buckets"]]))
+        self.assertEqual(("Claude and GPT models", [("weekly", 1.0, "2026-09-22T20:56:18Z")]),        # malformed buckets dropped, never guessed
+                         (third_party["name"], [(b["window"], b["remaining_fraction"], b["reset_time"]) for b in third_party["buckets"]]))
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(["agy.exe", "-p", "/usage", "--output-format", "json"], argv)       # never a prompt
+        self.assertFalse({"GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"} & {k.upper() for k in kwargs["env"]})
+        self.assertFalse(kwargs["shell"])
+
+    def test_anything_but_a_clean_zero_turn_answer_is_unavailable(self) -> None:
+        for payload, code in (({**self.USAGE, "num_turns": 1}, 0), (self.USAGE, 1), ({**self.USAGE, "status": "ERROR"}, 0),
+                              ({"status": "SUCCESS", "num_turns": 0, "command": {"data": {"groups": []}}}, 0), ("not json", 0)):
+            with self.subTest(payload=str(payload)[:40], code=code):
+                self.assertEqual("unavailable", self.run_state(payload, code)[0]["status"])
+        self.assertEqual("not_installed", self.run_state(self.USAGE, executable=None)[0]["status"])
+
+
+class ClaudeModelSelectionTests(unittest.TestCase):
+    def test_the_model_grammar_admits_the_cli_variant_suffix_only(self) -> None:
+        from jarvis.settings import validate_claude_model
+        for good in ("opus[1m]", "claude-fable-5-1[1m]", "haiku", "claude-sonnet-5"):
+            self.assertEqual(good, validate_claude_model(good))
+        for bad in ("opus[1M]", "opus[1m][2]", "--model", "opus [1m]", "[1m]", "opus[]"):
+            with self.assertRaises(ValueError):
+                validate_claude_model(bad)
+
+    def test_the_cli_model_list_is_read_without_a_model_call(self) -> None:
+        from unittest.mock import patch, MagicMock
+        import jarvis.intent as intent
+        response = {"type": "control_response", "response": {"subtype": "success", "response": {"models": [
+            {"value": "default", "resolvedModel": "claude-opus-5[1m]", "displayName": "Default", "supportedEffortLevels": ["low", "max"]},
+            {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001", "displayName": "Haiku"},
+            {"value": "bad model; rm", "displayName": "x"}]}}}
+        process = MagicMock()
+        process.stdout = iter([json.dumps({"type": "system"}) + "\n", json.dumps(response) + "\n"])
+        with patch.object(ClaudeCodeConnector, "prohibited_billing_env_vars", return_value=("ANTHROPIC_BASE_URL",)), \
+                patch.object(intent.subprocess, "Popen") as refused:
+            self.assertEqual([], intent.claude_model_catalog())                        # a metered route variable: not even asked
+            refused.assert_not_called()
+        with patch.object(ClaudeCodeConnector, "prohibited_billing_env_vars", return_value=()), \
+                patch.object(intent.subprocess, "Popen", return_value=process) as popen:
+            models = intent.claude_model_catalog()
+        self.assertEqual([("default", ["low", "max"]), ("haiku", [])], [(m["id"], m["efforts"]) for m in models])
+        written = process.stdin.write.call_args[0][0]
+        self.assertEqual("initialize", json.loads(written)["request"]["subtype"])        # a control request, never a prompt
+        argv = popen.call_args[0][0]
+        self.assertEqual("", argv[argv.index("--tools") + 1])
+        process.kill.assert_called()
 
 
 if __name__ == "__main__":  # pragma: no cover

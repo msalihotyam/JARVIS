@@ -20,7 +20,7 @@ import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AbstractSet, Any, Iterable, Mapping
+from typing import AbstractSet, Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from jarvis.connectors.base import BaseConnector
@@ -167,12 +167,14 @@ from jarvis.intent import (
     INTENT_ACTION,
     INTENT_CAPABILITY,
     ClaudeIntentAdapter,
+    ClaudeResearchAdapter,
     IntentStatus,
     ProposalError,
     build_catalog,
     intent_text_refusal,
     model_failure_status,
     parse_proposal,
+    parse_research,
     conversation_window,
     model_failure_reason,
     resolve_proposal,
@@ -2966,7 +2968,12 @@ _INTENT_EXIT: dict[IntentStatus, tuple[int, ErrorCode | None]] = {
     IntentStatus.MODEL_FAILED: (EXIT_INTERNAL, ErrorCode.CONNECTOR_FAILED),
     IntentStatus.EXECUTION_DISABLED: (EXIT_POLICY, ErrorCode.EXECUTION_DISABLED),
     IntentStatus.INVALID_INPUT: (EXIT_INVALID_INPUT, ErrorCode.INVALID_TASK),
+    IntentStatus.RESEARCH_UNAVAILABLE: (EXIT_INTERNAL, ErrorCode.CONNECTOR_UNAVAILABLE),
+    IntentStatus.RESEARCH_FAILED: (EXIT_INTERNAL, ErrorCode.CONNECTOR_FAILED),
 }
+
+#: Why Web Research could not run, as stable non-secret codes for the interface.
+RESEARCH_PROVIDER_UNSUPPORTED = "research_provider_unsupported"
 
 #: The execution barrier on the free-text entry: the request was understood,
 #: and nothing authoritative followed.
@@ -2989,6 +2996,9 @@ def text_result(
     objective: str = "",
     reply: str = "",
     reason: str = "",
+    usage: dict[str, Any] | None = None,
+    sources: Iterable[dict[str, str]] = (),
+    sources_cited: bool = False,
     choices: Iterable[dict[str, str]] = (),
     run: dict[str, Any] | None = None,
     job: dict[str, Any] | None = None,
@@ -3025,6 +3035,15 @@ def text_result(
             # A stable, non-secret code for an ESTABLISHED failure cause, so the
             # interface can explain it in the person's language. Never prose.
             "reason": reason or None,
+            # The understanding call's own usage: the token fields the provider
+            # REPORTED (none invented) and measured character sizes of the
+            # request, the conversation window and the catalogue it carried.
+            "usage": usage or None,
+            # Web Research: the public pages the search REALLY returned that
+            # back the reply (``sources_cited``), or - when the reply named
+            # none of them - the returned results themselves. Untrusted links.
+            "sources": [dict(source) for source in sources],
+            "sources_cited": bool(sources_cited),
             # The configured destinations a clarification asks the user to
             # choose between, each with the exact text that selects it. Built
             # from the grant rows only; empty when no choice is pending.
@@ -3037,6 +3056,24 @@ def text_result(
     return CommandResult(_redact(payload), code)
 
 
+def _model_usage(model: Any, request_id: str) -> dict[str, Any]:
+    """What a model adapter REPORTED about one call: the provider's own token
+    fields and answering model (``reported``), the plan limits it stated
+    (``rate_limits``) and which provider answered. Nothing is estimated."""
+    reported = getattr(model, "reported", None)
+    observed = getattr(model, "observed", None)
+    found: dict[str, Any] = {
+        "provider": getattr(model, "provider", None) or None,
+        "reported": dict(reported.get(request_id) or {}) if isinstance(reported, dict) else {},
+    }
+    seen = observed.get(request_id) if isinstance(observed, dict) else None
+    for key in ("rate_limits", "quota", "requested_model"):
+        value = seen.get(key) if isinstance(seen, dict) else None
+        if value:
+            found[key] = dict(value) if isinstance(value, dict) else value
+    return found
+
+
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
 
@@ -3046,6 +3083,7 @@ class JarvisApp:
         memory: MemoryStore,
         settings: Settings,
         intent_model: ModelAdapter | None = None,
+        research_model: ModelAdapter | None = None,
     ) -> None:
         self.core = core
         self.memory = memory
@@ -3053,6 +3091,9 @@ class JarvisApp:
         #: The understanding model, or ``None`` when none is composed. Never
         #: a registered connector: it interprets, it does not execute.
         self.intent_model = intent_model
+        #: The read-only public Web Research model, or ``None`` when the
+        #: composed provider has no verified research route. Never registered.
+        self.research_model = research_model
         self._cancelled_text: set[str] = set()
 
     @property
@@ -3096,8 +3137,15 @@ class JarvisApp:
         request_id = request_id or str(uuid4())
         mode = self.settings.permission_mode
 
+        # What the call really cost in tokens, as the provider reported it, and
+        # the measured sizes of what was sent - filled only after the call.
+        usage: dict[str, Any] = {}
+
+        def respond(*args: Any, **kwargs: Any) -> CommandResult:
+            return text_result(*args, usage=usage, **kwargs)
+
         def refused(status: IntentStatus, message: str, reason: str = "") -> CommandResult:
-            return text_result(mode, status, request_id, message=message, reason=reason)
+            return respond(mode, status, request_id, message=message, reason=reason)
 
         reason = intent_text_refusal(text)
         if reason is None and previous_text:
@@ -3112,7 +3160,7 @@ class JarvisApp:
         if session_id is not None:
             session = self.memory.load_session(session_id)
             if session is None:
-                return text_result(
+                return respond(
                     mode, IntentStatus.INVALID_INPUT, request_id,
                     message=f"Unknown session: {session_id}", exit_code=EXIT_NOT_FOUND,
                 )
@@ -3160,6 +3208,12 @@ class JarvisApp:
             )
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)
+        usage.update({
+            **_model_usage(model, request_id),
+            "request_chars": len(text),
+            "conversation_chars": sum(len(turn["text"]) for turn in intent_task.context["conversation"]),
+            "context_chars": len(json.dumps(intent_task.context["catalog"], sort_keys=True)),
+        })
         if not result.ok:
             status = model_failure_status(result, cancelled)
             detail = result.error.message if result.error is not None else result.summary
@@ -3184,7 +3238,7 @@ class JarvisApp:
         resolution = resolve_proposal(proposal, catalog, now, text)
         if resolution.status in (IntentStatus.STRUCTURED, IntentStatus.SCHEDULED) and not self.core.execution_allowed():
             # THE barrier: understood, but nothing is created, queued or started.
-            return text_result(
+            return respond(
                 mode, IntentStatus.EXECUTION_DISABLED, request_id,
                 message=_FROZEN_UNDERSTOOD_MESSAGE,
                 capability=resolution.capability,
@@ -3202,7 +3256,7 @@ class JarvisApp:
             # From here on the ordinary lifecycle owns everything. No grant
             # is passed: a natural-language request cannot approve itself.
             run = self.core.run(task, session_id)
-            return text_result(
+            return respond(
                 mode, IntentStatus.STRUCTURED, request_id,
                 capability=resolution.capability,
                 destination=resolution.destination,
@@ -3212,7 +3266,12 @@ class JarvisApp:
             )
         if resolution.status is IntentStatus.CONVERSATION:
             # Text to show. Nothing was created and nothing can run from it.
-            return text_result(mode, IntentStatus.CONVERSATION, request_id, reply=resolution.reply)
+            return respond(mode, IntentStatus.CONVERSATION, request_id, reply=resolution.reply)
+        if resolution.status is IntentStatus.RESEARCH:
+            # Like conversation, research creates nothing and needs no approval:
+            # one read-only public search answers a question. It is not gated by
+            # Freeze for the same reason chat is not - nothing authoritative runs.
+            return self._research(resolution.objective, text, request_id, response_language, usage, respond)
         if resolution.status is IntentStatus.SCHEDULED:
             created = job_create_result(
                 self.memory, self.settings, json.dumps(resolution.job_document)
@@ -3223,14 +3282,14 @@ class JarvisApp:
                     IntentStatus.MALFORMED_MODEL_OUTPUT,
                     f"The proposed job was refused: {error.get('message')} Nothing was created.",
                 )
-            return text_result(
+            return respond(
                 mode, IntentStatus.SCHEDULED, request_id,
                 capability=resolution.capability,
                 destination=resolution.destination,
                 objective=resolution.objective,
                 job=created.payload,
             )
-        return text_result(
+        return respond(
             mode, resolution.status, request_id,
             message=resolution.message,
             question=resolution.question,
@@ -3239,21 +3298,85 @@ class JarvisApp:
             choices=resolution.choices,
         )
 
+    def _research(
+        self, query: str, text: str, request_id: str, response_language: str,
+        usage: dict[str, Any], respond: Callable[..., CommandResult],
+    ) -> CommandResult:
+        """One read-only public Web Research call for an understood question."""
+        mode = self.settings.permission_mode
+        model = self.research_model
+        if model is None:
+            return respond(mode, IntentStatus.RESEARCH_UNAVAILABLE, request_id, objective=query,
+                           message="Web Research has no verified route with the selected provider. Nothing was searched.",
+                           reason=RESEARCH_PROVIDER_UNSUPPORTED)
+        availability = model.availability()
+        if not availability.available:
+            return respond(mode, IntentStatus.RESEARCH_UNAVAILABLE, request_id, objective=query,
+                           message=availability.reason or "Web Research is unavailable.")
+        task = Task(
+            objective=query,
+            capability="web_research",
+            scope=ActionScope(action="research", destination=DEFAULT_TASK_DESTINATION),
+            context={"request": text, "local_time": datetime.now().astimezone().isoformat(timespec="minutes"),
+                     "response_language": response_language_hint(response_language)},
+            id=request_id,
+        )
+        try:
+            result = model.complete(task, SessionState(objective=query))
+        except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
+            return respond(mode, IntentStatus.RESEARCH_FAILED, request_id, objective=query,
+                           message=f"Web Research failed: {type(exc).__name__}.")
+        cancelled = request_id in self._cancelled_text
+        self._cancelled_text.discard(request_id)
+        usage["research"] = _model_usage(model, request_id)
+        if cancelled:
+            return respond(mode, IntentStatus.MODEL_CANCELLED, request_id, objective=query,
+                           message="Web Research was cancelled.")
+        if not result.ok:
+            detail = result.error.message if result.error is not None else result.summary
+            details = result.error.details if result.error is not None and isinstance(result.error.details, dict) else {}
+            if "redacted_items" in details:
+                # A failed turn carries the model's own text as its message: never shown.
+                detail = "The web search did not finish with an answer."
+            return respond(mode, IntentStatus.RESEARCH_FAILED, request_id, objective=query,
+                           message=sanitize_diagnostic_text(detail, 240), reason=model_failure_reason(result))
+        data = result.data if isinstance(result.data, dict) else {}
+        answer = data.get(MODEL_ANSWER_RESULT_KEY)
+        # The CLI's schema-validated object first; the answer text only as its carrier.
+        structured = data.get("structured") if isinstance(data.get("structured"), dict) else None
+        if structured is None and (type(answer) is not ModelAnswer or not answer.present):
+            return respond(mode, IntentStatus.RESEARCH_FAILED, request_id, objective=query,
+                           message="Web Research returned no answer.")
+        links = [link for link in data.get("search_links") or [] if isinstance(link, dict) and type(link.get("url")) is str]
+        reply, sources, cited = parse_research(structured if structured is not None else answer.content, links)
+        if not reply:
+            # Never show what could not be read: no raw output reaches the conversation.
+            return respond(mode, IntentStatus.RESEARCH_FAILED, request_id, objective=query,
+                           message="Web Research returned a result JARVIS could not read, so nothing from it is shown.")
+        return respond(mode, IntentStatus.RESEARCH, request_id, objective=query, reply=reply,
+                       sources=sources, sources_cited=cited)
+
     def cancel_text(self, request_id: str) -> bool:
-        """Ask the running understanding call for ``request_id`` to stop.
+        """Ask the running understanding or research call for ``request_id`` to stop.
 
         Advisory and best-effort, exactly like connector cancellation: the
         return value says a signal was delivered, never that nothing left
         the machine. A cancelled call reports ``model_cancelled`` and
         creates nothing.
         """
-        if self.intent_model is None or type(request_id) is not str:
+        if type(request_id) is not str:
+            return False
+        models = [m for m in (self.intent_model, self.research_model) if m is not None]
+        if not models:
             return False
         self._cancelled_text.add(request_id)
-        try:
-            return bool(self.intent_model.cancel(request_id))
-        except Exception:  # noqa: BLE001 - advisory signal; never raises
-            return False
+        delivered = False
+        for model in models:
+            try:
+                delivered = bool(model.cancel(request_id)) or delivered
+            except Exception:  # noqa: BLE001 - advisory signal; never raises
+                pass
+        return delivered
 
     def run(self, raw_task_json: str | bytes, session_id: str | None = None) -> CommandResult:
         try:
@@ -3531,6 +3654,7 @@ def create_app(
     github_identity: GitHubIdentityBinding | None = None,
     gmail_identity: GmailIdentityBinding | None = None,
     intent_model: ModelAdapter | None = None,
+    research_model: ModelAdapter | None = None,
 ) -> JarvisApp:
     """Assemble an application from injected parts. Tests use this.
 
@@ -3567,6 +3691,7 @@ def create_app(
         memory,
         settings,
         intent_model=intent_model,
+        research_model=research_model,
     )
 
 
@@ -3585,6 +3710,15 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     # and the same operator model/effort/budget, held by the app and NOT
     # registered - it interprets a request, it never executes one.
     intent_model = ClaudeIntentAdapter(
+        allowed_roots=(startup_directory,),
+        default_working_directory=startup_directory,
+        max_budget_usd=settings.claude_call_budget_usd,
+        model=settings.claude_model,
+        effort=settings.claude_effort,
+    )
+    # Web Research: the same seam, the same operator model/effort, one tool
+    # (WebSearch). Held by the app and NOT registered, like the understanding call.
+    research_model = ClaudeResearchAdapter(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
         max_budget_usd=settings.claude_call_budget_usd,
@@ -3644,6 +3778,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         github_identity=github_identity,
         gmail_identity=gmail_identity,
         intent_model=intent_model,
+        research_model=research_model,
     )
 
 

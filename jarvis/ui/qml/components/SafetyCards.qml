@@ -12,6 +12,8 @@ Column {
     objectName: "safetyCards"
     property real inset: 0                      // the JARVIS message column
     readonly property var s: bridge.safety
+    // Whether the approval card is on screen, for the conversation to bring it into view.
+    readonly property bool approvalShown: approvalCard.visible
     readonly property real cardWidth: Math.min(760, width - inset)
     readonly property bool narrow: cardWidth < 560
     spacing: 16

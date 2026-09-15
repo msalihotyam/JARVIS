@@ -23,6 +23,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from jarvis.codex import CODEX_EFFORT_VALUES, CODEX_MODEL_PATTERN
+
 PREFERENCES_VERSION = 4
 THEMES = ("space", "dark", "command")
 #: Execution-status lamp skins: the canonical glass orb and the HUD variant.
@@ -41,6 +43,8 @@ CONTEXTUAL_PANELS = frozenset({"workflow"})
 RAIL_IDS = ("tasks", "updates", "focus", "plan", "memory")
 #: Interface languages, as stable locale ids (never the visible option name).
 LANGUAGES = ("en-US", "tr-TR")
+#: The chat / understanding providers a person can choose.
+CHAT_PROVIDERS = ("claude", "codex")
 
 #: Bounds, in fractions of the content area. The stack's height shares are
 #: normalized on render, so a share is a proportion, not a pixel count.
@@ -91,6 +95,17 @@ def canonical_profiles() -> dict[str, dict[str, Any]]:
     }
 
 
+def canonical_chat() -> dict[str, str]:
+    return {"provider": "claude", "codex_model": "", "codex_effort": ""}
+
+
+def _valid_chat(candidate: Any) -> bool:
+    return (isinstance(candidate, dict) and set(candidate) == set(canonical_chat())
+            and candidate["provider"] in CHAT_PROVIDERS
+            and type(candidate["codex_model"]) is str and (candidate["codex_model"] == "" or bool(CODEX_MODEL_PATTERN.match(candidate["codex_model"])))
+            and candidate["codex_effort"] in ("",) + CODEX_EFFORT_VALUES)
+
+
 def canonical_rail() -> dict[str, Any]:
     return {"order": list(RAIL_IDS), "visible": {name: True for name in RAIL_IDS}}
 
@@ -113,6 +128,10 @@ def canonical_preferences() -> dict[str, Any]:
         "page": "home",
         # An application preference, not layout: Reset layout never touches it.
         "language": "en-US",
+        # Who answers General Chat and interprets requests, and each provider's
+        # own model / effort. Inference routing only - never authority. Claude's
+        # model and effort are operator configuration (claude_model / claude_effort).
+        "chat": canonical_chat(),
         "rail": canonical_rail(),
         "profiles": canonical_profiles(),
         "packages": {name: {"profile": "normal", "profiles": package_profiles(name)}
@@ -181,11 +200,11 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     defaults = canonical_preferences()
     # Preserve only a complete, valid v1 document. Validation below still
     # rejects malformed old fields; migration never writes product config.
-    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator", "language"} == set(defaults) - {"packages", "status_indicator", "rail", "language"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator", "language", "chat"} == set(defaults) - {"packages", "status_indicator", "rail", "language", "chat"}:
         candidate = {**candidate, "version": 3, "packages": defaults["packages"]}
     # Version 2 -> 3: the conversation-first grid replaced every layout; the
     # person's other choices are kept.
-    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) - {"language"} == set(defaults) - {"rail", "language"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) - {"language", "chat"} == set(defaults) - {"rail", "language", "chat"}:
         kept = {key: candidate[key] for key in ("theme", "ambient_effects", "status_indicator", "page")}
         candidate = {**defaults, **kept, "version": 3}
         candidate.pop("rail")
@@ -197,6 +216,9 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     # English: an existing installation never switches language on its own.
     if isinstance(candidate, dict) and "version" in candidate and "language" not in candidate:
         candidate = {**candidate, "language": defaults["language"]}
+    # A document from before provider choice keeps everything and answers with Claude.
+    if isinstance(candidate, dict) and "version" in candidate and "chat" not in candidate:
+        candidate = {**candidate, "chat": canonical_chat()}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
@@ -213,7 +235,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
     if candidate["profile"] not in PROFILES or candidate["page"] not in PAGES:
         return defaults
-    if candidate["language"] not in LANGUAGES:
+    if candidate["language"] not in LANGUAGES or not _valid_chat(candidate["chat"]):
         return defaults
     rail = candidate["rail"]
     if (not isinstance(rail, dict) or set(rail) != {"order", "visible"}
@@ -252,6 +274,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "profile": candidate["profile"],
         "page": candidate["page"],
         "language": candidate["language"],
+        "chat": dict(candidate["chat"]),
         "rail": {"order": list(rail["order"]), "visible": dict(rail["visible"])},
         "profiles": validated,
         "packages": validated_packages,

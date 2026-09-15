@@ -36,7 +36,30 @@ Item {
     readonly property alias viewportHeight: flick.height
     property alias followEnd: flick.followEnd
     readonly property bool overflow: flick.contentHeight > flick.height + 1
-    function scrollTo(y) { flick.contentY = Math.max(0, Math.min(flick.endY, y)) }
+    function scrollTo(y) { glide.stop(); flick.contentY = Math.max(0, Math.min(flick.endY, y)) }
+    // For inspection: how many glides have started, and whether one is running.
+    readonly property alias gliding: glide.running
+    property int glideCount: 0
+    // A newly shown approval card glides into view when the reader is at the
+    // end. Reading older messages, the position is kept and the jump-to-latest
+    // arrow (plus the attention strip) leads to it - nothing is lost.
+    readonly property bool approvalCardShown: safetyLoader.item ? safetyLoader.item.approvalShown : false
+    // Its arrival also resizes the viewport (the attention strip appears), so
+    // that resize joins the same single glide instead of jumping.
+    property bool approvalGlide: false
+    onApprovalCardShownChanged: if (approvalCardShown) { if (flick.followEnd) { approvalGlide = true; growth.restart() } else newBelow = true }
+    // Newer content arrived below while the reader was reading older messages.
+    property bool newBelow: false
+    readonly property bool jumpVisible: newBelow && !flick.followEnd
+    // The arrow and sending a message: one smooth glide to the exact end.
+    function jumpToLatest() {
+        newBelow = false; flick.followEnd = true
+        if (Math.abs(flick.endY - flick.contentY) > 1) {
+            glideCount += 1
+            glide.stop(); glide.from = flick.contentY; glide.to = flick.endY; glide.start()
+        }
+    }
+    Connections { target: bridge; function onInputAccepted() { feed.jumpToLatest() } }
     // Review: bring the card for an attention key into view and move focus to
     // its heading (never to a decision button). "decision" answers happen in
     // the choices / composer below the stream, so the end is shown.
@@ -52,6 +75,20 @@ Item {
         }
     }
 
+    // One compact, visually secondary message action.
+    component MessageAction: Text {
+        property string label: ""
+        signal activated()
+        text: label
+        color: actionArea.containsMouse ? Theme.accent : Theme.textMuted
+        font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
+        style: Text.Outline; styleColor: "#b3000812"
+        Accessible.role: Accessible.Button
+        Accessible.name: label
+        MouseArea { id: actionArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor; onClicked: parent.activated() }
+    }
+
     function railColor(kind) {
         switch (kind) {
         case "user": return Theme.accentSoft
@@ -62,6 +99,7 @@ Item {
         case "clarify": return Theme.accentSoft
         case "scheduled": return Theme.success
         case "data": return Theme.textMuted
+        case "notice": return Theme.accentSoft
         default: return Theme.textDim
         }
     }
@@ -75,6 +113,7 @@ Item {
         case "clarify": return qsTr("JARVIS · needs one detail")
         case "scheduled": return qsTr("SCHEDULED")
         case "data": return qsTr("UNTRUSTED DATA")
+        case "notice": return qsTr("NOTE")
         default: return qsTr("SYSTEM")
         }
     }
@@ -93,20 +132,44 @@ Item {
         // reader makes (wheel, flick, drag, thumb), never from our own settling.
         property bool followEnd: true
         property bool settling: false
+        // Set after the first layout: only content that arrives later glides.
+        property bool primed: false
         function remember() { followEnd = contentY >= endY - 6 }
-        onContentYChanged: if (!settling) remember()
+        onContentYChanged: if (!settling && !glide.running) remember()
         // Content grew or the viewport changed: keep the end if the reader
         // was there, otherwise leave the reading position exactly as it is
-        // (only pulling back inside the range when the range shrank).
-        function settle() {
+        // (only pulling back inside the range when the range shrank). New
+        // content glides to the end - short, eased, no bounce - and a glide
+        // already under way is simply re-aimed at the new end.
+        NumberAnimation { id: glide; target: flick; property: "contentY"; duration: 260; easing.type: Easing.OutCubic }
+        function settle(smooth) {
             settling = true
-            if (followEnd) contentY = endY
-            else if (contentY > endY) contentY = endY
+            if (followEnd) {
+                if (smooth && primed && Math.abs(endY - contentY) > 1) {
+                    if (!glide.running) feed.glideCount += 1
+                    glide.stop(); glide.from = contentY; glide.to = endY; glide.start()
+                } else if (!glide.running) {
+                    contentY = endY
+                }
+            } else if (contentY > endY) {
+                contentY = endY
+            }
             settling = false
         }
-        onContentHeightChanged: Qt.callLater(settle)
-        onHeightChanged: Qt.callLater(settle)
-        Component.onCompleted: Qt.callLater(settle)
+        function settleGrowth() {
+            if (!followEnd && endY - contentY > 6) feed.newBelow = true
+            settle(true); feed.approvalGlide = false
+        }
+        onFollowEndChanged: if (followEnd) feed.newBelow = false
+        function settleResize() { primed = true; if (feed.approvalGlide) growth.restart(); else settle(false) }
+        // A burst of growth (a card laying itself out in steps) is one glide:
+        // the changes are gathered for a few frames, then settled once.
+        Timer { id: growth; interval: 50; onTriggered: flick.settleGrowth() }
+        onContentHeightChanged: growth.restart()
+        onHeightChanged: if (feed.approvalGlide) growth.restart(); else Qt.callLater(settleResize)
+        Component.onCompleted: Qt.callLater(settleResize)
+        // The reader takes over at once.
+        onMovementStarted: glide.stop()
 
         Column {
             id: stack
@@ -208,26 +271,23 @@ Item {
                                    font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 2.2 }) }
                             Item {
                                 width: parent.width
-                                height: message.y + message.height + (row.isJarvis ? (feed.referenceLayout ? 13 : 12) : 0)
-                                // JARVIS: a lighter, quieter glass surface under the answer.
-                                Rectangle {
-                                    visible: row.isJarvis
-                                    anchors.fill: parent; radius: 12
-                                    color: Theme.glassPrimaryReading
-                                    border.width: 1; border.color: Theme.glassSeparator
-                                    Rectangle { x: 14; y: 1; width: parent.width - 28; height: 1; color: "#2e6fd2f5" }
-                                }
-                                Text { id: name; visible: row.isJarvis; x: 18; y: 11; text: feed.kindLabel(row.kind); color: Theme.materialBlue
-                                       font: feed.referenceLayout ? Theme.messageIdentity : Qt.font({ family: Theme.font, pixelSize: 12, weight: Font.Bold, letterSpacing: 1.4 })
+                                height: (sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
+                                // JARVIS: no surface at all - the small name, then the answer
+                                // itself at a readable measure; the avatar is the identity.
+                                Text { id: name; visible: row.isJarvis; x: 0; y: 5; text: feed.kindLabel(row.kind); color: Theme.materialBlue
+                                       opacity: 0.85
+                                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.2 })
                                        lineHeightMode: Text.FixedHeight; lineHeight: 16 }
                                 TextEdit {
                                     id: message
-                                    x: row.isJarvis ? 18 : 0
-                                    y: row.isJarvis ? name.y + name.height + 6 : 0
-                                    width: row.isJarvis ? Math.min(parent.width - 2 * x, 760) : parent.width
+                                    x: 0
+                                    y: row.isJarvis ? name.y + name.height + 4 : 0
+                                    width: row.isJarvis ? Math.min(parent.width, 760) : parent.width
                                     text: modelData.text
                                     readOnly: true
                                     selectByMouse: true
+                                    // A selection survives the click on "Quote selection".
+                                    persistentSelection: row.conversational
                                     wrapMode: Text.Wrap
                                     objectName: "feedMessage_" + row.kind
                                     color: row.kind === "system" ? Theme.textMuted : Theme.text
@@ -240,6 +300,33 @@ Item {
                                     // (a new feed rebuilds the rows), and the formatting edit itself would
                                     // otherwise re-trigger a text-change handler.
                                     Component.onCompleted: if (feed.referenceLayout && row.kind !== "data" && typeof typography !== "undefined") typography.setLineHeight(textDocument, 28, 12)
+                                }
+                                // Web Research: the public pages behind the answer. Untrusted
+                                // links, plain text; a click opens only an http(s) page in the
+                                // person's own browser - JARVIS itself visits nothing here.
+                                Column {
+                                    id: sources
+                                    objectName: "feedSources"
+                                    visible: (modelData.sources || []).length > 0
+                                    y: message.y + message.height + 10
+                                    width: message.width
+                                    spacing: 3
+                                    Text { text: modelData.sources_cited ? qsTr("Sources") : qsTr("Search results (the answer names no specific page)")
+                                           color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 0.8 }) }
+                                    Repeater {
+                                        model: modelData.sources || []
+                                        delegate: Text {
+                                            objectName: "feedSource_" + index
+                                            width: sources.width
+                                            elide: Text.ElideRight
+                                            textFormat: Text.PlainText
+                                            text: (index + 1) + ". " + (modelData.title || modelData.url) + "  ·  " + modelData.url.replace(/^https?:\/\//, "").split("/")[0]
+                                            color: linkArea.containsMouse ? Theme.accent : Theme.materialBlue
+                                            font: Qt.font({ family: Theme.font, pixelSize: 13 })
+                                            MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                                        onClicked: if (/^https?:\/\//.test(modelData.url)) Qt.openUrlExternally(modelData.url) }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -257,6 +344,25 @@ Item {
                         font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
                         lineHeightMode: Text.FixedHeight; lineHeight: 16
                     }
+                    // Copy / Quote, hidden until hover: only on what the person wrote
+                    // and on General Chat replies - never on cards, notices, errors,
+                    // external data or task results.
+                    readonly property bool conversational: row.isUser || modelData.chat === true
+                    HoverHandler { id: rowHover; enabled: row.conversational }
+                    Row {
+                        objectName: "messageActions_" + index
+                        visible: row.conversational
+                        opacity: rowHover.hovered || message.selectedText.length > 0 ? 1 : 0
+                        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+                        spacing: 14
+                        y: stamp.y
+                        x: row.isUser ? stamp.x - width - 16 : stamp.x + stamp.width + 16
+                        MessageAction { objectName: "messageCopy_" + index; label: qsTr("Copy"); onActivated: bridge.copyText(modelData.text) }
+                        MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteText(modelData.text) }
+                        MessageAction { objectName: "messageQuoteSelection_" + index; label: qsTr("Quote selection")
+                                        visible: message.selectedText.length > 0
+                                        onActivated: { bridge.quoteText(message.selectedText); message.deselect() } }
+                    }
                 }
             }
             Loader {
@@ -269,6 +375,28 @@ Item {
                 sourceComponent: Component { SafetyCards { width: stack.width; inset: feed.messageX } }
             }
         }
+    }
+
+    // -- jump to latest: a small arrow just above the composer, only while newer
+    //    content waits below the reading position ---------------------------------
+    Rectangle {
+        id: jump
+        objectName: "jumpToLatest"
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.horizontalCenterOffset: -feed.strip / 2
+        anchors.bottom: parent.bottom; anchors.bottomMargin: 12
+        width: 36; height: 36; radius: 18
+        opacity: feed.jumpVisible ? 1 : 0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 160 } }
+        color: jumpArea.containsMouse ? Theme.alpha(Theme.accent, 0.22) : Theme.glassPrimaryReading
+        border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55)
+        Accessible.role: Accessible.Button
+        Accessible.name: qsTr("Jump to latest message")
+        Text { anchors.centerIn: parent; anchors.verticalCenterOffset: 1; text: "↓"; color: Theme.text
+               font: Qt.font({ family: Theme.font, pixelSize: 17, weight: Font.DemiBold }) }
+        MouseArea { id: jumpArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    enabled: feed.jumpVisible; onClicked: feed.jumpToLatest() }
     }
 
     // -- the transient scrollbar, in the reserved strip -------------------------

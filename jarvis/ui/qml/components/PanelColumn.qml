@@ -322,7 +322,8 @@ Item {
             readonly property string uptime: (Math.floor(bridge.uptimeSeconds / 3600) > 0 ? Math.floor(bridge.uptimeSeconds / 3600) + "h " : "") + (Math.floor(bridge.uptimeSeconds / 60) % 60) + "m"
             readonly property string execution: bridge.executionState === "unconfirmed" ? qsTr("Unconfirmed") : bridge.configRefused ? qsTr("Refused") : bridge.executionState === "freeze_requested" ? qsTr("Freezing") : (bridge.executionEnabled ? qsTr("Running") : qsTr("Frozen"))
             readonly property color executionTint: bridge.executionState === "unconfirmed" || bridge.executionState === "freeze_requested" ? Theme.warning : bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
-            readonly property string model: bridge.config.claude_model || qsTr("CLI default")
+            readonly property string model: bridge.chatProvider === "codex" ? (bridge.codexModel || qsTr("No model chosen"))
+                                            : bridge.config.claude_model || qsTr("CLI default")
             Row {
                 id: gauges
                 objectName: "systemGauges"

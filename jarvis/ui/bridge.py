@@ -20,11 +20,13 @@ from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import Property, QDateTime, QLocale, QObject, QThreadPool, Signal, Slot
+from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, Signal, Slot
+from PySide6.QtGui import QWindow
 
 from jarvis.ui.backend import ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui.preferences import (
+    CHAT_PROVIDERS,
     CONTEXTUAL_PANELS,
     PAGES,
     PANEL_IDS,
@@ -32,6 +34,7 @@ from jarvis.ui.preferences import (
     THEMES,
     UiPreferences,
     STATUS_INDICATORS,
+    validate_preferences,
 )
 from jarvis.ui.present import (
     REFUSED_CODES,
@@ -85,6 +88,8 @@ class Bridge(QObject):
     # UI events the core reacts to: they report what the application
     # actually did, never a new backend state.
     inputAccepted = Signal()      # a message or choice was accepted and sent on
+    quoteRequested = Signal(str)  # a conversational message to quote into the composer
+    providersChanged = Signal()
     modelApplied = Signal()       # the configured model / effort really changed
     composingChanged = Signal()
     attentionChanged = Signal()   # the safety projection may have changed
@@ -112,6 +117,12 @@ class Bridge(QObject):
         self._started_frozen = False
         # One in-app scheduler sweep at a time (see ``sweepDueWork``).
         self._sweeping = False
+        self._providers: list[dict] = []
+        # The last understanding / General Chat call's usage, as its envelope reported it.
+        self._chat_usage: dict = {}
+        # Plan limits exactly as each provider last REPORTED them, with when that was.
+        self._claude_limits: dict = {}
+        self._codex_quota: dict = {}
         self._composing = False
         self._core_state = "idle"
         self._session_id = ""
@@ -189,7 +200,7 @@ class Bridge(QObject):
             # (at its next safe point, or finished): now JARVIS is frozen.
             self._freeze_waiting = False
             if not self.executionEnabled:
-                self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen. The operation that was running has returned; nothing new can start."))
+                # Lifecycle, not conversation: the live feed and the attention strip say it.
                 self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"), ()), "system")
         self._refresh_core_state()
 
@@ -206,8 +217,11 @@ class Bridge(QObject):
             return (context, source, tuple(Bridge._redacted(a) for a in args))
         return redact_text(str(message))
 
-    def _say(self, kind: str, message: Any, chat: bool = False) -> None:
-        entry = {"kind": kind, "msg": self._redacted(message), "ts": time.time()}
+    def _say(self, kind: str, message: Any, chat: bool = False, **extra: Any) -> None:
+        if isinstance(extra.get("sources"), list):   # untrusted links: redacted like everything shown
+            extra["sources"] = [{key: redact_text(str(source.get(key) or "")) for key in ("title", "url")}
+                                for source in extra["sources"] if isinstance(source, dict)]
+        entry = {"kind": kind, "msg": self._redacted(message), "ts": time.time(), **extra}
         if chat:
             entry["chat"] = True         # a General Chat reply: part of the conversation window
         self._feed.append(entry)
@@ -300,8 +314,23 @@ class Bridge(QObject):
         if not isinstance(intent, dict):
             intent = None
         status = str((intent or {}).get("status") or "")
+        if isinstance(intent, dict) and isinstance(intent.get("usage"), dict):
+            self._chat_usage = dict(intent["usage"])
+            for call in (self._chat_usage, self._chat_usage.get("research")):
+                if isinstance(call, dict) and isinstance(call.get("rate_limits"), dict):
+                    self._claude_limits = {**call["rate_limits"], "seen_at": int(time.time())}
+            if isinstance(self._chat_usage.get("quota"), dict):
+                self._codex_quota = {**self._chat_usage["quota"], "seen_at": int(time.time())}
+            self.providersChanged.emit()
+        verified = getattr(self.backend, "codex_verified", None)
+        if isinstance(verified, dict) and verified:
+            # What the last Codex call showed reaches the model list without a new provider check.
+            for provider in self._providers:
+                if provider.get("id") == "codex":
+                    provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))} for m in provider.get("models") or []]
+            self.providersChanged.emit()
         for entry in text_entries(payload):
-            self._say(entry["kind"], entry["text"], chat=status == "conversation")
+            self._say(entry.pop("kind"), entry.pop("text"), chat=status in ("conversation", "research"), **entry)
         self._clarification = {}
         if status == "structured":
             self._apply_run(payload.get("run"), intent)
@@ -321,6 +350,9 @@ class Bridge(QObject):
             self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
         elif status == "conversation":
             pass                                # General Chat: the reply is the whole result
+        elif status == "research":
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Web Research answered with %1 sources"),
+                        (len((intent or {}).get("sources") or []),)), "system")
         else:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Intent %1"), (status,)), "error" if status != "scheduled" else "system")
         self._task = task_status(None, intent) if status != "structured" else self._task
@@ -525,10 +557,11 @@ class Bridge(QObject):
             return True
         self._task = {}
         language = self.language           # the default reply language for General Chat
+        route = self._provider_route()
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
-                                             conversation=conversation),
+                                             conversation=conversation, **route),
             lambda payload: self._apply_text(payload, text),
         )
         return True
@@ -551,10 +584,11 @@ class Bridge(QObject):
         request_id = str(uuid4())
         self._request_id = request_id
         language = self.language
+        route = self._provider_route()
         self._run(
             "task",
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
-                                             response_language=language, conversation=conversation),
+                                             response_language=language, conversation=conversation, **route),
             lambda payload: self._apply_text(payload, label),
         )
 
@@ -663,7 +697,7 @@ class Bridge(QObject):
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
         self._decision = {}
         self._last_outcome = "idle"
-        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "New session: the next message starts a fresh session."))
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New session: the next message starts a fresh session."), ()), "system")
         self.approvalChanged.emit()
         self._refresh_core_state()
 
@@ -671,7 +705,7 @@ class Bridge(QObject):
     def useSession(self, session_id: str) -> None:
         if session_id and not self._busy:
             self._session_id, self._task, self._ticket, self._approval, self._decision = str(session_id), {}, None, {}, {}
-            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), session_id)
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), (session_id,)), "system")
             self.approvalChanged.emit()
             self._refresh_core_state()
 
@@ -749,8 +783,26 @@ class Bridge(QObject):
     def runSweep(self) -> None:
         if self._busy:
             return
-        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Running one scheduler sweep..."))
-        self._run("task", self.backend.scheduler_once, self._apply_run)
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Running one scheduler sweep..."), ()), "scheduled")
+        self._run("task", self.backend.scheduler_once, self._apply_manual_sweep)
+
+    def _apply_manual_sweep(self, payload: Any) -> None:
+        """The Automations button's sweep: what the scheduler did goes to the
+        live feed; only a failure to sweep reaches the conversation."""
+        if not isinstance(payload, dict):
+            self._apply_run(payload)
+            return
+        if payload.get("error") is not None:
+            for entry in error_entries(payload["error"]):
+                self._say(entry["kind"], entry["text"])
+        actions = [a for a in payload.get("actions") or [] if isinstance(a, dict)]
+        for action in actions[:10]:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduled job %1: %2"),
+                        (str(action.get("job_id") or ""), str(action.get("action") or ""))), "scheduled")
+        if not actions and payload.get("error") is None:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduler sweep: nothing started - JARVIS is frozen")
+                        if payload.get("claims_suspended") else QT_TRANSLATE_NOOP("Bridge", "Scheduler sweep: nothing was due"), ()), "scheduled")
+        self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
 
     @Slot()
     def sweepDueWork(self) -> None:
@@ -774,7 +826,127 @@ class Bridge(QObject):
         self._sweeping = False
         actions = payload.get("actions") if isinstance(payload, dict) else None
         if actions:
+            # What the scheduler really did, in the live feed: one line per action.
+            for action in actions[:10]:
+                if isinstance(action, dict):
+                    self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduled job %1: %2"),
+                                (str(action.get("job_id") or ""), str(action.get("action") or ""))), "scheduled")
             self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
+
+    # -- providers and usage -------------------------------------------------
+
+    @Property("QVariantList", notify=providersChanged)
+    def providers(self) -> list:
+        """The provider lines and their REAL route state (``Backend.providers``);
+        empty until the first local check has answered."""
+        return [dict(provider) for provider in self._providers]
+
+    @Slot()
+    def refreshProviders(self) -> None:
+        self._run("providers", self.backend.providers, self._set_providers)
+
+    def _set_providers(self, payload: Any) -> None:
+        self._providers = [p for p in payload if isinstance(p, dict)] if isinstance(payload, list) else []
+        for provider in self._providers:
+            if isinstance(provider.get("quota"), dict) and provider["quota"]:
+                provider["quota"] = {**provider["quota"], "seen_at": int(time.time())}
+        self.providersChanged.emit()
+
+    def _provider_route(self) -> dict:
+        """The chosen provider and ITS model / effort for the next call."""
+        chat = self.prefs.data["chat"]
+        if chat["provider"] == "codex":
+            return {"provider": "codex", "model": chat["codex_model"], "effort": chat["codex_effort"]}
+        return {"provider": "claude"}
+
+    @Property("QVariantMap", notify=dataChanged)
+    def chatUsage(self) -> dict:
+        """The last understanding / General Chat call's usage exactly as reported
+        (``reported``: the provider's own token fields and model; absent fields
+        were not reported) plus measured request / conversation / catalogue sizes."""
+        return dict(self._chat_usage)
+
+    @Property("QVariantMap", notify=providersChanged)
+    def claudeLimits(self) -> dict:
+        """Claude plan limits as Claude Code last REPORTED them on a real call
+        (``windows``: utilization 0-1 and reset time; ``seen_at``), or {}."""
+        return dict(self._claude_limits)
+
+    @Property("QVariantMap", notify=providersChanged)
+    def codexQuota(self) -> dict:
+        """Codex plan usage windows: from the newest of the provider check and
+        the last Codex call (``seen_at``), or {} when none was reported."""
+        probed = next((p.get("quota") for p in self._providers if p.get("id") == "codex" and p.get("quota")), None)
+        if probed and probed.get("seen_at", 0) >= self._codex_quota.get("seen_at", 0):
+            return dict(probed)
+        return dict(self._codex_quota)
+
+    # -- chat provider: who answers and interprets (never authority) ---------------
+
+    @Property(str, notify=prefsChanged)
+    def chatProvider(self) -> str:
+        return self.prefs.data["chat"]["provider"]
+
+    @Property(str, notify=prefsChanged)
+    def codexModel(self) -> str:
+        return self.prefs.data["chat"]["codex_model"]
+
+    @Property(str, notify=prefsChanged)
+    def codexEffort(self) -> str:
+        return self.prefs.data["chat"]["codex_effort"]
+
+    @Slot(str)
+    def setChatProvider(self, provider: str) -> None:
+        """Manual only; persisted. Each provider keeps its own model and effort."""
+        if provider in CHAT_PROVIDERS and provider != self.chatProvider:
+            self.prefs.data["chat"]["provider"] = provider
+            self.prefs.save()
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Chat provider: %1"), (provider,)), "system")
+            self.prefsChanged.emit()
+
+    @Slot(str, str)
+    def setCodexModel(self, model: str, effort: str) -> None:
+        chat = dict(self.prefs.data["chat"], codex_model=str(model), codex_effort=str(effort))
+        if validate_preferences({**self.prefs.data, "chat": chat})["chat"] == chat:
+            self.prefs.data["chat"] = chat
+            self.prefs.save()
+            self.prefsChanged.emit()
+
+    # -- permission mode: Core's own policy, projected and changed through Core ----
+
+    @Property(str, notify=stateChanged)
+    def permissionMode(self) -> str:
+        """The permission mode the stored configuration holds ("" before any read)."""
+        return str(self._config.get("permission_mode") or "") if not self._config_refused() else ""
+
+    @Slot(str, result=bool)
+    def setPermissionMode(self, mode: str) -> bool:
+        """Write ``permission_mode`` through the same config path the CLI uses;
+        Core reads it on the next action. True only when the store confirms it."""
+        if self._busy or mode not in ("strict", "smart_auto", "session") or mode == self.permissionMode:
+            return mode == self.permissionMode
+        self._apply_config(self.backend.set_config("permission_mode", mode))
+        confirmed = self.permissionMode == mode
+        if confirmed:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Permission mode: %1"), (mode,)), "system")
+        return confirmed
+
+    # -- conversation actions ----------------------------------------------------
+
+    @Slot(str)
+    def copyText(self, text: str) -> None:
+        """Copy exactly the visible plain text of one conversational message."""
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.clipboard().setText(str(text))
+
+    @Slot(str)
+    def quoteText(self, text: str) -> None:
+        """Offer one conversational message to the composer as a plain-text
+        quote. Quoting only puts words in the draft: it sends nothing and
+        carries no authority."""
+        # A text selection separates paragraphs with U+2029 / U+2028: plain newlines here.
+        lines = str(text).replace(" ", "\n").replace(" ", "\n").strip().splitlines() or [""]
+        self.quoteRequested.emit("\n".join("> " + line for line in lines))
 
     @Slot(str, bool)
     def refreshMemory(self, project_id: str, include_inactive: bool) -> None:
@@ -836,14 +1008,12 @@ class Bridge(QObject):
                           QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed: the request to freeze JARVIS was not confirmed. The store reports execution frozen."))
             self._tell("error", source)
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS state unconfirmed"), ()), "error")
+        # Lifecycle is not conversation: the live feed notes it and the attention
+        # strip / safety cards project the state itself. An UNCONFIRMED change
+        # above stays in the conversation - that is safety truth.
         elif not want and self._freeze_waiting:
-            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Freeze requested. Nothing new can start. The operation that is running now "
-                                                             "stops at its next safe point; a step already sent to its destination is not "
-                                                             "stopped or undone."))
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Freeze requested"), ()), "system")
         elif not want:
-            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen. Nothing new can start; JARVIS stays open. "
-                                                             "Resume JARVIS from the red control or the tray when ready."))
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"), ()), "system")
         self._refresh_core_state()
         return confirmed
@@ -860,9 +1030,8 @@ class Bridge(QObject):
         if not self._set_gate(True):
             return
         paused = task_outcome(self._task).get("kind") == "paused"
-        self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed. Continuing the paused task from where it stopped.")
-                   if paused else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed. Nothing else restarts by itself."))
-        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed"), ()), "system")
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - continuing the paused task")
+                    if paused else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed"), ()), "system")
         if paused and self._session_id:
             self.resumeTask(self._session_id, self._task["task_id"])
 
@@ -916,6 +1085,14 @@ class Bridge(QObject):
     @Slot()
     def noteHiddenToTray(self) -> None:
         self.hiddenToTray.emit()
+
+    @Slot(QObject)
+    def minimizeWindow(self, window: QObject) -> None:
+        """Minimize WITHOUT forgetting full screen / maximized. ``showMinimized``
+        replaces the window states, so a restore from the taskbar came back
+        windowed; adding the flag keeps them, exactly like the native minimize."""
+        if isinstance(window, QWindow):
+            window.setWindowStates(window.windowStates() | Qt.WindowState.WindowMinimized)
 
     @Property(str, notify=attentionChanged)
     def quitWarning(self) -> str:

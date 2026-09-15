@@ -394,9 +394,12 @@ Item {
             y: controls.mid - height / 2
             width: bar.selectorWidth; height: Theme.stripSelectorHeight
             open: bar.modelOpen
-            // Real state: the configured model, or the CLI's own default.
-            modelName: bridge.config.claude_model ? bridge.config.claude_model : qsTr("CLI default")
-            metadata: bar.selectorWidth >= 240 ? "ANTHROPIC  |  CLI" : "ANTHROPIC"
+            // Real state: the chosen provider's configured model (Claude: or the CLI's own default).
+            readonly property bool codex: bridge.chatProvider === "codex"
+            modelName: codex ? (bridge.codexModel || qsTr("No model chosen"))
+                       : bridge.config.claude_model ? bridge.config.claude_model : qsTr("CLI default")
+            metadata: codex ? "OPENAI  |  CODEX" + (bridge.codexEffort ? "  |  " + bridge.codexEffort.toUpperCase() : "")
+                      : bar.selectorWidth >= 240 ? "ANTHROPIC  |  CLI" : "ANTHROPIC"
                       + (bridge.config.claude_effort ? "  |  " + String(bridge.config.claude_effort).toUpperCase() : "")
             onActivated: bar.openModel()
         }

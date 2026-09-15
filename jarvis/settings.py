@@ -62,11 +62,14 @@ CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "max")
 #: whitespace, separators, quotes, slashes or control characters), and never
 #: exceed 64 characters. This is a SHAPE check, not a list of model
 #: releases; which names the installed CLI accepts stays the CLI's business.
-CLAUDE_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+#: One optional bracketed variant suffix of lowercase letters and digits
+#: (``opus[1m]``, the CLI's own spelling of a context variant) is allowed.
+CLAUDE_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\[[a-z0-9]{1,8}\])?\Z")
 
 _MODEL_GRAMMAR_MESSAGE = (
     "claude_model must be 1-64 characters of letters, digits, dot, "
-    "underscore or hyphen, starting with a letter or digit"
+    "underscore or hyphen, starting with a letter or digit, optionally "
+    "followed by one bracketed variant such as [1m]"
 )
 
 

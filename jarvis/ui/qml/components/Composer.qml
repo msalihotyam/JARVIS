@@ -34,18 +34,96 @@ Rectangle {
     readonly property alias inputHeight: input.implicitHeight
     // Clear the draft only when the application really accepted it.
     function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
+    // A quoted message goes into the draft as plain text, ready for a reply
+    // under it. Nothing is sent and nothing is authorized by quoting.
+    Connections {
+        target: bridge
+        function onQuoteRequested(quote) {
+            var draft = input.text.replace(/\s+$/, "")
+            input.text = (draft ? draft + "\n\n" : "") + quote + "\n\n"
+            input.cursorPosition = input.length
+            input.forceActiveFocus()
+        }
+    }
 
     // Material depth: a restrained upper-edge reflection; focus adds a fine
     // inner highlight and nothing larger.
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 26); radius: 9
         gradient: Gradient { GradientStop { position: 0; color: input.activeFocus ? Theme.glassInnerHighlight : Theme.glassReflection } GradientStop { position: 1; color: "transparent" } } }
 
+    // Permission mode: Core's own approval policy (``permission_mode``), shown
+    // and changed here. The label is what the stored configuration holds; a
+    // choice is written through the same config path the CLI uses and Core
+    // applies it on the next action. It never overrides an always-approval
+    // action, UNKNOWN_OUTCOME, the execution journal or Freeze.
+    readonly property var permissionModes: [
+        { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
+          detail: qsTr("Every action asks for your approval first, local file reads included.") },
+        { id: "smart_auto", short: qsTr("Smart"), name: qsTr("Smart approval"),
+          detail: qsTr("Low-risk, reversible actions (local file reads) run without asking. Everything else asks.") },
+        { id: "session", short: qsTr("Session"), name: qsTr("Session permission"),
+          detail: qsTr("As Smart approval; Core may also reuse an approval for this session where its rules allow. No current capability qualifies, so today it asks exactly like Smart approval.") }
+    ]
+    function modeInfo(id) { for (var i = 0; i < permissionModes.length; i++) if (permissionModes[i].id === id) return permissionModes[i]; return null }
+    Item {
+        id: permissionChip
+        objectName: "permissionModeControl"
+        anchors.left: parent.left; anchors.leftMargin: 8; anchors.bottom: parent.bottom; anchors.bottomMargin: 10
+        width: chipRow.width + 18; height: 32
+        readonly property var current: composer.modeInfo(bridge.permissionMode)
+        enabled: !bridge.busy && !bridge.configRefused
+        opacity: enabled ? 1 : 0.5
+        Accessible.role: Accessible.Button
+        Accessible.name: qsTr("Permission mode: %1").arg(current ? current.name : qsTr("Unknown"))
+        Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
+                    color: chipArea.containsMouse || modeMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+                    border.width: 1; border.color: modeMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
+        Row { id: chipRow; anchors.centerIn: parent; spacing: 6
+            Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter
+                        color: bridge.permissionMode === "strict" ? Theme.warning : Theme.accent }
+            Text { objectName: "permissionModeLabel"; text: permissionChip.current ? permissionChip.current.short : qsTr("Unknown")
+                   color: Theme.text; font: Qt.font({ family: Theme.font, pixelSize: 12, weight: Font.DemiBold }) } }
+        MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: modeMenu.visible ? modeMenu.close() : modeMenu.open() }
+        Popup {
+            id: modeMenu
+            objectName: "permissionModeMenu"
+            y: -height - 8; x: 0
+            width: 360; padding: 10
+            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong }
+            contentItem: Column {
+                spacing: 4
+                Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
+                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 1.6 }) }
+                Repeater {
+                    model: composer.permissionModes
+                    delegate: Rectangle {
+                        objectName: "permissionMode_" + modelData.id
+                        width: 340; height: modeText.height + 16; radius: 8
+                        readonly property bool selected: bridge.permissionMode === modelData.id
+                        color: selected ? Theme.alpha(Theme.accent, 0.16) : optionArea.containsMouse ? Theme.alpha(Theme.text, 0.06) : "transparent"
+                        border.width: selected ? 1 : 0; border.color: Theme.alpha(Theme.accent, 0.5)
+                        Column { id: modeText; x: 10; y: 8; width: parent.width - 20; spacing: 2
+                            Text { text: modelData.name + (parent.parent.selected ? "  ✓" : ""); color: Theme.text
+                                   font: Qt.font({ family: Theme.font, pixelSize: 13, weight: Font.DemiBold }) }
+                            Text { width: parent.width; wrapMode: Text.Wrap; text: modelData.detail; color: Theme.textMuted
+                                   font: Qt.font({ family: Theme.font, pixelSize: 12 }) } }
+                        MouseArea { id: optionArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: { bridge.setPermissionMode(modelData.id); modeMenu.close() } }
+                    }
+                }
+                Text { width: 340; wrapMode: Text.Wrap; color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                       text: qsTr("Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.") }
+            }
+        }
+    }
+
     // The draft: a wrapping text area inside a flickable, so past the maximum
     // height the text scrolls and the caret stays in view.
     Flickable {
         id: flick
-        anchors { left: parent.left; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
-                  leftMargin: 14; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
+        anchors { left: permissionChip.right; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
+                  leftMargin: 10; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         interactive: contentHeight > height + 1

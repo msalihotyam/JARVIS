@@ -245,12 +245,8 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>Bridge</name>
     <message>
-        <source>JARVIS frozen. The operation that was running has returned; nothing new can start.</source>
-        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision.</extracomment>
-        <translation>JARVIS donduruldu. Çalışmakta olan işlem geri döndü; yeni hiçbir iş başlayamaz.</translation>
-    </message>
-    <message>
         <source>JARVIS frozen</source>
+        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision.</extracomment>
         <translation>JARVIS donduruldu</translation>
     </message>
     <message>
@@ -268,6 +264,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Scheduled job %1</source>
         <translation>Zamanlanmış iş %1</translation>
+    </message>
+    <message>
+        <source>Web Research answered with %1 sources</source>
+        <translation>Web Araştırması %1 kaynakla yanıtladı</translation>
     </message>
     <message>
         <source>Intent %1</source>
@@ -350,6 +350,26 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bir zamanlayıcı taraması çalıştırılıyor...</translation>
     </message>
     <message>
+        <source>Scheduled job %1: %2</source>
+        <translation>Zamanlanmış iş %1: %2</translation>
+    </message>
+    <message>
+        <source>Scheduler sweep: nothing started - JARVIS is frozen</source>
+        <translation>Zamanlayıcı taraması: hiçbir şey başlamadı - JARVIS dondurulmuş</translation>
+    </message>
+    <message>
+        <source>Scheduler sweep: nothing was due</source>
+        <translation>Zamanlayıcı taraması: zamanı gelen iş yoktu</translation>
+    </message>
+    <message>
+        <source>Chat provider: %1</source>
+        <translation>Sohbet sağlayıcısı: %1</translation>
+    </message>
+    <message>
+        <source>Permission mode: %1</source>
+        <translation>İzin modu: %1</translation>
+    </message>
+    <message>
         <source>JARVIS state unconfirmed: the request to resume JARVIS was not confirmed. The store reports execution running.</source>
         <translation>JARVIS durumu doğrulanmadı: JARVIS&apos;i sürdürme isteği doğrulanmadı. Kayıt, yürütmeyi çalışıyor olarak bildiriyor.</translation>
     </message>
@@ -370,24 +390,12 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>JARVIS durumu doğrulanmadı</translation>
     </message>
     <message>
-        <source>Freeze requested. Nothing new can start. The operation that is running now stops at its next safe point; a step already sent to its destination is not stopped or undone.</source>
-        <translation>Dondurma istendi. Yeni hiçbir iş başlayamaz. Şu anda çalışan işlem bir sonraki güvenli noktada durur; hedefine gönderilmiş bir adım durdurulmaz veya geri alınmaz.</translation>
+        <source>JARVIS resumed - continuing the paused task</source>
+        <translation>JARVIS devam ettirildi - duraklatılan görev sürdürülüyor</translation>
     </message>
     <message>
         <source>Freeze requested</source>
         <translation>Dondurma istendi</translation>
-    </message>
-    <message>
-        <source>JARVIS frozen. Nothing new can start; JARVIS stays open. Resume JARVIS from the red control or the tray when ready.</source>
-        <translation>JARVIS donduruldu. Yeni hiçbir iş başlayamaz; JARVIS açık kalır. Hazır olduğunuzda JARVIS&apos;i kırmızı düğmeden ya da sistem tepsisinden sürdürün.</translation>
-    </message>
-    <message>
-        <source>JARVIS resumed. Continuing the paused task from where it stopped.</source>
-        <translation>JARVIS sürdürüldü. Duraklatılan görev kaldığı yerden devam ediyor.</translation>
-    </message>
-    <message>
-        <source>JARVIS resumed. Nothing else restarts by itself.</source>
-        <translation>JARVIS sürdürüldü. Başka hiçbir şey kendiliğinden yeniden başlamaz.</translation>
     </message>
     <message>
         <source>JARVIS resumed</source>
@@ -750,6 +758,58 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>Composer</name>
     <message>
+        <source>Ask</source>
+        <translation>Sor</translation>
+    </message>
+    <message>
+        <source>Ask every time</source>
+        <translation>Her seferinde onay iste</translation>
+    </message>
+    <message>
+        <source>Every action asks for your approval first, local file reads included.</source>
+        <translation>Yerel dosya okumaları dahil her eylem önce onayınızı ister.</translation>
+    </message>
+    <message>
+        <source>Smart</source>
+        <translation>Akıllı</translation>
+    </message>
+    <message>
+        <source>Smart approval</source>
+        <translation>Akıllı onay</translation>
+    </message>
+    <message>
+        <source>Low-risk, reversible actions (local file reads) run without asking. Everything else asks.</source>
+        <translation>Düşük riskli, geri alınabilir eylemler (yerel dosya okumaları) sormadan çalışır. Diğer her şey onay ister.</translation>
+    </message>
+    <message>
+        <source>Session</source>
+        <translation>Oturum</translation>
+    </message>
+    <message>
+        <source>Session permission</source>
+        <translation>Oturum izni</translation>
+    </message>
+    <message>
+        <source>As Smart approval; Core may also reuse an approval for this session where its rules allow. No current capability qualifies, so today it asks exactly like Smart approval.</source>
+        <translation>Akıllı onay gibidir; Core, kurallarının izin verdiği yerde bir onayı bu oturum boyunca yeniden kullanabilir. Şu an buna uyan bir yetkinlik yok, bu yüzden bugün tam olarak Akıllı onay gibi sorar.</translation>
+    </message>
+    <message>
+        <source>Permission mode: %1</source>
+        <translation>İzin modu: %1</translation>
+    </message>
+    <message>
+        <source>Unknown</source>
+        <translation>Bilinmiyor</translation>
+    </message>
+    <message>
+        <source>PERMISSION MODE</source>
+        <translation>İZİN MODU</translation>
+    </message>
+    <message>
+        <source>Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.</source>
+        <translation>E-posta, GitHub, tarayıcı, masaüstü, dosya yazma ve Claude analizi her modda her zaman onay ister. Dondurma ayrıdır ve her şeyi durdurur.</translation>
+    </message>
+    <message>
         <source>Answer the pending approval first</source>
         <translation>Önce bekleyen onayı yanıtlayın</translation>
     </message>
@@ -823,8 +883,36 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>GÜVENİLMEYEN VERİ</translation>
     </message>
     <message>
+        <source>NOTE</source>
+        <translation>NOT</translation>
+    </message>
+    <message>
         <source>SYSTEM</source>
         <translation>SİSTEM</translation>
+    </message>
+    <message>
+        <source>Sources</source>
+        <translation>Kaynaklar</translation>
+    </message>
+    <message>
+        <source>Search results (the answer names no specific page)</source>
+        <translation>Arama sonuçları (yanıt belirli bir sayfa belirtmiyor)</translation>
+    </message>
+    <message>
+        <source>Copy</source>
+        <translation>Kopyala</translation>
+    </message>
+    <message>
+        <source>Quote</source>
+        <translation>Alıntıla</translation>
+    </message>
+    <message>
+        <source>Quote selection</source>
+        <translation>Seçileni alıntıla</translation>
+    </message>
+    <message>
+        <source>Jump to latest message</source>
+        <translation>En son mesaja git</translation>
     </message>
 </context>
 <context>
@@ -1126,8 +1214,8 @@ değil</translation>
         <translation>MODEL VE SAĞLAYICI</translation>
     </message>
     <message>
-        <source>Claude Code CLI · subscription route</source>
-        <translation>Claude Code CLI · abonelik yolu</translation>
+        <source>Subscription route verified</source>
+        <translation>Abonelik yolu doğrulandı</translation>
     </message>
     <message>
         <source>MODEL</source>
@@ -1142,12 +1230,88 @@ değil</translation>
         <translation>Claude Code CLI ne seçerse</translation>
     </message>
     <message>
-        <source>ANTHROPIC  |  CONFIGURED HERE</source>
-        <translation>ANTHROPIC  |  BURADA YAPILANDIRILDI</translation>
+        <source>Checking…</source>
+        <translation>Denetleniyor…</translation>
     </message>
     <message>
-        <source>OTHER MODEL</source>
-        <translation>DİĞER MODEL</translation>
+        <source>ChatGPT subscription sign-in verified%1</source>
+        <translation>ChatGPT abonelik oturumu doğrulandı%1</translation>
+    </message>
+    <message>
+        <source>Not signed in - run: %1</source>
+        <translation>Oturum açılmamış - çalıştırın: %1</translation>
+    </message>
+    <message>
+        <source>Not signed in - run %1 and choose Sign in with Google</source>
+        <translation>Oturum açılmamış - %1 komutunu çalıştırıp Sign in with Google seçin</translation>
+    </message>
+    <message>
+        <source>CLI not installed</source>
+        <translation>CLI yüklü değil</translation>
+    </message>
+    <message>
+        <source>Set up with an API key (metered) - refused</source>
+        <translation>API anahtarıyla (kullanım başına ücretli) kurulmuş - reddedildi</translation>
+    </message>
+    <message>
+        <source>Planned after V1</source>
+        <translation>V1 sonrasına planlandı</translation>
+    </message>
+    <message>
+        <source>Route not established - calls are refused</source>
+        <translation>Yol doğrulanamadı - çağrılar reddediliyor</translation>
+    </message>
+    <message>
+        <source>Status unavailable - chat unavailable for safety</source>
+        <translation>Durum okunamadı - sohbet güvenlik nedeniyle kapalı</translation>
+    </message>
+    <message>
+        <source>Connected - chat unavailable for safety</source>
+        <translation>Bağlı - sohbet güvenlik nedeniyle kapalı</translation>
+    </message>
+    <message>
+        <source>PROVIDER</source>
+        <translation>SAĞLAYICI</translation>
+    </message>
+    <message>
+        <source>Checking the providers…</source>
+        <translation>Sağlayıcılar denetleniyor…</translation>
+    </message>
+    <message>
+        <source>The provider answers and interprets requests; it never changes what JARVIS may do. Manual choice, no automatic fallback.</source>
+        <translation>Sağlayıcı istekleri yanıtlar ve yorumlar; JARVIS&apos;in neler yapabileceğini asla değiştirmez. Seçim elle yapılır, otomatik geçiş yoktur.</translation>
+    </message>
+    <message>
+        <source>ANTIGRAVITY QUOTA (READ-ONLY)</source>
+        <translation>ANTIGRAVITY KOTASI (SALT OKUNUR)</translation>
+    </message>
+    <message>
+        <source>%1 %2% remaining · resets %3</source>
+        <translation>%1 %%2 kaldı · sıfırlanma %3</translation>
+    </message>
+    <message>
+        <source>weekly</source>
+        <translation>haftalık</translation>
+    </message>
+    <message>
+        <source>5-hour</source>
+        <translation>5 saatlik</translation>
+    </message>
+    <message>
+        <source>Currently %1</source>
+        <translation>Şu an %1</translation>
+    </message>
+    <message>
+        <source>The CLI did not list its models; enter one below.</source>
+        <translation>CLI modellerini listelemedi; aşağıya bir model girin.</translation>
+    </message>
+    <message>
+        <source>Other model (as the CLI names it)</source>
+        <translation>Başka model (CLI&apos;nin adlandırdığı şekilde)</translation>
+    </message>
+    <message>
+        <source>e.g. claude-sonnet-5</source>
+        <translation>ör. claude-sonnet-5</translation>
     </message>
     <message>
         <source>EFFORT</source>
@@ -1158,12 +1322,152 @@ değil</translation>
         <translation>Varsayılan</translation>
     </message>
     <message>
+        <source>This model does not support an effort setting.</source>
+        <translation>Bu model efor ayarını desteklemiyor.</translation>
+    </message>
+    <message>
         <source>Apply model / effort</source>
         <translation>Modeli / eforu uygula</translation>
     </message>
     <message>
         <source>Validated configuration</source>
         <translation>Doğrulanmış yapılandırma</translation>
+    </message>
+    <message>
+        <source>USAGE / QUOTA</source>
+        <translation>KULLANIM / KOTA</translation>
+    </message>
+    <message>
+        <source>Configured model: %1 · effort: %2</source>
+        <translation>Yapılandırılan model: %1 · efor: %2</translation>
+    </message>
+    <message>
+        <source>Answered the last call: %1</source>
+        <translation>Son çağrıyı yanıtlayan: %1</translation>
+    </message>
+    <message>
+        <source>Answered the last call: no Claude call yet</source>
+        <translation>Son çağrıyı yanıtlayan: henüz Claude çağrısı yok</translation>
+    </message>
+    <message>
+        <source>%1: %2% used · resets %3</source>
+        <translation>%1: %%2 kullanıldı · sıfırlanma %3</translation>
+    </message>
+    <message>
+        <source>Current session (5 h)</source>
+        <translation>Geçerli oturum (5 sa)</translation>
+    </message>
+    <message>
+        <source>Current week (all models)</source>
+        <translation>Bu hafta (tüm modeller)</translation>
+    </message>
+    <message>
+        <source>Current week (Opus)</source>
+        <translation>Bu hafta (Opus)</translation>
+    </message>
+    <message>
+        <source>Current week (Sonnet)</source>
+        <translation>Bu hafta (Sonnet)</translation>
+    </message>
+    <message>
+        <source>Plan limits: shown after the first Claude call - Claude Code reports them with each answer, and JARVIS makes no call just to check.</source>
+        <translation>Plan limitleri: ilk Claude çağrısından sonra gösterilir - Claude Code bunları her yanıtla bildirir; JARVIS yalnızca kontrol için çağrı yapmaz.</translation>
+    </message>
+    <message>
+        <source>As reported by Claude Code at %1 · extra paid usage: %2</source>
+        <translation>Claude Code&apos;un %1 itibarıyla bildirdiği · ek ücretli kullanım: %2</translation>
+    </message>
+    <message>
+        <source>IN USE</source>
+        <translation>KULLANIMDA</translation>
+    </message>
+    <message>
+        <source>off</source>
+        <translation>kapalı</translation>
+    </message>
+    <message>
+        <source>not reported</source>
+        <translation>bildirilmedi</translation>
+    </message>
+    <message>
+        <source>Last call tokens: %1 input · %2 cache read · %3 cache write · %4 output</source>
+        <translation>Son çağrı token: %1 girdi · %2 önbellek okuma · %3 önbellek yazma · %4 çıktı</translation>
+    </message>
+    <message>
+        <source>Web Research: available on this provider (read-only public web search).</source>
+        <translation>Web Araştırması: bu sağlayıcıda kullanılabilir (salt okunur genel web araması).</translation>
+    </message>
+    <message>
+        <source>Answered this session</source>
+        <translation>Bu oturumda yanıt verdi</translation>
+    </message>
+    <message>
+        <source>Failed this session: %1</source>
+        <translation>Bu oturumda başarısız: %1</translation>
+    </message>
+    <message>
+        <source>Efforts: %1</source>
+        <translation>Efor seviyeleri: %1</translation>
+    </message>
+    <message>
+        <source>Listed by Codex - not tried yet</source>
+        <translation>Codex listeliyor - henüz denenmedi</translation>
+    </message>
+    <message>
+        <source>Codex listed no model that JARVIS can run with every tool disabled.</source>
+        <translation>Codex, JARVIS&apos;in tüm araçlar kapalıyken çalıştırabileceği bir model listelemedi.</translation>
+    </message>
+    <message>
+        <source>The saved model %1 is not offered now; calls are refused until you choose one.</source>
+        <translation>Kayıtlı model %1 şu an sunulmuyor; bir model seçene kadar çağrılar reddedilir.</translation>
+    </message>
+    <message>
+        <source>none</source>
+        <translation>yok</translation>
+    </message>
+    <message>
+        <source>model default</source>
+        <translation>model varsayılanı</translation>
+    </message>
+    <message>
+        <source>Answering model: Codex does not report it - the call requests %1</source>
+        <translation>Yanıtlayan model: Codex bunu bildirmiyor - çağrı %1 modelini istiyor</translation>
+    </message>
+    <message>
+        <source>5-hour window</source>
+        <translation>5 saatlik pencere</translation>
+    </message>
+    <message>
+        <source>Weekly window</source>
+        <translation>Haftalık pencere</translation>
+    </message>
+    <message>
+        <source>%1-minute window</source>
+        <translation>%1 dakikalık pencere</translation>
+    </message>
+    <message>
+        <source>Plan limits: not reported yet.</source>
+        <translation>Plan limitleri: henüz bildirilmedi.</translation>
+    </message>
+    <message>
+        <source>As reported by Codex at %1 · purchased credits: %2</source>
+        <translation>Codex&apos;in %1 itibarıyla bildirdiği · satın alınmış kredi: %2</translation>
+    </message>
+    <message>
+        <source>present</source>
+        <translation>var</translation>
+    </message>
+    <message>
+        <source>Last call tokens: %1 input · %2 cached · %3 output · %4 reasoning</source>
+        <translation>Son çağrı token: %1 girdi · %2 önbellekten · %3 çıktı · %4 akıl yürütme</translation>
+    </message>
+    <message>
+        <source>Web Research: not available with Codex in this build - research questions are refused, never sent to another provider.</source>
+        <translation>Web Araştırması: bu sürümde Codex ile kullanılamaz - araştırma soruları reddedilir, asla başka bir sağlayıcıya gönderilmez.</translation>
+    </message>
+    <message>
+        <source>Last call: no usage reported yet</source>
+        <translation>Son çağrı: henüz kullanım bildirilmedi</translation>
     </message>
 </context>
 <context>
@@ -1411,6 +1715,10 @@ değil</translation>
         <translation>Donduruldu</translation>
     </message>
     <message>
+        <source>No model chosen</source>
+        <translation>Model seçilmedi</translation>
+    </message>
+    <message>
         <source>CLI default</source>
         <translation>CLI varsayılanı</translation>
     </message>
@@ -1590,9 +1898,29 @@ değil</translation>
         <translation>GEÇERSİZ İSTEK: %1</translation>
     </message>
     <message>
+        <source>Web Research unavailable: %1</source>
+        <translation>Web Araştırması kullanılamıyor: %1</translation>
+    </message>
+    <message>
+        <source>Web Research failed: %1</source>
+        <translation>Web Araştırması başarısız: %1</translation>
+    </message>
+    <message>
         <source>Claude Code CLI is not logged in. Run `claude auth login` in a normal PowerShell, complete the Claude subscription login, then restart JARVIS.</source>
-        <extracomment>JARVIS&apos;s own explanation of an ESTABLISHED failure cause, keyed by the stable reason code the envelope carries. Shown instead of the provider&apos;s generic diagnostic; every other failure keeps its truthful generic text. The key is ``jarvis.intent.CLAUDE_NOT_LOGGED_IN``; this module imports nothing.</extracomment>
+        <extracomment>Verdicts that are an expected limitation, not a failure: nothing executed and nothing went wrong, so they read as a light notice rather than an error card. JARVIS&apos;s own explanation of an ESTABLISHED failure cause, keyed by the stable reason code the envelope carries. Shown instead of the provider&apos;s generic diagnostic; every other failure keeps its truthful generic text. The key is ``jarvis.intent.CLAUDE_NOT_LOGGED_IN``; this module imports nothing.</extracomment>
         <translation>Claude Code CLI oturumu açık değil. Normal PowerShell&apos;de `claude auth login` komutunu çalıştırın, Claude abonelik girişini tamamlayın ve ardından JARVIS&apos;i yeniden başlatın.</translation>
+    </message>
+    <message>
+        <source>Web Research is not available with the selected chat provider. It runs on the Claude subscription route; choose Claude in the model panel to research this. Nothing was searched.</source>
+        <translation>Web Araştırması seçili sohbet sağlayıcısıyla kullanılamaz. Claude abonelik yolu üzerinden çalışır; bunu araştırmak için model panelinde Claude&apos;u seçin. Hiçbir arama yapılmadı.</translation>
+    </message>
+    <message>
+        <source>Codex CLI is not signed in with ChatGPT. Run `codex login` in a normal PowerShell and choose Sign in with ChatGPT. Nothing was sent.</source>
+        <translation>Codex CLI&apos;de ChatGPT ile oturum açılmamış. Normal bir PowerShell&apos;de `codex login` çalıştırıp Sign in with ChatGPT seçin. Hiçbir şey gönderilmedi.</translation>
+    </message>
+    <message>
+        <source>Codex is set up with an API key, which would be billed per use. JARVIS uses only the ChatGPT subscription sign-in, so nothing was sent.</source>
+        <translation>Codex, kullanım başına ücretlendirilecek bir API anahtarıyla kurulmuş. JARVIS yalnızca ChatGPT abonelik oturumunu kullanır; bu yüzden hiçbir şey gönderilmedi.</translation>
     </message>
     <message>
         <source>No current JARVIS browser tab is available for this site. Open the site in a new JARVIS tab first.</source>
@@ -1610,6 +1938,7 @@ Date: %3
 Subject: %4
 
 %5</source>
+        <extracomment>Invisible characters marketing mail pads snippets with. Only these: joiners that carry meaning (ZWJ in emoji sequences, ZWNJ in some scripts) are kept.</extracomment>
         <translation>Kimden: %1
 Kime: %2
 Tarih: %3
@@ -1684,24 +2013,8 @@ Tekrar denemeden önce görevi Geçmiş&apos;te kontrol edin.</translation>
 %3</translation>
     </message>
     <message>
-        <source>%1: %2 - task %3 %4/%5 via %6</source>
-        <translation>%1: %2 - görev %3 %4/%5, %6 üzerinden</translation>
-    </message>
-    <message>
         <source>Open issue: %1</source>
         <translation>Açık konu: %1</translation>
-    </message>
-    <message>
-        <source>APPROVAL REQUIRED - review the authorization card.</source>
-        <translation>ONAY GEREKLİ - yetkilendirme kartını inceleyin.</translation>
-    </message>
-    <message>
-        <source>Understood as %1 -&gt; %2: %3</source>
-        <translation>%1 -&gt; %2 olarak anlaşıldı: %3</translation>
-    </message>
-    <message>
-        <source>Understood as %1 -&gt; %2</source>
-        <translation>%1 -&gt; %2 olarak anlaşıldı</translation>
     </message>
     <message>
         <source>never</source>
@@ -2683,6 +2996,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Outcome</source>
         <translation>Sonuç</translation>
+    </message>
+    <message>
+        <source>No model chosen</source>
+        <translation>Model seçilmedi</translation>
     </message>
     <message>
         <source>CLI default</source>

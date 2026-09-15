@@ -1,118 +1,263 @@
 import QtQuick
-import QtQuick.Shapes
 import QtQuick.Controls.Basic
 import "../theme"
 import "../components"
 
-// The selector's open state, in the same Option 5 "Command" language as the
-// closed trigger: premium dark glass, compact rows with the provider mark,
-// the model name, the metadata the installation actually knows, and a
-// restrained check on the active row.
-//
-// The rows are the choices that genuinely exist here: the CLI's own default
-// and whatever model this installation is configured with. Claude Code
-// takes a free-form model string, so anything else is entered directly -
-// the panel never invents a catalogue, a context length or a price, and it
-// still routes every change through the one authoritative applyModel call.
+// Provider -> Model -> Effort -> Usage / Quota, from what each provider's own
+// local tooling REPORTED (bridge.providers, no model call) and what the last
+// real call reported. Nothing is estimated and nothing is offered that the
+// route check did not establish. The choice is manual and persisted; there is
+// no automatic fallback, and a provider changes who answers and interprets a
+// request - never what JARVIS may do.
 ContextPanel {
     id: modelPanel
     heading: qsTr("MODEL & PROVIDER")
     surfaceName: "modelSurface"
-    panelWidth: 430; panelHeight: 476
-    onOpenChanged: if (open) { modelField.text = bridge.config.claude_model || ""; effortPick.value = bridge.config.claude_effort || "" }
-    QtObject { id: effortPick; property string value: "" }
-    readonly property string current: bridge.config.claude_model || ""
+    panelWidth: 460; panelHeight: 720
+    onOpenChanged: if (open) { claudeDraft.model = bridge.config.claude_model || ""; claudeDraft.effort = bridge.config.claude_effort || ""
+                               modelField.text = ""; bridge.refreshProviders() }
 
-    Column {
-        width: parent.width; spacing: 14
-
-        // -- the provider, as one instrument row ---------------------------
-        Row { spacing: 13
-            Rectangle {
-                width: 38; height: 38; radius: 10
-                color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.34)
-                Text { anchors.centerIn: parent; anchors.horizontalCenterOffset: -1; text: "A\\"; color: Theme.text
-                       font { family: Theme.font; pixelSize: 19; weight: Font.DemiBold; letterSpacing: -1 } }
-            }
-            Column { spacing: 3
-                Text { text: "Anthropic"; color: Theme.text; font { family: Theme.font; pixelSize: 17; weight: Font.DemiBold } }
-                Text { text: qsTr("Claude Code CLI · subscription route"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
-            }
+    function provider(id) { return (bridge.providers || []).filter(function(p) { return p.id === id })[0] || null }
+    readonly property var claude: provider("claude")
+    readonly property var codex: provider("codex")
+    readonly property string chosen: bridge.chatProvider
+    readonly property var usage: bridge.chatUsage || ({})
+    readonly property var reported: usage.reported || ({})
+    function tokens(value) { return value === undefined ? "—" : Number(value).toLocaleString(Qt.locale(i18n.qtLocale), "f", 0) }
+    function when(epoch) { return new Date(epoch * 1000).toLocaleString(Qt.locale(i18n.qtLocale), Locale.ShortFormat) }
+    function percent(fraction) { return Math.round(fraction * 100) }
+    function statusText(p) {
+        if (!p) return qsTr("Checking…")
+        switch (p.status) {
+        case "available": return p.id === "codex" ? qsTr("ChatGPT subscription sign-in verified%1").arg(p.plan ? " · " + p.plan : "")
+                                                  : qsTr("Subscription route verified")
+        case "not_logged_in": return p.id === "claude" ? qsTr("Not signed in - run: %1").arg("claude auth login")
+                               : p.id === "codex" ? qsTr("Not signed in - run: %1").arg("codex login")
+                               : qsTr("Not signed in - run %1 and choose Sign in with Google").arg("gemini")
+        case "not_installed": return qsTr("CLI not installed")
+        case "unavailable": if (p.id === "google") return qsTr("Status unavailable - chat unavailable for safety")
+                            return qsTr("Route not established - calls are refused")
+        case "api_key_route": return qsTr("Set up with an API key (metered) - refused")
+        case "chat_unavailable": return qsTr("Connected - chat unavailable for safety")
+        case "deferred": return qsTr("Planned after V1")
+        default: return qsTr("Route not established - calls are refused")
         }
-        Rectangle { width: parent.width; height: 1; color: Theme.border }
+    }
+    readonly property var claudeModels: claude ? claude.models || [] : []
+    function claudeEntry(id) { return claudeModels.filter(function(m) { return m.id === (id || "default") })[0] || null }
+    // Claude's choice is operator configuration: drafted here, applied through applyModel.
+    QtObject { id: claudeDraft; property string model: ""; property string effort: "" }
 
-        Text { text: qsTr("MODEL"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+    component Caption: Text { color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+    component Line: Text { width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textLabel; font { family: Theme.font; pixelSize: 12 } }
+    component Choice: Rectangle {
+        id: choice
+        property string title: ""
+        property string meta: ""
+        property bool selected: false
+        property bool selectable: true
+        signal chosen()
+        width: parent ? parent.width : 0; height: 44; radius: Theme.radiusSmall
+        opacity: selectable ? 1 : 0.55
+        color: area.containsMouse && selectable ? Theme.alpha(Theme.commandEdge, 0.08) : selected ? Theme.alpha(Theme.commandEdge, 0.05) : "transparent"
+        border.width: 1
+        border.color: selected ? Theme.alpha(Theme.commandEdge, 0.42) : Theme.alpha(Theme.text, 0.05)
+        Column { x: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 44; spacing: 1
+            Text { width: parent.width; elide: Text.ElideRight; text: choice.title; color: choice.selected ? Theme.commandEdge : Theme.text
+                   font { family: Theme.font; pixelSize: 14 } }
+            Text { width: parent.width; elide: Text.ElideRight; text: choice.meta; color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } } }
+        Text { visible: choice.selected; anchors.verticalCenter: parent.verticalCenter; x: parent.width - 24; text: "✓"; color: Theme.commandEdge
+               font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold } }
+        MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; enabled: choice.selectable
+                    cursorShape: Qt.PointingHandCursor; onClicked: choice.chosen() }
+    }
 
-        // -- the real rows --------------------------------------------------
+    Flickable {
+        anchors.fill: parent
+        contentHeight: col.height + 8
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; width: 6 }
         Column {
-            width: parent.width; spacing: 4
+            id: col
+            width: parent.width - 10; spacing: 10
+
+            Caption { text: qsTr("PROVIDER") }
             Repeater {
-                model: modelPanel.current ? [{ value: "", label: qsTr("CLI default"), meta: qsTr("Whatever the Claude Code CLI selects") },
-                                             { value: modelPanel.current, label: modelPanel.current, meta: qsTr("ANTHROPIC  |  CONFIGURED HERE") }]
-                                          : [{ value: "", label: qsTr("CLI default"), meta: qsTr("Whatever the Claude Code CLI selects") }]
-                Rectangle {
-                    width: parent.width; height: 46; radius: Theme.radiusSmall
-                    readonly property bool selected: modelData.value === modelPanel.current
-                    color: rowArea.containsMouse ? Theme.alpha(Theme.commandEdge, 0.08)
-                                                 : selected ? Theme.alpha(Theme.commandEdge, 0.05) : "transparent"
-                    border.width: 1
-                    border.color: selected ? Theme.alpha(Theme.commandEdge, 0.42)
-                                           : rowArea.containsMouse ? Theme.alpha(Theme.commandEdge, 0.22) : Theme.alpha(Theme.text, 0.05)
-                    Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-                    Rectangle {
-                        x: 8; anchors.verticalCenter: parent.verticalCenter
-                        width: 28; height: 28; radius: 8
-                        color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.28)
-                        Text { anchors.centerIn: parent; anchors.horizontalCenterOffset: -1; text: "A\\"; color: Theme.textLabel
-                               font { family: Theme.font; pixelSize: 14; weight: Font.DemiBold; letterSpacing: -1 } }
-                    }
-                    Column {
-                        x: 46; anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width - 46 - 34; spacing: 1
-                        Text { width: parent.width; elide: Text.ElideRight; text: modelData.label
-                               color: parent.parent.selected ? Theme.commandEdge : Theme.text
-                               font { family: Theme.font; pixelSize: 15 } }
-                        Text { width: parent.width; elide: Text.ElideRight; text: modelData.meta
-                               color: Theme.textDim; font { family: Theme.font; pixelSize: 11; letterSpacing: 1.2 } }
-                    }
-                    // The selected-state marker: one drawn check, no badge.
-                    Shape {
-                        visible: parent.selected
-                        anchors.verticalCenter: parent.verticalCenter
-                        x: parent.width - 28; width: 14; height: 11
-                        preferredRendererType: Shape.CurveRenderer
-                        ShapePath { strokeColor: Theme.commandEdge; strokeWidth: 1.8; fillColor: "transparent"
-                            capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
-                            startX: 0.9; startY: 5.5
-                            PathLine { x: 5; y: 9.8 }
-                            PathLine { x: 13.1; y: 1 }
-                        }
-                    }
-                    MouseArea {
-                        id: rowArea
-                        objectName: modelData.value === "" ? "modelRowDefault" : "modelRowCurrent"
-                        anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                        onClicked: bridge.applyModel(modelData.value, effortPick.value)
+                model: bridge.providers || []
+                Choice {
+                    objectName: "providerRow_" + modelData.id
+                    title: modelData.name + "  ·  " + modelData.vendor
+                    meta: modelPanel.statusText(modelData)
+                    selectable: (modelData.id === "claude" || modelData.id === "codex") && modelData.status === "available"
+                    selected: modelData.id === modelPanel.chosen
+                    onChosen: {
+                        bridge.setChatProvider(modelData.id)
+                        if (modelData.id === "codex" && !bridge.codexModel && (modelData.models || []).length > 0)
+                            bridge.setCodexModel(modelData.models[0].id, modelData.models[0].default_effort || "")
                     }
                 }
             }
-        }
+            Text { visible: (bridge.providers || []).length === 0; text: qsTr("Checking the providers…"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+            Line { objectName: "providerAuthorityNote"; color: Theme.textDim
+                   text: qsTr("The provider answers and interprets requests; it never changes what JARVIS may do. Manual choice, no automatic fallback.") }
+            // Google / Antigravity: read-only quota, each pool exactly as the CLI reported it.
+            Column {
+                readonly property var google: modelPanel.provider("google")
+                readonly property var groups: google && google.quota ? google.quota.groups || [] : []
+                visible: groups.length > 0
+                width: parent.width; spacing: 3
+                Caption { text: qsTr("ANTIGRAVITY QUOTA (READ-ONLY)") }
+                Repeater {
+                    model: parent.groups
+                    Line { objectName: "googleQuota_" + index
+                           text: modelData.name + ": " + modelData.buckets.map(function(b) {
+                                     return qsTr("%1 %2% remaining · resets %3")
+                                         .arg(b.window === "weekly" ? qsTr("weekly") : qsTr("5-hour"))
+                                         .arg(Math.round(b.remaining_fraction * 100))
+                                         .arg(new Date(b.reset_time).toLocaleString(Qt.locale(i18n.qtLocale), Locale.ShortFormat)) }).join("  ·  ") }
+                }
+            }
+            Rectangle { width: parent.width; height: 1; color: Theme.border }
 
-        Text { text: qsTr("OTHER MODEL"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
-        TextField {
-            id: modelField; objectName: "modelField"
-            width: parent.width; height: 38; leftPadding: 12; rightPadding: 12
-            placeholderText: qsTr("CLI default"); placeholderTextColor: Theme.textDim; color: Theme.text
-            selectByMouse: true; font { family: Theme.font; pixelSize: 14 }
-            background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
-                                    border.color: modelField.activeFocus ? Theme.commandEdge : Theme.border }
-        }
-        Text { text: qsTr("EFFORT"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
-        Segmented { value: effortPick.value; onPicked: function(v) { effortPick.value = v }; options: [{value:"",label:qsTr("Default")}].concat(bridge.effortChoices.map(function(e) { return {value:e,label:e} })) }
-        Row { spacing: 12
-            ActionButton { objectName: "applyModelButton"; label: qsTr("Apply model / effort"); primary: true; onClicked: bridge.applyModel(modelField.text, effortPick.value) }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Validated configuration"); color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
+            // -- Claude ---------------------------------------------------------
+            Column {
+                visible: modelPanel.chosen === "claude"
+                width: parent.width; spacing: 8
+                Caption { text: qsTr("MODEL") }
+                Choice {
+                    objectName: "modelRowDefault"
+                    title: qsTr("CLI default")
+                    meta: modelPanel.claudeEntry("") && modelPanel.claudeEntry("").resolved ? qsTr("Currently %1").arg(modelPanel.claudeEntry("").resolved) : qsTr("Whatever the Claude Code CLI selects")
+                    selected: claudeDraft.model === ""
+                    onChosen: { modelField.text = ""; claudeDraft.model = "" }
+                }
+                Repeater {
+                    model: modelPanel.claudeModels.filter(function(m) { return m.id !== "default" })
+                    Choice {
+                        objectName: "claudeModel_" + modelData.id
+                        title: modelData.name + "  ·  " + modelData.id
+                        meta: modelData.resolved || modelData.description
+                        selected: claudeDraft.model === modelData.id
+                        onChosen: { modelField.text = ""; claudeDraft.model = modelData.id; if (claudeDraft.effort && modelData.efforts.indexOf(claudeDraft.effort) < 0) claudeDraft.effort = "" }
+                    }
+                }
+                Line { visible: modelPanel.claude && modelPanel.claude.status === "available" && modelPanel.claudeModels.length === 0
+                       text: qsTr("The CLI did not list its models; enter one below.") }
+                Text { text: qsTr("Other model (as the CLI names it)"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
+                TextField {
+                    id: modelField; objectName: "modelField"
+                    width: parent.width; height: 36; leftPadding: 12; rightPadding: 12
+                    placeholderText: claudeDraft.model && !modelPanel.claudeEntry(claudeDraft.model) ? claudeDraft.model : qsTr("e.g. claude-sonnet-5")
+                    placeholderTextColor: Theme.textDim; color: Theme.text
+                    selectByMouse: true; font { family: Theme.font; pixelSize: 13 }
+                    // Any entered text is the draft (typed or pasted); the panel's own reset to "" is not.
+                    onTextChanged: if (text.trim() || activeFocus) claudeDraft.model = text.trim()
+                    background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1; border.color: modelField.activeFocus ? Theme.commandEdge : Theme.border }
+                }
+                Caption { text: qsTr("EFFORT") }
+                Segmented {
+                    objectName: "claudeEffort"
+                    readonly property var entry: modelPanel.claudeEntry(claudeDraft.model)
+                    readonly property var levels: entry ? entry.efforts : bridge.effortChoices
+                    enabled: levels.length > 0
+                    value: claudeDraft.effort
+                    onPicked: function(v) { claudeDraft.effort = v }
+                    options: [{ value: "", label: qsTr("Default") }].concat(levels.map(function(e) { return { value: e, label: e } }))
+                }
+                Line { visible: !!modelPanel.claudeEntry(claudeDraft.model) && modelPanel.claudeEntry(claudeDraft.model).efforts.length === 0
+                       text: qsTr("This model does not support an effort setting.") }
+                Row { spacing: 12
+                    ActionButton { objectName: "applyModelButton"; label: qsTr("Apply model / effort"); primary: true
+                                   onClicked: bridge.applyModel(claudeDraft.model, claudeDraft.effort) }
+                    Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Validated configuration"); color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } } }
+                Rectangle { width: parent.width; height: 1; color: Theme.border }
+                Caption { text: qsTr("USAGE / QUOTA") }
+                Line { objectName: "configuredModelLine"
+                       text: qsTr("Configured model: %1 · effort: %2").arg(bridge.config.claude_model || qsTr("CLI default")).arg(bridge.config.claude_effort || qsTr("Default")) }
+                Line { objectName: "actualModelLine"
+                       text: modelPanel.usage.provider === "anthropic" && modelPanel.reported.model ? qsTr("Answered the last call: %1").arg(modelPanel.reported.model)
+                             : qsTr("Answered the last call: no Claude call yet") }
+                Repeater {
+                    model: Object.keys((bridge.claudeLimits || {}).windows || {})
+                    Line { objectName: "claudeLimit_" + modelData
+                           readonly property var w: bridge.claudeLimits.windows[modelData]
+                           text: qsTr("%1: %2% used · resets %3").arg(modelData === "five_hour" ? qsTr("Current session (5 h)")
+                                                                     : modelData === "seven_day" ? qsTr("Current week (all models)")
+                                                                     : modelData === "seven_day_opus" ? qsTr("Current week (Opus)")
+                                                                     : modelData === "seven_day_sonnet" ? qsTr("Current week (Sonnet)") : modelData)
+                                 .arg(modelPanel.percent(w.utilization)).arg(modelPanel.when(w.resets_at)) }
+                }
+                Line { objectName: "quotaLine"
+                       text: Object.keys(bridge.claudeLimits || {}).length === 0
+                             ? qsTr("Plan limits: shown after the first Claude call - Claude Code reports them with each answer, and JARVIS makes no call just to check.")
+                             : qsTr("As reported by Claude Code at %1 · extra paid usage: %2").arg(modelPanel.when(bridge.claudeLimits.seen_at))
+                                   .arg(bridge.claudeLimits.using_overage === true ? qsTr("IN USE") : bridge.claudeLimits.overage_status === "rejected" ? qsTr("off") : qsTr("not reported")) }
+                Line { objectName: "usageLine"
+                       text: modelPanel.usage.provider !== "anthropic" || Object.keys(modelPanel.reported).length === 0 ? qsTr("Last call: no usage reported yet")
+                             : qsTr("Last call tokens: %1 input · %2 cache read · %3 cache write · %4 output")
+                                 .arg(modelPanel.tokens(modelPanel.reported.input_tokens))
+                                 .arg(modelPanel.tokens(modelPanel.reported.cache_read_input_tokens))
+                                 .arg(modelPanel.tokens(modelPanel.reported.cache_creation_input_tokens))
+                                 .arg(modelPanel.tokens(modelPanel.reported.output_tokens)) }
+                Line { text: qsTr("Web Research: available on this provider (read-only public web search).") }
+            }
+
+            // -- Codex ----------------------------------------------------------
+            Column {
+                visible: modelPanel.chosen === "codex"
+                width: parent.width; spacing: 8
+                readonly property var models: modelPanel.codex ? modelPanel.codex.models || [] : []
+                readonly property var current: models.filter(function(m) { return m.id === bridge.codexModel })[0] || null
+                Caption { text: qsTr("MODEL") }
+                Repeater {
+                    model: parent.models
+                    Choice {
+                        objectName: "codexModel_" + modelData.id
+                        title: modelData.name + "  ·  " + modelData.id
+                        // Listed by Codex is not proof it works: say what a real call showed.
+                        readonly property var verified: modelData.verified || ({})
+                        meta: (verified.state === "usable" ? qsTr("Answered this session")
+                               : verified.state === "failed" ? qsTr("Failed this session: %1").arg(verified.reason)
+                               : qsTr("Listed by Codex - not tried yet")) + "  ·  " + qsTr("Efforts: %1").arg(modelData.efforts.join(", "))
+                        selected: bridge.codexModel === modelData.id
+                        onChosen: bridge.setCodexModel(modelData.id, modelData.efforts.indexOf(bridge.codexEffort) >= 0 ? bridge.codexEffort : modelData.default_effort)
+                    }
+                }
+                Line { visible: !!modelPanel.codex && modelPanel.codex.status === "available" && parent.models.length === 0
+                       text: qsTr("Codex listed no model that JARVIS can run with every tool disabled.") }
+                Line { visible: !!bridge.codexModel && !parent.current && parent.models.length > 0
+                       text: qsTr("The saved model %1 is not offered now; calls are refused until you choose one.").arg(bridge.codexModel) }
+                Caption { text: qsTr("EFFORT") }
+                Segmented {
+                    objectName: "codexEffort"
+                    enabled: !!parent.current
+                    value: bridge.codexEffort
+                    onPicked: function(v) { bridge.setCodexModel(bridge.codexModel, v) }
+                    options: (parent.current ? parent.current.efforts : []).map(function(e) { return { value: e, label: e } })
+                }
+                Rectangle { width: parent.width; height: 1; color: Theme.border }
+                Caption { text: qsTr("USAGE / QUOTA") }
+                Line { text: qsTr("Configured model: %1 · effort: %2").arg(bridge.codexModel || qsTr("none")).arg(bridge.codexEffort || qsTr("model default")) }
+                Line { objectName: "codexActualModelLine"
+                       text: qsTr("Answering model: Codex does not report it - the call requests %1").arg(bridge.codexModel || qsTr("none")) }
+                Repeater {
+                    model: ["primary", "secondary"].filter(function(k) { return !!(bridge.codexQuota || {})[k] })
+                    Line { objectName: "codexQuota_" + modelData
+                           readonly property var w: bridge.codexQuota[modelData]
+                           text: qsTr("%1: %2% used · resets %3").arg(w.window_minutes === 300 ? qsTr("5-hour window") : w.window_minutes === 10080 ? qsTr("Weekly window")
+                                                                     : qsTr("%1-minute window").arg(w.window_minutes))
+                                 .arg(Math.round(w.used_percent)).arg(modelPanel.when(w.resets_at)) }
+                }
+                Line { text: Object.keys(bridge.codexQuota || {}).length === 0 ? qsTr("Plan limits: not reported yet.")
+                             : qsTr("As reported by Codex at %1 · purchased credits: %2").arg(modelPanel.when(bridge.codexQuota.seen_at))
+                                   .arg(bridge.codexQuota.has_credits === true ? qsTr("present") : bridge.codexQuota.has_credits === false ? qsTr("none") : qsTr("not reported")) }
+                Line { text: modelPanel.usage.provider !== "openai" || Object.keys(modelPanel.reported).length === 0 ? qsTr("Last call: no usage reported yet")
+                             : qsTr("Last call tokens: %1 input · %2 cached · %3 output · %4 reasoning")
+                                 .arg(modelPanel.tokens(modelPanel.reported.input_tokens)).arg(modelPanel.tokens(modelPanel.reported.cached_input_tokens))
+                                 .arg(modelPanel.tokens(modelPanel.reported.output_tokens)).arg(modelPanel.tokens(modelPanel.reported.reasoning_output_tokens)) }
+                Line { text: qsTr("Web Research: not available with Codex in this build - research questions are refused, never sent to another provider.") }
+            }
         }
     }
 }

@@ -41,7 +41,11 @@ from jarvis.app import (
     tasks_result,
 )
 from jarvis.cli import _config_change, _config_reset_change
-from jarvis.contracts import ErrorCode
+from jarvis.antigravity import antigravity_state
+from jarvis.codex import CodexIntentAdapter, codex_state
+from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE, ClaudeCodeConnector
+from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
+from jarvis.contracts import BillingClass, ErrorCode
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import ConfigError, ConfigStore, Settings
 
@@ -89,9 +93,19 @@ class Backend:
         self,
         store: ConfigStore | None = None,
         app_factory: Callable[[Settings], JarvisApp] = build_default_app,
+        codex_factory: Callable[..., Any] = CodexIntentAdapter,
+        codex_state: Callable[[], dict] = codex_state,
+        claude_catalog: Callable[[], list] = claude_model_catalog,
+        google_state: Callable[[], dict] = antigravity_state,
     ) -> None:
         self.store = store or ConfigStore()
         self.app_factory = app_factory
+        self.codex_factory = codex_factory
+        self.codex_state = codex_state
+        self.google_state = google_state
+        self.claude_catalog = claude_catalog
+        #: Codex model -> what the last real call with it showed (this session only).
+        self.codex_verified: dict[str, dict[str, str]] = {}
         #: The application instance whose understanding call is running, so
         #: ``cancel_text`` reaches the same adapter that owns the process.
         self._text_app: JarvisApp | None = None
@@ -166,16 +180,68 @@ class Backend:
             return config_failure_result(command, mode, exc).payload
         return config_mutation_result(command, self.store, updated, self.store.load()).payload
 
+    # -- providers --------------------------------------------------------------
+
+    #: The provider lines a person can choose for General Chat / understanding.
+    #: Choosing one changes who INTERPRETS a request - never what JARVIS may do.
+    CHAT_PROVIDERS = ("claude", "codex")
+
+    def providers(self) -> list[dict]:
+        """What is REALLY known about each provider line, from local checks only
+        - no model call, no spend: the Claude auth probe and the CLI's own model
+        list; Codex's app-server account, plan limits and model catalog; whether
+        a Google CLI is installed and signed in. Qwen is deferred past V1."""
+        loaded = self.store.load()
+        if not loaded.usable:
+            status, evidence, models = "unavailable", "config_refused", []
+        else:
+            try:
+                billing_class, evidence = ClaudeCodeConnector().billing_route()
+            except Exception:  # noqa: BLE001 - an unreadable probe establishes nothing
+                billing_class, evidence = BillingClass.UNKNOWN, "claude_auth_status:unavailable"
+            status = ("available" if billing_class is BillingClass.SUBSCRIPTION_INCLUDED
+                      else "not_logged_in" if evidence == AUTH_NOT_LOGGED_IN_EVIDENCE else "unavailable")
+            models = self.claude_catalog() if status == "available" else []
+        claude = {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": status,
+                  "evidence": evidence, "models": models, "research": status == "available"}
+        try:
+            state = self.codex_state()
+        except Exception:  # noqa: BLE001
+            state = {"status": "unavailable", "models": []}
+        # DISCOVERED (the account lists it) is not USABLE: each model carries what
+        # a real call in this session showed - "usable", "failed" + reason, or
+        # nothing yet ("" = discovered, not verified).
+        models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))}
+                  for model in state.get("models", []) if isinstance(model, dict)]
+        codex = {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
+                 "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
+                 "research": False}
+        try:
+            google = self.google_state()
+        except Exception:  # noqa: BLE001 - an unreadable check establishes nothing
+            google = {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "unavailable", "models": [], "research": False}
+        # Never selectable in V1: no chat, no research, read-only quota at most.
+        return [claude, codex, google,
+                {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+
     # -- natural language -----------------------------------------------------
 
     def submit_text(
         self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = "",
-        response_language: str = "", conversation: tuple = (),
+        response_language: str = "", conversation: tuple = (), provider: str = "claude", model: str = "",
+        effort: str = "",
     ) -> dict:
         request_id = request_id or str(uuid4())
 
         def run(settings: Settings) -> Any:
             app = self._app(settings)
+            if provider == "codex":
+                # The person chose Codex: it interprets, the same code judges.
+                # It has no verified research route, so research is refused, never re-routed.
+                app.intent_model = self.codex_factory(INTENT_SYSTEM_PROMPT, model, effort)
+                app.research_model = None
+            elif provider != "claude":
+                app.intent_model, app.research_model = None, None
             self._text_app = app
             try:
                 return app.submit_text(
@@ -185,7 +251,16 @@ class Backend:
             finally:
                 self._text_app = None
 
-        return self._call("text", run)
+        payload = self._call("text", run)
+        if provider == "codex" and model:
+            intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+            status = str(intent.get("status") or "")
+            broken = ("model_failed", "model_unavailable", "model_timeout", "malformed_model_output")
+            if status in broken and not intent.get("reason"):
+                self.codex_verified[model] = {"state": "failed", "reason": str(intent.get("message") or "")[:240]}
+            elif status and status not in broken + ("model_cancelled", "invalid_input"):
+                self.codex_verified[model] = {"state": "usable"}      # the model answered through the safe contract
+        return payload
 
     def cancel_text(self, request_id: str) -> bool:
         app = self._text_app

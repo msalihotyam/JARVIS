@@ -34,8 +34,12 @@ Window {
     readonly property string presentation: bridge.theme
     readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
     property bool devApprovalVisible: false
-    // How the window was shown when it went to the tray; Open JARVIS restores it.
+    // The last non-minimized, non-hidden state (full screen / maximized /
+    // windowed). Only a real change between those states updates it:
+    // minimizing, hiding to the tray and Alt+Tab never do. Open JARVIS restores it.
     property int restoreVisibility: Window.FullScreen
+    onVisibilityChanged: if (visibility === Window.Windowed || visibility === Window.Maximized
+                             || visibility === Window.FullScreen) restoreVisibility = visibility
 
     // Window X hides JARVIS to the system tray: the process, the session and
     // any work keep running (unless JARVIS is frozen separately). Only Quit
@@ -43,7 +47,6 @@ Window {
     onClosing: function(close) {
         if (bridge.quitting || !bridge.trayAvailable) return
         close.accepted = false
-        root.restoreVisibility = root.visibility === Window.Minimized || root.visibility === Window.Hidden ? Window.Windowed : root.visibility
         root.closeContexts()
         root.hide()
         bridge.noteHiddenToTray()
@@ -111,7 +114,7 @@ Window {
         onMenuRequested: root.toggleNav()
         onLifecycleRequested: root.toggleLifecycle()
         onEditRequested: bridge.setEditMode(!bridge.editMode)
-        onMinimizeRequested: root.showMinimized()
+        onMinimizeRequested: bridge.minimizeWindow(root)
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
         onOpenSettings: root.toggleSettings()
