@@ -110,6 +110,8 @@ class Bridge(QObject):
         # The running request began while frozen: it can start no work (Core
         # refuses anything authoritative), so nothing is on its way to a safe point.
         self._started_frozen = False
+        # One in-app scheduler sweep at a time (see ``sweepDueWork``).
+        self._sweeping = False
         self._composing = False
         self._core_state = "idle"
         self._session_id = ""
@@ -749,6 +751,30 @@ class Bridge(QObject):
             return
         self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Running one scheduler sweep..."))
         self._run("task", self.backend.scheduler_once, self._apply_run)
+
+    @Slot()
+    def sweepDueWork(self) -> None:
+        """The in-app scheduler loop's one sweep: drive the EXISTING scheduler.
+
+        Skipped while a foreground operation runs, while a sweep is already in
+        flight and while the configuration is refused, so sweeps never overlap
+        and an idle one stays cheap. It adds no authority: Core's claim, lease,
+        fencing, approval and execution-gate rules decide everything, exactly
+        as they do for the Automations button.
+        """
+        if self._busy or self._sweeping or self._config_refused():
+            return
+        self._sweeping = True
+        self._run("sweep", self.backend.scheduler_once, self._apply_sweep)
+
+    def _apply_sweep(self, payload: Any) -> None:
+        """A background sweep never disturbs what is on screen: it replaces no
+        approval, task or outcome. Only a sweep that really acted refreshes the
+        job list, so the Automations page keeps projecting real state."""
+        self._sweeping = False
+        actions = payload.get("actions") if isinstance(payload, dict) else None
+        if actions:
+            self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
 
     @Slot(str, bool)
     def refreshMemory(self, project_id: str, include_inactive: bool) -> None:

@@ -268,7 +268,8 @@ class GmailCliConnector(BaseConnector):
         except Exception:  # noqa: BLE001 - an unclassified failure is a refusal
             return self._refusal(task, ErrorCode.CONNECTOR_FAILED, "the Gmail read did not complete")
         try:
-            content = gmail_read_content(output.stdout, frame=frame)
+            metadata = tuple(getattr(output, "metadata", ()) or ())
+            content = gmail_read_content(output.stdout, frame=frame, metadata=metadata)
         except GmailExecutionUnavailable as exc:
             return self._refusal(task, ErrorCode.EGRESS_REFUSED, str(exc))
         truncated = bool(output.truncated)
@@ -295,7 +296,8 @@ class GmailCliConnector(BaseConnector):
                 f"{' (truncated)' if snapshot.truncated else ''}."
             ),
             data={EXTERNAL_READ_RESULT_KEY: snapshot.to_dict()},
-            usage=self._usage(task, session_id=session.id, call_count=1),
+            # The listing plus each metadata request it made: the true count.
+            usage=self._usage(task, session_id=session.id, call_count=1 + len(metadata)),
         )
 
     def _write(self, task: Task, session: SessionState, frame: GmailRequestFrame, plan: Any) -> ToolResult:

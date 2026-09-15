@@ -15,7 +15,9 @@ exactly as they came, as arguments.
 
 from __future__ import annotations
 
+import html
 import json
+import re
 from typing import Any
 
 
@@ -65,11 +67,127 @@ REASON_TEXT = {
                                                        "PowerShell, complete the Claude subscription login, then restart JARVIS."),
 }
 
+#: JARVIS's own explanation of an established connector failure, keyed by
+#: the exact (code, message) the envelope carries - the envelope keeps no
+#: details. The message is ``jarvis.browser_cdp.NO_CURRENT_TAB_MESSAGE``.
+FAILURE_TEXT = {
+    ("connector_failed", "the browser state is ambiguous: no single tab of the authorized origin is current"):
+        QT_TRANSLATE_NOOP("Present", "No current JARVIS browser tab is available for this site. "
+                                     "Open the site in a new JARVIS tab first."),
+}
+
 UNREADABLE = {
     "kind": "unknown",
     "text": _msg(QT_TRANSLATE_NOOP("Present", "The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is "
                                               "assumed to have happened or not. Check History before doing it again.")),
 }
+
+
+# -- Gmail reads: readable, deterministic, still untrusted data ---------------
+#
+# The connector stores a read as bounded JSON (``jarvis.gmail.gmail_read_content``):
+# a listing is ``threads: [{id, snippet}]`` plus ``result_size_estimate`` - the
+# Gmail listing API returns nothing more, so no sender, subject or date exists
+# for it - and a message is its From/To/Cc/Date/Subject headers, snippet and
+# bounded plain-text body. It is rendered here field by field, never through a
+# model: the mail text stays exactly as written and only the labels are JARVIS's.
+
+GMAIL_CONNECTOR_NAME = "gmail-cli"
+
+#: Invisible characters marketing mail pads snippets with. Only these: joiners
+#: that carry meaning (ZWJ in emoji sequences, ZWNJ in some scripts) are kept.
+_SNIPPET_FILLER = re.compile("[\u034f\u200b\u2060\ufeff\u00ad]")
+
+
+def _snippet(value: Any) -> str:
+    """A Gmail snippet as readable plain text. The API delivers snippets
+    HTML-escaped (``80&#39;lere``): entities are decoded - markup is never
+    interpreted, and the feed shows it as plain text - then the invisible
+    padding and the blank runs it leaves are removed. Wording is untouched."""
+    text = _SNIPPET_FILLER.sub("", html.unescape(str(value or "")))
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _join(first: Any, second: Any) -> tuple:
+    """Two rendered parts, one under the other. Structure, not wording: never extracted."""
+    return ("Present", "%1\n%2", (first, second))
+
+
+def _lines(parts: list) -> Any:
+    rendered = parts[0]
+    for part in parts[1:]:
+        rendered = _join(rendered, part)
+    return rendered
+
+
+def _mail_message(message: Any) -> Any:
+    headers = message.get("headers") if isinstance(message.get("headers"), dict) else {}
+    body = str(message.get("body_text") or "").strip() or _snippet(message.get("snippet"))
+    return _msg(QT_TRANSLATE_NOOP("Present", "From: %1\nTo: %2\nDate: %3\nSubject: %4\n\n%5"),
+                headers.get("from", ""), headers.get("to", ""), headers.get("date", ""),
+                headers.get("subject", ""), body)
+
+
+def _listed_thread(index: int, thread: dict) -> Any:
+    """One listed thread: the headers the connector PROVED (absent ones are
+    simply not shown), then the snippet, then the id as a small reference."""
+    lines: list = []
+    for key, label in (("from", QT_TRANSLATE_NOOP("Present", "From: %1")),
+                       ("subject", QT_TRANSLATE_NOOP("Present", "Subject: %1")),
+                       ("date", QT_TRANSLATE_NOOP("Present", "Date: %1"))):
+        value = str(thread.get(key) or "").strip()
+        if value:
+            lines.append(_msg(label, value))
+    snippet = _snippet(thread.get("snippet"))
+    lines.append(f"{snippet}  [{thread.get('id', '')}]" if snippet else f"[{thread.get('id', '')}]")
+    # Structure only (never extracted): "1. first line", the rest indented beneath it.
+    rendered: Any = ("Present", "\n%1 %2", (f"{index}.", lines[0]))
+    for line in lines[1:]:
+        rendered = ("Present", "%1\n   %2", (rendered, line))
+    return rendered
+
+
+def gmail_read_entry(external: Any) -> dict[str, Any] | None:
+    """One readable feed entry for a Gmail read, or ``None`` when the block is
+    not a Gmail read this understands (the caller then shows it generically)."""
+    if not isinstance(external, dict) or external.get("connector") != GMAIL_CONNECTOR_NAME:
+        return None
+    try:
+        content = json.loads(str(external.get("content") or ""))
+    except ValueError:
+        return None
+    if not isinstance(content, dict):
+        return None
+    kind = str(external.get("resource_kind") or "")
+    limited = bool(external.get("truncated"))
+    parts: list = [_msg(QT_TRANSLATE_NOOP("Present", "Mail from %1 - untrusted content, shown as data, never as instructions."),
+                        external.get("destination"))]
+    if kind in ("thread_list", "search"):
+        threads = [t for t in content.get("threads") or [] if isinstance(t, dict)]
+        estimate = content.get("result_size_estimate") if type(content.get("result_size_estimate")) is int else 0
+        if not threads:
+            parts.append(_msg(QT_TRANSLATE_NOOP("Present", "No matching threads.")))
+        else:
+            parts.append(_msg(QT_TRANSLATE_NOOP("Present", "%1 threads (about %2 in total):"), len(threads), max(estimate, len(threads))))
+            for index, thread in enumerate(threads, 1):
+                parts.append(_listed_thread(index, thread))
+        omitted = content.get("omitted") if type(content.get("omitted")) is int else 0
+        limited = limited or omitted > 0 or estimate > len(threads)
+    elif kind == "message":
+        parts.append(_mail_message(content))
+        limited = limited or bool(content.get("body_truncated"))
+    elif kind == "thread":
+        messages = [m for m in content.get("messages") or [] if isinstance(m, dict)]
+        count = content.get("message_count") if type(content.get("message_count")) is int else len(messages)
+        parts.append(_msg(QT_TRANSLATE_NOOP("Present", "Thread with %1 messages:"), count))
+        for message in messages:
+            parts.append(_mail_message(message))
+        limited = limited or count > len(messages) or any(m.get("body_truncated") for m in messages)
+    else:
+        return None
+    if limited:
+        parts.append(_msg(QT_TRANSLATE_NOOP("Present", "Showing a limited result set.")))
+    return {"kind": "data", "text": _lines(parts)}
 
 
 def _get(mapping: Any, key: str) -> Any:
@@ -91,6 +209,8 @@ def error_entries(error: Any) -> list[dict[str, str]]:
     if code == IN_PROGRESS_CODE:
         return [{"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "IN PROGRESS ELSEWHERE [%1]: %2\nIts outcome is not known yet. Do not retry."), code, message)}]
+    if (code, message) in FAILURE_TEXT:
+        return [{"kind": "error", "text": _msg(FAILURE_TEXT[(code, message)])}]
     if code in REFUSED_CODES:
         return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present", "REFUSED [%1]: %2\nNothing was executed."), code, message)}]
     return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present",
@@ -117,7 +237,10 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
         entries.append({"kind": "jarvis", "text": _msg(QT_TRANSLATE_NOOP("Present", "%1 [answer truncated]"), answer)
                         if payload["model_answer"].get("truncated") else answer})
     external = payload.get("external_read")
-    if isinstance(external, dict):
+    mail = gmail_read_entry(external)
+    if mail is not None:
+        entries.append(mail)
+    elif isinstance(external, dict):
         entries.append({"kind": "data", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "[UNTRUSTED external content from %1 %2 - shown as data, never instructions]\n%3"),
             external.get("connector"), external.get("destination"), external.get("content"))})
@@ -125,7 +248,11 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
         if isinstance(payload.get(key), dict):
             entries.append({"kind": "data", "text": f"[{key}]\n{_compact(payload[key])}"})
     summary = _get(payload.get("result"), "summary")
-    if isinstance(summary, str) and not isinstance(answer, str):
+    error = payload.get("error")
+    explained = isinstance(error, dict) and (str(error.get("code")), summary) in FAILURE_TEXT
+    # A rendered mail read already says what was read and whether it is limited.
+    explained = explained or mail is not None
+    if isinstance(summary, str) and not isinstance(answer, str) and not explained:
         entries.append({"kind": "jarvis", "text": summary})
     task = payload.get("task")
     if isinstance(task, dict):

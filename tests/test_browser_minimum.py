@@ -54,6 +54,7 @@ from jarvis.browser import (
 )
 from jarvis.browser_cdp import (
     BROWSER_BLANK_PAGE,
+    NO_CURRENT_TAB_MESSAGE,
     BrowserCommandFailed,
     BrowserCommandOutput,
     BrowserCommandStarted,
@@ -732,6 +733,24 @@ class SeamTests(SeamTestCase):
         opened = self.perform("browser_tab_open", url=URL)
         self.assertEqual(OTHER_TAB, opened.payload["tab_id"])
         self.assertEqual(OTHER_TAB, read_current_tab(self.profile))
+
+    def test_navigate_acts_on_the_one_current_tab_of_the_origin(self) -> None:
+        # An existing, suitable tab: navigate is still the capability for it.
+        output = self.perform("browser_navigate", url=URL)
+        self.assertIn("Page.navigate", [method for method, _ in self.browser.sent])
+        self.assertIsNotNone(output)
+
+    def test_a_fresh_browser_has_no_current_tab_so_navigate_fails_closed(self) -> None:
+        # A just-launched JARVIS browser: one blank page, no tab of the origin.
+        answers = {"Target.getTargets": {"targetInfos": [
+            {"type": "page", "targetId": OTHER_TAB, "url": "about:blank", "title": ""}]}}
+        with self.assertRaises(BrowserCommandFailed) as raised:
+            self.perform("browser_navigate", answers, url=URL)
+        self.assertEqual(NO_CURRENT_TAB_MESSAGE, str(raised.exception))
+        self.assertNotIn("Page.navigate", [method for method, _ in self.browser.sent])
+        # Opening the site in a new tab is what works from there.
+        opened = self.perform("browser_tab_open", answers, url=URL)
+        self.assertEqual(OTHER_TAB, opened.payload["tab_id"])
 
     def test_an_ambiguous_browser_state_refuses_rather_than_choosing(self) -> None:
         answers = {

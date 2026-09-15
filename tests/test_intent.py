@@ -1217,5 +1217,37 @@ class ClaudeAuthUxTests(IntentTestCase):
                 self.assertEqual(BillingClass.UNKNOWN, connector.billing_route()[0])
 
 
+class BrowserCatalogueHintTests(IntentTestCase):
+    """'Open <site>' is a new JARVIS tab; navigate is only for a tab that is
+    already open and current. Hint text only - scope and authority unchanged."""
+
+    def test_open_a_site_points_to_tab_open_and_navigate_needs_a_current_tab(self) -> None:
+        tab_open = NL_CAPABILITIES["browser_tab_open"].description
+        navigate = NL_CAPABILITIES["browser_navigate"].description
+        for phrase in ("'open <site>'", "'open <site> in the browser'", "'open a new tab for <site>'"):
+            self.assertIn(phrase, tab_open)
+        self.assertIn("already open and current", navigate)
+        self.assertIn("to open a site, use browser_tab_open", navigate)
+
+    def test_the_catalogue_offers_only_the_granted_origin_and_the_same_capabilities(self) -> None:
+        from jarvis.browser import BROWSER_ENABLED_CAPABILITIES
+        self.assertEqual(("browser_page_read", "browser_tab_list", "browser_wait", "browser_navigate", "browser_click",
+                          "browser_type", "browser_tab_open", "browser_tab_switch", "browser_tab_close"),
+                         BROWSER_ENABLED_CAPABILITIES)
+        model = ScriptedModel(task_proposal("browser_tab_open", ORIGIN, url="https://openai.com/"))
+        app = self.build(model, browser=(ORIGIN,))
+        payload = app.submit_text("openai.com'u yeni sekmede aç").payload
+        self.assertEqual(IntentStatus.STRUCTURED.value, payload["intent"]["status"], payload)
+        self.assertEqual(("browser_tab_open", ORIGIN), (payload["intent"]["capability"], payload["intent"]["destination"]))
+        self.assertEqual("awaiting_approval", payload["run"]["run_status"])
+        entries = {entry["name"]: entry for entry in model.calls[0].context["catalog"]["capabilities"]}
+        browser = {name: entry for name, entry in entries.items() if name.startswith("browser_")}
+        # Exactly the natural-language browser subset (no element-bound click/type), all enabled.
+        self.assertEqual({name for name in NL_CAPABILITIES if name.startswith("browser_")}, set(browser))
+        self.assertTrue(set(browser) <= set(BROWSER_ENABLED_CAPABILITIES))
+        self.assertTrue(all(entry["destinations"] == [ORIGIN] for entry in browser.values()), browser)
+        self.assertEqual(0, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

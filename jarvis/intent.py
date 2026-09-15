@@ -214,11 +214,16 @@ NL_CAPABILITIES: Mapping[str, CapabilityHint] = {
     ),
     "browser_navigate": CapabilityHint(
         "browser", "navigate",
-        "Open a URL in the JARVIS browser tab. The URL must be inside the destination origin.",
+        "Move the CURRENT JARVIS browser tab to another URL inside the destination "
+        "origin. Only for a tab of that origin that is already open and current; "
+        "to open a site, use browser_tab_open.",
         {"url": "full http(s) URL inside the destination origin (required)"},
     ),
     "browser_tab_open": CapabilityHint(
-        "browser", "open", "Open a URL in a new JARVIS browser tab.",
+        "browser", "open",
+        "Open a site in a new JARVIS browser tab - the choice for 'open <site>', "
+        "'open <site> in the browser' or 'open a new tab for <site>'. The URL "
+        "must be inside the destination origin.",
         {"url": "full http(s) URL inside the destination origin (required)"},
     ),
     "browser_page_read": CapabilityHint(

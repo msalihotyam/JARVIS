@@ -1486,6 +1486,83 @@ def _render_message(payload: Any) -> dict[str, Any]:
     }
 
 
+#: Listing enrichment. The listing API returns only ids and snippets, so each
+#: LISTED thread (never more than the request's own limit) is asked for these
+#: three headers as METADATA - no body, no attachment - through the same
+#: attested credential and route as the listing itself. Headers come from the
+#: thread's most recent message.
+GMAIL_LIST_METADATA_HEADERS: tuple[str, ...] = ("From", "Subject", "Date")
+GMAIL_LIST_HEADER_MAX_CHARS = 160
+
+
+def gws_thread_metadata_arguments(account: Any, thread_id: Any) -> tuple[str, ...]:
+    """The one vector that asks a listed thread for From / Subject / Date:
+    ``format=metadata`` with exactly those headers, under the bound account."""
+    reason = gmail_principal_refusal(account) or gmail_id_refusal(thread_id, "thread id")
+    if reason is not None:
+        raise GmailExecutionUnavailable(f"no thread metadata request can be derived: {reason}")
+    return (
+        *GWS_API_ARGS, "threads", "get",
+        "--params", _params(userId=account, id=thread_id, format="metadata",
+                            metadataHeaders=list(GMAIL_LIST_METADATA_HEADERS)),
+    )
+
+
+def gmail_listing_thread_ids(stdout: Any, *, limit: int) -> tuple[str, ...]:
+    """The valid, distinct thread ids a listing response returned, at most
+    ``limit`` of them. Anything unreadable yields none - never a guess."""
+    try:
+        payload = _one_json_object(stdout, "read")
+    except GmailExecutionUnavailable:
+        return ()
+    threads = payload.get("threads")
+    if type(threads) is not list:
+        return ()
+    ids: list[str] = []
+    for thread in threads[: max(0, limit)]:
+        thread_id = thread.get("id") if type(thread) is dict else None
+        if gmail_id_refusal(thread_id) is None and thread_id not in ids:
+            ids.append(thread_id)
+    return tuple(ids)
+
+
+def _listed_headers(thread_id: str, raw: Any) -> dict[str, str]:
+    """From / Subject / Date of one listed thread, from its own metadata
+    response - or nothing at all when that response does not prove them."""
+    try:
+        payload = json.loads(raw) if type(raw) is str else None
+    except ValueError:
+        return {}
+    if type(payload) is not dict or "error" in payload or payload.get("id") != thread_id:
+        return {}
+    messages = payload.get("messages")
+    if type(messages) is not list or not messages or type(messages[-1]) is not dict:
+        return {}
+    root = messages[-1].get("payload") if type(messages[-1].get("payload")) is dict else {}
+    found: dict[str, str] = {}
+    for header in root.get("headers") or ():
+        if type(header) is not dict or type(header.get("name")) is not str:
+            continue
+        name = header["name"].title()
+        if name in GMAIL_LIST_METADATA_HEADERS and name.lower() not in found:
+            value = _clean_text(header.get("value"), GMAIL_LIST_HEADER_MAX_CHARS).strip()
+            if value:
+                found[name.lower()] = value
+    return found
+
+
+def _fitted_listing(threads: list[dict[str, Any]], estimate: int) -> str:
+    """The listing as JSON that always fits the external-read bound: whole
+    threads are dropped from the end (and counted) rather than cutting JSON."""
+    kept = list(threads)
+    while True:
+        rendered = {"threads": kept, "result_size_estimate": estimate, "omitted": len(threads) - len(kept)}
+        text = json.dumps(rendered, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if len(text) <= EXTERNAL_READ_MAX_CHARS or not kept:
+            return text
+        kept.pop()
+
+
 def _one_json_object(stdout: Any, what: str) -> dict[str, Any]:
     if type(stdout) is not str or not stdout.strip():
         raise GmailExecutionUnavailable(f"the Gmail {what} returned no response")
@@ -1504,13 +1581,15 @@ def _one_json_object(stdout: Any, what: str) -> dict[str, Any]:
     return payload
 
 
-def gmail_read_content(stdout: Any, *, frame: Any) -> str:
+def gmail_read_content(stdout: Any, *, frame: Any, metadata: Any = ()) -> str:
     """The bounded, untrusted content of ONE read, bound to its request.
 
-    A message or thread response must carry the exact id the frame asked for;
-    a listing is rendered as ids and snippets only. Everything is cleaned,
-    bounded and serialized deterministically, and none of it is trusted for
-    anything downstream.
+    A message or thread response must carry the exact id the frame asked for.
+    A listing is rendered as ids and snippets, plus From / Subject / Date for a
+    thread only where ``metadata`` - ``(thread_id, raw metadata response)``
+    pairs from the seam - proves them; a missing or unreadable response adds
+    nothing and invents nothing. Everything is cleaned, bounded and serialized
+    deterministically, and none of it is trusted for anything downstream.
     """
     if type(frame) is not GmailRequestFrame or frame.capability not in GMAIL_READ_CAPABILITIES:
         raise GmailExecutionUnavailable("the read names no validated request")
@@ -1520,21 +1599,19 @@ def gmail_read_content(stdout: Any, *, frame: Any) -> str:
         threads = payload.get("threads") or ()
         if type(threads) is not list:
             raise GmailExecutionUnavailable("the Gmail listing is not a list")
-        rendered: dict[str, Any] = {
-            "threads": [
-                {
-                    "id": _clean_text(thread.get("id"), GMAIL_ID_MAX_CHARS),
-                    "snippet": _clean_text(thread.get("snippet"), GMAIL_SNIPPET_MAX_CHARS),
-                }
-                for thread in threads[: resource.limit]
-                if type(thread) is dict
-            ],
-            "result_size_estimate": (
-                payload["resultSizeEstimate"]
-                if type(payload.get("resultSizeEstimate")) is int
-                else 0
-            ),
-        }
+        known = {thread_id: raw for thread_id, raw in metadata if type(thread_id) is str}
+        listed = []
+        for thread in threads[: resource.limit]:
+            if type(thread) is not dict:
+                continue
+            entry = {
+                "id": _clean_text(thread.get("id"), GMAIL_ID_MAX_CHARS),
+                "snippet": _clean_text(thread.get("snippet"), GMAIL_SNIPPET_MAX_CHARS),
+            }
+            entry.update(_listed_headers(entry["id"], known.get(entry["id"])))
+            listed.append(entry)
+        estimate = payload["resultSizeEstimate"] if type(payload.get("resultSizeEstimate")) is int else 0
+        return _fitted_listing(listed, estimate)
     elif resource.kind is GmailResourceKind.MESSAGE:
         if payload.get("id") != resource.message_id:
             raise GmailExecutionUnavailable(

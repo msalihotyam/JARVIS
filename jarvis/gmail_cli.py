@@ -137,7 +137,10 @@ from jarvis.gmail import (
     GmailCredentialAttestation,
     GmailExecutionUnavailable,
     GmailOutcomeUnknown,
+    GmailResourceKind,
     gmail_address_refusal,
+    gmail_listing_thread_ids,
+    gws_thread_metadata_arguments,
     gmail_attestation_from_dict,
     gmail_attestation_refusal,
     gmail_config_dir_refusal,
@@ -246,6 +249,9 @@ class GmailCommandOutput:
 
     stdout: str
     truncated: bool
+    #: A listing only: ``(thread_id, raw metadata response or None)`` for each
+    #: listed thread the seam asked for its From / Subject / Date.
+    metadata: tuple[tuple[str, str | None], ...] = ()
 
 
 def gws_executable(*, path_lookup: Any = which) -> str:
@@ -875,7 +881,7 @@ def run_operation_plan(
     with attested_credential(config_dir, plan.resource.account):
         gmail_route_check(config_dir, environ=environ, path_lookup=path_lookup, popen=popen)
         if not plan.is_write:
-            return _run(
+            output = _run(
                 plan.arguments,
                 config_dir=config_dir,
                 cwd=_run_directory(config_dir),
@@ -884,6 +890,28 @@ def run_operation_plan(
                 popen=popen,
                 timeout=GWS_READ_TIMEOUT_SECONDS,
             )
+            if plan.resource.kind not in (GmailResourceKind.THREAD_LIST, GmailResourceKind.SEARCH):
+                return output
+            # Enrichment, under the SAME held credential and proved route: one
+            # metadata-only request per listed thread, never beyond the
+            # request's own limit. A failed one is recorded as unavailable -
+            # the listing is still true without it.
+            metadata: list[tuple[str, str | None]] = []
+            for thread_id in gmail_listing_thread_ids(output.stdout, limit=plan.resource.limit):
+                try:
+                    detail = _run(
+                        gws_thread_metadata_arguments(plan.resource.account, thread_id),
+                        config_dir=config_dir,
+                        cwd=_run_directory(config_dir),
+                        environ=environ,
+                        path_lookup=path_lookup,
+                        popen=popen,
+                        timeout=GWS_READ_TIMEOUT_SECONDS,
+                    )
+                    metadata.append((thread_id, detail.stdout))
+                except GmailExecutionUnavailable:
+                    metadata.append((thread_id, None))
+            return GmailCommandOutput(output.stdout, output.truncated, tuple(metadata))
         return _write_under_hold(
             plan, config_dir=config_dir, environ=environ, path_lookup=path_lookup, popen=popen
         )

@@ -465,6 +465,14 @@ def _page_targets(connection: CdpConnection) -> list[dict[str, Any]]:
     ]
 
 
+#: The fail-closed refusal when no single tab of the authorized origin is
+#: current (a fresh JARVIS browser has none). A constant so the interface can
+#: explain this one established cause in the person's language.
+NO_CURRENT_TAB_MESSAGE = (
+    "the browser state is ambiguous: no single tab of the authorized origin is current"
+)
+
+
 def _resolve_tab(
     connection: CdpConnection, profile_dir: str, *, origin: str
 ) -> dict[str, Any]:
@@ -484,10 +492,7 @@ def _resolve_tab(
         target for target in targets if url_in_origin(str(target.get("url", "")), origin)
     ]
     if len(candidates) != 1:
-        raise BrowserCommandFailed(
-            "the browser state is ambiguous: no single tab of the authorized "
-            "origin is current"
-        )
+        raise BrowserCommandFailed(NO_CURRENT_TAB_MESSAGE)
     return candidates[0]
 
 

@@ -18,6 +18,13 @@ from jarvis.ui.preferences import UiPreferences
 QML_DIR = Path(__file__).resolve().parent / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
 
+#: The in-app scheduler loop. One sweep shortly after the window is up, then
+#: one every 30 seconds for as long as the application runs - hidden to the
+#: tray included. V1 deliberately stops at the process: nothing is registered
+#: with Windows, so JARVIS runs no reminder while it is closed.
+FIRST_SWEEP_MS = 2_500
+SWEEP_INTERVAL_MS = 30_000
+
 
 def create_engine(bridge: Bridge):
     """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml."""
@@ -46,6 +53,22 @@ def create_engine(bridge: Bridge):
     return engine
 
 
+def install_scheduler_sweeps(bridge: Bridge):
+    """Start the periodic sweep and return its timer (owned by the bridge).
+
+    This is a DRIVER for the existing scheduler, never a second one: every
+    sweep is the same ``scheduler_once`` call the Automations button makes.
+    """
+    from PySide6.QtCore import QTimer
+
+    timer = QTimer(bridge)
+    timer.setInterval(SWEEP_INTERVAL_MS)
+    timer.timeout.connect(bridge.sweepDueWork)
+    timer.start()
+    QTimer.singleShot(FIRST_SWEEP_MS, bridge.sweepDueWork)
+    return timer
+
+
 def main(argv: list[str] | None = None) -> int:
     # The Basic style is the one whose look this UI fully overrides; nothing
     # of the platform's stock widget styling is meant to show through.
@@ -68,4 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     if install_tray(app, bridge, engine.rootObjects()[0]) is not None:
         app.setQuitOnLastWindowClosed(False)
     bridge.quitRequested.connect(app.quit)
+    # Due work is swept while the application runs, the tray included; the
+    # timer belongs to the bridge, so quitting ends it with the process.
+    install_scheduler_sweeps(bridge)
     return app.exec()
