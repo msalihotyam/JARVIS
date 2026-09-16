@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +188,7 @@ def codex_state() -> dict[str, Any]:
         if limits.get("rateLimitReachedType") is not None:
             quota["limit_reached"] = True
         if quota:
+            quota["checked_at"] = int(time.time())       # when Codex reported it (a reused state keeps this time)
             state["quota"] = quota
     for model in _catalog(executable):
         slug = model.get("slug")
@@ -200,13 +202,53 @@ def codex_state() -> dict[str, Any]:
     return state
 
 
+#: How long a verified Codex state may be reused for chat. The check costs a
+#: separate app-server + catalogue process per message (about 0.7 s measured);
+#: the call itself still enforces the route on every message (ChatGPT login
+#: forced, API-key variables stripped), so a reused state can never open a
+#: metered route.
+CODEX_STATE_REUSE_SECONDS = 300.0
+_state_cache: dict[str, Any] = {}
+_state_lock = threading.Lock()
+
+
+def remember_codex_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep a state for reuse only when it is fully safe to reuse: a verified
+    ChatGPT route whose plan has NO purchased credits (so a stale 'limit not
+    reached' can never let credits be spent)."""
+    with _state_lock:
+        _state_cache.clear()
+        quota = state.get("quota") if isinstance(state.get("quota"), dict) else {}
+        if state.get("status") == "available" and quota.get("has_credits") is False and not quota.get("limit_reached"):
+            _state_cache.update(state=state, at=time.monotonic())
+    return state
+
+
+def forget_codex_state() -> None:
+    with _state_lock:
+        _state_cache.clear()
+
+
+def reusable_codex_state() -> dict[str, Any]:
+    """A recently verified state, or a fresh check. Never reused when an
+    API-key variable has appeared since."""
+    if prohibited_env_present():
+        forget_codex_state()
+        return codex_state()
+    with _state_lock:
+        cached = _state_cache.get("state")
+        if cached is not None and time.monotonic() - _state_cache["at"] < CODEX_STATE_REUSE_SECONDS:
+            return cached
+    return remember_codex_state(codex_state())
+
+
 class CodexIntentAdapter:
     """The understanding / General Chat call through Codex. A ``ModelAdapter``."""
 
     name = "codex-intent"
     provider = "openai"
 
-    def __init__(self, system_prompt: str, model: str, effort: str = "", state: Any = codex_state) -> None:
+    def __init__(self, system_prompt: str, model: str, effort: str = "", state: Any = reusable_codex_state) -> None:
         self.system_prompt = system_prompt
         self.model = model
         self.effort = effort
@@ -230,6 +272,8 @@ class CodexIntentAdapter:
         return True
 
     def _refused(self, message: str, code: ErrorCode = ErrorCode.BILLING_ROUTE_UNKNOWN, reason: str = "") -> ToolResult:
+        # Any refusal or failure re-verifies the route next time: nothing stale is trusted after a problem.
+        forget_codex_state()
         # Every failure names the provider and the model the person chose.
         message = f"Codex · {self.model or 'no model'}: {message}"
         details = {"billing_evidence": reason} if reason else {}
@@ -256,7 +300,7 @@ class CodexIntentAdapter:
                                  ErrorCode.CONNECTOR_UNAVAILABLE)
         payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": task.context})
         prompt = (self.system_prompt + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
-                  + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+                  + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")))
         workdir = tempfile.mkdtemp(prefix="jarvis-codex-")
         command = [executable, "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules",
                    "--skip-git-repo-check", "-s", "read-only", "-C", workdir, "-m", self.model,

@@ -559,7 +559,7 @@ class ClaudeCodeConnector(BaseConnector):
         with self._process_lock:
             self._processes[task.id] = process
         try:
-            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            stdout, stderr = self._collect_output(process)
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate()
@@ -755,6 +755,15 @@ class ClaudeCodeConnector(BaseConnector):
             method="model_answer_integrity",
             evidence=tuple(evidence),
         )
+
+    def _collect_output(self, process: subprocess.Popen[str]) -> tuple[str, str]:
+        """The finished process's (stdout, stderr), bounded by the timeout.
+
+        Raises ``subprocess.TimeoutExpired`` exactly like ``communicate``. A
+        subclass may read the stream as it arrives; the returned text is the
+        same complete output either way, so every later check is unchanged.
+        """
+        return process.communicate(timeout=self.timeout_seconds)
 
     def cancel(self, task_id: str) -> bool:
         with self._process_lock:

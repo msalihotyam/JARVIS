@@ -44,7 +44,10 @@ ContextPanel {
         }
     }
     readonly property var claudeModels: claude ? claude.models || [] : []
-    function claudeEntry(id) { return claudeModels.filter(function(m) { return m.id === (id || "default") })[0] || null }
+    // A row is applied by the model id it RESOLVES to: the CLI's short alias does not always get that model
+    // (live: "haiku" was answered by claude-sonnet-5, "claude-haiku-4-5-20251001" by Haiku).
+    function claudeValue(m) { return m.id === "default" ? "" : (m.resolved || m.id) }
+    function claudeEntry(id) { var key = id || "default"; return claudeModels.filter(function(m) { return m.id === key || (id && m.resolved === id) })[0] || null }
     // Claude's choice is operator configuration: drafted here, applied through applyModel.
     QtObject { id: claudeDraft; property string model: ""; property string effort: "" }
 
@@ -136,10 +139,10 @@ ContextPanel {
                     model: modelPanel.claudeModels.filter(function(m) { return m.id !== "default" })
                     Choice {
                         objectName: "claudeModel_" + modelData.id
-                        title: modelData.name + "  ·  " + modelData.id
-                        meta: modelData.resolved || modelData.description
-                        selected: claudeDraft.model === modelData.id
-                        onChosen: { modelField.text = ""; claudeDraft.model = modelData.id; if (claudeDraft.effort && modelData.efforts.indexOf(claudeDraft.effort) < 0) claudeDraft.effort = "" }
+                        title: modelData.name + "  ·  " + modelPanel.claudeValue(modelData)
+                        meta: modelData.description || modelData.id
+                        selected: claudeDraft.model === modelPanel.claudeValue(modelData) || claudeDraft.model === modelData.id
+                        onChosen: { modelField.text = ""; claudeDraft.model = modelPanel.claudeValue(modelData); if (claudeDraft.effort && modelData.efforts.indexOf(claudeDraft.effort) < 0) claudeDraft.effort = "" }
                     }
                 }
                 Line { visible: modelPanel.claude && modelPanel.claude.status === "available" && modelPanel.claudeModels.length === 0

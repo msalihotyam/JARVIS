@@ -18,7 +18,9 @@ import io
 import json
 import os
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1582,7 +1584,9 @@ class CodexProviderTests(IntentTestCase):
                 patch.object(codex, "_app_server", return_value=answers), patch.object(codex, "_catalog", return_value=catalog):
             state = codex.codex_state()
             self.assertEqual(("available", ["gpt-5.6-luna"], ["low"]), (state["status"], [m["id"] for m in state["models"]], state["models"][0]["efforts"]))
+            checked = state["quota"].pop("checked_at")
             self.assertEqual({"primary": {"used_percent": 4.0, "window_minutes": 300, "resets_at": 9}, "has_credits": False}, state["quota"])
+            self.assertAlmostEqual(time.time(), checked, delta=5)                        # when Codex reported it
             answers["account/read"] = {"account": {"type": "apiKey"}}
             self.assertEqual("api_key_route", codex.codex_state()["status"])
             answers["account/read"] = {"account": None}
@@ -1629,6 +1633,156 @@ class AntigravityStatusTests(unittest.TestCase):
             with self.subTest(payload=str(payload)[:40], code=code):
                 self.assertEqual("unavailable", self.run_state(payload, code)[0]["status"])
         self.assertEqual("not_installed", self.run_state(self.USAGE, executable=None)[0]["status"])
+
+
+def stream_line(text: str = "", *, kind: str = "text_delta", parent: str | None = None) -> str:
+    """One Claude Code stream-json partial-message line."""
+    delta = {"type": kind, "text" if kind == "text_delta" else "thinking": text}
+    return json.dumps({"type": "stream_event", "parent_tool_use_id": parent,
+                       "event": {"type": "content_block_delta", "index": 0, "delta": delta}}) + "\n"
+
+
+class FakeStreamProcess:
+    """A finished CLI process whose stdout is read line by line."""
+
+    def __init__(self, lines, stderr=""):
+        self.stdout = iter(lines)
+        self.stderr = io.StringIO(stderr)
+        self.args = ["claude"]
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+class DailyUseStreamingTests(IntentTestCase):
+    """General Chat streams its reply as a preview; the validated proposal stays the one result."""
+
+    def adapter(self, **kwargs):
+        return ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd(), **kwargs)
+
+    def test_the_reply_decoder_previews_only_a_chat_reply(self) -> None:
+        from jarvis.intent import ChatReplyStream
+        stream = ChatReplyStream()
+        chunks = ['```json\n{"ki', 'nd":"chat","re', 'ply":"Merhaba \\u00e7i', "\\u00e7ek \\ud83d", '\\ude00 sat\\u0131r\\nİki \\', '"t\\"', '"}\n```']
+        shown = []
+        for chunk in chunks:
+            if stream.feed(chunk):
+                shown.append(stream.text)
+        self.assertEqual('Merhaba çiçek 😀 satır\nİki "t"', stream.text)
+        self.assertEqual("done", stream.state)
+        self.assertTrue(all(b.startswith(a) for a, b in zip(shown, shown[1:])))            # only ever grows
+        for other in ('{"kind":"task","objective":"x","capability":"code_analysis"}', "Sorry, I cannot answer that.",
+                      '{"reply":"a","kind":"chat"}', '{"kind":"chat","reply":"a\\x"}'):
+            with self.subTest(other=other):
+                preview = ChatReplyStream()
+                preview.feed(other)
+                self.assertIn(preview.text, ("", "a"))
+                self.assertNotEqual("reply", preview.state)
+
+    def test_the_adapter_previews_answer_deltas_and_returns_the_same_complete_output(self) -> None:
+        adapter = self.adapter()
+        self.assertNotIn("--include-partial-messages", adapter._command("q"))       # no listener: nothing extra
+        previews = []
+        adapter.stream_listener = previews.append
+        self.assertIn("--include-partial-messages", adapter._command("q"))
+        lines = [json.dumps({"type": "system", "subtype": "init", "model": "claude-sonnet-5"}) + "\n",
+                 stream_line("I should greet.", kind="thinking_delta"),
+                 stream_line('{"kind":"chat","reply":"Mer'),
+                 stream_line("SUBAGENT TEXT", parent="toolu_1"),
+                 stream_line('haba!"}'),
+                 json.dumps({"type": "result", "result": '{"kind":"chat","reply":"Merhaba!"}', "usage": {}}) + "\n"]
+        stdout, stderr = adapter._collect_output(FakeStreamProcess(lines, "warn"))
+        self.assertEqual(("".join(lines), "warn"), (stdout, stderr))                   # every later check sees the whole stream
+        self.assertEqual("Merhaba!", previews[-1])
+        self.assertTrue(all("SUBAGENT" not in p and "greet" not in p for p in previews))
+
+    def test_a_streaming_call_is_still_bounded_by_its_timeout(self) -> None:
+        import subprocess
+        adapter = self.adapter(timeout_seconds=1)
+        adapter.stream_listener = lambda text: None
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            adapter._collect_output(process)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNotNone(process.poll())                                            # killed
+
+    def test_the_app_previews_only_through_a_streaming_adapter_and_keeps_the_proposal_authoritative(self) -> None:
+        class StreamingModel(ScriptedModel):
+            stream_listener = None
+
+            def complete(self, task, session):
+                if self.stream_listener is not None:
+                    self.stream_listener("Merhaba")
+                    self.stream_listener("Merhaba! Nasıl")
+                return super().complete(task, session)
+
+        model = StreamingModel(chat_proposal("Merhaba! Nasıl yardımcı olabilirim?"))
+        previews = []
+        intent = self.build(model).submit_text("Merhaba", on_reply_preview=previews.append).payload["intent"]
+        self.assertEqual((["Merhaba", "Merhaba! Nasıl"], "Merhaba! Nasıl yardımcı olabilirim?"), (previews, intent["reply"]))
+        self.assertIsNone(model.stream_listener)                                        # never left attached
+        plain = ScriptedModel(chat_proposal("hi"))
+        self.assertEqual("hi", self.build(plain).submit_text("hi", on_reply_preview=previews.append).payload["intent"]["reply"])
+        self.assertFalse(hasattr(plain, "stream_listener"))
+
+    def test_the_catalog_travels_once_in_the_cacheable_system_prompt(self) -> None:
+        from jarvis.intent import CATALOG_SECTION
+        adapter = self.adapter()
+        catalog = {"local_time": "2026-09-16T10:00+03:00", "capabilities": [{"name": "code_analysis", "description": "d"}],
+                   "scheduler": {"available": True, "note": SECRET}}
+        task = Task(objective="Merhaba", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target=""),
+                    context={"catalog": catalog, "local_time": "2026-09-16T10:00+03:00", "conversation": [], "response_language": "tr-TR"})
+        prompt, _ = adapter._build_prompt(task)
+        command = adapter._command(prompt)
+        system = command[command.index("--system-prompt") + 1]
+        self.assertTrue(system.startswith(INTENT_SYSTEM_PROMPT + CATALOG_SECTION))
+        section = json.loads(system[len(INTENT_SYSTEM_PROMPT + CATALOG_SECTION):])
+        self.assertEqual({"capabilities", "scheduler"}, set(section))                  # no per-minute clock in the cached prefix
+        self.assertNotIn(SECRET, system)                                                # still credential-redacted
+        payload = json.loads(prompt[len(adapter.prompt_prefix):])
+        self.assertNotIn("catalog", payload["context"])
+        self.assertEqual(("Merhaba", "2026-09-16T10:00+03:00"), (payload["request"], payload["context"]["local_time"]))
+        self.assertNotIn(", ", prompt[len(adapter.prompt_prefix):])                    # compact JSON
+        second, _ = adapter._build_prompt(replace(task, objective="Başka bir soru", context={**task.context, "local_time": "2026-09-16T10:07+03:00"}))
+        self.assertEqual(system, adapter._command(second)[command.index("--system-prompt") + 1])   # identical prefix across messages
+
+    def test_a_reused_codex_state_never_outlives_a_problem_credits_or_an_api_key(self) -> None:
+        from unittest.mock import patch
+        import jarvis.codex as codex
+        fresh = {"status": "available", "models": [], "quota": {"has_credits": False, "checked_at": 1}}
+        calls = []
+        with patch.object(codex, "codex_state", side_effect=lambda: calls.append(1) or dict(fresh)), \
+                patch.object(codex, "prohibited_env_present", return_value=False):
+            codex.forget_codex_state()
+            codex.reusable_codex_state(); codex.reusable_codex_state()
+            self.assertEqual(1, len(calls))                                              # reused within the window
+            codex.forget_codex_state(); codex.reusable_codex_state()
+            self.assertEqual(2, len(calls))
+            with patch.object(codex.time, "monotonic", return_value=time.monotonic() + codex.CODEX_STATE_REUSE_SECONDS + 1):
+                codex.reusable_codex_state()
+            self.assertEqual(3, len(calls))                                              # expired
+            for unsafe in ({**fresh, "quota": {"has_credits": True}}, {**fresh, "quota": {"has_credits": False, "limit_reached": True}},
+                           {"status": "not_logged_in", "models": []}):
+                codex.forget_codex_state()
+                codex.remember_codex_state(unsafe)
+                self.assertEqual({}, codex._state_cache)                                 # never kept
+            codex.remember_codex_state(dict(fresh))
+            adapter = codex.CodexIntentAdapter(INTENT_SYSTEM_PROMPT, "gpt-x", "")        # not offered -> refused
+            with patch.object(codex, "codex_executable", return_value="codex.exe"):
+                adapter.complete(Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target="")),
+                                 SessionState(objective="hi"))
+            self.assertEqual({}, codex._state_cache)                                     # a refusal forgets it
+        codex.remember_codex_state(dict(fresh))
+        with patch.object(codex, "prohibited_env_present", return_value=True), \
+                patch.object(codex, "codex_state", return_value={"status": "api_key_route", "models": []}):
+            self.assertEqual("api_key_route", codex.reusable_codex_state()["status"])    # an API key appearing bypasses reuse
+        codex.forget_codex_state()
 
 
 class ClaudeModelSelectionTests(unittest.TestCase):

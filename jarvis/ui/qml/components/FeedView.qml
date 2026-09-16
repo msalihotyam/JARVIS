@@ -187,10 +187,11 @@ Item {
                     readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
                     readonly property bool loud: kind === "error" || kind === "unknown" || kind === "approval"
                     readonly property color tone: feed.railColor(kind)
-                    // Appearance: fade + short slide, no bounce.
-                    opacity: 0
-                    transform: Translate { id: slide; y: 8 }
-                    Component.onCompleted: appear.start()
+                    // Appearance: fade + short slide, no bounce. A reply that streamed is
+                    // already on screen: its final entry takes over without a second entrance.
+                    opacity: modelData.streamed === true ? 1 : 0
+                    transform: Translate { id: slide; y: modelData.streamed === true ? 0 : 8 }
+                    Component.onCompleted: if (modelData.streamed !== true) appear.start()
                     ParallelAnimation {
                         id: appear
                         NumberAnimation { target: row; property: "opacity"; to: 1; duration: Theme.panelIn; easing.type: Easing.OutCubic }
@@ -274,7 +275,11 @@ Item {
                                 height: (sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
                                 // JARVIS: no surface at all - the small name, then the answer
                                 // itself at a readable measure; the avatar is the identity.
-                                Text { id: name; visible: row.isJarvis; x: 0; y: 5; text: feed.kindLabel(row.kind); color: Theme.materialBlue
+                                Text { id: name; visible: row.isJarvis; x: 0; y: 5
+                                       objectName: modelData.interrupted === true ? "feedInterrupted" : ""
+                                       // A reply that stopped part-way says so; it is never presented as an answer.
+                                       text: feed.kindLabel(row.kind) + (modelData.interrupted === true ? "  ·  " + qsTr("INTERRUPTED - INCOMPLETE ANSWER") : "")
+                                       color: modelData.interrupted === true ? Theme.warning : Theme.materialBlue
                                        opacity: 0.85
                                        font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.2 })
                                        lineHeightMode: Text.FixedHeight; lineHeight: 16 }
@@ -363,6 +368,58 @@ Item {
                                         visible: message.selectedText.length > 0
                                         onActivated: { bridge.quoteText(message.selectedText); message.deselect() } }
                     }
+                }
+            }
+            // The General Chat reply while it streams: ONE turn that grows in place.
+            // It is not part of the feed, so a delta rebuilds nothing; the final entry
+            // replaces it in the same frame. Same measure, rhythm and identity as a reply.
+            Item {
+                id: streamRow
+                objectName: "streamingReply"
+                visible: bridge.streamText !== ""
+                width: stack.width
+                height: visible ? Math.max(feed.avatarSize, streamText.y + streamText.height + 4 + streamStamp.height + 5) : 0
+                Item {
+                    width: feed.avatarSize; height: width
+                    Item { anchors.centerIn: parent; width: 32; height: 32
+                        Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: Theme.alpha("#36aaff", 0.09) }
+                        Rectangle { anchors.fill: parent; radius: 16; color: "#061424"; border.width: 1; border.color: "#2a5f8f" }
+                        Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
+                        Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" } }
+                }
+                Text { id: streamName; x: feed.messageX; y: 7; text: "JARVIS"; color: Theme.materialBlue; opacity: 0.85
+                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.2 })
+                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+                TextEdit {
+                    id: streamText
+                    objectName: "streamingReplyText"
+                    x: feed.messageX; y: streamName.y + streamName.height + 4
+                    width: Math.min(streamRow.width - feed.messageX, 760)
+                    text: bridge.streamText
+                    readOnly: true
+                    wrapMode: Text.Wrap
+                    textFormat: TextEdit.PlainText
+                    color: Theme.text
+                    font: feed.referenceLayout ? Theme.conversationBody : Qt.font({ family: Theme.font, pixelSize: 16 })
+                    // The same reading rhythm as the final reply, re-applied as text grows (guarded:
+                    // the formatting edit itself reports a text change).
+                    property bool formatting: false
+                    onTextChanged: if (!formatting && feed.referenceLayout && typeof typography !== "undefined") {
+                        formatting = true; typography.setLineHeight(textDocument, 28, 12); formatting = false }
+                }
+                Text { id: streamStamp; x: feed.messageX; y: streamText.y + streamText.height + 5; text: bridge.streamTime
+                       color: Theme.textMuted; style: Text.Outline; styleColor: "#b3000812"
+                       font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
+                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+                HoverHandler { id: streamHover }
+                Row {
+                    visible: streamRow.visible
+                    opacity: streamHover.hovered ? 1 : 0
+                    spacing: 14
+                    y: streamStamp.y
+                    x: streamStamp.x + streamStamp.width + 16
+                    MessageAction { objectName: "streamCopy"; label: qsTr("Copy"); onActivated: bridge.copyText(bridge.streamText) }
+                    MessageAction { objectName: "streamQuote"; label: qsTr("Quote"); onActivated: bridge.quoteText(bridge.streamText) }
                 }
             }
             Loader {

@@ -65,6 +65,7 @@ class _Emitter(QObject):
     """Lives on the GUI thread; the worker emits through it (queued)."""
 
     finished = Signal(str, int, object)
+    preview = Signal(str, str)        # request id, the reply text visible so far
 
 
 def _guarded(fn: Callable[[], Any]) -> Any:
@@ -106,6 +107,11 @@ class Bridge(QObject):
         self._pool.setMaxThreadCount(1)
         self._emitter = _Emitter(self)
         self._emitter.finished.connect(self._on_finished)
+        self._emitter.preview.connect(self._on_preview)
+        # The General Chat reply while it streams: ONE turn, shown apart from the
+        # feed until the final envelope replaces it (display only, never history).
+        self._stream_text = ""
+        self._stream_ts = 0.0
         self._sequence: dict[str, int] = {}
         self._handlers: dict[tuple[str, int], Callable[[Any], None]] = {}
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
@@ -309,18 +315,62 @@ class Bridge(QObject):
         self.approvalChanged.emit()
         self.dataChanged.emit()
 
+    # -- streaming preview ---------------------------------------------------
+
+    def _preview_relay(self, request_id: str) -> Callable[[str], None]:
+        """What the worker calls with each reply preview; it reaches the GUI thread queued."""
+        if self.sync:
+            return lambda text: self._on_preview(request_id, text)
+        emitter = self._emitter
+        return lambda text: emitter.preview.emit(request_id, text)
+
+    def _on_preview(self, request_id: str, text: str) -> None:
+        # Only the request that is still running may show text.
+        if request_id != self._request_id or not self._busy or not isinstance(text, str):
+            return
+        if not self._stream_text:
+            self._stream_ts = time.time()
+        self._stream_text = redact_text(text)
+        self.streamChanged.emit()
+
+    def _end_stream(self) -> str:
+        partial, self._stream_text = self._stream_text, ""
+        if partial:
+            self.streamChanged.emit()
+        return partial
+
+    streamChanged = Signal()
+
+    @Property(str, notify=streamChanged)
+    def streamText(self) -> str:
+        """The General Chat reply visible so far while it streams, else ""."""
+        return self._stream_text
+
+    @Property(str, notify=streamChanged)
+    def streamTime(self) -> str:
+        """The streaming turn's one stable time."""
+        if not self._stream_text:
+            return ""
+        return QLocale().toString(QDateTime.fromSecsSinceEpoch(int(self._stream_ts)).time(), QLocale.FormatType.ShortFormat)
+
     def _apply_text(self, payload: Any, text: str) -> None:
         intent = payload.get("intent") if isinstance(payload, dict) else None
         if not isinstance(intent, dict):
             intent = None
         status = str((intent or {}).get("status") or "")
+        partial = self._end_stream()
+        if partial and status not in ("conversation", "research"):
+            # The reply had started and did not finish: what was shown stays, marked
+            # incomplete - never passed off as an answer, never part of the history.
+            self._say("jarvis", partial, interrupted=True)
         if isinstance(intent, dict) and isinstance(intent.get("usage"), dict):
             self._chat_usage = dict(intent["usage"])
             for call in (self._chat_usage, self._chat_usage.get("research")):
                 if isinstance(call, dict) and isinstance(call.get("rate_limits"), dict):
                     self._claude_limits = {**call["rate_limits"], "seen_at": int(time.time())}
             if isinstance(self._chat_usage.get("quota"), dict):
-                self._codex_quota = {**self._chat_usage["quota"], "seen_at": int(time.time())}
+                quota = self._chat_usage["quota"]
+                self._codex_quota = {**quota, "seen_at": int(quota.get("checked_at") or time.time())}
             self.providersChanged.emit()
         verified = getattr(self.backend, "codex_verified", None)
         if isinstance(verified, dict) and verified:
@@ -330,6 +380,8 @@ class Bridge(QObject):
                     provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))} for m in provider.get("models") or []]
             self.providersChanged.emit()
         for entry in text_entries(payload):
+            if partial and status == "conversation":
+                entry["streamed"] = True        # replaces the preview in place: no second entrance
             self._say(entry.pop("kind"), entry.pop("text"), chat=status in ("conversation", "research"), **entry)
         self._clarification = {}
         if status == "structured":
@@ -558,10 +610,12 @@ class Bridge(QObject):
         self._task = {}
         language = self.language           # the default reply language for General Chat
         route = self._provider_route()
+        self._end_stream()
+        relay = self._preview_relay(request_id)
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
-                                             conversation=conversation, **route),
+                                             conversation=conversation, on_reply_preview=relay, **route),
             lambda payload: self._apply_text(payload, text),
         )
         return True
@@ -585,10 +639,13 @@ class Bridge(QObject):
         self._request_id = request_id
         language = self.language
         route = self._provider_route()
+        self._end_stream()
+        relay = self._preview_relay(request_id)
         self._run(
             "task",
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
-                                             response_language=language, conversation=conversation, **route),
+                                             response_language=language, conversation=conversation,
+                                             on_reply_preview=relay, **route),
             lambda payload: self._apply_text(payload, label),
         )
 

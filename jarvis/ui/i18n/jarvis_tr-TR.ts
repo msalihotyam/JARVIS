@@ -891,6 +891,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>SİSTEM</translation>
     </message>
     <message>
+        <source>INTERRUPTED - INCOMPLETE ANSWER</source>
+        <translation>YARIDA KESİLDİ - EKSİK YANIT</translation>
+    </message>
+    <message>
         <source>Sources</source>
         <translation>Kaynaklar</translation>
     </message>

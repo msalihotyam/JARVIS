@@ -3109,6 +3109,7 @@ class JarvisApp:
         request_id: str | None = None,
         response_language: str = "",
         conversation: Iterable[Mapping[str, str]] = (),
+        on_reply_preview: Callable[[str], None] | None = None,
     ) -> CommandResult:
         """Free text in, the authoritative envelope out.
 
@@ -3198,6 +3199,12 @@ class JarvisApp:
             id=request_id,
         )
         self._cancelled_text.discard(request_id)
+        # ``on_reply_preview`` sees a General Chat reply while it streams, when
+        # the adapter can stream. Display only: the envelope below - built from
+        # the validated proposal - stays the one result.
+        streams = on_reply_preview is not None and hasattr(model, "stream_listener")
+        if streams:
+            model.stream_listener = on_reply_preview
         try:
             result = model.complete(intent_task, SessionState(objective=text))
         except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
@@ -3206,6 +3213,9 @@ class JarvisApp:
                 IntentStatus.MODEL_FAILED,
                 f"The understanding model failed: {type(exc).__name__}.",
             )
+        finally:
+            if streams:
+                model.stream_listener = None
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)
         usage.update({

@@ -3260,8 +3260,9 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual("claude", bridge.chatProvider)                                   # not selectable in any way
         self.invoke(root, "claudeModel_haiku", "chosen")
         self.invoke(root, "applyModelButton", "clicked")
-        self.assertEqual(("haiku", None), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
-        self.assertEqual("Configured model: haiku · effort: Default", self.item(root, "configuredModelLine").property("text"))
+        # The row applies the id the alias RESOLVES to (the "haiku" alias was answered by Sonnet live).
+        self.assertEqual(("claude-haiku-4-5-20251001", None), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
+        self.assertEqual("Configured model: claude-haiku-4-5-20251001 · effort: Default", self.item(root, "configuredModelLine").property("text"))
         self.model.reported, self.model.observed = {}, {}
         def report(task):
             self.model.reported[task.id] = {"model": "claude-haiku-4-5-20251001", "input_tokens": 3, "output_tokens": 41}
@@ -3278,7 +3279,7 @@ class ProviderSelectionTests(UiTestCase):
         self.assertTrue(self.item(root, "claudeEffort").property("enabled"))
         QMetaObject.invokeMethod(self.item(root, "claudeEffort"), "picked", Q_ARG(str, "max")); pump(50)
         self.invoke(root, "applyModelButton", "clicked")
-        self.assertEqual(("opus[1m]", "max"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
+        self.assertEqual(("claude-opus-5[1m]", "max"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
 
     def test_choosing_codex_persists_routes_calls_there_and_changes_no_authority(self) -> None:
         bridge = self.bridge(task_proposal("code_analysis"))
@@ -3529,6 +3530,129 @@ class ConversationCleanlinessTests(UiTestCase):
         bridge.backend.scheduler_once = lambda: {"command": "scheduler-run", "error": {"code": "config_invalid", "message": "bad"}}
         bridge.runSweep()
         self.assertIn("REFUSED [config_invalid]", self.feed_text(bridge))
+
+
+class StreamingModel(ScriptedModel):
+    """A scripted understanding model that previews its reply while 'streaming' (the adapter contract)."""
+
+    stream_listener = None
+
+    def __init__(self, *answers, previews=(), during=None, **kwargs):
+        super().__init__(*answers, **kwargs)
+        self.previews = list(previews)
+        self.during = during
+
+    def complete(self, task, session):
+        for text in self.previews:
+            if self.stream_listener is not None:
+                self.stream_listener(text)
+            if self.during is not None:
+                self.during(text)
+        return super().complete(task, session)
+
+
+class StreamingChatTests(UiTestCase):
+    """A General Chat reply grows in ONE turn and the final answer replaces it once."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    FINAL = "Merhaba! Size nasıl yardımcı olabilirim? Bugün birlikte ne yapalım?"
+    PREVIEWS = ("Merhaba!", "Merhaba! Size nasıl", "Merhaba! Size nasıl yardımcı olabilirim?")
+
+    def streaming(self, *answers, previews=PREVIEWS, error=None):
+        self.model = StreamingModel(previews=previews, error=error)
+        self.seen = []
+        bridge = self.bridge(*answers)
+        self.model.during = lambda text: (pump(60), self.seen.append((bridge.streamText, len(bridge.feed), bridge.coreState)))
+        return bridge
+
+    def test_one_turn_grows_and_the_final_answer_replaces_it_without_a_duplicate(self) -> None:
+        bridge = self.streaming(proposal(kind="chat", reply=self.FINAL))
+        root = self.window(bridge)
+        row = self.item(root, "streamingReply")
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual([(p, 1, "running") for p in self.PREVIEWS], self.seen)       # the same turn, the feed untouched
+        self.assertEqual(["user", "jarvis"], self.kinds(bridge))
+        self.assertEqual((self.FINAL, True, True), (bridge.feed[-1]["text"], bridge.feed[-1]["chat"], bridge.feed[-1]["streamed"]))
+        self.assertEqual(("", False, "idle"), (bridge.streamText, row.isVisible(), bridge.coreState))
+        self.assertEqual(1, self.feed_text(bridge).count("Merhaba! Size nasıl"))       # no second copy
+        self.assertEqual(self.FINAL, bridge._conversation()[-1]["text"])
+
+    def test_the_streaming_row_shows_the_text_with_a_stable_time_and_copy_of_what_is_visible(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+        times = []
+        bridge = self.streaming(proposal(kind="chat", reply=self.FINAL))
+        root = self.window(bridge)
+
+        def look(text):
+            pump(60)
+            times.append(bridge.streamTime)
+            self.assertTrue(self.item(root, "streamingReply").isVisible())
+            self.assertEqual(text, self.item(root, "streamingReplyText").property("text"))
+            if text == self.PREVIEWS[1]:
+                QMetaObject.invokeMethod(self.item(root, "streamCopy"), "activated")
+                self.assertEqual(self.PREVIEWS[1], QGuiApplication.clipboard().text())
+        self.model.during = look
+        bridge.submitText("Merhaba"); pump(200)
+        self.assertEqual(3, len(times))
+        self.assertEqual(1, len(set(times)))                                            # the time never changes while streaming
+
+    def test_near_the_end_it_follows_and_reading_older_messages_it_never_pulls_down(self) -> None:
+        lines = ["Satır %d: akış sırasında büyüyen uzun bir yanıt. " % i for i in range(1, 40)]
+        previews = ["".join(lines[:n]) for n in range(4, 40, 6)]
+        bridge = self.streaming(proposal(kind="chat", reply="".join(lines)), previews=previews)
+        root = self.window(bridge)
+        feed = self.item(root, "conversationFeed")
+        for i in range(30):
+            bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height.")
+        pump(800)
+        gaps = []
+        self.model.during = lambda text: (pump(400), gaps.append(feed.property("contentHeight") - feed.property("viewportHeight") - feed.property("contentY")))
+        bridge.submitText("Uzun yanıt ver."); pump(800)
+        self.assertTrue(gaps and all(gap < 40 for gap in gaps[1:]), gaps)              # the growing answer stays in view
+        # Reading older messages while a reply streams: the position is kept, the arrow offered, nothing loops.
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 100.0)); pump(200)
+        bridge._busy, bridge._request_id = True, "live"
+        positions = []
+        for text in previews:
+            bridge._on_preview("live", text); pump(250)
+            positions.append(round(feed.property("contentY")))
+        self.assertEqual({100}, set(positions))
+        self.assertTrue(feed.property("jumpVisible"))
+        bridge._busy = False
+        final = {"command": "text", "intent": {"status": "conversation", "reply": "".join(lines), "request_id": "live", "choices": []},
+                 "run": None, "job": None, "error": None}
+        bridge._apply_text(final, "Uzun yanıt ver."); pump(400)
+        # Two completed replies in this test, each shown exactly once.
+        self.assertEqual((100, "", 2), (round(feed.property("contentY")), bridge.streamText, self.feed_text(bridge).count("Satır 39")))
+        glides = feed.property("glideCount"); pump(1000)
+        self.assertEqual((glides, 100), (feed.property("glideCount"), round(feed.property("contentY"))))   # settled: no oscillation
+
+    def test_a_failure_after_partial_text_keeps_it_marked_incomplete_and_before_text_is_a_clean_error(self) -> None:
+        failure = StructuredError(ErrorCode.CONNECTOR_FAILED, "Claude Code request failed.")
+        bridge = self.streaming(previews=("Kısmi bir yanıt",), error=failure)
+        root = self.window(bridge)
+        bridge.submitText("Merhaba"); pump(300)
+        self.assertEqual(["user", "jarvis", "error"], self.kinds(bridge))
+        partial = bridge.feed[1]
+        self.assertEqual(("Kısmi bir yanıt", True), (partial["text"], partial.get("interrupted")))
+        self.assertNotIn("chat", partial)                                               # never part of the conversation window
+        self.assertEqual(["Merhaba"], [t["text"] for t in bridge._conversation()])
+        self.assertIn("INTERRUPTED - INCOMPLETE ANSWER", self.item(root, "feedInterrupted").property("text"))
+        self.assertEqual("", bridge.streamText)
+        before = self.streaming(previews=(), error=failure)
+        before.submitText("Merhaba")
+        self.assertEqual(["user", "error"], self.kinds(before))
+        self.assertNotIn("{", self.feed_text(before))
+
+    def test_a_stale_preview_never_shows(self) -> None:
+        bridge = self.streaming(proposal(kind="chat", reply="ok"))
+        bridge._busy, bridge._request_id = True, "current"
+        bridge._on_preview("earlier", "eski metin")
+        self.assertEqual("", bridge.streamText)
+        bridge._busy = False
+        bridge._on_preview("current", "yeni")
+        self.assertEqual("", bridge.streamText)                                         # nothing running: nothing shown
 
 
 class ChatPresentationTests(UiTestCase):

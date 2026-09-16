@@ -42,7 +42,7 @@ from jarvis.app import (
 )
 from jarvis.cli import _config_change, _config_reset_change
 from jarvis.antigravity import antigravity_state
-from jarvis.codex import CodexIntentAdapter, codex_state
+from jarvis.codex import CodexIntentAdapter, codex_state, remember_codex_state
 from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE, ClaudeCodeConnector
 from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
 from jarvis.contracts import BillingClass, ErrorCode
@@ -208,6 +208,8 @@ class Backend:
             state = self.codex_state()
         except Exception:  # noqa: BLE001
             state = {"status": "unavailable", "models": []}
+        if self.codex_state is codex_state:
+            remember_codex_state(state)          # the panel's fresh check serves the next chat too
         # DISCOVERED (the account lists it) is not USABLE: each model carries what
         # a real call in this session showed - "usable", "failed" + reason, or
         # nothing yet ("" = discovered, not verified).
@@ -229,7 +231,7 @@ class Backend:
     def submit_text(
         self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = "",
         response_language: str = "", conversation: tuple = (), provider: str = "claude", model: str = "",
-        effort: str = "",
+        effort: str = "", on_reply_preview: Callable[[str], None] | None = None,
     ) -> dict:
         request_id = request_id or str(uuid4())
 
@@ -247,6 +249,7 @@ class Backend:
                 return app.submit_text(
                     text, session_id, previous_text=previous_text, request_id=request_id,
                     response_language=response_language, conversation=conversation,
+                    on_reply_preview=on_reply_preview,
                 )
             finally:
                 self._text_app = None
