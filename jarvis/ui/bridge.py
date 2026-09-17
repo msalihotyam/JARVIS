@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, QUrl, Signal, Slot
+from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QWindow
 
 from jarvis.context_items import (
@@ -43,6 +44,8 @@ from jarvis.context_items import (
 )
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
+from jarvis.ui import weather
+from jarvis.ui.telemetry import Sampler
 from jarvis.ui.preferences import (
     CHAT_PROVIDERS,
     CONTEXTUAL_PANELS,
@@ -119,7 +122,8 @@ class Bridge(QObject):
     attentionChanged = Signal()   # the safety projection may have changed
 
     def __init__(
-        self, backend: Backend, preferences: UiPreferences, *, sync: bool = False, parent: QObject | None = None
+        self, backend: Backend, preferences: UiPreferences, *, sync: bool = False, parent: QObject | None = None,
+        weather_key: str = "",
     ) -> None:
         super().__init__(parent)
         self.backend = backend
@@ -144,6 +148,37 @@ class Bridge(QObject):
         self._response_mode = DEFAULT_RESPONSE_MODE
         self._snapshots = Path(tempfile.mkdtemp(prefix="jarvis-attachments-"))
         self._entry_seq = 0
+        # Local machine load for the System status card: read-only kernel
+        # figures, sampled on a slow clock. Nothing until the first reading.
+        self._sampler = Sampler()
+        self._telemetry: dict[str, Any] = {"available": False}
+        self._telemetry_timer = QTimer(self)
+        self._telemetry_timer.setInterval(5_000)
+        self._telemetry_timer.timeout.connect(self._sample_telemetry)
+        QTimer.singleShot(1_500, self._sample_telemetry)
+        self._telemetry_timer.start()
+        # Current weather for the clock card (jarvis.ui.weather): the operator's
+        # fixed place, its own thread (never the chat worker), every ~5 minutes,
+        # and no network at all without a key. The key is held here only.
+        self._weather_key = weather_key
+        self._weather_fetch = weather.fetch_json
+        self._weather_cache = self.prefs.path.parent / "weather-location.json"
+        self._weather_location: dict[str, Any] | None = None
+        self._weather_reading: dict[str, Any] | None = None
+        self._weather_error = ""
+        self._weather_view: dict[str, Any] = weather.project(None, None)
+        self._weather_busy = False
+        self._weather_next = 0.0
+        # Set once by ``shutdown``; under the lock so a finishing weather thread
+        # either delivers before it or never.
+        self._shutting_down = False
+        self._weather_lock = threading.Lock()
+        self._weatherDone.connect(self._weather_finished, Qt.QueuedConnection)
+        self._weather_timer = QTimer(self)
+        self._weather_timer.setInterval(60_000)
+        self._weather_timer.timeout.connect(self._weather_tick)
+        QTimer.singleShot(3_000, self._weather_tick)
+        self._weather_timer.start()
         self._sequence: dict[str, int] = {}
         self._handlers: dict[tuple[str, int], Callable[[Any], None]] = {}
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
@@ -534,6 +569,88 @@ class Bridge(QObject):
     def taskLive(self) -> bool:
         return bool(self._session_id) and (self._busy or (
             bool(self._task.get("status")) and self._task.get("status") not in TERMINAL_STATUSES))
+
+    # -- local telemetry: a gauge, never a capability ---------------------------
+
+    telemetryChanged = Signal()
+
+    def _sample_telemetry(self) -> None:
+        try:
+            sample = self._sampler.sample()
+        except Exception:  # noqa: BLE001 - a gauge that cannot read shows nothing
+            sample = {"available": False}
+        if sample != self._telemetry:
+            self._telemetry = sample
+            self.telemetryChanged.emit()
+
+    @Property("QVariantMap", notify=telemetryChanged)
+    def telemetry(self) -> dict:
+        """CPU, memory and disk use of THIS machine as the kernel reports them
+        (``available`` False until read, and whenever a figure cannot be read -
+        then the card shows nothing rather than a placeholder)."""
+        return dict(self._telemetry)
+
+    # -- current weather: read-only, one fixed place ----------------------------
+
+    weatherChanged = Signal()
+    _weatherDone = Signal(object)
+
+    def _weather_tick(self) -> None:
+        """Re-judge freshness every minute; refresh when due (about every 5 minutes)."""
+        if self._shutting_down:
+            return
+        self._publish_weather()
+        if not self._weather_key or self._weather_busy or time.monotonic() < self._weather_next:
+            return
+        self._weather_busy = True
+        self._weather_next = time.monotonic() + weather.REFRESH_SECONDS
+        cache, key, fetch, location = self._weather_cache, self._weather_key, self._weather_fetch, self._weather_location
+
+        def work() -> tuple:
+            try:
+                return weather.refresh(cache, key, fetch, location)
+            except Exception:  # noqa: BLE001 - weather never breaks the interface
+                return location, None, "network"
+
+        if self.sync:
+            self._weather_finished(work())
+            return
+
+        def run() -> None:
+            result = work()
+            with self._weather_lock:
+                if self._shutting_down:     # JARVIS is quitting: the result is dropped
+                    return
+                self._weatherDone.emit(result)
+
+        threading.Thread(target=run, name="jarvis-weather", daemon=True).start()
+
+    def _weather_finished(self, result: tuple) -> None:
+        if self._shutting_down:
+            return
+        location, reading, error = result
+        self._weather_busy = False
+        if location is not None:
+            self._weather_location = location
+        if reading is not None:         # a failed refresh keeps the last good reading
+            self._weather_reading = reading
+        self._weather_error = error
+        if error in ("rate_limited", "auth", "not_found", "no_key") or (error and location is None):
+            self._weather_next = time.monotonic() + weather.HOLD_SECONDS
+        self._publish_weather()
+
+    def _publish_weather(self) -> None:
+        view = weather.project(self._weather_location, self._weather_reading)
+        if view != self._weather_view:
+            self._weather_view = view
+            self.weatherChanged.emit()
+
+    @Property("QVariantMap", notify=weatherChanged)
+    def weather(self) -> dict:
+        """The clock card's weather: ``state`` fresh / stale / unavailable, and only
+        real values (district, rounded temperature, condition key, reading and fetch
+        times). No key, coordinate or error detail is ever part of it."""
+        return dict(self._weather_view)
 
     @Property(int, notify=stateChanged)
     def uptimeSeconds(self) -> int:
@@ -1142,8 +1259,27 @@ class Bridge(QObject):
 
     @staticmethod
     def _shown(item: dict) -> dict:
-        """An item as the interface shows it: JARVIS's snapshot path stays here."""
-        return {key: value for key, value in item.items() if key != "path"}
+        """An item as the interface shows it. The original path was never kept;
+        an image gets a ``preview`` URL to JARVIS's own snapshot copy, the only
+        file a thumbnail or the lightbox ever reads."""
+        shown = {key: value for key, value in item.items() if key != "path"}
+        if item.get("kind") == "image" and type(item.get("path")) is str:
+            shown["preview"] = QUrl.fromLocalFile(item["path"]).toString()
+        return shown
+
+    # -- attachment preview: display only ------------------------------------------
+
+    #: The interface asked to look at one attachment (the lightbox / text view).
+    previewRequested = Signal("QVariant")
+
+    @Slot("QVariant")
+    def previewAttachment(self, file: Any) -> None:
+        """Open the internal preview for one attachment as the interface holds
+        it (name, size, snapshot preview URL, snapshotted text). It reads no
+        path: what is shown is exactly what was already taken at attach time."""
+        if isinstance(file, dict) and file.get("kind") in ("image", "text"):
+            self.previewRequested.emit({key: file[key] for key in ("id", "kind", "name", "bytes", "media_type", "preview", "text", "truncated")
+                                        if key in file})
 
     @Property("QVariantList", notify=groupsChanged)
     def contextGroups(self) -> list:
@@ -1927,6 +2063,16 @@ class Bridge(QObject):
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS interface started"), ()), "system")
         if self.devFixture:
             self._seed_dev_fixture()
+
+    def shutdown(self) -> None:
+        """The application is really quitting (never Window X, Freeze or Cancel):
+        stop every clock this bridge owns and refuse late weather deliveries, so
+        nothing schedules UI work while the QML tree is torn down. The bridge
+        itself stays whole until the engine is gone (``jarvis.ui.app.teardown``)."""
+        with self._weather_lock:
+            self._shutting_down = True
+        for timer in self.findChildren(QTimer):
+            timer.stop()
 
     @Slot()
     def waitIdle(self) -> None:

@@ -14,6 +14,7 @@ from pathlib import Path
 from jarvis.ui.backend import Backend
 from jarvis.ui.bridge import Bridge
 from jarvis.ui.preferences import UiPreferences
+from jarvis.ui.weather import KEY_ENV as WEATHER_KEY_ENV
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
@@ -82,7 +83,10 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("JARVIS")
     app.setOrganizationName("JARVIS")
-    bridge = Bridge(Backend(), UiPreferences())
+    # The weather key is taken OUT of the environment before anything starts, so
+    # no child process (Claude, Codex, Antigravity...) ever inherits it.
+    weather_key = os.environ.pop(WEATHER_KEY_ENV, "").strip()
+    bridge = Bridge(Backend(), UiPreferences(), weather_key=weather_key)
     engine = create_engine(bridge)
     if not engine.rootObjects():
         return 1
@@ -94,4 +98,24 @@ def main(argv: list[str] | None = None) -> int:
     # Due work is swept while the application runs, the tray included; the
     # timer belongs to the bridge, so quitting ends it with the process.
     install_scheduler_sweeps(bridge)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        teardown(bridge, engine)
+
+
+def teardown(bridge: Bridge, engine) -> None:
+    """End the QML tree while the bridge it reads is still whole.
+
+    Left to Python, ``main``'s locals are released in slot order when it
+    returns - the bridge BEFORE the engine - and every live binding then
+    re-evaluates against a null ``bridge`` (a TypeError per binding). So the
+    order is explicit: the bridge stops its clocks and refuses late deliveries,
+    the engine (and with it the window and every binding) is deleted now, and
+    only then may the bridge go.
+    """
+    import shiboken6
+
+    bridge.shutdown()
+    if shiboken6.isValid(engine):
+        shiboken6.delete(engine)

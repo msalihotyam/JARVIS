@@ -23,7 +23,7 @@ Item {
 
     Rectangle {
         id: head
-        width: parent.width; height: 46; radius: Theme.radiusSmall
+        width: parent.width; height: 52; radius: Theme.radiusSmall
         opacity: field.enabled ? 1 : 0.55
         color: hit.containsMouse && field.enabled ? Theme.alpha(Theme.commandEdge, 0.08)
                : field.open ? Theme.alpha(Theme.commandEdge, 0.05) : "transparent"
@@ -32,9 +32,9 @@ Item {
         Column {
             x: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 42; spacing: 1
             Text { objectName: "collapsedTitle"; width: parent.width; elide: Text.ElideRight
-                   text: field.title; color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
+                   text: field.title; color: "#e8f4ff"; font { family: Theme.font; pixelSize: 16; weight: Font.DemiBold } }
             Text { objectName: "collapsedMeta"; visible: field.meta !== ""; width: parent.width; elide: Text.ElideRight
-                   text: field.meta; color: Theme.textDim; font { family: Theme.font; pixelSize: 11 } }
+                   text: field.meta; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
         }
         // The 10 px chevron, reversed when the choices are showing.
         Canvas {

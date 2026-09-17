@@ -272,7 +272,7 @@ Item {
                                    font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 2.2 }) }
                             Item {
                                 width: parent.width
-                                height: (sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
+                                height: (sent.visible ? sent.y + sent.height : sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
                                 // An ordinary JARVIS reply keeps its open shape; the only
                                 // addition is a very quiet dark pane behind the text so the
                                 // planet below never competes with it. No border, no card.
@@ -323,6 +323,40 @@ Item {
                                     // The offer to quote appears AT the selection, and only
                                     // for a message that may be quoted at all.
                                     onSelectedTextChanged: row.conversational ? feed.offerQuote(message, modelData.id) : feed.hideQuoteTip()
+                                }
+                                // What the person attached to this message, still visible after
+                                // sending: each file with the letter of the group that owned it,
+                                // then the message's own files. Same cards as the draft.
+                                Flow {
+                                    id: sent
+                                    objectName: "sentAttachments"
+                                    readonly property var files: {
+                                        var out = []
+                                        var groups = modelData.groups || []
+                                        for (var g = 0; g < groups.length; g++) {
+                                            var owned = groups[g].attachments || []
+                                            for (var i = 0; i < owned.length; i++) out.push({ file: owned[i], label: String.fromCharCode(65 + g) })
+                                        }
+                                        var own = modelData.attachments || []
+                                        for (var j = 0; j < own.length; j++) out.push({ file: own[j], label: "" })
+                                        return out
+                                    }
+                                    visible: row.isUser && files.length > 0
+                                    y: message.y + message.height + 8
+                                    width: message.width
+                                    spacing: 6
+                                    Repeater {
+                                        model: sent.files
+                                        Item {
+                                            width: card.width + (badge.visible ? 22 : 0); height: card.height
+                                            Rectangle { id: badge; visible: modelData.label !== ""; x: 0; y: (parent.height - 18) / 2; width: 18; height: 18; radius: 9
+                                                        color: Theme.alpha("#36aaff", 0.14); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.45)
+                                                        Text { anchors.centerIn: parent; text: modelData.label; color: Theme.text
+                                                               font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold }) } }
+                                            AttachmentCard { id: card; x: badge.visible ? 22 : 0; file: modelData.file; compact: true
+                                                             onOpened: bridge.previewAttachment(modelData.file) }
+                                        }
+                                    }
                                 }
                                 // Web Research: the public pages behind the answer. Untrusted
                                 // links, plain text; a click opens only an http(s) page in the

@@ -38,8 +38,10 @@ Window {
     // windowed). Only a real change between those states updates it:
     // minimizing, hiding to the tray and Alt+Tab never do. Open JARVIS restores it.
     property int restoreVisibility: Window.FullScreen
-    onVisibilityChanged: if (visibility === Window.Windowed || visibility === Window.Maximized
-                             || visibility === Window.FullScreen) restoreVisibility = visibility
+    onVisibilityChanged: function(visibility) {
+        if (visibility === Window.Windowed || visibility === Window.Maximized
+                || visibility === Window.FullScreen) restoreVisibility = visibility
+    }
 
     // Window X hides JARVIS to the system tray: the process, the session and
     // any work keep running (unless JARVIS is frozen separately). Only Quit
@@ -286,6 +288,9 @@ Window {
         }
     }
     ModelPanel { id: modelPanel; anchorPoint: topBar.modelAnchor }
+    // The internal attachment preview (image lightbox / text view), above every panel.
+    AttachmentPreview { id: attachmentPreview }
+    Connections { target: bridge; function onPreviewRequested(file) { attachmentPreview.show(file) } }
 
     // -- the left ambient rail's summary stack and its quick-look peek ------
     // The rail sits under the date / time / context block, inside the Phase 1
@@ -366,7 +371,8 @@ Window {
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
     Shortcut { sequence: "Ctrl+6"; onActivated: root.toggleSettings() }
     Shortcut { sequence: "Escape"; onActivated: {
-        if (palette.open) palette.hide()
+        if (attachmentPreview.open) attachmentPreview.close()
+        else if (palette.open) palette.hide()
         else if (confirm.open) confirm.open = false
         else if (resumeConfirm.open) resumeConfirm.open = false
         else if (settings.open) settings.open = false

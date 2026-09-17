@@ -1878,6 +1878,10 @@ class ContextItemsTests(IntentTestCase):
         item = attach_file(good, folder / "snap", "att-1")
         self.assertEqual(("text", "notes.md", "text/markdown", "# Başlık\nSatır"),
                          (item["kind"], item["name"], item["media_type"], item["text"]))
+        # The record carries a stable identity and its storage scope: enough for a
+        # later project or library scope to adopt it without a second store.
+        self.assertEqual("chat", item["scope"])
+        self.assertTrue(item["sha256"] and item["attached_at"] > 0)
         # The bytes are COPIED at attach time: editing the original afterwards
         # cannot change what the draft will send.
         snapshot = Path(item["path"])

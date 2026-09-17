@@ -145,6 +145,52 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
 </context>
 <context>
+    <name>AttachmentCard</name>
+    <message>
+        <source>%1 B</source>
+        <translation>%1 B</translation>
+    </message>
+    <message>
+        <source>%1 KB</source>
+        <translation>%1 KB</translation>
+    </message>
+    <message>
+        <source>%1 MB</source>
+        <translation>%1 MB</translation>
+    </message>
+    <message>
+        <source>Image</source>
+        <translation>Görsel</translation>
+    </message>
+    <message>
+        <source>File</source>
+        <translation>Dosya</translation>
+    </message>
+    <message>
+        <source>Remove this attachment</source>
+        <translation>Bu eki kaldır</translation>
+    </message>
+</context>
+<context>
+    <name>AttachmentPreview</name>
+    <message>
+        <source>Image</source>
+        <translation>Görsel</translation>
+    </message>
+    <message>
+        <source>Text file</source>
+        <translation>Metin dosyası</translation>
+    </message>
+    <message>
+        <source>shown up to the first %1 characters</source>
+        <translation>ilk %1 karaktere kadar gösterilir</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Kapat</translation>
+    </message>
+</context>
+<context>
     <name>AttentionStrip</name>
     <message>
         <source>Previous item</source>
@@ -371,6 +417,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>A message can carry at most %1 context items.</source>
+        <extracomment>The interface asked to look at one attachment (the lightbox / text view).</extracomment>
         <translation>Bir mesaj en fazla %1 bağlam ögesi taşıyabilir.</translation>
     </message>
     <message>
@@ -723,10 +770,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Disk</translation>
     </message>
     <message>
-        <source>Telemetry not measured</source>
-        <translation>Telemetri ölçülmüyor</translation>
-    </message>
-    <message>
         <source>Agent capacity</source>
         <translation>Ajan kapasitesi</translation>
     </message>
@@ -891,10 +934,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yanıt</translation>
     </message>
     <message>
-        <source>Remove this attachment</source>
-        <translation>Bu eki kaldır</translation>
-    </message>
-    <message>
         <source>Evaluate together</source>
         <translation>Birlikte değerlendir</translation>
     </message>
@@ -945,14 +984,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Attached to the message</source>
         <translation>Mesajın ekleri</translation>
-    </message>
-    <message>
-        <source>Image</source>
-        <translation>Görsel</translation>
-    </message>
-    <message>
-        <source>File</source>
-        <translation>Dosya</translation>
     </message>
     <message>
         <source>Note</source>
@@ -1217,8 +1248,105 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>LeftContextCard</name>
     <message>
-        <source>%1, %2, Local time, %3. Weather not connected.</source>
-        <translation>%1, %2, yerel saat, %3. Hava durumu bağlı değil.</translation>
+        <source>Clear</source>
+        <comment>weather</comment>
+        <translation>Açık</translation>
+    </message>
+    <message>
+        <source>Mostly clear</source>
+        <translation>Çoğunlukla açık</translation>
+    </message>
+    <message>
+        <source>Partly cloudy</source>
+        <translation>Parçalı bulutlu</translation>
+    </message>
+    <message>
+        <source>Mostly cloudy</source>
+        <translation>Çok bulutlu</translation>
+    </message>
+    <message>
+        <source>Cloudy</source>
+        <translation>Bulutlu</translation>
+    </message>
+    <message>
+        <source>Fog</source>
+        <translation>Sisli</translation>
+    </message>
+    <message>
+        <source>Light fog</source>
+        <translation>Hafif sisli</translation>
+    </message>
+    <message>
+        <source>Drizzle</source>
+        <translation>Çisenti</translation>
+    </message>
+    <message>
+        <source>Rain</source>
+        <translation>Yağmurlu</translation>
+    </message>
+    <message>
+        <source>Light rain</source>
+        <translation>Hafif yağmurlu</translation>
+    </message>
+    <message>
+        <source>Heavy rain</source>
+        <translation>Kuvvetli yağmur</translation>
+    </message>
+    <message>
+        <source>Snow</source>
+        <translation>Karlı</translation>
+    </message>
+    <message>
+        <source>Flurries</source>
+        <translation>Kar serpintisi</translation>
+    </message>
+    <message>
+        <source>Light snow</source>
+        <translation>Hafif karlı</translation>
+    </message>
+    <message>
+        <source>Heavy snow</source>
+        <translation>Yoğun kar</translation>
+    </message>
+    <message>
+        <source>Freezing drizzle</source>
+        <translation>Donan çisenti</translation>
+    </message>
+    <message>
+        <source>Freezing rain</source>
+        <translation>Donan yağmur</translation>
+    </message>
+    <message>
+        <source>Light freezing rain</source>
+        <translation>Hafif donan yağmur</translation>
+    </message>
+    <message>
+        <source>Heavy freezing rain</source>
+        <translation>Kuvvetli donan yağmur</translation>
+    </message>
+    <message>
+        <source>Ice pellets</source>
+        <translation>Buz taneleri</translation>
+    </message>
+    <message>
+        <source>Heavy ice pellets</source>
+        <translation>Yoğun buz taneleri</translation>
+    </message>
+    <message>
+        <source>Light ice pellets</source>
+        <translation>Hafif buz taneleri</translation>
+    </message>
+    <message>
+        <source>Thunderstorm</source>
+        <translation>Gök gürültülü sağanak</translation>
+    </message>
+    <message>
+        <source>%1, %2. %3, %4 %5, reading at %6.</source>
+        <translation>%1, %2. %3, %4 %5, ölçüm saati %6.</translation>
+    </message>
+    <message>
+        <source>%1, %2, Local time, %3. Weather unavailable.</source>
+        <translation>%1, %2, Yerel saat, %3. Hava durumu yok.</translation>
     </message>
     <message>
         <source>Local</source>
@@ -1229,14 +1357,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yerel saat</translation>
     </message>
     <message>
-        <source>Not
-connected</source>
-        <translation>Bağlı
-değil</translation>
+        <source>Last reading %1</source>
+        <translation>Son ölçüm %1</translation>
     </message>
     <message>
-        <source>Weather not connected</source>
-        <translation>Hava durumu bağlı değil</translation>
+        <source>As of %1</source>
+        <translation>%1 itibarıyla</translation>
+    </message>
+    <message>
+        <source>Weather
+unavailable</source>
+        <translation>Hava durumu
+yok</translation>
     </message>
 </context>
 <context>
@@ -1356,10 +1488,6 @@ değil</translation>
         <translation>Abonelik yolu doğrulandı</translation>
     </message>
     <message>
-        <source>MODEL</source>
-        <translation>MODEL</translation>
-    </message>
-    <message>
         <source>CLI default</source>
         <translation>CLI varsayılanı</translation>
     </message>
@@ -1408,8 +1536,14 @@ değil</translation>
         <translation>Bağlı - sohbet güvenlik nedeniyle kapalı</translation>
     </message>
     <message>
-        <source>PROVIDER</source>
-        <translation>SAĞLAYICI</translation>
+        <source>Available</source>
+        <comment>capability</comment>
+        <translation>Var</translation>
+    </message>
+    <message>
+        <source>Unavailable</source>
+        <comment>capability</comment>
+        <translation>Yok</translation>
     </message>
     <message>
         <source>Checking the providers…</source>
@@ -1420,44 +1554,8 @@ değil</translation>
         <translation>Sağlayıcı istekleri yanıtlar ve yorumlar; JARVIS&apos;in neler yapabileceğini asla değiştirmez. Seçim elle yapılır, otomatik geçiş yoktur.</translation>
     </message>
     <message>
-        <source>Hide Antigravity quota</source>
-        <translation>Antigravity kotasını gizle</translation>
-    </message>
-    <message>
-        <source>Show Antigravity quota (read-only)</source>
-        <translation>Antigravity kotasını göster (salt okunur)</translation>
-    </message>
-    <message>
-        <source>ANTIGRAVITY QUOTA (READ-ONLY)</source>
-        <translation>ANTIGRAVITY KOTASI (SALT OKUNUR)</translation>
-    </message>
-    <message>
-        <source>5-hour</source>
-        <translation>5 saatlik</translation>
-    </message>
-    <message>
-        <source>Weekly</source>
-        <translation>Haftalık</translation>
-    </message>
-    <message>
         <source>Currently %1</source>
         <translation>Şu an %1</translation>
-    </message>
-    <message>
-        <source>The CLI did not list its models; enter one below.</source>
-        <translation>CLI modellerini listelemedi; aşağıya bir model girin.</translation>
-    </message>
-    <message>
-        <source>Other model (as the CLI names it)</source>
-        <translation>Başka model (CLI&apos;nin adlandırdığı şekilde)</translation>
-    </message>
-    <message>
-        <source>e.g. claude-sonnet-5</source>
-        <translation>ör. claude-sonnet-5</translation>
-    </message>
-    <message>
-        <source>EFFORT</source>
-        <translation>EFOR</translation>
     </message>
     <message>
         <source>Default</source>
@@ -1468,20 +1566,56 @@ değil</translation>
         <translation>Bu model efor ayarını desteklemiyor.</translation>
     </message>
     <message>
-        <source>USAGE / QUOTA</source>
-        <translation>KULLANIM / KOTA</translation>
-    </message>
-    <message>
         <source>Configured model: %1 · effort: %2</source>
         <translation>Yapılandırılan model: %1 · efor: %2</translation>
     </message>
     <message>
-        <source>Answered the last call: %1</source>
-        <translation>Son çağrıyı yanıtlayan: %1</translation>
+        <source>Provider</source>
+        <translation>Sağlayıcı</translation>
     </message>
     <message>
-        <source>Answered the last call: no Claude call yet</source>
-        <translation>Son çağrıyı yanıtlayan: henüz Claude çağrısı yok</translation>
+        <source>Model</source>
+        <translation>Model</translation>
+    </message>
+    <message>
+        <source>The CLI did not list its models.</source>
+        <translation>CLI modellerini listelemedi.</translation>
+    </message>
+    <message>
+        <source>Effort</source>
+        <translation>Efor</translation>
+    </message>
+    <message>
+        <source>Usage</source>
+        <translation>Kullanım</translation>
+    </message>
+    <message>
+        <source>Answered the last call</source>
+        <translation>Son çağrıyı yanıtlayan</translation>
+    </message>
+    <message>
+        <source>No Claude call yet</source>
+        <translation>Henüz Claude çağrısı yok</translation>
+    </message>
+    <message>
+        <source>%1 calls, one per group</source>
+        <translation>%1 çağrı, grup başına bir tane</translation>
+    </message>
+    <message>
+        <source>Plan, this session</source>
+        <translation>Plan, bu oturum</translation>
+    </message>
+    <message>
+        <source>%1% left</source>
+        <translation>%%1 kaldı</translation>
+    </message>
+    <message>
+        <source>Not reported yet</source>
+        <translation>Henüz bildirilmedi</translation>
+    </message>
+    <message>
+        <source>Resets %1</source>
+        <translation>Sıfırlanma: %1</translation>
     </message>
     <message>
         <source>Current session (5 h)</source>
@@ -1498,6 +1632,10 @@ değil</translation>
     <message>
         <source>Current week (Sonnet)</source>
         <translation>Bu hafta (Sonnet)</translation>
+    </message>
+    <message>
+        <source>Web Research</source>
+        <translation>Web Araştırması</translation>
     </message>
     <message>
         <source>Plan limits: shown after the first Claude call - Claude Code reports them with each answer, and JARVIS makes no call just to check.</source>
@@ -1528,14 +1666,6 @@ değil</translation>
         <translation>Son çağrı token: %1 girdi · %2 önbellek okuma · %3 önbellek yazma · %4 çıktı</translation>
     </message>
     <message>
-        <source>Web Research: available on this provider (read-only public web search).</source>
-        <translation>Web Araştırması: bu sağlayıcıda kullanılabilir (salt okunur genel web araması).</translation>
-    </message>
-    <message>
-        <source>Attachments: images and text-like files, exactly the ones you pick.</source>
-        <translation>Ekler: görseller ve metin türü dosyalar, tam olarak sizin seçtikleriniz.</translation>
-    </message>
-    <message>
         <source>No model chosen</source>
         <translation>Model seçilmedi</translation>
     </message>
@@ -1564,16 +1694,20 @@ değil</translation>
         <translation>Kayıtlı model %1 şu an sunulmuyor; bir model seçene kadar çağrılar reddedilir.</translation>
     </message>
     <message>
+        <source>Answering model</source>
+        <translation>Yanıtlayan model</translation>
+    </message>
+    <message>
         <source>none</source>
         <translation>yok</translation>
     </message>
     <message>
-        <source>model default</source>
-        <translation>model varsayılanı</translation>
+        <source>Codex does not report it - the call requests %1</source>
+        <translation>Codex bunu bildirmiyor - çağrı %1 modelini istiyor</translation>
     </message>
     <message>
-        <source>Answering model: Codex does not report it - the call requests %1</source>
-        <translation>Yanıtlayan model: Codex bunu bildirmiyor - çağrı %1 modelini istiyor</translation>
+        <source>model default</source>
+        <translation>model varsayılanı</translation>
     </message>
     <message>
         <source>5-hour window</source>
@@ -1602,10 +1736,6 @@ değil</translation>
     <message>
         <source>Last call tokens: %1 input · %2 cached · %3 output · %4 reasoning</source>
         <translation>Son çağrı token: %1 girdi · %2 önbellekten · %3 çıktı · %4 akıl yürütme</translation>
-    </message>
-    <message>
-        <source>Web Research: not available with Codex in this build - research questions are refused, never sent to another provider.</source>
-        <translation>Web Araştırması: bu sürümde Codex ile kullanılamaz - araştırma soruları reddedilir, asla başka bir sağlayıcıya gönderilmez.</translation>
     </message>
     <message>
         <source>Last call: no usage reported yet</source>
@@ -1881,8 +2011,8 @@ değil</translation>
         <translation>Disk</translation>
     </message>
     <message>
-        <source>Not measured by this build</source>
-        <translation>Bu sürümde ölçülmüyor</translation>
+        <source>This machine, now</source>
+        <translation>Bu makine, şu an</translation>
     </message>
     <message>
         <source>Uptime</source>

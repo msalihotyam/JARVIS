@@ -96,18 +96,20 @@ Item {
         Row { width: dock.contentWidth; height: dock.height; spacing: 12
         GlassPanel {
             width: dock.contentWidth * 0.29; height: parent.height; title: qsTr("System status"); badge: bridge.executionEnabled ? qsTr("running") : qsTr("frozen"); padding: 14; brackets: true
-            Row { anchors { left: parent.left; right: parent.right; top: parent.top } spacing: 12
-                Repeater { model: ["CPU", "RAM", qsTr("Disk")]
-                    Item { width: (parent.width - 24) / 3; height: 77
-                        Rectangle { anchors.centerIn: parent; width: 65; height: 65; radius: 32.5; color: "transparent"; border.width: 6; border.color: Theme.alpha(Theme.textDim, 0.3) }
+            // Real machine load only; without a reading the rings are simply not drawn.
+            readonly property var load: bridge.telemetry || ({})
+            Row { id: loadRow; anchors { left: parent.left; right: parent.right; top: parent.top } spacing: 12
+                visible: (bridge.telemetry || {}).available === true
+                Repeater { model: [{ label: "CPU", key: "cpu" }, { label: "RAM", key: "ram" }, { label: qsTr("Disk"), key: "disk" }]
+                    Item { width: (loadRow.width - 24) / 3; height: 77
+                        Rectangle { anchors.centerIn: parent; width: 65; height: 65; radius: 32.5; color: "transparent"; border.width: 6; border.color: Theme.alpha(Theme.accent, 0.3) }
                         Column { anchors.centerIn: parent; spacing: 1
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "—"; color: Theme.textLabel; font.pixelSize: 23 }
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: ((bridge.telemetry || {})[modelData.key] || 0) + "%"; color: Theme.text; font.pixelSize: 18 }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
                         }
                     }
                 }
             }
-            Text { anchors.bottom: parent.bottom; text: qsTr("Telemetry not measured"); color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
         }
         GlassPanel {
             width: dock.contentWidth * 0.21; height: parent.height; title: qsTr("Agent capacity"); padding: 14

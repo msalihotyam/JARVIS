@@ -3,8 +3,9 @@ import QtQuick.Shapes
 import QtQuick.Effects
 import "../theme"
 
-// The same blue glass as the accepted summary rail. The product has no
-// weather or location provider: a time zone is context, not a city claim.
+// The same blue glass as the accepted summary rail. Weather is the operator's
+// fixed place as the bridge projects it (fresh, stale or unavailable); QML only
+// shows it and never fetches anything. Without a reading the card claims no city.
 Rectangle {
     id: context
     objectName: "leftContextCard"
@@ -22,10 +23,56 @@ Rectangle {
         minutes = Math.abs(minutes)
         return "UTC" + sign + ("0" + Math.floor(minutes / 60)).slice(-2) + ":" + ("0" + minutes % 60).slice(-2)
     }
+    readonly property var wx: bridge.weather
+    readonly property bool hasWeather: wx.available === true
+    readonly property bool stale: hasWeather && wx.state !== "fresh"
+    readonly property string temperatureText: hasWeather ? wx.temperature + "°" : ""
+    readonly property string readingText: hasWeather
+        ? new Date(wx.observed_at * 1000).toLocaleTimeString(Qt.locale(i18n.qtLocale), "HH:mm") : ""
+    // Tomorrow.io's documented codes, mapped in Python to these keys; an unknown code shows no condition.
+    function conditionText(key) {
+        switch (key) {
+        case "clear": return qsTr("Clear", "weather")
+        case "mostly_clear": return qsTr("Mostly clear")
+        case "partly_cloudy": return qsTr("Partly cloudy")
+        case "mostly_cloudy": return qsTr("Mostly cloudy")
+        case "cloudy": return qsTr("Cloudy")
+        case "fog": return qsTr("Fog")
+        case "light_fog": return qsTr("Light fog")
+        case "drizzle": return qsTr("Drizzle")
+        case "rain": return qsTr("Rain")
+        case "light_rain": return qsTr("Light rain")
+        case "heavy_rain": return qsTr("Heavy rain")
+        case "snow": return qsTr("Snow")
+        case "flurries": return qsTr("Flurries")
+        case "light_snow": return qsTr("Light snow")
+        case "heavy_snow": return qsTr("Heavy snow")
+        case "freezing_drizzle": return qsTr("Freezing drizzle")
+        case "freezing_rain": return qsTr("Freezing rain")
+        case "light_freezing_rain": return qsTr("Light freezing rain")
+        case "heavy_freezing_rain": return qsTr("Heavy freezing rain")
+        case "ice_pellets": return qsTr("Ice pellets")
+        case "heavy_ice_pellets": return qsTr("Heavy ice pellets")
+        case "light_ice_pellets": return qsTr("Light ice pellets")
+        case "thunderstorm": return qsTr("Thunderstorm")
+        }
+        return ""
+    }
+    readonly property string conditionLabel: hasWeather ? conditionText(wx.condition) : ""
+    // The instrument's mark, by family: sun, cloud/fog bars, or falling lines.
+    readonly property string family: {
+        var c = hasWeather ? String(wx.condition) : ""
+        if (c === "clear" || c === "mostly_clear") return "sun"
+        if (c.indexOf("cloud") >= 0 || c.indexOf("fog") >= 0) return "cloud"
+        return c ? "fall" : ""
+    }
     radius: 14
     color: Theme.glassSecondaryShell
     Accessible.role: Accessible.Pane
-    Accessible.name: qsTr("%1, %2, Local time, %3. Weather not connected.").arg(timeText).arg(dateText).arg(zoneText)
+    Accessible.name: hasWeather
+        ? qsTr("%1, %2. %3, %4 %5, reading at %6.").arg(timeText).arg(dateText).arg(wx.district)
+              .arg(temperatureText).arg(conditionLabel).arg(readingText)
+        : qsTr("%1, %2, Local time, %3. Weather unavailable.").arg(timeText).arg(dateText).arg(zoneText)
 
     BorderImage {
         anchors.fill: parent; anchors.margins: -12
@@ -97,8 +144,14 @@ Rectangle {
         }
         Column {
             x: pin.visible ? 21 : 0; width: parent.width - x; spacing: 2
-            Text { text: context.compact ? qsTr("Local") : qsTr("Local time"); color: Theme.text; font { family: Theme.font; pixelSize: context.compact ? 12 : 14 } }
-            Text { objectName: "contextTimeZone"; text: context.zoneText; color: Theme.textLabel; font { family: Theme.font; pixelSize: context.tight ? 10 : 11 } }
+            Text { objectName: "contextPlace"; width: parent.width; elide: Text.ElideRight
+                   text: context.hasWeather ? context.wx.district : context.compact ? qsTr("Local") : qsTr("Local time")
+                   color: Theme.text; font { family: Theme.font; pixelSize: context.compact ? 12 : 14 } }
+            // With a reading: when the provider says it applies ("last reading" once it is no longer current).
+            Text { objectName: "contextTimeZone"; width: parent.width; elide: Text.ElideRight
+                   text: !context.hasWeather ? context.zoneText
+                         : context.stale ? qsTr("Last reading %1").arg(context.readingText) : qsTr("As of %1").arg(context.readingText)
+                   color: Theme.textLabel; font { family: Theme.font; pixelSize: context.tight ? 10 : 11 } }
         }
     }
     Column {
@@ -111,23 +164,39 @@ Rectangle {
         Item {
             anchors.horizontalCenter: parent.horizontalCenter
             width: context.compact ? 29 : 38; height: width
-            // A neutral unavailable instrument, not a fabricated sun/moon.
+            id: mark
+            objectName: "contextWeatherMark"
+            property string family: context.family
+            opacity: context.stale ? 0.55 : 1
             Rectangle { anchors.fill: parent; radius: width / 2; color: "#2036aaff"; border.color: "#596d9ebe" }
             Rectangle { anchors.fill: parent; anchors.margins: 5; radius: width / 2; color: "transparent"; border.color: "#7197b2"; opacity: 0.7 }
-            Rectangle { anchors.centerIn: parent; width: parent.width * 0.7; height: 1.8; rotation: -45; color: "#c2dff4" }
+            // Unavailable: the neutral slashed instrument, never a fabricated sun.
+            Rectangle { visible: mark.family === ""; anchors.centerIn: parent; width: parent.width * 0.7; height: 1.8; rotation: -45; color: "#c2dff4" }
+            Rectangle { visible: mark.family === "sun"; anchors.centerIn: parent; width: parent.width * 0.34; height: width; radius: width / 2; color: "#d8ecfa" }
+            Column {
+                visible: mark.family === "cloud"; anchors.centerIn: parent; spacing: mark.width * 0.09
+                Repeater { model: [0.5, 0.36, 0.5]
+                    Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: mark.width * modelData; height: 1.8; radius: 1; color: "#c2dff4" } }
+            }
+            Row {
+                visible: mark.family === "fall"; anchors.centerIn: parent; spacing: mark.width * 0.1
+                Repeater { model: 3
+                    Rectangle { width: 1.8; height: mark.width * 0.3; radius: 1; rotation: 18; color: "#c2dff4" } }
+            }
         }
         Text {
             objectName: "contextTemperature"
             width: parent.width; horizontalAlignment: Text.AlignHCenter
-            text: "--°"; color: Theme.text
+            visible: context.hasWeather
+            text: context.temperatureText; color: context.stale ? Theme.textMuted : Theme.text
             font { family: Theme.display; pixelSize: context.compact ? 25 : 31; weight: Font.Medium }
         }
         Text {
             objectName: "contextWeatherCondition"
             width: parent.width; horizontalAlignment: Text.AlignHCenter
-            text: qsTr("Not\nconnected"); wrapMode: Text.WordWrap
-            Accessible.name: qsTr("Weather not connected")
-            color: "#acc8df"; font { family: Theme.font; pixelSize: context.tight ? 10 : context.compact ? 11 : 12 }
+            text: context.hasWeather ? context.conditionLabel : qsTr("Weather\nunavailable")
+            wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+            color: context.stale ? Theme.textMuted : "#acc8df"; font { family: Theme.font; pixelSize: context.tight ? 10 : context.compact ? 11 : 12 }
         }
     }
 }

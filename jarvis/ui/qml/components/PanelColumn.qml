@@ -236,7 +236,15 @@ Item {
         readonly property real stroke: Math.max(3, Math.round(width * 0.085))
         // Soft halo, then the track, then the dark glass disc and its edge light.
         Rectangle { anchors.fill: parent; anchors.margins: -4; radius: width / 2; color: "transparent"; border.width: 1; border.color: ratio < 0 ? Theme.alpha(column.structure, 0.45) : Theme.alpha(tint, 0.35); opacity: 0.6 }
-        Rectangle { anchors.fill: parent; radius: width / 2; color: "#081a2c"; border.width: stroke; border.color: ratio < 0 ? Theme.alpha(column.structure, 0.62) : Theme.alpha(tint, 0.9) }
+        Rectangle { anchors.fill: parent; radius: width / 2; color: "#081a2c"; border.width: stroke; border.color: ratio < 0 ? Theme.alpha(column.structure, 0.62) : Theme.alpha(tint, 0.28) }
+        // The measured share of the ring, from 12 o'clock.
+        Canvas {
+            anchors.fill: parent; visible: ratio >= 0
+            property real share: Math.max(0, Math.min(1, ratio)); property color line: tint; property real w: stroke
+            onShareChanged: requestPaint(); onLineChanged: requestPaint(); onWidthChanged: requestPaint()
+            onPaint: { var c = getContext("2d"); c.reset(); c.lineWidth = w; c.strokeStyle = line; c.lineCap = "butt"
+                       c.beginPath(); c.arc(width / 2, height / 2, width / 2 - w / 2, -Math.PI / 2, -Math.PI / 2 + share * 2 * Math.PI); c.stroke() }
+        }
         Rectangle { anchors.fill: parent; anchors.margins: stroke; radius: width / 2; color: "transparent"; border.width: 1; border.color: column.structure; opacity: 0.4 }
         Rectangle { anchors.fill: parent; anchors.margins: stroke + 1; radius: width / 2
             gradient: Gradient { GradientStop { position: 0; color: "#14102a44" } GradientStop { position: 1; color: "#00000000" } } }
@@ -312,7 +320,7 @@ Item {
             readonly property int d: side ? (bw >= 460 ? 60 : bw >= 340 ? 48 : 34) : 32
             readonly property int g: side ? (bw >= 340 ? Math.round(d * 0.55) : 10) : 12
             readonly property int clusterW: 3 * d + 2 * g
-            readonly property real listX: side ? clusterW + 14 : 0
+            readonly property real listX: side && measured ? clusterW + 14 : 0
             readonly property int fs: 14
             readonly property int pitch: Math.max(20, Math.min(bh >= 110 ? 38 : 34, Math.floor((bh - 6) / 3)))
             readonly property bool caption: !side || bh >= d + 34
@@ -324,25 +332,30 @@ Item {
             readonly property color executionTint: bridge.executionState === "unconfirmed" || bridge.executionState === "freeze_requested" ? Theme.warning : bridge.configRefused || !bridge.executionEnabled ? Theme.danger : Theme.success
             readonly property string model: (bridge.modelCard || {}).name
                                             || (bridge.chatProvider === "claude" ? qsTr("CLI default") : qsTr("No model chosen"))
+            // The machine's own load, read from the kernel every few seconds.
+            // No reading, no ring: the metadata simply takes the whole width.
+            readonly property var load: bridge.telemetry || ({})
+            readonly property bool measured: load.available === true
             Row {
                 id: gauges
                 objectName: "systemGauges"
+                visible: sys.measured
                 x: 2; y: Math.round(sys.cy - sys.d / 2)
                 spacing: sys.g
-                Gauge { label: "CPU"; width: sys.d; height: width }
-                Gauge { label: "RAM"; width: sys.d; height: width }
-                Gauge { label: qsTr("Disk"); width: sys.d; height: width }
+                Gauge { objectName: "gaugeCpu"; label: "CPU"; width: sys.d; height: width
+                        value: sys.measured ? sys.load.cpu + "%" : "—"; ratio: sys.measured ? sys.load.cpu / 100 : -1 }
+                Gauge { objectName: "gaugeRam"; label: "RAM"; width: sys.d; height: width
+                        value: sys.measured ? sys.load.ram + "%" : "—"; ratio: sys.measured ? sys.load.ram / 100 : -1 }
+                Gauge { objectName: "gaugeDisk"; label: qsTr("Disk"); width: sys.d; height: width
+                        value: sys.measured ? sys.load.disk + "%" : "—"; ratio: sys.measured ? sys.load.disk / 100 : -1 }
             }
-            // Said plainly, once, on one deliberate baseline beneath the rings.
-            Text { objectName: "systemNote"; visible: sys.caption
-                   x: sys.side ? 2 : 2; y: gauges.y + sys.d + (sys.side ? 9 : 3)
-                   // Compact: the note takes the room up to the metadata list, untracked, so it stays whole.
+            // Said once beneath the rings: what they are.
+            Text { objectName: "systemNote"; visible: sys.caption && sys.measured
+                   x: 2; y: gauges.y + sys.d + (sys.side ? 9 : 3)
                    width: !sys.side ? sys.bw - 4 : sys.bw >= 340 ? sys.clusterW : sys.listX - 10
                    horizontalAlignment: sys.side ? Text.AlignHCenter : Text.AlignLeft
-                   text: qsTr("Not measured by this build"); color: Theme.textMuted; elide: Text.ElideRight
-                   // Supporting metadata 12 / 18; the compact cluster keeps the smaller step it needs to stay whole.
-                   font { family: Theme.font; pixelSize: noteMetrics.advanceWidth <= width ? 12 : 10; letterSpacing: 0 }
-                   TextMetrics { id: noteMetrics; text: qsTr("Not measured by this build"); font: Theme.metadata } }
+                   text: qsTr("This machine, now"); color: Theme.textMuted; elide: Text.ElideRight
+                   font { family: Theme.font; pixelSize: 12; letterSpacing: 0 } }
             // Beside the rings: three rows - one dot axis, labels left, values right.
             Rectangle { visible: sys.side; x: sys.listX - 8; width: sys.bw - x; radius: 10
                 y: sys.listY - 4; height: 3 * sys.pitch + 8; color: Theme.glassSecondaryReading }
@@ -358,11 +371,11 @@ Item {
             }
             // Reflowed: the three fields side by side beneath the note - each a
             // dot and label over its value - so all three stay inside the height.
-            Rectangle { visible: !sys.side; x: 0; width: sys.bw; y: sys.d + 19; height: sys.bh - y; radius: 7; color: Theme.glassSecondaryReading }
+            Rectangle { visible: !sys.side; x: 0; width: sys.bw; y: sys.measured ? sys.d + 19 : 0; height: sys.bh - y; radius: 7; color: Theme.glassSecondaryReading }
             Row {
                 objectName: "systemMetadataCompact"
                 visible: !sys.side
-                x: 6; y: sys.d + 20; width: sys.bw - 12
+                x: 6; y: sys.measured ? sys.d + 20 : 4; width: sys.bw - 12
                 Repeater {
                     model: [{ k: "Uptime", label: qsTr("Uptime"), v: sys.uptime, tint: Theme.accentSoft, vc: "#f2f8ff" },
                             { k: "Execution", label: qsTr("Execution"), v: sys.execution, tint: sys.executionTint, vc: sys.executionTint },
@@ -435,7 +448,10 @@ Item {
             TextMetrics { id: stamp; text: qsTr("%1 min ago").arg("00"); font: column.commandMode ? Qt.font({ family: Theme.font, pixelSize: 11 }) : Theme.timestamp }
             readonly property int rowsShown: bridge.activity.length + (bridge.activity.length < 4 ? 1 : 0)
             readonly property int rowsFit: Math.max(1, Math.floor((feedRoot.height - 2) / pitch))
-            height: Math.min(rowsShown, rowsFit) * pitch + 2
+            // The well takes the whole body: as many real rows as fit, and a
+            // quiet surface - never a hole - beneath a short list.
+            objectName: "activityWell"
+            height: feedRoot.height
             ListView {
                 width: parent.width; height: feedWell.height - 2
                 clip: true

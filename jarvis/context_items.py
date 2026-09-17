@@ -29,6 +29,7 @@ import hashlib
 import os
 import re
 import shutil
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -194,6 +195,10 @@ def _describe(data: bytes, name: str, kind: str, folder: str | Path, item_id: st
         "id": str(item_id), "type": "attachment", "kind": kind, "name": name,
         "media_type": (IMAGE_MEDIA_TYPES if kind == "image" else TEXT_MEDIA_TYPES)[suffix],
         "bytes": len(data), "sha256": digest, "path": str(path),
+        # Where this attachment lives: the current chat, for now. The field is
+        # the seam for later scopes (a project's files, a library) - the record
+        # already carries the stable identity those need, so no second store.
+        "scope": "chat", "attached_at": int(time.time()),
     }
     if kind == "text":
         text = data.decode("utf-8", errors="replace")

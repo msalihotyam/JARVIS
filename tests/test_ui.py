@@ -25,7 +25,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 os.environ.pop("ANTHROPIC_BASE_URL", None)
 
-from PySide6.QtCore import QMetaObject, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
+from PySide6.QtCore import QMetaObject, QPointF, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
 from PySide6.QtQml import QQmlProperty  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
@@ -856,7 +856,7 @@ class PresentationTests(UiTestCase):
         legacy["version"] = 1
         legacy["profiles"]["normal"]["panels"]["system"]["share"] = 0.54
         migrated = validate_preferences(legacy)
-        self.assertEqual(4, migrated["version"])
+        self.assertEqual(5, migrated["version"])
         self.assertEqual(legacy["profiles"], migrated["profiles"])
         self.assertEqual({"dark", "command"}, set(migrated["packages"]))
         # Version 2 -> 3: the conversation-first grid replaces every layout;
@@ -865,7 +865,7 @@ class PresentationTests(UiTestCase):
         v2.pop("rail")
         v2["profiles"]["normal"]["column_width"] = 0.32
         moved = validate_preferences(v2)
-        self.assertEqual((4, "dark", False, "tasks"), (moved["version"], moved["theme"], moved["ambient_effects"], moved["page"]))
+        self.assertEqual((5, "dark", False, "tasks"), (moved["version"], moved["theme"], moved["ambient_effects"], moved["page"]))
         self.assertEqual(canonical_preferences()["profiles"], moved["profiles"])
         for key, value in (("profile", "foreign"), ("profiles", {})):
             bad = deepcopy(migrated)
@@ -1246,11 +1246,16 @@ class CommandHeaderTests(UiTestCase):
         pump(250)
         self.assertFalse(self.store.load().settings.claude_model)
 
-        field = self.item(root, "modelField")
-        QMetaObject.invokeMethod(field, "insert", Q_ARG(int, 0), Q_ARG(str, "claude-opus-5"))
-        QMetaObject.invokeMethod(field, "editingFinished")     # a typed id applies when it is finished
-        pump(250)
-        self.assertEqual("claude-opus-5", self.store.load().settings.claude_model)
+        # No free-text model field any more: the models the CLI lists are the choice.
+        self.assertEqual([], [i for i in visual_items(root) if i.objectName() == "modelField"])
+        bridge.backend.providers = lambda: [
+            {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
+             "models": [{"id": "opus[1m]", "name": "Opus", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "medium", "high"]}]},
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "not_installed", "models": [], "research": False}]
+        bridge.refreshProviders(); pump(300)
+        self.click(root, "claudeModelField"); pump(300)
+        QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen"); pump(250)
+        self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
         self.assertEqual("Opus 5", chip.property("modelName"))                    # short name, canonical id stored
         self.assertEqual(0, self.execute_calls())
 
@@ -1313,13 +1318,454 @@ class LeftContextTests(UiTestCase):
                 self.assertLessEqual(end, weather.x())
         self.assertEqual(0, self.execute_calls())
 
-    def test_weather_remains_explicitly_unavailable_without_provider_or_city(self) -> None:
+    def test_weather_remains_explicitly_unavailable_without_a_key_or_reading(self) -> None:
         root = self.window(self.bridge())
-        self.assertEqual("--°", self.item(root, "contextTemperature").property("text"))
-        self.assertEqual("Not\nconnected", self.item(root, "contextWeatherCondition").property("text"))
+        self.assertFalse(self.item(root, "contextTemperature").isVisible())      # no "--°", no 0°
+        self.assertEqual("Weather\nunavailable", self.item(root, "contextWeatherCondition").property("text"))
+        self.assertEqual("Local time", self.item(root, "contextPlace").property("text"))
         context = self.item(root, "leftContextCard")
         self.assertTrue(context.property("zoneText").startswith("UTC"))
+        self.assertTrue(self.item(root, "contextTimeZone").property("text").startswith("UTC"))
         self.assertEqual(0, self.execute_calls())
+
+
+GEOCODE = {"results": [
+    {"name": "Beşiktaş", "latitude": 40.91119, "longitude": 42.87263, "country_code": "TR", "admin1": "Ardahan", "admin2": "Ardahan"},
+    {"name": "Beşiktaş", "latitude": 41.04541, "longitude": 29.00991, "country_code": "TR", "admin1": "İstanbul", "admin2": "Beşiktaş"},
+    {"name": "Beşiktaş", "latitude": 37.87988, "longitude": 43.02317, "country_code": "TR", "admin1": "Van", "admin2": "Çatak İlçesi"},
+]}
+
+
+def realtime(temperature=18.4, code=1101, age_seconds=120, **extra):
+    stamp = datetime.fromtimestamp(time.time() - age_seconds).astimezone().isoformat()
+    return {"data": {"time": stamp, "values": {"temperature": temperature, "weatherCode": code,
+                                                "temperatureApparent": 17.9, "precipitationProbability": 5, **extra}},
+            "location": {"lat": 41.04541, "lon": 29.00991}}
+
+
+class FakeWeatherNet:
+    """Stands in for the two approved endpoints; records every call."""
+
+    def __init__(self, weather=None, geocode=GEOCODE):
+        self.calls: list[tuple[str, dict, dict]] = []
+        self.weather = weather if weather is not None else realtime()
+        self.geocode = geocode
+
+    def __call__(self, url, params, headers=None):
+        from jarvis.ui import weather
+        self.calls.append((url, dict(params), dict(headers or {})))
+        answer = self.geocode if url == weather.GEOCODER_URL else self.weather
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def urls(self):
+        return [c[0] for c in self.calls]
+
+
+class WeatherServiceTests(unittest.TestCase):
+    """jarvis.ui.weather without a network: the place, the reading, the freshness."""
+
+    def setUp(self) -> None:
+        from jarvis.ui import weather
+        self.w = weather
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-weather-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        self.cache = folder / "weather-location.json"
+
+    def test_besiktas_istanbul_is_picked_and_same_named_places_elsewhere_are_refused(self) -> None:
+        place = self.w.pick_location(GEOCODE)
+        self.assertEqual((41.04541, 29.00991), (place["latitude"], place["longitude"]))
+        self.assertEqual(("Türkiye", "İstanbul", "Beşiktaş"), (place["country"], place["province"], place["district"]))
+        self.assertEqual("Beşiktaş, İstanbul, Türkiye", place["display_name"])
+        wrong = {"results": [GEOCODE["results"][0], GEOCODE["results"][2],
+                             {**GEOCODE["results"][1], "country_code": "CY"}]}
+        with self.assertRaises(self.w.WeatherError) as caught:
+            self.w.pick_location(wrong)
+        self.assertEqual("not_found", caught.exception.code)
+        for broken in (None, {}, {"results": "x"}, {"results": [{**GEOCODE["results"][1], "latitude": "41"}]}):
+            with self.assertRaises(self.w.WeatherError):
+                self.w.pick_location(broken)
+
+    def test_cached_coordinates_prevent_repeated_geocoding(self) -> None:
+        net = FakeWeatherNet()
+        location, reading, error = self.w.refresh(self.cache, "k", net)
+        self.assertEqual("", error)
+        self.assertEqual([self.w.GEOCODER_URL, self.w.WEATHER_URL], net.urls())
+        self.assertEqual(41.04541, json.loads(self.cache.read_text(encoding="utf-8"))["latitude"])
+        # Same process (location in hand) and a restart (cache on disk): weather only.
+        self.w.refresh(self.cache, "k", net, location)
+        self.w.refresh(self.cache, "k", net)
+        self.assertEqual([self.w.GEOCODER_URL] + [self.w.WEATHER_URL] * 3, net.urls())
+        self.assertEqual("41.04541,29.00991", net.calls[-1][1]["location"])
+        # A cache for another place is not trusted.
+        self.cache.write_text(json.dumps({**location, "district": "Kadıköy"}), encoding="utf-8")
+        self.w.refresh(self.cache, "k", net)
+        self.assertEqual(self.w.GEOCODER_URL, net.urls()[-2])
+
+    def test_realtime_payload_parsing(self) -> None:
+        reading = self.w.parse_realtime({"data": {"time": "2026-09-17T13:42:00Z", "values": {
+            "temperature": 18.44, "weatherCode": 4201, "temperatureApparent": 17.2, "precipitationProbability": 80}}},
+            fetched_at=datetime.fromisoformat("2026-09-17T13:45:00+00:00").timestamp())
+        self.assertEqual(18.44, reading["temperature"])
+        self.assertEqual("heavy_rain", reading["condition"])
+        self.assertEqual(datetime.fromisoformat("2026-09-17T13:42:00+00:00").timestamp(), reading["observed_at"])
+        self.assertEqual((17.2, 80.0), (reading["feels_like"], reading["precipitation_probability"]))
+        # Every documented code has a key; 0 (Unknown) and undocumented codes have none.
+        self.assertEqual(23, len(self.w.CONDITIONS))
+        for code, key in ((1000, "clear"), (1100, "mostly_clear"), (1001, "cloudy"), (2000, "fog"), (4000, "drizzle"),
+                          (5000, "snow"), (8000, "thunderstorm"), (0, ""), (9999, "")):
+            self.assertEqual(key, self.w.parse_realtime(realtime(code=code))["condition"])
+
+    def test_malformed_payloads_are_refused_whole(self) -> None:
+        ok = realtime()
+        broken = [None, [], {}, {"data": {}}, {"data": {"time": ok["data"]["time"], "values": {}}},
+                  realtime(temperature="18"), realtime(temperature=float("nan")), realtime(temperature=None),
+                  realtime(temperature=250), {"data": {"time": "yesterday", "values": ok["data"]["values"]}},
+                  {"data": {"time": "2026-09-17T13:42:00", "values": ok["data"]["values"]}},
+                  realtime(age_seconds=-3600)]
+        for payload in broken:
+            with self.subTest(payload=payload), self.assertRaises(self.w.WeatherError) as caught:
+                self.w.parse_realtime(payload)
+            self.assertEqual("malformed", caught.exception.code)
+
+    def test_failures_become_codes_and_keep_the_place(self) -> None:
+        location = self.w.pick_location(GEOCODE)
+        for code in ("timeout", "rate_limited", "auth", "http", "network", "malformed"):
+            net = FakeWeatherNet(weather=self.w.WeatherError(code))
+            self.assertEqual((location, None, code), self.w.refresh(self.cache, "k", net, location))
+        # Geocoder down: nothing to show, nothing cached.
+        net = FakeWeatherNet(geocode=self.w.WeatherError("network"))
+        self.assertEqual((None, None, "network"), self.w.refresh(self.cache, "k", net))
+        self.assertFalse(self.cache.exists())
+        # No key: no network at all.
+        net = FakeWeatherNet()
+        self.assertEqual((None, None, "no_key"), self.w.refresh(self.cache, "", net))
+        self.assertEqual([], net.calls)
+
+    def test_the_real_fetch_maps_http_timeout_and_redirect_failures(self) -> None:
+        from io import BytesIO
+        from unittest import mock
+        from urllib.error import HTTPError, URLError
+        w = self.w
+        cases = [(HTTPError(w.WEATHER_URL, 429, "Too Many", {}, BytesIO()), "rate_limited"),
+                 (HTTPError(w.WEATHER_URL, 401, "No", {}, BytesIO()), "auth"),
+                 (HTTPError(w.WEATHER_URL, 302, "Moved", {}, BytesIO()), "http"),
+                 (HTTPError(w.WEATHER_URL, 503, "Down", {}, BytesIO()), "http"),
+                 (TimeoutError(), "timeout"), (URLError(TimeoutError()), "timeout"), (URLError("dns"), "network")]
+        for error, code in cases:
+            with self.subTest(code=code), mock.patch.object(w._OPENER, "open", side_effect=error):
+                with self.assertRaises(w.WeatherError) as caught:
+                    w.fetch_json(w.WEATHER_URL, {"location": "1,2"}, {"apikey": "secret-key"})
+                self.assertEqual(code, caught.exception.code)
+                self.assertNotIn("secret-key", str(caught.exception))
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"not json"
+        with mock.patch.object(w._OPENER, "open", return_value=response) as opened:
+            with self.assertRaises(w.WeatherError) as caught:
+                w.fetch_json(w.WEATHER_URL, {"location": "41.04541,29.00991", "units": "metric"}, {"apikey": "secret-key"})
+        self.assertEqual("malformed", caught.exception.code)
+        request = opened.call_args[0][0]
+        self.assertEqual("api.tomorrow.io", request.host)
+        self.assertNotIn("secret-key", request.full_url)                 # the key rides in the header only
+        self.assertEqual("secret-key", request.get_header("Apikey"))
+        self.assertEqual(w.TIMEOUT_SECONDS, opened.call_args[1]["timeout"])
+        self.assertFalse(any(isinstance(h, __import__("urllib.request").request.HTTPCookieProcessor) for h in w._OPENER.handlers))
+        self.assertTrue(any(isinstance(h, w._NoRedirect) for h in w._OPENER.handlers))
+
+    def test_only_the_two_approved_endpoints_can_be_fetched(self) -> None:
+        from unittest import mock
+        with mock.patch.object(self.w._OPENER, "open") as opened:
+            for url in ("https://evil.example/v4/weather/realtime", "http://api.tomorrow.io/v4/weather/realtime",
+                        "https://api.tomorrow.io/v4/weather/forecast", "https://api.tomorrow.io.evil.example/x",
+                        "file:///C:/Windows/win.ini", "https://geocoding-api.open-meteo.com/v1/other"):
+                with self.subTest(url=url), self.assertRaises(self.w.WeatherError) as caught:
+                    self.w.fetch_json(url, {})
+                self.assertEqual("not_allowed", caught.exception.code)
+            opened.assert_not_called()
+        self.assertEqual({"geocoding-api.open-meteo.com", "api.tomorrow.io"}, set(self.w.APPROVED_HOSTS))
+
+    def test_freshness_fresh_stale_expired_and_no_default(self) -> None:
+        location = self.w.pick_location(GEOCODE)
+        now = time.time()
+        reading = self.w.parse_realtime(realtime(age_seconds=0), fetched_at=now)
+        fresh = self.w.project(location, reading, now + 5 * 60)
+        self.assertEqual((True, "fresh", "Beşiktaş", 18, "partly_cloudy"),
+                         (fresh["available"], fresh["state"], fresh["district"], fresh["temperature"], fresh["condition"]))
+        self.assertEqual({"available", "state", "district", "temperature", "condition", "observed_at", "fetched_at"}, set(fresh))
+        self.assertEqual("stale", self.w.project(location, reading, now + self.w.FRESH_SECONDS + 60)["state"])
+        self.assertEqual({"available": False, "state": "unavailable"},
+                         self.w.project(location, reading, now + self.w.EXPIRED_SECONDS + 60))
+        self.assertEqual({"available": False, "state": "unavailable"}, self.w.project(location, None))
+        self.assertEqual({"available": False, "state": "unavailable"}, self.w.project(None, reading))
+
+    def test_the_module_has_no_location_guessing_model_or_shell_path(self) -> None:
+        source = Path(self.w.__file__).read_text(encoding="utf-8")
+        for banned in ("subprocess", "geolocation", "ipinfo", "ip-api", "Geolocator", "QGeoPosition", "tzname",
+                       "jarvis.connectors", "codex", "claude", "anthropic", "webbrowser", "print(", "logging"):
+            self.assertNotIn(banned, source)
+
+
+class WeatherCardTests(UiTestCase):
+    """The bridge refreshes off the UI thread on a slow clock; the card only projects what it gets."""
+
+    item = PresentationTests.item
+    window = PresentationTests.window
+
+    def weather_bridge(self, net, key="test-key-123"):
+        bridge = self.bridge()
+        bridge._weather_key = key
+        bridge._weather_fetch = net
+        return bridge
+
+    def texts(self, root):
+        return [str(i.property("text")) for i in visual_items(root) if isinstance(i.property("text"), str)]
+
+    def test_the_card_shows_the_real_reading_for_besiktas_with_the_clock_first(self) -> None:
+        net = FakeWeatherNet()
+        bridge = self.weather_bridge(net)
+        root = self.window(bridge)
+        bridge._weather_tick(); pump(200)
+        self.assertEqual(18, bridge.weather["temperature"])
+        self.assertEqual("18°", self.item(root, "contextTemperature").property("text"))
+        self.assertTrue(self.item(root, "contextTemperature").isVisible())
+        self.assertEqual("Partly cloudy", self.item(root, "contextWeatherCondition").property("text"))
+        self.assertEqual("Beşiktaş", self.item(root, "contextPlace").property("text"))
+        reading = datetime.fromtimestamp(bridge.weather["observed_at"]).strftime("%H:%M")
+        self.assertEqual("As of " + reading, self.item(root, "contextTimeZone").property("text"))
+        self.assertEqual("cloud", self.item(root, "contextWeatherMark").property("family"))
+        # Time stays primary, date secondary, weather tertiary.
+        clock = self.item(root, "contextClock").property("font").pixelSize()
+        temp = self.item(root, "contextTemperature").property("font").pixelSize()
+        self.assertGreater(clock, temp)
+        self.assertLess(self.item(root, "contextClock").mapToScene(QPointF(0, 0)).y(),
+                        self.item(root, "contextPlace").mapToScene(QPointF(0, 0)).y())
+        self.assertIn("Beşiktaş", self.item(root, "leftContextCard").property("Accessible.name") or "Beşiktaş")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_refresh_cadence_geocodes_once_and_keeps_a_recent_reading_through_a_failure(self) -> None:
+        net = FakeWeatherNet()
+        bridge = self.weather_bridge(net)
+        bridge._weather_tick()
+        self.assertEqual([w_geo(), w_now()], net.urls())
+        for _ in range(4):                       # minute ticks inside the 5-minute window: no network
+            bridge._weather_tick()
+        self.assertEqual(2, len(net.calls))
+        bridge._weather_next = 0                 # five minutes later
+        net.weather = __import__("jarvis.ui.weather", fromlist=["x"]).WeatherError("timeout")
+        bridge._weather_tick()
+        self.assertEqual([w_geo(), w_now(), w_now()], net.urls())    # no second geocode
+        self.assertEqual((True, "fresh", 18), (bridge.weather["available"], bridge.weather["state"], bridge.weather["temperature"]))
+        from jarvis.ui import weather
+        self.assertEqual(300, weather.REFRESH_SECONDS)
+        self.assertEqual(60_000, bridge._weather_timer.interval())
+        # A rate limit holds off for half an hour instead of retrying.
+        bridge._weather_next = 0
+        net.weather = weather.WeatherError("rate_limited")
+        before = time.monotonic()
+        bridge._weather_tick()
+        self.assertGreaterEqual(bridge._weather_next - before, weather.HOLD_SECONDS - 1)
+
+    def test_a_restart_reuses_the_cached_coordinates(self) -> None:
+        net = FakeWeatherNet()
+        self.weather_bridge(net)._weather_tick()
+        again = FakeWeatherNet()
+        self.weather_bridge(again)._weather_tick()
+        self.assertEqual([w_now()], again.urls())
+
+    def test_stale_readings_stop_looking_current_and_expired_ones_disappear(self) -> None:
+        net = FakeWeatherNet(weather=realtime(age_seconds=25 * 60))
+        bridge = self.weather_bridge(net)
+        root = self.window(bridge)
+        bridge._weather_tick(); pump(200)
+        self.assertEqual("stale", bridge.weather["state"])
+        self.assertTrue(self.item(root, "contextTimeZone").property("text").startswith("Last reading "))
+        self.assertTrue(self.item(root, "leftContextCard").property("stale"))
+        bridge._weather_reading = {**bridge._weather_reading, "observed_at": time.time() - 3 * 3600}
+        bridge._weather_tick(); pump(200)
+        self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather)
+        self.assertFalse(self.item(root, "contextTemperature").isVisible())
+        self.assertEqual("Local time", self.item(root, "contextPlace").property("text"))
+
+    def test_no_key_means_no_network_and_no_invented_weather(self) -> None:
+        net = FakeWeatherNet()
+        bridge = self.weather_bridge(net, key="")
+        root = self.window(bridge)
+        bridge._weather_tick(); pump(200)
+        self.assertEqual([], net.calls)
+        self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather)
+        texts = self.texts(root)
+        for fake in ("0°", "Clear", "--°"):
+            self.assertNotIn(fake, texts)
+        # Malformed answers never produce a value either.
+        bad = FakeWeatherNet(weather={"data": {"values": {"temperature": 0}}})
+        bridge = self.weather_bridge(bad)
+        bridge._weather_tick()
+        self.assertEqual(False, bridge.weather["available"])
+
+    def test_the_key_never_reaches_the_bridge_surface_qml_or_child_processes(self) -> None:
+        from unittest import mock
+        from jarvis.ui import app as ui_app
+        secret = "tomorrow-secret-xyz"
+        net = FakeWeatherNet()
+        bridge = self.weather_bridge(net, key=secret)
+        root = self.window(bridge)
+        bridge._weather_tick(); pump(200)
+        self.assertEqual(secret, net.calls[-1][2]["apikey"])
+        self.assertNotIn(secret, json.dumps(bridge.weather))
+        self.assertNotIn(secret, json.dumps(net.calls[-1][1]))
+        self.assertFalse(any(secret in t for t in self.texts(root)))
+        self.assertFalse(any(secret in json.dumps(e, default=str) for e in bridge.feed + bridge.activity))
+        names = [str(bridge.metaObject().property(i).name()) for i in range(bridge.metaObject().propertyCount())]
+        self.assertFalse(any("key" in n.lower() and "weather" in n.lower() for n in names))
+        # The launcher takes the key out of the environment before anything starts.
+        with mock.patch.dict(os.environ, {"TOMORROW_API_KEY": secret}), \
+                mock.patch.object(ui_app, "Bridge", side_effect=RuntimeError("stop")) as made, \
+                mock.patch("PySide6.QtWidgets.QApplication"), mock.patch.object(ui_app, "Backend"), \
+                mock.patch.object(ui_app, "UiPreferences"):
+            with self.assertRaises(RuntimeError):
+                ui_app.main([])
+            self.assertNotIn("TOMORROW_API_KEY", os.environ)
+        self.assertEqual(secret, made.call_args[1]["weather_key"])
+
+    def test_the_refresh_runs_off_the_ui_thread(self) -> None:
+        started = threading.Event(); release = threading.Event(); seen = []
+
+        def slow(url, params, headers=None):
+            seen.append(threading.current_thread() is threading.main_thread())
+            started.set(); release.wait(5)
+            return FakeWeatherNet()(url, params, headers)
+        bridge = self.bridge(sync=False)
+        bridge._weather_key = "k"; bridge._weather_fetch = slow
+        began = time.monotonic()
+        bridge._weather_tick()
+        self.assertLess(time.monotonic() - began, 0.5)          # the tick returned while the call waits
+        self.assertTrue(started.wait(5))
+        self.assertTrue(bridge._weather_busy)
+        bridge._weather_tick()                                   # no overlapping refresh
+        release.set()
+        deadline = time.monotonic() + 5
+        while bridge._weather_busy and time.monotonic() < deadline:
+            pump(50)
+        self.assertEqual([False, False], seen)
+        self.assertEqual(True, bridge.weather["available"])
+
+    def test_turkish_labels(self) -> None:
+        net = FakeWeatherNet(weather=realtime(code=8000))
+        bridge = self.weather_bridge(net)
+        root = self.window(bridge)
+        bridge.setLanguage("tr-TR"); pump(300)
+        bridge._weather_tick(); pump(300)
+        self.assertEqual("Gök gürültülü sağanak", self.item(root, "contextWeatherCondition").property("text"))
+        self.assertTrue(self.item(root, "contextTimeZone").property("text").endswith(" itibarıyla"))
+        bridge._weather_reading = None; bridge._publish_weather(); pump(200)
+        self.assertEqual("Hava durumu\nyok", self.item(root, "contextWeatherCondition").property("text"))
+
+
+def w_geo():
+    from jarvis.ui import weather
+    return weather.GEOCODER_URL
+
+
+def w_now():
+    from jarvis.ui import weather
+    return weather.WEATHER_URL
+
+
+#: The real ``python -m jarvis.ui`` shape - ``raise SystemExit(main())`` - on
+#: throwaway state, quitting through the tray's Quit path after the first frames.
+SHUTDOWN_SCRIPT = r'''
+import os, sys, tempfile
+from pathlib import Path
+from PySide6.QtCore import QCoreApplication, QTimer
+from jarvis.settings import ConfigStore
+from jarvis.ui import app as ui_app
+tmp = Path(tempfile.mkdtemp(prefix="jarvis-shutdown-test-"))
+Backend, Prefs, engine_of, sweeps = ui_app.Backend, ui_app.UiPreferences, ui_app.create_engine, ui_app.install_scheduler_sweeps
+ui_app.Backend = lambda: Backend(ConfigStore(tmp / "config.json"))
+ui_app.UiPreferences = lambda: Prefs(tmp / "prefs.json")
+say = lambda what: os.write(2, (what + "\n").encode())
+def create_engine(bridge):
+    engine = engine_of(bridge)
+    for name, obj in (("bridge", bridge), ("engine", engine), ("window", engine.rootObjects()[0]),
+                      ("application", QCoreApplication.instance())):
+        obj.destroyed.connect(lambda *_, name=name: say("DESTROYED " + name))
+    return engine
+def install_scheduler_sweeps(bridge):
+    QTimer.singleShot(1500, bridge.requestQuit)
+    return sweeps(bridge)
+ui_app.create_engine, ui_app.install_scheduler_sweeps = create_engine, install_scheduler_sweeps
+raise SystemExit(ui_app.main([]))
+'''
+
+
+class ShutdownLifecycleTests(UiTestCase):
+    """A true quit ends the QML tree while the bridge is whole, and nothing late reaches it."""
+
+    def test_a_true_quit_tears_down_quietly_in_dependency_order(self) -> None:
+        import subprocess
+        import sys
+        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_FORCE_STDERR_LOGGING": "1",
+               "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+        env.pop("TOMORROW_API_KEY", None)
+        done = subprocess.run([sys.executable, "-c", SHUTDOWN_SCRIPT], env=env, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=120)
+        log = done.stderr
+        self.assertEqual(0, done.returncode, log[-2000:])
+        self.assertNotIn("of null", log)                              # the teardown flood
+        self.assertNotIn("TypeError", log)
+        self.assertNotIn("is not declared", log)                      # injected signal parameters
+        self.assertNotIn("already deleted", log)
+        order = [line.split()[1] for line in log.splitlines() if line.startswith("DESTROYED ")]
+        self.assertEqual(["window", "engine", "bridge", "application"], order)
+
+    def test_teardown_keeps_the_bridge_valid_through_the_qml_teardown(self) -> None:
+        import shiboken6
+        from PySide6.QtCore import qInstallMessageHandler
+        from jarvis.ui.app import teardown
+        bridge = self.bridge()
+        engine = create_engine(bridge)
+        root = engine.rootObjects()[0]
+        root.show(); pump(200)
+        messages = []
+        previous = qInstallMessageHandler(lambda mode, context, text: messages.append(text))
+        self.addCleanup(qInstallMessageHandler, previous)
+        teardown(bridge, engine)
+        self.assertFalse(shiboken6.isValid(engine))
+        self.assertTrue(shiboken6.isValid(bridge))
+        self.assertEqual([], [m for m in messages if "of null" in m or "TypeError" in m])
+
+    def test_shutdown_stops_the_clocks_and_drops_late_weather_without_touching_product_state(self) -> None:
+        from PySide6.QtCore import QTimer
+        bridge = self.bridge(sync=False)
+        before = (bridge.executionState, bridge.quitting, bridge.trayAvailable, bridge.quitWarning)
+        release = threading.Event(); started = threading.Event()
+
+        def slow(url, params, headers=None):
+            started.set(); release.wait(5)
+            return FakeWeatherNet()(url, params, headers)
+        bridge._weather_key = "k"; bridge._weather_fetch = slow
+        bridge._weather_tick()
+        self.assertTrue(started.wait(5))
+        seen = []
+        bridge.weatherChanged.connect(lambda: seen.append("weather"))
+        bridge._weatherDone.connect(lambda result: seen.append("delivered"))
+        bridge.shutdown()
+        self.assertTrue(all(not t.isActive() for t in bridge.findChildren(QTimer)))
+        self.assertIn(bridge._weather_timer, bridge.findChildren(QTimer))
+        self.assertIn(bridge._telemetry_timer, bridge.findChildren(QTimer))
+        release.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            pump(50)
+        self.assertEqual([], seen)                                   # the finished fetch never reaches the UI
+        self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather)
+        bridge._weather_next = 0
+        bridge._weather_tick()                                       # no new fetch once quitting
+        bridge._weather_finished((None, {"temperature": 1.0}, ""))   # a stray delivery changes nothing
+        self.assertIsNone(bridge._weather_reading)
+        # Quitting is not Freeze, Cancel or a hide: the product state is untouched.
+        self.assertEqual(before, (bridge.executionState, bridge.quitting, bridge.trayAvailable, bridge.quitWarning))
 
 
 class ConversationSurfaceTests(UiTestCase):
@@ -1330,7 +1776,7 @@ class ConversationSurfaceTests(UiTestCase):
     item = PresentationTests.item
     click = PresentationTests.click
     window = PresentationTests.window
-    SUMMARY = ("Tasks", "Updates", "Focus", "Plan")
+    SUMMARY = ("Tasks", "Focus", "Plan")
 
     def shown_rail(self, bridge) -> tuple:
         """The rail cards the layout shows, in order, by their titles."""
@@ -1364,7 +1810,7 @@ class ConversationSurfaceTests(UiTestCase):
             with self.subTest(size=(width, height)):
                 previous_bottom = rail[1]
                 shown = self.shown_rail(bridge)
-                self.assertEqual(self.SUMMARY + ("Memory",), shown)      # the default rail: all five cards
+                self.assertEqual(self.SUMMARY + ("Memory",), shown)      # the default rail: four cards (Updates waits in Cards)
                 # The cards share the rail height evenly: n cards, n - 1 gaps of 10-14 px.
                 share = (rail[3] - rail[1] - 12 * (len(shown) - 1)) / len(shown)
                 for key in shown:
@@ -1534,6 +1980,7 @@ class ConversationSurfaceTests(UiTestCase):
     def test_peek_opens_anchored_switches_and_closes_every_way(self) -> None:
         from PySide6.QtCore import QPoint
         bridge = self.bridge()
+        bridge.setCardVisible("rail", "updates", True)      # hidden by default; this test uses it
         root = self.window(bridge)
         pump(700)   # the work surface width animates in; read it settled
         work = self.box(root, "canonicalWorkspace")
@@ -1551,7 +1998,7 @@ class ConversationSurfaceTests(UiTestCase):
         # Another card switches in place; exactly one card is active.
         self.click(root, "railUpdates"); pump(300)
         self.assertTrue(root.property("peekOpen")); self.assertEqual("Updates", root.property("peekKey"))
-        self.assertEqual(["Updates"], [k for k in self.SUMMARY if self.item(root, "rail" + k).property("active")])
+        self.assertEqual(["Updates"], [k for k in self.SUMMARY + ("Updates",) if self.item(root, "rail" + k).property("active")])
         # The same card again closes it.
         self.click(root, "railUpdates"); pump(300)
         self.assertFalse(root.property("peekOpen"))
@@ -1577,6 +2024,7 @@ class ConversationSurfaceTests(UiTestCase):
 
     def test_peek_stays_inside_the_viewport_and_shows_only_real_state(self) -> None:
         bridge = self.bridge()
+        bridge.setCardVisible("rail", "updates", True)      # hidden by default; this test uses it
         root = self.window(bridge)
         for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
             root.resize(width, height)
@@ -1940,7 +2388,7 @@ class LocalFitTests(UiTestCase):
             # Use a point inside BOTH a rail card and the Dark package choice,
             # not its centre (which lies safely to the right of the rail).
             choice = self.item(root, "package_dark")
-            for key in ("Tasks", "Updates", "Focus", "Plan"):
+            for key in ("Tasks", "Focus", "Plan"):
                 card = self.item(root, "rail" + key)
                 p = card.mapToScene(QPointF(0, 0))
                 q = choice.mapToScene(QPointF(0, 0))
@@ -2042,7 +2490,7 @@ class LayoutEditorTests(UiTestCase):
 
     def test_hide_restore_and_move_in_both_regions_persist(self):
         bridge = self.bridge()
-        self.assertEqual([(n, True) for n in ("tasks", "updates", "focus", "plan", "memory")], self.rail(bridge))
+        self.assertEqual([("tasks", True), ("updates", False), ("focus", True), ("plan", True), ("memory", True)], self.rail(bridge))
         bridge.setCardVisible("rail", "memory", False)
         bridge.setCardVisible("stack", "activity", False)
         self.assertEqual("saved", bridge.layoutSaveState)
@@ -2104,9 +2552,10 @@ class LayoutEditorTests(UiTestCase):
         v3["profiles"]["normal"]["order"] = ["activity", "system", "workflow", "automations"]
         self.prefs_path.write_text(json.dumps(v3), encoding="utf-8")
         prefs = UiPreferences(self.prefs_path)
-        self.assertEqual(4, prefs.data["version"])
+        self.assertEqual(5, prefs.data["version"])
         self.assertEqual(v3["profiles"], prefs.data["profiles"])
-        self.assertEqual({"tasks": True, "updates": True, "focus": True, "plan": True, "memory": False}, prefs.data["rail"]["visible"])
+        # Memory waits in Cards as before; Updates now does too (v4 -> v5).
+        self.assertEqual({"tasks": True, "updates": False, "focus": True, "plan": True, "memory": False}, prefs.data["rail"]["visible"])
         broken = canonical_preferences(); broken["rail"]["order"] = ["tasks"]
         self.assertEqual(canonical_preferences(), validate_preferences(broken))
 
@@ -2141,7 +2590,7 @@ class LayoutEditorTests(UiTestCase):
                 self.assertFalse(bridge.railCards[-1]["visible"])
                 self.click(root, "layoutCards")
                 popover = self.item(root, "layoutPopover")
-                self.assertEqual("7 visible · 2 hidden", self.item(root, "inventoryCount").property("text"))
+                self.assertEqual("6 visible · 3 hidden", self.item(root, "inventoryCount").property("text"))
                 top_left = popover.mapToScene(popover.boundingRect().topLeft())
                 self.assertGreaterEqual(top_left.x(), 0); self.assertGreaterEqual(top_left.y(), 0)
                 self.assertLessEqual(top_left.x() + popover.width(), width)
@@ -3259,21 +3708,14 @@ class ProviderSelectionTests(UiTestCase):
     def test_claude_model_and_effort_are_manual_and_the_answering_model_is_shown_apart(self) -> None:
         bridge = self.bridge(proposal(kind="chat", reply="Merhaba!"))
         root = self.open_panel(bridge)
-        self.assertEqual("Answered the last call: no Claude call yet", self.item(root, "actualModelLine").property("text"))
+        self.assertEqual("No Claude call yet", self.item(root, "actualModelLine").property("value"))
         self.assertIn("shown after the first Claude call", self.item(root, "quotaLine").property("text"))
         self.assertEqual("Connected - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
         self.assertFalse(self.item(root, "providerRow_google").property("selectable"))
-        # Google's pools belong to Google: nothing of them shows while Claude is chosen.
-        self.assertFalse(self.item(root, "googleQuota_0_weekly").property("visible"))
-        self.click(root, "providerDetails_google"); pump(200)
-        # Two pools, each exactly as reported - never merged into one number.
-        self.assertEqual(["Gemini Models", "Claude and GPT models"],
-                         [self.item(root, f"googlePoolName_{i}").property("text") for i in (0, 1)])
-        self.assertEqual([79, 100, 100, 100],
-                         [self.item(root, name).property("remaining") for name in
-                          ("googleQuota_0_weekly", "googleQuota_0_5h", "googleQuota_1_weekly", "googleQuota_1_5h")])
-        self.assertTrue(self.item(root, "googleQuota_0_weekly").property("resetText"))
-        self.assertTrue(self.item(root, "googleQuota_0_weekly").property("visible"))
+        # Google keeps its connection state, but no quota control sits in this panel
+        # any more, and Google's pools are read by the backend only.
+        self.assertEqual([], [i for i in visual_items(root) if str(i.objectName()).startswith(("providerDetails_", "googleQuota_"))])
+        self.assertEqual(2, len(bridge.providers[2]["quota"]["groups"]))
         bridge.setChatProvider("google")
         self.assertEqual("claude", bridge.chatProvider)                                   # not selectable in any way
         # No Apply step: a chosen model is persisted at once, for the NEXT call.
@@ -3289,7 +3731,8 @@ class ProviderSelectionTests(UiTestCase):
         self.model.on_complete = report
         self.model.provider = "anthropic"
         bridge.submitText("Merhaba"); pump(300)
-        self.assertEqual("Answered the last call: claude-haiku-4-5-20251001", self.item(root, "actualModelLine").property("text"))
+        answered = self.item(root, "actualModelLine")
+        self.assertEqual(("Haiku 4.5", "claude-haiku-4-5-20251001"), (answered.property("value"), answered.property("note")))
         # The quota bar carries what REMAINS, and the reset the provider named.
         five_hour = self.item(root, "claudeQuota_five_hour")
         self.assertEqual((75, "Current session (5 h)", True), (five_hour.property("remaining"), five_hour.property("label"),
@@ -3315,7 +3758,8 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
         primary = self.item(root, "codexQuota_primary")
         self.assertEqual((96, "5-hour window"), (primary.property("remaining"), primary.property("label")))
-        self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("text"))
+        self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("note"))
+        self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value"))
         # Codex interprets the SAME request into the SAME gated task: approval and destination unchanged.
         self.codex.answers = [task_proposal("code_analysis")]
         bridge.submitText("Bu projeyi incele."); pump(300)
@@ -4543,3 +4987,184 @@ class GlassStateTests(SurfaceCase):
         self.assertLess(surfaces[0].property("color").alphaF(), 0.6)          # a pane, not a card
         self.assertEqual(0, QQmlProperty.read(surfaces[0], "border.width"))
 
+
+def tiny_png(path: Path, rgb=(220, 20, 60), size=8) -> Path:
+    """A real PNG of one colour, so thumbnails and the lightbox have pixels to show."""
+    import struct
+    import zlib
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    return path
+
+
+class PrePolishTests(SurfaceCase):
+    """The pre-polish cleanup: truthful gauges, a filled feed, a quieter panel, real attachment previews."""
+
+    def files(self):
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-prepolish-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        tiny_png(folder / "shot.png")
+        (folder / "notes.md").write_text("# Rapor\nSatır bir\nSatır iki", encoding="utf-8")
+        return folder
+
+    def test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all(self) -> None:
+        from jarvis.ui.telemetry import Sampler
+        sample = Sampler().sample()
+        self.assertEqual({"available", "cpu", "ram", "disk"}, set(sample))
+        for key in ("ram", "disk"):
+            if sample[key] is not None:
+                self.assertTrue(0 <= sample[key] <= 100)
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._telemetry = {"available": True, "cpu": 43, "ram": 67, "disk": 89}
+        bridge.telemetryChanged.emit(); pump(200)
+        self.assertTrue(self.item(root, "systemGauges").isVisible())
+        self.assertEqual(("43%", "67%", "89%"), tuple(self.item(root, n).property("value") for n in ("gaugeCpu", "gaugeRam", "gaugeDisk")))
+        self.assertAlmostEqual(0.43, self.item(root, "gaugeCpu").property("ratio"), places=3)
+        self.assertEqual("This machine, now", self.item(root, "systemNote").property("text"))
+        # Nothing readable: no ring, no note, no dash - the metadata takes the width.
+        bridge._telemetry = {"available": False}
+        bridge.telemetryChanged.emit(); pump(200)
+        self.assertFalse(self.item(root, "systemGauges").isVisible())
+        self.assertFalse(self.item(root, "systemNote").isVisible())
+        self.assertEqual(0, self.item(root, "systemMetadata").x())
+        self.assertNotIn("Not measured", self.texts(root.contentItem(), []))
+
+    def texts(self, node, out):
+        text = node.property("text")
+        if isinstance(text, str) and node.isVisible():
+            out.append(text)
+        for child in node.childItems():
+            self.texts(child, out)
+        return out
+
+    def test_the_live_feed_well_fills_its_panel_body(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+            root.resize(width, height); pump(500)
+            well = self.item(root, "activityWell")
+            with self.subTest(size=(width, height)):
+                self.assertGreater(well.height(), 100)
+                self.assertAlmostEqual(well.parentItem().height(), well.height(), delta=1)   # no hole beneath a short list
+
+    def test_the_provider_panel_lost_its_clutter_and_says_web_research_plainly(self) -> None:
+        bridge = self.bridge()
+        bridge.backend.providers = lambda: [
+            {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
+             "models": [{"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5", "description": "", "efforts": ["low", "medium"]}]},
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
+             "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low"], "default_effort": "low", "verified": {}}]},
+            {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False,
+             "quota": {"groups": [{"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]}},
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+        root = self.window(bridge)
+        self.click(root, "modelTrigger"); pump(400)
+        names = [str(i.objectName()) for i in self.all_items(root)]
+        for gone in ("providerDetails_google", "modelField", "claudeAttachmentLine", "codexAttachmentLine"):
+            self.assertNotIn(gone, names)
+        self.assertFalse(any(n.startswith("googleQuota_") for n in names))
+        self.assertEqual("Available", self.item(root, "claudeResearchStateBadge").property("text"))
+        self.assertEqual("No Claude call yet", self.item(root, "actualModelLine").property("value"))
+        self.assertEqual("Not reported yet", self.item(root, "claudePlanFact").property("value"))
+        # The selector still works from the collapsed list, and the answering model is a fact.
+        self.click(root, "claudeModelField"); pump(300)
+        self.invoke(root, "claudeModel_sonnet", "chosen"); pump(200)
+        self.assertEqual("claude-sonnet-5", self.store.load().settings.claude_model)
+        bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-luna", "low"); pump(200)
+        self.assertEqual("Unavailable", self.item(root, "codexResearchStateBadge").property("text"))
+        self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value"))
+        # Google's quota is still retrieved - it just has no control here.
+        self.assertEqual(1, len(bridge.providers[2]["quota"]["groups"]))
+
+    def invoke(self, root, name, signal):
+        QMetaObject.invokeMethod(self.item(root, name), signal)
+        pump(200)
+
+    def test_updates_starts_hidden_because_it_repeats_the_live_feed_and_stays_in_cards(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(False, [c for c in bridge.railCards if c["id"] == "updates"][0]["visible"])
+        self.assertNotIn("railUpdates", [str(i.objectName()) for i in self.all_items(root)])
+        # Same data source as the live feed: this session's activity notes.
+        bridge.setCardVisible("rail", "updates", True); pump(300)
+        self.assertTrue(self.item(root, "railUpdates").isVisible())
+        self.assertGreaterEqual(len(bridge.activity), 1)                 # what the card would count
+
+    def test_attachments_preview_from_the_snapshot_in_the_draft_the_groups_and_the_sent_message(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        folder = self.files()
+        bridge._say("jarvis", "Konu A planı.", chat=True); pump(200)
+        bridge.quoteMessage(bridge.feed[-1]["id"])
+        group_id = bridge.contextGroups[0]["id"]
+        self.assertTrue(bridge.attachFileToGroup(group_id, (folder / "shot.png").as_uri()))
+        self.assertTrue(bridge.attachFile((folder / "notes.md").as_uri()))
+        pump(400)
+        image = bridge.groupAttachments(group_id)[0]
+        note = bridge.globalAttachments[0]
+        # The thumbnail reads JARVIS's snapshot copy, never the picked path.
+        self.assertTrue(image["preview"].startswith("file:///"))
+        self.assertIn(bridge._snapshots.name, image["preview"])
+        self.assertNotIn(str(folder), image["preview"])
+        self.assertNotIn("preview", note)
+        self.assertEqual(image["preview"], self.item(root, "attachmentThumb_" + image["id"]).property("source").toString())
+        self.assertIn("Image", self.item(root, "attachmentMeta_" + image["id"]).property("text"))
+        self.assertIn("B", self.item(root, "attachmentMeta_" + note["id"]).property("text"))
+        # The group's image sits inside the group card; the note sits under the message.
+        self.assertTrue(self.item(root, "contextGroupFiles_" + group_id).isVisible())
+        self.assertTrue(self.item(root, "globalAttachments").isVisible())
+        # Click: the internal lightbox, in proportion; Escape closes it.
+        overlay = self.item(root, "attachmentPreview")
+        self.click(root, "attachmentOpen_" + image["id"]); pump(300)
+        self.assertEqual((True, "image", "shot.png"), (overlay.property("open"), overlay.property("kind"), overlay.property("file")["name"]))
+        self.assertEqual(image["preview"], self.item(root, "attachmentPreviewImage").property("source").toString())
+        QTest.keyClick(root, Qt.Key_Escape); pump(300)
+        self.assertFalse(overlay.property("open"))
+        # A text file: read-only, the snapshotted text, bounded; the X closes it.
+        self.click(root, "attachmentOpen_" + note["id"]); pump(300)
+        body = self.item(root, "attachmentPreviewText")
+        self.assertEqual(("text", "# Rapor\nSatır bir\nSatır iki", True), (overlay.property("kind"), body.property("text"), body.property("readOnly")))
+        self.click(root, "attachmentPreviewClose"); pump(300)
+        self.assertFalse(overlay.property("open"))
+        # Remove still works in the draft.
+        self.click(root, "attachmentRemove_" + note["id"]); pump(200)
+        self.assertEqual([], bridge.globalAttachments)
+        bridge.attachFile((folder / "notes.md").as_uri()); pump(200)
+        # Sent: the message keeps its files, the group's one marked with its letter.
+        bridge.submitText("Bunlara bak."); pump(400)
+        user = [e for e in bridge.feed if e["kind"] == "user"][-1]
+        self.assertEqual("shot.png", user["groups"][0]["attachments"][0]["name"])
+        self.assertTrue(user["groups"][0]["attachments"][0]["preview"].startswith("file:///"))
+        strip = [i for i in self.all_items(root) if i.objectName() == "sentAttachments" and i.isVisible()]
+        self.assertEqual(1, len(strip))
+        self.assertEqual(["A", ""], [f["label"] for f in strip[0].property("files").toVariant()])
+        self.assertEqual(([], []), (bridge.contextGroups, bridge.globalAttachments))
+
+    def test_the_preview_relays_only_display_data_and_only_for_readable_kinds(self) -> None:
+        bridge = self.bridge()
+        seen = []
+        bridge.previewRequested.connect(seen.append)
+        bridge.previewAttachment({"id": "att-9", "kind": "image", "name": "x.png", "bytes": 3, "media_type": "image/png",
+                                  "preview": "file:///snap/x.png", "path": r"C:\somewhere\x.png"})
+        bridge.previewAttachment({"id": "att-8", "kind": "pdf", "name": "x.pdf"})
+        bridge.previewAttachment("not a file")
+        self.assertEqual(1, len(seen))
+        self.assertNotIn("path", seen[0])
+        self.assertEqual(("att-9", "file:///snap/x.png"), (seen[0]["id"], seen[0]["preview"]))
+
+
+def visual_items(root):
+    """Every item in the window's visual tree (for name checks across classes)."""
+    found, stack = [], [root.contentItem()]
+    while stack:
+        node = stack.pop()
+        found.append(node)
+        stack.extend(node.childItems())
+    return found

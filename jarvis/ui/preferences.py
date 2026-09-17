@@ -25,7 +25,7 @@ from typing import Any
 
 from jarvis.codex import CODEX_EFFORT_VALUES, CODEX_MODEL_PATTERN
 
-PREFERENCES_VERSION = 4
+PREFERENCES_VERSION = 5
 THEMES = ("space", "dark", "command")
 #: Execution-status lamp skins: the canonical glass orb and the HUD variant.
 STATUS_INDICATORS = ("orb", "hud")
@@ -107,7 +107,10 @@ def _valid_chat(candidate: Any) -> bool:
 
 
 def canonical_rail() -> dict[str, Any]:
-    return {"order": list(RAIL_IDS), "visible": {name: True for name in RAIL_IDS}}
+    """Every card in canonical order. Updates starts hidden: it lists the same
+    activity notes the Live intelligence feed already shows, so on the default
+    workspace it only repeated them; it stays in the Cards inventory."""
+    return {"order": list(RAIL_IDS), "visible": {name: name != "updates" for name in RAIL_IDS}}
 
 
 def legacy_rail() -> dict[str, Any]:
@@ -211,7 +214,12 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     # Version 3 -> 4: the rail became editable and gained Memory. Everything
     # saved is kept; Memory arrives hidden, restorable from Cards.
     if isinstance(candidate, dict) and candidate.get("version") == 3 and "rail" not in candidate:
-        candidate = {**candidate, "version": PREFERENCES_VERSION, "rail": legacy_rail()}
+        candidate = {**candidate, "version": 4, "rail": legacy_rail()}
+    # Version 4 -> 5: Updates leaves the default rail (it duplicated the Live
+    # intelligence feed). A saved layout keeps everything else the person chose.
+    if isinstance(candidate, dict) and candidate.get("version") == 4 and isinstance(candidate.get("rail"), dict)             and isinstance(candidate["rail"].get("visible"), dict):
+        candidate = {**candidate, "version": PREFERENCES_VERSION,
+                     "rail": {**candidate["rail"], "visible": {**candidate["rail"]["visible"], "updates": False}}}
     # A document from before the language setting keeps every choice and gains
     # English: an existing installation never switches language on its own.
     if isinstance(candidate, dict) and "version" in candidate and "language" not in candidate:

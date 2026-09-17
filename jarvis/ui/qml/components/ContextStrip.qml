@@ -23,36 +23,6 @@ Item {
     visible: groups.length > 0 || globals.length > 0
     height: visible ? body.height + 10 : 0
 
-    // One attached file: its kind, its name, and a remove control.
-    component FileChip: Rectangle {
-        id: chip
-        property var file: ({})
-        objectName: "attachment_" + file.id
-        width: chipRow.width + 18; height: 24; radius: 6
-        color: Theme.alpha(Theme.text, 0.05)
-        border.width: 1; border.color: Theme.alpha(Theme.text, 0.08)
-        Row {
-            id: chipRow
-            x: 9; anchors.verticalCenter: parent.verticalCenter; spacing: 7
-            Text { anchors.verticalCenter: parent.verticalCenter; color: Theme.materialBlue
-                   text: chip.file.kind === "image" ? qsTr("Image") : qsTr("File")
-                   font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold }) }
-            Text { anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel
-                   text: chip.file.name || ""; elide: Text.ElideMiddle; width: Math.min(implicitWidth, 180)
-                   font: Qt.font({ family: Theme.font, pixelSize: 12 }) }
-            Text {
-                objectName: "attachmentRemove_" + chip.file.id
-                anchors.verticalCenter: parent.verticalCenter
-                text: "✕"; color: chipRemove.containsMouse ? Theme.danger : Theme.textMuted
-                font: Qt.font({ family: Theme.font, pixelSize: 11 })
-                Accessible.role: Accessible.Button
-                Accessible.name: qsTr("Remove this attachment")
-                MouseArea { id: chipRemove; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor; onClicked: bridge.removeAttachment(chip.file.id) }
-            }
-        }
-    }
-
     Column {
         id: body
         width: parent.width
@@ -217,7 +187,8 @@ Item {
                     }
                 }
                 EditMenu { id: noteMenu; objectName: "noteEditMenu_" + card.groupId; editor: noteInput }
-                // This group's files, indented under its letter.
+                // This group's files, indented under its letter: the same cards as
+                // everywhere else, thumbnails included.
                 Flow {
                     id: fileRow
                     objectName: "contextGroupFiles_" + card.groupId
@@ -225,7 +196,8 @@ Item {
                     x: 39; y: (noteBox.visible ? noteBox.y + noteBox.height : head.y + head.height) + 6
                     width: parent.width - 49
                     spacing: 6
-                    Repeater { model: card.files; FileChip { file: modelData } }
+                    Repeater { model: card.files
+                               AttachmentCard { file: modelData; removable: true; compact: true; onOpened: bridge.previewAttachment(modelData) } }
                 }
             }
         }
@@ -240,7 +212,8 @@ Item {
                    font: Qt.font({ family: Theme.font, pixelSize: 11 }) }
             Flow {
                 width: parent.width; spacing: 6
-                Repeater { model: strip.globals; FileChip { file: modelData } }
+                Repeater { model: strip.globals
+                           AttachmentCard { file: modelData; removable: true; onOpened: bridge.previewAttachment(modelData) } }
             }
         }
     }
