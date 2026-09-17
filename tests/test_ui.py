@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -1140,7 +1141,16 @@ class MacroGeometryTests(UiTestCase):
         bridge = self.bridge()
         root = self.load(bridge)
         root.showNormal(); root.resize(1920, 1080); pump(300)
-        canonical_left = self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x()
+        left = lambda: self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x()
+        # The first layout animates in; under a long suite's load 300 ms is not
+        # always enough, so sample only once two readings agree (bounded wait).
+        canonical_left, waited = left(), 0
+        while waited < 3000:
+            pump(150); waited += 150
+            now = left()
+            if abs(now - canonical_left) < 0.01:
+                break
+            canonical_left = now
         bridge.setTheme("command")
         pump(600)
         # The command preset is a different layout family: it must not inherit
@@ -1228,18 +1238,20 @@ class CommandHeaderTests(UiTestCase):
         pump(300)
         self.assertTrue(root.property("modelOpen"))
         self.assertTrue(chip.property("open"))
-        # The dropdown offers the real choices and routes through the one
-        # authoritative call.
+        # The model list is collapsed until it is asked for; a choice is persisted
+        # at once, with no separate Apply step.
+        self.click(root, "claudeModelField")
+        pump(300)
         self.click(root, "modelRowDefault")
-        pump(200)
+        pump(250)
         self.assertFalse(self.store.load().settings.claude_model)
 
-        QMetaObject.invokeMethod(self.item(root, "modelField"), "insert",
-                                 Q_ARG(int, 0), Q_ARG(str, "claude-opus-5"))
-        QMetaObject.invokeMethod(self.item(root, "applyModelButton"), "clicked")   # below the fold of the scrolling panel
+        field = self.item(root, "modelField")
+        QMetaObject.invokeMethod(field, "insert", Q_ARG(int, 0), Q_ARG(str, "claude-opus-5"))
+        QMetaObject.invokeMethod(field, "editingFinished")     # a typed id applies when it is finished
         pump(250)
         self.assertEqual("claude-opus-5", self.store.load().settings.claude_model)
-        self.assertEqual("claude-opus-5", chip.property("modelName"))
+        self.assertEqual("Opus 5", chip.property("modelName"))                    # short name, canonical id stored
         self.assertEqual(0, self.execute_calls())
 
 class LeftContextTests(UiTestCase):
@@ -3251,15 +3263,21 @@ class ProviderSelectionTests(UiTestCase):
         self.assertIn("shown after the first Claude call", self.item(root, "quotaLine").property("text"))
         self.assertEqual("Connected - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
         self.assertFalse(self.item(root, "providerRow_google").property("selectable"))
-        # Two pools, each exactly as reported - never merged.
-        gemini, third_party = (self.item(root, f"googleQuota_{i}").property("text") for i in (0, 1))
-        self.assertTrue(gemini.startswith("Gemini Models: weekly 79% remaining · resets "), gemini)
-        self.assertIn("5-hour 100% remaining · resets ", gemini)
-        self.assertTrue(third_party.startswith("Claude and GPT models: weekly 100% remaining · resets "), third_party)
+        # Google's pools belong to Google: nothing of them shows while Claude is chosen.
+        self.assertFalse(self.item(root, "googleQuota_0_weekly").property("visible"))
+        self.click(root, "providerDetails_google"); pump(200)
+        # Two pools, each exactly as reported - never merged into one number.
+        self.assertEqual(["Gemini Models", "Claude and GPT models"],
+                         [self.item(root, f"googlePoolName_{i}").property("text") for i in (0, 1)])
+        self.assertEqual([79, 100, 100, 100],
+                         [self.item(root, name).property("remaining") for name in
+                          ("googleQuota_0_weekly", "googleQuota_0_5h", "googleQuota_1_weekly", "googleQuota_1_5h")])
+        self.assertTrue(self.item(root, "googleQuota_0_weekly").property("resetText"))
+        self.assertTrue(self.item(root, "googleQuota_0_weekly").property("visible"))
         bridge.setChatProvider("google")
         self.assertEqual("claude", bridge.chatProvider)                                   # not selectable in any way
-        self.invoke(root, "claudeModel_haiku", "chosen")
-        self.invoke(root, "applyModelButton", "clicked")
+        # No Apply step: a chosen model is persisted at once, for the NEXT call.
+        self.invoke(root, "claudeModel_haiku", "chosen"); pump(100)
         # The row applies the id the alias RESOLVES to (the "haiku" alias was answered by Sonnet live).
         self.assertEqual(("claude-haiku-4-5-20251001", None), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
         self.assertEqual("Configured model: claude-haiku-4-5-20251001 · effort: Default", self.item(root, "configuredModelLine").property("text"))
@@ -3272,13 +3290,17 @@ class ProviderSelectionTests(UiTestCase):
         self.model.provider = "anthropic"
         bridge.submitText("Merhaba"); pump(300)
         self.assertEqual("Answered the last call: claude-haiku-4-5-20251001", self.item(root, "actualModelLine").property("text"))
-        self.assertTrue(self.item(root, "claudeLimit_five_hour").property("text").startswith("Current session (5 h): 25% used · resets "))
+        # The quota bar carries what REMAINS, and the reset the provider named.
+        five_hour = self.item(root, "claudeQuota_five_hour")
+        self.assertEqual((75, "Current session (5 h)", True), (five_hour.property("remaining"), five_hour.property("label"),
+                                                               five_hour.property("visible")))
+        self.assertTrue(five_hour.property("resetText"))
         self.assertIn("extra paid usage: off", self.item(root, "quotaLine").property("text"))
         self.assertEqual("Last call tokens: 3 input · — cache read · — cache write · 41 output", self.item(root, "usageLine").property("text"))
-        self.invoke(root, "claudeModel_opus[1m]", "chosen")
+        self.invoke(root, "claudeModel_opus[1m]", "chosen"); pump(100)
+        self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
         self.assertTrue(self.item(root, "claudeEffort").property("enabled"))
-        QMetaObject.invokeMethod(self.item(root, "claudeEffort"), "picked", Q_ARG(str, "max")); pump(50)
-        self.invoke(root, "applyModelButton", "clicked")
+        QMetaObject.invokeMethod(self.item(root, "claudeEffort"), "picked", Q_ARG(str, "max")); pump(100)
         self.assertEqual(("claude-opus-5[1m]", "max"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
 
     def test_choosing_codex_persists_routes_calls_there_and_changes_no_authority(self) -> None:
@@ -3290,8 +3312,9 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium"}, saved)
         bridge.setCodexModel("gpt-5.6-luna", "low")
         trigger = self.item(root, "modelTrigger")                                        # the header names the real choice
-        self.assertEqual(("gpt-5.6-luna", "OPENAI  |  CODEX  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
-        self.assertTrue(self.item(root, "codexQuota_primary").property("text").startswith("5-hour window: 4% used · resets "))
+        self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
+        primary = self.item(root, "codexQuota_primary")
+        self.assertEqual((96, "5-hour window"), (primary.property("remaining"), primary.property("label")))
         self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("text"))
         # Codex interprets the SAME request into the SAME gated task: approval and destination unchanged.
         self.codex.answers = [task_proposal("code_analysis")]
@@ -3327,7 +3350,9 @@ class ProviderSelectionTests(UiTestCase):
         root = self.window(bridge)
         bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-sol", "medium")
         self.click(root, "modelTrigger"); pump(400)
-        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Listed by Codex - not tried yet"))
+        self.assertEqual("5.6 Sol", self.item(root, "codexModel_gpt-5.6-sol").property("title"))
+        self.assertIn("Listed by Codex - not tried yet", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
+        self.assertIn("gpt-5.6-sol", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))   # the canonical id stays visible
         self.click(root, "modelTrigger"); pump(300)
         # A real failure: named provider, model and reason; no raw output; nothing falls back to Claude.
         self.codex.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.")
@@ -3336,7 +3361,7 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"])
         self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes))
         self.click(root, "modelTrigger"); pump(400)
-        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Failed this session: "))
+        self.assertIn("Failed this session: ", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
         self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
         self.click(root, "modelTrigger"); pump(300)
         # The same model answering later is recorded as usable.
@@ -3344,7 +3369,7 @@ class ProviderSelectionTests(UiTestCase):
         bridge.submitText("Merhaba, kısaca kendini tanıt."); pump(300)
         self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState))
         self.click(root, "modelTrigger"); pump(400)
-        self.assertTrue(self.item(root, "codexModel_gpt-5.6-sol").property("meta").startswith("Answered this session"))
+        self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
         self.assertEqual(0, len(self.model.calls))
 
 
@@ -3448,7 +3473,10 @@ class ConversationUxTests(UiTestCase):
         self.assertEqual("şöyle.\nİkinci satır ✅", reply.property("selectedText"))          # only the selection, lines as newlines
         self.assertTrue(self.item(root, "messageQuoteSelection_1").property("visible"))
         QMetaObject.invokeMethod(self.item(root, "messageQuoteSelection_1"), "activated"); pump(100)
-        self.assertEqual("> şöyle.\n> İkinci satır ✅\n\n", self.item(root, "composerInput").property("text"))
+        # A reference on the draft - not a word written into the message being composed.
+        self.assertEqual("", self.item(root, "composerInput").property("text"))
+        self.assertEqual([("partial", "şöyle.\nİkinci satır ✅", "assistant")],
+                         [(g["reference"]["selection"], g["reference"]["text"], g["reference"]["source_role"]) for g in bridge.contextGroups])
         self.assertTrue(self.item(root, "messageQuote_1").property("visible"))           # whole-message Quote still offered
         self.assertFalse(self.item(root, "messageActions_2").property("visible"))       # never on an error card
         self.assertEqual(([], False, 0), (self.model.calls, bridge.approvalPending, self.execute_calls()))
@@ -3477,12 +3505,12 @@ class ConversationUxTests(UiTestCase):
         QMetaObject.invokeMethod(self.item(root, "messageCopy_1"), "activated"); pump(50)
         self.assertEqual("Tabii — işte düzeltme:\nMerhaba!", QGuiApplication.clipboard().text())
         QMetaObject.invokeMethod(self.item(root, "messageQuote_0"), "activated"); pump(100)
-        draft = self.item(root, "composerInput").property("text")
-        self.assertEqual("> Şu satırı düzelt: “merhaba” 👋\n\n", draft)
+        self.assertEqual("", self.item(root, "composerInput").property("text"))
         QMetaObject.invokeMethod(self.item(root, "messageQuote_1"), "activated"); pump(100)
-        self.assertEqual("> Şu satırı düzelt: “merhaba” 👋\n\n> Tabii — işte düzeltme:\n> Merhaba!\n\n",
-                         self.item(root, "composerInput").property("text"))
-        # Quoting only fills the draft: nothing is sent, understood or authorized.
+        self.assertEqual([("full", "Şu satırı düzelt: “merhaba” 👋", "user"),
+                          ("full", "Tabii — işte düzeltme:\nMerhaba!", "assistant")],
+                         [(g["reference"]["selection"], g["reference"]["text"], g["reference"]["source_role"]) for g in bridge.contextGroups])
+        # Quoting only attaches context: nothing is sent, understood or authorized.
         self.assertEqual(([], False, 0), (self.model.calls, bridge.approvalPending, self.execute_calls()))
 
 
@@ -3823,3 +3851,695 @@ class WindowStateTests(UiTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class SurfaceCase(UiTestCase):
+    """A shown window plus the two lookups the interaction tests below need."""
+
+    def window(self, bridge):
+        root = self.load(bridge)
+        root.showNormal()
+        root.resize(1920, 1080)
+        pump(350)
+        return root
+
+    def item(self, root, name):
+        def visual_find(node):
+            if node.objectName() == name:
+                return node
+            for child in node.childItems():
+                found = visual_find(child)
+                if found is not None:
+                    return found
+            return None
+        found = visual_find(root.contentItem())
+        self.assertIsNotNone(found, name)
+        return found
+
+    def click(self, root, name):
+        from PySide6.QtCore import QPointF
+        item = self.item(root, name)
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, centre)
+        pump(260)
+
+    def all_items(self, root):
+        found, stack = [], [root.contentItem()]
+        while stack:
+            node = stack.pop()
+            found.append(node)
+            stack.extend(node.childItems())
+        return found
+
+    def feed(self, root):
+        return self.item(root, "conversationFeed")
+
+
+
+class ModelCardTests(SurfaceCase):
+    """One compact card for every provider: a short name, BRAND | EFFORT, and the real plan summary."""
+
+    CLAUDE_MODELS = [
+        {"id": "default", "name": "Default (recommended)", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "medium", "high"]},
+        {"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5", "description": "", "efforts": ["low", "medium", "high"]},
+        {"id": "haiku", "name": "Haiku", "resolved": "claude-haiku-4-5-20251001", "description": "", "efforts": []},
+    ]
+
+    def providers(self, bridge):
+        bridge.backend.providers = lambda: [
+            {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "models": self.CLAUDE_MODELS, "research": True},
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
+             "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low", "medium"], "default_effort": "medium"}],
+             "quota": {"primary": {"used_percent": 8.0, "window_minutes": 300, "resets_at": 1789560046},
+                       "secondary": {"used_percent": 26.0, "window_minutes": 10080, "resets_at": 1789814410}, "has_credits": False}},
+            {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False},
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+        bridge.refreshProviders(); pump(200)
+
+    def test_the_name_is_short_the_canonical_id_is_untouched_and_the_brand_line_is_plain(self) -> None:
+        bridge = self.bridge()
+        self.providers(bridge)
+        bridge.applyModel("claude-sonnet-5", "high")
+        self.assertEqual(("Sonnet 5", "ANTHROPIC  |  HIGH", "claude-sonnet-5"),
+                         (bridge.modelCard["name"], bridge.modelCard["meta"], bridge.modelCard["model"]))
+        self.assertEqual("claude-sonnet-5", self.store.load().settings.claude_model)      # display never rewrites the id
+        bridge.applyModel("claude-sonnet-5", "")
+        self.assertEqual("ANTHROPIC", bridge.modelCard["meta"])                           # no effort: brand alone
+        bridge.applyModel("", "")
+        self.assertEqual("Opus 5", bridge.modelCard["name"])                              # the CLI default, as it resolves
+        bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-luna", "medium")
+        self.assertEqual(("5.6 Luna", "OPENAI  |  MEDIUM"), (bridge.modelCard["name"], bridge.modelCard["meta"]))
+        for technical in ("claude-", "gpt-", "CLI"):
+            self.assertNotIn(technical, bridge.modelCard["name"] + bridge.modelCard["meta"])
+        from jarvis.ui.present import display_model_name
+        self.assertEqual(["Opus 5", "Haiku 4.5", "Fable 5.1", "6 Astra", "Daybreak Blue"],
+                         [display_model_name(m) for m in ("claude-opus-5[1m]", "claude-haiku-4-5-20251001",
+                                                          "claude-fable-5-1", "gpt-6-astra", "gpt-daybreak-blue-latest")])
+
+    def test_the_card_summary_is_reported_truth_for_the_chosen_provider_only(self) -> None:
+        bridge = self.bridge()
+        self.providers(bridge)
+        self.assertEqual([], bridge.modelCard["quota"])                                   # nothing reported yet: nothing shown
+        bridge._claude_limits = {"seen_at": 10, "windows": {
+            "five_hour": {"utilization": 0.08, "resets_at": 1789560046},
+            "seven_day": {"utilization": 0.26, "resets_at": 1789814410},
+            "seven_day_opus": {"utilization": 0.61, "resets_at": 1789814410}}}
+        bridge.applyModel("claude-sonnet-5", "")
+        self.assertEqual([("five_hour", 92), ("weekly", 74)], [(q["window"], q["remaining"]) for q in bridge.modelCard["quota"]])
+        # A weekly bucket that genuinely belongs to the chosen model is the one shown.
+        bridge.applyModel("claude-opus-5[1m]", "")
+        self.assertEqual([("five_hour", 92), ("weekly", 39)], [(q["window"], q["remaining"]) for q in bridge.modelCard["quota"]])
+        self.assertEqual(1789814410, bridge.modelCard["quota"][1]["resets_at"])
+        # Switching provider switches the numbers with it: no carry-over, no merge.
+        bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-luna", "low")
+        self.assertEqual([("five_hour", 92), ("weekly", 74)], [(q["window"], q["remaining"]) for q in bridge.modelCard["quota"]])
+        self.assertEqual("openai", bridge.modelCard["brand"].lower().replace("openai", "openai"))
+
+    def test_the_card_shows_the_summary_and_the_panel_shows_the_bars(self) -> None:
+        bridge = self.bridge()
+        self.providers(bridge)
+        bridge._claude_limits = {"seen_at": 10, "windows": {"five_hour": {"utilization": 0.08, "resets_at": 1789560046},
+                                                            "seven_day": {"utilization": 0.26, "resets_at": 1789814410}}}
+        bridge.applyModel("claude-sonnet-5", "high")
+        root = self.window(bridge); pump(200)
+        trigger = self.item(root, "modelTrigger")
+        self.assertEqual(("Sonnet 5", "ANTHROPIC  |  HIGH"), (trigger.property("modelName"), trigger.property("metadata")))
+        self.assertTrue(self.item(root, "selectorQuota").property("visible"))
+        self.assertTrue(self.item(root, "selectorQuota_five_hour").property("visible"))
+        self.click(root, "modelTrigger"); pump(400)
+        bar = self.item(root, "claudeQuota_five_hour")
+        self.assertEqual((92, True), (bar.property("remaining"), bar.property("exact")))
+        fill = self.item(root, "quotaFill")
+        self.assertGreater(fill.width(), 0)
+        self.assertLess(fill.width(), self.item(root, "claudeQuota_five_hour").width())
+
+
+class ContextReferenceTests(SurfaceCase):
+    """Every quote starts its own GROUP; the text being written stays the person's own."""
+
+    def conversation(self, bridge):
+        bridge._say("user", "Planı ver.")
+        bridge._say("jarvis", "Konu A: kimlik denetimi. Konu B: önbellek. Konu C: model takma adı.", chat=True)
+        bridge._say("jarvis", "Codex cache beş dakika yeniden kullanılıyor.", chat=True)
+        bridge._say("error", "FAILED [x]: y")
+        pump(300)
+        return [e["id"] for e in bridge.feed]
+
+    def files(self):
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-grp-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "spec-a.txt").write_text("A spesifikasyonu", encoding="utf-8")
+        (folder / "notes-c.md").write_text("# C notları", encoding="utf-8")
+        (folder / "global.txt").write_text("genel", encoding="utf-8")
+        return folder
+
+    def test_three_quotes_make_three_stable_groups_that_own_their_notes_and_files(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        ids = self.conversation(bridge)
+        folder = self.files()
+        for part in ("Konu A: kimlik denetimi.", "Konu B: önbellek.", "Konu C: model takma adı."):
+            self.assertTrue(bridge.quoteSelection(ids[1], part))
+        pump(200)
+        groups = bridge.contextGroups
+        self.assertEqual(["A", "B", "C"], [g["label"] for g in groups])
+        a, b, c = (g["id"] for g in groups)
+        bridge.setGroupNote(a, "Bu kısmı değiştir")
+        bridge.setGroupNote(b, "Bunu neden seçtik?")
+        self.assertTrue(bridge.attachFileToGroup(a, (folder / "spec-a.txt").as_uri()))
+        self.assertTrue(bridge.attachFileToGroup(c, (folder / "notes-c.md").as_uri()))
+        self.assertTrue(bridge.attachFile((folder / "global.txt").as_uri()))
+        pump(200)
+        self.assertEqual(["spec-a.txt"], [f["name"] for f in bridge.groupAttachments(a)])
+        self.assertEqual([], bridge.groupAttachments(b))
+        self.assertEqual(["notes-c.md"], [f["name"] for f in bridge.groupAttachments(c)])
+        self.assertEqual(["global.txt"], [f["name"] for f in bridge.globalAttachments])
+        # Ownership is visible: each file sits inside its own group's card.
+        self.assertTrue(self.item(root, "contextGroupFiles_" + a).isVisible())
+        self.assertFalse(self.item(root, "contextGroupFiles_" + b).isVisible())
+        self.assertTrue(self.item(root, "globalAttachments").isVisible())
+        # Removing A's file touches nothing else; removing group A shifts nothing onto B.
+        bridge.removeAttachment(bridge.groupAttachments(a)[0]["id"]); pump(150)
+        self.assertEqual(([], ["notes-c.md"], ["global.txt"]),
+                         ([f["name"] for f in bridge.groupAttachments(a)], [f["name"] for f in bridge.groupAttachments(c)],
+                          [f["name"] for f in bridge.globalAttachments]))
+        bridge.removeGroup(a); pump(200)
+        self.assertEqual([(b, "Bunu neden seçtik?", "Konu B: önbellek."), (c, "", "Konu C: model takma adı.")],
+                         [(g["id"], g["note"], g["reference"]["text"]) for g in bridge.contextGroups])
+        self.assertEqual(["A", "B"], [g["label"] for g in bridge.contextGroups])      # letters follow the order shown
+        self.assertEqual(["notes-c.md"], [f["name"] for f in bridge.groupAttachments(c)])
+        self.assertEqual(["global.txt"], [f["name"] for f in bridge.globalAttachments])
+        # The same selection twice stays one group; an error card is never quotable.
+        bridge.quoteSelection(ids[1], "Konu B: önbellek.")
+        self.assertEqual(2, len(bridge.contextGroups))
+        self.assertFalse(bridge.quoteMessage(ids[3]))
+        self.assertEqual("", self.item(root, "composerInput").property("text"))
+
+    def test_the_turn_carries_groups_mode_and_global_files_then_history_keeps_only_names(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A tamam."), proposal(kind="chat", reply="B tamam."),
+                             proposal(kind="chat", reply="Peki."))
+        ids = self.conversation(bridge)
+        folder = self.files()
+        bridge.quoteSelection(ids[1], "Konu A: kimlik denetimi.")
+        bridge.quoteSelection(ids[2], "Codex cache")
+        a, b = (g["id"] for g in bridge.contextGroups)
+        bridge.setGroupNote(a, "bunu açıkla")
+        bridge.attachFileToGroup(b, (folder / "notes-c.md").as_uri())
+        bridge.attachFile((folder / "global.txt").as_uri())
+        bridge.setResponseMode("separate")
+        bridge.submitText("Her birine kısa cevap ver."); pump(300)
+        # Separate: one call per group, each carrying only its own group plus the global file.
+        first, second = (call.context for call in self.model.calls[-2:])
+        self.assertEqual(("separate", "separate"), (first["response_mode"], second["response_mode"]))
+        self.assertEqual([("A", "Konu A: kimlik denetimi.", "bunu açıkla", [])],
+                         [(g["label"], g["reference"]["quoted_text"], g.get("note"), [f["name"] for f in g["attachments"]])
+                          for g in first["context_groups"]])
+        self.assertEqual([("B", "Codex cache", None, ["notes-c.md"])],
+                         [(g["label"], g["reference"]["quoted_text"], g.get("note"), [f["name"] for f in g["attachments"]])
+                          for g in second["context_groups"]])
+        self.assertEqual((["global.txt"], ["global.txt"]),
+                         ([f["name"] for f in first["global_attachments"]], [f["name"] for f in second["global_attachments"]]))
+        # The draft is empty again and the mode is back to the default.
+        self.assertEqual(([], [], "together"), (bridge.contextGroups, bridge.globalAttachments, bridge.responseMode))
+        bridge.submitText("Peki?"); pump(300)
+        follow_up = self.model.calls[-1].context
+        self.assertEqual(([], []), (follow_up["context_groups"], follow_up["global_attachments"]))
+        remembered = [t["text"] for t in follow_up["conversation"] if t["role"] == "user"][-1]
+        self.assertIn('[Group A: quote "Konu A: kimlik denetimi."]', remembered)
+        self.assertIn('[Group B: quote "Codex cache"; file notes-c.md]', remembered)
+        self.assertIn("[attached: file global.txt]", remembered)
+        for leaked in ("bunu açıkla", "# C notları", "genel"):
+            self.assertNotIn(leaked, remembered)
+
+    def test_the_contextual_quote_action_follows_the_selection_and_leaves_with_it(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        self.conversation(bridge)
+        for i in range(24):
+            bridge._say("jarvis", f"Dolgu {i}: bu akışa gerçek bir yükseklik veren yeterli metin.", chat=True)
+        pump(700)
+        tip = self.item(root, "quoteTip")
+        self.assertFalse(tip.property("shown"))
+        feed = self.feed(root)
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 0.0)); pump(250)
+        reply = [i for i in self.all_items(root) if i.objectName() == "feedMessage_jarvis"
+                 and str(i.property("text")).startswith("Konu A:")][0]
+        QMetaObject.invokeMethod(reply, "select", Q_ARG(int, 0), Q_ARG(int, 6)); pump(200)
+        self.assertTrue(tip.property("shown"))
+        where = tip.y()
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 60.0)); pump(300)
+        self.assertAlmostEqual(where - 60, tip.y(), delta=1)
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 0.0)); pump(300)
+        self.click(root, "quoteTipButton")
+        self.assertEqual([("partial", "Konu A")], [(g["reference"]["selection"], g["reference"]["text"]) for g in bridge.contextGroups])
+        self.assertFalse(tip.property("shown"))
+        self.assertEqual("", self.item(root, "composerInput").property("text"))
+
+
+class ReferenceNoteTests(SurfaceCase):
+    """A group note is typed continuously in place and stays on ITS own group."""
+
+    def draft(self, bridge, count=2):
+        bridge._say("user", "Planı ver.")
+        bridge._say("jarvis", "Konu A: kimlik denetimi.", chat=True)
+        bridge._say("jarvis", "Konu B: önbellek.", chat=True)
+        pump(300)
+        ids = [e["id"] for e in bridge.feed]
+        for index in range(count):
+            bridge.quoteMessage(ids[1 + index])
+        pump(300)
+        return [g["id"] for g in bridge.contextGroups]
+
+    def note(self, root, group_id):
+        return self.item(root, "contextGroupNote_" + group_id)
+
+    def type(self, root, text):
+        for char in text:
+            QTest.keyClick(root, char)
+            pump(40)
+
+    def open_note(self, root, group_id):
+        self.click(root, "contextGroupNoteToggle_" + group_id)
+        pump(200)
+        return self.note(root, group_id)
+
+    def test_typing_keeps_the_same_focused_editor_through_files_and_mode_changes(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        first, second = self.draft(bridge)
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-note-")); self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "a.txt").write_text("a", encoding="utf-8")
+        editor = self.open_note(root, first)
+        self.assertTrue(editor.property("activeFocus"))
+        self.type(root, "bunu sade")
+        # A file added to THIS group, a file removed, and the answer mode flipped -
+        # none of them rebuilds the card or takes the editor away.
+        self.assertTrue(bridge.attachFileToGroup(first, (folder / "a.txt").as_uri())); pump(150)
+        bridge.setResponseMode("separate"); pump(100)
+        self.type(root, "lestir")
+        bridge.removeAttachment(bridge.groupAttachments(first)[0]["id"]); pump(150)
+        self.assertIs(editor, self.note(root, first))
+        self.assertEqual(("bunu sadelestir", True, 15),
+                         (editor.property("text"), editor.property("activeFocus"), editor.property("cursorPosition")))
+        QTest.keyClick(root, Qt.Key_Backspace); pump(60)
+        QTest.keyClick(root, Qt.Key_Backspace); pump(60)
+        self.assertEqual(("bunu sadelest", 13), (editor.property("text"), editor.property("cursorPosition")))
+        self.assertEqual(["bunu sadelest", ""], [g["note"] for g in bridge.contextGroups])
+
+    def test_each_note_belongs_to_its_own_group_and_survives_the_cards_rebuilding(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        first, second = self.draft(bridge)
+        self.open_note(root, first)
+        self.type(root, "ilki")
+        self.open_note(root, second)
+        self.type(root, "ikinci")
+        self.assertEqual([(first, "ilki"), (second, "ikinci")], [(g["id"], g["note"]) for g in bridge.contextGroups])
+        # A new group really changes the membership: the cards rebuild and each
+        # note comes back on its own card, found by id.
+        bridge.quoteSelection([e["id"] for e in bridge.feed][1], "kimlik"); pump(300)
+        self.assertEqual(["ilki", "ikinci", ""], [g["note"] for g in bridge.contextGroups])
+        self.assertEqual(("ilki", "ikinci"), (self.note(root, first).property("text"), self.note(root, second).property("text")))
+        bridge.removeGroup(first); pump(300)
+        self.assertEqual((second, "ikinci"), (bridge.contextGroups[0]["id"], bridge.contextGroups[0]["note"]))
+        self.assertEqual("ikinci", self.note(root, second).property("text"))
+
+    def test_sending_while_the_note_editor_still_has_focus_carries_the_last_character(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A tamam."), proposal(kind="chat", reply="B tamam."))
+        root = self.window(bridge)
+        first, second = self.draft(bridge)
+        self.open_note(root, first)
+        self.type(root, "Bunun guvenlik etkisini ayrintili acikla")
+        bridge.setResponseMode("separate")
+        self.assertTrue(self.note(root, first).property("activeFocus"))
+        self.item(root, "composerInput").setProperty("text", "İkisini de değerlendir.")
+        pump(80)
+        self.click(root, "composerSend")
+        pump(400)
+        # Separate mode: two isolated calls. The first carries the note exactly as typed.
+        first, second = (call.context for call in self.model.calls[-2:])
+        self.assertEqual(("separate", "separate"), (first["response_mode"], second["response_mode"]))
+        self.assertEqual((["Bunun guvenlik etkisini ayrintili acikla"], [None]),
+                         ([g.get("note") for g in first["context_groups"]], [g.get("note") for g in second["context_groups"]]))
+        self.assertEqual([], bridge.contextGroups)
+
+
+class AttachmentUiTests(SurfaceCase):
+    """An attachment is one explicitly chosen item - never a door into the filesystem."""
+
+    def files(self):
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-att-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "notes.md").write_text("# Rapor\nSatır", encoding="utf-8")
+        (folder / "book.pdf").write_bytes(b"%PDF-1.4")
+        (folder / "inner").mkdir()
+        return folder
+
+    def test_only_the_chosen_supported_file_is_taken_and_a_refusal_is_said_plainly(self) -> None:
+        bridge = self.bridge()
+        folder = self.files()
+        self.assertTrue(bridge.attachFile((folder / "notes.md").as_uri()))
+        self.assertEqual([("notes.md", "text", "# Rapor\nSatır")], [(i["name"], i["kind"], i["text"]) for i in bridge.globalAttachments])
+        self.assertNotIn("path", bridge.globalAttachments[0])
+        for bad in ("book.pdf", "inner", "ghost.txt"):
+            with self.subTest(bad=bad):
+                self.assertFalse(bridge.attachFile((folder / bad).as_uri()))
+        self.assertFalse(bridge.attachFileToGroup("grp-nope", (folder / "notes.md").as_uri()))   # no such owner
+        self.assertEqual(1, len(bridge.globalAttachments))
+        self.assertEqual("notice", bridge.feed[-1]["kind"])
+        self.assertIn("book.pdf", " ".join(e["text"] for e in bridge.feed))
+        (folder / "notes.md").write_text("değişti", encoding="utf-8")
+        bridge.submitText("Bunu özetle."); pump(300)
+        self.assertEqual("# Rapor\nSatır", self.model.calls[-1].context["global_attachments"][0]["file_text"])
+
+    def test_a_provider_that_cannot_take_a_kind_refuses_it_and_nothing_is_re_routed(self) -> None:
+        from unittest.mock import patch
+        import jarvis.ui.bridge as bridge_module
+        bridge = self.bridge()
+        folder = self.files()
+        with patch.dict(bridge_module.ATTACHMENT_SUPPORT, {"claude": {"image": False, "text": True}}):
+            self.assertFalse(bridge.attachFile((folder / "shot.png").as_uri()))
+        self.assertEqual([], bridge.globalAttachments)
+        self.assertIn("cannot take", bridge.feed[-1]["text"])
+        self.assertEqual("claude", bridge.chatProvider)
+        self.assertEqual({"image": True, "text": True}, bridge.attachmentSupport)
+
+    def test_the_clipboard_gives_an_image_or_files_and_plain_text_is_left_alone(self) -> None:
+        from PySide6.QtCore import QMimeData, QUrl
+        from PySide6.QtGui import QImage
+        bridge = self.bridge()
+        folder = self.files()
+        text = QMimeData(); text.setText("sadece metin")
+        bridge.clipboard_data = lambda: text
+        self.assertEqual((-1, False), (bridge.attachClipboard(), bridge.clipboardAttachable()))   # text: not an attachment
+        self.assertEqual([], bridge.globalAttachments)
+        image = QImage(4, 4, QImage.Format.Format_RGB32); image.fill(0xFFCC0022)
+        picture = QMimeData(); picture.setImageData(image)
+        bridge.clipboard_data = lambda: picture
+        self.assertTrue(bridge.clipboardAttachable())
+        self.assertEqual(1, bridge.attachClipboard())
+        self.assertEqual([("pasted-image.png", "image", "image/png")],
+                         [(i["name"], i["kind"], i["media_type"]) for i in bridge.globalAttachments])
+        bridge.clearContext()
+        files = QMimeData()
+        files.setUrls([QUrl.fromLocalFile(str(folder / "notes.md")), QUrl.fromLocalFile(str(folder / "book.pdf"))])
+        bridge.clipboard_data = lambda: files
+        self.assertEqual(1, bridge.attachClipboard())
+        self.assertEqual(["notes.md"], [i["name"] for i in bridge.globalAttachments])
+
+    def test_a_group_paste_is_owned_by_that_group_only(self) -> None:
+        from PySide6.QtGui import QImage
+        from PySide6.QtCore import QMimeData
+        bridge = self.bridge()
+        bridge._say("jarvis", "Konu A.", chat=True); bridge._say("jarvis", "Konu B.", chat=True)
+        ids = [e["id"] for e in bridge.feed]
+        bridge.quoteMessage(ids[0]); bridge.quoteMessage(ids[1])
+        a, b = (g["id"] for g in bridge.contextGroups)
+        image = QImage(4, 4, QImage.Format.Format_RGB32); image.fill(0xFF22CC00)
+        picture = QMimeData(); picture.setImageData(image)
+        bridge.clipboard_data = lambda: picture
+        self.assertEqual(1, bridge.attachClipboardToGroup(b))
+        self.assertEqual(([], ["pasted-image.png"], []),
+                         ([f["name"] for f in bridge.groupAttachments(a)], [f["name"] for f in bridge.groupAttachments(b)],
+                          bridge.globalAttachments))
+
+    def test_snapshots_are_thrown_away_with_the_session(self) -> None:
+        bridge = self.bridge()
+        folder = self.files()
+        bridge.attachFile((folder / "notes.md").as_uri())
+        snapshots = bridge._snapshots
+        self.assertTrue(any(snapshots.iterdir()))
+        bridge.newSession()
+        self.assertEqual(([], False), (bridge.globalAttachments, snapshots.exists()))
+
+
+class EditMenuPasteTests(SurfaceCase):
+    """One JARVIS edit menu; Ctrl+V and the menu's Paste take the same single route."""
+
+    def menu(self, root, name):
+        from PySide6.QtCore import QObject
+        found = root.findChild(QObject, name)
+        self.assertIsNotNone(found, name)
+        return found
+
+    def entry(self, menu, name):
+        from PySide6.QtCore import QObject
+        found = menu.findChild(QObject, name)
+        self.assertIsNotNone(found, name)
+        return found
+
+    @staticmethod
+    def mime(kind, folder=None):
+        from PySide6.QtCore import QMimeData, QUrl
+        from PySide6.QtGui import QImage
+        data = QMimeData()
+        if kind == "text":
+            data.setText("yapıştırılan metin")
+        elif kind == "image":
+            image = QImage(4, 4, QImage.Format.Format_RGB32); image.fill(0xFFCC0022)
+            data.setImageData(image)
+        elif kind == "file":
+            data.setUrls([QUrl.fromLocalFile(str(folder / "notes.md"))])
+        elif kind == "unsupported":
+            data.setUrls([QUrl.fromLocalFile(str(folder / "book.pdf"))])
+        return data
+
+    def clipboard(self, bridge, kind, folder=None):
+        """The same content on the real clipboard (what an editor's text paste
+        reads) and behind the bridge's seam (what the attachment decision reads)."""
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.clipboard().setMimeData(self.mime(kind, folder))
+        data = self.mime(kind, folder)
+        bridge.clipboard_data = lambda: data
+
+    def test_the_composer_menu_replaces_the_platform_one_and_enables_truthfully(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        editor = self.item(root, "composerInput")
+        menu = self.menu(root, "composerEditMenu")
+        self.assertTrue(menu.property("attachAware"))
+        editor.forceActiveFocus(); pump(50)
+        QMetaObject.invokeMethod(menu, "popup"); pump(250)
+        self.assertTrue(menu.property("visible"))
+        states = {name: self.entry(menu, name).property("enabled")
+                  for name in ("editUndo", "editCut", "editCopy", "editSelectAll")}
+        self.assertEqual({"editUndo": False, "editCut": False, "editCopy": False, "editSelectAll": False}, states)
+        QMetaObject.invokeMethod(menu, "close"); pump(150)
+        editor.setProperty("text", "merhaba dünya"); pump(50)
+        QMetaObject.invokeMethod(editor, "selectAll"); pump(50)
+        QMetaObject.invokeMethod(menu, "popup"); pump(250)
+        self.assertEqual((True, True, True), tuple(self.entry(menu, n).property("enabled") for n in ("editCut", "editCopy", "editSelectAll")))
+        QMetaObject.invokeMethod(menu, "close"); pump(150)
+
+    def test_menu_paste_and_ctrl_v_do_exactly_the_same_thing_for_every_clipboard(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-paste-")); self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "notes.md").write_text("# not", encoding="utf-8")
+        (folder / "book.pdf").write_bytes(b"%PDF-1.4")
+        for kind in ("text", "image", "file", "unsupported"):
+            outcomes = []
+            for route in ("keyboard", "menu"):
+                with self.subTest(kind=kind, route=route):
+                    bridge = self.bridge()
+                    root = self.window(bridge)
+                    editor = self.item(root, "composerInput")
+                    self.clipboard(bridge, kind, folder)
+                    editor.forceActiveFocus(); pump(50)
+                    if route == "keyboard":
+                        QTest.keyClick(root, Qt.Key_V, Qt.ControlModifier)
+                    else:
+                        menu = self.menu(root, "composerEditMenu")
+                        QMetaObject.invokeMethod(menu, "popup"); pump(200)
+                        paste = self.entry(menu, "editPaste")
+                        if paste.property("enabled"):
+                            QMetaObject.invokeMethod(paste, "triggered")
+                        QMetaObject.invokeMethod(menu, "close")
+                    pump(250)
+                    outcomes.append((editor.property("text"), [a["name"] for a in bridge.globalAttachments]))
+            self.assertEqual(outcomes[0], outcomes[1], kind)
+            expected = {"text": ("yapıştırılan metin", []), "image": ("", ["pasted-image.png"]),
+                        "file": ("", ["notes.md"]), "unsupported": ("", [])}[kind]
+            self.assertEqual(expected, outcomes[0], kind)
+            if kind == "unsupported":
+                # A truthful refusal, and the file's path is not pasted as text instead.
+                self.assertIn("book.pdf", bridge.feed[-1]["text"])
+
+    def test_a_note_editor_menu_pastes_text_only(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("jarvis", "Konu A.", chat=True); pump(200)
+        bridge.quoteMessage(bridge.feed[-1]["id"]); pump(300)
+        group_id = bridge.contextGroups[0]["id"]
+        self.click(root, "contextGroupNoteToggle_" + group_id); pump(200)
+        from PySide6.QtCore import QObject
+        card = self.item(root, "contextGroup_" + group_id)
+        menu = card.findChild(QObject, "noteEditMenu_" + group_id)
+        self.assertIsNotNone(menu)
+        self.assertFalse(menu.property("attachAware"))
+        self.clipboard(bridge, "image")
+        QMetaObject.invokeMethod(menu, "popup"); pump(200)
+        self.assertFalse(self.entry(menu, "editPaste").property("enabled"))        # nothing textual to paste
+        QMetaObject.invokeMethod(menu, "close"); pump(100)
+        QTest.keyClick(root, Qt.Key_V, Qt.ControlModifier); pump(200)
+        self.assertEqual(([], []), (bridge.groupAttachments(group_id), bridge.globalAttachments))
+
+
+
+class GroupSeparateTurnTests(SurfaceCase):
+    """In the interface, a separate grouped turn is ONE JARVIS reply built from N isolated calls."""
+
+    def draft(self, bridge):
+        bridge._say("user", "Planı ver.")
+        bridge._say("jarvis", "Konu A: kimlik. Konu B: önbellek. Konu C: takma ad.", chat=True)
+        pump(200)
+        source = bridge.feed[-1]["id"]
+        for part in ("Konu A: kimlik.", "Konu B: önbellek.", "Konu C: takma ad."):
+            bridge.quoteSelection(source, part)
+        a, b, c = (g["id"] for g in bridge.contextGroups)
+        bridge.setGroupNote(a, "A notu")
+        bridge.setGroupNote(b, "B notu")
+        bridge.setGroupNote(c, "C notu")
+        bridge.setResponseMode("separate")
+
+    def test_three_isolated_calls_become_one_reply_in_order(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A yanıtı"), proposal(kind="chat", reply="B yanıtı"),
+                             proposal(kind="chat", reply="C yanıtı"))
+        root = self.window(bridge)
+        self.draft(bridge)
+        before = len(bridge.feed)
+        bridge.submitText("Her birine kısa cevap ver."); pump(400)
+        self.assertEqual(3, len(self.model.calls))
+        for label, task in zip("ABC", self.model.calls):
+            notes = [g.get("note") for g in task.context["context_groups"]]
+            self.assertEqual([f"{label} notu"], notes)                           # its own note, no other
+        new = bridge.feed[before:]
+        self.assertEqual(["user", "jarvis"], [e["kind"] for e in new])           # ONE reply, not three
+        self.assertEqual("A\nA yanıtı\n\nB\nB yanıtı\n\nC\nC yanıtı", new[1]["text"])
+        self.assertTrue(new[1].get("chat"))                                      # ordinary chat: copyable, quotable
+        self.assertTrue(bridge.quoteMessage(new[1]["id"]))
+        self.assertEqual(3, bridge.chatUsage["call_count"])
+        self.assertEqual((False, 0), (bridge.approvalPending, self.execute_calls()))
+
+    def test_every_group_call_uses_the_turn_s_provider_snapshot_and_nothing_falls_back(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Claude must not answer."))
+        root = self.window(bridge)
+        bridge.setChatProvider("codex"); bridge.setCodexModel("gpt-5.6-luna", "low")
+        self.draft(bridge)
+        self.codex.answers = [proposal(kind="chat", reply=f"{x} yanıtı") for x in "ABC"]
+        # Changing the model while the turn runs affects only the NEXT turn.
+        self.codex.on_complete = lambda task: bridge.setCodexModel("gpt-5.6-sol", "medium") if len(self.codex.calls) == 1 else None
+        bridge.submitText("Kısa cevap ver."); pump(400)
+        self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes)          # one adapter for the whole turn
+        self.assertEqual((3, 0), (len(self.codex.calls), len(self.model.calls)))
+        self.assertIn("C\nC yanıtı", bridge.feed[-1]["text"])
+        self.codex.on_complete = None
+        self.codex.answers = [proposal(kind="chat", reply="Sonraki tur.")]
+        bridge.submitText("Sonraki soru."); pump(300)
+        self.assertEqual(("gpt-5.6-sol", "medium"), self.codex_routes[-1])
+
+    def test_a_failed_group_is_said_in_the_reply_and_the_others_stay(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A yanıtı"), "this is not a proposal", proposal(kind="chat", reply="C yanıtı"))
+        root = self.window(bridge)
+        self.draft(bridge)
+        bridge.submitText("Cevap ver."); pump(400)
+        text = bridge.feed[-1]["text"]
+        self.assertTrue(text.startswith("A\nA yanıtı\n\nB\nNot answered: "), text)
+        self.assertTrue(text.endswith("C\nC yanıtı"), text)
+        self.assertEqual("jarvis", bridge.feed[-1]["kind"])
+
+
+class ScrollOwnershipTests(SurfaceCase):
+    """Whatever is under the pointer scrolls; nothing leaks through to the conversation behind."""
+
+    clock = 1_000
+
+    def wheel(self, root, item):
+        from PySide6.QtCore import QPoint, QPointF
+        from PySide6.QtGui import QWheelEvent
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseMove(root, centre)                     # the pointer is really there first
+        pump(30)
+        event = QWheelEvent(QPointF(centre), QPointF(centre), QPoint(0, 0), QPoint(0, 240),
+                            Qt.NoButton, Qt.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        # Separate turns of a real wheel are half a second apart; without a moving
+        # timestamp Qt treats them as ONE continuing gesture and keeps delivering
+        # them to whatever accepted the first.
+        ScrollOwnershipTests.clock += 500
+        event.setTimestamp(ScrollOwnershipTests.clock)
+        QGuiApplication.sendEvent(root, event)
+        pump(300)
+
+    def fill(self, bridge, count=30):
+        for i in range(count):
+            bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height at this width.")
+        pump(800)
+
+    def test_the_conversation_scrolls_under_the_pointer_and_not_under_a_panel(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        self.fill(bridge)
+        feed = self.item(root, "conversationFeed")
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0)); pump(200)
+        # Pointer on the conversation: the conversation moves.
+        self.wheel(root, feed)
+        self.assertLess(feed.property("contentY"), 200)
+        # The model panel is open and the pointer is over it: the conversation stays put.
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0)); pump(200)
+        self.click(root, "modelTrigger"); pump(400)
+        self.wheel(root, self.item(root, "modelSurface"))
+        self.assertEqual(200.0, feed.property("contentY"))
+        # Even a wheel turn over the dimmed area outside the panel stops there.
+        self.wheel(root, self.item(root, "conversationFeed"))
+        self.assertEqual(200.0, feed.property("contentY"))
+        # Closed again, the wheel belongs to the conversation once more: blocking
+        # the wheel must not leave the surface holding it afterwards.
+        self.click(root, "modelTrigger"); pump(600)
+        self.assertFalse(self.item(root, "modelSurface").isVisible())
+        self.wheel(root, feed)
+        self.assertLess(feed.property("contentY"), 200)
+
+    def test_a_general_settings_panel_also_keeps_the_wheel(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        root = self.window(bridge)
+        self.fill(bridge)
+        feed = self.item(root, "conversationFeed")
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0)); pump(200)
+        self.click(root, "settingsOrb"); pump(400)
+        self.wheel(root, self.item(root, "settingsSurface"))
+        self.assertEqual(200.0, feed.property("contentY"))
+        self.click(root, "settingsOrb"); pump(600)
+        self.wheel(root, feed)
+        self.assertLess(feed.property("contentY"), 200)
+
+
+class GlassStateTests(SurfaceCase):
+    """Only the BACKGROUND follows idle / hover / active; what is read never fades."""
+
+    def test_the_card_and_the_composer_darken_by_state_and_never_the_content(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        trigger = self.item(root, "modelTrigger")
+        idle = trigger.property("body")
+        self.assertEqual(1.0, self.item(root, "selectorModelText").property("opacity"))
+        trigger.setProperty("open", True); pump(300)
+        active = trigger.property("body")
+        self.assertGreater(active.alphaF(), idle.alphaF())                    # open is the denser surface
+        self.assertEqual(1.0, self.item(root, "selectorModelText").property("opacity"))
+        trigger.setProperty("open", False); pump(300)
+        # The composer follows the same progression, and its text stays fully opaque.
+        composer = self.item(root, "canonicalComposer")
+        text = self.item(root, "composerInput")
+        self.assertEqual(1.0, text.property("opacity"))
+        self.item(root, "composerInput").forceActiveFocus(); pump(300)
+        self.assertEqual(1.0, text.property("opacity"))
+
+    def test_an_ordinary_reply_gets_a_quiet_reading_surface_and_cards_stay_cards(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._say("jarvis", "Sıradan bir yanıt.", chat=True)
+        bridge._say("error", "FAILED [x]: y")
+        pump(300)
+        surfaces = [i for i in self.all_items(root) if i.objectName() == "readingSurface" and i.isVisible()]
+        self.assertEqual(1, len(surfaces))
+        self.assertLess(surfaces[0].property("color").alphaF(), 0.6)          # a pane, not a card
+        self.assertEqual(0, QQmlProperty.read(surfaces[0], "border.width"))
+

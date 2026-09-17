@@ -246,7 +246,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <name>Bridge</name>
     <message>
         <source>JARVIS frozen</source>
-        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision.</extracomment>
+        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing).</extracomment>
         <translation>JARVIS donduruldu</translation>
     </message>
     <message>
@@ -368,6 +368,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Permission mode: %1</source>
         <translation>İzin modu: %1</translation>
+    </message>
+    <message>
+        <source>A message can carry at most %1 context items.</source>
+        <translation>Bir mesaj en fazla %1 bağlam ögesi taşıyabilir.</translation>
+    </message>
+    <message>
+        <source>The selected provider cannot take %1 files, so %2 was not attached. JARVIS never sends it to another provider instead.</source>
+        <translation>Seçili sağlayıcı %1 dosyalarını alamıyor, bu yüzden %2 eklenmedi. JARVIS bunun yerine başka bir sağlayıcıya asla göndermez.</translation>
     </message>
     <message>
         <source>JARVIS state unconfirmed: the request to resume JARVIS was not confirmed. The store reports execution running.</source>
@@ -794,6 +802,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Akıllı onay gibidir; Core, kurallarının izin verdiği yerde bir onayı bu oturum boyunca yeniden kullanabilir. Şu an buna uyan bir yetkinlik yok, bu yüzden bugün tam olarak Akıllı onay gibi sorar.</translation>
     </message>
     <message>
+        <source>Images (%1)</source>
+        <translation>Görseller (%1)</translation>
+    </message>
+    <message>
+        <source>Text and code (%1)</source>
+        <translation>Metin ve kod (%1)</translation>
+    </message>
+    <message>
         <source>Permission mode: %1</source>
         <translation>İzin modu: %1</translation>
     </message>
@@ -808,6 +824,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.</source>
         <translation>E-posta, GitHub, tarayıcı, masaüstü, dosya yazma ve Claude analizi her modda her zaman onay ister. Dondurma ayrıdır ve her şeyi durdurur.</translation>
+    </message>
+    <message>
+        <source>Attach a file or an image</source>
+        <translation>Dosya veya görsel ekle</translation>
+    </message>
+    <message>
+        <source>Add file</source>
+        <translation>Dosya ekle</translation>
+    </message>
+    <message>
+        <source>Add image</source>
+        <translation>Görsel ekle</translation>
+    </message>
+    <message>
+        <source>Only the item you choose is read. JARVIS gets no access to your files.</source>
+        <translation>Yalnızca seçtiğiniz öge okunur. JARVIS dosyalarınıza erişim kazanmaz.</translation>
     </message>
     <message>
         <source>Answer the pending approval first</source>
@@ -850,6 +882,108 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Close</source>
         <translation>Kapat</translation>
+    </message>
+</context>
+<context>
+    <name>ContextStrip</name>
+    <message>
+        <source>Answer</source>
+        <translation>Yanıt</translation>
+    </message>
+    <message>
+        <source>Remove this attachment</source>
+        <translation>Bu eki kaldır</translation>
+    </message>
+    <message>
+        <source>Evaluate together</source>
+        <translation>Birlikte değerlendir</translation>
+    </message>
+    <message>
+        <source>Reply to each group separately</source>
+        <translation>Her gruba ayrı yanıt ver</translation>
+    </message>
+    <message>
+        <source>You</source>
+        <translation>Siz</translation>
+    </message>
+    <message>
+        <source>selection</source>
+        <translation>seçim</translation>
+    </message>
+    <message>
+        <source>whole message</source>
+        <translation>mesajın tamamı</translation>
+    </message>
+    <message>
+        <source>+ File</source>
+        <translation>+ Dosya</translation>
+    </message>
+    <message>
+        <source>Attach a file or an image to this group</source>
+        <translation>Bu gruba dosya veya görsel ekle</translation>
+    </message>
+    <message>
+        <source>Add file</source>
+        <translation>Dosya ekle</translation>
+    </message>
+    <message>
+        <source>Add image</source>
+        <translation>Görsel ekle</translation>
+    </message>
+    <message>
+        <source>Paste from clipboard</source>
+        <translation>Panodan yapıştır</translation>
+    </message>
+    <message>
+        <source>Remove this group</source>
+        <translation>Bu grubu kaldır</translation>
+    </message>
+    <message>
+        <source>What should JARVIS do with this part?</source>
+        <translation>JARVIS bu bölümle ne yapsın?</translation>
+    </message>
+    <message>
+        <source>Attached to the message</source>
+        <translation>Mesajın ekleri</translation>
+    </message>
+    <message>
+        <source>Image</source>
+        <translation>Görsel</translation>
+    </message>
+    <message>
+        <source>File</source>
+        <translation>Dosya</translation>
+    </message>
+    <message>
+        <source>Note</source>
+        <translation>Not</translation>
+    </message>
+    <message>
+        <source>+ Note</source>
+        <translation>+ Not</translation>
+    </message>
+</context>
+<context>
+    <name>EditMenu</name>
+    <message>
+        <source>Undo</source>
+        <translation>Geri Al</translation>
+    </message>
+    <message>
+        <source>Cut</source>
+        <translation>Kes</translation>
+    </message>
+    <message>
+        <source>Copy</source>
+        <translation>Kopyala</translation>
+    </message>
+    <message>
+        <source>Paste</source>
+        <translation>Yapıştır</translation>
+    </message>
+    <message>
+        <source>Select All</source>
+        <translation>Tümünü Seç</translation>
     </message>
 </context>
 <context>
@@ -1286,20 +1420,24 @@ değil</translation>
         <translation>Sağlayıcı istekleri yanıtlar ve yorumlar; JARVIS&apos;in neler yapabileceğini asla değiştirmez. Seçim elle yapılır, otomatik geçiş yoktur.</translation>
     </message>
     <message>
+        <source>Hide Antigravity quota</source>
+        <translation>Antigravity kotasını gizle</translation>
+    </message>
+    <message>
+        <source>Show Antigravity quota (read-only)</source>
+        <translation>Antigravity kotasını göster (salt okunur)</translation>
+    </message>
+    <message>
         <source>ANTIGRAVITY QUOTA (READ-ONLY)</source>
         <translation>ANTIGRAVITY KOTASI (SALT OKUNUR)</translation>
     </message>
     <message>
-        <source>%1 %2% remaining · resets %3</source>
-        <translation>%1 %%2 kaldı · sıfırlanma %3</translation>
-    </message>
-    <message>
-        <source>weekly</source>
-        <translation>haftalık</translation>
-    </message>
-    <message>
         <source>5-hour</source>
         <translation>5 saatlik</translation>
+    </message>
+    <message>
+        <source>Weekly</source>
+        <translation>Haftalık</translation>
     </message>
     <message>
         <source>Currently %1</source>
@@ -1330,14 +1468,6 @@ değil</translation>
         <translation>Bu model efor ayarını desteklemiyor.</translation>
     </message>
     <message>
-        <source>Apply model / effort</source>
-        <translation>Modeli / eforu uygula</translation>
-    </message>
-    <message>
-        <source>Validated configuration</source>
-        <translation>Doğrulanmış yapılandırma</translation>
-    </message>
-    <message>
         <source>USAGE / QUOTA</source>
         <translation>KULLANIM / KOTA</translation>
     </message>
@@ -1352,10 +1482,6 @@ değil</translation>
     <message>
         <source>Answered the last call: no Claude call yet</source>
         <translation>Son çağrıyı yanıtlayan: henüz Claude çağrısı yok</translation>
-    </message>
-    <message>
-        <source>%1: %2% used · resets %3</source>
-        <translation>%1: %%2 kullanıldı · sıfırlanma %3</translation>
     </message>
     <message>
         <source>Current session (5 h)</source>
@@ -1394,6 +1520,10 @@ değil</translation>
         <translation>bildirilmedi</translation>
     </message>
     <message>
+        <source>Last turn: %1 calls, one per group. Tokens summed over all of them:</source>
+        <translation>Son tur: grup başına bir tane olmak üzere %1 çağrı. Token toplamı:</translation>
+    </message>
+    <message>
         <source>Last call tokens: %1 input · %2 cache read · %3 cache write · %4 output</source>
         <translation>Son çağrı token: %1 girdi · %2 önbellek okuma · %3 önbellek yazma · %4 çıktı</translation>
     </message>
@@ -1402,16 +1532,24 @@ değil</translation>
         <translation>Web Araştırması: bu sağlayıcıda kullanılabilir (salt okunur genel web araması).</translation>
     </message>
     <message>
+        <source>Attachments: images and text-like files, exactly the ones you pick.</source>
+        <translation>Ekler: görseller ve metin türü dosyalar, tam olarak sizin seçtikleriniz.</translation>
+    </message>
+    <message>
+        <source>No model chosen</source>
+        <translation>Model seçilmedi</translation>
+    </message>
+    <message>
+        <source>Choose one of the models Codex lists</source>
+        <translation>Codex&apos;in listelediği modellerden birini seçin</translation>
+    </message>
+    <message>
         <source>Answered this session</source>
         <translation>Bu oturumda yanıt verdi</translation>
     </message>
     <message>
         <source>Failed this session: %1</source>
         <translation>Bu oturumda başarısız: %1</translation>
-    </message>
-    <message>
-        <source>Efforts: %1</source>
-        <translation>Efor seviyeleri: %1</translation>
     </message>
     <message>
         <source>Listed by Codex - not tried yet</source>
@@ -1479,6 +1617,18 @@ değil</translation>
     <message>
         <source>Model and provider</source>
         <translation>Model ve sağlayıcı</translation>
+    </message>
+    <message>
+        <source>5 h</source>
+        <translation>5 sa.</translation>
+    </message>
+    <message>
+        <source>Weekly</source>
+        <translation>Haftalık</translation>
+    </message>
+    <message>
+        <source>%1%</source>
+        <translation>%%1</translation>
     </message>
 </context>
 <context>
@@ -2021,6 +2171,18 @@ Tekrar denemeden önce görevi Geçmiş&apos;te kontrol edin.</translation>
         <translation>Açık konu: %1</translation>
     </message>
     <message>
+        <source>Not answered: the request was stopped before this group.</source>
+        <translation>Yanıtlanmadı: istek bu gruba gelmeden durduruldu.</translation>
+    </message>
+    <message>
+        <source>Not answered: this group&apos;s answer asked for something to be done or looked up, and a grouped answer only replies. Nothing was started.</source>
+        <translation>Yanıtlanmadı: bu grubun yanıtı bir işlem ya da araştırma istedi; gruplu yanıt yalnızca cevap verir. Hiçbir şey başlatılmadı.</translation>
+    </message>
+    <message>
+        <source>Not answered: %1</source>
+        <translation>Yanıtlanmadı: %1</translation>
+    </message>
+    <message>
         <source>never</source>
         <translation>hiçbir zaman</translation>
     </message>
@@ -2063,6 +2225,17 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Awaiting approval - resume this task to review the exact request.</source>
         <translation>Onay bekleniyor - isteğin kendisini incelemek için bu görevi sürdürün.</translation>
+    </message>
+</context>
+<context>
+    <name>QuotaBar</name>
+    <message>
+        <source>%1% left · %2</source>
+        <translation>%%1 kaldı · %2</translation>
+    </message>
+    <message>
+        <source>%1% left</source>
+        <translation>%%1 kaldı</translation>
     </message>
 </context>
 <context>

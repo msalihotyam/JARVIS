@@ -114,6 +114,12 @@ from jarvis.contracts import (
     sanitize_diagnostic_text,
     validate_project_id,
 )
+from jarvis.context_items import (
+    DEFAULT_RESPONSE_MODE,
+    context_window,
+    image_files,
+)
+from jarvis.context_items import response_mode as items_response_mode
 from jarvis.core import AgentCore
 from jarvis.dispatch import DISPATCH_REFUSED, cancel_job_run
 from jarvis.destinations import (
@@ -3000,6 +3006,7 @@ def text_result(
     sources: Iterable[dict[str, str]] = (),
     sources_cited: bool = False,
     choices: Iterable[dict[str, str]] = (),
+    sections: Iterable[dict[str, Any]] = (),
     run: dict[str, Any] | None = None,
     job: dict[str, Any] | None = None,
     exit_code: int | None = None,
@@ -3018,6 +3025,7 @@ def text_result(
     error = None
     if error_code is not None:
         error = {"code": error_code.value, "message": message, "retryable": False}
+    sections = [dict(section) for section in sections]
     payload = {
         "command": "text",
         "effective_permission_mode": permission_mode.value,
@@ -3053,6 +3061,11 @@ def text_result(
         "job": job,
         "error": error,
     }
+    if sections:
+        # "Reply to each group separately": one section per group, in order, each
+        # from its OWN call - the answer, or why it has none. Only present then,
+        # so every other envelope keeps its exact shape.
+        payload["intent"]["sections"] = sections
     return CommandResult(_redact(payload), code)
 
 
@@ -3109,6 +3122,9 @@ class JarvisApp:
         request_id: str | None = None,
         response_language: str = "",
         conversation: Iterable[Mapping[str, str]] = (),
+        context_groups: Iterable[Mapping[str, Any]] = (),
+        context_attachments: Iterable[Mapping[str, Any]] = (),
+        response_mode: str = DEFAULT_RESPONSE_MODE,
         on_reply_preview: Callable[[str], None] | None = None,
     ) -> CommandResult:
         """Free text in, the authoritative envelope out.
@@ -3134,6 +3150,14 @@ class JarvisApp:
         ``conversation`` is the caller's recent chat turns (user / assistant
         text only), bounded by ``conversation_window`` so a follow-up can be
         understood. It is data: only the CURRENT turn can select a destination.
+
+        ``context_groups`` are the quotes the person attached to THIS turn,
+        each owning its own note and files; ``context_attachments`` are files
+        that belong to the message as a whole (``jarvis.context_items``).
+        ``response_mode`` says whether the groups are evaluated together or
+        answered separately. All of it is context: it never selects a
+        destination, never grants anything and never changes what JARVIS may
+        do - the person's own message does that.
         """
         request_id = request_id or str(uuid4())
         mode = self.settings.permission_mode
@@ -3177,6 +3201,9 @@ class JarvisApp:
                 IntentStatus.MODEL_UNAVAILABLE,
                 availability.reason or "The understanding model is unavailable.",
             )
+        groups, attachments = list(context_groups), list(context_attachments)
+        items = context_window(groups, attachments)
+        carried = bool(items["groups"] or items["global_attachments"])
         now = datetime.now().astimezone()
         catalog = build_catalog(
             self.core.registry,
@@ -3185,6 +3212,12 @@ class JarvisApp:
             session.project_id if session is not None else None,
             now,
         )
+        if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
+            # Strict isolation: one call per group, merged into one reply.
+            return self._answer_groups_separately(
+                text, request_id, mode, previous_text, response_language, list(conversation),
+                groups, attachments, items, catalog, on_reply_preview, usage, respond, refused,
+            )
         intent_task = Task(
             objective=text,
             capability=INTENT_CAPABILITY,
@@ -3193,6 +3226,13 @@ class JarvisApp:
                 "previous_request": previous_text,
                 "response_language": response_language_hint(response_language),
                 "conversation": conversation_window(list(conversation)),
+                "context_groups": items["groups"],
+                "global_attachments": items["global_attachments"],
+                "response_mode": items_response_mode(response_mode) if items["groups"] else "",
+                # JARVIS's own snapshots of the images the person attached. The
+                # adapter attaches exactly these files and strips the key from
+                # the payload: a local path is a file handle, never model context.
+                "attachment_files": image_files(groups, attachments),
                 "local_time": catalog.local_time,
                 "catalog": catalog.to_dict(),
             },
@@ -3222,6 +3262,8 @@ class JarvisApp:
             **_model_usage(model, request_id),
             "request_chars": len(text),
             "conversation_chars": sum(len(turn["text"]) for turn in intent_task.context["conversation"]),
+            "items_chars": len(json.dumps(items, ensure_ascii=False)) if carried else 0,
+            "items": len(items["groups"]) + sum(len(g["attachments"]) for g in items["groups"]) + len(items["global_attachments"]),
             "context_chars": len(json.dumps(intent_task.context["catalog"], sort_keys=True)),
         })
         if not result.ok:
@@ -3365,6 +3407,170 @@ class JarvisApp:
                            message="Web Research returned a result JARVIS could not read, so nothing from it is shown.")
         return respond(mode, IntentStatus.RESEARCH, request_id, objective=query, reply=reply,
                        sources=sources, sources_cited=cited)
+
+    def _answer_groups_separately(
+        self,
+        text: str,
+        request_id: str,
+        mode: PermissionMode,
+        previous_text: str,
+        response_language: str,
+        conversation: list[Mapping[str, str]],
+        groups: list[Mapping[str, Any]],
+        attachments: list[Mapping[str, Any]],
+        items: dict[str, Any],
+        catalog: Any,
+        on_reply_preview: Callable[[str], None] | None,
+        usage: dict[str, Any],
+        respond: Callable[..., CommandResult],
+        refused: Callable[..., CommandResult],
+    ) -> CommandResult:
+        """"Reply to each group separately": ONE understanding call PER GROUP.
+
+        A real context boundary, not an instruction: group B's call is built
+        without group A's reference, note or files, so no later call can see an
+        earlier group. Every call gets the same global message, the same global
+        attachments, the same conversation history and the same adapter - one
+        provider / model / effort snapshot for the whole turn.
+
+        Calls run one after another, so a preview never mixes two groups and a
+        cancellation stops before the next call starts (an already dispatched
+        call is cancelled the ordinary way). Each group's result is judged on
+        its own: a reply is shown under its label; a proposal to DO something
+        is never carried out from a grouped answer; a failure is said, never
+        filled in. The turn is one conversation reply with one section per
+        group, in order.
+        """
+        model = self.intent_model
+        owned = {str(group.get("id")): group for group in groups if isinstance(group, Mapping)}
+        history = conversation_window(conversation)
+        sections: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = []
+        streams = on_reply_preview is not None and hasattr(model, "stream_listener")
+        shown = ""                                  # the answered sections, as the preview shows them
+        self._cancelled_text.discard(request_id)
+        try:
+            for entry in items["groups"]:
+                label = entry["label"]
+                if request_id in self._cancelled_text:
+                    sections.append({"label": label, "status": "cancelled"})
+                    continue
+                source = owned.get(entry["id"])
+                own = context_window([source], attachments)
+                if not own["groups"]:
+                    sections.append({"label": label, "status": "failed",
+                                     "message": "The group could not be read. Nothing was sent for it."})
+                    continue
+                own["groups"][0]["label"] = label
+                task = Task(
+                    objective=text,
+                    capability=INTENT_CAPABILITY,
+                    scope=ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION),
+                    context={
+                        "previous_request": previous_text,
+                        "response_language": response_language_hint(response_language),
+                        "conversation": history,
+                        "context_groups": own["groups"],
+                        "global_attachments": own["global_attachments"],
+                        "response_mode": "separate",
+                        "attachment_files": image_files([source], attachments),
+                        "local_time": catalog.local_time,
+                        "catalog": catalog.to_dict(),
+                    },
+                    # The turn's request id for every call: they run one at a time,
+                    # and cancel_text reaches whichever call is running.
+                    id=request_id,
+                )
+                if streams:
+                    head = f"{shown}{label}\n"
+                    model.stream_listener = lambda partial, head=head: on_reply_preview(head + partial)
+                try:
+                    result = model.complete(task, SessionState(objective=text))
+                except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
+                    result = exc
+                calls.append({"label": label, **_model_usage(model, request_id)})
+                section = self._group_section(label, result, request_id in self._cancelled_text)
+                sections.append(section)
+                if section["status"] == "answered":
+                    shown += f"{label}\n{section['text']}\n\n"
+        finally:
+            if streams:
+                model.stream_listener = None
+        cancelled = request_id in self._cancelled_text
+        self._cancelled_text.discard(request_id)
+        # N groups, N calls: the totals are the SUM of what each call reported,
+        # and every call is kept on its own - nothing is presented as one call.
+        totals: dict[str, Any] = {}
+        for call in calls:
+            for key, value in call["reported"].items():
+                if type(value) is int:
+                    totals[key] = totals.get(key, 0) + value
+        answering = [call["reported"]["model"] for call in calls if call["reported"].get("model")]
+        if answering:
+            totals["model"] = answering[-1]
+        usage.update({
+            "provider": getattr(model, "provider", None) or None,
+            "reported": totals,
+            "call_count": len(calls),
+            "calls": calls,
+            "request_chars": len(text),
+            "conversation_chars": sum(len(turn["text"]) for turn in history),
+            "items_chars": len(json.dumps(items, ensure_ascii=False)),
+            "items": len(items["groups"]) + sum(len(g["attachments"]) for g in items["groups"]) + len(items["global_attachments"]),
+        })
+        for call in reversed(calls):                 # the newest plan state any call reported
+            for key in ("rate_limits", "quota", "requested_model"):
+                if call.get(key) and key not in usage:
+                    usage[key] = call[key]
+        if not any(section["status"] == "answered" for section in sections):
+            if cancelled:
+                return refused(IntentStatus.MODEL_CANCELLED, "The understanding call was cancelled.")
+            failed = next((s for s in sections if s["status"] == "failed"), None)
+            if failed is not None:
+                return refused(IntentStatus(failed.get("intent_status") or IntentStatus.MODEL_FAILED.value),
+                               "No group could be answered: " + str(failed.get("message") or ""))
+        # A plain rendition for consumers that read ``reply``; the interface
+        # composes the sections itself in the person's language.
+        plain = []
+        for section in sections:
+            body = section.get("text") or {
+                "failed": "[not answered: %s]" % (section.get("message") or "the call failed"),
+                "cancelled": "[not answered: stopped before this group]",
+                "not_answered": "[not answered: this group asked for something to be done; nothing was started]",
+            }.get(section["status"], "")
+            plain.append(f"{section['label']}\n{body}")
+        return respond(mode, IntentStatus.CONVERSATION, request_id, reply="\n\n".join(plain), sections=sections)
+
+    @staticmethod
+    def _group_section(label: str, result: Any, cancelled: bool) -> dict[str, Any]:
+        """What ONE group's call produced, judged on its own and never filled in."""
+        if isinstance(result, Exception):
+            return {"label": label, "status": "failed", "intent_status": IntentStatus.MODEL_FAILED.value,
+                    "message": f"The understanding model failed: {type(result).__name__}."}
+        if not result.ok:
+            status = model_failure_status(result, cancelled)
+            if status is IntentStatus.MODEL_CANCELLED:
+                return {"label": label, "status": "cancelled"}
+            detail = result.error.message if result.error is not None else result.summary
+            return {"label": label, "status": "failed", "intent_status": status.value,
+                    "message": sanitize_diagnostic_text(detail, 240)}
+        if cancelled:
+            return {"label": label, "status": "cancelled"}
+        answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
+        if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
+            return {"label": label, "status": "failed", "intent_status": IntentStatus.MALFORMED_MODEL_OUTPUT.value,
+                    "message": "The model returned no usable answer."}
+        try:
+            proposal = parse_proposal(answer.content)
+        except ProposalError as exc:
+            return {"label": label, "status": "failed", "intent_status": IntentStatus.MALFORMED_MODEL_OUTPUT.value,
+                    "message": f"The answer was refused: {exc}."}
+        spoken = {"chat": proposal.reply, "clarify": proposal.question, "unsupported": proposal.reason}.get(proposal.kind)
+        if spoken:
+            return {"label": label, "status": "answered", "kind": proposal.kind, "text": spoken}
+        # A task, a job or a web search proposed from inside one group's answer
+        # is not started: a grouped answer only replies.
+        return {"label": label, "status": "not_answered", "kind": proposal.kind}
 
     def cancel_text(self, request_id: str) -> bool:
         """Ask the running understanding or research call for ``request_id`` to stop.

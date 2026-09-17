@@ -283,6 +283,27 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
     return entries
 
 
+def group_sections(sections: list) -> Any:
+    """The separately answered groups as one message: each label on its own
+    line, then that group's answer or the reason it has none."""
+    parts: list = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        status = section.get("status")
+        if status == "answered" and section.get("text"):
+            body: Any = str(section["text"])
+        elif status == "cancelled":
+            body = _msg(QT_TRANSLATE_NOOP("Present", "Not answered: the request was stopped before this group."))
+        elif status == "not_answered":
+            body = _msg(QT_TRANSLATE_NOOP("Present", "Not answered: this group's answer asked for something to be done or looked up, and a grouped answer only replies. Nothing was started."))
+        else:
+            body = _msg(QT_TRANSLATE_NOOP("Present", "Not answered: %1"), str(section.get("message") or ""))
+        block = _join(str(section.get("label") or "?"), body)
+        parts.append(block if not parts else ("Present", "\n%1", (block,)))
+    return _lines(parts) if parts else dict(UNREADABLE)["text"]
+
+
 def text_entries(payload: Any) -> list[dict[str, str]]:
     """What one ``text`` (natural-language) envelope says, run included."""
     try:
@@ -302,6 +323,11 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
         entries.append({"kind": "scheduled", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "SCHEDULED: '%1' (%2) as job %3 - next due %4 (UTC). Nothing has run; the scheduler "
             "runs it and every approval still applies."), job.get("label"), job.get("kind"), job.get("job_id"), due)})
+    elif status == "conversation" and isinstance(intent.get("sections"), list) and intent["sections"]:
+        # Groups answered separately: ONE turn, one section per group in order,
+        # each from its own call. A group that was not answered says why - its
+        # answer is never filled in from anywhere else.
+        entries.append({"kind": "jarvis", "text": group_sections(intent["sections"])})
     elif status == "conversation":
         # General Chat: the model's words, shown as JARVIS's turn, as written.
         reply = intent.get("reply")
@@ -503,3 +529,51 @@ def rows(payload: Any, key: str, id_key: str) -> list[dict]:
     if not isinstance(items, list):
         return []
     return [r for r in items if isinstance(r, dict) and isinstance(r.get(id_key), str)]
+
+
+#: The technical prefix a model id carries for its vendor. It identifies the
+#: route, not the model, and the compact card shows the model.
+_MODEL_PREFIXES = ("claude-", "gpt-", "gemini-", "qwen-")
+#: The brand behind each provider line, for the card's small second line.
+PROVIDER_BRANDS = {"claude": "ANTHROPIC", "codex": "OPENAI", "google": "GOOGLE", "qwen": "ALIBABA CLOUD"}
+
+
+def display_model_name(model_id: Any, fallback: str = "") -> str:
+    """The SHORT name of a model, from the canonical id and only for display.
+
+    ``claude-opus-5[1m]`` reads as "Opus 5", ``claude-haiku-4-5-20251001`` as
+    "Haiku 4.5", ``gpt-5.6-sol`` as "5.6 Sol", ``gpt-daybreak-blue-latest`` as
+    "Daybreak Blue". The vendor prefix, the context tag and the dated build
+    are route detail; the order of what remains is the vendor's own, so a
+    version that comes first stays first. The canonical id NEVER changes: this
+    is the label, and every call still uses the id it was given.
+    """
+    text = str(model_id or "").strip()
+    if not text:
+        return fallback
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"-(latest|preview)$", "", text)
+    text = re.sub(r"-\d{6,8}$", "", text)
+    for prefix in _MODEL_PREFIXES:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    parts = [part for part in re.split(r"[-_]", text) if part]
+    if not parts:
+        return fallback or str(model_id)
+    words: list[str] = []
+    for part in parts:
+        numeric = re.fullmatch(r"\d+(\.\d+)*", part) is not None
+        if numeric and words and re.fullmatch(r"\d+(\.\d+)*", words[-1]):
+            words[-1] = f"{words[-1]}.{part}"       # 4 + 5 is one version, 4.5
+        elif numeric:
+            words.append(part)
+        else:
+            words.append(part[:1].upper() + part[1:])
+    return " ".join(words)
+
+
+def provider_brand(provider_id: Any) -> str:
+    """The brand line for a provider, or its id upper-cased when unknown."""
+    key = str(provider_id or "").strip().lower()
+    return PROVIDER_BRANDS.get(key, key.upper())

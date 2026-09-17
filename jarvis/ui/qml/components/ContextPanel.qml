@@ -35,7 +35,12 @@ Item {
     onOpenChanged: if (open) panel.forceActiveFocus()
     Rectangle { anchors.fill: parent; color: "#000000"; opacity: context.open ? 0.18 : 0
         Behavior on opacity { NumberAnimation { duration: Theme.panelIn } }
+        // While this surface is open it OWNS the pointer: a click outside closes
+        // it, and a wheel turn stops here instead of reaching the conversation.
+        // A WheelHandler blocks without taking a grab, so closing the surface
+        // hands the wheel straight back to whatever is underneath.
         MouseArea { anchors.fill: parent; onClicked: context.open = false }
+        WheelHandler { }
     }
     GlassPanel {
         id: panel
@@ -64,6 +69,10 @@ Item {
         Behavior on opacity { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } }
         Keys.onEscapePressed: context.open = false
         MouseArea { parent: panel; anchors.fill: parent; z: -0.5 }
+        // Below the panel's own content, above everything behind the panel: an
+        // inner Flickable scrolls first, and when it reaches its end the wheel
+        // stops here rather than leaking through to the feed underneath.
+        WheelHandler { }
         Item { id: heading; width: parent.width; height: context.header ? 50 : 34
             Text { visible: !context.header; anchors.verticalCenter: parent.verticalCenter; text: context.heading; color: Theme.text; font { family: Theme.font; pixelSize: 13; letterSpacing: 2.4; weight: Font.DemiBold } }
             Loader { active: !!context.header; sourceComponent: context.header; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 44 }

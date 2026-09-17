@@ -217,6 +217,27 @@ QtObject {
     readonly property color glassReflection: ambient ? "#129dd8ff" : "#009dd8ff"       // ~5 % upper-edge highlight
     readonly property color glassInnerHighlight: ambient ? "#2449bdfa" : "#0049bdfa"
 
+    // -- interactive glass: the three states of a control's BACKGROUND -----
+    // Only the surface changes. Text, icons, borders and focus rings keep
+    // their own colour at full strength, so nothing a person reads or aims
+    // at ever fades with the state. The darkest state (active / focused) is
+    // exactly the old fixed value, so no state is heavier than before.
+    readonly property color glassControlIdle: ambient ? "#5e061424" : "#d6061424"
+    readonly property color glassControlIdleTop: ambient ? "#5e0a2038" : "#d60a2038"
+    readonly property color glassControlHover: ambient ? "#a8061424" : "#dd061424"
+    readonly property color glassControlHoverTop: ambient ? "#a80a2038" : "#dd0a2038"
+    readonly property color glassControlActive: glassInteractive
+    readonly property color glassControlActiveTop: glassInteractiveTop
+
+    // -- panel glass: how much of the space behind a panel stays visible ---
+    // General Settings is the lightest (it is read at a glance); the model
+    // panel holds names, quota and reset times, so it stays denser.
+    readonly property color glassSettings: ambient ? "#99061424" : "#f0061424"
+    readonly property color glassModelPanel: ambient ? "#d6061424" : "#f4061424"
+    // The quiet reading surface behind an ordinary JARVIS reply: enough to
+    // lift the text off the planet, far too little to read as a card.
+    readonly property color glassReadingSurface: ambient ? "#3d02101e" : "#7a02101e"
+
     // -- stage 5: text and state accents (260-420 ms) -------------------
     property color text: space ? "#eaf4ff" : "#dfebf2"            // primary
     property color textLabel: space ? "#acc2d8" : "#a5c0d1"       // secondary

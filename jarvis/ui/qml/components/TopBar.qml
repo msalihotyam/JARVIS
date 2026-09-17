@@ -58,7 +58,11 @@ Item {
                                       - (ticker0 + tickerNeed + 10)
     readonly property real selectorMax: stripRoom - stripFixed
     readonly property bool tickerFits: !Theme.command && selectorMax >= 188
-    readonly property real selectorWidth: tickerFits ? Math.min(Theme.chipWidth(width), selectorMax)
+    // The card carries the plan summary on its right when a provider reported
+    // one, so it is allowed that much more width - never at the cost of the
+    // controls, and never past the room the strip really has.
+    readonly property real selectorExtra: ((bridge.modelCard || {}).quota || []).length > 0 ? 150 : 0
+    readonly property real selectorWidth: tickerFits ? Math.min(Theme.chipWidth(width) + selectorExtra, selectorMax)
                                                      : Theme.chipWidth(width)
 
     // -- header linework ------------------------------------------------------
@@ -394,13 +398,15 @@ Item {
             y: controls.mid - height / 2
             width: bar.selectorWidth; height: Theme.stripSelectorHeight
             open: bar.modelOpen
-            // Real state: the chosen provider's configured model (Claude: or the CLI's own default).
-            readonly property bool codex: bridge.chatProvider === "codex"
-            modelName: codex ? (bridge.codexModel || qsTr("No model chosen"))
-                       : bridge.config.claude_model ? bridge.config.claude_model : qsTr("CLI default")
-            metadata: codex ? "OPENAI  |  CODEX" + (bridge.codexEffort ? "  |  " + bridge.codexEffort.toUpperCase() : "")
-                      : bar.selectorWidth >= 240 ? "ANTHROPIC  |  CLI" : "ANTHROPIC"
-                      + (bridge.config.claude_effort ? "  |  " + String(bridge.config.claude_effort).toUpperCase() : "")
+            // One shape for every provider: the SHORT model name, then
+            // BRAND | EFFORT, then the plan summary - all real reported state
+            // (bridge.modelCard). The canonical model id is unchanged by this.
+            readonly property var card: bridge.modelCard || ({})
+            // Claude with nothing configured really is "whatever the CLI picks";
+            // Codex has no default at all, so there the truth is "no model chosen".
+            modelName: card.name ? card.name : card.provider === "claude" ? qsTr("CLI default") : qsTr("No model chosen")
+            metadata: card.meta || ""
+            quota: card.quota || []
             onActivated: bar.openModel()
         }
 

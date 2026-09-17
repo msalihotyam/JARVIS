@@ -532,10 +532,14 @@ class ClaudeCodeConnector(BaseConnector):
             )
 
         command = self._command(prompt)
+        # What the CLI reads on stdin, when the call does not carry its prompt
+        # in argv (see ``_stdin_payload``). ``None`` keeps today's argv-only call.
+        stdin_text = self._stdin_payload(prompt)
         try:
             process = subprocess.Popen(
                 command,
                 cwd=working_directory,
+                stdin=subprocess.PIPE if stdin_text is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -558,6 +562,12 @@ class ClaudeCodeConnector(BaseConnector):
 
         with self._process_lock:
             self._processes[task.id] = process
+        if stdin_text is not None:
+            try:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            except OSError:
+                pass            # the CLI exited already; the outcome below is read from its output
         try:
             stdout, stderr = self._collect_output(process)
         except subprocess.TimeoutExpired:
@@ -755,6 +765,14 @@ class ClaudeCodeConnector(BaseConnector):
             method="model_answer_integrity",
             evidence=tuple(evidence),
         )
+
+    def _stdin_payload(self, prompt: str) -> str | None:
+        """Text to write to the CLI's stdin, or ``None`` when the prompt travels
+        in argv (the default). A subclass returns text only when its own
+        ``_command`` asked the CLI to read the request from stdin; whatever it
+        returns is prompt content, bounded and redacted exactly like the argv
+        prompt, and no tool grant, flag or route changes with it."""
+        return None
 
     def _collect_output(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         """The finished process's (stdout, stderr), bounded by the timeout.

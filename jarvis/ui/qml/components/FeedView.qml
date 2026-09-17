@@ -273,6 +273,21 @@ Item {
                             Item {
                                 width: parent.width
                                 height: (sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
+                                // An ordinary JARVIS reply keeps its open shape; the only
+                                // addition is a very quiet dark pane behind the text so the
+                                // planet below never competes with it. No border, no card.
+                                Rectangle {
+                                    objectName: "readingSurface"
+                                    visible: row.isJarvis && !row.loud
+                                    z: -1
+                                    x: -10
+                                    y: message.y - 6
+                                    width: Math.min(parent.width + 10, message.width + 20)
+                                    height: (sources.visible ? sources.y + sources.height : message.y + message.height) - message.y + 12
+                                    radius: 8
+                                    color: Theme.glassReadingSurface
+                                    border.width: 0
+                                }
                                 // JARVIS: no surface at all - the small name, then the answer
                                 // itself at a readable measure; the avatar is the identity.
                                 Text { id: name; visible: row.isJarvis; x: 0; y: 5
@@ -305,6 +320,9 @@ Item {
                                     // (a new feed rebuilds the rows), and the formatting edit itself would
                                     // otherwise re-trigger a text-change handler.
                                     Component.onCompleted: if (feed.referenceLayout && row.kind !== "data" && typeof typography !== "undefined") typography.setLineHeight(textDocument, 28, 12)
+                                    // The offer to quote appears AT the selection, and only
+                                    // for a message that may be quoted at all.
+                                    onSelectedTextChanged: row.conversational ? feed.offerQuote(message, modelData.id) : feed.hideQuoteTip()
                                 }
                                 // Web Research: the public pages behind the answer. Untrusted
                                 // links, plain text; a click opens only an http(s) page in the
@@ -363,10 +381,12 @@ Item {
                         y: stamp.y
                         x: row.isUser ? stamp.x - width - 16 : stamp.x + stamp.width + 16
                         MessageAction { objectName: "messageCopy_" + index; label: qsTr("Copy"); onActivated: bridge.copyText(modelData.text) }
-                        MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteText(modelData.text) }
+                        // Quoting adds a REFERENCE to the draft - it never writes into
+                        // the message being composed, and it authorizes nothing.
+                        MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteMessage(modelData.id) }
                         MessageAction { objectName: "messageQuoteSelection_" + index; label: qsTr("Quote selection")
                                         visible: message.selectedText.length > 0
-                                        onActivated: { bridge.quoteText(message.selectedText); message.deselect() } }
+                                        onActivated: { bridge.quoteSelection(modelData.id, message.selectedText); message.deselect(); feed.hideQuoteTip() } }
                     }
                 }
             }
@@ -419,7 +439,6 @@ Item {
                     y: streamStamp.y
                     x: streamStamp.x + streamStamp.width + 16
                     MessageAction { objectName: "streamCopy"; label: qsTr("Copy"); onActivated: bridge.copyText(bridge.streamText) }
-                    MessageAction { objectName: "streamQuote"; label: qsTr("Quote"); onActivated: bridge.quoteText(bridge.streamText) }
                 }
             }
             Loader {
@@ -503,6 +522,62 @@ Item {
                 if (!onThumb) moveTo(mouse.y)
             }
             onPositionChanged: function(mouse) { if (pressed) moveTo(mouse.y) }
+        }
+    }
+
+    // -- the contextual quote action ------------------------------------------
+    // Selecting text inside a message JARVIS or the person wrote offers to quote
+    // exactly that selection, right where the selection is. It follows the text
+    // while the view scrolls, leaves as soon as the selection is cleared or the
+    // conversation is rebuilt, and never interferes with selecting.
+    function offerQuote(edit, entryId) {
+        if (!edit || edit.selectedText.length === 0) { hideQuoteTip(); return }
+        quoteTip.source = edit
+        quoteTip.entryId = String(entryId || "")
+        quoteTip.place()
+    }
+    function hideQuoteTip() { quoteTip.source = null; quoteTip.shown = false }
+    Connections { target: bridge; function onFeedChanged() { feed.hideQuoteTip() } }
+
+    Item {
+        id: quoteTip
+        objectName: "quoteTip"
+        property var source: null
+        property string entryId: ""
+        property bool shown: false
+        visible: shown
+        z: 60
+        width: tipLabel.width + 20; height: 26
+        function place() {
+            if (!source || !source.visible || source.selectedText.length === 0) { shown = false; return }
+            var start = Math.min(source.selectionStart, source.selectionEnd)
+            var box = source.positionToRectangle(start)
+            var point = source.mapToItem(feed, box.x, box.y)
+            x = Math.max(4, Math.min(point.x - 6, feed.width - width - feed.strip - 4))
+            y = point.y - height - 6
+            // Outside the visible part of the conversation it simply does not show.
+            shown = y > 0 && y < feed.height - height
+        }
+        Connections { target: flick; function onContentYChanged() { quoteTip.place() } }
+        Connections { target: feed; function onHeightChanged() { quoteTip.place() } }
+        Rectangle {
+            anchors.fill: parent; radius: 7
+            color: tipArea.containsMouse ? Theme.alpha(Theme.accent, 0.22) : Theme.glassMenu
+            border.width: 1; border.color: Theme.glassEdgeStrong
+        }
+        Text { id: tipLabel; anchors.centerIn: parent; text: qsTr("Quote selection"); color: Theme.text
+               font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
+        MouseArea {
+            id: tipArea
+            objectName: "quoteTipButton"
+            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+            onClicked: {
+                if (quoteTip.source) {
+                    bridge.quoteSelection(quoteTip.entryId, quoteTip.source.selectedText)
+                    quoteTip.source.deselect()
+                }
+                feed.hideQuoteTip()
+            }
         }
     }
 }

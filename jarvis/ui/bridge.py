@@ -14,16 +14,34 @@ selection and cancellation it is handed.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, Signal, Slot
+from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, QUrl, Signal, Slot
 from PySide6.QtGui import QWindow
 
-from jarvis.ui.backend import ApprovalTicket, Backend, approval_ticket, redact_text
+from jarvis.context_items import (
+    DEFAULT_RESPONSE_MODE,
+    MAX_ITEMS,
+    NOTE_MAX_CHARS,
+    RESPONSE_MODES,
+    AttachmentRefused,
+    attach_bytes,
+    attach_file,
+    discard_snapshots,
+    file_kind,
+    group,
+    group_label,
+    history_text,
+    reference,
+    safe_name,
+    same_reference,
+)
+from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui.preferences import (
     CHAT_PROVIDERS,
@@ -38,6 +56,8 @@ from jarvis.ui.preferences import (
 )
 from jarvis.ui.present import (
     REFUSED_CODES,
+    display_model_name,
+    provider_brand,
     TERMINAL_STATUSES,
     approval_card,
     error_entries,
@@ -59,6 +79,10 @@ CORE_STATES = ("idle", "running", "awaiting_approval", "awaiting_input", "comple
 #: DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for
 #: visual review. They never create a ticket, a task or a decision.
 DEV_SAFETY_SCENARIOS = ("", "approval", "approval_incomplete", "unknown", "failed", "blocked", "completed")
+
+
+#: What a pasted image is called on the draft (the clipboard names nothing).
+CLIPBOARD_IMAGE_NAME = "pasted-image.png"
 
 
 class _Emitter(QObject):
@@ -89,7 +113,6 @@ class Bridge(QObject):
     # UI events the core reacts to: they report what the application
     # actually did, never a new backend state.
     inputAccepted = Signal()      # a message or choice was accepted and sent on
-    quoteRequested = Signal(str)  # a conversational message to quote into the composer
     providersChanged = Signal()
     modelApplied = Signal()       # the configured model / effort really changed
     composingChanged = Signal()
@@ -112,6 +135,15 @@ class Bridge(QObject):
         # feed until the final envelope replaces it (display only, never history).
         self._stream_text = ""
         self._stream_ts = 0.0
+        # The CURRENT draft's context: reference groups (each owning its note and
+        # files) and the message's own attachments. Data for that one turn.
+        self._groups: list[dict[str, Any]] = []
+        self._attachments: list[dict[str, Any]] = []
+        self._attach_revision = 0
+        self._item_seq = 0
+        self._response_mode = DEFAULT_RESPONSE_MODE
+        self._snapshots = Path(tempfile.mkdtemp(prefix="jarvis-attachments-"))
+        self._entry_seq = 0
         self._sequence: dict[str, int] = {}
         self._handlers: dict[tuple[str, int], Callable[[Any], None]] = {}
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
@@ -162,6 +194,10 @@ class Bridge(QObject):
         self._dev_safety = ""
         for signal in (self.stateChanged, self.approvalChanged, self.dataChanged):
             signal.connect(self.attentionChanged)
+        # The compact model card reads configuration, preferences AND provider
+        # state, so any of the three refreshes it.
+        for signal in (self.stateChanged, self.prefsChanged):
+            signal.connect(self.providersChanged)
 
     # -- worker --------------------------------------------------------------
 
@@ -227,7 +263,9 @@ class Bridge(QObject):
         if isinstance(extra.get("sources"), list):   # untrusted links: redacted like everything shown
             extra["sources"] = [{key: redact_text(str(source.get(key) or "")) for key in ("title", "url")}
                                 for source in extra["sources"] if isinstance(source, dict)]
-        entry = {"kind": kind, "msg": self._redacted(message), "ts": time.time(), **extra}
+        self._entry_seq += 1
+        entry = {"kind": kind, "msg": self._redacted(message), "ts": time.time(),
+                 "id": f"m{self._entry_seq}", **extra}
         if chat:
             entry["chat"] = True         # a General Chat reply: part of the conversation window
         self._feed.append(entry)
@@ -238,7 +276,11 @@ class Bridge(QObject):
         """The recent chat of this window for a follow-up: what the person typed
         and General Chat's replies, as written - never notices, approvals,
         errors, task results or fixtures. Core bounds it (intent.conversation_window)."""
-        return tuple({"role": "user" if entry["kind"] == "user" else "assistant", "text": entry["msg"]}
+        # A turn that carried context items sends them in full exactly ONCE, with
+        # that turn. Afterwards only a short provenance line remains, so no quote,
+        # file text or image is ever duplicated into a later request.
+        return tuple({"role": "user" if entry["kind"] == "user" else "assistant",
+                      "text": history_text(entry["msg"], entry.get("groups"), entry.get("attachments"))}
                      for entry in self._feed
                      if isinstance(entry["msg"], str) and (entry["kind"] == "user" or entry.get("chat")))
 
@@ -380,6 +422,10 @@ class Bridge(QObject):
                     provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))} for m in provider.get("models") or []]
             self.providersChanged.emit()
         for entry in text_entries(payload):
+            if status == "conversation" and not isinstance(entry.get("text"), str):
+                # Separately answered groups: rendered once, in the interface language,
+                # so the reply is ordinary text - copyable, quotable, part of the history.
+                entry["text"] = render(entry["text"])
             if partial and status == "conversation":
                 entry["streamed"] = True        # replaces the preview in place: no second entrance
             self._say(entry.pop("kind"), entry.pop("text"), chat=status in ("conversation", "research"), **entry)
@@ -598,7 +644,13 @@ class Bridge(QObject):
         self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
         conversation = self._conversation()   # before this turn: the window is what came earlier
-        self._say("user", text)
+        groups, attachments, mode = self._take_context()
+        # The feed keeps what the turn carried (paths dropped) so later history
+        # can name it briefly; the full content travels with this turn only.
+        self._say("user", text,
+                  groups=[{**g, "attachments": [self._shown(a) for a in g["attachments"]]} for g in groups],
+                  attachments=[self._shown(a) for a in attachments])
+        self.clearContext()
         self.inputAccepted.emit()
         session_id = self._session_id or None
         request_id = str(uuid4())
@@ -615,7 +667,9 @@ class Bridge(QObject):
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
-                                             conversation=conversation, on_reply_preview=relay, **route),
+                                             conversation=conversation, context_groups=groups,
+                                             context_attachments=attachments, response_mode=mode,
+                                             on_reply_preview=relay, **route),
             lambda payload: self._apply_text(payload, text),
         )
         return True
@@ -747,12 +801,18 @@ class Bridge(QObject):
         self.approvalChanged.emit()
         self._run("cancel", lambda: self.backend.cancel(session_id, task_id), self._apply_run)
 
+    def _discard_snapshots(self) -> None:
+        """Throw away every attachment snapshot JARVIS copied for this session."""
+        self.clearContext()
+        discard_snapshots(self._snapshots)
+
     @Slot()
     def newSession(self) -> None:
         if self._busy:
             return
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
         self._decision = {}
+        self._discard_snapshots()       # a new session keeps none of the old drafts' files
         self._last_outcome = "idle"
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New session: the next message starts a fresh session."), ()), "system")
         self.approvalChanged.emit()
@@ -938,6 +998,77 @@ class Bridge(QObject):
             return dict(probed)
         return dict(self._codex_quota)
 
+    # -- the compact model card: one shape for every selectable provider ---------
+
+    @Slot(str, str, result=str)
+    def modelLabel(self, model_id: str, fallback: str = "") -> str:
+        """The SHORT display name of a model id. Display only: the canonical id
+        is what every call still uses, and nothing here changes it."""
+        return display_model_name(model_id, fallback)
+
+    def _claude_model_id(self) -> str:
+        """The Claude model this installation will really use: what is configured,
+        or - for the CLI default - the id the CLI says that default resolves to."""
+        configured = str(self._config.get("claude_model") or "")
+        if configured:
+            return configured
+        models = next((p.get("models") or [] for p in self._providers if p.get("id") == "claude"), [])
+        entry = next((m for m in models if isinstance(m, dict) and m.get("id") == "default"), None)
+        return str((entry or {}).get("resolved") or "")
+
+    def _claude_card_quota(self, model_id: str) -> list:
+        windows = (self._claude_limits or {}).get("windows") or {}
+        if not isinstance(windows, dict):
+            return []
+        # The weekly bucket that genuinely belongs to the chosen model, when the
+        # plan exposes one; otherwise the all-model week. Any further bucket stays
+        # in the detailed panel rather than crowding the card.
+        family = model_id.lower()
+        weekly = "seven_day"
+        for name in ("seven_day_opus", "seven_day_sonnet"):
+            if name in windows and name.rsplit("_", 1)[-1] in family:
+                weekly = name
+        rows = []
+        for key, label in (("five_hour", "five_hour"), (weekly, "weekly")):
+            window = windows.get(key)
+            if isinstance(window, dict) and isinstance(window.get("utilization"), (int, float)):
+                rows.append({"window": label, "remaining": max(0, 100 - round(window["utilization"] * 100)),
+                             "resets_at": int(window.get("resets_at") or 0)})
+        return rows
+
+    def _codex_card_quota(self) -> list:
+        quota = self.codexQuota
+        rows = []
+        for key, label in (("primary", "five_hour"), ("secondary", "weekly")):
+            window = quota.get(key)
+            if isinstance(window, dict) and isinstance(window.get("used_percent"), (int, float)):
+                rows.append({"window": label, "remaining": max(0, 100 - round(window["used_percent"])),
+                             "resets_at": int(window.get("resets_at") or 0)})
+        return rows
+
+    @Property("QVariantMap", notify=providersChanged)
+    def modelCard(self) -> dict:
+        """The compact card's content, the same shape for every provider: the
+        short model name, ``BRAND | EFFORT`` and at most two quota rows.
+
+        Every value is provider-reported truth. A field no provider reported is
+        absent - never estimated, never carried over from another provider.
+        """
+        provider = self.chatProvider
+        if provider == "codex":
+            model_id, effort = self.codexModel, self.codexEffort
+            quota = self._codex_card_quota()
+        else:
+            model_id, effort = self._claude_model_id(), str(self._config.get("claude_effort") or "")
+            quota = self._claude_card_quota(model_id)
+        brand = provider_brand(provider)
+        effort = str(effort).upper()
+        return {"provider": provider, "model": model_id,
+                "name": display_model_name(model_id),
+                "brand": brand, "effort": effort,
+                "meta": f"{brand}  |  {effort}" if effort else brand,
+                "quota": quota}
+
     # -- chat provider: who answers and interprets (never authority) ---------------
 
     @Property(str, notify=prefsChanged)
@@ -988,6 +1119,301 @@ class Bridge(QObject):
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Permission mode: %1"), (mode,)), "system")
         return confirmed
 
+    # -- draft context: reference GROUPS and the message's own attachments -------
+    #
+    # A quoted message or selection starts a CONTEXT GROUP that owns its own
+    # note and its own files; files that belong to no quote are the message's
+    # global attachments. Every part is addressed by a stable id, never by its
+    # position. All of it is DATA for one turn: it selects no destination,
+    # grants no capability, approves nothing and changes no permission mode.
+    # An attachment is the exact file the person picked, snapshotted here at
+    # attach time, so the draft cannot change under them and no path a model
+    # produced can ever be read.
+    #
+    # Three separate signals, because a republished list rebuilds its QML
+    # delegates: groups (membership only), attachments (any attachment, global
+    # or in a group - group cards re-read theirs without being rebuilt) and the
+    # answer mode. A note changes none of them, so its editor is never destroyed
+    # while someone types in it.
+
+    groupsChanged = Signal()
+    attachmentsChanged = Signal()
+    modeChanged = Signal()
+
+    @staticmethod
+    def _shown(item: dict) -> dict:
+        """An item as the interface shows it: JARVIS's snapshot path stays here."""
+        return {key: value for key, value in item.items() if key != "path"}
+
+    @Property("QVariantList", notify=groupsChanged)
+    def contextGroups(self) -> list:
+        """The draft's groups in order: id, the display letter, the reference and
+        the note. Attachments are read per group (``groupAttachments``)."""
+        return [{"id": group["id"], "label": group_label(index), "reference": dict(group["reference"]),
+                 "note": group["note"]} for index, group in enumerate(self._groups)]
+
+    @Property("QVariantList", notify=attachmentsChanged)
+    def globalAttachments(self) -> list:
+        """Files attached to the message as a whole, not to any group."""
+        return [self._shown(item) for item in self._attachments]
+
+    @Property(int, notify=attachmentsChanged)
+    def attachmentRevision(self) -> int:
+        """Moves whenever any attachment is added or removed (see ``groupAttachments``)."""
+        return self._attach_revision
+
+    @Slot(str, result="QVariantList")
+    def groupAttachments(self, group_id: str) -> list:
+        """The files owned by ONE group, in the order they were attached."""
+        group = self._group(group_id)
+        return [self._shown(item) for item in group["attachments"]] if group else []
+
+    @Property(str, notify=modeChanged)
+    def responseMode(self) -> str:
+        """"together" - reason across groups - or "separate" - one isolated answer per group."""
+        return self._response_mode
+
+    @Slot(str)
+    def setResponseMode(self, mode: str) -> None:
+        if mode in RESPONSE_MODES and mode != self._response_mode:
+            self._response_mode = mode
+            self.modeChanged.emit()
+
+    @Property("QVariantMap", notify=prefsChanged)
+    def attachmentSupport(self) -> dict:
+        """What the CHOSEN provider really accepts as an explicit attachment.
+        A kind it does not accept is refused here - never sent to another provider."""
+        return dict(ATTACHMENT_SUPPORT.get(self.chatProvider, {"image": False, "text": False}))
+
+    def _group(self, group_id: str) -> dict | None:
+        return next((group for group in self._groups if group["id"] == str(group_id)), None)
+
+    def _entry(self, entry_id: str) -> dict | None:
+        """The conversational feed entry with this id: what the person wrote and
+        General Chat's replies only. A notice, an approval, an error, external
+        data or a task result is never quotable."""
+        for entry in self._feed:
+            if entry.get("id") == entry_id and isinstance(entry.get("msg"), str):
+                return entry if entry["kind"] == "user" or entry.get("chat") else None
+        return None
+
+    def _item_count(self) -> int:
+        return len(self._groups) + len(self._attachments) + sum(len(g["attachments"]) for g in self._groups)
+
+    def _room(self) -> bool:
+        if self._item_count() < MAX_ITEMS:
+            return True
+        self._tell("notice", QT_TRANSLATE_NOOP("Bridge", "A message can carry at most %1 context items."), MAX_ITEMS)
+        return False
+
+    def _new_id(self, prefix: str) -> str:
+        self._item_seq += 1
+        return f"{prefix}{self._item_seq}"
+
+    def _start_group(self, entry: dict, selection: str, text: str) -> bool:
+        primary = reference(self._new_id("ref-"), source_role=entry["kind"], source_id=entry["id"],
+                            selection=selection, text=redact_text(text), source_time=str(int(entry.get("ts") or 0)))
+        if any(same_reference(primary, group["reference"]) for group in self._groups):
+            return True                     # the same quote twice stays one group
+        if not self._room():
+            return False
+        self._groups.append(group(self._new_id("grp-"), primary))
+        self.groupsChanged.emit()
+        return True
+
+    @Slot(str, result=bool)
+    def quoteMessage(self, entry_id: str) -> bool:
+        """Quote a WHOLE conversational message: a new group on the draft.
+        Nothing is pasted into the text the person is writing, nothing is sent."""
+        entry = self._entry(str(entry_id))
+        return entry is not None and self._start_group(entry, "full", entry["msg"])
+
+    @Slot(str, str, result=bool)
+    def quoteSelection(self, entry_id: str, text: str) -> bool:
+        """Quote exactly the selected part of one conversational message: a new group."""
+        entry = self._entry(str(entry_id))
+        selected = str(text).strip()
+        return entry is not None and bool(selected) and self._start_group(entry, "partial", selected)
+
+    @Slot(str, str)
+    def setGroupNote(self, group_id: str, note: str) -> None:
+        """The person's instruction for ONE group, written straight to it.
+
+        No list change is announced: republishing would rebuild the cards and
+        destroy the editor being typed in. The stored value is always the newest,
+        so a turn sent while the editor still has focus carries exactly what was typed.
+        """
+        found = self._group(group_id)
+        if found is not None:
+            found["note"] = redact_text(str(note)[:NOTE_MAX_CHARS])
+
+    @Slot(str)
+    def removeGroup(self, group_id: str) -> None:
+        """Remove one group: its reference, its note and its attachments. Every
+        other group and every global attachment is untouched."""
+        found = self._group(group_id)
+        if found is None:
+            return
+        self._groups.remove(found)
+        self.groupsChanged.emit()
+        if found["attachments"]:
+            self._attach_revision += 1
+            self.attachmentsChanged.emit()
+
+    @Slot(str)
+    def removeAttachment(self, attachment_id: str) -> None:
+        """Remove exactly one attachment, wherever it is owned."""
+        for owner in [self._attachments] + [group["attachments"] for group in self._groups]:
+            for item in owner:
+                if item["id"] == str(attachment_id):
+                    owner.remove(item)
+                    self._attach_revision += 1
+                    self.attachmentsChanged.emit()
+                    return
+
+    def _unsupported_attachment(self, kind: str, name: str) -> None:
+        self._tell("notice", QT_TRANSLATE_NOOP(
+            "Bridge", "The selected provider cannot take %1 files, so %2 was not attached. "
+                      "JARVIS never sends it to another provider instead."), kind, name)
+
+    def _owner(self, group_id: str) -> list | None:
+        """Where a new attachment goes: the named group, or the message itself."""
+        if not group_id:
+            return self._attachments
+        found = self._group(group_id)
+        return found["attachments"] if found is not None else None
+
+    def _store_attachment(self, item: dict, owner: list) -> bool:
+        for key in ("text", "name"):
+            if isinstance(item.get(key), str):
+                item[key] = redact_text(item[key])
+        if not self._room():
+            return False
+        owner.append(item)
+        self._attach_revision += 1
+        self.attachmentsChanged.emit()
+        return True
+
+    def _attach_path(self, url: str, group_id: str) -> bool:
+        owner = self._owner(group_id)
+        if owner is None:
+            return False
+        local = QUrl(str(url)).toLocalFile() if str(url).startswith("file:") else str(url)
+        kind = file_kind(safe_name(local))
+        if kind and not self.attachmentSupport.get(kind, False):
+            self._unsupported_attachment(kind, safe_name(local))
+            return False
+        try:
+            item = attach_file(local, self._snapshots, self._new_id("att-"))
+        except AttachmentRefused as refused:
+            self._tell("notice", refused.source, *refused.args_tuple)
+            return False
+        return self._store_attachment(item, owner)
+
+    @Slot(str, result=bool)
+    def attachFile(self, url: str) -> bool:
+        """Attach exactly the ONE file the person picked, to the message itself.
+        A folder, a device, an unreadable path or a format this build cannot read
+        is refused and said so."""
+        return self._attach_path(url, "")
+
+    @Slot(str, str, result=bool)
+    def attachFileToGroup(self, group_id: str, url: str) -> bool:
+        """The same, owned by ONE group - and only that group."""
+        return self._attach_path(url, group_id)
+
+    def clipboard_data(self) -> Any:
+        """What the system clipboard currently holds (the seam tests replace)."""
+        from PySide6.QtGui import QGuiApplication
+        clipboard = QGuiApplication.clipboard()
+        return clipboard.mimeData() if clipboard is not None else None
+
+    @Slot(result=bool)
+    def clipboardAttachable(self) -> bool:
+        """Whether the clipboard holds something paste would ATTACH (an image or
+        local files) rather than paste as text. Reads only; changes nothing."""
+        data = self.clipboard_data()
+        if data is None:
+            return False
+        return bool(data.hasImage() or any(url.isLocalFile() for url in (data.urls() if data.hasUrls() else [])))
+
+    def _paste_attachments(self, group_id: str) -> int:
+        """-1 when the clipboard is not an attachment payload at all (so it is
+        ordinary text); otherwise how many items were attached - 0 included,
+        when every file was refused with its reason. A refused file is never
+        pasted as its path instead."""
+        owner = self._owner(group_id)
+        data = self.clipboard_data()
+        if data is None:
+            return -1
+        files = [url for url in (data.urls() if data.hasUrls() else []) if url.isLocalFile()]
+        if not data.hasImage() and not files:
+            return -1
+        if owner is None:
+            return 0
+        if data.hasImage():
+            return int(self._attach_clipboard_image(data.imageData(), owner))
+        return sum(1 for url in files if self._attach_path(url.toString(), group_id))
+
+    @Slot(result=int)
+    def attachClipboard(self) -> int:
+        """THE paste decision for the main composer, used by Ctrl+V and by the
+        context menu alike. An image or local files become attachments of the
+        message and the count is returned (0 when all were refused, each with
+        its reason); -1 means the clipboard holds no attachment, and the editor
+        pastes it as ordinary text."""
+        return self._paste_attachments("")
+
+    @Slot(str, result=int)
+    def attachClipboardToGroup(self, group_id: str) -> int:
+        """The same decision, with the result owned by ONE group. Only called
+        from that group's own explicit control - JARVIS never guesses an owner."""
+        return self._paste_attachments(str(group_id))
+
+    def _attach_clipboard_image(self, image: Any, owner: list) -> bool:
+        from PySide6.QtCore import QBuffer, QByteArray
+        if image is None or not hasattr(image, "save"):
+            return False
+        if not self.attachmentSupport.get("image", False):
+            self._unsupported_attachment("image", CLIPBOARD_IMAGE_NAME)
+            return False
+        store = QByteArray()          # the buffer writes into THIS: it must outlive the buffer
+        buffer = QBuffer(store)
+        buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+        saved = bool(image.save(buffer, "PNG"))
+        buffer.close()
+        if not saved:
+            return False
+        try:
+            item = attach_bytes(bytes(store.data()), CLIPBOARD_IMAGE_NAME, self._snapshots, self._new_id("att-"))
+        except AttachmentRefused as refused:
+            self._tell("notice", refused.source, *refused.args_tuple)
+            return False
+        return self._store_attachment(item, owner)
+
+    @Slot()
+    def clearContext(self) -> None:
+        """Empty the draft's groups and attachments. The answer mode returns to
+        its default with them: a mode chosen for one draft never governs the next."""
+        had_files = bool(self._attachments) or any(group["attachments"] for group in self._groups)
+        if self._groups:
+            self._groups = []
+            self.groupsChanged.emit()
+        if had_files:
+            self._attachments = []
+            self._attach_revision += 1
+            self.attachmentsChanged.emit()
+        if self._response_mode != DEFAULT_RESPONSE_MODE:
+            self._response_mode = DEFAULT_RESPONSE_MODE
+            self.modeChanged.emit()
+
+    def _take_context(self) -> tuple[tuple, tuple, str]:
+        """The draft's groups and attachments for the turn being sent, and the mode."""
+        groups = tuple({**group, "reference": dict(group["reference"]),
+                        "attachments": [dict(item) for item in group["attachments"]]} for group in self._groups)
+        attachments = tuple(dict(item) for item in self._attachments)
+        return groups, attachments, (self._response_mode if groups else DEFAULT_RESPONSE_MODE)
+
     # -- conversation actions ----------------------------------------------------
 
     @Slot(str)
@@ -995,15 +1421,6 @@ class Bridge(QObject):
         """Copy exactly the visible plain text of one conversational message."""
         from PySide6.QtGui import QGuiApplication
         QGuiApplication.clipboard().setText(str(text))
-
-    @Slot(str)
-    def quoteText(self, text: str) -> None:
-        """Offer one conversational message to the composer as a plain-text
-        quote. Quoting only puts words in the draft: it sends nothing and
-        carries no authority."""
-        # A text selection separates paragraphs with U+2029 / U+2028: plain newlines here.
-        lines = str(text).replace(" ", "\n").replace(" ", "\n").strip().splitlines() or [""]
-        self.quoteRequested.emit("\n".join("> " + line for line in lines))
 
     @Slot(str, bool)
     def refreshMemory(self, project_id: str, include_inactive: bool) -> None:
@@ -1176,6 +1593,7 @@ class Bridge(QObject):
     def confirmQuit(self) -> None:
         """The orderly quit. The window accepts its close from here on."""
         self._quitting = True
+        self._discard_snapshots()
         self.trayChanged.emit()
         self.quitRequested.emit()
 

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 import QtQuick.Controls.Basic
+import QtQuick.Dialogs
 import "../theme"
 
 // The natural-language composer. Text goes to bridge.submitText, which is
@@ -10,41 +11,96 @@ import "../theme"
 // UPWARD with the draft (about 140 ms per step) to `maxHeight` and scrolling
 // inside beyond it; back to 52 px when an accepted submission clears the
 // draft or the field is emptied. A refused submission keeps the draft.
-// Enter sends, Shift+Enter breaks a line. Only supported controls appear:
-// the compact send key and, while a request is being understood, Stop. No
-// attachment, voice, web or menu control is faked.
-Rectangle {
+// Enter sends, Shift+Enter breaks a line.
+//
+// Above the bar sit the draft's context items - quoted messages, quoted
+// selections and the files the person attached with "+". They are separate
+// from the text being written and stay separate all the way to the provider.
+// Only supported controls appear; no voice, web or menu control is faked.
+Item {
     id: composer
     property int minHeight: 52
     property int maxHeight: 180
     readonly property int vpad: 8
-    implicitHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
-    Behavior on implicitHeight { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
-    radius: 10
-    gradient: Gradient {
-        GradientStop { position: 0; color: Theme.glassInteractiveTop }
-        GradientStop { position: 1; color: Theme.glassInteractive }
-    }
-    border.width: 1
-    border.color: input.activeFocus ? Theme.glassEdgeStrong : Theme.glassEdge
-    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+    readonly property int barHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
+    implicitHeight: strip.height + barHeight
     property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused
+    // Attached items travel WITH a message; the request itself is still the words
+    // the person writes, so an empty draft sends nothing.
     property bool canSend: !blocked && input.text.trim() !== ""
     property alias text: input.text
     readonly property alias inputHeight: input.implicitHeight
     // Clear the draft only when the application really accepted it.
     function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
-    // A quoted message goes into the draft as plain text, ready for a reply
-    // under it. Nothing is sent and nothing is authorized by quoting.
-    Connections {
-        target: bridge
-        function onQuoteRequested(quote) {
-            var draft = input.text.replace(/\s+$/, "")
-            input.text = (draft ? draft + "\n\n" : "") + quote + "\n\n"
-            input.cursorPosition = input.length
-            input.forceActiveFocus()
+
+    readonly property var permissionModes: [
+        { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
+          detail: qsTr("Every action asks for your approval first, local file reads included.") },
+        { id: "smart_auto", short: qsTr("Smart"), name: qsTr("Smart approval"),
+          detail: qsTr("Low-risk, reversible actions (local file reads) run without asking. Everything else asks.") },
+        { id: "session", short: qsTr("Session"), name: qsTr("Session permission"),
+          detail: qsTr("As Smart approval; Core may also reuse an approval for this session where its rules allow. No current capability qualifies, so today it asks exactly like Smart approval.") }
+    ]
+    function modeInfo(id) { for (var i = 0; i < permissionModes.length; i++) if (permissionModes[i].id === id) return permissionModes[i]; return null }
+    // Paste, for the keyboard and the menu alike: the bridge decides once whether
+    // the clipboard holds attachments; only when it does not is it ordinary text.
+    function paste() { if (bridge.attachClipboard() < 0) input.paste() }
+    // Pick files for the message itself, or - with a group id - for that group only.
+    function pick(kind, groupId) { picker.imagesOnly = kind === "image"; picker.group = groupId || ""; picker.open() }
+    FileDialog {
+        id: picker
+        objectName: "attachDialog"
+        property bool imagesOnly: false
+        property string group: ""
+        fileMode: FileDialog.OpenFiles
+        nameFilters: imagesOnly ? [qsTr("Images (%1)").arg("*.png *.jpg *.jpeg *.webp")]
+                                : [qsTr("Text and code (%1)").arg("*.txt *.md *.json *.yaml *.yml *.csv *.log *.py *.js *.ts *.qml *.html *.css *.xml *.sh *.sql"),
+                                   qsTr("Images (%1)").arg("*.png *.jpg *.jpeg *.webp")]
+        onAccepted: {
+            for (var i = 0; i < selectedFiles.length; i++) {
+                if (group) bridge.attachFileToGroup(group, selectedFiles[i])
+                else bridge.attachFile(selectedFiles[i])
+            }
         }
     }
+
+    EditMenu {
+        id: composerMenu
+        objectName: "composerEditMenu"
+        editor: input
+        attachAware: true
+        onPasteRequested: composer.paste()
+    }
+
+    // The draft's context items, above the bar and in their own order.
+    ContextStrip {
+        id: strip
+        objectName: "composerContext"
+        anchors { left: parent.left; right: parent.right; top: parent.top }
+        onPickRequested: function(kind, groupId) { composer.pick(kind, groupId) }
+    }
+
+    Rectangle {
+        id: bar
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        height: composer.barHeight
+        Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        radius: 10
+        // The BODY only: very transparent at rest, a step darker under the
+        // pointer, a step darker again while it has focus. The draft text, the
+        // placeholder, the chips and the send key never change opacity.
+        property color body: input.activeFocus ? Theme.glassControlActive : barHover.hovered ? Theme.glassControlHover : Theme.glassControlIdle
+        property color bodyTop: input.activeFocus ? Theme.glassControlActiveTop : barHover.hovered ? Theme.glassControlHoverTop : Theme.glassControlIdleTop
+        Behavior on body { ColorAnimation { duration: Theme.hoverMs } }
+        Behavior on bodyTop { ColorAnimation { duration: Theme.hoverMs } }
+        gradient: Gradient {
+            GradientStop { position: 0; color: bar.bodyTop }
+            GradientStop { position: 1; color: bar.body }
+        }
+        border.width: 1
+        border.color: input.activeFocus ? Theme.glassEdgeStrong : Theme.glassEdge
+        Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+        HoverHandler { id: barHover }
 
     // Material depth: a restrained upper-edge reflection; focus adds a fine
     // inner highlight and nothing larger.
@@ -56,15 +112,6 @@ Rectangle {
     // choice is written through the same config path the CLI uses and Core
     // applies it on the next action. It never overrides an always-approval
     // action, UNKNOWN_OUTCOME, the execution journal or Freeze.
-    readonly property var permissionModes: [
-        { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
-          detail: qsTr("Every action asks for your approval first, local file reads included.") },
-        { id: "smart_auto", short: qsTr("Smart"), name: qsTr("Smart approval"),
-          detail: qsTr("Low-risk, reversible actions (local file reads) run without asking. Everything else asks.") },
-        { id: "session", short: qsTr("Session"), name: qsTr("Session permission"),
-          detail: qsTr("As Smart approval; Core may also reuse an approval for this session where its rules allow. No current capability qualifies, so today it asks exactly like Smart approval.") }
-    ]
-    function modeInfo(id) { for (var i = 0; i < permissionModes.length; i++) if (permissionModes[i].id === id) return permissionModes[i]; return null }
     Item {
         id: permissionChip
         objectName: "permissionModeControl"
@@ -90,7 +137,9 @@ Rectangle {
             objectName: "permissionModeMenu"
             y: -height - 8; x: 0
             width: 360; padding: 10
-            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong }
+            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong
+                // An open menu OWNS the wheel: the conversation behind it stays put.
+                WheelHandler { } }
             contentItem: Column {
                 spacing: 4
                 Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
@@ -118,11 +167,58 @@ Rectangle {
         }
     }
 
+    // "+": attach a file or an image the person picks themselves. It grants
+    // JARVIS no filesystem access of any kind - only the exact item chosen in
+    // this dialog is read, once, and copied into the draft.
+    Item {
+        id: attachChip
+        objectName: "attachControl"
+        anchors.left: permissionChip.right; anchors.leftMargin: 6
+        anchors.bottom: parent.bottom; anchors.bottomMargin: 10
+        width: 32; height: 32
+        enabled: !bridge.busy && !bridge.configRefused
+        opacity: enabled ? 1 : 0.5
+        Accessible.role: Accessible.Button
+        Accessible.name: qsTr("Attach a file or an image")
+        Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
+                    color: attachArea.containsMouse || attachMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+                    border.width: 1; border.color: attachMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
+        Text { anchors.centerIn: parent; text: "+"; color: Theme.text
+               font: Qt.font({ family: Theme.font, pixelSize: 16, weight: Font.Medium }) }
+        MouseArea { id: attachArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: attachMenu.visible ? attachMenu.close() : attachMenu.open() }
+        Popup {
+            id: attachMenu
+            objectName: "attachMenu"
+            y: -height - 8; x: 0
+            width: 240; padding: 8
+            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong
+                WheelHandler { } }
+            contentItem: Column {
+                spacing: 2
+                Repeater {
+                    model: [{ id: "file", label: qsTr("Add file") }, { id: "image", label: qsTr("Add image") }]
+                    delegate: Rectangle {
+                        objectName: "attach_" + modelData.id
+                        width: 224; height: 32; radius: 6
+                        color: pickArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
+                        Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.text
+                               font: Qt.font({ family: Theme.font, pixelSize: 13 }) }
+                        MouseArea { id: pickArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: { attachMenu.close(); composer.pick(modelData.id) } }
+                    }
+                }
+                Text { width: 224; wrapMode: Text.Wrap; color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                       text: qsTr("Only the item you choose is read. JARVIS gets no access to your files.") }
+            }
+        }
+    }
+
     // The draft: a wrapping text area inside a flickable, so past the maximum
     // height the text scrolls and the caret stays in view.
     Flickable {
         id: flick
-        anchors { left: permissionChip.right; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
+        anchors { left: attachChip.right; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
                   leftMargin: 10; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
         clip: true
         boundsBehavior: Flickable.StopAtBounds
@@ -144,6 +240,12 @@ Rectangle {
             enabled: !bridge.configRefused
             Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
             Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
+            // Paste: the same single route as the menu's Paste (composer.paste).
+            Keys.onPressed: function(event) {
+                if (event.matches(StandardKey.Paste)) { composer.paste(); event.accepted = true }
+            }
+            // The JARVIS edit menu replaces the platform one; its Paste is the same route.
+            ContextMenu.menu: composerMenu
             // Real typing activity for the core: on while text is being entered,
             // off 900 ms after the last edit or as soon as the field is empty.
             onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
@@ -219,5 +321,6 @@ Rectangle {
             Rectangle { width: 8; height: 8; radius: 2; color: Theme.danger; anchors.verticalCenter: parent.verticalCenter }
             Text { text: qsTr("Stop"); color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } } }
         MouseArea { id: stopArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (!bridge.cancelText()) bridge.cancelTask() } }
+    }
     }
 }

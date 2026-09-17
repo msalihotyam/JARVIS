@@ -86,6 +86,27 @@ def approval_ticket(payload: Any) -> ApprovalTicket | None:
     return ApprovalTicket(*values)
 
 
+#: What each provider route REALLY accepts as an explicitly attached item,
+#: established by a live probe of the same hardened invocation this build
+#: uses - not assumed, and never the same answer for both by default:
+#:
+#: * Claude Code takes images as ``image`` content blocks of one user
+#:   message on stdin (``--input-format stream-json``) with the empty tool
+#:   grant, safe mode and empty MCP set unchanged.
+#: * Codex takes images with ``codex exec -i``, with the read-only sandbox,
+#:   ``approval_policy=never`` and every disabled feature unchanged.
+#: * Text-like files are read by JARVIS itself and travel as text, so they
+#:   need nothing from the provider and grant it no file access.
+#: * No provider gets a file tool, a shell or a browser for this, and a
+#:   combination that is not supported is refused - never re-routed.
+ATTACHMENT_SUPPORT = {
+    "claude": {"image": True, "text": True},
+    "codex": {"image": True, "text": True},
+    "google": {"image": False, "text": False},
+    "qwen": {"image": False, "text": False},
+}
+
+
 class Backend:
     """Every UI action as one CLI-equivalent call, on freshly loaded config."""
 
@@ -186,6 +207,7 @@ class Backend:
     #: Choosing one changes who INTERPRETS a request - never what JARVIS may do.
     CHAT_PROVIDERS = ("claude", "codex")
 
+
     def providers(self) -> list[dict]:
         """What is REALLY known about each provider line, from local checks only
         - no model call, no spend: the Claude auth probe and the CLI's own model
@@ -203,7 +225,8 @@ class Backend:
                       else "not_logged_in" if evidence == AUTH_NOT_LOGGED_IN_EVIDENCE else "unavailable")
             models = self.claude_catalog() if status == "available" else []
         claude = {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": status,
-                  "evidence": evidence, "models": models, "research": status == "available"}
+                  "evidence": evidence, "models": models, "research": status == "available",
+                  "attachments": dict(ATTACHMENT_SUPPORT["claude"])}
         try:
             state = self.codex_state()
         except Exception:  # noqa: BLE001
@@ -217,21 +240,24 @@ class Backend:
                   for model in state.get("models", []) if isinstance(model, dict)]
         codex = {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
                  "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
-                 "research": False}
+                 "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
         try:
             google = self.google_state()
         except Exception:  # noqa: BLE001 - an unreadable check establishes nothing
             google = {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "unavailable", "models": [], "research": False}
         # Never selectable in V1: no chat, no research, read-only quota at most.
+        google = {**google, "attachments": dict(ATTACHMENT_SUPPORT["google"])}
         return [claude, codex, google,
-                {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+                {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [],
+                 "research": False, "attachments": dict(ATTACHMENT_SUPPORT["qwen"])}]
 
     # -- natural language -----------------------------------------------------
 
     def submit_text(
         self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = "",
         response_language: str = "", conversation: tuple = (), provider: str = "claude", model: str = "",
-        effort: str = "", on_reply_preview: Callable[[str], None] | None = None,
+        effort: str = "", context_groups: tuple = (), context_attachments: tuple = (), response_mode: str = "together",
+        on_reply_preview: Callable[[str], None] | None = None,
     ) -> dict:
         request_id = request_id or str(uuid4())
 
@@ -249,6 +275,7 @@ class Backend:
                 return app.submit_text(
                     text, session_id, previous_text=previous_text, request_id=request_id,
                     response_language=response_language, conversation=conversation,
+                    context_groups=context_groups, context_attachments=context_attachments, response_mode=response_mode,
                     on_reply_preview=on_reply_preview,
                 )
             finally:

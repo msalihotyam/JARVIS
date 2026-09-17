@@ -8,7 +8,10 @@ ContextPanel {
     // Above the interactive summary rail (420), below permanent top controls.
     z: 430
     surfaceEdge: Theme.materialBlue
-    surfaceFill: "#fd06182d"
+    // Substantially more glass than the rest: this panel is read at a glance and
+    // the space behind it should stay visible. Text, controls and borders keep
+    // their own colour, so nothing here is harder to read.
+    surfaceFill: Theme.glassSettings
     heading: qsTr("GENERAL SETTINGS")
     surfaceName: "settingsSurface"
     panelWidth: 460; panelHeight: 671

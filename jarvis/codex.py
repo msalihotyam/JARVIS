@@ -298,7 +298,11 @@ class CodexIntentAdapter:
         if (state.get("quota") or {}).get("limit_reached"):
             return self._refused("The Codex plan limit is reached; nothing was sent so no credits can be used.",
                                  ErrorCode.CONNECTOR_UNAVAILABLE)
-        payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": task.context})
+        # JARVIS's own snapshots of the images the person attached: a local file
+        # handle for `-i`, never model context, so they leave the payload here.
+        context = dict(task.context)
+        images = [str(path) for _, _, path in (context.pop("attachment_files", None) or [])]
+        payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": context})
         prompt = (self.system_prompt + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
                   + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")))
         workdir = tempfile.mkdtemp(prefix="jarvis-codex-")
@@ -309,6 +313,11 @@ class CodexIntentAdapter:
             command += ["-c", f"model_reasoning_effort={self.effort}"]
         for feature in CODEX_DISABLED_FEATURES:
             command += ["--disable", feature]
+        if images:
+            # Explicit image input, exactly these files. `-i` takes a list, so
+            # `--` closes it and `-` still means "the request is on stdin"; the
+            # sandbox, the approval policy and the disabled features are unchanged.
+            command += ["-i", *images, "--"]
         command.append("-")
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

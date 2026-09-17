@@ -145,7 +145,7 @@ Item {
         }
         }
     }
-    Composer { id: composer; objectName: "commandComposer"; height: 60
+    Composer { id: composer; objectName: "commandComposer"; minHeight: 60; maxHeight: 60
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; leftMargin: cockpit.navWidth ? cockpit.navWidth + 24 : 0; rightMargin: cockpit.wide ? 180 : 0 }
     }
 }

@@ -17,6 +17,9 @@ Item {
     property bool open: false
     property string modelName: ""
     property string metadata: ""
+    // At most two quota rows, each {window, remaining, resets_at}, exactly as the
+    // provider reported them. An empty list draws nothing: no bar, no estimate.
+    property var quota: []
     signal activated()
 
     implicitWidth: 304
@@ -37,6 +40,13 @@ Item {
     // brighter under the pointer or while open. Weight never changes.
     property real edge: (sel.open || sel.hovered) ? 1 : 0.5
     Behavior on edge { NumberAnimation { duration: Theme.hoverMs } }
+    // The BODY is light at rest and darkens a step under the pointer and again
+    // while the panel is open. Only the surface moves: the model name, the
+    // route line, the quota figures and the chevron keep their own colour.
+    property color body: sel.open ? Theme.glassControlActive : sel.hovered ? Theme.glassControlHover : Theme.glassControlIdle
+    property color bodyTop: sel.open ? Theme.glassControlActiveTop : sel.hovered ? Theme.glassControlHoverTop : Theme.glassControlIdleTop
+    Behavior on body { ColorAnimation { duration: Theme.hoverMs } }
+    Behavior on bodyTop { ColorAnimation { duration: Theme.hoverMs } }
 
     // -- body: deep navy, one fine perimeter with corner cuts -----------------
     Shape {
@@ -51,8 +61,8 @@ Item {
             joinStyle: ShapePath.MiterJoin
             fillGradient: LinearGradient {
                 x1: 0; y1: 0; x2: 0; y2: frame.h
-                GradientStop { position: 0; color: Theme.glassInteractiveTop }
-                GradientStop { position: 1; color: Theme.glassInteractive }
+                GradientStop { position: 0; color: sel.bodyTop }
+                GradientStop { position: 1; color: sel.body }
             }
             startX: frame.c + 0.5; startY: 0.5
             PathLine { x: frame.w - frame.c - 0.5; y: 0.5 }
@@ -101,7 +111,7 @@ Item {
         id: identity
         anchors.verticalCenter: parent.verticalCenter
         x: badge.x + badge.width + 10
-        width: Math.max(40, chevron.x - x - 8)
+        width: Math.max(40, (summary.visible ? summary.x : chevron.x) - x - 10)
         spacing: 1
         Text {
             width: parent.width; elide: Text.ElideRight
@@ -127,6 +137,39 @@ Item {
             lineHeightMode: Text.FixedHeight; lineHeight: 16
             TextMetrics { id: metaFull; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium; font.letterSpacing: 0.44 }
             TextMetrics { id: metaTight; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium }
+        }
+    }
+
+    // -- plan summary: the empty right side of the card ---------------------------
+    // Two compact rows - name, what REMAINS, when it resets - and nothing else:
+    // no bar here, no percentage the provider did not report.
+    Column {
+        id: summary
+        objectName: "selectorQuota"
+        // Only where the model name still has a comfortable measure of its own;
+        // below that the card keeps the name and the panel keeps the figures.
+        visible: (sel.quota || []).length > 0 && sel.width >= 330
+        anchors.verticalCenter: parent.verticalCenter
+        x: chevron.x - width - 12
+        spacing: 2
+        Repeater {
+            model: sel.quota || []
+            Row {
+                objectName: "selectorQuota_" + modelData.window
+                spacing: 6
+                Text { width: 46; elide: Text.ElideRight; color: Theme.textMuted
+                       text: modelData.window === "five_hour" ? qsTr("5 h") : qsTr("Weekly")
+                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.Medium }) }
+                Text { width: 30; horizontalAlignment: Text.AlignRight; color: Theme.text
+                       text: qsTr("%1%").arg(modelData.remaining)
+                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
+                Text { width: 54; elide: Text.ElideRight; color: Theme.textMuted
+                       text: modelData.resets_at > 0
+                             ? new Date(modelData.resets_at * 1000).toLocaleString(Qt.locale(i18n.qtLocale),
+                                   modelData.window === "five_hour" ? "HH:mm" : "ddd HH:mm")
+                             : ""
+                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.Medium }) }
+            }
         }
     }
 
