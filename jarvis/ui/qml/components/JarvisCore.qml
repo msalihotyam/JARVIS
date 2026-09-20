@@ -682,8 +682,10 @@ Item {
 
     // ======================= the layer stack ==================================
     // Restrained halo: the level lifts it a little; it never becomes a fog.
+    // The broad outer bloom sits ~18 % under its first tuning, so the dark
+    // structure and the lit faces read before the light around them.
     Image { source: "../assets/core-halo.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: (0.45 + 0.6 * (core.lvl - 0.22) + 0.3 * core.bootGlow) * core.residual }
+            opacity: 0.82 * (0.45 + 0.6 * (core.lvl - 0.22) + 0.3 * core.bootGlow) * core.residual }
     // L1: the dark bed. Present from the first frame: the plate's globe never shows.
     Image { source: "../assets/core-bed.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true }
     // L8 (static part): fixed tick groups.

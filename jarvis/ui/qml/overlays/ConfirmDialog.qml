@@ -40,9 +40,9 @@ Item {
             Row { spacing: 12
                 Rectangle { width: 10; height: 10; radius: 5; color: dialog.danger ? Theme.danger : Theme.accent; anchors.verticalCenter: parent.verticalCenter
                     Rectangle { anchors.centerIn: parent; width: 20; height: 20; radius: 10; color: parent.color; opacity: 0.22 } }
-                Text { anchors.verticalCenter: parent.verticalCenter; text: i18n.upper(dialog.title); color: dialog.danger ? Theme.danger : Theme.accent; font { family: Theme.font; pixelSize: 12; letterSpacing: 3; weight: Font.DemiBold } }
+                Text { anchors.verticalCenter: parent.verticalCenter; text: i18n.upper(dialog.title); color: dialog.danger ? Theme.danger : Theme.accent; font: Theme.label }
             }
-            Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font { family: Theme.font; pixelSize: 14 } }
+            Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font: Theme.body }
             Row { spacing: 10; anchors.right: parent.right
                 ActionButton { objectName: "confirmCancel"; label: dialog.cancelLabel; onClicked: dialog.open = false }
                 ActionButton { objectName: "confirmAccept"; label: dialog.confirmLabel; primary: true; danger: dialog.danger; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }

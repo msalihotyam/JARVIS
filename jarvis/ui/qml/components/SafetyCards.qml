@@ -54,7 +54,7 @@ Column {
         property string glyph: ""
         width: 40; height: 40; radius: width / 2
         color: Theme.alpha(tone, 0.10); border.width: 2; border.color: Theme.alpha(tone, 0.85)
-        Text { anchors.centerIn: parent; text: parent.glyph; color: parent.tone; font { family: Theme.font; pixelSize: 19; weight: Font.DemiBold } }
+        Text { anchors.centerIn: parent; text: parent.glyph; color: parent.tone; font: Theme.title }
     }
     // One label / value field. Values wrap; nothing approval-critical is elided.
     component Field: Item {
@@ -63,13 +63,16 @@ Column {
         property color vColor: Theme.text
         width: parent ? parent.width : 0
         height: (cards.narrow ? key.height + 2 : 0) + value.height + 12
-        Text { id: key; y: 6; width: cards.narrow ? parent.width : 118; text: parent.k; color: Theme.textLabel; font: Theme.uiLabel }
+        Text { id: key; y: 6; width: cards.narrow ? parent.width : 118; text: parent.k; color: Theme.textLabel; font: Theme.uiLabel
+               renderType: Theme.textRender }
         TextEdit { id: value; x: cards.narrow ? 0 : 130; y: cards.narrow ? key.height + 8 : 6; width: parent.width - x
                    text: parent.v; readOnly: true; selectByMouse: true; wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText
+                   renderType: Theme.textRender
                    color: parent.vColor; font: Theme.uiValue }
         Rectangle { width: parent.width; height: 1; anchors.bottom: parent.bottom; color: Theme.glassSeparator }
     }
     component Heading: Text {
+        renderType: Theme.textRender
         activeFocusOnTab: true
         Accessible.role: Accessible.Heading
         Accessible.name: text
@@ -94,7 +97,8 @@ Column {
             Heading { id: executionHeading; objectName: "safetyHeading_execution"; width: parent.width; color: executionCard.tone
                       text: ({ frozen: qsTr("JARVIS frozen"), freeze_requested: qsTr("Freeze requested — waiting for the current operation"),
                                unconfirmed: qsTr("JARVIS state unconfirmed"), refused: qsTr("Configuration refused — execution off") })[executionCard.st] || "" }
-            Text { objectName: "safetyExecutionText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
+            Text { objectName: "safetyExecutionText"; renderType: Theme.textRender; width: parent.width; wrapMode: Text.Wrap; color: Theme.text
+                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22
                    text: executionCard.st === "unconfirmed"
                          ? qsTr("The last request to freeze or resume JARVIS was not confirmed, so JARVIS does not show it as running or frozen until a request is confirmed.")
                          : executionCard.st === "refused" ? qsTr("The stored configuration was refused, so execution stays off. Repair it with: %1").arg("jarvis config reset --all")
@@ -121,7 +125,8 @@ Column {
             x: 76; y: 18; width: parent.width - 96; spacing: 8
             Heading { id: approvalHeading; objectName: "safetyHeading_approval"; width: parent.width; color: Theme.warning
                       text: approvalCard.a.complete ? qsTr("Approval required") : qsTr("Approval details unavailable") }
-            Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
+            Text { objectName: "safetyApprovalText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; renderType: Theme.textRender
+                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22
                    text: approvalCard.a.complete ? (approvalCard.a.summary || approvalCard.a.reason || qsTr("Review this action before authorizing it."))
                                                  : qsTr("Core's request is missing details needed to approve it safely, so approval is unavailable.") }
             Column {
@@ -151,7 +156,8 @@ Column {
                 Field { k: qsTr("Expires"); v: approvalCard.a.expires_at || qsTr("Not reported") }
                 Field { k: qsTr("Request"); v: (approvalCard.a.request_id || qsTr("Not reported")) + "\n" + (approvalCard.a.fingerprint || "") ; vColor: Theme.textLabel }
             }
-            Text { visible: !!approvalCard.a.hold; width: parent.width; wrapMode: Text.Wrap; color: Theme.warning; font: Theme.uiLabel; text: approvalCard.a.hold || "" }
+            Text { visible: !!approvalCard.a.hold; width: parent.width; wrapMode: Text.Wrap; color: Theme.warning; renderType: Theme.textRender
+                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22; text: approvalCard.a.hold || "" }
             Flow {
                 width: parent.width; spacing: 10
                 ActionButton { objectName: "approvalApprove"; label: qsTr("Approve action"); primary: true; accent: Theme.warning; height: 44
@@ -198,20 +204,26 @@ Column {
         readonly property var o: cards.s.outcome || ({})
         readonly property string kind: o.kind || ""
         visible: kind !== ""
+        // Green is reserved for a confirmed, achieved objective. A run that ended
+        // without achieving what was asked is amber, not success and not failure.
         tone: kind === "unknown" || kind === "in_progress" ? Theme.unknownEdge : kind === "failed" ? Theme.danger
-            : kind === "blocked" ? Theme.warning : kind === "completed" ? Theme.success : Theme.accentSoft
+            : kind === "blocked" || kind === "unmet" ? Theme.warning : kind === "completed" ? Theme.success : Theme.accentSoft
         height: visible ? outcomeBody.height + 32 : 0
         StateIcon { x: 20; y: 16; tone: outcomeCard.tone
                     glyph: outcomeCard.kind === "unknown" || outcomeCard.kind === "in_progress" ? "?" : outcomeCard.kind === "failed" ? "✕"
-                         : outcomeCard.kind === "completed" ? "✓" : outcomeCard.kind === "blocked" ? "—" : outcomeCard.kind === "paused" ? "❚❚" : "·" }
+                         : outcomeCard.kind === "completed" ? "✓" : outcomeCard.kind === "blocked" || outcomeCard.kind === "unmet" ? "—"
+                         : outcomeCard.kind === "paused" ? "❚❚" : "·" }
         Column {
             id: outcomeBody
             x: 76; y: 16; width: parent.width - 96; spacing: 6
             Heading { id: outcomeHeading; objectName: "safetyHeading_outcome"; width: parent.width; color: outcomeCard.tone
                       text: ({ unknown: qsTr("Outcome unknown"), in_progress: qsTr("Outcome not established yet"), failed: qsTr("Failed"), blocked: qsTr("Blocked"), paused: qsTr("Paused by Freeze"),
-                               completed: qsTr("Completed"), cancelled: outcomeCard.o.run_status === "cancelling" ? qsTr("Cancellation requested") : qsTr("Cancelled") })[outcomeCard.kind] || "" }
-            Text { objectName: "safetyOutcomeText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiLabel
-                   text: outcomeCard.kind === "unknown" ? qsTr("JARVIS could not verify whether the action completed.")
+                               completed: qsTr("Completed"), unmet: qsTr("Not completed"),
+                               cancelled: outcomeCard.o.run_status === "cancelling" ? qsTr("Cancellation requested") : qsTr("Cancelled") })[outcomeCard.kind] || "" }
+            Text { objectName: "safetyOutcomeText"; renderType: Theme.textRender; width: parent.width; wrapMode: Text.Wrap; color: Theme.text
+                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22
+                   text: outcomeCard.kind === "unmet" ? qsTr("The read-only access an inspection needs was not available, so what you asked for was not done. Nothing failed and nothing was changed.")
+                       : outcomeCard.kind === "unknown" ? qsTr("JARVIS could not verify whether the action completed.")
                        : outcomeCard.kind === "in_progress" ? qsTr("This action is in progress elsewhere; its outcome is not known yet. Do not repeat it.")
                        : outcomeCard.kind === "paused" ? qsTr("JARVIS froze at a safe point between this task's steps. It was not failed or cancelled; Resume JARVIS continues it from where it stopped.")
                        // Core's own detail is appended as written: technical detail, not rewritten.

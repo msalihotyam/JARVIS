@@ -181,10 +181,18 @@ from jarvis.intent import (
     model_failure_status,
     parse_proposal,
     parse_research,
-    conversation_window,
     model_failure_reason,
     resolve_proposal,
     response_language_hint,
+)
+from jarvis.conversation import (
+    ConversationState,
+    argv_chars,
+    assemble_context,
+    context_fields,
+    context_profile_of,
+    json_text,
+    rehydrate,
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
@@ -3147,9 +3155,13 @@ class JarvisApp:
         reply - no task, job, grant or connector, and nothing to approve.
         ``response_language`` (a language tag, e.g. the interface language)
         is only the default for that reply; the user's own language wins.
-        ``conversation`` is the caller's recent chat turns (user / assistant
-        text only), bounded by ``conversation_window`` so a follow-up can be
-        understood. It is data: only the CURRENT turn can select a destination.
+        ``conversation`` is the caller's canonical conversation - a
+        ``jarvis.conversation.ConversationState`` (turns, compacted digests,
+        the person's active pins) or, from older callers, a plain list of
+        ``{role, text}`` turns. It is assembled here, inside the answering
+        provider's reported budget, into a checkpoint, the active pins and the
+        recent turns verbatim (``jarvis.conversation.assemble_context``). It is
+        data: only the CURRENT turn can select a destination.
 
         ``context_groups`` are the quotes the person attached to THIS turn,
         each owning its own note and files; ``context_attachments`` are files
@@ -3202,6 +3214,9 @@ class JarvisApp:
                 availability.reason or "The understanding model is unavailable.",
             )
         groups, attachments = list(context_groups), list(context_attachments)
+        # One canonical conversation, read more than once below: never a one-shot iterator.
+        if not isinstance(conversation, ConversationState):
+            conversation = list(conversation)
         items = context_window(groups, attachments)
         carried = bool(items["groups"] or items["global_attachments"])
         now = datetime.now().astimezone()
@@ -3215,9 +3230,26 @@ class JarvisApp:
         if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
             # Strict isolation: one call per group, merged into one reply.
             return self._answer_groups_separately(
-                text, request_id, mode, previous_text, response_language, list(conversation),
+                text, request_id, mode, previous_text, response_language, conversation,
                 groups, attachments, items, catalog, on_reply_preview, usage, respond, refused,
             )
+        # A file named again from an earlier turn comes back as data with its
+        # provenance - never merged into this turn's groups.
+        present = [str(a.get("name") or "") for g in items["groups"] for a in g["attachments"]]
+        present += [str(a.get("name") or "") for a in items["global_attachments"]]
+        rehydrated = rehydrate(conversation, text, present)
+        turn_context = {
+            "previous_request": previous_text,
+            "response_language": response_language_hint(response_language),
+            "context_groups": items["groups"],
+            "global_attachments": items["global_attachments"],
+            "response_mode": items_response_mode(response_mode) if items["groups"] else "",
+            "local_time": catalog.local_time,
+        }
+        if rehydrated:
+            turn_context["rehydrated_references"] = rehydrated
+        plan = assemble_context(conversation, context_profile_of(model), text,
+                                extra_chars=argv_chars(json_text(turn_context)) + argv_chars(json_text(catalog.to_dict())))
         intent_task = Task(
             objective=text,
             capability=INTENT_CAPABILITY,
@@ -3225,7 +3257,8 @@ class JarvisApp:
             context={
                 "previous_request": previous_text,
                 "response_language": response_language_hint(response_language),
-                "conversation": conversation_window(list(conversation)),
+                **context_fields(plan),
+                **({"rehydrated_references": rehydrated} if rehydrated else {}),
                 "context_groups": items["groups"],
                 "global_attachments": items["global_attachments"],
                 "response_mode": items_response_mode(response_mode) if items["groups"] else "",
@@ -3262,6 +3295,7 @@ class JarvisApp:
             **_model_usage(model, request_id),
             "request_chars": len(text),
             "conversation_chars": sum(len(turn["text"]) for turn in intent_task.context["conversation"]),
+            "context_plan": {**plan.stats, "budget_tokens": plan.budget_tokens, "used_tokens": plan.used_tokens},
             "items_chars": len(json.dumps(items, ensure_ascii=False)) if carried else 0,
             "items": len(items["groups"]) + sum(len(g["attachments"]) for g in items["groups"]) + len(items["global_attachments"]),
             "context_chars": len(json.dumps(intent_task.context["catalog"], sort_keys=True)),
@@ -3415,7 +3449,7 @@ class JarvisApp:
         mode: PermissionMode,
         previous_text: str,
         response_language: str,
-        conversation: list[Mapping[str, str]],
+        conversation: Any,
         groups: list[Mapping[str, Any]],
         attachments: list[Mapping[str, Any]],
         items: dict[str, Any],
@@ -3443,7 +3477,10 @@ class JarvisApp:
         """
         model = self.intent_model
         owned = {str(group.get("id")): group for group in groups if isinstance(group, Mapping)}
-        history = conversation_window(conversation)
+        largest = max((json_text(context_window([g], attachments)) for g in owned.values()), key=len, default="")
+        plan = assemble_context(conversation, context_profile_of(model), text,
+                                extra_chars=argv_chars(largest) + argv_chars(json_text(catalog.to_dict())))
+        history = context_fields(plan)
         sections: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         streams = on_reply_preview is not None and hasattr(model, "stream_listener")
@@ -3469,7 +3506,7 @@ class JarvisApp:
                     context={
                         "previous_request": previous_text,
                         "response_language": response_language_hint(response_language),
-                        "conversation": history,
+                        **history,
                         "context_groups": own["groups"],
                         "global_attachments": own["global_attachments"],
                         "response_mode": "separate",
@@ -3514,7 +3551,7 @@ class JarvisApp:
             "call_count": len(calls),
             "calls": calls,
             "request_chars": len(text),
-            "conversation_chars": sum(len(turn["text"]) for turn in history),
+            "conversation_chars": sum(len(turn["text"]) for turn in history["conversation"]),
             "items_chars": len(json.dumps(items, ensure_ascii=False)),
             "items": len(items["groups"]) + sum(len(g["attachments"]) for g in items["groups"]) + len(items["global_attachments"]),
         })

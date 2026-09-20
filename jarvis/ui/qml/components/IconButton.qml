@@ -35,13 +35,14 @@ Rectangle {
     Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on scale { NumberAnimation { duration: 90 } }
-    Rectangle { anchors.fill: parent; anchors.margins: -2; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: button.activeFocus }
+    // Keyboard focus: a crisp 2 px outline just outside the control, distinct from hover and active.
+    Rectangle { anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 2; color: "transparent"; border.width: 2; border.color: Theme.materialGlint; visible: button.activeFocus }
 
     Text {
         anchors.centerIn: parent
         text: button.glyph
         color: danger ? Theme.danger : (active ? tone : (hovered ? Theme.text : Theme.textLabel))
-        font { family: Theme.font; pixelSize: 14 }
+        font: Theme.body
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     }
     MouseArea {
@@ -57,6 +58,6 @@ Rectangle {
         width: tipText.width + 16; height: tipText.height + 10
         radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.color: Theme.borderStrong; border.width: 1
         z: 50
-        Text { id: tipText; anchors.centerIn: parent; text: button.tip; color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
+        Text { id: tipText; anchors.centerIn: parent; text: button.tip; color: Theme.text; font: Theme.caption }
     }
 }

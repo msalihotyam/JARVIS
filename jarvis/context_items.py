@@ -369,6 +369,19 @@ def history_text(text: str, groups: Any, attachments: Any = ()) -> str:
     return "%s\n%s" % (text, "\n".join(lines)) if lines else str(text)
 
 
+def result_history(text: str, capability: Any = "", destination: Any = "") -> str:
+    """One delivered TASK RESULT as later history should remember it.
+
+    The result's own words, once, with a SHORT marker saying what produced
+    them. The words are what a follow-up needs - "what did you find in that
+    result?" is answerable only from the result itself - while the marker
+    keeps them from being read back as something JARVIS said in its own voice,
+    and keeps the capability/destination provenance out of the content.
+    """
+    what = " - ".join(part for part in (str(capability or ""), str(destination or "")) if part)
+    return "[Task result%s]\n%s" % (" - " + what if what else "", text)
+
+
 __all__ = [
     "ATTACHMENT_MAX_BYTES",
     "AttachmentRefused",
@@ -392,6 +405,7 @@ __all__ = [
     "history_text",
     "image_files",
     "reference",
+    "result_history",
     "response_mode",
     "safe_name",
     "same_reference",

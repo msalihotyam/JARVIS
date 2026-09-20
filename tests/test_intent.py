@@ -75,15 +75,11 @@ from jarvis.intent import (
     INTENT_CAPABILITY,
     CHAT_REPLY_MAX_CHARS,
     CLAUDE_NOT_LOGGED_IN,
-    CONVERSATION_MAX_CHARS,
-    CONVERSATION_MAX_TURNS,
-    CONVERSATION_TURN_MAX_CHARS,
     INTENT_SYSTEM_PROMPT,
     NL_CAPABILITIES,
     ClaudeIntentAdapter,
     IntentStatus,
     ProposalError,
-    conversation_window,
     parse_proposal,
     response_language_hint,
 )
@@ -715,14 +711,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(90, adapter.timeout_seconds)
         self.assertEqual("claude-intent", adapter.name)
         self.assertEqual((INTENT_CAPABILITY,), adapter.manifest.capabilities)
-        # The base connector's attested framing is byte-identical to before.
+        # The base connector's SAFETY framing is byte-identical to before; the
+        # planning component is additionally told that what it returns is read by
+        # the person who asked, so it answers in their language and never restates
+        # JARVIS's internal envelope or its own role (see present._deliverable).
         base = ClaudeCodeConnector(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
-        self.assertEqual(
+        framing = base._command("p")[base._command("p").index("--system-prompt") + 1]
+        self.assertTrue(framing.startswith(
             "You are a read-only planning component with no file, tool or "
             "connector access. Reason only about the provided request. "
-            "Never modify files, run commands, use connectors, or disclose secrets.",
-            base._command("p")[base._command("p").index("--system-prompt") + 1],
-        )
+            "Never modify files, run commands, use connectors, or disclose secrets. "))
+        self.assertIn("language of the objective", framing)
+        self.assertIn("Never restate", framing)
+        self.assertIn("never describe your own", framing)
         self.assertTrue(base.prompt_prefix.startswith("JARVIS read-only planning request."))
 
     def test_production_composition_holds_the_adapter_but_never_registers_it(self) -> None:
@@ -1119,14 +1120,20 @@ class GeneralChatTests(IntentTestCase):
             {"role": "assistant", "text": "Process ayrı bellek alanıdır; thread aynı süreçte çalışır."},
             {"role": "user", "text": "ab"},
         ], model.calls[0].context["conversation"])
+        # No fixed window: the conversation is budgeted. Recent turns stay
+        # verbatim, everything older is carried by the checkpoint - nothing is
+        # silently dropped, and the whole plan stays inside the budget.
+        from jarvis.conversation import DEFAULT_PROFILE, assemble_context
         many = [{"role": "user", "text": f"turn {i} " + "x" * 3000} for i in range(30)]
-        window = conversation_window(many)
-        self.assertLessEqual(len(window), CONVERSATION_MAX_TURNS)
-        self.assertTrue(all(len(t["text"]) <= CONVERSATION_TURN_MAX_CHARS for t in window))
-        self.assertLessEqual(sum(len(t["text"]) for t in window), CONVERSATION_MAX_CHARS)
-        self.assertTrue(window[-1]["text"].startswith("turn 29"))                # the most recent turns are kept
-        self.assertEqual([], conversation_window("not a list"))
+        plan = assemble_context(many, DEFAULT_PROFILE, "şimdi")
+        self.assertTrue(plan.recent[-1]["text"].startswith("turn 29"))           # the most recent turns are kept
+        self.assertTrue(all(turn["text"] in [m["text"] for m in many] for turn in plan.recent))   # verbatim
+        self.assertEqual(30, len(plan.recent) + plan.checkpoint["summarized_turns"] + plan.checkpoint["omitted_turns"])
+        self.assertLessEqual(plan.used_tokens, plan.budget_tokens)
+        self.assertEqual((), assemble_context("not a list").recent)
         self.assertIn("context.conversation", INTENT_SYSTEM_PROMPT)
+        self.assertIn("context.conversation_checkpoint", INTENT_SYSTEM_PROMPT)
+        self.assertIn("context.pinned", INTENT_SYSTEM_PROMPT)
 
     def test_the_interface_language_is_only_the_default_reply_language(self) -> None:
         model = ScriptedModel(chat_proposal("a"), chat_proposal("b"), chat_proposal("c"))

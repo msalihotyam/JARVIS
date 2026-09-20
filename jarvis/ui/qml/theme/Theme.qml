@@ -14,8 +14,13 @@ QtObject {
     readonly property bool command: name === "command"
 
     // -- motion contract ------------------------------------------------
-    readonly property int panelIn: 220
-    readonly property int panelOut: 180
+    // Restrained and fast: hover ~110 ms, an overlay 180 ms in / 150 out
+    // with at most 4 px of travel. Reduced motion (ambient effects off)
+    // removes the travel and the decorative interpolation: the same states,
+    // shown at once.
+    readonly property int panelIn: ambient ? 180 : 0
+    readonly property int panelOut: ambient ? 150 : 0
+    readonly property int panelTravel: ambient ? 4 : 0
     readonly property int reflow: 220
     readonly property int pageMs: 220
     readonly property int approvalIn: 260
@@ -23,63 +28,155 @@ QtObject {
     readonly property int editMs: 200
     readonly property int focusMs: 280
     readonly property int themeMs: 400
-    readonly property int hoverMs: 140
+    readonly property int hoverMs: ambient ? 110 : 0
+    readonly property int attachMs: ambient ? 150 : 0
     readonly property int ease: Easing.OutCubic
     readonly property int easeInOut: Easing.InOutCubic
 
     // -- typography -----------------------------------------------------
-    // Two bundled families (jarvis/ui/typography.py registers them; the
-    // names are the ones Qt reports): IBM Plex Sans for the interface and the
-    // conversation, Space Grotesk for the wordmark, the greeting and the
-    // instrument numerals. `font` is the interface family every text uses.
-    readonly property string sans: typeof typography !== "undefined" && typography.sans !== "" ? typography.sans : "Segoe UI"
-    readonly property string display: typeof typography !== "undefined" && typography.display !== "" ? typography.display : sans
-    readonly property string font: sans
-    readonly property string mono: "Cascadia Mono"
-    readonly property int fsMicro: 9
-    readonly property int fsLabel: 11
-    readonly property int fsMeta: 12
-    readonly property int fsBody: 15
-    readonly property int fsLead: 17
-    readonly property int fsTitle: 20
-    readonly property int fsHero: 34
-    readonly property real labelSpacing: 2.4
-
-    // -- typographic roles (1920x1080 baseline; size / line height / weight) --
-    // Space Grotesk's 600 is its variable weight axis on the Medium face -
-    // asking Qt for weight 600 directly would synthesise bold. Numerals that
-    // must not jitter use the font's tabular figures (tnum).
-    readonly property var semibold600: ({ "wght": 600 })
+    // ONE interface face and one small ramp; every text takes its type from a
+    // role here, never from a size of its own (jarvis/ui/typography.py resolves
+    // the faces; the names are the ones Qt reports).
+    //   `ui` / `uiStrong` - the interface face and its REAL semibold: Segoe UI
+    //       Variable on Windows 11, Segoe UI on Windows 10, the bundled IBM Plex
+    //       Sans elsewhere. The conversation, the composer, labels, rows,
+    //       captions and headings are all this face. A semibold is always
+    //       `uiStrong` at `uiStrongWeight`: asking the regular family for 600
+    //       lands on its Bold instance on Segoe UI Variable.
+    //   `display` - Space Grotesk, the identity only: wordmark, greeting, clock
+    //       and large instrument numerals. Never running text or small print.
+    //   `mono` - a real fixed-pitch face for code and technical literals.
+    // How text is rasterized: native (the platform rasterizer, crisp stems and
+    // Turkish diacritics). Nothing here is scaled or rotated.
+    readonly property int textRender: Text.NativeRendering
+    readonly property bool faces: typeof typography !== "undefined" && typography.ui !== ""
+    readonly property string ui: faces ? typography.ui : "Segoe UI"
+    readonly property string uiStrong: faces ? typography.uiStrong : "Segoe UI"
+    readonly property int uiStrongWeight: faces ? typography.uiStrongWeight : Font.DemiBold
+    readonly property string sans: ui
+    readonly property string reading: ui
+    readonly property string font: ui
+    readonly property string display: typeof typography !== "undefined" && typography.display !== "" ? typography.display : ui
+    readonly property string mono: typeof typography !== "undefined" && typography.mono !== "" ? typography.mono : "Cascadia Mono"
     readonly property var tabular: ({ "tnum": 1 })
+    function face(px, strong, spacing, figures) {
+        return Qt.font({ family: strong ? uiStrong : ui, pixelSize: px, weight: strong ? uiStrongWeight : Font.Normal,
+                         letterSpacing: spacing || 0, features: figures ? tabular : ({}) })
+    }
+
+    // -- the ramp (1920x1080 baseline) ------------------------------------
+    // Informational text is never below 13 px, and small text is never a
+    // hairline: hierarchy comes from size steps, the semibold and the ink,
+    // not from shrinking. 12 px exists only as the tracked uppercase label.
+    readonly property font label: face(12, true, 0.7)          // UPPERCASE section / column labels
+    readonly property font caption: face(13, false)            // metadata, timestamps, helper, row sub-lines, actions
+    readonly property font captionStrong: face(13, true)       // a caption that names something (a chip, a counter's label)
+    readonly property font body: face(14, false)               // interface text, values, descriptions
+    readonly property font bodyStrong: face(14, true)          // row titles, buttons, emphasised values
+    readonly property font lead: face(15, false)               // an explanatory sentence on a card
+    readonly property font subtitle: face(16, true)            // a panel / empty-state title
+    readonly property font title: face(18, true)               // a card title
+    readonly property font titleLarge: face(22, true)          // an open panel's heading
+    readonly property font pageHeading: face(14, true, 1.1)    // a full page's UPPERCASE heading
+    // A FULL PAGE (Tasks, History, Memory, Automations) is read at a desk, from
+    // the whole screen: the same interface face, one clear step larger than the
+    // dense side panels - hierarchy by size and ink, never by another family.
+    readonly property font pageTitle: face(19, true, 1.3)      // the page's own UPPERCASE title
+    readonly property font pageSection: face(14, true, 0.8)    // an UPPERCASE column / section label
+    readonly property font pageRow: face(15, false)            // a list row's primary line, running content
+    readonly property font pageRowStrong: face(15, true)       // a row's name
+    readonly property font pageMeta: face(14, false)           // a row's second line, helper text
+    readonly property font pageMetaFigures: face(14, false, 0, true)
+    readonly property font pageCode: Qt.font({ family: mono, pixelSize: 14 })
+    // Large instrument numerals keep the identity face.
+    readonly property var semibold600: ({ "wght": 600 })
+    function figure(px) { return Qt.font({ family: display, pixelSize: px, weight: Font.Medium, variableAxes: semibold600, features: tabular }) }
+
+    // -- named roles on the ramp -----------------------------------------
     readonly property font brand: Qt.font({ family: display, pixelSize: 28, weight: Font.Medium, variableAxes: semibold600, letterSpacing: 3.92 })   // 28/34, +0.14 em
-    readonly property font sectionHeading: Qt.font({ family: sans, pixelSize: 13, weight: Font.DemiBold, letterSpacing: 0.78 })                    // 13/18, +0.06 em
-    readonly property font conversationBody: Qt.font({ family: sans, pixelSize: 18, weight: Font.Normal })                                        // 18/28
-    readonly property font messageIdentity: Qt.font({ family: sans, pixelSize: 12, weight: Font.DemiBold })                                       // 12/16
-    readonly property font uiLabel: Qt.font({ family: sans, pixelSize: 14, weight: Font.Medium })                                                 // 14/20
-    readonly property font uiValue: Qt.font({ family: sans, pixelSize: 14, weight: Font.DemiBold })                                               // 14/20
-    readonly property font metadata: Qt.font({ family: sans, pixelSize: 12, weight: Font.Normal })                                                // 12/18
-    readonly property font timestamp: Qt.font({ family: display, pixelSize: 12, weight: Font.Medium, features: tabular })                         // 12/16
-    readonly property font counter: Qt.font({ family: display, pixelSize: 16, weight: Font.Medium, variableAxes: semibold600, features: tabular }) // 16/20
-    readonly property font uptimeValue: Qt.font({ family: display, pixelSize: 14, weight: Font.Medium, variableAxes: semibold600, features: tabular }) // 14/20
-    readonly property font modelName: Qt.font({ family: sans, pixelSize: 18, weight: Font.DemiBold })                                             // 18/24
-    readonly property font composerText: Qt.font({ family: sans, pixelSize: 18, weight: Font.Normal })                                            // 18/24
-    readonly property font hudLabel: Qt.font({ family: sans, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.32 })                              // 11/16, +0.12 em
-    readonly property font dateText: Qt.font({ family: sans, pixelSize: 13, weight: Font.Medium })                                                // 13/18
-    // A role with different tracking (e.g. a tight heading losing its +0.06 em).
+    // A panel's UPPERCASE heading in the right stack: a step under the page heading.
+    readonly property font sectionHeading: face(13, true, 0.8)
+    // The primary reading surface: 16/26 with a 12 px paragraph gap. Headings,
+    // list rhythm and inline code inside a rendered reply are character
+    // formats, so they live in jarvis/ui/typography.py.
+    // THE CONVERSATION'S OWN VOICE (and nothing outside the conversation):
+    // Manrope, read at Medium - a full, modern stroke that never goes thin on
+    // the dark glass - with its real SemiBold for what names something. The
+    // bundled file is what resolves; `ui` only stands in if it failed to load.
+    readonly property string chat: typeof typography !== "undefined" && typography.chat !== "" ? typography.chat : ui
+    function chatFace(px, strong, figures) {
+        return Qt.font({ family: chat, pixelSize: px, weight: strong ? Font.DemiBold : Font.Medium,
+                         features: figures ? tabular : ({}) })
+    }
+    readonly property font conversationBody: chatFace(16, false)
+    readonly property int conversationLine: 26
+    readonly property int conversationParagraph: 12
+    // What the person wrote, inside its bounded block: the same face and size,
+    // a tighter line - the block, not a heavier weight, makes it theirs.
+    readonly property font conversationUser: chatFace(16, false)
+    readonly property int conversationUserLine: 24
+    // The compact layout's message text: the same voice, one step smaller.
+    readonly property font conversationCompact: chatFace(15, false)
+    // "JARVIS" above a reply: the identity face at a real 600 on its weight axis.
+    readonly property font chatAuthor: Qt.font({ family: display, pixelSize: 14, weight: Font.Medium, variableAxes: semibold600, letterSpacing: 0.9 })
+    // Beneath a reply: time, duration, tokens and the actions - subordinate by
+    // size and ink, never by a weakened stroke.
+    readonly property font chatMeta: chatFace(13, false, true)
+    readonly property font chatSourcesHeading: chatFace(14, true)
+    readonly property font chatSource: chatFace(13, false)
+    // The live line of the turn being answered: what JARVIS is doing, and for how long.
+    readonly property font chatStatus: chatFace(14, false, true)
+    readonly property font metadataStrong: caption
+    readonly property font eventTitle: bodyStrong
+    readonly property font eventMeta: caption
+    readonly property int eventMetaLine: 18
+    readonly property font cardBody: lead
+    readonly property font messageIdentity: label
+    readonly property font uiLabel: body
+    readonly property font uiValue: bodyStrong
+    readonly property font metadata: caption
+    readonly property font timestamp: face(13, false, 0, true)
+    readonly property font counter: face(16, true, 0, true)
+    readonly property font uptimeValue: face(14, true, 0, true)
+    readonly property font modelName: title
+    // What the person is writing, in the face their message will be read in:
+    // the typed text and the placeholder are ONE font; the placeholder differs
+    // only by ink (`textMuted`).
+    readonly property font composerText: face(16, false)
+    // The invitation in the empty composer - the placeholder ONLY - is Inter
+    // Medium: clearly legible at rest, never thin, never heavy. Typed text and
+    // every composer control keep the interface face.
+    readonly property string placeholderFamily: typeof typography !== "undefined" && typography.placeholder !== "" ? typography.placeholder : ui
+    readonly property font composerPlaceholder: Qt.font({ family: placeholderFamily, pixelSize: 16, weight: Font.Medium })
+    readonly property font composerChip: captionStrong
+    readonly property font hudLabel: label
+    readonly property font dateText: caption
+    readonly property font code: Qt.font({ family: mono, pixelSize: 13 })
+    // A role with different tracking (e.g. a tight heading losing its tracking).
     function tracked(f, spacing) { return Qt.font({ family: f.family, pixelSize: f.pixelSize, weight: f.weight, letterSpacing: spacing, variableAxes: f.variableAxes, features: f.features }) }
     // Role-specific responsive sizes. Tier 0 = 1920x1080, 1 = 1536x864, 2 = 1280x760.
     function tier(w) { return w >= 1728 ? 0 : w >= 1408 ? 1 : 2 }
     function greeting(t) { var s = [44, 38, 34][t]; return Qt.font({ family: display, pixelSize: s, weight: Font.Medium, variableAxes: semibold600, letterSpacing: -0.02 * s }) }
     function greetingLine(t) { return [56, 48, 44][t] }
-    function greetingSupport(t) { return Qt.font({ family: sans, pixelSize: [20, 18, 18][t], weight: Font.Normal }) }
+    function greetingSupport(t) { return face([20, 18, 18][t], false) }
     function greetingSupportLine(t) { return [28, 26, 26][t] }
     function clockSize(t) { return [44, 40, 36][t] }
     function clockLine(t) { return [48, 44, 42][t] }
     function clock(px) { return Qt.font({ family: display, pixelSize: px, weight: Font.Medium, features: tabular }) }
-    function railTitle(t) { return Qt.font({ family: sans, pixelSize: [18, 17, 16][t], weight: Font.DemiBold }) }
+    function railTitle(t) { return face([18, 17, 16][t], true) }
     function railTitleLine(t) { return [24, 22, 22][t] }
-    function railCount(t) { return Qt.font({ family: display, pixelSize: [22, 20, 20][t], weight: Font.Medium, variableAxes: semibold600, features: tabular }) }
+    function railCount(t) { return figure([22, 20, 20][t]) }
     function railCountLine(t) { return [28, 26, 26][t] }
+
+    // Legacy size tokens, on the ramp.
+    readonly property int fsMicro: 12
+    readonly property int fsLabel: 12
+    readonly property int fsMeta: 13
+    readonly property int fsBody: 14
+    readonly property int fsLead: 16
+    readonly property int fsTitle: 20
+    readonly property int fsHero: 34
+    readonly property real labelSpacing: 0.7
 
     // -- macro geometry ---------------------------------------------------
     // The Canonical Space composition, normalized to the viewport and
@@ -210,6 +307,8 @@ QtObject {
     readonly property color glassInteractive: "#e3061424"
     readonly property color glassInteractiveTop: "#e30a2038"
     readonly property color glassMenu: "#f7061424"
+    // The edit menu: a lighter, translucent glass (about 88 %), text at full contrast.
+    readonly property color glassMenuVeil: "#e0061424"
     readonly property color glassMicro: "#3d1a4f88"
     readonly property color glassEdge: "#80278dce"                  // the ~1 px structural perimeter
     readonly property color glassEdgeStrong: "#c049bdfa"
@@ -222,27 +321,39 @@ QtObject {
     // their own colour at full strength, so nothing a person reads or aims
     // at ever fades with the state. The darkest state (active / focused) is
     // exactly the old fixed value, so no state is heavier than before.
-    readonly property color glassControlIdle: ambient ? "#5e061424" : "#d6061424"
-    readonly property color glassControlIdleTop: ambient ? "#5e0a2038" : "#d60a2038"
-    readonly property color glassControlHover: ambient ? "#a8061424" : "#dd061424"
-    readonly property color glassControlHoverTop: ambient ? "#a80a2038" : "#dd0a2038"
+    readonly property color glassControlIdle: ambient ? "#80061424" : "#d6061424"
+    readonly property color glassControlIdleTop: ambient ? "#800a2038" : "#d60a2038"
+    readonly property color glassControlHover: ambient ? "#b4061424" : "#dd061424"
+    readonly property color glassControlHoverTop: ambient ? "#b40a2038" : "#dd0a2038"
     readonly property color glassControlActive: glassInteractive
     readonly property color glassControlActiveTop: glassInteractiveTop
 
-    // -- panel glass: how much of the space behind a panel stays visible ---
-    // General Settings is the lightest (it is read at a glance); the model
-    // panel holds names, quota and reset times, so it stays denser.
-    readonly property color glassSettings: ambient ? "#99061424" : "#f0061424"
-    readonly property color glassModelPanel: ambient ? "#d6061424" : "#f4061424"
-    // The quiet reading surface behind an ordinary JARVIS reply: enough to
-    // lift the text off the planet, far too little to read as a card.
-    readonly property color glassReadingSurface: ambient ? "#3d02101e" : "#7a02101e"
+    // -- the three visual distances ---------------------------------------
+    // Environment (the shells above), workspace (reading islands) and the
+    // FOREGROUND: an open panel, a preview, a menu. A foreground surface is
+    // one material for all of them - deep navy at ~95 %, one fine edge, a
+    // small dark shadow - so nothing behind it stays readable through it.
+    readonly property color glassOverlay: ambient ? "#f2061424" : "#fa061424"
+    readonly property color glassOverlayEdge: "#993d9be0"
+    // A nested control inside a card: a small tonal step from its parent,
+    // never another framed sheet.
+    readonly property color glassNested: "#0aeaf4ff"
+    readonly property color glassNestedEdge: "#0eeaf4ff"
+    // The reading veil behind an ordinary JARVIS reply: dark close to the
+    // text and feathered outward (assets/reading-veil.png), so the planet
+    // never competes with the answer and no card silhouette appears. This is
+    // the veil's strength; the asset carries the falloff.
+    readonly property real glassReadingVeil: ambient ? 0.6 : 0.82
 
     // -- stage 5: text and state accents (260-420 ms) -------------------
-    property color text: space ? "#eaf4ff" : "#dfebf2"            // primary
-    property color textLabel: space ? "#acc2d8" : "#a5c0d1"       // secondary
-    property color textMuted: space ? "#8faac2" : "#7792a5"       // metadata
-    property color textDim: space ? "#526f85" : "#506776"
+    // Resolved colours, never an opacity: a faded glyph rasterizes thinner on
+    // Windows. Primary is clear without being white; each step is a distinct,
+    // still-readable tone with the blue kept to a hint.
+    property color text: space ? "#e1eaf3" : "#dde6ec"            // primary
+    property color textLabel: space ? "#b8c6d4" : "#b2c1cb"       // secondary: helper text, row sub-lines
+    property color textMuted: space ? "#98aabb" : "#93a4b0"       // metadata, placeholder, timestamps
+    readonly property color eventMetaInk: textLabel                // a live event's secondary lines
+    property color textDim: space ? "#6f8294" : "#6b7d89"         // tertiary / disabled
     Behavior on text { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
     Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
     Behavior on textMuted { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
@@ -276,16 +387,19 @@ QtObject {
         default: return accent
         }
     }
+    // One complete, sentence-case label per reported core state; the header
+    // shows it whole. Idle says nothing (there is no readiness to claim), and
+    // a running request is worded by what it is doing (TopBar).
     function stateLabel(state) {
         switch (state) {
-        case "running": return qsTr("REASONING / EXECUTING")
-        case "awaiting_approval": return qsTr("AWAITING APPROVAL")
-        case "awaiting_input": return qsTr("AWAITING YOUR ANSWER")
-        case "completed": return qsTr("COMPLETED")
-        case "error": return qsTr("ERROR")
-        case "unknown": return qsTr("OUTCOME UNKNOWN")
-        case "disabled": return qsTr("JARVIS FROZEN")
-        default: return qsTr("IDLE")
+        case "running": return qsTr("Preparing the answer")
+        case "awaiting_approval": return qsTr("Awaiting your approval")
+        case "awaiting_input": return qsTr("Awaiting your answer")
+        case "completed": return qsTr("Completed")
+        case "error": return qsTr("Error")
+        case "unknown": return qsTr("Outcome unknown")
+        case "disabled": return qsTr("JARVIS frozen")
+        default: return ""
         }
     }
 }

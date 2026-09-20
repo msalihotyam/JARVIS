@@ -28,8 +28,8 @@ ContextPanel {
                 Keys.onReturnPressed: nav.go(modelData.page)
                 Keys.onSpacePressed: nav.go(modelData.page)
                 Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: modelData.glyph; color: Theme.accent; font.pixelSize: 18 }
-                Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: entry.current ? Theme.text : Theme.textLabel; font { family: Theme.font; pixelSize: 14 } }
-                Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+" + modelData.key; color: Theme.textDim; font { family: Theme.font; pixelSize: 10 } }
+                Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: entry.current ? Theme.text : Theme.textLabel; font: Theme.body }
+                Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+" + modelData.key; color: Theme.textDim; font: Theme.caption }
                 MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: nav.go(modelData.page) }
             }
         }

@@ -29,6 +29,9 @@ Item {
     // the person writes, so an empty draft sends nothing.
     property bool canSend: !blocked && input.text.trim() !== ""
     property alias text: input.text
+    // A press anywhere else releases the draft's focus (jarvis.ui.app); inside
+    // the composer - the draft, its chips and actions - it stays.
+    readonly property bool keepsTextFocus: true
     readonly property alias inputHeight: input.implicitHeight
     // Clear the draft only when the application really accepted it.
     function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
@@ -129,7 +132,7 @@ Item {
             Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter
                         color: bridge.permissionMode === "strict" ? Theme.warning : Theme.accent }
             Text { objectName: "permissionModeLabel"; text: permissionChip.current ? permissionChip.current.short : qsTr("Unknown")
-                   color: Theme.text; font: Qt.font({ family: Theme.font, pixelSize: 12, weight: Font.DemiBold }) } }
+                   color: Theme.text; renderType: Theme.textRender; font: Theme.composerChip } }
         MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: modeMenu.visible ? modeMenu.close() : modeMenu.open() }
         Popup {
@@ -137,13 +140,13 @@ Item {
             objectName: "permissionModeMenu"
             y: -height - 8; x: 0
             width: 360; padding: 10
-            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
                 // An open menu OWNS the wheel: the conversation behind it stays put.
                 WheelHandler { } }
             contentItem: Column {
                 spacing: 4
                 Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
-                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 1.6 }) }
+                       font: Theme.label }
                 Repeater {
                     model: composer.permissionModes
                     delegate: Rectangle {
@@ -154,14 +157,14 @@ Item {
                         border.width: selected ? 1 : 0; border.color: Theme.alpha(Theme.accent, 0.5)
                         Column { id: modeText; x: 10; y: 8; width: parent.width - 20; spacing: 2
                             Text { text: modelData.name + (parent.parent.selected ? "  ✓" : ""); color: Theme.text
-                                   font: Qt.font({ family: Theme.font, pixelSize: 13, weight: Font.DemiBold }) }
+                                   font: Theme.captionStrong }
                             Text { width: parent.width; wrapMode: Text.Wrap; text: modelData.detail; color: Theme.textMuted
-                                   font: Qt.font({ family: Theme.font, pixelSize: 12 }) } }
+                                   font: Theme.caption } }
                         MouseArea { id: optionArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                     onClicked: { bridge.setPermissionMode(modelData.id); modeMenu.close() } }
                     }
                 }
-                Text { width: 340; wrapMode: Text.Wrap; color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                Text { width: 340; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
                        text: qsTr("Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.") }
             }
         }
@@ -183,8 +186,8 @@ Item {
         Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
                     color: attachArea.containsMouse || attachMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
                     border.width: 1; border.color: attachMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
-        Text { anchors.centerIn: parent; text: "+"; color: Theme.text
-               font: Qt.font({ family: Theme.font, pixelSize: 16, weight: Font.Medium }) }
+        Text { anchors.centerIn: parent; text: "+"; color: Theme.text; renderType: Theme.textRender
+               font: Qt.font({ family: Theme.ui, pixelSize: 16 }) }
         MouseArea { id: attachArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: attachMenu.visible ? attachMenu.close() : attachMenu.open() }
         Popup {
@@ -192,7 +195,7 @@ Item {
             objectName: "attachMenu"
             y: -height - 8; x: 0
             width: 240; padding: 8
-            background: Rectangle { radius: 10; color: Theme.glassPrimaryReading; border.width: 1; border.color: Theme.glassEdgeStrong
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
                 WheelHandler { } }
             contentItem: Column {
                 spacing: 2
@@ -200,15 +203,15 @@ Item {
                     model: [{ id: "file", label: qsTr("Add file") }, { id: "image", label: qsTr("Add image") }]
                     delegate: Rectangle {
                         objectName: "attach_" + modelData.id
-                        width: 224; height: 32; radius: 6
+                        width: 224; height: 34; radius: 6
                         color: pickArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
                         Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.text
-                               font: Qt.font({ family: Theme.font, pixelSize: 13 }) }
+                               font: Theme.body }
                         MouseArea { id: pickArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                     onClicked: { attachMenu.close(); composer.pick(modelData.id) } }
                     }
                 }
-                Text { width: 224; wrapMode: Text.Wrap; color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                Text { width: 224; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
                        text: qsTr("Only the item you choose is read. JARVIS gets no access to your files.") }
             }
         }
@@ -232,9 +235,19 @@ Item {
             placeholderText: bridge.approvalPending ? qsTr("Answer the pending approval first")
                             : bridge.configRefused ? qsTr("Configuration refused - repair it with: %1").arg("jarvis config reset --all")
                             : (bridge.task.status === "awaiting_clarification" ? qsTr("Answer JARVIS's question…") : qsTr("Message JARVIS…"))
-            placeholderTextColor: Theme.textLabel
+            // The invitation has a face of its own (Inter Medium, Theme.composerPlaceholder):
+            // the style's placeholder item - and nothing else in the composer - takes it.
+            // The typed text keeps the interface face; the size and the muted ink are shared.
+            placeholderTextColor: Theme.textMuted
             color: Theme.text
+            renderType: Theme.textRender
             font: Theme.composerText
+            property Item placeholderItem: null
+            Component.onCompleted: {
+                for (var i = 0; i < children.length; i++)
+                    if (String(children[i]).indexOf("PlaceholderText") !== -1) placeholderItem = children[i]
+            }
+            Binding { target: input.placeholderItem; property: "font"; value: Theme.composerPlaceholder; when: input.placeholderItem !== null }
             background: null
             selectByMouse: true
             enabled: !bridge.configRefused
@@ -243,9 +256,11 @@ Item {
             // Paste: the same single route as the menu's Paste (composer.paste).
             Keys.onPressed: function(event) {
                 if (event.matches(StandardKey.Paste)) { composer.paste(); event.accepted = true }
+                else if (event.key === Qt.Key_Menu) {
+                    composerMenu.openAt(input, Qt.point(cursorRectangle.x, cursorRectangle.y + cursorRectangle.height)); event.accepted = true }
             }
-            // The JARVIS edit menu replaces the platform one; its Paste is the same route.
-            ContextMenu.menu: composerMenu
+            // The JARVIS edit menu replaces the platform one, at the pointer; its Paste is the same route.
+            TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { composerMenu.openAt(input, point.position) } }
             // Real typing activity for the core: on while text is being entered,
             // off 900 ms after the last edit or as soon as the field is empty.
             onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
@@ -319,7 +334,7 @@ Item {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         Row { id: stopRow; anchors.centerIn: parent; spacing: 8
             Rectangle { width: 8; height: 8; radius: 2; color: Theme.danger; anchors.verticalCenter: parent.verticalCenter }
-            Text { text: qsTr("Stop"); color: Theme.text; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold } } }
+            Text { text: qsTr("Stop"); color: Theme.text; font: Theme.captionStrong } }
         MouseArea { id: stopArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (!bridge.cancelText()) bridge.cancelTask() } }
     }
     }

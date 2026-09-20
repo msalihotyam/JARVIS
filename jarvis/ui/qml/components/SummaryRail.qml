@@ -87,7 +87,10 @@ Item {
         { id: "focus", key: "Focus", title: qsTr("Focus"), page: "memory", icon: "focus",
           line: bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length),
           note: bridge.projects.length ? (rail.roomy ? qsTr("Active in memory") : qsTr("In memory"))
-                                       : (rail.roomy ? qsTr("No focus context yet") : rail.width < 180 ? qsTr("No context") : qsTr("No context yet")) },
+                                       : (rail.roomy ? qsTr("No focus context yet") : rail.width < 180 ? qsTr("No context") : qsTr("No context yet")),
+          // The long form is a whole sentence; at this size it is the one note
+          // that can outgrow the rail, so it keeps a short form to fall back to.
+          shortNote: bridge.projects.length ? qsTr("In memory") : qsTr("No context yet") },
         { id: "plan", key: "Plan", title: qsTr("Plan"), page: "automations", icon: "plan",
           line: rail.tight ? (rail.enabledJobs.length === 1 ? qsTr("1 job") : qsTr("%1 jobs").arg(rail.enabledJobs.length)) : qsTr("%1 scheduled").arg(rail.enabledJobs.length),
           note: rail.nextJob ? qsTr("Next %1").arg(rail.dueShort(rail.nextJob.next_due_at_utc))
@@ -231,20 +234,24 @@ Item {
                     readonly property int tier: Theme.tier(card.Window.width)
                     // Title, then the count numeral with its unit on one baseline, then the detail.
                     Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.title; color: Theme.text
+                           renderType: Theme.textRender
                            font: Theme.railTitle(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railTitleLine(labels.tier) }
                     Row {
                         width: parent.width; spacing: count === "" ? 0 : 5
                         readonly property string count: modelData.status ? "" : modelData.line.split(" ")[0]
                         // A status card keeps the count's line box (1 px wide: a Row skips zero-width items) so its rhythm matches.
                         Text { id: countText; objectName: "railCount" + modelData.key; text: parent.count === "" ? " " : parent.count; width: parent.count === "" ? 1 : implicitWidth; color: "#37c4f0"
+                               renderType: Theme.textRender
                                font: Theme.railCount(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railCountLine(labels.tier) }
                         Text { objectName: "railLine" + modelData.key; anchors.baseline: countText.baseline; width: parent.width - countText.width - parent.spacing; elide: Text.ElideRight
+                               renderType: Theme.textRender
                                text: parent.count === "" ? modelData.line : modelData.line.substring(parent.count.length + 1); color: "#37c4f0"; font: Theme.uiLabel }
                     }
                     Text { objectName: "railNote" + modelData.key; visible: rail.showNote; width: parent.width; elide: Text.ElideRight; color: Theme.textLabel
+                           renderType: Theme.textRender
                            text: modelData.shortNote && noteMetrics.advanceWidth > width ? modelData.shortNote : modelData.note
-                           font: Theme.metadata; lineHeightMode: Text.FixedHeight; lineHeight: 18
-                           TextMetrics { id: noteMetrics; text: modelData.note; font: Theme.metadata } }
+                           font: Theme.metadataStrong; lineHeightMode: Text.FixedHeight; lineHeight: 18
+                           TextMetrics { id: noteMetrics; text: modelData.note; font: Theme.metadataStrong } }
                 }
                 Shape {
                     visible: !card.active && card.navigable

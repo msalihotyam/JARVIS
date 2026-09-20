@@ -144,14 +144,14 @@ Rectangle {
         }
         Column {
             x: pin.visible ? 21 : 0; width: parent.width - x; spacing: 2
-            Text { objectName: "contextPlace"; width: parent.width; elide: Text.ElideRight
+            Text { objectName: "contextPlace"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight
                    text: context.hasWeather ? context.wx.district : context.compact ? qsTr("Local") : qsTr("Local time")
-                   color: Theme.text; font { family: Theme.font; pixelSize: context.compact ? 12 : 14 } }
+                   color: Theme.text; font: context.compact ? Theme.caption : Theme.body }
             // With a reading: when the provider says it applies ("last reading" once it is no longer current).
-            Text { objectName: "contextTimeZone"; width: parent.width; elide: Text.ElideRight
+            Text { objectName: "contextTimeZone"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight
                    text: !context.hasWeather ? context.zoneText
                          : context.stale ? qsTr("Last reading %1").arg(context.readingText) : qsTr("As of %1").arg(context.readingText)
-                   color: Theme.textLabel; font { family: Theme.font; pixelSize: context.tight ? 10 : 11 } }
+                   color: Theme.textLabel; font: Theme.caption }
         }
     }
     Column {
@@ -193,10 +193,12 @@ Rectangle {
         }
         Text {
             objectName: "contextWeatherCondition"
+            renderType: Theme.textRender
             width: parent.width; horizontalAlignment: Text.AlignHCenter
-            text: context.hasWeather ? context.conditionLabel : qsTr("Weather\nunavailable")
-            wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
-            color: context.stale ? Theme.textMuted : "#acc8df"; font { family: Theme.font; pixelSize: context.tight ? 10 : context.compact ? 11 : 12 }
+            // Unavailable: said whole - the narrowest rail takes the shorter phrase rather than an ellipsis.
+            text: context.hasWeather ? context.conditionLabel : context.tight ? qsTr("No\nweather") : qsTr("Weather\nunavailable")
+            wrapMode: Text.WordWrap; maximumLineCount: context.hasWeather ? 2 : 3; elide: Text.ElideRight
+            color: context.stale ? Theme.textMuted : Theme.textLabel; font: Theme.caption
         }
     }
 }

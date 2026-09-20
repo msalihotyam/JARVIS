@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.conversation import ContextProfile
 from jarvis.contracts import (
     MODEL_ANSWER_RESULT_KEY,
     Availability,
@@ -257,6 +258,13 @@ class CodexIntentAdapter:
         self.observed: dict[str, dict[str, Any]] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._lock = threading.Lock()
+
+    def context_profile(self) -> ContextProfile:
+        """What one call can carry, REPORTED to the Conversation Context Core,
+        which owns the conversation. The request reaches ``codex exec`` on stdin,
+        so no command line bounds it; 128k tokens is the conservative window."""
+        return ContextProfile(context_window_tokens=128_000, output_reserve_tokens=8_000,
+                              transport_chars=None, fixed_chars=len(self.system_prompt))
 
     def availability(self) -> Availability:
         if codex_executable() is None:

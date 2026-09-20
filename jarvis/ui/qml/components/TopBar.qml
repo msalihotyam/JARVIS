@@ -250,7 +250,7 @@ Item {
             visible: orb.hovered && !bar.settingsOpen
             anchors.top: parent.bottom; anchors.topMargin: 10; anchors.horizontalCenter: parent.horizontalCenter
             width: tipText.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
-            Text { id: tipText; anchors.centerIn: parent; text: qsTr("Settings"); color: Theme.text; font { family: Theme.font; pixelSize: 11 } }
+            Text { id: tipText; anchors.centerIn: parent; text: qsTr("Settings"); color: Theme.text; font: Theme.caption }
         }
     }
     Text { objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
@@ -280,45 +280,37 @@ Item {
         environment: !bar.narrow && !Theme.command
         Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
     }
-    // The compact vertical status group, immediately right of the core and
-    // clearly subordinate to it. Only states the installation genuinely
-    // reports are lit: REASONING while a request is being understood,
-    // EXECUTING only while an approved execution or a resume is running.
+    // The core's companion: ONE complete label, immediately right of the core
+    // and clearly subordinate to it, for where the installation STANDS - an
+    // outcome (completed, error, outcome unknown) or the frozen safety state.
+    // What is in progress - preparing, executing, waiting for an approval or an
+    // answer - is said once, in the conversation, on the live turn it belongs
+    // to (FeedView), never a second time here; the core's own light still shows
+    // every one of those states. Idle says nothing: readiness is not claimed,
+    // and no voice or listening is implied anywhere. It wraps whole words and
+    // is never cut short.
     Item {
         id: ticker
         objectName: "coreStatusGroup"
-        visible: bar.tickerFits
+        readonly property bool inProgress: bridge.coreState === "running" || bridge.coreState === "awaiting_approval"
+                                          || bridge.coreState === "awaiting_input"
+        readonly property string label: inProgress ? "" : Theme.stateLabel(bridge.coreState)
+        visible: bar.tickerFits && label !== ""
         x: bar.ticker0
-        y: bar.coreCy - height / 2 - Math.round(bar.coreDiameter * 0.021)
-        width: bar.tickerNeed; height: stack.height
-        Column {
-            id: stack
-            width: parent.width; spacing: Math.round(bar.coreDiameter * 0.052)
-            Repeater {
-                model: ["LISTENING", "REASONING", "EXECUTING"]
-                Text {
-                    readonly property bool lit: (modelData === "LISTENING" && (bridge.coreState === "idle" || bridge.coreState === "awaiting_input"))
-                                                || (modelData === "REASONING" && bridge.coreState === "running" && !bridge.executing)
-                                                || (modelData === "EXECUTING" && bridge.coreState === "running" && bridge.executing)
-                    text: ({ LISTENING: qsTr("LISTENING"), REASONING: qsTr("REASONING"), EXECUTING: qsTr("EXECUTING") })[modelData]
-                    color: lit ? "#eaf6ff" : Theme.textLabel
-                    opacity: lit ? 1 : 0.7
-                    font: Theme.hudLabel
-                    Behavior on color { ColorAnimation { duration: 200 } }
-                    Behavior on opacity { NumberAnimation { duration: 200 } }
-                }
-            }
+        y: bar.coreCy - height / 2
+        // Never under the selector: the label stops short of the strip.
+        width: Math.max(bar.tickerNeed, Math.min(240, controls.x - x - 12)); height: companion.height
+        Text {
+            id: companion
+            objectName: "coreStatusLabel"
+            width: parent.width
+            text: ticker.label
+            wrapMode: Text.WordWrap; maximumLineCount: 2
+            color: bridge.coreState === "running" ? Theme.materialGlint : Theme.stateColor(bridge.coreState)
+            font: Theme.caption
+            lineHeightMode: Text.FixedHeight; lineHeight: 18
+            Behavior on color { ColorAnimation { duration: 200 } }
         }
-    }
-    Text {
-        visible: ticker.visible && bridge.coreState !== "idle"
-        x: ticker.x; y: ticker.y + ticker.height + 12
-        // Never under the selector: the caption stops short of the strip.
-        width: Math.max(0, controls.x - x - 12); elide: Text.ElideRight
-        text: Theme.stateLabel(bridge.coreState)
-        color: Theme.stateColor(bridge.coreState)
-        font: Theme.hudLabel
-        Behavior on color { ColorAnimation { duration: 200 } }
     }
 
     // -- lifecycle progress ------------------------------------------------------
@@ -430,7 +422,7 @@ Item {
                     visible: orbHover.containsMouse
                     anchors.top: parent.bottom; anchors.topMargin: 2; anchors.horizontalCenter: parent.horizontalCenter
                     width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
-                    Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font { family: Theme.font; pixelSize: 11 }
+                    Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font: Theme.caption
                         text: bridge.executionState === "unconfirmed" ? qsTr("JARVIS state unconfirmed") : bridge.configRefused ? qsTr("Configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS frozen") : bridge.executionState === "freeze_requested" ? qsTr("Freeze requested") : (bridge.busy ? qsTr("Running · operation in progress") : qsTr("Running")) }
                 }
             }
@@ -461,7 +453,7 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
                 text: ({ frozen: qsTr("FROZEN"), freeze_requested: qsTr("FREEZING"), resuming: qsTr("RESUMING"), unconfirmed: qsTr("STATE\nUNCONFIRMED"), refused: qsTr("FROZEN") })[bridge.executionState] || qsTr("FREEZE")
                 color: bridge.executionState === "running" || bridge.executionState === "unknown" ? Theme.textLabel : Theme.danger
-                font { family: Theme.font; pixelSize: 8; letterSpacing: 1.1; weight: Font.DemiBold }
+                font: Theme.label
                 lineHeight: 0.95
             }
         }

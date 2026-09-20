@@ -23,7 +23,7 @@ ContextPanel {
     id: modelPanel
     heading: qsTr("MODEL & PROVIDER")
     surfaceName: "modelSurface"
-    surfaceFill: Theme.glassModelPanel
+    surfaceFill: Theme.glassOverlay
     panelWidth: 460; panelHeight: 720
     onOpenChanged: if (open) { claudeDraft.model = bridge.config.claude_model || ""; claudeDraft.effort = bridge.config.claude_effort || ""
                                providerField.open = false; claudeField.open = false; codexField.open = false
@@ -72,23 +72,30 @@ ContextPanel {
 
     // -- the panel's few text roles ------------------------------------------
     // A section name: quiet, sentence case, no tracking.
-    component Caption: Text { color: Theme.textMuted; font { family: Theme.font; pixelSize: 12; weight: Font.Medium } }
+    component Caption: Text { color: Theme.textMuted; renderType: Theme.textRender; font: Theme.caption }
     // Small print: what is secondary lives here, readable but quiet.
-    component Line: Text { width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
-    // One of the two primary usage rows: a label and a large, clear value.
+    component Line: Text { width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textMuted; renderType: Theme.textRender; font: Theme.caption }
+    // One of the two primary usage rows: a label and a large, clear value. The
+    // plan figure is the dominant one (`big`: the instrument numerals); its
+    // reset time is the quieter note beneath. A low remainder is attention,
+    // amber - never red: nothing has failed.
     component Fact: Item {
         property string label: ""
         property string value: ""
         property string note: ""
-        property color valueColor: "#e8f4ff"
+        property bool big: false
+        property bool attention: false
+        property color valueColor: attention ? Theme.warning : "#e8f4ff"
         width: parent ? parent.width : 0
-        height: 24 + valueText.height + (noteText.visible ? noteText.height + 2 : 0)
-        Text { text: label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12; weight: Font.Medium } }
-        Text { id: valueText; objectName: parent.objectName ? parent.objectName + "Value" : ""
-               y: 20; width: parent.width; elide: Text.ElideRight; text: value; color: valueColor
-               font { family: Theme.font; pixelSize: 17; weight: Font.DemiBold } }
-        Text { id: noteText; visible: note !== ""; y: valueText.y + valueText.height + 2; width: parent.width; elide: Text.ElideRight
-               text: note; color: Theme.textLabel; font { family: Theme.font; pixelSize: 12 } }
+        height: 22 + valueText.height + (noteText.visible ? noteText.height + 2 : 0)
+        Text { text: label; color: Theme.textMuted; renderType: Theme.textRender; font: Theme.caption }
+        Text { id: valueText; renderType: Theme.textRender; objectName: parent.objectName ? parent.objectName + "Value" : ""
+               y: 19; width: parent.width; elide: Text.ElideRight; text: value; color: valueColor
+               font: big ? Qt.font({ family: Theme.display, pixelSize: 26, weight: Font.Medium, variableAxes: Theme.semibold600, features: Theme.tabular })
+                         : Theme.title }
+        Text { id: noteText; renderType: Theme.textRender; visible: note !== ""; y: valueText.y + valueText.height + 2; width: parent.width
+               wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+               text: note; color: Theme.textLabel; font: Theme.caption }
     }
     // A compact state row: name on the left, a semantic badge on the right.
     component StateRow: Item {
@@ -98,7 +105,7 @@ ContextPanel {
         property string offText: qsTr("Unavailable", "capability")
         width: parent ? parent.width : 0; height: 26
         Text { anchors.verticalCenter: parent.verticalCenter; text: label; color: Theme.textLabel
-               font { family: Theme.font; pixelSize: 13 } }
+               font: Theme.body }
         Pill { objectName: parent.objectName ? parent.objectName + "Badge" : ""
                anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                text: on ? onText : offText; tint: on ? Theme.success : Theme.textMuted }
@@ -112,21 +119,31 @@ ContextPanel {
         signal chosen()
         width: parent ? parent.width : 0; height: 50; radius: Theme.radiusSmall
         opacity: selectable ? 1 : 0.55
+        // Three distinct states of the BACKGROUND: hover is a small tonal lift,
+        // selected is the stable fill with its edge mark, keyboard focus is the
+        // crisp outline - never colour alone for any of them.
         color: area.containsMouse && selectable ? Theme.alpha(Theme.commandEdge, 0.08) : selected ? Theme.alpha(Theme.commandEdge, 0.06) : "transparent"
         border.width: 1
         border.color: selected ? Theme.alpha(Theme.commandEdge, 0.45) : Theme.alpha(Theme.text, 0.05)
+        activeFocusOnTab: selectable
+        Accessible.role: Accessible.Button
+        Accessible.name: title
+        Keys.onReturnPressed: if (selectable) chosen()
+        Keys.onSpacePressed: if (selectable) chosen()
         MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; enabled: choice.selectable
                     cursorShape: Qt.PointingHandCursor; onClicked: choice.chosen() }
+        Rectangle { anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"
+                    border.width: 2; border.color: Theme.materialGlint; visible: choice.activeFocus }
         // The chosen row: a fine cool light along its left edge, and its name in
         // clean white-cyan. Restrained - a mark, not a glow.
         Rectangle { visible: choice.selected; x: 0; y: 8; width: 2; height: parent.height - 16; radius: 1; color: Theme.commandEdge; opacity: 0.85 }
         Column { x: 14; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 52; spacing: 2
             Text { width: parent.width; elide: Text.ElideRight; text: choice.title
                    color: choice.selected ? "#e6f8ff" : Theme.text
-                   font { family: Theme.font; pixelSize: 16; weight: choice.selected ? Font.DemiBold : Font.Medium } }
-            Text { width: parent.width; elide: Text.ElideRight; text: choice.meta; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } } }
+                   font: Theme.face(16, choice.selected) }
+            Text { width: parent.width; elide: Text.ElideRight; text: choice.meta; color: Theme.textMuted; font: Theme.caption } }
         Text { visible: choice.selected; anchors.verticalCenter: parent.verticalCenter; x: parent.width - 26; text: "✓"; color: Theme.commandEdge
-               font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
+               font: Theme.subtitle }
     }
 
     Flickable {
@@ -230,8 +247,11 @@ ContextPanel {
                 Fact {
                     objectName: "claudePlanFact"
                     readonly property var five: ((bridge.claudeLimits || {}).windows || {}).five_hour
+                    readonly property bool known: !!five && five.utilization !== undefined
                     label: qsTr("Plan, this session")
-                    value: five && five.utilization !== undefined ? qsTr("%1% left").arg(100 - modelPanel.percent(five.utilization)) : qsTr("Not reported yet")
+                    big: known
+                    attention: known && 100 - modelPanel.percent(five.utilization) <= 25
+                    value: known ? qsTr("%1% left").arg(100 - modelPanel.percent(five.utilization)) : qsTr("Not reported yet")
                     note: five && five.resets_at ? qsTr("Resets %1").arg(modelPanel.when(five.resets_at)) : ""
                 }
                 Repeater {
@@ -323,8 +343,11 @@ ContextPanel {
                 Fact {
                     objectName: "codexPlanFact"
                     readonly property var primary: (bridge.codexQuota || {}).primary
+                    readonly property bool known: !!primary && primary.used_percent !== undefined
                     label: qsTr("Plan, this session")
-                    value: primary && primary.used_percent !== undefined ? qsTr("%1% left").arg(100 - Math.round(primary.used_percent)) : qsTr("Not reported yet")
+                    big: known
+                    attention: known && 100 - Math.round(primary.used_percent) <= 25
+                    value: known ? qsTr("%1% left").arg(100 - Math.round(primary.used_percent)) : qsTr("Not reported yet")
                     note: primary && primary.resets_at ? qsTr("Resets %1").arg(modelPanel.when(primary.resets_at)) : ""
                 }
                 Repeater {

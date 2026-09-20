@@ -42,8 +42,11 @@ Item {
                                          : Math.min(maxH, Math.max(220, body.height + head.height + 44))
         anchors.centerIn: parent
         radius: 12
-        color: Theme.glassMenu
-        border.width: 1; border.color: Theme.glassEdgeStrong
+        // The same foreground material as every open panel: one fine edge, a quiet drop.
+        color: Theme.glassOverlay
+        border.width: 1; border.color: Theme.glassOverlayEdge
+        Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 6; anchors.leftMargin: 2; anchors.rightMargin: -2
+                    anchors.bottomMargin: -6; radius: parent.radius + 2; color: "#000000"; opacity: 0.32 }
         opacity: preview.open ? 1 : 0
         scale: preview.open ? 1 : 0.98
         Behavior on opacity { NumberAnimation { duration: Theme.panelIn } }
@@ -57,14 +60,14 @@ Item {
             x: 16; y: 12; width: parent.width - 32; height: 36
             Column {
                 anchors.verticalCenter: parent.verticalCenter; width: parent.width - 40; spacing: 1
-                Text { objectName: "attachmentPreviewName"; width: parent.width; elide: Text.ElideMiddle
+                Text { objectName: "attachmentPreviewName"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideMiddle
                        text: String(preview.file.name || ""); color: Theme.text
-                       font: Qt.font({ family: Theme.font, pixelSize: 14, weight: Font.DemiBold }) }
-                Text { objectName: "attachmentPreviewMeta"; width: parent.width; elide: Text.ElideRight; color: Theme.textMuted
+                       font: Theme.subtitle }
+                Text { objectName: "attachmentPreviewMeta"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight; color: Theme.textMuted
                        text: (preview.kind === "image" ? qsTr("Image") : qsTr("Text file")) + " · " + String(preview.file.media_type || "")
                              + " · " + card.human(preview.file.bytes)
                              + (preview.file.truncated ? " · " + qsTr("shown up to the first %1 characters").arg("20000") : "")
-                       font: Qt.font({ family: Theme.font, pixelSize: 11 }) }
+                       font: Theme.caption }
             }
             IconButton { objectName: "attachmentPreviewClose"; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                          glyph: "✕"; tip: qsTr("Close"); onClicked: preview.close() }
@@ -105,9 +108,10 @@ Item {
                 selectByMouse: true
                 wrapMode: TextEdit.Wrap
                 textFormat: TextEdit.PlainText
+                renderType: Theme.textRender
                 color: Theme.text
                 selectionColor: Theme.accentSoft
-                font: Qt.font({ family: Theme.mono, pixelSize: 12 })
+                font: Theme.tracked(Theme.code, 0)
             }
         }
     }

@@ -36,7 +36,7 @@ Rectangle {
         id: marker
         x: 14; anchors.verticalCenter: parent.verticalCenter
         width: 22; height: 22; radius: 11; color: Theme.alpha(strip.tone, 0.12); border.width: 1.5; border.color: strip.tone
-        Text { anchors.centerIn: parent; color: strip.tone; font { family: Theme.font; pixelSize: 12; weight: Font.DemiBold }
+        Text { anchors.centerIn: parent; color: strip.tone; font: Theme.captionStrong
                text: ({ execution: "❚❚", approval: "◆", decision: "◆", outcome: strip.item.tone === "unknown" ? "?" : "!" })[strip.item.key] || "!" }
     }
     Text {

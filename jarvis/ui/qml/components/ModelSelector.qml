@@ -102,7 +102,7 @@ Item {
             objectName: "selectorLogo"
             anchors.centerIn: parent
             text: "AI"; color: "#dbeeff"
-            font { family: Theme.font; pixelSize: 13; weight: Font.DemiBold }
+            font: Theme.captionStrong
         }
     }
 
@@ -128,15 +128,13 @@ Item {
             objectName: "selectorMetadataText"
             text: sel.metadata.replace(/\s*\|\s*/g, " | ")
             color: Theme.textMuted
-            // 11 / 16 Medium, +0.04 em; where the real route text does not fit,
-            // the tracking goes first, then the size steps down - never below 9.
-            readonly property real fit: Math.min(1, width / Math.max(1, metaFull.advanceWidth))
-            font.family: Theme.font; font.weight: Font.Medium
-            font.letterSpacing: fit < 1 ? 0 : 0.44
-            font.pixelSize: fit < 1 ? Math.max(9, Math.floor(11 * width / Math.max(1, metaTight.advanceWidth))) : 11
+            // The tracked label. Where the real route text does not fit, the
+            // tracking goes first; the size never steps below the ramp's 12 px,
+            // and a route that still does not fit is elided, not shrunk.
+            readonly property bool tight: metaTracked.advanceWidth > width
+            font: tight ? Theme.tracked(Theme.label, 0) : Theme.label
             lineHeightMode: Text.FixedHeight; lineHeight: 16
-            TextMetrics { id: metaFull; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium; font.letterSpacing: 0.44 }
-            TextMetrics { id: metaTight; text: metaText.text; font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Medium }
+            TextMetrics { id: metaTracked; text: metaText.text; font: Theme.label }
         }
     }
 
@@ -157,18 +155,20 @@ Item {
             Row {
                 objectName: "selectorQuota_" + modelData.window
                 spacing: 6
-                Text { width: 46; elide: Text.ElideRight; color: Theme.textMuted
+                Text { width: 48; elide: Text.ElideRight; color: Theme.textMuted
                        text: modelData.window === "five_hour" ? qsTr("5 h") : qsTr("Weekly")
-                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.Medium }) }
-                Text { width: 30; horizontalAlignment: Text.AlignRight; color: Theme.text
+                       font: Theme.caption }
+                Text { width: 34; horizontalAlignment: Text.AlignRight
+                       // What remains, readable at a glance; a low remainder is attention, never an error.
+                       color: modelData.remaining <= 25 ? Theme.warning : Theme.text
                        text: qsTr("%1%").arg(modelData.remaining)
-                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
-                Text { width: 54; elide: Text.ElideRight; color: Theme.textMuted
+                       font: Theme.captionStrong }
+                Text { width: 60; elide: Text.ElideRight; color: Theme.textMuted
                        text: modelData.resets_at > 0
                              ? new Date(modelData.resets_at * 1000).toLocaleString(Qt.locale(i18n.qtLocale),
                                    modelData.window === "five_hour" ? "HH:mm" : "ddd HH:mm")
                              : ""
-                       font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.Medium }) }
+                       font: Theme.caption }
             }
         }
     }

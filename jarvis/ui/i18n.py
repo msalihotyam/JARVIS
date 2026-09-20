@@ -57,8 +57,10 @@ def compiled_path(language: str) -> Path:
 
 
 def linguist_tool(name: str) -> Path:
-    """``lupdate`` / ``lrelease`` as PySide6 installs them."""
-    tool = Path(sys.executable).parent / "Scripts" / f"pyside6-{name}.exe"
+    """``lupdate`` / ``lrelease`` as PySide6 installs them: next to the running
+    interpreter itself on a venv (``python.exe``'s own directory IS ``Scripts``
+    on Windows - appending it again looked here twice and never found either)."""
+    tool = Path(sys.executable).parent / f"pyside6-{name}.exe"
     return tool if tool.exists() else Path(f"pyside6-{name}")
 
 

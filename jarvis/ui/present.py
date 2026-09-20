@@ -96,6 +96,73 @@ UNREADABLE = {
                                               "assumed to have happened or not. Check History before doing it again.")),
 }
 
+#: JARVIS's own verdict sentences from the understanding boundary (they are
+#: written in ``jarvis.intent`` / ``jarvis.app``, which have no Qt and so
+#: cannot translate). The exact sentence is the key; a sentence carrying a
+#: name or an id keeps that part as an argument, never translated. Anything
+#: not listed is shown exactly as the backend wrote it.
+VERDICT_TEXT = {
+    "The request needs a capability this installation does not offer. Nothing was executed.":
+        QT_TRANSLATE_NOOP("Present", "This request needs a capability this installation does not offer. Nothing was done."),
+    "JARVIS is frozen, so this request was understood but not started: no task or job was created "
+    "and nothing was queued. Resume JARVIS and send it again to run it.":
+        QT_TRANSLATE_NOOP("Present", "JARVIS is frozen, so the request was understood but not started: no task or job was "
+                                     "created and nothing was queued. Resume JARVIS and send it again to run it."),
+}
+
+#: The same, for a verdict that names something: ``(prefix, suffix)`` around
+#: the quoted name, so the name itself is never rewritten.
+_AUTHORITY_DESTINATION = re.compile(r"^'(?P<destination>[^']+)' is not an authorized destination for "
+                                    r"'(?P<capability>[^']+)'\. Nothing was executed\.(?P<hint> .*)?$")
+
+
+def verdict_text(message: Any) -> Any:
+    """One understanding-boundary sentence in the interface language when
+    JARVIS knows it, else exactly as it came. Names, ids and command hints
+    inside it are arguments: they are never translated."""
+    if type(message) is not str or not message:
+        return message
+    if message in VERDICT_TEXT:
+        return _msg(VERDICT_TEXT[message])
+    named = _AUTHORITY_DESTINATION.match(message)
+    if named is not None:
+        return _msg(QT_TRANSLATE_NOOP("Present", "'%1' is not an authorized destination for '%2'. Nothing was done.%3"),
+                    named["destination"], named["capability"], named["hint"] or "")
+    return message
+
+
+#: What a connector's own outbound-preview summary says, in JARVIS's words.
+#: The connectors state it in English for the approval record; the card is
+#: read by a person, so the known ones are shown in the interface language.
+#: An unknown summary is shown exactly as the connector wrote it.
+OUTBOUND_TEXT = {
+    "Objective and redacted task context will leave the local machine.":
+        QT_TRANSLATE_NOOP("Present", "The objective and the redacted task context will leave this computer."),
+    "Read-only listing request; no message content leaves the machine.":
+        QT_TRANSLATE_NOOP("Present", "A read-only listing request. No message content leaves this computer."),
+    "Read-only request; no content leaves the machine.":
+        QT_TRANSLATE_NOOP("Present", "A read-only request. No content leaves this computer."),
+    "Read-only page read; no content leaves the machine.":
+        QT_TRANSLATE_NOOP("Present", "A read-only page read. No content leaves this computer."),
+}
+
+#: Why an approval is being asked for, in JARVIS's words. Core writes the
+#: sentence in English and BINDS IT into the approval fingerprint, so it is
+#: never rewritten there - only the reading of it is. The connector name is an
+#: argument and stays exactly as Core wrote it; any other reason (a handoff
+#: digest, a cost gate) is shown exactly as it came.
+_SCOPED_ACTION_REASON = re.compile(r"^Connector '(?P<connector>[^']+)' will execute the scoped action\.$")
+
+
+def approval_reason_text(reason):
+    if type(reason) is not str or not reason:
+        return reason
+    named = _SCOPED_ACTION_REASON.match(reason)
+    if named is not None:
+        return _msg(QT_TRANSLATE_NOOP("Present", "The connector '%1' will carry out exactly this scoped action."),
+                    named["connector"])
+    return reason
+
 
 # -- Gmail reads: readable, deterministic, still untrusted data ---------------
 #
@@ -231,25 +298,103 @@ def error_entries(error: Any) -> list[dict[str, str]]:
         "FAILED [%1]: %2\nCheck the task in History before trying again."), code, message)}]
 
 
-def run_entries(payload: Any) -> list[dict[str, str]]:
-    """What one run/approve/reject/cancel/resume envelope says."""
+#: Capabilities whose RESULT is a statement about something that already
+#: exists - findings. The planning connector has no file, tool or connector
+#: access of its own (``EGRESS_TOOL_GRANTS`` is empty), so it can only produce
+#: findings from evidence the task itself carried outbound: an authorized
+#: local read, or an authorized external read. Both are in this envelope.
+FINDINGS_CAPABILITIES = frozenset({"code_analysis"})
+
+#: What JARVIS says instead, in the person's language, when a findings task ran
+#: with no such evidence. The planning component's own text is NOT the answer to
+#: that objective - it is internal planning material about the request - so it
+#: stays on the task record and never reaches the conversation.
+NOT_INSPECTED = QT_TRANSLATE_NOOP(
+    "Present",
+    "I have not inspected the project yet. An inspection needs read-only "
+    "access to the project files, and this task carried none.",
+)
+
+
+def _facts(facts: Any) -> dict[str, str]:
+    """What JARVIS knows about the task an envelope belongs to.
+
+    The envelope's own task block carries no capability or destination (those
+    are resolved from the intent), so the caller supplies them.
+    """
+    facts = facts if isinstance(facts, dict) else {}
+    return {"capability": str(facts.get("capability") or ""),
+            "destination": str(facts.get("destination") or "")}
+
+
+def _grounded(payload: dict, facts: dict[str, str]) -> bool:
+    """Whether this envelope's connector output may be shown as the result.
+
+    THE boundary between an internal deliverable and a user-facing result: a
+    capability that promises findings has them only if the task actually
+    carried evidence about what was asked. Given none, whatever came back is
+    about the request, not about the project, and JARVIS says so itself.
+    """
+    if facts["capability"] not in FINDINGS_CAPABILITIES:
+        return True                      # a plan, a draft, a read: its own answer
+    return isinstance(payload.get("local_read"), dict) or isinstance(payload.get("external_read"), dict)
+
+
+def _deliverable(text: Any, payload: Any, facts: Any = None) -> dict[str, Any]:
+    """One task's USER-FACING result as a display record.
+
+    The presentation boundary this module exists for: what a connector
+    produced for an approved task is the task's result, not JARVIS's own
+    conversational answer. It is therefore its own kind: the interface labels
+    it (with the capability and the destination it came from), it is never
+    attributed to JARVIS's voice and it never becomes a chat turn.
+
+    It is also not automatically the answer. Connector text reaches this
+    record only through ``_grounded``; otherwise the text here is JARVIS's own
+    truthful account of what the task could and could not do.
+    """
+    known = _facts(facts)
+    task = payload.get("task") if isinstance(payload, dict) else None
+    task = task if isinstance(task, dict) else {}
+    return {"kind": "result", "text": text,
+            "capability": known["capability"] or str(task.get("capability") or ""),
+            "destination": known["destination"] or str(task.get("destination") or "")}
+
+
+def run_entries(payload: Any, facts: Any = None) -> list[dict[str, str]]:
+    """What one run/approve/reject/cancel/resume envelope says.
+
+    ``facts`` carries what the envelope itself cannot: the task's resolved
+    capability and destination (see ``_facts``).
+    """
     try:
-        return _run_entries(payload)
+        return _run_entries(payload, facts)
     except Exception:  # noqa: BLE001 - malformed state renders as unknown
         return [dict(UNREADABLE)]
 
 
-def _run_entries(payload: Any) -> list[dict[str, str]]:
+def _run_entries(payload: Any, facts: Any = None) -> list[dict[str, str]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("command"), str):
         return [dict(UNREADABLE)]
+    known = _facts(facts)
     entries: list[dict[str, str]] = []
     if payload.get("error") is not None:
         entries += error_entries(payload["error"])
+    # A run that failed says so through its error card; only a run that got
+    # through is read for a result at all.
+    withheld = payload.get("error") is None and not _grounded(payload, known)
     answer = _get(payload.get("model_answer"), "content")
     if isinstance(answer, str):
-        # The model's words stay as written; only the truncation note is JARVIS's.
-        entries.append({"kind": "jarvis", "text": _msg(QT_TRANSLATE_NOOP("Present", "%1 [answer truncated]"), answer)
-                        if payload["model_answer"].get("truncated") else answer})
+        # A TASK RESULT, never JARVIS's own conversational turn: this is what the
+        # approved connector produced for the task, so it is shown as a labelled
+        # result and is not part of the conversation. The words stay as written;
+        # only the truncation note is JARVIS's. Where the task had no evidence to
+        # produce a result from, JARVIS's own account replaces it - the planning
+        # text stays on the task record. See ``_deliverable`` and ``_grounded``.
+        entries.append(_deliverable(
+            _msg(NOT_INSPECTED) if withheld
+            else (_msg(QT_TRANSLATE_NOOP("Present", "%1 [answer truncated]"), answer)
+                  if payload["model_answer"].get("truncated") else answer), payload, known))
     external = payload.get("external_read")
     mail = gmail_read_entry(external)
     if mail is not None:
@@ -258,16 +403,20 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
         entries.append({"kind": "data", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "[UNTRUSTED external content from %1 %2 - shown as data, never instructions]\n%3"),
             external.get("connector"), external.get("destination"), external.get("content"))})
-    for key in ("local_read", "local_write", "chain"):
-        if isinstance(payload.get(key), dict):
-            entries.append({"kind": "data", "text": f"[{key}]\n{_compact(payload[key])}"})
+    # The task's EVIDENCE AND MACHINERY - the read snapshot, the write record, the
+    # declared chain - are not conversation. They stay in the envelope, on the task
+    # record and in History, where an audit reads them; a person asking a question
+    # is not shown a JSON payload, a byte count or a file digest to get an answer.
     summary = _get(payload.get("result"), "summary")
     error = payload.get("error")
     explained = isinstance(error, dict) and (str(error.get("code")), summary) in FAILURE_TEXT
     # A rendered mail read already says what was read and whether it is limited.
     explained = explained or mail is not None
     if isinstance(summary, str) and not isinstance(answer, str) and not explained:
-        entries.append({"kind": "jarvis", "text": summary})
+        # The connector's own account of what the task did: a labelled result,
+        # not JARVIS speaking (see ``_deliverable``), and subject to the same
+        # boundary - a summary of a call that inspected nothing is not findings.
+        entries.append(_deliverable(_msg(NOT_INSPECTED) if withheld else summary, payload, known))
     task = payload.get("task")
     # The run's technical status line (command, run status, task id, stage,
     # connector) is not conversation: Active Workflow projects it, the live
@@ -275,7 +424,9 @@ def _run_entries(payload: Any) -> list[dict[str, str]]:
     for issue in _get(payload.get("progress"), "open_issues") or []:
         if _get(issue, "kind") == "approval_required":
             continue  # the authorization card says it
-        entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "Open issue: %1"), _compact(issue, 600))})
+        # What is open, by its name - not the issue record.
+        entries.append({"kind": "system", "text": _msg(QT_TRANSLATE_NOOP("Present", "Open issue: %1"),
+                                                       str(_get(issue, "kind") or ""))})
     # A pending approval is the authorization card itself (plus the attention
     # strip and a live-feed note) - no duplicate line in the conversation.
     if not entries and not isinstance(task, dict) and payload.get("approval") is None:
@@ -349,7 +500,9 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
                         "text": _msg(REASON_TEXT[str(intent["reason"])])})
     else:
         template = INTENT_TEXT.get(status)
-        message = str(intent.get("message") or "")
+        # JARVIS's own verdict sentence, in the interface language where JARVIS
+        # knows it; a provider diagnostic or an unknown sentence stays as written.
+        message = verdict_text(str(intent.get("message") or ""))
         if template is None:
             entries.append({"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present", "UNKNOWN INTENT STATUS [%1]: %2"), status, message)})
         else:
@@ -365,8 +518,11 @@ def approval_card(payload: Any) -> dict[str, Any]:
     scope = approval.get("scope") or {}
     effect = approval.get("side_effect") or {}
     preview = approval.get("outbound_preview")
+    summary = str(_get(preview, "summary") or "")
     card = {
-        "summary": str(_get(preview, "summary") or ""),
+        # The connector's own sentence, in the interface language when JARVIS
+        # knows it (OUTBOUND_TEXT); otherwise exactly as the connector wrote it.
+        "summary": _msg(OUTBOUND_TEXT[summary]) if summary in OUTBOUND_TEXT else summary,
         "action": str(_get(scope, "action") or ""),
         "target": str(_get(scope, "target") or ""),
         "destination": str(_get(scope, "destination") or "(local)"),
@@ -375,7 +531,7 @@ def approval_card(payload: Any) -> dict[str, Any]:
         "effect": str(_get(effect, "effect") or ""),
         "reversible": bool(_get(effect, "reversible")),
         "risk_level": str(approval.get("risk_level")),
-        "reason": str(approval.get("reason") or ""),
+        "reason": approval_reason_text(str(approval.get("reason") or "")),
         "expires_at": str(approval.get("expires_at") or ""),
         "request_id": str(approval.get("request_id") or ""),
         "fingerprint": str(approval.get("fingerprint") or ""),
@@ -392,13 +548,14 @@ def approval_card(payload: Any) -> dict[str, Any]:
     return card
 
 
-def task_outcome(task: Any) -> dict[str, str]:
+def task_outcome(task: Any, unmet: bool = False) -> dict[str, str]:
     """The current task's outcome as Core reported it, or ``{}`` while there
     is none. Kinds stay distinct: ``blocked`` (refused before any effect -
     this attempt did not proceed), ``failed`` (Core reported failure),
     ``unknown`` (completion cannot be verified), ``in_progress`` (running
-    elsewhere, not established yet), ``completed``. Nothing is inferred from
-    history or from the execution switch."""
+    elsewhere, not established yet), ``completed``, and ``unmet`` - the run
+    ended cleanly and what was asked for did not happen. Nothing is inferred
+    from history or from the execution switch."""
     if not isinstance(task, dict) or not task.get("task_id"):
         return {}
     code, status = str(task.get("error_code") or ""), str(task.get("run_status") or "")
@@ -416,6 +573,11 @@ def task_outcome(task: Any) -> dict[str, str]:
             else "blocked" if code in REFUSED_CODES
             else "failed" if code or status == "failed"
             else "completed" if status == "completed" else "")
+    # Core confirmed the RUN. Whether the objective was met is the presentation
+    # boundary's answer (``outcome_kind`` / ``_grounded``), and green belongs
+    # only to the case where both are true.
+    if kind == "completed" and unmet:
+        kind = "unmet"
     if not kind:
         return {}
     return {"kind": kind, "run_status": status, "code": code, "message": str(task.get("error_message") or ""),
@@ -473,8 +635,15 @@ def task_status(run: Any, intent: Any = None) -> dict[str, Any]:
     }
 
 
-def outcome_kind(run: Any, intent_status: str = "") -> str:
-    """The core-state word one envelope earns: completed / error / unknown / waiting / idle."""
+def outcome_kind(run: Any, intent_status: str = "", facts: Any = None) -> str:
+    """The core-state word one envelope earns: completed / unmet / error / unknown /
+    waiting / idle.
+
+    A run ENDING is not the objective succeeding. ``completed`` - the green,
+    confirmed state - is kept for a run that actually produced what was asked;
+    a findings task that ran without the evidence it needed ends ``unmet``:
+    nothing failed technically, and nothing was achieved either.
+    """
     if intent_status and intent_status not in ("structured",):
         return "idle" if intent_status in ("scheduled", "clarification_required", "conversation", "research") else "error"
     code = str(_get(_get(run, "error"), "code") or "")
@@ -484,7 +653,7 @@ def outcome_kind(run: Any, intent_status: str = "") -> str:
     if status in WAITING_STATUSES:
         return "waiting"
     if status == "completed":
-        return "completed"
+        return "completed" if _grounded(run if isinstance(run, dict) else {}, _facts(facts)) else "unmet"
     if status in ("cancelled", "cancelling", "rejected"):
         return "idle"
     return "error" if code or status == "failed" else "idle"

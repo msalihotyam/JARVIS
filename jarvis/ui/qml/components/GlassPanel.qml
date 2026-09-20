@@ -23,6 +23,10 @@ Rectangle {
     // Opt-in: a title that does not fit on one line wraps deliberately onto
     // two (baselines ~20 / ~34 px) inside the same header allocation.
     property bool titleWrap: false
+    // The title's type role and the header's height: the dense panels' by
+    // default; a full page opts into its larger title (SecondaryPage).
+    property font titleFont: Theme.sectionHeading
+    property int headerHeight: 24
     // The colour of the panel's edge light and brackets (structural, not semantic).
     property color accentColor: Theme.accent
     signal closeRequested()
@@ -98,7 +102,7 @@ Rectangle {
         id: header
         visible: panel.title !== ""
         anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: panel.padding; rightMargin: panel.padding; topMargin: panel.padding - 2 }
-        height: visible ? 24 : 0
+        height: visible ? panel.headerHeight : 0
         Row {
             anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
             spacing: 14
@@ -111,16 +115,20 @@ Rectangle {
                 // loses its tracking first; only then does it wrap (opt-in) or elide.
                 readonly property bool tight: titleMetrics.advanceWidth > room
                 readonly property bool wraps: panel.titleWrap && tightMetrics.advanceWidth > room
-                width: !panel.titleWrap ? Math.min(implicitWidth, room) : wraps ? room : Math.min(Math.ceil((tight ? tightMetrics : titleMetrics).advanceWidth) + 2, room)
+                // TextMetrics.advanceWidth can under-measure native-rendered text; a
+                // Text lays out exactly as this one does. Measured on a hidden twin,
+                // not on this item's own implicitWidth (which would bind width to itself).
+                width: wraps ? room : Math.min(Math.ceil(titleProbe.implicitWidth), room)
+                Text { id: titleProbe; visible: false; text: parent.text; font: parent.font; renderType: parent.renderType }
                 wrapMode: wraps ? Text.WordWrap : Text.NoWrap
                 maximumLineCount: wraps ? 2 : 1
                 lineHeightMode: wraps ? Text.FixedHeight : Text.ProportionalHeight
                 lineHeight: wraps ? 14 : 1
                 elide: Text.ElideRight
-                color: "#cfeaff"
-                font: tight ? Theme.tracked(Theme.sectionHeading, 0) : Theme.sectionHeading
-                TextMetrics { id: titleMetrics; text: i18n.upper(panel.title); font: Theme.sectionHeading }
-                TextMetrics { id: tightMetrics; text: i18n.upper(panel.title); font.family: Theme.font; font.pixelSize: 13; font.weight: Font.DemiBold }
+                color: Theme.text
+                font: tight ? Theme.tracked(panel.titleFont, 0) : panel.titleFont
+                TextMetrics { id: titleMetrics; text: i18n.upper(panel.title); font: panel.titleFont }
+                TextMetrics { id: tightMetrics; text: i18n.upper(panel.title); font: Theme.tracked(panel.titleFont, 0) }
             }
             Pill { id: leftBadge; visible: panel.badge !== "" && !panel.badgeRight; text: panel.badge; tint: panel.badgeColor; anchors.verticalCenter: parent.verticalCenter }
         }

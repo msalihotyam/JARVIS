@@ -32,6 +32,17 @@ Window {
     readonly property bool peekOpen: peek.open
     readonly property string peekKey: peek.open ? peek.key : ""
     readonly property string presentation: bridge.theme
+    // Observable from the outside (tests): the live motion contract.
+    readonly property int textRenderToken: Theme.textRender
+    readonly property int hoverToken: Theme.hoverMs
+    readonly property int panelInToken: Theme.panelIn
+    readonly property int panelTravelToken: Theme.panelTravel
+    // Observable from the outside (tests): the type ramp and the ink steps.
+    readonly property var typeTokens: ({ label: Theme.label, caption: Theme.caption, captionStrong: Theme.captionStrong,
+                                         body: Theme.body, bodyStrong: Theme.bodyStrong, lead: Theme.lead, subtitle: Theme.subtitle,
+                                         title: Theme.title, titleLarge: Theme.titleLarge, reading: Theme.conversationBody,
+                                         composer: Theme.composerText })
+    readonly property var inkTokens: ({ primary: Theme.text, secondary: Theme.textLabel, muted: Theme.textMuted, dim: Theme.textDim })
     readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
     property bool devApprovalVisible: false
     // The last non-minimized, non-hidden state (full screen / maximized /
@@ -54,20 +65,36 @@ Window {
         bridge.noteHiddenToTray()
     }
 
-    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; peek.open = false }
-    // One summary peek at a time: the same card again closes it, another
-    // card switches the content in place without closing the surface first.
+    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; closePeek() }
+    function closePeek() { peekSwitch.stop(); peek.open = false }
+    // One summary peek at a time: the same card again closes it. Another card
+    // is a real switch: the open surface closes with its own transition, then
+    // the new one opens with its own - never content swapped in an open
+    // surface. Picks during a switch only re-aim it; the last one wins.
     function togglePeek(key, cardY) {
+        if (peekSwitch.running) {
+            if (peekSwitch.key === key) peekSwitch.stop()
+            else { peekSwitch.key = key; peekSwitch.cardY = cardY }
+            return
+        }
         if (peek.open && peek.key === key) { peek.open = false; return }
         if (palette.open) palette.hide()
         settings.open = false; modelPanel.open = false; nav.open = false
+        if (peek.open) { peekSwitch.key = key; peekSwitch.cardY = cardY; peek.open = false; peekSwitch.start(); return }
         peek.key = key; peek.cardY = cardY; peek.open = true
+    }
+    Timer {
+        id: peekSwitch
+        property string key: ""
+        property real cardY: 0
+        interval: Theme.panelOut
+        onTriggered: { peek.key = key; peek.cardY = cardY; peek.open = true }
     }
     function toggleSettings() { var next = !settings.open; closeContexts(); settings.open = next }
     function toggleModel() { var next = !modelPanel.open; closeContexts(); modelPanel.open = next }
     function toggleNav() { var next = !nav.open; closeContexts(); nav.open = next }
     onHomePageChanged: closeContexts()
-    onPresentationChanged: { nav.open = false; modelPanel.open = false; peek.open = false }
+    onPresentationChanged: { nav.open = false; modelPanel.open = false; closePeek() }
 
     Component.onCompleted: {
         Theme.name = bridge.theme
@@ -76,7 +103,7 @@ Window {
     }
     Connections {
         target: bridge
-        function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects; if (bridge.editMode) peek.open = false }
+        function onPrefsChanged() { Theme.name = bridge.theme; Theme.ambient = bridge.ambientEffects; if (bridge.editMode) root.closePeek() }
         function onApprovalChanged() { if (bridge.approvalPending) { root.closeContexts(); bridge.setPage("home") } }
         // From the tray: the same confirmations the window uses.
         function onResumeConfirmRequested() { root.closeContexts(); resumeConfirm.open = true }
@@ -309,7 +336,7 @@ Window {
         y: Math.round(root.height * 0.1980) + 76
         width: Theme.railWidth(root.width) - x - 10
         height: root.height - y - 64
-        activeKey: peek.open ? peek.key : ""
+        activeKey: peekSwitch.running ? peekSwitch.key : peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
         onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
     }
@@ -331,7 +358,7 @@ Window {
         fillMode: Image.Stretch
         enabled: false
         Rectangle { anchors { right: parent.right; top: parent.top; margins: 8 } width: devLabel.width + 16; height: 22; radius: 6; color: "#c0000000"
-            Text { id: devLabel; anchors.centerIn: parent; text: qsTr("DEV REFERENCE OVERLAY %1 %").arg(Math.round(devReference.opacity * 100)); color: "#ff8080"; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.5; weight: Font.DemiBold } } }
+            Text { id: devLabel; anchors.centerIn: parent; text: qsTr("DEV REFERENCE OVERLAY %1 %").arg(Math.round(devReference.opacity * 100)); color: "#ff8080"; font: Theme.label } }
     }
     Shortcut { sequence: "Ctrl+Shift+R"; enabled: bridge.devReference !== ""; onActivated: devReference.opacity = devReference.opacity === 0 ? 0.5 : (devReference.opacity === 0.5 ? 1 : 0) }
     Shortcut { sequence: "Ctrl+Shift+A"; enabled: bridge.devFixture && !bridge.approvalPending; onActivated: { root.closeContexts(); root.devApprovalVisible = !root.devApprovalVisible
@@ -365,7 +392,7 @@ Window {
         width: auditionText.width + 24; height: 26; radius: 6; color: "#d0000812"; border.width: 1; border.color: "#ff8080"
         Text { id: auditionText; anchors.centerIn: parent; color: "#ff8080"
             text: "DEV · " + (root.auditionIndex === 0 ? qsTr("CURRENT BACKGROUND") : qsTr("BACKGROUND %1 / %2").arg(root.auditionIndex).arg(bridge.devBackgroundCandidates.length))
-            font { family: Theme.font; pixelSize: 11; letterSpacing: 1.5; weight: Font.DemiBold } }
+            font: Theme.label }
         SequentialAnimation { id: auditionFade; PauseAnimation { duration: 900 } NumberAnimation { target: auditionLabel; property: "opacity"; to: 0; duration: 250 } }
     }
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
@@ -379,7 +406,7 @@ Window {
         else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
         else if (layoutMenus.open) layoutMenus.close()
-        else if (peek.open) peek.open = false
+        else if (peek.open || peekSwitch.running) root.closePeek()
         else if (!root.homePage && pageLoader.item) pageLoader.item.closePage()
         else if (bridge.editMode) bridge.setEditMode(false) } }
 }

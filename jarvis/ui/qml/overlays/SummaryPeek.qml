@@ -50,13 +50,16 @@ ContextPanel {
         case "Tasks": {
             var rows = []
             if (bridge.taskLive)
-                rows.push({ title: bridge.task.capability || qsTr("Current request"),
+                rows.push({ title: bridge.task.title || bridge.task.capability || qsTr("Current request"),
+                            id: bridge.task.task_id || "", named: bridge.task.title || "",
                             sub: bridge.task.stage ? qsTr("Stage: %1").arg(bridge.task.stage) : (bridge.task.connector || qsTr("Live task")),
                             pill: r.statusWord(bridge.task.status) || qsTr("Running"), meta: qsTr("Now"),
                             dot: bridge.coreState === "awaiting_approval" ? "warn" : (bridge.coreState === "error" || bridge.coreState === "unknown") ? "alert" : "live" })
             bridge.sessions.forEach(function(s) {
-                rows.push({ title: (s.task_count || 0) === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(s.task_count || 0),
-                            sub: s.session_id, pill: s.active_task_id ? qsTr("Active task") : "",
+                // A session is shown by its name; its id stays underneath.
+                var count = (s.task_count || 0) === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(s.task_count || 0)
+                rows.push({ title: s.title || count, sub: s.title ? count : qsTr("Untitled session"),
+                            id: s.session_id, named: s.title || "", pill: s.active_task_id ? qsTr("Active task") : "",
                             meta: peek.shortDate(s.updated_at), dot: s.active_task_id ? "live" : "quiet" })
             })
             return { title: qsTr("Tasks"), subtitle: qsTr("The live task and recorded sessions"), icon: "tasks", tone: "#1b7fe0",
@@ -98,6 +101,8 @@ ContextPanel {
         return null
     }
 
+    RenameMenu { id: renameMenu }
+
     header: Component {
         Row {
             spacing: 13
@@ -109,8 +114,8 @@ ContextPanel {
             Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 2
-                Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 24; weight: Font.DemiBold } }
-                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#a9bfdc"; font { family: Theme.font; pixelSize: 14 } }
+                Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font: Theme.titleLarge }
+                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#a9bfdc"; font: Theme.body }
             }
         }
     }
@@ -139,11 +144,11 @@ ContextPanel {
                     Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: Theme.alpha(Theme.materialGlint, 0.35) }
                     Column {
                         x: 16; anchors.verticalCenter: parent.verticalCenter; spacing: -1
-                        Text { text: modelData.value; color: modelData.tone; font { family: Theme.font; pixelSize: 34; weight: Font.DemiBold } }
+                        Text { text: modelData.value; color: modelData.tone; font: Theme.figure(34) }
                         Row {
                             spacing: 7
                             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 7; height: 7; radius: 3.5; color: modelData.tone; opacity: 0.9 }
-                            Text { width: tile.width - 46; elide: Text.ElideRight; text: modelData.label; color: "#b3c7e0"; font { family: Theme.font; pixelSize: 13 } }
+                            Text { width: tile.width - 46; elide: Text.ElideRight; text: modelData.label; color: "#b3c7e0"; font: Theme.caption }
                         }
                     }
                 }
@@ -164,8 +169,12 @@ ContextPanel {
                 Repeater {
                     model: peek.rows
                     Item {
+                        id: peekRow
                         objectName: "summaryPeekRow"
                         width: parent.width; height: peek.rowHeight
+                        // Right-click a task or a session: Rename.
+                        TapHandler { acceptedButtons: Qt.RightButton; enabled: !!modelData.id
+                                     onTapped: function(point) { renameMenu.openFor(peekRow, point.position, modelData.id, modelData.named) } }
                         readonly property color tone: modelData.dot === "alert" ? Theme.danger : modelData.dot === "warn" ? Theme.warning
                                                      : modelData.dot === "live" ? Theme.accent : Theme.textDim
                         Rectangle { visible: index > 0; width: parent.width; height: 1; color: Theme.alpha(Theme.accent, 0.14) }
@@ -174,8 +183,8 @@ ContextPanel {
                             x: 22; anchors.verticalCenter: parent.verticalCenter
                             width: parent.width - x - (pill.visible ? pill.width + 10 : 0) - (meta.visible ? meta.width + 12 : 0)
                             spacing: 2
-                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: "#eef6fc"; font { family: Theme.font; pixelSize: 15 } }
-                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.sub; color: Theme.textMuted; font { family: Theme.font; pixelSize: 11 } }
+                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: "#eef6fc"; font: Theme.lead }
+                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.sub; color: Theme.textMuted; font: Theme.caption }
                         }
                         Rectangle {
                             id: pill
@@ -186,14 +195,14 @@ ContextPanel {
                             border.width: 1; border.color: Theme.alpha(parent.tone, modelData.dot === "quiet" ? 0.25 : 0.42)
                             Text { id: pillText; anchors.centerIn: parent; text: modelData.pill
                                    color: modelData.dot === "quiet" ? Theme.textLabel : Qt.lighter(parent.parent.tone, 1.25)
-                                   font { family: Theme.font; pixelSize: 11 } }
+                                   font: Theme.caption }
                         }
                         Text {
                             id: meta
                             visible: modelData.meta !== ""
                             anchors { right: parent.right; rightMargin: 2; verticalCenter: parent.verticalCenter }
                             text: modelData.meta; color: Theme.textLabel
-                            font { family: Theme.font; pixelSize: 12 }
+                            font: Theme.caption
                         }
                     }
                 }
@@ -217,9 +226,9 @@ ContextPanel {
                     SummaryIcon { anchors.centerIn: parent; icon: peek.spec ? peek.spec.icon : "tasks"; tint: Theme.accent; scale: 0.85 }
                 }
                 Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: peek.spec ? peek.spec.empty : ""
-                       color: Theme.text; font { family: Theme.font; pixelSize: 14 } }
+                       color: Theme.text; font: Theme.body }
                 Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: peek.spec ? peek.spec.emptyNote : ""
-                       color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                       color: Theme.textMuted; font: Theme.caption }
             }
         }
 
@@ -255,8 +264,8 @@ ContextPanel {
             Column {
                 x: 48; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                 width: parent.width - 48 - 36
-                Text { text: peek.spec ? peek.spec.action.label : ""; color: "#fafeff"; font { family: Theme.font; pixelSize: 15; weight: Font.DemiBold } }
-                Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+                Text { text: peek.spec ? peek.spec.action.label : ""; color: "#fafeff"; font: Theme.subtitle }
+                Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font: Theme.caption }
             }
             Text { anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
                    text: "›"; color: Theme.accent; font.pixelSize: 22 }

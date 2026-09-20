@@ -20,21 +20,32 @@ Item {
     height: implicitHeight
     Behavior on height { NumberAnimation { duration: Theme.hoverMs; easing.type: Easing.OutCubic } }
     clip: true
+    // The keyboard opens and closes it like the pointer does.
+    activeFocusOnTab: enabled
+    Accessible.role: Accessible.Button
+    Accessible.name: title
+    Keys.onReturnPressed: if (enabled) open = !open
+    Keys.onSpacePressed: if (enabled) open = !open
 
     Rectangle {
         id: head
         width: parent.width; height: 52; radius: Theme.radiusSmall
         opacity: field.enabled ? 1 : 0.55
+        // Idle: a nested control, one small tonal step from the panel. Hover
+        // lifts the fill a step; open marks the edge as well.
         color: hit.containsMouse && field.enabled ? Theme.alpha(Theme.commandEdge, 0.08)
-               : field.open ? Theme.alpha(Theme.commandEdge, 0.05) : "transparent"
+               : field.open ? Theme.alpha(Theme.commandEdge, 0.05) : Theme.glassNested
         border.width: 1
-        border.color: field.open ? Theme.alpha(Theme.commandEdge, 0.42) : Theme.alpha(Theme.text, 0.08)
+        border.color: field.open ? Theme.alpha(Theme.commandEdge, 0.42) : Theme.glassNestedEdge
+        // Keyboard focus: a crisp 2 px outline inside the head (the field clips).
+        Rectangle { anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"
+                    border.width: 2; border.color: Theme.materialGlint; visible: field.activeFocus }
         Column {
             x: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 42; spacing: 1
-            Text { objectName: "collapsedTitle"; width: parent.width; elide: Text.ElideRight
-                   text: field.title; color: "#e8f4ff"; font { family: Theme.font; pixelSize: 16; weight: Font.DemiBold } }
-            Text { objectName: "collapsedMeta"; visible: field.meta !== ""; width: parent.width; elide: Text.ElideRight
-                   text: field.meta; color: Theme.textMuted; font { family: Theme.font; pixelSize: 12 } }
+            Text { objectName: "collapsedTitle"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight
+                   text: field.title; color: "#e8f4ff"; font: Theme.subtitle }
+            Text { objectName: "collapsedMeta"; renderType: Theme.textRender; visible: field.meta !== ""; width: parent.width; elide: Text.ElideRight
+                   text: field.meta; color: Theme.textMuted; font: Theme.caption }
         }
         // The 10 px chevron, reversed when the choices are showing.
         Canvas {

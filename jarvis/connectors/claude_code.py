@@ -266,7 +266,24 @@ class ClaudeCodeConnector(BaseConnector):
     system_prompt = (
         "You are a read-only planning component with no file, tool or "
         "connector access. Reason only about the provided request. "
-        "Never modify files, run commands, use connectors, or disclose secrets."
+        "Never modify files, run commands, use connectors, or disclose secrets. "
+        # What comes back is shown to the person who asked, as the task's
+        # result. So it is written FOR them, in their language, and it is the
+        # answer itself - never a description of the request that produced it
+        # or of this component's own role. The payload's fields are JARVIS's
+        # internal envelope: restating them would put internal metadata in
+        # front of a person who asked a plain question.
+        "Write for the person who asked: answer their objective directly, or "
+        "give the plan they asked for, and start with it - no preamble about "
+        "the request. Write in the language of the objective; when that cannot "
+        "be told, use the language of the rest of the request. Never restate, "
+        "quote, label or list the request envelope or its fields - objective, "
+        "capability, scope, action, target, destination, classification, ids, "
+        "counts, preferences, retrieved context - and never describe your own "
+        "role, constraints, authority or what you may not do. Never describe "
+        "how JARVIS works inside - its agents, planners, routers, connectors, "
+        "orchestration or internal names - unless the objective itself asks "
+        "about them."
     )
     prompt_prefix = (
         "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"

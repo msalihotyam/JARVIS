@@ -25,7 +25,7 @@ Item {
             Repeater { model: [{label:qsTr("Home"),page:"home",glyph:"⌂"},{label:qsTr("Tasks"),page:"tasks",glyph:"◇"},{label:qsTr("Automations"),page:"automations",glyph:"⟳"},{label:qsTr("Memory"),page:"memory",glyph:"▤"},{label:qsTr("History"),page:"history",glyph:"◷"}]
                 Rectangle { width: parent.width; height: 43; radius: 5; color: bridge.page === modelData.page ? Theme.alpha(Theme.accent, 0.10) : "transparent"
                     Text { x: cockpit.wide ? 10 : 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.glyph; color: Theme.accent; font.pixelSize: 21 }
-                    Text { visible: cockpit.wide; x: 43; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.textLabel; font { family: Theme.font; pixelSize: 13 } }
+                    Text { visible: cockpit.wide; x: 43; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.textLabel; font: Theme.caption }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setPage(modelData.page) }
                 }
             }
@@ -38,14 +38,14 @@ Item {
         height: cockpit.height - composer.height - 20 - (cockpit.dockHeight ? cockpit.dockHeight + 18 : 0)
         Column {
             id: greeting; width: parent.width; spacing: 5
-            Text { text: (new Date().getHours() < 12 ? qsTr("Good morning, %1.") : new Date().getHours() < 18 ? qsTr("Good afternoon, %1.") : qsTr("Good evening, %1.")).arg(bridge.operatorName); color: Theme.text; font { family: Theme.font; pixelSize: 29; weight: Font.DemiBold } }
-            Text { text: qsTr("Here to help you think, plan, and get things done."); color: Theme.textLabel; font { family: Theme.font; pixelSize: 15 } }
+            Text { text: (new Date().getHours() < 12 ? qsTr("Good morning, %1.") : new Date().getHours() < 18 ? qsTr("Good afternoon, %1.") : qsTr("Good evening, %1.")).arg(bridge.operatorName); color: Theme.text; font: Theme.face(29, true) }
+            Text { text: qsTr("Here to help you think, plan, and get things done."); color: Theme.textLabel; font: Theme.lead }
         }
         Item {
             id: conversation
             anchors { left: parent.left; top: greeting.bottom; bottom: parent.bottom; topMargin: 25 }
             width: cockpit.showBay ? parent.width * 0.53 - 20 : parent.width
-            Text { visible: bridge.feed.length === 0; width: parent.width; wrapMode: Text.Wrap; text: qsTr("Waiting for your request. The model proposes; you remain in control of each authorized action."); color: Theme.textLabel; font { family: Theme.font; pixelSize: 15 } }
+            Text { visible: bridge.feed.length === 0; width: parent.width; wrapMode: Text.Wrap; text: qsTr("Waiting for your request. The model proposes; you remain in control of each authorized action."); color: Theme.textLabel; font: Theme.lead }
             FeedView { anchors.fill: parent; visible: bridge.feed.length > 0 }
             Flow { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } spacing: 8
                 Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
@@ -61,8 +61,8 @@ Item {
             GlassPanel { anchors.fill: parent; visible: !bridge.approvalPending && !cockpit.fixtureApproval; title: qsTr("Authorization gate"); brackets: true; border.color: Theme.borderStrong
                 Column { anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter } spacing: 22
                     IconBox { width: 58; height: 58; anchors.horizontalCenter: parent.horizontalCenter; glyph: "◇"; tint: Theme.accent }
-                    Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: qsTr("No action awaiting approval"); color: Theme.text; font { family: Theme.font; pixelSize: 18; weight: Font.DemiBold } }
-                    Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: qsTr("When an action needs permission, its exact scope, destination and outbound preview appear here. Nothing is pre-authorized by this panel."); color: Theme.textMuted; font { family: Theme.font; pixelSize: 13 } }
+                    Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: qsTr("No action awaiting approval"); color: Theme.text; font: Theme.title }
+                    Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: qsTr("When an action needs permission, its exact scope, destination and outbound preview appear here. Nothing is pre-authorized by this panel."); color: Theme.textMuted; font: Theme.caption }
                     Pill { anchors.horizontalCenter: parent.horizontalCenter; text: qsTr("Standing by"); tint: Theme.accent }
                 }
             }
@@ -105,7 +105,7 @@ Item {
                         Rectangle { anchors.centerIn: parent; width: 65; height: 65; radius: 32.5; color: "transparent"; border.width: 6; border.color: Theme.alpha(Theme.accent, 0.3) }
                         Column { anchors.centerIn: parent; spacing: 1
                             Text { anchors.horizontalCenter: parent.horizontalCenter; text: ((bridge.telemetry || {})[modelData.key] || 0) + "%"; color: Theme.text; font.pixelSize: 18 }
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: Theme.textMuted; font { family: Theme.font; pixelSize: 10 } }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.label; color: Theme.textMuted; font: Theme.caption }
                         }
                     }
                 }
@@ -118,8 +118,8 @@ Item {
                     Row { width: parent.width; spacing: 8
                         IconBox { width: 25; height: 25; glyph: "◇"; tint: Theme.textMuted }
                         Column { spacing: 1
-                            Text { text: modelData; color: Theme.textLabel; font { family: Theme.font; pixelSize: 11 } }
-                            Text { text: qsTr("Unavailable in this build"); color: Theme.textDim; font { family: Theme.font; pixelSize: 10 } }
+                            Text { text: modelData; color: Theme.textLabel; font: Theme.caption }
+                            Text { text: qsTr("Unavailable in this build"); color: Theme.textDim; font: Theme.caption }
                         }
                     }
                 }
@@ -130,7 +130,7 @@ Item {
             ListView { anchors.fill: parent; clip: true; model: bridge.activity
                 delegate: Item { width: ListView.view.width; height: 31
                     Rectangle { width: 5; height: 5; radius: 2.5; y: 10; color: modelData.kind === "approval" ? Theme.warning : Theme.accent }
-                    Text { x: 14; width: parent.width - 16; y: 3; text: modelData.text; elide: Text.ElideRight; color: Theme.textLabel; font { family: Theme.font; pixelSize: 11 } }
+                    Text { x: 14; width: parent.width - 16; y: 3; text: modelData.text; elide: Text.ElideRight; color: Theme.textLabel; font: Theme.caption }
                     Rectangle { y: 30; width: parent.width; height: 1; color: Theme.border }
                 }
             }

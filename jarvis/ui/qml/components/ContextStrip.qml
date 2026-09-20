@@ -32,21 +32,22 @@ Item {
         Row {
             objectName: "responseModeRow"
             visible: strip.groups.length > 1
-            height: visible ? 24 : 0
+            height: visible ? 26 : 0
             spacing: 8
             Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Answer"); color: Theme.textMuted
-                   font: Qt.font({ family: Theme.font, pixelSize: 11 }) }
+                   font: Theme.caption }
             Repeater {
                 model: [{ id: "together", label: qsTr("Evaluate together") },
                         { id: "separate", label: qsTr("Reply to each group separately") }]
                 Rectangle {
                     objectName: "responseMode_" + modelData.id
                     readonly property bool on: bridge.responseMode === modelData.id
-                    width: label.width + 18; height: 24; radius: Theme.radiusSmall
+                    width: label.width + 20; height: 26; radius: Theme.radiusSmall
+                    // Selected: the stable fill and edge; hover: a small tonal lift, no glow.
                     color: on ? Theme.alpha(Theme.accent, 0.16) : modeArea.containsMouse ? Theme.alpha(Theme.text, 0.06) : "transparent"
                     border.width: 1; border.color: on ? Theme.alpha(Theme.accent, 0.5) : Theme.border
                     Text { id: label; anchors.centerIn: parent; text: modelData.label; color: Theme.text
-                           font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
+                           font: on ? Theme.captionStrong : Theme.caption }
                     MouseArea { id: modeArea; anchors.fill: parent; hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor; onClicked: bridge.setResponseMode(modelData.id) }
                 }
@@ -68,49 +69,53 @@ Item {
                 // itself (and its note editor) stays.
                 readonly property var files: { bridge.attachmentRevision; return bridge.groupAttachments(card.groupId) }
                 width: strip.width
-                height: head.height + (noteBox.visible ? noteBox.height + 6 : 0) + (fileRow.visible ? fileRow.height + 6 : 0) + 12
-                radius: 8
-                color: Theme.alpha(Theme.text, 0.035)
-                border.width: 1; border.color: Theme.border
+                height: head.height + (noteBox.visible ? noteBox.height + 6 : 0) + (fileRow.visible ? fileRow.height + 6 : 0) + 14
+                radius: 10
+                // One quiet boundary per group; the letter is the strongest mark in it.
+                color: Theme.alpha(Theme.text, 0.04)
+                border.width: 1; border.color: Theme.alpha("#278dce", 0.24)
 
                 Item {
                     id: head
-                    x: 10; y: 6; width: parent.width - 20; height: 32
-                    // The group's letter: the name it is answered under.
+                    x: 12; y: 8; width: parent.width - 24; height: 36
+                    // The group's letter: the name it is answered under - the clearest,
+                    // most compact ownership marker on the card.
                     Rectangle {
                         id: badge
                         objectName: "contextGroupLabel_" + card.groupId
                         property string letter: modelData.label
-                        width: 20; height: 20; radius: 10; y: 6
-                        color: Theme.alpha("#36aaff", 0.14); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.45)
+                        width: 22; height: 22; radius: 11; y: 7
+                        color: Theme.alpha("#36aaff", 0.2); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.6)
                         Text { anchors.centerIn: parent; text: modelData.label; color: Theme.text
-                               font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
+                               font: Theme.captionStrong }
                     }
                     Text {
                         objectName: "contextGroupTag_" + card.groupId
-                        x: badge.width + 9; y: 0
+                        x: badge.width + 10; y: 0
                         text: (card.ref.source_role === "user" ? qsTr("You") : "JARVIS")
                               + " · " + (card.ref.selection === "partial" ? qsTr("selection") : qsTr("whole message"))
                         color: Theme.materialBlue; elide: Text.ElideRight
                         width: Math.min(implicitWidth, parent.width - 200)
-                        font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 1 })
+                        font: Theme.captionStrong
                     }
+                    // The quoted words themselves: readable, secondary only to the letter.
                     Text {
                         objectName: "contextGroupText_" + card.groupId
-                        x: badge.width + 9; y: 15; width: parent.width - x - 150; elide: Text.ElideRight
+                        renderType: Theme.textRender
+                        x: badge.width + 10; y: 17; width: parent.width - x - 150; elide: Text.ElideRight
                         text: String(card.ref.text || "").replace(/\s+/g, " ")
-                        color: Theme.textLabel
-                        font: Qt.font({ family: Theme.font, pixelSize: 12 })
+                        color: Theme.text; opacity: 0.92
+                        font: Theme.caption
                     }
                     Row {
-                        anchors.right: parent.right; y: 2
+                        anchors.right: parent.right; y: 1
                         spacing: 14
                         // A note for THIS group: offered compactly, opened only when wanted.
                         Text {
                             objectName: "contextGroupNoteToggle_" + card.groupId
                             text: card.noted ? qsTr("Note") : qsTr("+ Note")
                             color: noteArea.containsMouse ? Theme.accent : Theme.textMuted
-                            font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                            font: Theme.caption
                             MouseArea { id: noteArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
                                         onClicked: { noteBox.open = !noteBox.open; if (noteBox.open) noteInput.forceActiveFocus() } }
@@ -121,7 +126,7 @@ Item {
                             objectName: "contextGroupAttach_" + card.groupId
                             text: qsTr("+ File")
                             color: attachArea.containsMouse || groupMenu.visible ? Theme.accent : Theme.textMuted
-                            font: Qt.font({ family: Theme.font, pixelSize: 11 })
+                            font: Theme.caption
                             Accessible.role: Accessible.Button
                             Accessible.name: qsTr("Attach a file or an image to this group")
                             MouseArea { id: attachArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
@@ -131,15 +136,19 @@ Item {
                                 objectName: "contextGroupMenu_" + card.groupId
                                 property bool attachable: false
                                 onAboutToShow: attachable = bridge.clipboardAttachable()
-                                padding: 5
-                                background: Rectangle { implicitWidth: 210; radius: 8; color: Theme.alpha("#061424", 0.9)
-                                                        border.width: 1; border.color: Theme.glassEdge }
+                                padding: 6
+                                // The same foreground material and row grammar as the edit menu.
+                                background: Rectangle { implicitWidth: 220; radius: 8; color: Theme.glassOverlay
+                                                        border.width: 1; border.color: Theme.glassOverlayEdge
+                                                        Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 3; anchors.leftMargin: 1; anchors.rightMargin: -1
+                                                                    anchors.bottomMargin: -3; radius: parent.radius + 1; color: "#000000"; opacity: 0.3 } }
                                 component GroupItem: MenuItem {
                                     id: gi
-                                    implicitHeight: 30; leftPadding: 12; rightPadding: 12
+                                    implicitHeight: 34; leftPadding: 12; rightPadding: 12
                                     contentItem: Text { text: gi.text; color: gi.enabled ? Theme.text : Theme.textDim
-                                                        font: Qt.font({ family: Theme.font, pixelSize: 13 }); verticalAlignment: Text.AlignVCenter }
-                                    background: Rectangle { radius: 5; color: gi.highlighted && gi.enabled ? Theme.alpha("#36aaff", 0.16) : "transparent" }
+                                                        font: Theme.body; verticalAlignment: Text.AlignVCenter }
+                                    background: Rectangle { radius: 6; color: gi.highlighted && gi.enabled ? Theme.alpha("#36aaff", 0.12) : "transparent"
+                                                            border.width: gi.highlighted && gi.enabled ? 1 : 0; border.color: Theme.alpha("#49bdfa", 0.4) }
                                 }
                                 GroupItem { objectName: "groupAddFile_" + card.groupId; text: qsTr("Add file")
                                             onTriggered: strip.pickRequested("file", card.groupId) }
@@ -153,7 +162,7 @@ Item {
                         Text {
                             objectName: "contextGroupRemove_" + card.groupId
                             text: "✕"; color: removeArea.containsMouse ? Theme.danger : Theme.textMuted
-                            font: Qt.font({ family: Theme.font, pixelSize: 13 })
+                            font: Theme.caption
                             Accessible.role: Accessible.Button
                             Accessible.name: qsTr("Remove this group")
                             MouseArea { id: removeArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true
@@ -165,23 +174,24 @@ Item {
                     id: noteBox
                     property bool open: false
                     visible: open || card.noteText !== ""
-                    x: 39; y: head.y + head.height + 6
-                    width: parent.width - 49; height: 30
+                    x: 44; y: head.y + head.height + 6
+                    width: parent.width - 56; height: 32
                     TextField {
                         id: noteInput
                         objectName: "contextGroupNote_" + card.groupId
-                        width: parent.width; height: 30; leftPadding: 10; rightPadding: 10
+                        width: parent.width; height: 32; leftPadding: 10; rightPadding: 10
                         // Set once, never bound: a binding would rewrite the field (and
                         // move the caret) whenever the draft changed.
                         Component.onCompleted: text = card.noteText
                         placeholderText: qsTr("What should JARVIS do with this part?")
                         placeholderTextColor: Theme.textDim; color: Theme.text
-                        selectByMouse: true; font { family: Theme.font; pixelSize: 12 }
+                        selectByMouse: true; font: Theme.caption
                         // Each keystroke reaches the draft at once, addressed by the group's
                         // stable id, so sending mid-typing carries the latest text.
                         onTextChanged: { card.noteText = text; bridge.setGroupNote(card.groupId, text) }
                         // An ordinary text editor: its Paste is text only, never an attachment.
-                        ContextMenu.menu: noteMenu
+                        TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { noteMenu.openAt(noteInput, point.position) } }
+                        Keys.onMenuPressed: noteMenu.openAt(noteInput, Qt.point(cursorRectangle.x, cursorRectangle.y + cursorRectangle.height))
                         background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                                 border.color: noteInput.activeFocus ? Theme.commandEdge : Theme.border }
                     }
@@ -193,11 +203,11 @@ Item {
                     id: fileRow
                     objectName: "contextGroupFiles_" + card.groupId
                     visible: card.files.length > 0
-                    x: 39; y: (noteBox.visible ? noteBox.y + noteBox.height : head.y + head.height) + 6
-                    width: parent.width - 49
+                    x: 44; y: (noteBox.visible ? noteBox.y + noteBox.height : head.y + head.height) + 6
+                    width: parent.width - 56
                     spacing: 6
                     Repeater { model: card.files
-                               AttachmentCard { file: modelData; removable: true; compact: true; onOpened: bridge.previewAttachment(modelData) } }
+                               AttachmentCard { file: modelData; removable: true; compact: true; nested: true; onOpened: bridge.previewAttachment(modelData) } }
                 }
             }
         }
@@ -209,7 +219,7 @@ Item {
             width: parent.width
             spacing: 4
             Text { visible: strip.groups.length > 0; text: qsTr("Attached to the message"); color: Theme.textMuted
-                   font: Qt.font({ family: Theme.font, pixelSize: 11 }) }
+                   font: Theme.caption }
             Flow {
                 width: parent.width; spacing: 6
                 Repeater { model: strip.globals

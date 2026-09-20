@@ -292,7 +292,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <name>Bridge</name>
     <message>
         <source>JARVIS frozen</source>
-        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing).</extracomment>
         <translation>JARVIS donduruldu</translation>
     </message>
     <message>
@@ -302,6 +301,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>OUTCOME UNKNOWN for task %1</source>
         <translation>%1 görevinin SONUCU BİLİNMİYOR</translation>
+    </message>
+    <message>
+        <source>Task %1 ended without achieving what was asked</source>
+        <translation>%1 görevi, istenen sonuca ulaşmadan sona erdi</translation>
+    </message>
+    <message>
+        <source>Task %1 completed</source>
+        <translation>%1 görevi tamamlandı</translation>
     </message>
     <message>
         <source>Task %1 %2</source>
@@ -451,6 +458,15 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Freeze requested</source>
         <translation>Dondurma istendi</translation>
+    </message>
+    <message>
+        <source>The saved conversation could not be read, so JARVIS started a new one and remembers nothing from it: %1</source>
+        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing). The token fields a provider reports that together are what one call used. Claude counts cache reads and writes apart from ``input_tokens``; Codex counts its cached input INSIDE ``input_tokens`` and its reasoning INSIDE ``output_tokens``, so those two are never added again.</extracomment>
+        <translation>Kayıtlı konuşma okunamadı; JARVIS yeni bir konuşma başlattı ve ondan hiçbir şey hatırlamıyor: %1</translation>
+    </message>
+    <message>
+        <source>Continuing the previous conversation (%1 turns)</source>
+        <translation>Önceki konuşma sürdürülüyor (%1 tur)</translation>
     </message>
     <message>
         <source>JARVIS resumed</source>
@@ -1016,12 +1032,56 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <source>Select All</source>
         <translation>Tümünü Seç</translation>
     </message>
+    <message>
+        <source>Copied</source>
+        <translation>Kopyalandı</translation>
+    </message>
 </context>
 <context>
     <name>FeedView</name>
     <message>
+        <source>%1 s</source>
+        <translation>%1 sn</translation>
+    </message>
+    <message>
+        <source>%1 min %2 s</source>
+        <translation>%1 dk %2 sn</translation>
+    </message>
+    <message>
+        <source>Thinking %1</source>
+        <translation>Düşünme %1</translation>
+    </message>
+    <message>
+        <source>First response %1</source>
+        <translation>İlk yanıt %1</translation>
+    </message>
+    <message>
+        <source>%1 tokens</source>
+        <translation>%1 token</translation>
+    </message>
+    <message>
+        <source>%1K tokens</source>
+        <translation>%1K token</translation>
+    </message>
+    <message>
+        <source>%1 (%2 cached)</source>
+        <translation>%1 (%2 önbellek)</translation>
+    </message>
+    <message>
+        <source>Writing the answer</source>
+        <translation>Yanıt yazılıyor</translation>
+    </message>
+    <message>
+        <source>Executing</source>
+        <translation>Yürütülüyor</translation>
+    </message>
+    <message>
         <source>You</source>
         <translation>Siz</translation>
+    </message>
+    <message>
+        <source>TASK RESULT</source>
+        <translation>GÖREV SONUCU</translation>
     </message>
     <message>
         <source>ERROR</source>
@@ -1110,16 +1170,16 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>KALICI OTURUMLAR (son %1)</translation>
     </message>
     <message>
+        <source>Untitled session</source>
+        <translation>Adsız oturum</translation>
+    </message>
+    <message>
         <source>%1 tasks</source>
         <translation>%1 görev</translation>
     </message>
     <message>
-        <source>active: %1</source>
-        <translation>aktif: %1</translation>
-    </message>
-    <message>
-        <source>none</source>
-        <translation>yok</translation>
+        <source>a task is active</source>
+        <translation>bir görev etkin</translation>
     </message>
     <message>
         <source>UNREADABLE</source>
@@ -1368,6 +1428,12 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <source>Weather
 unavailable</source>
         <translation>Hava durumu
+yok</translation>
+    </message>
+    <message>
+        <source>No
+weather</source>
+        <translation>Hava
 yok</translation>
     </message>
 </context>
@@ -2095,6 +2161,10 @@ yok</translation>
         <translation>Arayüz</translation>
     </message>
     <message>
+        <source>Objective not met</source>
+        <translation>Hedefe ulaşılamadı</translation>
+    </message>
+    <message>
         <source>Nothing yet</source>
         <translation>Henüz bir şey yok</translation>
     </message>
@@ -2216,6 +2286,42 @@ yok</translation>
         <translation>Arka uç yanıtı okunamadı. SONUCU BİLİNMİYOR - bir şeyin olduğu ya da olmadığı varsayılmaz. Tekrar yapmadan önce Geçmiş&apos;i kontrol edin.</translation>
     </message>
     <message>
+        <source>This request needs a capability this installation does not offer. Nothing was done.</source>
+        <extracomment>JARVIS&apos;s own verdict sentences from the understanding boundary (they are written in ``jarvis.intent`` / ``jarvis.app``, which have no Qt and so cannot translate). The exact sentence is the key; a sentence carrying a name or an id keeps that part as an argument, never translated. Anything not listed is shown exactly as the backend wrote it.</extracomment>
+        <translation>Bu istek, bu kurulumun sunmadığı bir yetkinlik gerektiriyor. Hiçbir şey yapılmadı.</translation>
+    </message>
+    <message>
+        <source>JARVIS is frozen, so the request was understood but not started: no task or job was created and nothing was queued. Resume JARVIS and send it again to run it.</source>
+        <translation>JARVIS donduruldu; istek anlaşıldı ama başlatılmadı: görev veya iş oluşturulmadı, kuyruğa hiçbir şey alınmadı. JARVIS&apos;i sürdürüp isteği yeniden gönderin.</translation>
+    </message>
+    <message>
+        <source>&apos;%1&apos; is not an authorized destination for &apos;%2&apos;. Nothing was done.%3</source>
+        <extracomment>The same, for a verdict that names something: ``(prefix, suffix)`` around the quoted name, so the name itself is never rewritten.</extracomment>
+        <translation>&apos;%1&apos;, &apos;%2&apos; için yetkili bir hedef değil. Hiçbir şey yapılmadı.%3</translation>
+    </message>
+    <message>
+        <source>The objective and the redacted task context will leave this computer.</source>
+        <extracomment>What a connector&apos;s own outbound-preview summary says, in JARVIS&apos;s words. The connectors state it in English for the approval record; the card is read by a person, so the known ones are shown in the interface language. An unknown summary is shown exactly as the connector wrote it.</extracomment>
+        <translation>Amaç ve gizlenmiş görev bağlamı bu bilgisayardan çıkacak.</translation>
+    </message>
+    <message>
+        <source>A read-only listing request. No message content leaves this computer.</source>
+        <translation>Salt okunur bir listeleme isteği. Mesaj içeriği bu bilgisayardan çıkmıyor.</translation>
+    </message>
+    <message>
+        <source>A read-only request. No content leaves this computer.</source>
+        <translation>Salt okunur bir istek. Hiçbir içerik bu bilgisayardan çıkmıyor.</translation>
+    </message>
+    <message>
+        <source>A read-only page read. No content leaves this computer.</source>
+        <translation>Salt okunur bir sayfa okuma. Hiçbir içerik bu bilgisayardan çıkmıyor.</translation>
+    </message>
+    <message>
+        <source>The connector &apos;%1&apos; will carry out exactly this scoped action.</source>
+        <extracomment>Why an approval is being asked for, in JARVIS&apos;s words. Core writes the sentence in English and BINDS IT into the approval fingerprint, so it is never rewritten there - only the reading of it is. The connector name is an argument and stays exactly as Core wrote it; any other reason (a handoff digest, a cost gate) is shown exactly as it came.</extracomment>
+        <translation>&apos;%1&apos; bağlayıcısı yalnızca burada tanımlanan işlemi yürütecek.</translation>
+    </message>
+    <message>
         <source>From: %1
 To: %2
 Date: %3
@@ -2285,6 +2391,11 @@ Hiçbir şey yürütülmedi.</translation>
 Check the task in History before trying again.</source>
         <translation>BAŞARISIZ [%1]: %2
 Tekrar denemeden önce görevi Geçmiş&apos;te kontrol edin.</translation>
+    </message>
+    <message>
+        <source>I have not inspected the project yet. An inspection needs read-only access to the project files, and this task carried none.</source>
+        <extracomment>Capabilities whose RESULT is a statement about something that already exists - findings. The planning connector has no file, tool or connector access of its own (``EGRESS_TOOL_GRANTS`` is empty), so it can only produce findings from evidence the task itself carried outbound: an authorized local read, or an authorized external read. Both are in this envelope. What JARVIS says instead, in the person&apos;s language, when a findings task ran with no such evidence. The planning component&apos;s own text is NOT the answer to that objective - it is internal planning material about the request - so it stays on the task record and never reaches the conversation.</extracomment>
+        <translation>Projeyi henüz incelemedim. İnceleme için proje dosyalarına salt okunur erişim gerekiyor; bu görevde böyle bir erişim yoktu.</translation>
     </message>
     <message>
         <source>%1 [answer truncated]</source>
@@ -2360,12 +2471,23 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
 <context>
     <name>QuotaBar</name>
     <message>
-        <source>%1% left · %2</source>
-        <translation>%%1 kaldı · %2</translation>
-    </message>
-    <message>
         <source>%1% left</source>
         <translation>%%1 kaldı</translation>
+    </message>
+</context>
+<context>
+    <name>RenameMenu</name>
+    <message>
+        <source>Rename</source>
+        <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Kaydet</translation>
     </message>
 </context>
 <context>
@@ -2563,12 +2685,20 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Tamamlandı</translation>
     </message>
     <message>
+        <source>Not completed</source>
+        <translation>Tamamlanamadı</translation>
+    </message>
+    <message>
         <source>Cancellation requested</source>
         <translation>İptal istendi</translation>
     </message>
     <message>
         <source>Cancelled</source>
         <translation>İptal edildi</translation>
+    </message>
+    <message>
+        <source>The read-only access an inspection needs was not available, so what you asked for was not done. Nothing failed and nothing was changed.</source>
+        <translation>İnceleme için gerekli salt okunur erişim mevcut değildi; bu yüzden istediğiniz şey yapılmadı. Bir hata oluşmadı ve hiçbir şey değiştirilmedi.</translation>
     </message>
     <message>
         <source>JARVIS could not verify whether the action completed.</source>
@@ -2791,6 +2921,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>%1 tasks</source>
         <translation>%1 görev</translation>
+    </message>
+    <message>
+        <source>Untitled session</source>
+        <translation>Adsız oturum</translation>
     </message>
     <message>
         <source>Active task</source>
@@ -3183,6 +3317,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>OTURUMLAR (son %1)</translation>
     </message>
     <message>
+        <source>Untitled session</source>
+        <translation>Adsız oturum</translation>
+    </message>
+    <message>
         <source>%1 tasks</source>
         <translation>%1 görev</translation>
     </message>
@@ -3202,36 +3340,32 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
 <context>
     <name>Theme</name>
     <message>
-        <source>REASONING / EXECUTING</source>
-        <translation>DÜŞÜNÜYOR / YÜRÜTÜYOR</translation>
+        <source>Preparing the answer</source>
+        <translation>Yanıt hazırlanıyor</translation>
     </message>
     <message>
-        <source>AWAITING APPROVAL</source>
-        <translation>ONAY BEKLENİYOR</translation>
+        <source>Awaiting your approval</source>
+        <translation>Onayınız bekleniyor</translation>
     </message>
     <message>
-        <source>AWAITING YOUR ANSWER</source>
-        <translation>YANITINIZ BEKLENİYOR</translation>
+        <source>Awaiting your answer</source>
+        <translation>Yanıtınız bekleniyor</translation>
     </message>
     <message>
-        <source>COMPLETED</source>
-        <translation>TAMAMLANDI</translation>
+        <source>Completed</source>
+        <translation>Tamamlandı</translation>
     </message>
     <message>
-        <source>ERROR</source>
-        <translation>HATA</translation>
+        <source>Error</source>
+        <translation>Hata</translation>
     </message>
     <message>
-        <source>OUTCOME UNKNOWN</source>
-        <translation>SONUÇ BİLİNMİYOR</translation>
+        <source>Outcome unknown</source>
+        <translation>Sonuç bilinmiyor</translation>
     </message>
     <message>
-        <source>JARVIS FROZEN</source>
-        <translation>JARVIS DONDURULDU</translation>
-    </message>
-    <message>
-        <source>IDLE</source>
-        <translation>BOŞTA</translation>
+        <source>JARVIS frozen</source>
+        <translation>JARVIS donduruldu</translation>
     </message>
 </context>
 <context>
@@ -3247,18 +3381,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>THINKS AHEAD FOR YOU</source>
         <translation>SİZİN İÇİN ÖNCEDEN DÜŞÜNÜR</translation>
-    </message>
-    <message>
-        <source>LISTENING</source>
-        <translation>DİNLİYOR</translation>
-    </message>
-    <message>
-        <source>REASONING</source>
-        <translation>DÜŞÜNÜYOR</translation>
-    </message>
-    <message>
-        <source>EXECUTING</source>
-        <translation>YÜRÜTÜYOR</translation>
     </message>
     <message>
         <source>Pending</source>

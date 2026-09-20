@@ -66,7 +66,7 @@ Item {
             Rectangle { width: parent.width; height: 44; radius: Theme.radiusSmall; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.6)
                 Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: Theme.radiusSmall + 3; color: Theme.alpha(Theme.accent, 0.1) }
                 Text { x: 14; anchors.verticalCenter: parent.verticalCenter; text: "›"; color: Theme.accent; font.pixelSize: 18 }
-                TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: qsTr("Type a command…"); placeholderTextColor: Theme.textDim; font { family: Theme.font; pixelSize: 15 }
+                TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: qsTr("Type a command…"); placeholderTextColor: Theme.textDim; font: Theme.lead
                     onTextChanged: palette.cursor = 0
                     Keys.onDownPressed: palette.cursor = Math.min(palette.cursor + 1, palette.matches.length - 1)
                     Keys.onUpPressed: palette.cursor = Math.max(palette.cursor - 1, 0)
@@ -82,7 +82,7 @@ Item {
                     color: index === palette.cursor ? Theme.alpha(Theme.accent, 0.14) : "transparent"
                     border.width: 1; border.color: index === palette.cursor ? Theme.alpha(Theme.accent, 0.4) : "transparent"
                     Rectangle { visible: index === palette.cursor; x: 0; y: 10; width: 2; height: 16; radius: 1; color: Theme.accent }
-                    Text { anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: index === palette.cursor ? Theme.accent : Theme.textLabel; font { family: Theme.font; pixelSize: 14 } }
+                    Text { anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: index === palette.cursor ? Theme.accent : Theme.textLabel; font: Theme.body }
                     MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: palette.cursor = index; onClicked: { palette.cursor = index; palette.runCurrent() } }
                 }
             }

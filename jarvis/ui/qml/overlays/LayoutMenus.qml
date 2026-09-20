@@ -93,7 +93,7 @@ Item {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         Rectangle { anchors.fill: parent; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: row.activeFocus }
         Text { x: 12; width: 20; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignHCenter
-               text: row.glyph; color: Theme.accent; font { family: Theme.font; pixelSize: 15 } }
+               text: row.glyph; color: Theme.accent; font: Theme.lead }
         Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: row.label; color: Theme.text; font: Theme.uiLabel }
         MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; cursorShape: row.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: if (row.enabled) row.triggered() }
@@ -134,7 +134,7 @@ Item {
                     readonly property var hidden: modelData === "rail" ? menus.railHidden : menus.stackHidden
                     Rectangle { width: parent.width; height: 1; color: Theme.glassSeparator }
                     Text { x: 8; height: 30; verticalAlignment: Text.AlignVCenter; text: modelData === "rail" ? qsTr("LEFT RAIL") : qsTr("RIGHT STACK")
-                           color: Theme.textLabel; font { family: Theme.font; pixelSize: 10; letterSpacing: 1.4; weight: Font.DemiBold } }
+                           color: Theme.textLabel; font: Theme.label }
                     Text { visible: parent.hidden.length === 0; x: 8; height: 30; verticalAlignment: Text.AlignTop
                            text: qsTr("No hidden cards"); color: Theme.textMuted; font: Theme.metadata }
                     Repeater {

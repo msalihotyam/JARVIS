@@ -47,15 +47,15 @@ Rectangle {
     // Primary glow halo.
     Rectangle { z: -1; visible: primary; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: Theme.alpha(tone, hovered ? 0.30 : 0.16)
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
-    // Focus ring (keyboard focus, when a parent forwards it).
-    Rectangle { visible: button.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 3; color: "transparent"; border.width: 1; border.color: Theme.alpha(tone, 0.8) }
+    // Focus ring (keyboard focus, when a parent forwards it): crisp, 2 px, outside the fill.
+    Rectangle { visible: button.activeFocus; anchors.fill: parent; anchors.margins: -4; radius: parent.radius + 4; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
 
     Text {
         id: text
         anchors.centerIn: parent
         text: button.label
         color: primary ? "#04101c" : (danger ? Theme.danger : (hovered ? Theme.text : Theme.textLabel))
-        font { family: Theme.font; pixelSize: compact ? 12 : 13; weight: Font.DemiBold }
+        font: Theme.captionStrong
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     }
     MouseArea {

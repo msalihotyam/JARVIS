@@ -80,19 +80,72 @@ Item {
         property string label: ""
         signal activated()
         text: label
+        renderType: Theme.textRender
         color: actionArea.containsMouse ? Theme.accent : Theme.textMuted
-        font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
-        style: Text.Outline; styleColor: "#b3000812"
+        font: Theme.chatMeta
         Accessible.role: Accessible.Button
         Accessible.name: label
         MouseArea { id: actionArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor; onClicked: parent.activated() }
     }
 
+    // -- Markdown: presented, never executed, and never the source of truth ----
+    // The canonical assistant text (modelData.text) is what history, Copy and
+    // quoting use. What is SHOWN is this: the same text with & and < escaped, so
+    // no HTML, script, image or embedded object can arrive from a provider, and
+    // with single newlines turned into Markdown hard breaks, so a reply that
+    // separates its lines with one newline still reads as separate lines. A
+    // fenced code block is passed through untouched.
+    function displayMarkdown(raw) {
+        var safe = String(raw).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        var parts = safe.split(/(```[\s\S]*?```|```[\s\S]*$)/)
+        for (var i = 0; i < parts.length; i++) {
+            if (i % 2 === 1) continue
+            // A continuation line stays IN its paragraph: a line separator breaks
+            // the line without opening a block, so it keeps the reading line
+            // height instead of taking the gap that separates paragraphs.
+            parts[i] = parts[i].replace(/([^\n])\n(?![\n]|[ \t]*(?:[-*+>|#]|\d+[.)]|```|---))/g, "$1 ")
+            // Before a list, a heading, a quote, a table or a fence the newline is
+            // real Markdown structure, so there it stays a hard break.
+            parts[i] = parts[i].replace(/([^\n])\n(?!\n)/g, "$1  \n")
+        }
+        return parts.join("")
+    }
+
+    // -- response telemetry: measured, never estimated ----------------------------
+    // Seconds with one decimal below a minute, whole minutes and seconds above;
+    // tokens as the provider reported them. "Thinking" is only ever a provider's
+    // own reasoning time; otherwise the second figure is the first visible text.
+    function duration(ms, locale) {
+        if (ms < 60000) return qsTr("%1 s").arg(Number(ms / 1000).toLocaleString(Qt.locale(locale), "f", 1))
+        var total = Math.round(ms / 1000)
+        return qsTr("%1 min %2 s").arg(Math.floor(total / 60)).arg(total % 60)
+    }
+    function telemetryLine(t, locale) {
+        if (!t || t.elapsed_ms === undefined) return ""
+        var parts = [duration(t.elapsed_ms, locale)]
+        if (t.thinking_ms !== undefined) parts.push(qsTr("Thinking %1").arg(duration(t.thinking_ms, locale)))
+        else if (t.first_ms !== undefined) parts.push(qsTr("First response %1").arg(duration(t.first_ms, locale)))
+        if (t.tokens !== undefined) {
+            var tokenText = t.tokens < 1000 ? qsTr("%1 tokens").arg(t.tokens)
+                                            : qsTr("%1K tokens").arg(Number(t.tokens / 1000).toLocaleString(Qt.locale(locale), "f", 1))
+            // A total that is mostly cheap cache reads must never read as an
+            // equally expensive fresh call: named beside it, both exactly as
+            // reported (never estimated).
+            if (t.cached_tokens)
+                tokenText = qsTr("%1 (%2 cached)").arg(tokenText).arg(
+                    t.cached_tokens < 1000 ? String(t.cached_tokens)
+                                           : Number(t.cached_tokens / 1000).toLocaleString(Qt.locale(locale), "f", 1) + "K")
+            parts.push(tokenText)
+        }
+        return parts.join(" · ")
+    }
+
     function railColor(kind) {
         switch (kind) {
         case "user": return Theme.accentSoft
         case "jarvis": return Theme.accent
+        case "result": return Theme.accentSoft
         case "error": return Theme.danger
         case "unknown": return Theme.unknownEdge
         case "approval": return Theme.warning
@@ -107,6 +160,8 @@ Item {
         switch (kind) {
         case "user": return qsTr("You")
         case "jarvis": return "JARVIS"
+        // A task's own deliverable, never JARVIS's conversational voice.
+        case "result": return qsTr("TASK RESULT")
         case "error": return qsTr("ERROR")
         case "unknown": return qsTr("OUTCOME UNKNOWN")
         case "approval": return qsTr("APPROVAL")
@@ -185,7 +240,14 @@ Item {
                     readonly property string kind: modelData.kind
                     readonly property bool isUser: kind === "user"
                     readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
+                    // What an approved task produced (a plan, an analysis, an account
+                    // of what ran): shown, labelled with where it came from, and never
+                    // presented as something JARVIS said.
+                    readonly property bool isResult: kind === "result"
                     readonly property bool loud: kind === "error" || kind === "unknown" || kind === "approval"
+                    // Provider prose may carry Markdown; JARVIS's own notices and
+                    // untrusted external data never do.
+                    readonly property bool markdown: modelData.chat === true || isResult
                     readonly property color tone: feed.railColor(kind)
                     // Appearance: fade + short slide, no bounce. A reply that streamed is
                     // already on screen: its final entry takes over without a second entrance.
@@ -253,7 +315,7 @@ Item {
                             GradientStop { position: 0; color: Theme.glassUserReading }
                             GradientStop { position: 1; color: Theme.glassPrimaryReading } }
                         border.width: row.isUser || row.loud ? 1 : 0
-                        border.color: row.isUser ? "#327bb5" : Theme.alpha(row.tone, 0.45)
+                        border.color: row.isUser ? "#b8327bb5" : Theme.alpha(row.tone, 0.45)
                         Rectangle { visible: row.isUser; x: 14; y: 1; width: parent.width - 28; height: 1; color: "#5a6fd2f5" }
                         Rectangle { visible: row.isUser; anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.45, 34); radius: 11
                             gradient: Gradient { GradientStop { position: 0; color: "#0f4fc3ff" } GradientStop { position: 1; color: "transparent" } } }
@@ -265,45 +327,57 @@ Item {
                             spacing: row.isJarvis ? 0 : (feed.referenceLayout ? 7 : 9)
                             // The label line: JARVIS carries its name inside its surface;
                             // the operator's bubble needs none; the rest are labelled.
-                            Text { visible: row.loud || row.kind === "system" || row.kind === "scheduled" || row.kind === "data"
+                            Text { visible: row.loud || row.isResult || row.kind === "system" || row.kind === "scheduled" || row.kind === "data"
                                    text: feed.kindLabel(row.kind)
-                                   style: Text.Outline; styleColor: "#b3000812"
+                                         + (row.isResult && modelData.capability ? "  ·  " + modelData.capability : "")
+                                         + (row.isResult && modelData.destination ? "  ·  " + modelData.destination : "")
+                                   renderType: Theme.textRender
                                    color: row.tone
-                                   font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold, letterSpacing: 2.2 }) }
+                                   font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Theme.label }
                             Item {
                                 width: parent.width
                                 height: (sent.visible ? sent.y + sent.height : sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
                                 // An ordinary JARVIS reply keeps its open shape; the only
-                                // addition is a very quiet dark pane behind the text so the
-                                // planet below never competes with it. No border, no card.
-                                Rectangle {
+                                // addition is the reading veil: dark close to the text and
+                                // feathered outward (a nine-slice sheet, no effect), so the
+                                // planet never competes with the answer and no card
+                                // silhouette appears. No border, no tail, no bubble.
+                                BorderImage {
                                     objectName: "readingSurface"
-                                    visible: row.isJarvis && !row.loud
+                                    visible: (row.isJarvis || row.isResult) && !row.loud
                                     z: -1
-                                    x: -10
-                                    y: message.y - 6
-                                    width: Math.min(parent.width + 10, message.width + 20)
-                                    height: (sources.visible ? sources.y + sources.height : message.y + message.height) - message.y + 12
-                                    radius: 8
-                                    color: Theme.glassReadingSurface
-                                    border.width: 0
+                                    readonly property int feather: 36          // the sheet's falloff margin
+                                    readonly property int slice: 46            // feather + the core's corner radius
+                                    source: "../assets/reading-veil.png"
+                                    // Fully covered: the answer plus 10 px each side and 8 px above / below.
+                                    x: -10 - feather
+                                    y: message.y - 8 - feather
+                                    width: Math.min(parent.width + 10, message.width + 20) + 2 * feather
+                                    height: (sources.visible ? sources.y + sources.height : message.y + message.height) - message.y + 16 + 2 * feather
+                                    border { left: slice; top: slice; right: slice; bottom: slice }
+                                    opacity: Theme.glassReadingVeil
+                                    smooth: true
                                 }
                                 // JARVIS: no surface at all - the small name, then the answer
                                 // itself at a readable measure; the avatar is the identity.
                                 Text { id: name; visible: row.isJarvis; x: 0; y: 5
+                                       renderType: Theme.textRender
                                        objectName: modelData.interrupted === true ? "feedInterrupted" : ""
                                        // A reply that stopped part-way says so; it is never presented as an answer.
                                        text: feed.kindLabel(row.kind) + (modelData.interrupted === true ? "  ·  " + qsTr("INTERRUPTED - INCOMPLETE ANSWER") : "")
                                        color: modelData.interrupted === true ? Theme.warning : Theme.materialBlue
-                                       opacity: 0.85
-                                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.2 })
-                                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+                                       font: Theme.chatAuthor
+                                       lineHeightMode: Text.FixedHeight; lineHeight: 18 }
                                 TextEdit {
                                     id: message
                                     x: 0
                                     y: row.isJarvis ? name.y + name.height + 4 : 0
                                     width: row.isJarvis ? Math.min(parent.width, 760) : parent.width
-                                    text: modelData.text
+                                    // Canonical text in, presented text out: the raw
+                                    // assistant text is never rewritten for display.
+                                    text: row.markdown ? feed.displayMarkdown(modelData.text) : modelData.text
+                                    textFormat: row.markdown ? TextEdit.MarkdownText : TextEdit.PlainText
+                                    renderType: Theme.textRender
                                     readOnly: true
                                     selectByMouse: true
                                     // A selection survives the click on "Quote selection".
@@ -312,17 +386,38 @@ Item {
                                     objectName: "feedMessage_" + row.kind
                                     color: row.kind === "system" ? Theme.textMuted : Theme.text
                                     selectionColor: Theme.accentSoft
-                                    font: row.kind === "data" ? Qt.font({ family: Theme.mono, pixelSize: 12 })
-                                          : feed.referenceLayout ? Theme.conversationBody : Qt.font({ family: Theme.font, pixelSize: 16 })
-                                    textFormat: TextEdit.PlainText
-                                    // 18 / 28 reading rhythm, paragraphs ~12 px apart (TextEdit has no lineHeight).
-                                    // Applied once: a feed entry's text never changes after the row exists
-                                    // (a new feed rebuilds the rows), and the formatting edit itself would
-                                    // otherwise re-trigger a text-change handler.
-                                    Component.onCompleted: if (feed.referenceLayout && row.kind !== "data" && typeof typography !== "undefined") typography.setLineHeight(textDocument, 28, 12)
+                                    font: row.kind === "data" ? Theme.code
+                                          : !feed.referenceLayout ? Theme.conversationCompact
+                                          : row.isUser ? Theme.conversationUser : Theme.conversationBody
+                                    // The reading rhythm (TextEdit has no lineHeight): 18/29 with a
+                                    // 14 px paragraph gap for a reply, tighter for what the person
+                                    // wrote, plus the heading, list and code scale of a Markdown
+                                    // document. Applied to the TEXT, not just to the row: a delegate
+                                    // is reused with another entry's text, and formatting that only
+                                    // ran at creation would stay behind on the wrong words. The guard
+                                    // is the formatting edit's own text-change notification.
+                                    property bool formatting: false
+                                    function applyRhythm() {
+                                        if (formatting || !feed.referenceLayout || row.kind === "data" || typeof typography === "undefined")
+                                            return
+                                        formatting = true
+                                        typography.setLineHeight(textDocument,
+                                                                 row.isUser ? Theme.conversationUserLine : Theme.conversationLine,
+                                                                 row.isUser ? 8 : Theme.conversationParagraph, row.markdown)
+                                        formatting = false
+                                    }
+                                    Component.onCompleted: applyRhythm()
+                                    onTextChanged: applyRhythm()
+                                    // The compact layout has its own smaller type, so the reading
+                                    // rhythm follows the layout a row is actually shown in.
+                                    Connections { target: feed; function onReferenceLayoutChanged() { message.applyRhythm() } }
                                     // The offer to quote appears AT the selection, and only
                                     // for a message that may be quoted at all.
                                     onSelectedTextChanged: row.conversational ? feed.offerQuote(message, modelData.id) : feed.hideQuoteTip()
+                                    // Right-click: Copy (the selection, or the whole message) and Select All.
+                                    TapHandler { acceptedButtons: Qt.RightButton
+                                                 onTapped: function(point) { messageMenu.editor = message; messageMenu.wholeText = modelData.text
+                                                                             messageMenu.openAt(message, point.position) } }
                                 }
                                 // What the person attached to this message, still visible after
                                 // sending: each file with the letter of the group that owned it,
@@ -341,6 +436,9 @@ Item {
                                         for (var j = 0; j < own.length; j++) out.push({ file: own[j], label: "" })
                                         return out
                                     }
+                                    // One gutter for the ownership letters: reserved for every card
+                                    // once any file belongs to a group, so the cards line up.
+                                    readonly property bool lettered: files.some(function(f) { return f.label !== "" })
                                     visible: row.isUser && files.length > 0
                                     y: message.y + message.height + 8
                                     width: message.width
@@ -348,12 +446,12 @@ Item {
                                     Repeater {
                                         model: sent.files
                                         Item {
-                                            width: card.width + (badge.visible ? 22 : 0); height: card.height
-                                            Rectangle { id: badge; visible: modelData.label !== ""; x: 0; y: (parent.height - 18) / 2; width: 18; height: 18; radius: 9
-                                                        color: Theme.alpha("#36aaff", 0.14); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.45)
+                                            width: card.width + (sent.lettered ? 26 : 0); height: card.height
+                                            Rectangle { id: badge; visible: modelData.label !== ""; x: 0; y: (parent.height - 20) / 2; width: 20; height: 20; radius: 10
+                                                        color: Theme.alpha("#36aaff", 0.2); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.6)
                                                         Text { anchors.centerIn: parent; text: modelData.label; color: Theme.text
-                                                               font: Qt.font({ family: Theme.font, pixelSize: 10, weight: Font.DemiBold }) } }
-                                            AttachmentCard { id: card; x: badge.visible ? 22 : 0; file: modelData.file; compact: true
+                                                               font: Theme.captionStrong } }
+                                            AttachmentCard { id: card; x: sent.lettered ? 26 : 0; file: modelData.file; compact: true; nested: true
                                                              onOpened: bridge.previewAttachment(modelData.file) }
                                         }
                                     }
@@ -365,11 +463,13 @@ Item {
                                     id: sources
                                     objectName: "feedSources"
                                     visible: (modelData.sources || []).length > 0
-                                    y: message.y + message.height + 10
+                                    y: message.y + message.height + 14
                                     width: message.width
-                                    spacing: 3
-                                    Text { text: modelData.sources_cited ? qsTr("Sources") : qsTr("Search results (the answer names no specific page)")
-                                           color: Theme.textMuted; font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 0.8 }) }
+                                    spacing: 5
+                                    Text { objectName: "feedSourcesHeading"
+                                           text: modelData.sources_cited ? qsTr("Sources") : qsTr("Search results (the answer names no specific page)")
+                                           renderType: Theme.textRender
+                                           color: Theme.textLabel; font: Theme.chatSourcesHeading }
                                     Repeater {
                                         model: modelData.sources || []
                                         delegate: Text {
@@ -378,8 +478,9 @@ Item {
                                             elide: Text.ElideRight
                                             textFormat: Text.PlainText
                                             text: (index + 1) + ". " + (modelData.title || modelData.url) + "  ·  " + modelData.url.replace(/^https?:\/\//, "").split("/")[0]
+                                            renderType: Theme.textRender
                                             color: linkArea.containsMouse ? Theme.accent : Theme.materialBlue
-                                            font: Qt.font({ family: Theme.font, pixelSize: 13 })
+                                            font: Theme.chatSource
                                             MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                                         onClicked: if (/^https?:\/\//.test(modelData.url)) Qt.openUrlExternally(modelData.url) }
                                         }
@@ -393,13 +494,30 @@ Item {
                     // legible over the planet's bright horizon.
                     Text {
                         id: stamp
+                        objectName: "feedStamp"
                         readonly property int gap: 5
                         x: row.isUser ? row.width - width - 6 : card.x + (row.isJarvis ? 18 : 0)
                         y: card.height + gap
                         text: modelData.time; color: Theme.textMuted
-                        style: Text.Outline; styleColor: "#b3000812"
-                        font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
-                        lineHeightMode: Text.FixedHeight; lineHeight: 16
+                        renderType: Theme.textRender
+                        font: Theme.chatMeta
+                        lineHeightMode: Text.FixedHeight; lineHeight: 18
+                    }
+                    // What a finished answer or task result took: beside its time, quieter
+                    // still, and never on the person's own message.
+                    Text {
+                        id: telemetry
+                        objectName: "feedTelemetry"
+                        readonly property string line: row.isUser ? "" : feed.telemetryLine(modelData.telemetry, typeof i18n !== "undefined" ? i18n.qtLocale : "en_US")
+                        visible: line !== ""
+                        x: stamp.x + stamp.width + 14; y: stamp.y
+                        text: line
+                        color: Theme.textMuted
+                        renderType: Theme.textRender
+                        font: stamp.font
+                        lineHeightMode: Text.FixedHeight; lineHeight: 18
+                        Text { anchors.right: parent.left; anchors.rightMargin: 5; text: "·"; color: parent.color
+                               renderType: Theme.textRender; font: parent.font; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
                     }
                     // Copy / Quote, hidden until hover: only on what the person wrote
                     // and on General Chat replies - never on cards, notices, errors,
@@ -413,7 +531,7 @@ Item {
                         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
                         spacing: 14
                         y: stamp.y
-                        x: row.isUser ? stamp.x - width - 16 : stamp.x + stamp.width + 16
+                        x: row.isUser ? stamp.x - width - 16 : (telemetry.visible ? telemetry.x + telemetry.width : stamp.x + stamp.width) + 16
                         MessageAction { objectName: "messageCopy_" + index; label: qsTr("Copy"); onActivated: bridge.copyText(modelData.text) }
                         // Quoting adds a REFERENCE to the draft - it never writes into
                         // the message being composed, and it authorizes nothing.
@@ -424,15 +542,37 @@ Item {
                     }
                 }
             }
-            // The General Chat reply while it streams: ONE turn that grows in place.
-            // It is not part of the feed, so a delta rebuilds nothing; the final entry
-            // replaces it in the same frame. Same measure, rhythm and identity as a reply.
+            // THE TURN BEING ANSWERED: one live row, from the moment a request starts
+            // until its answer stands. It carries what JARVIS is really doing - the
+            // state the bridge reports, never an invented one - a small activity mark
+            // and the running time, all on ONE line that is updated in place; while a
+            // General Chat reply streams, its text grows above that same line and the
+            // time keeps running. It is not part of the feed, so a delta rebuilds
+            // nothing; the final entry replaces it in the same frame, and the measured
+            // duration then stays under the finished answer (its telemetry line).
+            // Waiting for the person (an approval, an answer) is said here too, calm
+            // and untimed: nothing is running, so no clock pretends otherwise.
             Item {
                 id: streamRow
                 objectName: "streamingReply"
-                visible: bridge.streamText !== ""
+                readonly property bool streaming: bridge.streamText !== ""
+                // Work is running: the core says so, or reply text is arriving right now.
+                readonly property bool working: bridge.coreState === "running" || streaming
+                readonly property string phase: streaming ? "writing"
+                                                : working ? (bridge.executing ? "executing" : "preparing")
+                                                : (bridge.coreState === "awaiting_approval" || bridge.coreState === "awaiting_input") ? bridge.coreState : ""
+                readonly property string label: phase === "writing" ? qsTr("Writing the answer")
+                                              : phase === "executing" ? qsTr("Executing")
+                                              : phase === "preparing" ? Theme.stateLabel("running")
+                                              : Theme.stateLabel(phase)
+                // The running time of THIS request: from the bridge's own start of work.
+                property real elapsedMs: 0
+                function tick() { elapsedMs = bridge.workStartedAt > 0 ? Math.max(0, Date.now() - bridge.workStartedAt) : 0 }
+                onWorkingChanged: tick()
+                Timer { interval: 100; repeat: true; running: streamRow.working && streamRow.visible; triggeredOnStart: true; onTriggered: streamRow.tick() }
+                visible: phase !== ""
                 width: stack.width
-                height: visible ? Math.max(feed.avatarSize, streamText.y + streamText.height + 4 + streamStamp.height + 5) : 0
+                height: visible ? Math.max(feed.avatarSize, liveStatus.y + liveStatus.height + 6) : 0
                 Item {
                     width: feed.avatarSize; height: width
                     Item { anchors.centerIn: parent; width: 32; height: 32
@@ -441,37 +581,93 @@ Item {
                         Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
                         Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" } }
                 }
-                Text { id: streamName; x: feed.messageX; y: 7; text: "JARVIS"; color: Theme.materialBlue; opacity: 0.85
-                       font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold, letterSpacing: 1.2 })
-                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+                Text { id: streamName; x: feed.messageX; y: 7; text: "JARVIS"; color: Theme.materialBlue
+                       renderType: Theme.textRender
+                       font: Theme.chatAuthor
+                       lineHeightMode: Text.FixedHeight; lineHeight: 18 }
                 TextEdit {
                     id: streamText
                     objectName: "streamingReplyText"
+                    visible: streamRow.streaming
                     x: feed.messageX; y: streamName.y + streamName.height + 4
                     width: Math.min(streamRow.width - feed.messageX, 760)
-                    text: bridge.streamText
+                    // Partial Markdown is safe to show: an unfinished emphasis or an
+                    // unclosed fence renders as text, and the layout does not jump when
+                    // the final row replaces this one.
+                    text: feed.displayMarkdown(bridge.streamText)
                     readOnly: true
                     wrapMode: Text.Wrap
-                    textFormat: TextEdit.PlainText
+                    textFormat: TextEdit.MarkdownText
+                    renderType: Theme.textRender
                     color: Theme.text
-                    font: feed.referenceLayout ? Theme.conversationBody : Qt.font({ family: Theme.font, pixelSize: 16 })
+                    font: feed.referenceLayout ? Theme.conversationBody : Theme.conversationCompact
                     // The same reading rhythm as the final reply, re-applied as text grows (guarded:
                     // the formatting edit itself reports a text change).
                     property bool formatting: false
                     onTextChanged: if (!formatting && feed.referenceLayout && typeof typography !== "undefined") {
-                        formatting = true; typography.setLineHeight(textDocument, 28, 12); formatting = false }
+                        formatting = true
+                        typography.setLineHeight(textDocument, Theme.conversationLine, Theme.conversationParagraph, true)
+                        formatting = false }
                 }
-                Text { id: streamStamp; x: feed.messageX; y: streamText.y + streamText.height + 5; text: bridge.streamTime
-                       color: Theme.textMuted; style: Text.Outline; styleColor: "#b3000812"
-                       font: feed.referenceLayout ? Theme.timestamp : Qt.font({ family: Theme.font, pixelSize: 11 })
-                       lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+                // The one live line: activity mark, what is happening, for how long.
+                Row {
+                    id: liveStatus
+                    objectName: "liveStatus"
+                    // Where the finished answer's time and duration will stand.
+                    x: feed.messageX + 18
+                    y: streamRow.streaming ? streamText.y + streamText.height + 8 : streamName.y + streamName.height + 6
+                    height: 20
+                    spacing: 9
+                    Row {
+                        id: activity
+                        objectName: "liveActivity"
+                        // For inspection: the mark moves only while work is really running.
+                        readonly property bool animated: streamRow.working && Theme.ambient
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 4
+                        Repeater {
+                            model: streamRow.working ? 3 : 1
+                            Rectangle {
+                                width: 5; height: 5; radius: 2.5
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: streamRow.working ? Theme.accent : Theme.stateColor(bridge.coreState)
+                                opacity: activity.animated ? 0.28 : 0.9
+                                SequentialAnimation on opacity {
+                                    running: activity.animated && streamRow.visible
+                                    loops: Animation.Infinite
+                                    PauseAnimation { duration: index * 160 }
+                                    NumberAnimation { to: 1; duration: 320; easing.type: Easing.InOutSine }
+                                    NumberAnimation { to: 0.28; duration: 420; easing.type: Easing.InOutSine }
+                                    PauseAnimation { duration: (2 - index) * 160 + 120 }
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        objectName: "liveStatusLabel"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: streamRow.label
+                        color: streamRow.working ? Theme.textLabel : Theme.stateColor(bridge.coreState)
+                        renderType: Theme.textRender
+                        font: Theme.chatStatus
+                    }
+                    Text {
+                        objectName: "liveStatusTimer"
+                        visible: streamRow.working
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "·  " + feed.duration(streamRow.elapsedMs, typeof i18n !== "undefined" ? i18n.qtLocale : "en_US")
+                        color: Theme.textMuted
+                        renderType: Theme.textRender
+                        font: Theme.chatStatus
+                    }
+                }
                 HoverHandler { id: streamHover }
                 Row {
-                    visible: streamRow.visible
+                    visible: streamRow.streaming
                     opacity: streamHover.hovered ? 1 : 0
                     spacing: 14
-                    y: streamStamp.y
-                    x: streamStamp.x + streamStamp.width + 16
+                    anchors.verticalCenter: liveStatus.verticalCenter
+                    x: liveStatus.x + liveStatus.width + 18
                     MessageAction { objectName: "streamCopy"; label: qsTr("Copy"); onActivated: bridge.copyText(bridge.streamText) }
                 }
             }
@@ -504,7 +700,7 @@ Item {
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Jump to latest message")
         Text { anchors.centerIn: parent; anchors.verticalCenterOffset: 1; text: "↓"; color: Theme.text
-               font: Qt.font({ family: Theme.font, pixelSize: 17, weight: Font.DemiBold }) }
+               font: Theme.title }
         MouseArea { id: jumpArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     enabled: feed.jumpVisible; onClicked: feed.jumpToLatest() }
     }
@@ -559,6 +755,9 @@ Item {
         }
     }
 
+    // One read-only menu for every message: the right-clicked one is its editor.
+    EditMenu { id: messageMenu; objectName: "messageEditMenu" }
+
     // -- the contextual quote action ------------------------------------------
     // Selecting text inside a message JARVIS or the person wrote offers to quote
     // exactly that selection, right where the selection is. It follows the text
@@ -600,7 +799,7 @@ Item {
             border.width: 1; border.color: Theme.glassEdgeStrong
         }
         Text { id: tipLabel; anchors.centerIn: parent; text: qsTr("Quote selection"); color: Theme.text
-               font: Qt.font({ family: Theme.font, pixelSize: 11, weight: Font.DemiBold }) }
+               font: Theme.captionStrong }
         MouseArea {
             id: tipArea
             objectName: "quoteTipButton"

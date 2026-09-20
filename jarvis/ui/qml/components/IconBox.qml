@@ -25,5 +25,5 @@ Rectangle {
         }
     }
     Rectangle { z: -1; visible: solid; anchors.fill: parent; anchors.margins: -4; radius: parent.radius + 4; color: Theme.alpha(tint, 0.18) }
-    Text { anchors.centerIn: parent; text: box.glyph; color: solid ? "#f4fbff" : box.tint; font { family: Theme.font; pixelSize: box.glyphSize; weight: solid ? Font.DemiBold : Font.Normal } }
+    Text { anchors.centerIn: parent; text: box.glyph; color: solid ? "#f4fbff" : box.tint; font: Qt.font({ family: solid ? Theme.uiStrong : Theme.ui, pixelSize: box.glyphSize, weight: solid ? Theme.uiStrongWeight : Font.Normal }) }
 }

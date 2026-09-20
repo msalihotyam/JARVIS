@@ -27,14 +27,45 @@ FIRST_SWEEP_MS = 2_500
 SWEEP_INTERVAL_MS = 30_000
 
 
+def _text_focus_release():
+    """An event filter for the window: a press outside the text editor that has
+    focus - outside its whole control (an ancestor marked ``keepsTextFocus``,
+    such as the composer with its chips and actions) - releases that focus.
+
+    It only looks: the press is never consumed, so it still reaches whatever is
+    under it, and nothing covers the window to catch it."""
+    from PySide6.QtCore import QEvent, QObject
+
+    class TextFocusRelease(QObject):
+        def eventFilter(self, window, event):  # noqa: N802 - Qt's name
+            if event.type() == QEvent.Type.MouseButtonPress:
+                item = window.activeFocusItem()
+                if item is not None and item.property("readOnly") is False and item.property("cursorPosition") is not None:
+                    owner = item
+                    while owner.parentItem() is not None and owner.property("keepsTextFocus") is not True:
+                        owner = owner.parentItem()
+                    region = owner if owner.property("keepsTextFocus") is True else item
+                    if not region.contains(region.mapFromScene(event.scenePosition())):
+                        # Its own focus is dropped (the window's scope would hand active
+                        # focus straight back to its focused child).
+                        item.setFocus(False)
+            return False
+
+    return TextFocusRelease()
+
+
 def create_engine(bridge: Bridge):
     """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml."""
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuick import QQuickWindow
 
     from jarvis.ui.i18n import localization
     from jarvis.ui.typography import Typography, load_fonts
 
+    # Every text on the platform's native (ClearType) rasterizer, the explicit
+    # and the defaulted alike: a mix with Qt's distance-field glyphs reads dirty.
+    QQuickWindow.setTextRenderType(QQuickWindow.TextRenderType.NativeTextRendering)
     engine = QQmlApplicationEngine()
     engine.addImportPath(str(QML_DIR))
     engine.rootContext().setContextProperty("bridge", bridge)
@@ -51,6 +82,9 @@ def create_engine(bridge: Bridge):
     bridge.languageChanged.connect(lambda: i18n.apply(bridge.language))
     i18n.languageChanged.connect(bridge.retranslated)
     engine.load(str(MAIN_QML))
+    engine._focus_release = _text_focus_release()
+    for window in engine.rootObjects():
+        window.installEventFilter(engine._focus_release)
     return engine
 
 

@@ -106,7 +106,7 @@ Item {
         anchors { left: parent.left; right: parent.right; bottom: composer.top; leftMargin: flowArea.anchors.leftMargin + 68; rightMargin: 36; bottomMargin: visible ? 18 : 0 }
         visible: !!bridge.clarification.choices && bridge.clarification.choices.length > 0
         height: visible ? implicitHeight : 0; spacing: 10
-        Text { text: qsTr("CHOOSE ONE"); color: Theme.accentSoft; font { family: Theme.font; pixelSize: 10; letterSpacing: 2 } }
+        Text { text: qsTr("CHOOSE ONE"); color: Theme.accentSoft; font: Theme.label }
         Flow { width: parent.width; spacing: 10
             Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
             ActionButton { label: qsTr("Never mind"); onClicked: bridge.dismissClarification() }

@@ -39,9 +39,11 @@ from jarvis.context_items import (
     group_label,
     history_text,
     reference,
+    result_history,
     safe_name,
     same_reference,
 )
+from jarvis.conversation import ConversationStore, task_title, turn_refs
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
@@ -95,6 +97,33 @@ class _Emitter(QObject):
     preview = Signal(str, str)        # request id, the reply text visible so far
 
 
+#: The token fields a provider reports that together are what one call used.
+#: Claude counts cache reads and writes apart from ``input_tokens``; Codex counts
+#: its cached input INSIDE ``input_tokens`` and its reasoning INSIDE
+#: ``output_tokens``, so those two are never added again.
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+#: Of those, the ones a cache serves at a fraction of the normal input price.
+#: Reported at face value alongside the total - never estimated, never implied
+#: for a provider (Codex) that folds its cached share INSIDE input_tokens.
+_CACHE_FIELDS = ("cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def reported_tokens(*reports: Any) -> int | None:
+    """The tokens the providers REPORTED for the calls behind one answer, or None
+    when none was reported - never an estimate."""
+    values = [report[name] for report in reports if isinstance(report, dict)
+              for name in _TOKEN_FIELDS if type(report.get(name)) is int and report[name] >= 0]
+    return sum(values) if values else None
+
+
+def reported_cache_tokens(*reports: Any) -> int | None:
+    """Of ``reported_tokens``, the share a cache served - so a total that is
+    mostly cheap cache reads never reads as an equally expensive fresh call."""
+    values = [report[name] for report in reports if isinstance(report, dict)
+              for name in _CACHE_FIELDS if type(report.get(name)) is int and report[name] >= 0]
+    return sum(values) if values else None
+
+
 def _guarded(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
@@ -139,6 +168,13 @@ class Bridge(QObject):
         # feed until the final envelope replaces it (display only, never history).
         self._stream_text = ""
         self._stream_ts = 0.0
+        # Response telemetry: the monotonic clock, when the running task started,
+        # when its first text became visible, and what the finished run took.
+        self._clock: Callable[[], float] = time.monotonic
+        self._work_started: float | None = None
+        self._first_visible: float | None = None
+        self._work_ms: int | None = None
+        self._work_started_at: float = 0.0
         # The CURRENT draft's context: reference groups (each owning its note and
         # files) and the message's own attachments. Data for that one turn.
         self._groups: list[dict[str, Any]] = []
@@ -202,6 +238,19 @@ class Bridge(QObject):
         self._task: dict[str, Any] = {}
         self._feed: list[dict[str, str]] = []
         self._activity: list[dict[str, str]] = []
+        # THE canonical conversation (jarvis.conversation): what later calls are
+        # given, durable across a restart, whichever provider answers. The feed
+        # above is what is SHOWN; this is what is remembered. A record that does
+        # not verify is set aside and nothing from it is used.
+        self._conversation_store, problem = ConversationStore.open(self.prefs.path.parent / "conversation.json")
+        self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
+        if problem:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The saved conversation could not be read, so JARVIS "
+                                                              "started a new one and remembers nothing from it: %1"),
+                        (problem,)), "error")
+        elif self._conversation_store.state.turns:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (%1 turns)"),
+                        (len(self._conversation_store.state.turns),)), "system")
         self._approval: dict[str, Any] = {}
         self._ticket: ApprovalTicket | None = None
         self._clarification: dict[str, Any] = {}
@@ -244,6 +293,10 @@ class Bridge(QObject):
         if kind == "task":
             self._busy = True
             self._executing = executing
+            self._work_started, self._first_visible, self._work_ms = self._clock(), None, None
+            # The wall-clock twin of ``_work_started``: the live turn's running
+            # time is drawn from it, so showing a clock never reads ``_clock``.
+            self._work_started_at = time.time()
             self._started_frozen = self._config.get("execution_enabled") is False
             self._refresh_core_state()
         if self.sync:
@@ -271,6 +324,8 @@ class Bridge(QObject):
             return
         if kind == "task":
             self._busy = False
+            if self._work_started is not None:
+                self._work_ms = max(0, round((self._clock() - self._work_started) * 1000))
         handler(result)
         if kind == "task" and self._freeze_waiting and not self._busy:
             # The operation that was running when Freeze arrived has returned
@@ -294,7 +349,7 @@ class Bridge(QObject):
             return (context, source, tuple(Bridge._redacted(a) for a in args))
         return redact_text(str(message))
 
-    def _say(self, kind: str, message: Any, chat: bool = False, **extra: Any) -> None:
+    def _say(self, kind: str, message: Any, chat: bool = False, refs: Any = None, **extra: Any) -> None:
         if isinstance(extra.get("sources"), list):   # untrusted links: redacted like everything shown
             extra["sources"] = [{key: redact_text(str(source.get(key) or "")) for key in ("title", "url")}
                                 for source in extra["sources"] if isinstance(source, dict)]
@@ -305,19 +360,58 @@ class Bridge(QObject):
             entry["chat"] = True         # a General Chat reply: part of the conversation window
         self._feed.append(entry)
         del self._feed[:-FEED_LIMIT]
+        self._remember(entry, refs)
         self.feedChanged.emit()
 
+    def _remember(self, entry: dict, refs: Any) -> None:
+        """Enter one shown entry into the canonical conversation, if it is one.
+
+        What the person typed, General Chat's completed replies and the task
+        results they were shown - exactly once each - and nothing else: never a
+        notice, an approval, an error, a fixture, a partial or interrupted reply,
+        or anything a planning component wrote. A user turn keeps its own words
+        apart (only they can become a pinned decision) and its references by
+        identity; a result keeps its provenance as a marker, not as the content.
+        """
+        kind, message = entry["kind"], entry["msg"]
+        store = self._conversation_store
+        if kind == "user" and isinstance(message, str):
+            store.append(role="user", kind="user", message=message,
+                         text=history_text(message, entry.get("groups"), entry.get("attachments")),
+                         refs=refs or (), key=f"{self._store_run}:{entry['id']}")
+        elif kind == "jarvis" and entry.get("chat") and isinstance(message, str):
+            store.append(role="assistant", kind="reply", text=message, key=f"{self._store_run}:{entry['id']}")
+        elif kind == "result":
+            shown = render(message)
+            # A result's identity is its TASK and the OUTCOME Core reported for it -
+            # never its text: a re-delivered envelope (a retry, a resume, a reopen)
+            # may render differently (another interface language, a truncation
+            # note) and is still the same result, so it adds nothing. A task that
+            # failed and later completed has two outcomes, and each is one turn.
+            task = str(entry.get("task_id") or "")
+            key = (f"result:{task}:{entry.get('run_status') or ''}" if task
+                   else f"{self._store_run}:{entry['id']}")
+            store.append(role="assistant", kind="result", key=key,
+                         text=result_history(shown, entry.get("capability"), entry.get("destination")),
+                         capability=str(entry.get("capability") or ""), destination=str(entry.get("destination") or ""))
+
     def _conversation(self) -> tuple:
-        """The recent chat of this window for a follow-up: what the person typed
-        and General Chat's replies, as written - never notices, approvals,
-        errors, task results or fixtures. Core bounds it (intent.conversation_window)."""
-        # A turn that carried context items sends them in full exactly ONCE, with
-        # that turn. Afterwards only a short provenance line remains, so no quote,
-        # file text or image is ever duplicated into a later request.
-        return tuple({"role": "user" if entry["kind"] == "user" else "assistant",
-                      "text": history_text(entry["msg"], entry.get("groups"), entry.get("attachments"))}
-                     for entry in self._feed
-                     if isinstance(entry["msg"], str) and (entry["kind"] == "user" or entry.get("chat")))
+        """The canonical conversation's raw turns as ``{role, text}``.
+
+        The invariant this upholds: everything shown as a completed assistant
+        message is here exactly once, as the text that was shown, and nothing
+        else is. A task result is remembered by WHAT IT SAID, with its provenance
+        as a short marker on the same turn. A turn that carried context items
+        sent them in full exactly ONCE, with that turn; here only a short
+        provenance line per item remains.
+        """
+        return tuple({"role": turn.role, "text": turn.text} for turn in self._conversation_store.state.turns)
+
+    def _conversation_state(self) -> Any:
+        """The canonical conversation as the call receives it: an immutable
+        snapshot (turns, compacted digests, pins) - the provider's budget is
+        applied where the call is assembled (jarvis.conversation)."""
+        return self._conversation_store.state
 
     def _tell(self, kind: str, source: str, *args: Any) -> None:
         """Say a JARVIS-owned notice (a ``Bridge`` catalog source)."""
@@ -354,7 +448,9 @@ class Bridge(QObject):
         elif self._clarification or self._task.get("status") == "awaiting_clarification":
             state = "awaiting_input"
         else:
-            state = self._last_outcome
+            # A run that ended without achieving what was asked is not a success
+            # state for the core: nothing is running, and nothing was completed.
+            state = "idle" if self._last_outcome == "unmet" else self._last_outcome
         if state != self._core_state:
             self._core_state = state
         self.stateChanged.emit()
@@ -366,33 +462,99 @@ class Bridge(QObject):
 
     # -- envelopes -----------------------------------------------------------
 
-    def _apply_run(self, payload: Any, intent: Any = None) -> None:
-        """Render one task envelope: replaces the task block and the approval."""
-        for entry in run_entries(payload):
-            self._say(entry["kind"], entry["text"])
+    def _apply_run(self, payload: Any, intent: Any = None, request: str = "") -> None:
+        """Render one task envelope: replaces the task block and the approval.
+
+        ``request`` is the person's message that started this run, when it did:
+        a task (and a session) with no name yet is named from it - once, never
+        by a model, and a rename of theirs is never replaced."""
+        # What the envelope cannot say about its own task. The capability and the
+        # destination come from the resolved intent, and on a later envelope of
+        # the same task (an approval carried out, say) from the task block this
+        # window already holds. The presentation boundary needs them to decide
+        # what this task's RESULT may be (present._grounded).
+        resolved = task_status(payload, intent) if intent is not None else {}
+        facts = {key: resolved.get(key) or self._task.get(key, "") for key in ("capability", "destination")}
+        task_id = str((payload.get("task") or {}).get("id") or "") if isinstance(payload, dict) and isinstance(payload.get("task"), dict) else ""
+        run_status = str(payload.get("run_status") or "") if isinstance(payload, dict) else ""
+        # A completed result shown for the first time carries what the run took; a
+        # re-delivered one (a resume, a retry, a reopen) is not measured again.
+        fresh = bool(task_id) and run_status == "completed" and f"result:{task_id}:{run_status}" not in self._conversation_store.state.keys
+        result_usage = (payload.get("result") or {}).get("usage") if isinstance(payload, dict) and isinstance(payload.get("result"), dict) else None
+        for entry in run_entries(payload, facts):
+            if fresh and entry.get("kind") == "result":
+                measured = self._measured(*self._intent_reports(intent), result_usage)
+                if measured:
+                    entry["telemetry"] = measured
+            self._say(entry.pop("kind"), entry.pop("text"), task_id=task_id, run_status=run_status, **entry)
         if isinstance(payload, dict):
             session_id = (payload.get("session") or {}).get("id") if isinstance(payload.get("session"), dict) else None
             if isinstance(session_id, str):
                 self._session_id = session_id
             if isinstance(payload.get("task"), dict) and isinstance(payload["task"].get("id"), str):
                 self._task = task_status(payload, intent)
+        if self._task.get("task_id"):
+            if request:
+                self._conversation_store.name_auto((self._task["task_id"], self._session_id), task_title(request))
+            self._task["title"] = self._conversation_store.title(self._task["task_id"])
         self._ticket = approval_ticket(payload)
         # Shown whenever Core sent a request - incomplete ones included, so a
         # request missing its binding reads as unavailable, never as absent.
         self._approval = approval_card(payload)
-        self._last_outcome = outcome_kind(payload)
+        self._last_outcome = outcome_kind(payload, facts=facts)
         if self._ticket is not None:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Approval required: %1 -> %2"),
                         (self._approval.get("action"), self._approval.get("destination"))), "approval")
         elif self._last_outcome == "unknown":
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "OUTCOME UNKNOWN for task %1"), (self._task.get("task_id"),)), "unknown")
+        elif self._last_outcome == "unmet" and self._task:
+            # The run ended; what was asked did not happen. The live feed says that,
+            # not "completed", which would be a claim JARVIS cannot make.
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 ended without achieving what was asked"),
+                        (self._task_label(),)), "unmet")
+        elif self._last_outcome == "completed" and self._task:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 completed"),
+                        (self._task_label(),)), "system")
         elif self._task:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 %2"),
-                        (self._task.get("task_id")[:8], self._task.get("run_status"))), "system")
+                        (self._task_label(), self._task.get("run_status"))), "system")
         self.approvalChanged.emit()
         self.dataChanged.emit()
 
     # -- streaming preview ---------------------------------------------------
+
+    def _measured(self, *reports: Any) -> dict:
+        """What the finished run took, measured - once: the next answer of the
+        same run gets nothing. ``first_ms`` is the first text that became visible;
+        ``thinking_ms`` only a provider's OWN reasoning time, never inferred;
+        ``tokens`` only what the providers reported."""
+        if self._work_ms is None:
+            return {}
+        measured = {"elapsed_ms": self._work_ms}
+        thinking = next((r["thinking_ms"] for r in reports if isinstance(r, dict)
+                         and type(r.get("thinking_ms")) is int and r["thinking_ms"] >= 0), None)
+        if thinking is not None:
+            measured["thinking_ms"] = thinking
+        elif self._first_visible is not None and self._work_started is not None:
+            measured["first_ms"] = max(0, round((self._first_visible - self._work_started) * 1000))
+        tokens = reported_tokens(*reports)
+        if tokens:
+            measured["tokens"] = tokens
+            cached = reported_cache_tokens(*reports)
+            if cached:
+                measured["cached_tokens"] = cached
+        self._work_ms = None
+        return measured
+
+    @staticmethod
+    def _intent_reports(intent: Any) -> tuple:
+        usage = intent.get("usage") if isinstance(intent, dict) and isinstance(intent.get("usage"), dict) else {}
+        research = usage.get("research") if isinstance(usage.get("research"), dict) else {}
+        return usage.get("reported"), research.get("reported")
+
+    def _task_label(self) -> str:
+        """The live task as notes name it: its title, else a short id."""
+        return self._task.get("title") or str(self._task.get("task_id") or "")[:8]
 
     def _preview_relay(self, request_id: str) -> Callable[[str], None]:
         """What the worker calls with each reply preview; it reaches the GUI thread queued."""
@@ -407,6 +569,8 @@ class Bridge(QObject):
             return
         if not self._stream_text:
             self._stream_ts = time.time()
+            if self._first_visible is None and text.strip():
+                self._first_visible = self._clock()
         self._stream_text = redact_text(text)
         self.streamChanged.emit()
 
@@ -430,7 +594,7 @@ class Bridge(QObject):
             return ""
         return QLocale().toString(QDateTime.fromSecsSinceEpoch(int(self._stream_ts)).time(), QLocale.FormatType.ShortFormat)
 
-    def _apply_text(self, payload: Any, text: str) -> None:
+    def _apply_text(self, payload: Any, text: str, request: str = "") -> None:
         intent = payload.get("intent") if isinstance(payload, dict) else None
         if not isinstance(intent, dict):
             intent = None
@@ -456,7 +620,13 @@ class Bridge(QObject):
                 if provider.get("id") == "codex":
                     provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))} for m in provider.get("models") or []]
             self.providersChanged.emit()
-        for entry in text_entries(payload):
+        entries = text_entries(payload)
+        answered = status in ("conversation", "research")
+        for index, entry in enumerate(entries):
+            if answered and index == len(entries) - 1:
+                measured = self._measured(*self._intent_reports(intent))
+                if measured:
+                    entry["telemetry"] = measured
             if status == "conversation" and not isinstance(entry.get("text"), str):
                 # Separately answered groups: rendered once, in the interface language,
                 # so the reply is ordinary text - copyable, quotable, part of the history.
@@ -466,7 +636,7 @@ class Bridge(QObject):
             self._say(entry.pop("kind"), entry.pop("text"), chat=status in ("conversation", "research"), **entry)
         self._clarification = {}
         if status == "structured":
-            self._apply_run(payload.get("run"), intent)
+            self._apply_run(payload.get("run"), intent, request=request or text)
             return
         self._ticket, self._approval = None, {}
         if status == "clarification_required" and isinstance(intent, dict):
@@ -502,6 +672,13 @@ class Bridge(QObject):
     @Property(str, notify=stateChanged)
     def coreState(self) -> str:
         return self._core_state
+
+    @Property(float, notify=stateChanged)
+    def workStartedAt(self) -> float:
+        """When the request being worked on started, in epoch milliseconds; 0 when
+        nothing is running. Display only - the live turn's running time. The ONE
+        measured duration of a finished answer is its telemetry (``_measured``)."""
+        return self._work_started_at * 1000 if self._busy else 0.0
 
     @Property(bool, notify=stateChanged)
     def executing(self) -> bool:
@@ -760,13 +937,15 @@ class Bridge(QObject):
             return False
         self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
-        conversation = self._conversation()   # before this turn: the window is what came earlier
+        conversation = self._conversation_state()   # before this turn: what came earlier
         groups, attachments, mode = self._take_context()
         # The feed keeps what the turn carried (paths dropped) so later history
-        # can name it briefly; the full content travels with this turn only.
+        # can name it briefly; the full content travels with this turn only. The
+        # canonical turn keeps each reference's identity (and JARVIS's own
+        # snapshot path, a local handle) for a later, explicit re-hydration.
         self._say("user", text,
                   groups=[{**g, "attachments": [self._shown(a) for a in g["attachments"]]} for g in groups],
-                  attachments=[self._shown(a) for a in attachments])
+                  attachments=[self._shown(a) for a in attachments], refs=turn_refs(groups, attachments))
         self.clearContext()
         self.inputAccepted.emit()
         session_id = self._session_id or None
@@ -802,7 +981,7 @@ class Bridge(QObject):
         previous = clarification["previous_text"]
         self._clarification = {}
         self.approvalChanged.emit()
-        conversation = self._conversation()
+        conversation = self._conversation_state()
         self._say("user", label)
         self.inputAccepted.emit()
         session_id = self._session_id or None
@@ -817,7 +996,7 @@ class Bridge(QObject):
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
                                              response_language=language, conversation=conversation,
                                              on_reply_preview=relay, **route),
-            lambda payload: self._apply_text(payload, label),
+            lambda payload: self._apply_text(payload, label, request=previous),
         )
 
     @Slot()
@@ -963,7 +1142,7 @@ class Bridge(QObject):
         self._run("sessions", self.backend.sessions, self._set_sessions)
 
     def _set_sessions(self, payload: Any) -> None:
-        self._sessions = rows(payload, "sessions", "session_id")
+        self._sessions = self._titled(rows(payload, "sessions", "session_id"), "session_id")
         if isinstance(payload, dict) and payload.get("error") is not None:
             self._last_error = str(payload["error"].get("message"))
         self.dataChanged.emit()
@@ -973,8 +1152,26 @@ class Bridge(QObject):
         self._run("tasks", lambda: self.backend.tasks(str(session_id)), self._set_tasks)
 
     def _set_tasks(self, payload: Any) -> None:
-        self._tasks = rows(payload, "tasks", "task_id")
+        self._tasks = self._titled(rows(payload, "tasks", "task_id"), "task_id")
         self.dataChanged.emit()
+
+    def _titled(self, listing: list, key: str) -> list:
+        """Each row with its display name ("" when it has none); the id stays."""
+        return [{**row, "title": self._conversation_store.title(str(row.get(key) or ""))} for row in listing]
+
+    @Slot(str, str, result=bool)
+    def renameTask(self, item_id: str, title: str) -> bool:
+        """The person's own name for a task or session; it always wins over the
+        automatic one. An empty name changes nothing (False)."""
+        if not self._conversation_store.rename(str(item_id), str(title)):
+            return False
+        self._sessions = self._titled(self._sessions, "session_id")
+        self._tasks = self._titled(self._tasks, "task_id")
+        if self._task.get("task_id") == item_id:
+            self._task["title"] = self._conversation_store.title(item_id)
+            self.stateChanged.emit()
+        self.dataChanged.emit()
+        return True
 
     @Slot(str, str)
     def showTask(self, session_id: str, task_id: str) -> None:
@@ -1366,9 +1563,14 @@ class Bridge(QObject):
 
     @Slot(str, str, result=bool)
     def quoteSelection(self, entry_id: str, text: str) -> bool:
-        """Quote exactly the selected part of one conversational message: a new group."""
+        """Quote exactly the selected part of one conversational message: a new group.
+
+        A rendered document separates its blocks with U+2029/U+2028: those are the
+        renderer's marks for a line break, never content. They become newlines
+        again here, so a quote carries the text and not a document's shape.
+        """
         entry = self._entry(str(entry_id))
-        selected = str(text).strip()
+        selected = str(text).replace(" ", "\n").replace(" ", "\n").strip()
         return entry is not None and bool(selected) and self._start_group(entry, "partial", selected)
 
     @Slot(str, str)
@@ -1745,6 +1947,10 @@ class Bridge(QObject):
         execution = self.executionState
         approval = dict(self._approval)
         if approval:
+            # The connector's outbound sentence, rendered in the interface language
+            # when JARVIS knows it (present.OUTBOUND_TEXT) and as written otherwise.
+            approval["summary"] = render(approval.get("summary"))
+            approval["reason"] = render(approval.get("reason"))
             decidable = self._ticket is not None and bool(approval.get("complete")) and not self._busy
             approval["capability"] = str(self._task.get("capability") or "")
             # Frozen: approving would start work, so it waits for Resume; rejecting
@@ -1755,7 +1961,7 @@ class Bridge(QObject):
                                 if not approval.get("complete") or self._ticket is None
                                 else tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."))
                                 if not self.executionEnabled else "")
-        outcome = task_outcome(self._task)
+        outcome = task_outcome(self._task, self._last_outcome == "unmet")
         items: list[dict[str, Any]] = []
         if execution in ("frozen", "freeze_requested", "resuming", "refused", "unconfirmed"):
             items.append({"key": "execution", "level": 1, "tone": "danger", "label": tx("Bridge", {
@@ -1785,6 +1991,9 @@ class Bridge(QObject):
     @staticmethod
     def _outcome_attention(kind: str) -> tuple | None:
         """(level, tone, label) for an outcome that needs attention, else None."""
+        # ``unmet`` is deliberately absent: nothing failed, nothing is pending and
+        # nothing was changed, so it is stated on the outcome card and in the live
+        # feed rather than raised as something to act on.
         entry = {"unknown": (3, "unknown", QT_TRANSLATE_NOOP("Bridge", "Outcome unknown")),
                  "in_progress": (3, "unknown", QT_TRANSLATE_NOOP("Bridge", "Outcome not established yet")),
                  "blocked": (4, "warning", QT_TRANSLATE_NOOP("Bridge", "Action blocked")),
@@ -2073,6 +2282,8 @@ class Bridge(QObject):
             self._shutting_down = True
         for timer in self.findChildren(QTimer):
             timer.stop()
+        # A turn whose write met a busy file is written now, not lost with the process.
+        self._conversation_store.flush()
 
     @Slot()
     def waitIdle(self) -> None:

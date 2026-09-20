@@ -31,7 +31,7 @@ Rectangle {
                 border.width: 1; border.color: on ? Theme.alpha(seg.accent, 0.6) : "transparent"
                 Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
                 Text { id: t; anchors.centerIn: parent; text: modelData.label; color: on ? seg.accent : (hovered ? Theme.text : Theme.textLabel)
-                    font { family: Theme.font; pixelSize: 12; weight: on ? Font.DemiBold : Font.Normal } }
+                    font: on ? Theme.captionStrong : Theme.caption }
                 MouseArea { id: m; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: seg.picked(modelData.value) }
             }
         }
