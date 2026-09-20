@@ -38,8 +38,10 @@ only when the composition root turned a configured origin into exact
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, Mapping
@@ -216,6 +218,118 @@ def url_in_origin(url: Any, origin: str) -> bool:
     parsed = urlsplit(url)
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme}://{parsed.hostname}{port}" == origin
+
+
+#: Host names that always mean "this machine", whatever they resolve to. Text
+#: alone is never the whole test (see ``private_host_refusal``); these are the
+#: names reserved for loopback by specification, so a request naming one needs
+#: no resolution to be classified.
+_LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"})
+#: Name suffixes reserved for local or intranet resolution.
+_LOCAL_NAME_SUFFIXES = (".localhost", ".local", ".internal", ".intranet", ".lan", ".home.arpa")
+
+
+#: The characters a numeric host can be spelled with - decimal, hex and the
+#: ``0x`` marker. Anything else makes it a NAME, which is not decided here.
+_NUMERIC_HOST_CHARS = frozenset("0123456789abcdefx.")
+
+
+def _as_address(name: str) -> Any:
+    """``name`` as an IP address, including the legacy spellings, or ``None``.
+
+    A browser accepts far more than dotted-quad: ``127.1``, ``2130706433`` and
+    ``0x7f.0.0.1`` all reach loopback, and ``ipaddress`` parses none of them.
+    Classifying only the canonical spelling would leave the shorthand forms as
+    "an ordinary name" and let them straight through, so the legacy forms are
+    resolved with ``inet_aton`` - the same parser the C library gives the
+    browser - and only for hosts that could be numeric at all.
+    """
+    try:
+        return ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    if not name or set(name) - _NUMERIC_HOST_CHARS:
+        return None
+    try:
+        return ipaddress.ip_address(socket.inet_aton(name))
+    except (OSError, ValueError):
+        return None
+
+
+def private_host_refusal(host: Any) -> str | None:
+    """Why this host is a local or private destination, or ``None`` (DB-002).
+
+    The browser JARVIS drives sits INSIDE the operator's network, so a page it
+    loads can reach what nothing on the internet can: services on this
+    machine's loopback, the router, a printer, an intranet application, a
+    cloud instance's link-local metadata endpoint. Approving a public origin
+    authorizes none of that.
+
+    Literal addresses are classified by ``ipaddress``, not by text, so the
+    many spellings of one address - ``127.1``, ``0x7f.0.0.1``, ``[::1]``,
+    ``[::ffff:127.0.0.1]`` - give one answer, and every special-use range the
+    library knows is covered rather than a hand-kept list of prefixes. Names
+    are judged only where the NAME itself is reserved; a public name that
+    RESOLVES to a private address is a different question, and the gate
+    answers it with the address the browser actually used.
+    """
+    if type(host) is not str or not host:
+        return "the request names no host"
+    name = host.strip("[]").rstrip(".").casefold()
+    if name in _LOOPBACK_NAMES or name.endswith(_LOCAL_NAME_SUFFIXES):
+        return "the request names a local host"
+    address = _as_address(name)
+    if address is None:
+        return None                      # an ordinary name: nothing decided here
+    mapped = getattr(address, "ipv4_mapped", None) or address
+    if mapped.is_loopback:
+        return "the request addresses loopback"
+    if mapped.is_link_local:
+        return "the request addresses a link-local service"
+    if mapped.is_multicast:
+        # ``ipaddress`` calls multicast GLOBAL and not private, so neither
+        # test below catches 224.0.0.0/4 or ff00::/8 - and those are delivered
+        # on the local link, which is exactly the network an approved public
+        # origin has no business reaching (DB-002B-02).
+        return "the request addresses a multicast group"
+    if mapped.is_private or not mapped.is_global:
+        # ``is_private`` covers RFC1918, unique-local IPv6 (fc00::/7), the
+        # unspecified address and the other reserved blocks; ``is_global``
+        # catches anything a later library release classifies that this does
+        # not enumerate.
+        return "the request addresses a private network"
+    return None
+
+
+def request_destination_refusal(url: Any, origin: str) -> str | None:
+    """Why this renderer request is not authorized, or ``None`` (DB-002).
+
+    THE ONE PREDICATE every request the browser makes is judged by: the
+    top-level document, every redirect hop, and every subresource the page
+    asks for - an image, a script, a stylesheet, a font, an XHR or ``fetch``,
+    a form submission, a frame. An approved page is not a trusted one: the
+    bytes deciding what it requests next came off the network.
+
+    Origin-level, exactly as the grant is - any path on the approved origin,
+    and nothing off it: not a sibling host, not the same host on another port,
+    not a CDN the page happens to want. Reaching a CDN is a second grant,
+    never a silent consequence of the first.
+
+    A private or loopback destination is refused even when the origin string
+    matches, UNLESS the approved origin is itself that destination: an
+    operator who approved ``http://127.0.0.1:8080`` gets exactly that, which
+    is what an explicit grant means, and gets nothing else local with it.
+    """
+    if browser_url_refusal(url) is not None:
+        return "the request is not a readable web URL"
+    if not url_in_origin(url, origin):
+        return "the request leaves the approved origin"
+    reason = private_host_refusal(urlsplit(url).hostname)
+    if reason is None:
+        return None
+    # Same origin AND the grant itself names a local host: that IS the
+    # explicit authority for this destination, and covers only it.
+    return None if private_host_refusal(urlsplit(origin).hostname) is not None else reason
 
 
 def browser_url_refusal(value: Any) -> str | None:
@@ -653,6 +767,43 @@ _ORIGIN_GATE_METHODS = frozenset(
     }
 )
 
+#: THE PERSISTENT POLICY'S OWN METHOD SET (DB-002 lifecycle). Not a
+#: capability's set and never derived from a plan: this is the standing
+#: mediation over ONE JARVIS-owned tab, which outlives every operation on it.
+#:
+#: WHAT IS ABSENT IS THE POINT. ``Fetch.disable`` is NOT here, so the policy
+#: connection physically cannot disarm itself - the allowlist refuses the name
+#: before it reaches the socket. A standing policy can therefore end in only
+#: one way, by destroying the page it was mediating (``Target.closeTarget``),
+#: which is the ordering "network offline before policy removal" expressed as
+#: a set of names rather than as a sequence somebody has to get right.
+#: ``Page.navigate`` is absent, so the policy can never move the page;
+#: ``Fetch.fulfillRequest`` and ``Fetch.continueWithAuth`` are absent for the
+#: same reasons they are absent from the navigation gate.
+#: The whole ``Runtime`` domain is absent too: nothing in this build evaluates
+#: anything, in any method set.
+BROWSER_POLICY_METHODS = frozenset(
+    {
+        "Target.attachToTarget",
+        "Target.setAutoAttach",
+        "Target.closeTarget",
+        # THE PUMP. Browser-level and answered by the browser process
+        # whatever the page is doing. The page-session read this used to use
+        # is NOT answered while an auto-attached child is held at startup, so
+        # the standing policy blocked on it and stopped judging anything -
+        # measured against Edge 153 on a page that creates a worker.
+        "Target.getTargets",
+        "Fetch.enable",
+        "Fetch.continueRequest",
+        "Fetch.failRequest",
+        # The tab's own browser context goes when the tab does. It is the
+        # thing that routed that tab to its own pre-connect boundary, so
+        # leaving it behind would leave a network identity with no tab
+        # (BROWSER-WS-01).
+        "Target.disposeBrowserContext",
+    }
+)
+
 #: What one approved navigation may follow before the chain itself is refused.
 BROWSER_MAX_REDIRECT_HOPS = 10
 #: How much protocol traffic one guarded navigation may produce before its
@@ -672,6 +823,18 @@ BROWSER_CAPABILITY_METHODS: Mapping[str, frozenset[str]] = {
     "browser_tab_open": frozenset(
         {
             "Target.getTargets",
+            # A JARVIS tab is created in a browser context of its own, which
+            # is what routes it to a pre-connect boundary serving only that
+            # tab's origin. Without it, a WebSocket - which no renderer gate
+            # can see - would leave through a boundary shared with every
+            # other tab (BROWSER-WS-01).
+            "Target.createBrowserContext",
+            # AND DISPOSING IT. Opening a tab is a transaction: if any step
+            # after the context is created fails, the context has to go back
+            # with everything else. Without this name in the set the undo is
+            # refused at the socket and the context is leaked - which was the
+            # whole transactional-startup defect.
+            "Target.disposeBrowserContext",
             "Target.createTarget",
             "Target.attachToTarget",
             "Page.navigate",
@@ -1066,6 +1229,7 @@ __all__ = [
     "BROWSER_MAX_TABS",
     "BROWSER_MONETARY_STATE",
     "BROWSER_ORIGIN_MAX_CHARS",
+    "BROWSER_POLICY_METHODS",
     "BROWSER_READ_CAPABILITIES",
     "BROWSER_SCHEMES",
     "BROWSER_TEXT_MAX_CHARS",
@@ -1107,5 +1271,7 @@ __all__ = [
     "browser_text_refusal",
     "browser_url_refusal",
     "is_browser_destination",
+    "private_host_refusal",
+    "request_destination_refusal",
     "url_in_origin",
 ]

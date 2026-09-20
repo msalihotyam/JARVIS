@@ -117,9 +117,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from shutil import which
 from typing import Any, Iterator, Mapping
 
+from jarvis.trusted_exec import resolve_trusted_executable
 from jarvis.gmail import (
     GMAIL_ATTESTATION_MAX_BYTES,
     GMAIL_ATTESTATION_NAME,
@@ -254,7 +254,16 @@ class GmailCommandOutput:
     metadata: tuple[tuple[str, str | None], ...] = ()
 
 
-def gws_executable(*, path_lookup: Any = which) -> str:
+def trusted_gws_lookup(name: str) -> str | None:
+    """``gws`` by provenance, never by a search that can reach the current
+    directory: a ``gws.exe`` in the workspace JARVIS was pointed at is not the
+    Google Workspace CLI, and it would be started against a real, logged-in
+    Google session (DB-001)."""
+    found = resolve_trusted_executable(name)
+    return None if found is None else found.path
+
+
+def gws_executable(*, path_lookup: Any = trusted_gws_lookup) -> str:
     """The resolved ``gws`` path, or fail closed. Resolved fresh every call."""
     resolved = path_lookup(GWS_EXECUTABLE_NAME)
     if not resolved or type(resolved) is not str:
@@ -303,7 +312,7 @@ def _run(
     config_dir: str,
     cwd: str,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gws_lookup,
     popen: Any = subprocess.Popen,
     timeout: int = GWS_READ_TIMEOUT_SECONDS,
     inherit_stderr: bool = False,
@@ -591,7 +600,7 @@ def gmail_controlled_login(
     principal: Any,
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gws_lookup,
     popen: Any = subprocess.Popen,
     now: Any = _utc_now_text,
 ) -> GmailCredentialAttestation:
@@ -687,7 +696,7 @@ def gmail_route_check(
     config_dir: str,
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gws_lookup,
     popen: Any = subprocess.Popen,
 ) -> None:
     """Require the dedicated authorized-user route, or fail closed.
@@ -722,7 +731,7 @@ def observed_gmail_identity(
     config_dir: Any,
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gws_lookup,
     popen: Any = subprocess.Popen,
 ) -> tuple[str, str]:
     """The ``(principal, credential_route)`` the dedicated session acts as.
@@ -847,7 +856,7 @@ def run_operation_plan(
     *,
     config_dir: str,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gws_lookup,
     popen: Any = subprocess.Popen,
 ) -> GmailCommandOutput:
     """Execute ONE re-proved plan, or fail closed - or, for a write that

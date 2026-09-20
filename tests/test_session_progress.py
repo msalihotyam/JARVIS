@@ -103,7 +103,7 @@ class ProcessBoundaryTestCase(unittest.TestCase):
         for target, attribute in (
             (claude_code.subprocess, "Popen"),
             (claude_code.subprocess, "run"),
-            (claude_code.shutil, "which"),
+            (claude_code, "resolve_trusted_executable"),
         ):
             patcher = mock.patch.object(
                 target,

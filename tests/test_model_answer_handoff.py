@@ -1432,7 +1432,7 @@ class IsolationTests(HandoffTestCase):
         ), mock.patch(
             "jarvis.connectors.claude_code.subprocess.run", side_effect=AssertionError
         ), mock.patch(
-            "jarvis.connectors.claude_code.shutil.which", side_effect=AssertionError
+            "jarvis.connectors.claude_code.resolve_trusted_executable", side_effect=AssertionError
         ):
             source_task = self.source_task()
             run = app.core.run(source_task)

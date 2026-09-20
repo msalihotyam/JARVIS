@@ -60,6 +60,7 @@ from jarvis.contracts import (
     Task,
     ToolResult,
 )
+from jarvis.trusted_exec import TrustedExecutableError, resolve_trusted_executable
 from jarvis.desktop import DESKTOP_CAPABILITY_RESOURCE, DESKTOP_DESTINATION_PREFIX
 from jarvis.destinations import DestinationGrant
 from jarvis.github import GITHUB_CAPABILITY_RESOURCE, GITHUB_DESTINATION_PREFIX
@@ -1591,7 +1592,19 @@ def claude_model_catalog(command: str = "claude") -> list[dict[str, Any]]:
     cannot be asked - never a guessed list."""
     if ClaudeCodeConnector.prohibited_billing_env_vars():
         return []
-    argv = [command, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+    # Provenance before anything starts (DB-001). This path runs BEFORE Core
+    # has approved anything, so a workspace ``claude.exe`` reaching it would
+    # be arbitrary code running ahead of the approval gate entirely.
+    located = resolve_trusted_executable(
+        command, configured=command if Path(command).is_absolute() else None
+    )
+    if located is None:
+        return []
+    try:
+        argv0 = located.argv0()
+    except TrustedExecutableError:
+        return []
+    argv = [argv0, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--tools", "", "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--disable-slash-commands", "--no-chrome", "--no-session-persistence"]
     try:

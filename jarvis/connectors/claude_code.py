@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-import shutil
 import stat
 import subprocess
 import threading
@@ -67,6 +66,12 @@ from jarvis.contracts import (
 )
 from jarvis.planning import build_task_plan
 from jarvis.settings import validate_claude_effort, validate_claude_model
+from jarvis.trusted_exec import (
+    TrustedExecutable,
+    TrustedExecutableError,
+    resolve_trusted_executable,
+    trusted_environment,
+)
 
 
 #: Structured keys whose whole value is dropped from the outbound payload.
@@ -117,6 +122,15 @@ PROHIBITED_BILLING_ENV_VARS = (
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 )
+
+#: What the Claude CLI legitimately reads: its own configuration and OAuth
+#: session home, plus the OS basics every child needs. An ALLOWLIST (DB-001):
+#: a removal policy has to anticipate every secret that might be in the
+#: parent environment, whereas nothing outside this list is there to leak.
+#: ``CLAUDE_CODE_USE_BEDROCK``/``_VERTEX`` match the prefix and are removed
+#: afterwards, because their absence is the billing policy.
+CLAUDE_ALLOWED_ENV_PREFIXES = ("CLAUDE_",)
+CLAUDE_ALLOWED_ENV_VARS = ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "NODE_OPTIONS")
 
 #: The only task preferences that may leave the machine, in this order.
 #:
@@ -335,10 +349,43 @@ class ClaudeCodeConnector(BaseConnector):
         self.effort = None if effort is None else validate_claude_effort(effort)
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._process_lock = threading.Lock()
+        #: The located CLI, resolved on first use and then reused (DB-001).
+        self._executable: TrustedExecutable | None = None
+
+    def _trusted_executable(self) -> TrustedExecutable | None:
+        """The CLI's absolute, canonical path - resolved once, then reused.
+
+        Resolved through ``jarvis.trusted_exec`` so the current directory is
+        never searched (DB-001): the connector's working directory is the
+        repository it was pointed at, and a ``claude.exe`` committed there
+        would otherwise BE the Claude CLI, on JARVIS's authority, before Core
+        approves anything. Resolved once rather than per call so two spawns in
+        one task cannot end up being two different programs; the identity is
+        re-checked at each spawn by ``argv0``.
+
+        A ``command`` that is already an absolute path is treated as the
+        operator's explicit configuration and is validated as such; a bare
+        name is a name, and is looked up by provenance.
+        """
+        if self._executable is None:
+            configured = self.command if Path(self.command).is_absolute() else None
+            self._executable = resolve_trusted_executable(
+                self.command, configured=configured, workspace=self.allowed_roots
+            )
+        return self._executable
+
+    def _argv0(self) -> str | None:
+        """The path to spawn, re-validated now, or ``None`` to refuse."""
+        executable = self._trusted_executable()
+        if executable is None:
+            return None
+        try:
+            return executable.argv0(workspace=self.allowed_roots)
+        except TrustedExecutableError:
+            return None
 
     def availability(self) -> Availability:
-        command_path = shutil.which(self.command)
-        if command_path is None and not Path(self.command).is_file():
+        if self._trusted_executable() is None:
             return Availability(False, "Claude Code CLI is not installed or not on PATH")
         return Availability(True)
 
@@ -401,9 +448,12 @@ class ClaudeCodeConnector(BaseConnector):
 
     def _auth_status(self) -> dict[str, Any] | None:
         """Local, non-model auth probe. Raw output never leaves this method."""
+        argv0 = self._argv0()
+        if argv0 is None:
+            return None
         try:
             completed = subprocess.run(
-                [self.command, "auth", "status", "--json"],
+                [argv0, "auth", "status", "--json"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -424,15 +474,24 @@ class ClaudeCodeConnector(BaseConnector):
 
     @staticmethod
     def _sanitized_environment() -> dict[str, str]:
-        """Child environment with metered credential routes removed.
+        """The child environment: an allowlist, then the billing subtraction.
 
-        Matching is case-insensitive so Windows environment casing cannot
-        smuggle a prohibited variable through.
+        The allowlist is what contains the damage (DB-001) - the CLI gets the
+        OS basics and its own ``CLAUDE_*`` configuration, so another
+        provider's token or an unrelated JARVIS secret simply is not in the
+        environment it is handed. The prohibited names are removed afterwards
+        as well, because two of them match ``CLAUDE_*`` and their ABSENCE is
+        what the subscription billing route is established on. Matching is
+        case-insensitive so Windows environment casing cannot smuggle a
+        prohibited variable through.
         """
         prohibited = {name.upper() for name in PROHIBITED_BILLING_ENV_VARS}
+        child = trusted_environment(
+            allow=CLAUDE_ALLOWED_ENV_VARS, prefixes=CLAUDE_ALLOWED_ENV_PREFIXES
+        )
         return {
             key: value
-            for key, value in os.environ.items()
+            for key, value in child.items()
             if key.upper() not in prohibited
         }
 
@@ -548,7 +607,25 @@ class ClaudeCodeConnector(BaseConnector):
                 billing_evidence=evidence,
             )
 
+        # Provenance immediately before the spawn (DB-001): the path is
+        # re-validated against the identity it had when it was accepted, and
+        # against THIS task's working directory, which is only known here.
+        argv0 = self._argv0()
+        if argv0 is None:
+            return self._error_result(
+                task,
+                ErrorCode.CONNECTOR_UNAVAILABLE,
+                "Claude Code CLI is not installed or is not on PATH.",
+                retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+            )
+        # Every subclass builds its own argv on top of ``_command`` and keeps
+        # that shape; only the program being started is replaced, so a
+        # subclass cannot inherit the hardened arguments while still being
+        # spawned by name.
         command = self._command(prompt)
+        command[0] = argv0
         # What the CLI reads on stdin, when the call does not carry its prompt
         # in argv (see ``_stdin_payload``). ``None`` keeps today's argv-only call.
         stdin_text = self._stdin_payload(prompt)

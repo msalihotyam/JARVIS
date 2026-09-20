@@ -22,6 +22,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from jarvis.trusted_exec import resolve_trusted_executable, trusted_environment
+
 #: Variables that could point the CLI at a metered Google route. They are never
 #: passed on; only their names are compared, never their values.
 GOOGLE_METERED_ENV_PREFIXES = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_CLOUD_PROJECT",
@@ -30,16 +32,29 @@ USAGE_TIMEOUT_SECONDS = 30
 _WINDOWS = ("weekly", "5h")
 
 
+#: What the Antigravity CLI legitimately reads: its own configuration/session
+#: home, plus the OS basics. An ALLOWLIST, so no unrelated JARVIS credential
+#: is in the environment it is handed (DB-001).
+AGY_ALLOWED_ENV_PREFIXES = ("AGY_", "ANTIGRAVITY_")
+AGY_ALLOWED_ENV_VARS = ("XDG_CONFIG_HOME", "XDG_CACHE_HOME")
+
+
 def agy_executable() -> str | None:
-    found = shutil.which("agy")
-    if found:
-        return found
-    default = Path(os.environ.get("LOCALAPPDATA", "")) / "agy" / "bin" / "agy.exe"
-    return str(default) if os.environ.get("LOCALAPPDATA") and default.is_file() else None
+    """The Antigravity CLI by provenance: its known install root first, then
+    PATH enumerated by ``jarvis.trusted_exec``. Never a search that can reach
+    the current directory - an ``agy.exe`` sitting in the workspace JARVIS was
+    pointed at is not the Antigravity CLI (DB-001)."""
+    local = os.environ.get("LOCALAPPDATA")
+    roots = (Path(local) / "agy" / "bin" / "agy.exe",) if local else ()
+    found = resolve_trusted_executable("agy", install_paths=roots)
+    return None if found is None else found.path
 
 
 def _environment() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if not key.upper().startswith(GOOGLE_METERED_ENV_PREFIXES)}
+    child = trusted_environment(allow=AGY_ALLOWED_ENV_VARS, prefixes=AGY_ALLOWED_ENV_PREFIXES)
+    # The metered Google routes are excluded by construction, and removed
+    # again here so a future prefix allowance cannot re-admit one.
+    return {key: value for key, value in child.items() if not key.upper().startswith(GOOGLE_METERED_ENV_PREFIXES)}
 
 
 def usage_groups(payload: Any) -> list[dict[str, Any]]:

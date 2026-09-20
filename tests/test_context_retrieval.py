@@ -48,7 +48,7 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DummyConnector, installed_cli, make_task, safe_cleanup
 from tests.test_claude_connector import (
     INTERNAL_PREFERENCES,
     OAUTH_MAX_AUTH_STATUS,
@@ -731,7 +731,7 @@ class ConnectorRetrievalTests(unittest.TestCase):
         for target, attribute in (
             (claude_code.subprocess, "Popen"),
             (claude_code.subprocess, "run"),
-            (claude_code.shutil, "which"),
+            (claude_code, "resolve_trusted_executable"),
         ):
             patcher = mock.patch.object(
                 target,
@@ -1243,7 +1243,7 @@ class ApprovalExecutionIntegrationTests(unittest.TestCase):
                 ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
             ),
             mock.patch.object(
-                claude_code.shutil, "which", return_value=str(self.root / "claude.exe")
+                claude_code, "resolve_trusted_executable", return_value=installed_cli(self)
             ),
             mock.patch.object(
                 claude_code.subprocess,

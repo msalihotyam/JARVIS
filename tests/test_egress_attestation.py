@@ -63,7 +63,7 @@ from jarvis.destinations import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, installed_cli, make_task, open_app, open_core, safe_cleanup
 from tests.test_claude_connector import (
     OAUTH_MAX_AUTH_STATUS,
     FakeProcess,
@@ -191,7 +191,7 @@ class ConnectorAttestationMutationTests(unittest.TestCase):
         for target, attribute in (
             (claude_code.subprocess, "Popen"),
             (claude_code.subprocess, "run"),
-            (claude_code.shutil, "which"),
+            (claude_code, "resolve_trusted_executable"),
         ):
             patcher = mock.patch.object(
                 target, attribute, side_effect=AssertionError(f"{attribute}")
@@ -494,7 +494,7 @@ class CredentialRedactionTests(unittest.TestCase):
             context={"note": "openai_api_key=LEAKTWO"},
             visible_assumption="reuse github-token: LEAKTHREE",
         )
-        with mock.patch.object(claude_code.shutil, "which", side_effect=AssertionError):
+        with mock.patch.object(claude_code, "resolve_trusted_executable", side_effect=AssertionError):
             payload, count = connector._sanitized_payload(task)
         serialized = json.dumps(payload)
         for leak in ("LEAKONE", "LEAKTWO", "LEAKTHREE"):
@@ -680,7 +680,7 @@ class ResourceBoundaryTests(unittest.TestCase):
         inside = str(self.root / "inside")
         task = self.task(target=inside)
         task.estimate = CostEstimate()
-        with mock.patch.object(claude_code.shutil, "which", side_effect=AssertionError):
+        with mock.patch.object(claude_code, "resolve_trusted_executable", side_effect=AssertionError):
             approved = self.connector.permission_request(task, "session-1")
             moved = ClaudeCodeConnector(
                 allowed_roots=(self.root / "inside",),
@@ -849,7 +849,7 @@ class OldGrantCannotAuthorizeRefreshedRequestTests(unittest.TestCase):
                 ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
             ),
             mock.patch.object(
-                claude_code.shutil, "which", return_value=str(self.root / "claude.exe")
+                claude_code, "resolve_trusted_executable", return_value=installed_cli(self)
             ),
             mock.patch.object(
                 claude_code.subprocess,
@@ -965,7 +965,7 @@ class ApprovedEgressEqualsExecutedEgressTests(unittest.TestCase):
                 ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
             ),
             mock.patch.object(
-                claude_code.shutil, "which", return_value=str(self.root / "claude.exe")
+                claude_code, "resolve_trusted_executable", return_value=installed_cli(self)
             ),
             mock.patch.object(
                 claude_code.subprocess,
@@ -1135,7 +1135,7 @@ class ToolManifestTests(unittest.TestCase):
         for target, attribute in (
             (claude_code.subprocess, "Popen"),
             (claude_code.subprocess, "run"),
-            (claude_code.shutil, "which"),
+            (claude_code, "resolve_trusted_executable"),
         ):
             patcher = mock.patch.object(
                 target, attribute, side_effect=AssertionError(attribute)
@@ -1381,7 +1381,7 @@ class ApprovalDisplayBindingTests(unittest.TestCase):
         for target, attribute in (
             (claude_code.subprocess, "Popen"),
             (claude_code.subprocess, "run"),
-            (claude_code.shutil, "which"),
+            (claude_code, "resolve_trusted_executable"),
         ):
             patcher = mock.patch.object(
                 target, attribute, side_effect=AssertionError(attribute)

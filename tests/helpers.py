@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -283,3 +285,25 @@ def make_task(
             always_requires_approval=always_requires_approval,
         ),
     )
+
+
+def installed_cli(case, stem: str = "claude"):
+    """A stand-in CLI that satisfies trusted-executable provenance (DB-001).
+
+    A real file in its own temporary directory OUTSIDE the case's workspace,
+    resolved through the production resolver so the returned value carries a
+    genuine identity and survives the re-validation every spawn performs. The
+    fixture cannot live under the connector's allowed roots any more: that is
+    precisely the location the fix refuses.
+    """
+    from jarvis.trusted_exec import resolve_trusted_executable
+
+    folder = Path(tempfile.mkdtemp(prefix="jarvis-installed-cli-"))
+    case.addCleanup(shutil.rmtree, folder, True)
+    binary = folder / (f"{stem}.exe" if os.name == "nt" else stem)
+    binary.write_bytes(b"stand-in for the installed CLI")
+    if os.name != "nt":
+        binary.chmod(0o755)
+    resolved = resolve_trusted_executable(stem, configured=str(binary))
+    assert resolved is not None, "the stand-in CLI did not resolve"
+    return resolved

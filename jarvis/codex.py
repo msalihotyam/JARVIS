@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.trusted_exec import resolve_trusted_executable, trusted_environment
 from jarvis.conversation import ContextProfile
 from jarvis.contracts import (
     MODEL_ANSWER_RESULT_KEY,
@@ -73,15 +74,26 @@ CODEX_API_KEY_ROUTE = "codex_api_key_route"
 
 def codex_executable() -> str | None:
     """The native Codex binary. The npm launcher is a script; the binary it
-    starts is run directly so no shell ever parses an argument."""
-    found = shutil.which("codex")
-    if found is None:
+    starts is run directly so no shell ever parses an argument.
+
+    Located by provenance (``jarvis.trusted_exec``), never by a search that can
+    reach the current directory: a ``codex.exe`` committed to the workspace
+    JARVIS was pointed at is not the Codex CLI (DB-001). The vendored binary
+    reached from an npm launcher is validated the same way before it is
+    returned - it is found by walking the launcher's own install tree, but it
+    still has to be a real file outside every workspace."""
+    resolved = resolve_trusted_executable("codex")
+    if resolved is None:
         return None
+    found = resolved.path
     path = Path(found)
     if path.suffix.lower() in (".cmd", ".ps1", "") and not path.name.lower().endswith(".exe"):
         vendor = path.parent / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai" / "codex-win32-x64" / "vendor"
         binaries = sorted(vendor.glob("*/bin/codex.exe")) if vendor.is_dir() else []
-        return str(binaries[0]) if binaries else (None if os.name == "nt" else found)
+        vendored = resolve_trusted_executable("codex", configured=binaries[0]) if binaries else None
+        if vendored is not None:
+            return vendored.path
+        return None if os.name == "nt" else found
     return found
 
 
@@ -95,9 +107,20 @@ def cli_reason(message: Any) -> str:
     return str(redact_credentials(line)[0])
 
 
+#: What the Codex CLI legitimately reads: its own configuration/session home
+#: and the OS basics ``trusted_exec`` allows every child. An ALLOWLIST, so an
+#: unrelated credential JARVIS happens to hold is not present to be leaked
+#: (DB-001) - and the metered routes in ``CODEX_PROHIBITED_ENV_VARS`` are
+#: excluded by construction rather than by remembering to subtract them.
+CODEX_ALLOWED_ENV_PREFIXES = ("CODEX_",)
+CODEX_ALLOWED_ENV_VARS = ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "NODE_OPTIONS")
+
+
 def _environment() -> dict[str, str]:
     prohibited = {name.upper() for name in CODEX_PROHIBITED_ENV_VARS}
-    return {key: value for key, value in os.environ.items() if key.upper() not in prohibited}
+    child = trusted_environment(allow=CODEX_ALLOWED_ENV_VARS, prefixes=CODEX_ALLOWED_ENV_PREFIXES)
+    # The prefix allowance must never re-admit a prohibited metered route.
+    return {key: value for key, value in child.items() if key.upper() not in prohibited}
 
 
 def prohibited_env_present() -> bool:

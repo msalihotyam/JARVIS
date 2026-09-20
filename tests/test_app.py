@@ -887,7 +887,7 @@ class CompositionRootTests(unittest.TestCase):
         ), mock.patch.object(
             claude_code.subprocess, "Popen", side_effect=AssertionError("no subprocess")
         ), mock.patch.object(
-            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+            claude_code, "resolve_trusted_executable", side_effect=AssertionError("no probe")
         ):
             app = build_default_app(self.settings)
 
@@ -915,7 +915,7 @@ class CompositionRootTests(unittest.TestCase):
         ), mock.patch.object(
             claude_code.subprocess, "Popen", side_effect=AssertionError("no subprocess")
         ), mock.patch.object(
-            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+            claude_code, "resolve_trusted_executable", side_effect=AssertionError("no probe")
         ):
             app = build_default_app(settings)
         connector = app.core.registry.get("claude-code-plan")
@@ -928,7 +928,7 @@ class CompositionRootTests(unittest.TestCase):
         with mock.patch.object(
             claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
         ), mock.patch.object(
-            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+            claude_code, "resolve_trusted_executable", side_effect=AssertionError("no probe")
         ):
             app = build_default_app(self.settings)
 
@@ -952,7 +952,7 @@ class CompositionRootTests(unittest.TestCase):
         with mock.patch.object(
             claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
         ), mock.patch.object(
-            claude_code.shutil, "which", side_effect=AssertionError("no probe")
+            claude_code, "resolve_trusted_executable", side_effect=AssertionError("no probe")
         ):
             app = build_default_app(self.settings)
 

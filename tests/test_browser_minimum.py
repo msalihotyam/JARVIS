@@ -18,6 +18,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -162,14 +163,33 @@ def _write_frame(connection: socket.socket, text: str) -> None:
 class FakeBrowser(threading.Thread):
     """One scripted DevTools endpoint on loopback. Answers, never decides."""
 
-    def __init__(self, answers: dict, navigator: Any = None) -> None:
+    def __init__(
+        self,
+        answers: dict,
+        navigator: Any = None,
+        triggers: dict | None = None,
+        silent: set | None = None,
+    ) -> None:
         super().__init__(daemon=True)
         self.answers = answers
+        #: Methods this browser simply never answers, so the client waits.
+        #: How a timeout is reproduced without waiting for a real one.
+        self.silent = silent or set()
         self.navigator = navigator
+        #: Method name -> callable, run when the client sends that method.
+        #: How a test says "and THEN the page asked for something", at the
+        #: moment a real page would have: while the click is being
+        #: dispatched, while the tree is being read.
+        self.triggers = triggers or {}
         self.sent: list[tuple[str, dict]] = []
+        #: The standing policy's connection, recognised by the one method
+        #: only it sends. A real browser delivers a paused request to every
+        #: intercepting client; this is how the test reaches that one.
+        self.policy_connection: Any = None
+        self._write_lock = threading.Lock()
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
-        self._listener.listen(1)
+        self._listener.listen(8)
         self.port = self._listener.getsockname()[1]
         self.start()
 
@@ -178,10 +198,20 @@ class FakeBrowser(threading.Thread):
         return f"ws://127.0.0.1:{self.port}/devtools/browser/fake"
 
     def run(self) -> None:  # pragma: no cover - the thread body
-        try:
-            connection, _ = self._listener.accept()
-        except OSError:
-            return
+        """Serve every client that connects, not only the first.
+
+        The standing network policy holds a connection of its own for as long
+        as the tab lives, alongside the per-operation connection, so a browser
+        that can only be spoken to once cannot reproduce the thing under test.
+        """
+        while True:
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._client, args=(connection,), daemon=True).start()
+
+    def _client(self, connection: socket.socket) -> None:  # pragma: no cover
         with connection:
             self._handshake(connection)
             while True:
@@ -189,12 +219,40 @@ class FakeBrowser(threading.Thread):
                     message = json.loads(_read_frame(connection))
                 except (ConnectionError, OSError, ValueError):
                     return
-                self.sent.append((message["method"], message.get("params", {})))
+                method = message["method"]
+                if method == "Target.setAutoAttach":
+                    # Only the standing policy sends this.
+                    self.policy_connection = connection
+                self.sent.append((method, message.get("params", {})))
+                if method in self.silent:
+                    continue
                 try:
                     if not self._navigation(connection, message):
                         self._answer(connection, message)
+                    trigger = self.triggers.get(method)
+                    if trigger is not None:
+                        trigger()
                 except OSError:
                     return
+
+    def announce(self, frames: list) -> None:
+        """Write browser-initiated events to the STANDING POLICY's client.
+
+        What a page doing something of its own accord looks like from the
+        protocol: nobody asked, and the only client still listening is the one
+        that never went away.
+        """
+        deadline = time.monotonic() + 10
+        while self.policy_connection is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        connection = self.policy_connection
+        assert connection is not None, "no standing policy is attached"
+        for one in frames:
+            self._send(connection, one)
+
+    def _send(self, connection: socket.socket, payload: dict) -> None:  # pragma: no cover
+        with self._write_lock:
+            _write_frame(connection, json.dumps(payload))
 
     def _answer(self, connection: socket.socket, message: dict) -> None:  # pragma: no cover
         answer = self.answers.get(message["method"])
@@ -205,21 +263,17 @@ class FakeBrowser(threading.Thread):
         else:
             body = {"id": message["id"], "result": answer or {}}
         # One unrelated event first, so the command loop must skip it.
-        _write_frame(connection, json.dumps({"method": "Page.frameResized", "params": {}}))
-        _write_frame(connection, json.dumps(body))
+        self._send(connection, {"method": "Page.frameResized", "params": {}})
+        self._send(connection, body)
         if message["method"] == "Page.navigate" and self.navigator is None:
             # No scripted chain: the navigation commits immediately, which
             # still has to be SAID rather than assumed from the reply.
-            _write_frame(
+            self._send(
                 connection,
-                json.dumps(
-                    {
-                        "method": "Page.frameNavigated",
-                        "params": {
-                            "frame": {"id": FRAME, "loaderId": LOADER, "url": URL}
-                        },
-                    }
-                ),
+                {
+                    "method": "Page.frameNavigated",
+                    "params": {"frame": {"id": FRAME, "loaderId": LOADER, "url": URL}},
+                },
             )
 
     def _navigation(self, connection: socket.socket, message: dict) -> bool:  # pragma: no cover
@@ -284,7 +338,7 @@ class FakeBrowser(threading.Thread):
         else:
             return False
         for one in outbound:
-            _write_frame(connection, json.dumps(one))
+            self._send(connection, one)
         return True
 
     def _handshake(self, connection: socket.socket) -> None:  # pragma: no cover
@@ -320,6 +374,10 @@ def page_answers(**overrides):
         },
         "Target.attachToTarget": {"sessionId": "s1"},
         "Target.createTarget": {"targetId": OTHER_TAB},
+        # A JARVIS tab is created in a browser context of its own, routed to a
+        # boundary serving only that tab (BROWSER-WS-01).
+        "Target.createBrowserContext": {"browserContextId": "CTX1"},
+        "Target.disposeBrowserContext": {},
         "Target.activateTarget": {},
         "Target.closeTarget": {},
         "DOM.enable": {},
@@ -625,6 +683,7 @@ class SeamTestCase(unittest.TestCase):
             profile_dir=self.profile,
             attach=lambda **kwargs: browser.socket_url,
             sleep=lambda seconds: None,
+            policies=None,
         )
 
 
@@ -787,6 +846,7 @@ class SeamTests(SeamTestCase):
             profile_dir=self.profile,
             attach=lambda **kwargs: browser.socket_url,
             sleep=slept.append,
+            policies=None,
         )
         self.assertEqual([3], slept)
         self.assertEqual(RENDERING, output.payload["content"])
@@ -823,7 +883,7 @@ class SeamTests(SeamTestCase):
         self.assertEqual(["Target.getTargets"], [name for name, _ in browser.sent])
 
     def test_the_launch_vector_uses_a_dedicated_profile_and_no_ambient_session(self) -> None:
-        arguments = browser_arguments(profile_dir=self.profile, port=9333)
+        arguments = browser_arguments(profile_dir=self.profile, port=9333, proxy_port=54321)
         self.assertIn("--remote-debugging-port=9333", arguments)
         self.assertIn(f"--user-data-dir={self.profile}", arguments)
         self.assertIn("--disable-extensions", arguments)
@@ -1248,6 +1308,8 @@ class _GatedNavigator:
         self._before = 0
         #: Requests still paused in the browser, id -> url.
         self.paused: dict[str, str] = {}
+        self._issued = 0
+        self._ids = threading.Lock()
         #: What a Fetch.disable actually let through, and what a target close
         #: destroyed. The point of the whole exercise.
         self.released: list[str] = []
@@ -1271,7 +1333,13 @@ class _GatedNavigator:
 
     def _pause(self, url: str) -> dict:
         self.hop = url
-        request_id = f"r{len(self.paused) + len(self.fetched) + len(self.failed) + 1}"
+        # A COUNTER, not an arithmetic of the three lists. Same numbering when
+        # requests are created one at a time, but a standing policy judges on
+        # its own thread while a page announces on another, and a request id
+        # derived from list lengths can then repeat one still in flight.
+        with self._ids:
+            self._issued += 1
+            request_id = f"r{self._issued}"
         self.paused[request_id] = url
         return {
             "method": "Fetch.requestPaused",
@@ -1450,6 +1518,7 @@ class RedirectAuthorityTests(unittest.TestCase):
             profile_dir=self.profile,
             attach=lambda **kwargs: browser.socket_url,
             sleep=lambda seconds: None,
+            policies=None,
         )
 
     # -- the invariant ----------------------------------------------------
@@ -1670,6 +1739,7 @@ class RedirectAuthorityTests(unittest.TestCase):
                 profile_dir=self.profile,
                 attach=lambda **kwargs: browser.socket_url,
                 sleep=lambda seconds: None,
+                policies=None,
             )
         # Even on that path the gate is put away.
         self.assertEqual(
@@ -1996,7 +2066,6 @@ class RedirectAuthorityTests(unittest.TestCase):
                     [
                         {
                             "urlPattern": "*",
-                            "resourceType": "Document",
                             "requestStage": "Request",
                         }
                     ],
@@ -2021,13 +2090,17 @@ class RedirectAuthorityTests(unittest.TestCase):
                 self.assertNotIn("Fetch.getResponseBody", methods)
                 self.assertIn("Fetch.failRequest", methods)
 
-    def test_only_top_level_documents_are_gated(self) -> None:
-        # A page's own stylesheets, scripts and XHRs are never paused, so this
-        # is a destination gate on the approved navigation, not a network
-        # policy over the page.
+    def test_every_renderer_request_is_gated_not_only_documents(self) -> None:
+        # DB-002. This test previously asserted the OPPOSITE - that a page's
+        # own stylesheets, scripts and XHRs are never paused - which was
+        # precisely the gap: gating the document alone left the page free to
+        # fetch from any origin, from loopback and from the intranet. An
+        # absent ``resourceType`` means every renderer request is paused and
+        # judged by the same predicate.
         self.drive("browser_navigate", "/final")
         patterns = dict(self.browser.sent)["Fetch.enable"]["patterns"]
-        self.assertEqual(["Document"], [one["resourceType"] for one in patterns])
+        self.assertEqual([{"urlPattern": "*", "requestStage": "Request"}], patterns)
+        self.assertEqual([], [one for one in patterns if "resourceType" in one])
 
     def test_an_endless_redirect_chain_is_refused_rather_than_followed(self) -> None:
         loop = _Origin({})
@@ -2067,6 +2140,7 @@ class RedirectAuthorityTests(unittest.TestCase):
                 profile_dir=self.profile,
                 attach=lambda **kwargs: browser.socket_url,
                 sleep=lambda seconds: None,
+                policies=None,
             )
         self.assertLessEqual(len(self.navigator.fetched), BROWSER_MAX_REDIRECT_HOPS)
 

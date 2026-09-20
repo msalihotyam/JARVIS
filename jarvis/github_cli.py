@@ -74,9 +74,9 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from shutil import which
 from typing import Any, Mapping
 
+from jarvis.trusted_exec import resolve_trusted_executable
 from jarvis.github import (
     GH_ARGUMENT_MAX_CHARS,
     GH_MAX_ARGUMENTS,
@@ -90,8 +90,9 @@ from jarvis.github import (
     sanitized_github_environment,
 )
 
-#: The one executable name this build will ever start. Resolved through PATH
-#: by ``shutil.which`` - never a caller-supplied path, and never a shell.
+#: The one executable name this build will ever start. Located by
+#: ``jarvis.trusted_exec`` - an absolute path outside every workspace, never a
+#: caller-supplied path, never a bare name handed to the OS, never a shell.
 GH_EXECUTABLE_NAME = "gh"
 
 #: Wall-clock ceiling on one child process. A read that cannot answer inside
@@ -149,7 +150,16 @@ class GitHubCommandOutput:
     truncated: bool
 
 
-def gh_executable(*, path_lookup: Any = which) -> str:
+def trusted_gh_lookup(name: str) -> str | None:
+    """``gh`` by provenance, never by a search that can reach the current
+    directory: a ``gh.exe`` committed to the repository JARVIS was pointed at
+    is not the GitHub CLI, and it would be started against a real, logged-in
+    GitHub session (DB-001)."""
+    found = resolve_trusted_executable(name)
+    return None if found is None else found.path
+
+
+def gh_executable(*, path_lookup: Any = trusted_gh_lookup) -> str:
     """The resolved ``gh`` path, or fail closed.
 
     Resolved fresh for every call rather than cached: a cached path could
@@ -195,7 +205,7 @@ def _run(
     arguments: tuple[str, ...],
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gh_lookup,
     runner: Any = subprocess.run,
     timeout: int = GH_TIMEOUT_SECONDS,
 ) -> GitHubCommandOutput:
@@ -255,7 +265,7 @@ def _run(
 def observed_github_identity(
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gh_lookup,
     runner: Any = subprocess.run,
 ) -> tuple[str, str]:
     """The ``(principal, credential_route)`` the local session belongs to.
@@ -328,7 +338,7 @@ def run_operation_plan(
     plan: Any,
     *,
     environ: Mapping[str, str] | None = None,
-    path_lookup: Any = which,
+    path_lookup: Any = trusted_gh_lookup,
     runner: Any = subprocess.run,
 ) -> GitHubCommandOutput:
     """Execute ONE re-proved read plan, or fail closed.
