@@ -13,13 +13,21 @@ wires it to a ``QSystemTrayIcon`` (which needs a ``QApplication``).
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Qt, Slot
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QWindow
+from PySide6.QtCore import QObject, Slot
+from PySide6.QtGui import QIcon, QWindow
 
 from jarvis.ui.i18n import QT_TRANSLATE_NOOP, tx
+from jarvis.ui.resources import asset_path
 
 #: Ring colours for the restrained state badge: normal, frozen, attention.
+#: The approved mark ships pre-tinted per state as ``tray-<state>.png``; this
+#: stays as the one place the mapping from badge name to meaning is written
+#: down, even though nothing here mixes a colour at runtime any more.
 _RING = {"running": "#3aa8f0", "frozen": "#ff5c6c", "attention": "#ffb347"}
+
+#: One ``QIcon`` per badge state, loaded once from the approved artwork and
+#: reused - ``refresh()`` asks for one on every bridge state change.
+_ICONS: dict[str, QIcon] = {}
 
 
 class TrayController(QObject):
@@ -92,19 +100,18 @@ class TrayController(QObject):
 
 
 def _icon(badge: str) -> QIcon:
-    """A small JARVIS mark drawn in code (the app-icon milestone is later)."""
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(QPen(QColor("#2a5f8f"), 3))
-    painter.setBrush(QColor("#061424"))
-    painter.drawEllipse(3, 3, 58, 58)
-    painter.setPen(QPen(QColor(_RING.get(badge, _RING["running"])), 9))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawEllipse(16, 16, 32, 32)
-    painter.end()
-    return QIcon(pixmap)
+    """The approved JARVIS mark, tinted for this status.
+
+    An unrecognised badge falls back to ``running``, exactly as the old
+    painted version's colour lookup did - ``badge()`` only ever returns one
+    of the three names, so this is defence, not a reachable path.
+    """
+    name = badge if badge in _RING else "running"
+    cached = _ICONS.get(name)
+    if cached is None:
+        cached = QIcon(str(asset_path(f"tray-{name}.png")))
+        _ICONS[name] = cached
+    return cached
 
 
 def install_tray(app, bridge, window):

@@ -54,8 +54,16 @@ def _text_focus_release():
     return TextFocusRelease()
 
 
-def create_engine(bridge: Bridge):
-    """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml."""
+def create_engine(bridge: Bridge, *, icon=None):
+    """A QML engine with the bridge exposed as ``bridge``. Loads Main.qml.
+
+    ``icon``, when given, is set on every root window explicitly. Qt already
+    hands a new window the application's default icon (set on ``QApplication``
+    before this runs), so this is belt-and-suspenders - but the Windows
+    taskbar icon follows the native window handle, and setting it directly on
+    the window is the one path that does not depend on that propagation
+    happening before the platform window is realized.
+    """
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuick import QQuickWindow
@@ -85,6 +93,8 @@ def create_engine(bridge: Bridge):
     engine._focus_release = _text_focus_release()
     for window in engine.rootObjects():
         window.installEventFilter(engine._focus_release)
+        if icon is not None:
+            window.setIcon(icon)
     return engine
 
 
@@ -110,18 +120,26 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
     # A QApplication (a QGuiApplication with widgets) because the system tray
     # icon and its menu are widgets; the interface itself stays QML.
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
+    from jarvis.ui.resources import asset_path
     from jarvis.ui.tray import install_tray
 
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("JARVIS")
     app.setOrganizationName("JARVIS")
+    # The approved mark, set once and reused: as the application default (new
+    # windows inherit it) and explicitly on the main window and the tray
+    # (below), so the taskbar and the window title bar both carry it whether
+    # or not the platform propagates the application default in time.
+    icon = QIcon(str(asset_path("app.ico")))
+    app.setWindowIcon(icon)
     # The weather key is taken OUT of the environment before anything starts, so
     # no child process (Claude, Codex, Antigravity...) ever inherits it.
     weather_key = os.environ.pop(WEATHER_KEY_ENV, "").strip()
     bridge = Bridge(Backend(), UiPreferences(), weather_key=weather_key)
-    engine = create_engine(bridge)
+    engine = create_engine(bridge, icon=icon)
     if not engine.rootObjects():
         return 1
     # Window X hides to the tray when there is one; Quit JARVIS (tray) is the

@@ -1699,8 +1699,8 @@ Backend, Prefs, engine_of, sweeps = ui_app.Backend, ui_app.UiPreferences, ui_app
 ui_app.Backend = lambda: Backend(ConfigStore(tmp / "config.json"))
 ui_app.UiPreferences = lambda: Prefs(tmp / "prefs.json")
 say = lambda what: os.write(2, (what + "\n").encode())
-def create_engine(bridge):
-    engine = engine_of(bridge)
+def create_engine(bridge, *, icon=None):
+    engine = engine_of(bridge, icon=icon)
     for name, obj in (("bridge", bridge), ("engine", engine), ("window", engine.rootObjects()[0]),
                       ("application", QCoreApplication.instance())):
         obj.destroyed.connect(lambda *_, name=name: say("DESTROYED " + name))
