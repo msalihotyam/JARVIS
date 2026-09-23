@@ -26,12 +26,14 @@ already knows how to report.
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "NO_CONSOLE_WINDOW",
     "TrustedExecutable",
     "TrustedExecutableError",
     "forbidden_roots",
@@ -40,6 +42,13 @@ __all__ = [
     "sanitized_path",
     "trusted_environment",
 ]
+
+
+#: ``creationflags`` for a headless child: on Windows a console program started
+#: from the windowed JARVIS.exe would otherwise get a console window of its own
+#: (a visible flash). Pipes are unaffected. ``0`` elsewhere, where Popen
+#: accepts nothing else.
+NO_CONSOLE_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class TrustedExecutableError(RuntimeError):

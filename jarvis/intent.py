@@ -60,7 +60,7 @@ from jarvis.contracts import (
     Task,
     ToolResult,
 )
-from jarvis.trusted_exec import TrustedExecutableError, resolve_trusted_executable
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW, TrustedExecutableError, resolve_trusted_executable
 from jarvis.desktop import DESKTOP_CAPABILITY_RESOURCE, DESKTOP_DESTINATION_PREFIX
 from jarvis.destinations import DestinationGrant
 from jarvis.github import GITHUB_CAPABILITY_RESOURCE, GITHUB_DESTINATION_PREFIX
@@ -1610,7 +1610,7 @@ def claude_model_catalog(command: str = "claude") -> list[dict[str, Any]]:
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    text=True, encoding="utf-8", errors="replace", shell=False,
-                                   env=ClaudeCodeConnector._sanitized_environment())
+                                   env=ClaudeCodeConnector._sanitized_environment(), creationflags=NO_CONSOLE_WINDOW)
     except OSError:
         return []
     timer = threading.Timer(CLAUDE_CATALOG_TIMEOUT_SECONDS, process.kill)

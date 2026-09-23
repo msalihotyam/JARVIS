@@ -384,6 +384,8 @@ class ClaudeConnectorSecurityTests(unittest.TestCase):
             ),
         )
         result = self.connector.execute(self.task(), SessionState())
+        from jarvis.trusted_exec import NO_CONSOLE_WINDOW
+        self.assertEqual(NO_CONSOLE_WINDOW, popen.call_args[1]["creationflags"])  # no console flash
         detail = result.error.details["cli_detail"]
         self.assertNotIn("abcdefghijklmnop", detail)
         self.assertNotIn("sk-super-secret", detail)

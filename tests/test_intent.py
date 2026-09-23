@@ -1536,6 +1536,7 @@ class CodexProviderTests(IntentTestCase):
         self.assertIn("--ignore-user-config", argv)
         self.assertNotIn("OPENAI_API_KEY", {k.upper() for k in kwargs["env"]})
         self.assertFalse(kwargs["shell"])
+        self.assertEqual(codex.NO_CONSOLE_WINDOW, kwargs["creationflags"])                # no console flash
         self.assertEqual(0, self.execute_calls())
 
     SOL = {**STATE, "models": [{"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -1637,6 +1638,8 @@ class AntigravityStatusTests(unittest.TestCase):
                          (third_party["name"], [(b["window"], b["remaining_fraction"], b["reset_time"]) for b in third_party["buckets"]]))
         argv, kwargs = run.call_args[0][0], run.call_args[1]
         self.assertEqual(["agy.exe", "-p", "/usage", "--output-format", "json"], argv)       # never a prompt
+        from jarvis.trusted_exec import NO_CONSOLE_WINDOW
+        self.assertEqual(NO_CONSOLE_WINDOW, kwargs["creationflags"])                         # no console flash
         self.assertFalse({"GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"} & {k.upper() for k in kwargs["env"]})
         self.assertFalse(kwargs["shell"])
 
@@ -1828,6 +1831,7 @@ class ClaudeModelSelectionTests(unittest.TestCase):
         self.assertEqual("initialize", json.loads(written)["request"]["subtype"])        # a control request, never a prompt
         argv = popen.call_args[0][0]
         self.assertEqual("", argv[argv.index("--tools") + 1])
+        self.assertEqual(intent.NO_CONSOLE_WINDOW, popen.call_args[1]["creationflags"])  # no console flash
         process.kill.assert_called()
 
 

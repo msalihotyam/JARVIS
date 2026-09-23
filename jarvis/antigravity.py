@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from jarvis.trusted_exec import resolve_trusted_executable, trusted_environment
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW, resolve_trusted_executable, trusted_environment
 
 #: Variables that could point the CLI at a metered Google route. They are never
 #: passed on; only their names are compared, never their values.
@@ -89,7 +89,8 @@ def antigravity_state() -> dict[str, Any]:
     try:
         completed = subprocess.run([executable, "-p", "/usage", "--output-format", "json"], capture_output=True, text=True,
                                    encoding="utf-8", errors="replace", timeout=USAGE_TIMEOUT_SECONDS, env=_environment(),
-                                   cwd=workdir, stdin=subprocess.DEVNULL, shell=False)
+                                   cwd=workdir, stdin=subprocess.DEVNULL, shell=False,
+                                   creationflags=NO_CONSOLE_WINDOW)
         payload = json.loads(completed.stdout) if completed.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         payload = None

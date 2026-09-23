@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.connectors.claude_code import ClaudeCodeConnector
-from jarvis.trusted_exec import resolve_trusted_executable, trusted_environment
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW, resolve_trusted_executable, trusted_environment
 from jarvis.conversation import ContextProfile
 from jarvis.contracts import (
     MODEL_ANSWER_RESULT_KEY,
@@ -132,7 +132,7 @@ def _app_server(executable: str, calls: list[tuple[str, dict | None]], timeout: 
     """Answers of a short read-only app-server session, keyed by method."""
     process = subprocess.Popen([executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                               env=_environment(), shell=False)
+                               env=_environment(), shell=False, creationflags=NO_CONSOLE_WINDOW)
     replies: dict[int, dict] = {}
     done = threading.Event()
 
@@ -168,7 +168,8 @@ def _app_server(executable: str, calls: list[tuple[str, dict | None]], timeout: 
 def _catalog(executable: str) -> list[dict[str, Any]]:
     try:
         completed = subprocess.run([executable, "debug", "models"], capture_output=True, text=True, encoding="utf-8",
-                                   errors="replace", timeout=CODEX_PROBE_TIMEOUT_SECONDS, env=_environment(), shell=False)
+                                   errors="replace", timeout=CODEX_PROBE_TIMEOUT_SECONDS, env=_environment(), shell=False,
+                                   creationflags=NO_CONSOLE_WINDOW)
         models = json.loads(completed.stdout).get("models")
     except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
         return []
@@ -352,7 +353,8 @@ class CodexIntentAdapter:
         command.append("-")
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True, encoding="utf-8", errors="replace", env=_environment(), shell=False)
+                                       text=True, encoding="utf-8", errors="replace", env=_environment(), shell=False,
+                                       creationflags=NO_CONSOLE_WINDOW)
         except OSError:
             return self._refused("The Codex CLI could not be started.", ErrorCode.CONNECTOR_UNAVAILABLE)
         with self._lock:

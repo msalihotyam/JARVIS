@@ -407,5 +407,58 @@ class LegitimateAvailabilityTests(unittest.TestCase):
         self.assertEqual(found.path, found.argv0())
 
 
+class HeadlessConsoleTests(unittest.TestCase):
+    """Probes the windowed JARVIS.exe runs in the background open no console.
+
+    The execution paths (Claude, Codex, the Claude catalog, Antigravity) are
+    asserted where their spawn shape is already pinned; these are the probes
+    that had no spawn-shape test of their own.
+    """
+
+    def test_the_flag_is_create_no_window_on_windows_and_inert_elsewhere(self) -> None:
+        import subprocess
+        from jarvis.trusted_exec import NO_CONSOLE_WINDOW
+        self.assertEqual(subprocess.CREATE_NO_WINDOW if WINDOWS else 0, NO_CONSOLE_WINDOW)
+
+    def test_the_claude_auth_probe_is_headless(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from jarvis.trusted_exec import NO_CONSOLE_WINDOW
+        root = Path(tempfile.mkdtemp(prefix="jarvis-noconsole-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        connector = ClaudeCodeConnector(allowed_roots=(root,), default_working_directory=root)
+        completed = MagicMock(returncode=0, stdout='{"loggedIn": true}')
+        with patch.object(ClaudeCodeConnector, "_argv0", return_value="C:/abs/claude.exe"), \
+                patch("jarvis.connectors.claude_code.subprocess.run", return_value=completed) as run:
+            connector._auth_status()
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(["C:/abs/claude.exe", "auth", "status", "--json"], argv)
+        self.assertEqual(NO_CONSOLE_WINDOW, kwargs["creationflags"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertFalse(kwargs["shell"])
+        self.assertIn("timeout", kwargs)
+        self.assertIsInstance(kwargs["env"], dict)
+
+    def test_the_codex_app_server_and_model_probe_are_headless(self) -> None:
+        import subprocess
+        from unittest.mock import MagicMock, patch
+        process = MagicMock()
+        process.stdout = iter([])
+        with patch.object(codex.subprocess, "Popen", return_value=process) as popen:
+            codex._app_server("C:/abs/codex.exe", [("account/read", None)], 0.01)
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        self.assertEqual(["C:/abs/codex.exe", "app-server"], argv)
+        self.assertEqual(codex.NO_CONSOLE_WINDOW, kwargs["creationflags"])
+        self.assertEqual((subprocess.PIPE, subprocess.PIPE), (kwargs["stdin"], kwargs["stdout"]))
+        self.assertFalse(kwargs["shell"])
+        process.kill.assert_called()                                   # still reaped on the timeout
+        with patch.object(codex.subprocess, "run", return_value=MagicMock(stdout='{"models": []}')) as run:
+            self.assertEqual([], codex._catalog("C:/abs/codex.exe"))
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(["C:/abs/codex.exe", "debug", "models"], argv)
+        self.assertEqual(codex.NO_CONSOLE_WINDOW, kwargs["creationflags"])
+        self.assertEqual(codex.CODEX_PROBE_TIMEOUT_SECONDS, kwargs["timeout"])
+        self.assertFalse(kwargs["shell"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

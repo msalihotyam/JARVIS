@@ -67,6 +67,7 @@ from jarvis.contracts import (
 from jarvis.planning import build_task_plan
 from jarvis.settings import validate_claude_effort, validate_claude_model
 from jarvis.trusted_exec import (
+    NO_CONSOLE_WINDOW,
     TrustedExecutable,
     TrustedExecutableError,
     resolve_trusted_executable,
@@ -461,6 +462,7 @@ class ClaudeCodeConnector(BaseConnector):
                 timeout=self.auth_probe_timeout_seconds,
                 shell=False,
                 env=self._sanitized_environment(),
+                creationflags=NO_CONSOLE_WINDOW,
             )
         except (OSError, ValueError, subprocess.SubprocessError):
             return None
@@ -643,6 +645,7 @@ class ClaudeCodeConnector(BaseConnector):
                 # Defense in depth: metered credential routes are stripped
                 # from the external model subprocess environment.
                 env=self._sanitized_environment(),
+                creationflags=NO_CONSOLE_WINDOW,
             )
         except FileNotFoundError:
             return self._error_result(
