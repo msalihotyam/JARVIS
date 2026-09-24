@@ -3823,6 +3823,40 @@ class ProviderSelectionTests(UiTestCase):
         again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
         self.assertEqual(("claude", "gpt-5.6-luna", "low"), (again.chatProvider, again.codexModel, again.codexEffort))
 
+    def test_selector_refresh_never_starts_antigravity_and_reports_only_what_the_file_check_proves(self) -> None:
+        # agy 1.2.9 answers `agy -p /usage` with a real agent turn: the refresh must spawn no agy at all.
+        import subprocess
+        from unittest.mock import patch
+        import jarvis.antigravity as antigravity
+        from jarvis.antigravity import antigravity_state
+        from jarvis.contracts import BillingClass
+        from jarvis.connectors.claude_code import ClaudeCodeConnector
+        bridge = self.bridge()
+        bridge.backend.google_state = antigravity_state                  # the production check, not a fake
+        bridge.backend.claude_catalog = lambda: self.CLAUDE_MODELS
+        bridge.backend.codex_state = lambda: self.CODEX
+        spawned: list = []
+        real_popen = subprocess.Popen
+
+        def popen(argv, *args, **kwargs):
+            spawned.append([str(a) for a in argv])
+            return real_popen(argv, *args, **kwargs)
+        with patch.object(ClaudeCodeConnector, "billing_route", return_value=(BillingClass.SUBSCRIPTION_INCLUDED, "ok")), \
+                patch.object(antigravity, "agy_executable", return_value="C:/Users/x/AppData/Local/agy/bin/agy.exe"), \
+                patch.object(subprocess, "Popen", side_effect=popen):
+            root = self.window(bridge)
+            for _ in range(5):                                           # open / close the selector five times
+                self.click(root, "modelTrigger"); pump(200)
+                self.click(root, "modelTrigger"); pump(100)
+            google = bridge.providers[2]
+            self.assertEqual(("google", "unavailable", False), (google["id"], google["status"], "quota" in google))
+            self.assertEqual("Status unavailable - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
+            self.assertEqual(("available", "available"), (bridge.providers[0]["status"], bridge.providers[1]["status"]))
+            with patch.object(antigravity, "agy_executable", return_value=None):
+                bridge.refreshProviders(); pump(100)
+            self.assertEqual(("not_installed", False), (bridge.providers[2]["status"], "quota" in bridge.providers[2]))
+        self.assertEqual([], [argv for argv in spawned if any("agy" in part.lower() for part in argv)])
+
     def test_listed_is_not_usable_until_a_real_call_and_a_failure_is_clean_with_no_fallback(self) -> None:
         sol = {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "efforts": ["low", "medium"], "default_effort": "low"}
         bridge = self.bridge(proposal(kind="chat", reply="Claude must not answer this."))

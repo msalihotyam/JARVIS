@@ -212,7 +212,8 @@ class Backend:
         """What is REALLY known about each provider line, from local checks only
         - no model call, no spend: the Claude auth probe and the CLI's own model
         list; Codex's app-server account, plan limits and model catalog; whether
-        a Google CLI is installed and signed in. Qwen is deferred past V1."""
+        the Antigravity CLI is installed (a file check - agy is never started).
+        Qwen is deferred past V1."""
         loaded = self.store.load()
         if not loaded.usable:
             status, evidence, models = "unavailable", "config_refused", []

@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jarvis import antigravity, browser_cdp, codex
+from jarvis import browser_cdp, codex
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.intent import ClaudeIntentAdapter, claude_model_catalog
 from jarvis.trusted_exec import (
@@ -358,7 +358,6 @@ class EnvironmentContainmentTests(unittest.TestCase):
         builders = {
             "claude": ClaudeCodeConnector._sanitized_environment,
             "codex": codex._environment,
-            "antigravity": antigravity._environment,
         }
         for tool, build in builders.items():
             with self.subTest(tool=tool):

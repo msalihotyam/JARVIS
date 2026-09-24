@@ -1608,47 +1608,33 @@ class CodexProviderTests(IntentTestCase):
 
 
 class AntigravityStatusTests(unittest.TestCase):
-    """Google in V1: never a prompt - only the CLI's read-only /usage, pools kept exactly as reported."""
+    """Google in V1: install status from a file check only - agy is never started.
 
-    USAGE = {"status": "SUCCESS", "num_turns": 0, "usage": {"total_tokens": 0}, "command": {"name": "usage", "data": {"groups": [
-        {"name": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro", "buckets": [
-            {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.7923486828804016, "reset_time": "2026-09-17T23:02:31Z"},
-            {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "2026-09-16T01:56:18Z"}]},
-        {"name": "Claude and GPT models", "buckets": [
-            {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1, "reset_time": "2026-09-22T20:56:18Z"},
-            {"id": "3p-bad", "window": "daily", "remaining_fraction": 1, "reset_time": "x"},
-            {"id": "3p-5h", "window": "5h", "remaining_fraction": "100%", "reset_time": "2026-09-16T01:56:18Z"}]}]}}}
+    agy 1.2.9 answers ``agy -p /usage`` with a real agent turn (quota spend,
+    a denied RunCommand), so the status check must spawn nothing at all."""
 
-    def run_state(self, payload, returncode=0, executable="agy.exe"):
-        from unittest.mock import patch, MagicMock
+    def state(self, executable):
+        from unittest.mock import patch
+        import subprocess
         import jarvis.antigravity as antigravity
-        completed = MagicMock(returncode=returncode, stdout=json.dumps(payload))
-        with patch.object(antigravity, "agy_executable", return_value=executable), \
-                patch.dict(os.environ, {"GEMINI_API_KEY": "x", "GOOGLE_CLOUD_PROJECT": "p"}), \
-                patch.object(antigravity.subprocess, "run", return_value=completed) as run:
-            return antigravity.antigravity_state(), run
+        with patch.object(antigravity, "agy_executable", return_value=executable),                 patch.object(subprocess, "Popen", side_effect=AssertionError("agy must not be started")) as popen:
+            return antigravity.antigravity_state(), popen
 
-    def test_quota_pools_are_exact_and_separate_and_only_the_read_only_command_runs(self) -> None:
-        state, run = self.run_state(self.USAGE)
-        self.assertEqual(("chat_unavailable", [], False), (state["status"], state["models"], state["research"]))
-        gemini, third_party = state["quota"]["groups"]
-        self.assertEqual(("Gemini Models", [("weekly", 0.7923486828804016, "2026-09-17T23:02:31Z"), ("5h", 1.0, "2026-09-16T01:56:18Z")]),
-                         (gemini["name"], [(b["window"], b["remaining_fraction"], b["reset_time"]) for b in gemini["buckets"]]))
-        self.assertEqual(("Claude and GPT models", [("weekly", 1.0, "2026-09-22T20:56:18Z")]),        # malformed buckets dropped, never guessed
-                         (third_party["name"], [(b["window"], b["remaining_fraction"], b["reset_time"]) for b in third_party["buckets"]]))
-        argv, kwargs = run.call_args[0][0], run.call_args[1]
-        self.assertEqual(["agy.exe", "-p", "/usage", "--output-format", "json"], argv)       # never a prompt
-        from jarvis.trusted_exec import NO_CONSOLE_WINDOW
-        self.assertEqual(NO_CONSOLE_WINDOW, kwargs["creationflags"])                         # no console flash
-        self.assertFalse({"GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"} & {k.upper() for k in kwargs["env"]})
-        self.assertFalse(kwargs["shell"])
+    def test_installed_is_proven_by_the_file_check_alone_and_nothing_is_started(self) -> None:
+        state, popen = self.state("C:/Users/x/AppData/Local/agy/bin/agy.exe")
+        popen.assert_not_called()
+        self.assertEqual({"id": "google", "vendor": "Google", "name": "Antigravity", "models": [], "research": False,
+                          "status": "unavailable"}, state)                  # installed; sign-in and quota unproven
+        self.assertNotIn("quota", state)                                     # never estimated
 
-    def test_anything_but_a_clean_zero_turn_answer_is_unavailable(self) -> None:
-        for payload, code in (({**self.USAGE, "num_turns": 1}, 0), (self.USAGE, 1), ({**self.USAGE, "status": "ERROR"}, 0),
-                              ({"status": "SUCCESS", "num_turns": 0, "command": {"data": {"groups": []}}}, 0), ("not json", 0)):
-            with self.subTest(payload=str(payload)[:40], code=code):
-                self.assertEqual("unavailable", self.run_state(payload, code)[0]["status"])
-        self.assertEqual("not_installed", self.run_state(self.USAGE, executable=None)[0]["status"])
+    def test_not_installed_starts_nothing(self) -> None:
+        state, popen = self.state(None)
+        popen.assert_not_called()
+        self.assertEqual(("not_installed", False), (state["status"], "quota" in state))
+
+    def test_the_module_cannot_start_a_process(self) -> None:
+        import jarvis.antigravity as antigravity
+        self.assertFalse(hasattr(antigravity, "subprocess"))
 
 
 def stream_line(text: str = "", *, kind: str = "text_delta", parent: str | None = None) -> str:
