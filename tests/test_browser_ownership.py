@@ -411,7 +411,7 @@ class AttachOwnershipTests(unittest.TestCase):
         first = attached_browser(
             profile_dir=self.profile,
             port=port,
-            executable_lookup=lambda: "C:/msedge.exe",
+            executable_lookup=_trusted_stand_in,
             spawn=spawn,
         )
         self.assertEqual(f"ws://127.0.0.1:{port}/devtools/browser/x", first)
@@ -419,7 +419,7 @@ class AttachOwnershipTests(unittest.TestCase):
         # flags, and nothing else.
         self.assertEqual(
             [
-                "C:/msedge.exe",
+                _TRUSTED_PATH,
                 *browser_arguments(
                     profile_dir=self.profile,
                     port=port,
@@ -466,7 +466,7 @@ class AttachOwnershipTests(unittest.TestCase):
         attached_browser(
             profile_dir=self.profile,
             port=port,
-            executable_lookup=lambda: "C:/msedge.exe",
+            executable_lookup=_trusted_stand_in,
             spawn=spawn,
         )
         self.assertIsNotNone(owned_browser(port))
@@ -484,7 +484,7 @@ class AttachOwnershipTests(unittest.TestCase):
             attached_browser(
                 profile_dir=self.profile,
                 port=_free_port(),
-                executable_lookup=lambda: "C:/msedge.exe",
+                executable_lookup=_trusted_stand_in,
                 spawn=refuse,
                 sleep=lambda seconds: None,
             )
@@ -508,7 +508,7 @@ class AttachOwnershipTests(unittest.TestCase):
             attached_browser(
                 profile_dir=self.profile,
                 port=port,
-                executable_lookup=lambda: "C:/msedge.exe",
+                executable_lookup=_trusted_stand_in,
                 spawn=spawn,
                 sleep=lambda seconds: None,
             )
@@ -529,7 +529,7 @@ class AttachOwnershipTests(unittest.TestCase):
             attached_browser(
                 profile_dir=self.profile,
                 port=port,
-                executable_lookup=lambda: "C:/msedge.exe",
+                executable_lookup=_trusted_stand_in,
                 spawn=lambda command: started,
                 sleep=lambda seconds: None,
             )
@@ -551,7 +551,7 @@ class AttachOwnershipTests(unittest.TestCase):
             attached_browser(
                 profile_dir=self.profile,
                 port=port,
-                executable_lookup=lambda: "C:/msedge.exe",
+                executable_lookup=_trusted_stand_in,
                 spawn=lambda command: gone,
                 sleep=lambda seconds: None,
             )
@@ -570,6 +570,25 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+#: What ``executable_lookup`` hands ``attached_browser`` here: a trusted
+#: identity whose ``argv0()`` answers the way a real ``TrustedExecutable``
+#: does, so the spawn boundary runs exactly as in production - the identity
+#: re-check included - without a browser binary. The browser these tests
+#: "start" is the python stand-in ``spawn`` supplies; the path is never run.
+_TRUSTED_PATH = "C:/chrome.exe"
+
+
+class _TrustedStandIn:
+    path = _TRUSTED_PATH
+
+    def argv0(self, **_kwargs: object) -> str:
+        return self.path
+
+
+def _trusted_stand_in() -> _TrustedStandIn:
+    return _TrustedStandIn()
 
 
 if __name__ == "__main__":  # pragma: no cover

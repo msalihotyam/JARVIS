@@ -64,7 +64,11 @@ from jarvis.owned_process import (
     launch_owned,
     listening_pid,
 )
-from jarvis.trusted_exec import resolve_trusted_executable
+from jarvis.trusted_exec import (
+    TrustedExecutable,
+    TrustedExecutableError,
+    resolve_trusted_executable,
+)
 from jarvis.browser import (
     BROWSER_CAPABILITY_METHODS,
     BROWSER_POLICY_METHODS,
@@ -89,13 +93,23 @@ from jarvis.browser import (
 #: that is where an operator's own ad-hoc debugging session lives, and
 #: attaching to it would put JARVIS inside their logged-in browsing profile.
 BROWSER_DEBUG_PORT = 9333
-#: The one browser this build drives. Chromium-based and present on every
-#: supported Windows install; the protocol below is Chromium's.
-BROWSER_EXECUTABLE_NAME = "msedge"
+#: The one browser this build drives: Google Chrome, and only a copy installed
+#: for the whole machine. The protocol below is Chromium's.
+BROWSER_EXECUTABLE_NAME = "chrome"
+#: The ONLY places the browser may come from: the system-wide installation
+#: roots, which are administrator-controlled. A per-user Chrome under
+#: ``%LOCALAPPDATA%`` is deliberately absent - that directory is writable by
+#: the same account JARVIS runs as, so a file there is no more trustworthy
+#: than one in the workspace (DB-001). ``PATH`` is not consulted at all for
+#: the browser, for the same reason: any entry of it can be user-writable.
 _BROWSER_INSTALL_PATHS = (
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 )
+#: Handed to the resolver as its environment: no ``PATH``, so the enumeration
+#: it would otherwise fall back to yields nothing and the install roots above
+#: are the whole candidate set.
+_NO_PATH_SEARCH: dict[str, str] = {}
 
 BROWSER_LAUNCH_TIMEOUT_SECONDS = 30
 BROWSER_COMMAND_TIMEOUT_SECONDS = 30
@@ -387,22 +401,38 @@ class CdpConnection:
 # --------------------------------------------------------------------------
 
 
-def trusted_browser_lookup(name: str) -> str | None:
-    """The browser's provenance rule: the known installation roots first, then
-    PATH enumerated by ``jarvis.trusted_exec`` - never a search that can reach
-    the current directory. A copy of ``msedge`` sitting in the workspace
-    JARVIS was pointed at is not a browser (DB-001)."""
-    found = resolve_trusted_executable(name, install_paths=_BROWSER_INSTALL_PATHS)
-    return None if found is None else found.path
+def trusted_browser_lookup(
+    name: str, *, install_paths: Iterable[Any] = _BROWSER_INSTALL_PATHS
+) -> TrustedExecutable | None:
+    """The browser's provenance rule: the system installation roots, and
+    nothing else. Not ``PATH``, not the current directory, not the workspace
+    JARVIS was pointed at, not a per-user install - a ``chrome.exe`` in any of
+    those is not a browser (DB-001). ``jarvis.trusted_exec`` still applies its
+    own rules to each root: a real file, canonical, outside every forbidden
+    directory.
+
+    Returns the TRUSTED IDENTITY, not a bare path: the caller keeps it until
+    the moment of process creation and re-checks it there (``argv0``).
+
+    The file must still be NAMED ``chrome`` once canonicalised: an install
+    root that turns out to be a link to some other program is refused."""
+    found = resolve_trusted_executable(
+        name, install_paths=install_paths, environ=_NO_PATH_SEARCH
+    )
+    if found is not None and Path(found.path).stem.lower() != name.lower():
+        return None
+    return found
 
 
-def browser_executable(*, path_lookup: Any = trusted_browser_lookup) -> str:
-    """Where the browser is, or fail closed. A LOCATION, never a credential."""
+def browser_executable(*, path_lookup: Any = trusted_browser_lookup) -> TrustedExecutable:
+    """The browser as a trusted identity, or fail closed. A LOCATION, never a
+    credential, and a location that will be re-verified before it is run."""
     found = path_lookup(BROWSER_EXECUTABLE_NAME)
-    if found:
-        return str(found)
+    if found is not None:
+        return found
     raise BrowserCommandFailed(
-        f"'{BROWSER_EXECUTABLE_NAME}' is not installed or not on PATH"
+        "Google Chrome is not installed for this machine (under Program Files), "
+        "so JARVIS has no browser to start"
     )
 
 
@@ -546,6 +576,10 @@ def attached_browser(
     click was read against lives in it. What no longer happens is reuse across
     JARVIS runs, and that is not a loss: with the lifetime binding in place
     there is no browser left over from a previous run to reuse.
+
+    ``executable_lookup`` returns a trusted identity (``TrustedExecutable``),
+    never a bare path; what reaches ``spawn`` as ``argv[0]`` is that
+    identity's ``argv0()``, re-validated at the spawn.
     """
     owned = owned_browser(port)
     existing = _debugging_socket(port)
@@ -569,14 +603,26 @@ def attached_browser(
             "rather than driven; close it and try again"
         )
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    executable = executable_lookup()
+    trusted = executable_lookup()
     # THE BOUNDARY FIRST. The browser is told to reach the network only
     # through this, so it exists before the browser does (DB-002B-02).
     proxy = browser_policy_proxy(port)
+    # THE IDENTITY LAST, immediately before process creation: the file that
+    # was accepted as the browser must still be that file - same canonical
+    # path, same volume and index, same size and mtime - or nothing is
+    # started. A swap between locating it and running it is caught here
+    # rather than executed (DB-001).
+    try:
+        argv0 = trusted.argv0()
+    except TrustedExecutableError as exc:
+        raise BrowserCommandFailed(
+            f"the browser executable is no longer the one that was located, so "
+            f"it was not started: {exc}"
+        ) from exc
     try:
         started = spawn(
             [
-                executable,
+                argv0,
                 *browser_arguments(
                     profile_dir=profile_dir, port=port, proxy_port=proxy.port
                 ),

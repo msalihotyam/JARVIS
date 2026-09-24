@@ -24,6 +24,7 @@ from jarvis import browser_cdp, codex
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.intent import ClaudeIntentAdapter, claude_model_catalog
 from jarvis.trusted_exec import (
+    TrustedExecutable,
     TrustedExecutableError,
     path_directories,
     resolve_trusted_executable,
@@ -151,15 +152,22 @@ class WorkspaceShadowTests(WorkspaceCase):
         self.assertFalse(adapter.availability().available)
         self.assert_never_invoked()
 
-    def test_a_workspace_msedge_is_never_invoked(self) -> None:
-        self.marker("msedge")
+    def test_a_workspace_chrome_is_never_invoked(self) -> None:
+        """The production browser lookup, given a workspace that holds a
+        runnable ``chrome`` and a planted ``chrome.exe`` (and the old
+        ``msedge`` pair, which counts for even less now), as the whole of
+        PATH and as the current directory: never the workspace copy, and
+        nothing runs."""
+        for stem in ("chrome", "msedge"):
+            self.marker(stem)
+            self.planted(stem)
         previous_path = os.environ.get("PATH", "")
         os.environ["PATH"] = str(self.workspace)
         self.addCleanup(os.environ.__setitem__, "PATH", previous_path)
-        # The real browser may be installed at a known root; what must never
+        # The real browser may be installed at a system root; what must never
         # happen is the workspace copy being chosen.
         try:
-            chosen = Path(browser_cdp.browser_executable()).resolve()
+            chosen = Path(browser_cdp.browser_executable().path).resolve()
         except browser_cdp.BrowserCommandFailed:
             chosen = None
         if chosen is not None:
@@ -167,7 +175,280 @@ class WorkspaceShadowTests(WorkspaceCase):
                 chosen.is_relative_to(self.workspace),
                 "the browser resolved to the workspace",
             )
+            if WINDOWS:
+                self.assertTrue(str(chosen).lower().startswith("c:\\program files"), chosen)
         self.assert_never_invoked()
+
+
+class ChromeTrustTests(WorkspaceCase):
+    """V2 M1 Gate 1: the browser comes from a system installation root, only.
+
+    Not PATH, not the current directory, not the workspace, not a per-user
+    install under ``%LOCALAPPDATA%``. Every root here is a temporary stand-in
+    handed to the lookup as its install root; the production roots are only
+    inspected, never resolved against, except in the one test that asks
+    whether the real Chrome on this machine resolves.
+    """
+
+    def system_root(self) -> Path:
+        """A stand-in for ``C:\\Program Files\\...\\chrome.exe``: a real file in
+        a directory outside the workspace."""
+        installed = Path(tempfile.mkdtemp(prefix="jarvis-chrome-root-")).resolve()
+        self.addCleanup(shutil.rmtree, installed, True)
+        exe = installed / ("chrome.exe" if WINDOWS else "chrome")
+        exe.write_bytes(b"stand-in browser")
+        return exe
+
+    def lookup(self, *roots: Path):
+        return browser_cdp.trusted_browser_lookup("chrome", install_paths=tuple(str(r) for r in roots))
+
+    def test_the_production_roots_are_system_locations_only(self) -> None:
+        self.assertEqual("chrome", browser_cdp.BROWSER_EXECUTABLE_NAME)
+        roots = browser_cdp._BROWSER_INSTALL_PATHS
+        self.assertTrue(roots)
+        for root in roots:
+            lowered = root.lower()
+            self.assertTrue(lowered.startswith("c:\\program files"), root)
+            self.assertTrue(lowered.endswith("\\google\\chrome\\application\\chrome.exe"), root)
+            self.assertNotIn("appdata", lowered)
+            self.assertNotIn("%", root)
+        # The resolver is handed NO PATH: the roots are the whole candidate set.
+        self.assertEqual({}, browser_cdp._NO_PATH_SEARCH)
+
+    def test_a_chrome_at_an_allowed_system_root_is_selected_as_a_trusted_identity(self) -> None:
+        exe = self.system_root()
+        found = self.lookup(exe)
+        self.assertIsInstance(found, TrustedExecutable)
+        self.assertEqual(str(exe), found.path)
+        self.assertEqual(found.path, found.argv0())
+        # ``browser_executable`` passes the identity through, not a string.
+        via = browser_cdp.browser_executable(path_lookup=lambda name: self.lookup(exe))
+        self.assertIsInstance(via, TrustedExecutable)
+        self.assertEqual(found.path, via.path)
+        # The second root is tried when the first is absent, in order.
+        self.assertEqual(found.path, self.lookup(exe.parent / "missing" / exe.name, exe).path)
+
+    def test_a_workspace_copy_is_never_a_candidate(self) -> None:
+        self.marker("chrome")
+        self.planted("chrome")
+        previous_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(self.workspace)
+        self.addCleanup(os.environ.__setitem__, "PATH", previous_path)
+        # Even as the whole of PATH, with no root to prefer: nothing.
+        self.assertIsNone(self.lookup())
+        self.assertIsNone(self.lookup(self.workspace / "missing" / "chrome.exe"))
+        self.assert_never_invoked()
+
+    def test_the_current_directory_is_refused_even_as_a_named_root(self) -> None:
+        planted = self.planted("chrome")
+        previous = Path.cwd()
+        os.chdir(self.workspace)
+        self.addCleanup(os.chdir, previous)
+        # The file exists and is named as a root, and the root is the current
+        # directory - the one place the OS would have searched on its own.
+        self.assertIsNone(self.lookup(planted))
+        self.assert_never_invoked()
+
+    def test_a_user_writable_path_directory_is_never_consulted(self) -> None:
+        tools = Path(tempfile.mkdtemp(prefix="jarvis-chrome-path-")).resolve()
+        self.addCleanup(shutil.rmtree, tools, True)
+        on_path = tools / ("chrome.exe" if WINDOWS else "chrome")
+        on_path.write_bytes(b"a chrome on PATH")
+        previous_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(tools)
+        self.addCleanup(os.environ.__setitem__, "PATH", previous_path)
+        # The general resolver WOULD find it on PATH; the browser lookup does not.
+        self.assertIsNotNone(
+            resolve_trusted_executable("chrome", environ={"PATH": str(tools), "PATHEXT": ".EXE"})
+        )
+        self.assertIsNone(self.lookup(tools / "no-such-root" / on_path.name))
+        # The refusal is about the SOURCE, not the file: named as a root it resolves.
+        self.assertEqual(str(on_path), self.lookup(on_path).path)
+
+    def test_a_per_user_install_under_localappdata_is_not_accepted(self) -> None:
+        home = Path(tempfile.mkdtemp(prefix="jarvis-chrome-local-")).resolve()
+        self.addCleanup(shutil.rmtree, home, True)
+        per_user = home / "Google" / "Chrome" / "Application"
+        per_user.mkdir(parents=True)
+        (per_user / ("chrome.exe" if WINDOWS else "chrome")).write_bytes(b"per-user chrome")
+        previous = {name: os.environ.get(name) for name in ("LOCALAPPDATA", "PATH")}
+        os.environ["LOCALAPPDATA"] = str(home)
+        os.environ["PATH"] = str(per_user)
+        for name, value in previous.items():
+            self.addCleanup(os.environ.__setitem__, name, value if value is not None else "")
+        with self.assertRaises(browser_cdp.BrowserCommandFailed) as raised:
+            browser_cdp.browser_executable(
+                path_lookup=lambda name: self.lookup(home / "no-such-root" / "chrome.exe")
+            )
+        self.assertIn("Google Chrome", str(raised.exception))
+        self.assertNotIn("PATH", str(raised.exception))
+        self.assertFalse(any("appdata" in root.lower() for root in browser_cdp._BROWSER_INSTALL_PATHS))
+
+    def test_missing_system_chrome_fails_closed_with_chrome_wording(self) -> None:
+        with self.assertRaises(browser_cdp.BrowserCommandFailed) as raised:
+            browser_cdp.browser_executable(path_lookup=lambda name: None)
+        text = str(raised.exception)
+        self.assertIn("Google Chrome", text)
+        self.assertIn("Program Files", text)
+        for stale in ("PATH", "msedge", "Edge"):
+            self.assertNotIn(stale, text)
+
+    def test_a_wrong_candidate_is_refused(self) -> None:
+        installed = Path(tempfile.mkdtemp(prefix="jarvis-chrome-wrong-")).resolve()
+        self.addCleanup(shutil.rmtree, installed, True)
+        (installed / "chrome.exe").mkdir()                       # a directory, not a program
+        (installed / "other.exe").write_bytes(b"some other program")
+        (installed / "notes.txt").write_bytes(b"not a program at all")
+        for candidate in (
+            installed / "chrome.exe",
+            installed / "other.exe",                             # a real file, but not chrome
+            installed / "notes.txt",
+            installed / "absent" / "chrome.exe",
+        ):
+            with self.subTest(candidate=candidate.name):
+                self.assertIsNone(self.lookup(candidate))
+
+    def test_the_real_system_chrome_resolves_when_installed(self) -> None:
+        """The production roots on this machine. Nothing is launched."""
+        found = browser_cdp.trusted_browser_lookup("chrome")
+        if found is None:
+            self.skipTest("Google Chrome is not installed for this machine")
+        self.assertTrue(Path(found.path).is_file())
+        self.assertEqual("chrome.exe" if WINDOWS else "chrome", Path(found.path).name.lower())
+        if WINDOWS:
+            self.assertTrue(found.path.lower().startswith("c:\\program files"), found.path)
+        self.assertEqual(found.path, found.argv0())
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class ChromeSpawnBoundaryTests(unittest.TestCase):
+    """The identity accepted at lookup is re-checked at the spawn, by
+    ``attached_browser`` itself, and what reaches ``spawn`` is its answer.
+
+    No browser runs: ``spawn`` is a fake that records what it was handed.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="jarvis-chrome-spawn-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name).resolve()
+        self.profile = str(root / "browser-profile")
+        self.exe = root / "install" / ("chrome.exe" if WINDOWS else "chrome")
+        self.exe.parent.mkdir()
+        self.exe.write_bytes(b"the original")
+        self.port = _free_port()
+        # ``attached_browser`` starts this port's pre-connect boundary before
+        # it reaches the spawn; the boundary is let go with the rest.
+        self.addCleanup(browser_cdp.release_owned_browsers, self.port)
+
+    def located(self):
+        found = browser_cdp.trusted_browser_lookup("chrome", install_paths=(str(self.exe),))
+        self.assertIsNotNone(found)
+        return found
+
+    def attach(self, lookup, spawn):
+        return browser_cdp.attached_browser(
+            profile_dir=self.profile,
+            port=self.port,
+            executable_lookup=lookup,
+            spawn=spawn,
+            sleep=lambda seconds: None,
+        )
+
+    def test_a_replacement_between_lookup_and_spawn_starts_nothing(self) -> None:
+        found = self.located()
+        spawned: list = []
+
+        def spawn(argv):
+            spawned.append(list(argv))
+            raise AssertionError("a replaced browser was spawned")
+
+        self.exe.write_bytes(b"a different program entirely")
+        with self.assertRaises(browser_cdp.BrowserCommandFailed) as raised:
+            self.attach(lambda: found, spawn)
+        self.assertIn("no longer the one that was located", str(raised.exception))
+        self.assertEqual([], spawned)
+        self.assertIsNone(browser_cdp.owned_browser(self.port))
+
+    def test_a_removal_between_lookup_and_spawn_starts_nothing(self) -> None:
+        found = self.located()
+        spawned: list = []
+        self.exe.unlink()
+        with self.assertRaises(browser_cdp.BrowserCommandFailed):
+            self.attach(lambda: found, lambda argv: spawned.append(argv))
+        self.assertEqual([], spawned)
+        self.assertIsNone(browser_cdp.owned_browser(self.port))
+
+    def test_the_spawn_receives_the_revalidated_argv0_and_this_builds_flags(self) -> None:
+        class Revalidated:
+            """An identity whose spawn-time answer differs from where it was
+            located: the spawn must use the answer, never the location."""
+
+            path = "C:/located/chrome.exe"
+
+            def argv0(self, **_kwargs: object) -> str:
+                return "C:/revalidated/chrome.exe"
+
+        class Dead:
+            """An owned process that exited at once, so the launch is reported
+            rather than waited out."""
+
+            pid = 0
+
+            def alive(self) -> bool:
+                return False
+
+            def contained(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                pass
+
+        spawned: list = []
+
+        def spawn(argv):
+            spawned.append(list(argv))
+            return Dead()
+
+        with self.assertRaises(browser_cdp.BrowserCommandFailed) as raised:
+            self.attach(lambda: Revalidated(), spawn)
+        self.assertIn("exited before it opened a debugging socket", str(raised.exception))
+        self.assertEqual(1, len(spawned))
+        argv = spawned[0]
+        self.assertEqual("C:/revalidated/chrome.exe", argv[0])
+        self.assertEqual(f"--remote-debugging-port={self.port}", argv[1])
+        self.assertIn(f"--user-data-dir={self.profile}", argv)
+        self.assertTrue(any(a.startswith("--proxy-server=http://127.0.0.1:") for a in argv))
+        self.assertIn("--proxy-bypass-list=<-loopback>", argv)
+        self.assertEqual("about:blank", argv[-1])
+
+    def test_an_unchanged_real_identity_reaches_the_spawn(self) -> None:
+        found = self.located()
+        spawned: list = []
+
+        class Dead:
+            pid = 0
+
+            def alive(self) -> bool:
+                return False
+
+            def contained(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                pass
+
+        with self.assertRaises(browser_cdp.BrowserCommandFailed):
+            self.attach(lambda: found, lambda argv: spawned.append(list(argv)) or Dead())
+        self.assertEqual(found.path, spawned[0][0])
+        self.assertEqual(str(self.exe), spawned[0][0])
 
 
 class PathEntryTests(WorkspaceCase):
