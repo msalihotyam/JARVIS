@@ -791,7 +791,10 @@ BROWSER_POLICY_METHODS = frozenset(
         # whatever the page is doing. The page-session read this used to use
         # is NOT answered while an auto-attached child is held at startup, so
         # the standing policy blocked on it and stopped judging anything -
-        # measured against Edge 153 on a page that creates a worker.
+        # measured against Edge 153 on a page that creates a worker. Chrome
+        # 153.0.8010.54 answered that page-session read at once even with a
+        # worker held (re-measured 2026-09-24), so on Chrome the browser-level
+        # pump is a conservative choice rather than a necessity; it stays.
         "Target.getTargets",
         "Fetch.enable",
         "Fetch.continueRequest",

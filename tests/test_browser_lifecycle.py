@@ -86,7 +86,8 @@ class _FetchEnable:
     """Scripted ``Fetch.enable``: fine until the test says otherwise.
 
     Stands in for a target that has no Fetch domain at all - a dedicated
-    worker, as Edge 153 answers for one.
+    worker, as Edge 153 and Chrome 153 both answer for one (the Chrome
+    answer measured live on 2026-09-24, held and running alike).
     """
 
     def __init__(self) -> None:
@@ -487,9 +488,11 @@ class WorkerTests(LifecycleCase):
         It is NOT held at startup any more. Holding it is the textbook order,
         but on Edge 153 a held child does not answer ``Fetch.enable`` and the
         policy loop blocked on that command - measured, and it stopped the
-        policy judging anything at all on any page that creates a worker. What
-        covers the moment before the gate is armed is the tab's own boundary,
-        which no child can reach past.
+        policy judging anything at all on any page that creates a worker.
+        Chrome 153 answers a held worker at once (measured 2026-09-24), so
+        not holding is a necessity on Edge and merely harmless on Chrome; the
+        rule is kept for both. What covers the moment before the gate is
+        armed is the tab's own boundary, which no child can reach past.
         """
         self.start_browser()
         self.navigate()

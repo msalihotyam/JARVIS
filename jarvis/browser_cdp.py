@@ -1401,7 +1401,11 @@ _POLICY_EVENTS = ("Fetch.requestPaused", "Target.attachedToTarget")
 #: runs a line, but on Edge 153 a held child does not answer ``Fetch.enable``:
 #: the standing policy's own loop blocked on that command and stopped judging
 #: anything at all, on any page that creates a worker. A policy that stalls is
-#: worse than one that arms a child a moment late.
+#: worse than one that arms a child a moment late. Chrome 153.0.8010.54 does
+#: NOT stall: a held dedicated worker answered ``Fetch.enable`` within
+#: milliseconds (with the "wasn't found" refusal below, as it has no Fetch
+#: domain) - re-measured 2026-09-24. Not holding remains the rule: it is
+#: required on Edge and costs nothing on Chrome.
 #:
 #: WHAT COVERS THE GAP is the per-tab boundary. A child shares its tab's
 #: browser context, so anything it asks for before its gate is armed can still
@@ -1662,7 +1666,8 @@ class BrowserPolicy:
             # Chromium answers "'Fetch.enable' wasn't found" for it. Treating
             # that as a lost gate destroyed the tab, so any page that created a
             # worker was killed by its own mediation - fail-closed, but
-            # unusable. Measured against Edge 153, not assumed.
+            # unusable. Measured against Edge 153, and again against Chrome
+            # 153.0.8010.54 (2026-09-24): the same refusal, held or running.
             #
             # WHAT STILL HOLDS FOR SUCH A TARGET is the thing a renderer gate
             # could never provide anyway: it shares this tab's browser context,

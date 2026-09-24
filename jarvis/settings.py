@@ -178,14 +178,20 @@ class Settings:
 
     @property
     def browser_profile_dir(self) -> Path:
-        """The JARVIS-dedicated browser profile directory.
+        """The JARVIS-dedicated browser profile directory (Google Chrome's
+        ``--user-data-dir``).
 
         DERIVED, never configured, and beside the memory database for the
         same reason the Gmail config directory is: the browser JARVIS drives
-        must never be the operator's own logged-in one. Not a secret and not
-        a credential: a location.
+        must never be the operator's own logged-in one - never Chrome's own
+        ``%LOCALAPPDATA%\\Google\\Chrome\\User Data``. Not a secret and not a
+        credential: a location.
+
+        ``chrome-profile``, a fresh directory: the sibling ``browser-profile``
+        is the profile the Edge runtime this replaced used, kept as it is for
+        rollback and never opened by Chrome.
         """
-        return Path(self.memory_database).resolve().parent / "browser-profile"
+        return Path(self.memory_database).resolve().parent / "chrome-profile"
 
     @property
     def gmail_config_dir(self) -> Path:

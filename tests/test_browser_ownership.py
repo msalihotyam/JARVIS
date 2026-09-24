@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from jarvis import browser_cdp as cdp_module
 from jarvis.browser_cdp import (
     BrowserCommandFailed,
     attached_browser,
@@ -563,6 +566,26 @@ class AttachOwnershipTests(unittest.TestCase):
         self.assertIn(f"--user-data-dir={self.profile}", arguments)
         self.assertIn("about:blank", arguments)
 
+    def test_releasing_jarvis_browsers_never_touches_an_unrelated_process(self) -> None:
+        """Cleanup releases JARVIS's own job objects and proxies. It never
+        matches a process by name, so an unrelated process that merely looks
+        like a browser (here: another python, standing in for the operator's
+        own Chrome) is untouched."""
+        import jarvis.browser_cdp as cdp
+
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        self.addCleanup(bystander.kill)
+        mine = self.stand_in(_free_port())
+        cdp._OWNED_BROWSERS[9_999] = mine
+        cdp.release_owned_browsers()
+        cdp.release_browser_policies()
+        deadline = time.monotonic() + REAPED_TIMEOUT
+        while time.monotonic() < deadline and process_alive(mine.pid):
+            time.sleep(0.05)
+        self.assertFalse(process_alive(mine.pid))                      # ours: gone with its job
+        self.assertIsNone(bystander.poll())                            # theirs: still running
+        self.assertTrue(process_alive(bystander.pid))
+
 
 def _free_port() -> int:
     import socket
@@ -570,6 +593,60 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class ChromeProfileTests(unittest.TestCase):
+    """V2 M1 Gate 2: the browser profile is a fresh Chrome directory beside
+    the memory database - never the Edge profile it replaced, never the
+    operator's own Chrome profile."""
+
+    def settings(self):
+        from dataclasses import replace
+
+        from jarvis.settings import ConfigStore
+
+        root = Path(tempfile.mkdtemp(prefix="jarvis-chrome-profile-")).resolve()
+        self.addCleanup(shutil.rmtree, root, True)
+        loaded = ConfigStore(root / "config.json").load().settings
+        return replace(loaded, memory_database=root / "jarvis.db"), root
+
+    def test_the_profile_is_chrome_profile_beside_the_database(self) -> None:
+        settings, root = self.settings()
+        self.assertEqual(root / "chrome-profile", settings.browser_profile_dir)
+
+    def test_the_edge_profile_is_a_sibling_that_is_never_named(self) -> None:
+        settings, root = self.settings()
+        profile = settings.browser_profile_dir
+        self.assertNotEqual("browser-profile", profile.name)
+        self.assertEqual(profile.parent, (root / "browser-profile").parent)     # same parent: rollback stays beside
+        arguments = browser_arguments(profile_dir=str(profile), port=9333, proxy_port=1)
+        self.assertIn(f"--user-data-dir={profile}", arguments)
+        self.assertFalse(any("browser-profile" in a for a in arguments), arguments)
+
+    def test_the_operators_own_chrome_profile_is_never_named(self) -> None:
+        settings, _ = self.settings()
+        profile = str(settings.browser_profile_dir)
+        self.assertNotIn("User Data", profile)
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            # Chrome's own profile root, whatever the temp directory happens to be under.
+            self.assertFalse(Path(profile).is_relative_to(Path(local) / "Google" / "Chrome" / "User Data"), profile)
+        arguments = browser_arguments(profile_dir=profile, port=9333, proxy_port=1)
+        self.assertFalse(any("User Data" in a or "Google\\Chrome" in a for a in arguments), arguments)
+
+    def test_the_current_tab_note_sits_beside_the_profile_not_inside_it(self) -> None:
+        settings, root = self.settings()
+        note = cdp_module._current_tab_path(str(settings.browser_profile_dir))
+        self.assertEqual(root / "current-tab", note)
+
+    def test_the_debugging_endpoint_is_ipv4_loopback_only(self) -> None:
+        """The ownership model is IPv4: discovery asks 127.0.0.1, the listener
+        check reads the IPv4 table, and a socket named on any other host -
+        including the IPv6 loopback - is refused rather than connected."""
+        self.assertEqual("http://127.0.0.1:9333", cdp_module._endpoint(9333))
+        for url in ("ws://[::1]:9333/devtools/browser/x", "ws://0.0.0.0:9333/x", "ws://192.168.1.2:9333/x", "wss://127.0.0.1:9333/x"):
+            with self.subTest(url=url), self.assertRaises(BrowserCommandFailed):
+                cdp_module._WebSocket(url, timeout=0.2)
 
 
 #: What ``executable_lookup`` hands ``attached_browser`` here: a trusted
