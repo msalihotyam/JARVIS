@@ -45,6 +45,7 @@ from jarvis.antigravity import antigravity_state
 from jarvis.codex import CodexIntentAdapter, codex_state, remember_codex_state
 from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE, ClaudeCodeConnector
 from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
+from jarvis.model_retirement import codex_retirement
 from jarvis.contracts import BillingClass, ErrorCode
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import ConfigError, ConfigStore, Settings
@@ -246,14 +247,18 @@ class Backend:
                 state = {"status": "unavailable", "models": []}
             if self.codex_state is codex_state:
                 remember_codex_state(state)          # the panel's fresh check serves the next chat too
+            # Models Codex itself retired (a declared successor it offers, or a
+            # passed retirement time) leave normal selection; ``retired`` names
+            # each successor for a saved choice (a fresh check only - never cached).
+            offered, retired = codex_retirement([m for m in state.get("models", []) if isinstance(m, dict)],
+                                                state.get("upgrades") if isinstance(state.get("upgrades"), dict) else {})
             # DISCOVERED (the account lists it) is not USABLE: each model carries what
             # a real call in this session showed - "usable", "failed" + reason, or
             # nothing yet ("" = discovered, not verified).
-            models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))}
-                      for model in state.get("models", []) if isinstance(model, dict)]
+            models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))} for model in offered]
             return {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
                     "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
-                    "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
+                    "retired": retired, "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
         try:
             google = self.google_state()
         except Exception:  # noqa: BLE001 - an unreadable check establishes nothing

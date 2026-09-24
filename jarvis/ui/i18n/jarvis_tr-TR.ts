@@ -415,6 +415,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Zamanlayıcı taraması: zamanı gelen iş yoktu</translation>
     </message>
     <message>
+        <source>Claude model updated from %1 to %2</source>
+        <translation>Claude modeli güncellendi: %1 → %2</translation>
+    </message>
+    <message>
+        <source>Codex model updated from %1 to %2</source>
+        <translation>Codex modeli güncellendi: %1 → %2</translation>
+    </message>
+    <message>
         <source>Chat provider: %1</source>
         <translation>Sohbet sağlayıcısı: %1</translation>
     </message>

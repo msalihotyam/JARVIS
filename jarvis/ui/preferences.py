@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.codex import CODEX_EFFORT_VALUES, CODEX_MODEL_PATTERN
+from jarvis.settings import CLAUDE_MODEL_PATTERN
 
 PREFERENCES_VERSION = 5
 THEMES = ("space", "dark", "command")
@@ -96,14 +97,23 @@ def canonical_profiles() -> dict[str, dict[str, Any]]:
 
 
 def canonical_chat() -> dict[str, str]:
-    return {"provider": "claude", "codex_model": "", "codex_effort": ""}
+    # claude_lane: the CLI alias (e.g. "opus[1m]") the configured Claude model was
+    # chosen through, recorded for exactly claude_lane_model - so the pin can
+    # follow that alias to a newer model, and a model set elsewhere never inherits it.
+    return {"provider": "claude", "codex_model": "", "codex_effort": "", "claude_lane": "", "claude_lane_model": ""}
+
+
+def _model_id(value: Any, pattern: Any) -> bool:
+    return type(value) is str and (value == "" or bool(pattern.match(value)))
 
 
 def _valid_chat(candidate: Any) -> bool:
     return (isinstance(candidate, dict) and set(candidate) == set(canonical_chat())
             and candidate["provider"] in CHAT_PROVIDERS
-            and type(candidate["codex_model"]) is str and (candidate["codex_model"] == "" or bool(CODEX_MODEL_PATTERN.match(candidate["codex_model"])))
-            and candidate["codex_effort"] in ("",) + CODEX_EFFORT_VALUES)
+            and _model_id(candidate["codex_model"], CODEX_MODEL_PATTERN)
+            and candidate["codex_effort"] in ("",) + CODEX_EFFORT_VALUES
+            and _model_id(candidate["claude_lane"], CLAUDE_MODEL_PATTERN)
+            and _model_id(candidate["claude_lane_model"], CLAUDE_MODEL_PATTERN))
 
 
 def canonical_rail() -> dict[str, Any]:
@@ -227,6 +237,10 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     # A document from before provider choice keeps everything and answers with Claude.
     if isinstance(candidate, dict) and "version" in candidate and "chat" not in candidate:
         candidate = {**candidate, "chat": canonical_chat()}
+    # A choice saved before Claude lanes keeps everything; no lane is known yet.
+    if (isinstance(candidate, dict) and isinstance(candidate.get("chat"), dict)
+            and not {"claude_lane", "claude_lane_model"} & set(candidate["chat"])):
+        candidate = {**candidate, "chat": {**candidate["chat"], "claude_lane": "", "claude_lane_model": ""}}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:

@@ -45,6 +45,7 @@ from jarvis.context_items import (
 )
 from jarvis.conversation import ConversationStore, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
+from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
@@ -230,9 +231,10 @@ class Bridge(QObject):
         # The selector's provider lines: last-known-good from the local catalog at
         # once, refreshed on the catalog's own threads (never the chat worker).
         self._providers: list[dict] = []
-        self._catalog = ProviderCatalog(default_catalog_path(self.prefs.path), lambda pid: self.backend.provider_line(pid),
+        self._catalog = ProviderCatalog(default_catalog_path(self.prefs.path), self._probe_provider,
                                         self._catalog_changed, sync=sync)
         self._catalogDone.connect(self._show_catalog, Qt.QueuedConnection)
+        self._liveLine.connect(self._follow_models, Qt.QueuedConnection)
         self._show_catalog()
         # The last understanding / General Chat call's usage, as its envelope reported it.
         self._chat_usage: dict = {}
@@ -1280,6 +1282,64 @@ class Bridge(QObject):
         return [dict(provider) for provider in self._providers]
 
     _catalogDone = Signal()
+    _liveLine = Signal(str, object)
+
+    def _probe_provider(self, pid: str) -> Any:
+        """The catalog's live check (its own thread). This fresh answer - never
+        the cache - is the only thing that may move a saved model choice."""
+        line = self.backend.provider_line(pid)
+        if self.sync:
+            self._follow_models(pid, line)
+        else:
+            with self._weather_lock:
+                if not self._shutting_down:
+                    self._liveLine.emit(pid, line)
+        return line
+
+    def _follow_models(self, pid: str, line: Any) -> None:
+        """A saved choice follows its provider-declared successor (see
+        jarvis.model_retirement) - only from a successful discovery that listed models."""
+        if self._shutting_down or not isinstance(line, dict) or line.get("status") != "available" or not line.get("models"):
+            return
+        if pid == "claude":
+            self._follow_claude(line["models"])
+        elif pid == "codex":
+            self._follow_codex(line["models"], line.get("retired") if isinstance(line.get("retired"), dict) else {})
+
+    def _follow_claude(self, models: list) -> None:
+        loaded = self.backend.store.load()
+        if not loaded.usable or not loaded.settings.claude_model:
+            return                                  # the CLI default follows the CLI by itself
+        model, effort = loaded.settings.claude_model, loaded.settings.claude_effort or ""
+        chat = self.prefs.data["chat"]
+        lane = chat["claude_lane"] if chat["claude_lane_model"] == model else adopt_claude_lane(models, model)
+        if lane and chat["claude_lane_model"] != model:
+            self._set_claude_lane(lane, model)      # a choice from before lanes: its one unambiguous alias
+        moved = claude_migration(models, lane, model, effort)
+        if moved is None:
+            return
+        payload = self._write_claude(*moved)
+        self._apply_config(payload)
+        if payload.get("error") is None:
+            self._set_claude_lane(lane, moved[0])
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Claude model updated from %1 to %2"), (model, moved[0])), "system")
+            self.modelApplied.emit()
+
+    def _follow_codex(self, offered: list, retired: dict) -> None:
+        chat = self.prefs.data["chat"]
+        moved = codex_migration(chat["codex_model"], chat["codex_effort"], offered, retired)
+        if moved is None:
+            return
+        before = chat["codex_model"]
+        self.setCodexModel(*moved)
+        if self.prefs.data["chat"]["codex_model"] == moved[0]:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Codex model updated from %1 to %2"), (before, moved[0])), "system")
+
+    def _set_claude_lane(self, lane: str, model: str) -> None:
+        chat = dict(self.prefs.data["chat"], claude_lane=lane, claude_lane_model=model)
+        if chat != self.prefs.data["chat"] and validate_preferences({**self.prefs.data, "chat": chat})["chat"] == chat:
+            self.prefs.data["chat"] = chat
+            self.prefs.save()
 
     @Slot()
     def refreshProviders(self, force: bool = False) -> None:
@@ -2082,17 +2142,27 @@ class Bridge(QObject):
         return {"fixture": True, "execution": "running", "running": False, "approval": approval, "decision": {},
                 "outcome": outcome, "attention": items, "cards": True}
 
-    @Slot(str, str)
-    def applyModel(self, model: str, effort: str) -> None:
+    @Slot(str, str, str)
+    def applyModel(self, model: str, effort: str, row: str = "") -> None:
+        """``row``: the catalog row the model was chosen from; when it is an alias
+        resolving to exactly this model, it is recorded as the model's lane."""
+        model, effort = str(model).strip(), str(effort).strip()
         before = (self._config.get("claude_model"), self._config.get("claude_effort"))
+        payload = self._write_claude(model, effort)
+        self._apply_config(payload)
+        if payload.get("error") is None and (row or model != (before[0] or "")):
+            claude = next((p for p in self._providers if p.get("id") == "claude"), {})
+            self._set_claude_lane(claude_lane(claude.get("models"), str(row), model), model)
+        if (self._config.get("claude_model"), self._config.get("claude_effort")) != before:
+            self.modelApplied.emit()
+
+    def _write_claude(self, model: str, effort: str) -> dict:
         payload: dict = {}
-        for key, value in (("claude_model", str(model).strip()), ("claude_effort", str(effort).strip())):
+        for key, value in (("claude_model", model), ("claude_effort", effort)):
             payload = self.backend.reset_config(key) if not value else self.backend.set_config(key, value)
             if payload.get("error") is not None:
                 break
-        self._apply_config(payload)
-        if (self._config.get("claude_model"), self._config.get("claude_effort")) != before:
-            self.modelApplied.emit()
+        return payload
 
     # -- preferences / layout ------------------------------------------------
 

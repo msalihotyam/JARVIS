@@ -59,16 +59,18 @@ ContextPanel {
     }
     readonly property var claudeModels: claude ? claude.models || [] : []
     readonly property var codexModels: codex ? codex.models || [] : []
-    // A row is applied by the model id it RESOLVES to: the CLI's short alias does not always get that model
-    // (live: "haiku" was answered by claude-sonnet-5, "claude-haiku-4-5-20251001" by Haiku).
-    function claudeValue(m) { return m.id === "default" ? "" : (m.resolved || m.id) }
+    // An alias row is applied by the model id it RESOLVES to: the CLI's short alias does not always get that model
+    // (live: "haiku" was answered by claude-sonnet-5, "claude-haiku-4-5-20251001" by Haiku). A full model id
+    // row is applied as listed, so a variant it names ("[1m]": the long context) is never dropped.
+    function claudeValue(m) { return m.id === "default" ? "" : m.id.indexOf("claude-") === 0 ? m.id : (m.resolved || m.id) }
     function claudeEntry(id) { var key = id || "default"; return claudeModels.filter(function(m) { return m.id === key || (id && m.resolved === id) })[0] || null }
     function codexEntry(id) { return codexModels.filter(function(m) { return m.id === id })[0] || null }
     // The short display name; the canonical id never changes with it.
     function shortName(id, fallback) { return bridge.modelLabel(id || "", fallback || "") }
     // Claude's choice: drafted here, persisted the moment it is made.
     QtObject { id: claudeDraft; property string model: ""; property string effort: "" }
-    function applyClaude(model, effort) { claudeDraft.model = model; claudeDraft.effort = effort; bridge.applyModel(model, effort) }
+    // ``row``: the catalog row it was chosen from; the bridge keeps it as the model's lane when it is an alias.
+    function applyClaude(model, effort, row) { claudeDraft.model = model; claudeDraft.effort = effort; bridge.applyModel(model, effort, row || "") }
 
     // -- the panel's few text roles ------------------------------------------
     // A section name: quiet, sentence case, no tracking.
@@ -213,7 +215,7 @@ ContextPanel {
                             selected: claudeDraft.model === modelPanel.claudeValue(modelData) || claudeDraft.model === modelData.id
                             onChosen: {
                                 var keep = claudeDraft.effort && modelData.efforts.indexOf(claudeDraft.effort) >= 0 ? claudeDraft.effort : ""
-                                modelPanel.applyClaude(modelPanel.claudeValue(modelData), keep)
+                                modelPanel.applyClaude(modelPanel.claudeValue(modelData), keep, modelData.id)
                                 claudeField.open = false
                             }
                         }

@@ -3810,7 +3810,8 @@ class ProviderSelectionTests(UiTestCase):
         self.invoke(root, "providerRow_codex", "chosen")
         self.assertEqual(("codex", "gpt-5.6-luna", "medium"), (bridge.chatProvider, bridge.codexModel, bridge.codexEffort))
         saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))["chat"]
-        self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium"}, saved)
+        self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium",
+                          "claude_lane": "", "claude_lane_model": ""}, saved)
         bridge.setCodexModel("gpt-5.6-luna", "low")
         trigger = self.item(root, "modelTrigger")                                        # the header names the real choice
         self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
@@ -3979,6 +3980,127 @@ class ProviderCatalogUiTests(UiTestCase):
         self.assertEqual({"claude", "codex", "google"}, set(stored["providers"]))
         self.assertEqual(3, len(calls))
         bridge.waitIdle()
+
+
+class ModelMigrationUiTests(UiTestCase):
+    """A saved model follows its provider-declared successor - from a live discovery only, once."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    click = PresentationTests.click
+    EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+    def claude_line(self, opus: str) -> dict:
+        return {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True, "models": [
+            {"id": "default", "name": "Default", "resolved": opus, "description": "", "efforts": self.EFFORTS},
+            {"id": "opus[1m]", "name": "Opus (1M context)", "resolved": opus, "description": "", "efforts": self.EFFORTS},
+            {"id": "claude-fable-5-1[1m]", "name": "Fable", "resolved": "claude-fable-5-1", "description": "", "efforts": self.EFFORTS},
+            {"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5", "description": "", "efforts": self.EFFORTS}]}
+
+    def codex_line(self, models: list[str], retired: dict | None = None) -> dict:
+        return {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
+                "models": [{"id": m, "name": m, "efforts": ["low", "medium", "high"], "default_effort": "medium"} for m in models],
+                "retired": retired or {}}
+
+    def notes(self, bridge) -> list[str]:
+        """The Live intelligence feed's migration lines (never the conversation)."""
+        self.assertFalse(any("model updated from" in e["text"] for e in bridge.feed))
+        return [e["text"] for e in bridge.activity if "model updated from" in e["text"]]
+
+    def test_claude_follows_its_lane_only_from_a_live_discovery_and_says_so_once(self) -> None:
+        bridge = self.bridge()
+        self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]"), self.codex_line(["gpt-5.6-sol"])])
+        bridge.applyModel("claude-opus-5-5[1m]", "high", "opus[1m]")                     # chosen through the Opus row
+        chat = UiPreferences(self.prefs_path).data["chat"]
+        self.assertEqual(("opus[1m]", "claude-opus-5-5[1m]"), (chat["claude_lane"], chat["claude_lane_model"]))
+        bridge.applyModel("claude-opus-5-5[1m]", "max")                                   # an effort change keeps the lane
+        bridge.applyModel("claude-opus-5-5[1m]", "high")
+        self.assertEqual("opus[1m]", UiPreferences(self.prefs_path).data["chat"]["claude_lane"])
+        # The cache already knows a newer Opus (another run saw it): loading it moves nothing.
+        from jarvis.model_catalog import ProviderCatalog, default_catalog_path
+        seen = ProviderCatalog(default_catalog_path(self.prefs_path), lambda pid: self.claude_line("claude-opus-6[1m]"), sync=True)
+        seen.refresh(force=True)
+        cached = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+        self.assertEqual("claude-opus-6[1m]", cached.providers[0]["models"][1]["resolved"])   # shown...
+        self.assertEqual("claude-opus-5-5[1m]", self.store.load().settings.claude_model)     # ...but never applied
+        # A failed or empty discovery moves nothing either.
+        for broken in ({"id": "claude", "status": "unavailable", "models": []}, {**self.claude_line("claude-opus-6[1m]"), "models": []},
+                       {**self.claude_line("claude-opus-6[1m]"), "status": "not_logged_in"}):
+            cached.backend.provider_line = lambda pid, broken=broken: broken if pid == "claude" else self.codex_line(["gpt-5.6-sol"])
+            cached.refreshProviders(force=True)
+            self.assertEqual(("claude-opus-5-5[1m]", []), (self.store.load().settings.claude_model, self.notes(cached)))
+        # A live discovery where the lane resolves to the next Opus: the pin follows, effort kept, one note.
+        self.fake_providers(cached, [self.claude_line("claude-opus-6[1m]"), self.codex_line(["gpt-5.6-sol"])])
+        settings = self.store.load().settings
+        self.assertEqual(("claude-opus-6[1m]", "high"), (settings.claude_model, settings.claude_effort))
+        self.assertEqual(["Claude model updated from claude-opus-5-5[1m] to claude-opus-6[1m]"], self.notes(cached))
+        self.assertEqual("claude-opus-6[1m]", UiPreferences(self.prefs_path).data["chat"]["claude_lane_model"])
+        cached.refreshProviders(force=True)
+        self.assertEqual(1, len(self.notes(cached)))                                      # no repeat in this run
+        restarted = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+        self.fake_providers(restarted, [self.claude_line("claude-opus-6[1m]"), self.codex_line(["gpt-5.6-sol"])])
+        self.assertEqual(("claude-opus-6[1m]", []), (self.store.load().settings.claude_model, self.notes(restarted)))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_the_cli_default_a_pinned_id_and_an_obsolete_pin_never_move(self) -> None:
+        bridge = self.bridge()
+        self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])
+        for model, row in (("", ""), ("claude-fable-5-1[1m]", "claude-fable-5-1[1m]"), ("claude-opus-5[1m]", "")):
+            with self.subTest(model=model):
+                bridge.applyModel(model, "", row)
+                self.fake_providers(bridge, [self.claude_line("claude-opus-6[1m]")])
+                self.assertEqual(model or None, self.store.load().settings.claude_model)
+                self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])
+        self.assertEqual([], self.notes(bridge))
+
+    def test_a_choice_saved_before_lanes_adopts_its_one_alias_then_follows_it(self) -> None:
+        self.store.mutate(lambda s: replace(s, claude_model="claude-opus-5-5[1m]", claude_effort="xhigh"))
+        bridge = self.bridge()
+        self.assertEqual("", bridge.prefs.data["chat"]["claude_lane"])
+        self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])                  # unambiguous: opus[1m]
+        self.assertEqual("opus[1m]", UiPreferences(self.prefs_path).data["chat"]["claude_lane"])
+        self.assertEqual([], self.notes(bridge))                                           # adopting is silent
+        self.fake_providers(bridge, [self.claude_line("claude-opus-6[1m]")])
+        self.assertEqual(("claude-opus-6[1m]", "xhigh"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
+
+    def test_codex_moves_only_to_a_declared_offered_successor_and_says_so_once(self) -> None:
+        bridge = self.bridge()
+        bridge.setCodexModel("gpt-5.6-sol", "high")
+        self.fake_providers(bridge, [self.codex_line(["gpt-6-astra", "gpt-5.6-sol"])])            # GPT-6 exists: nothing moves
+        self.fake_providers(bridge, [{"id": "codex", "status": "unavailable", "models": []}])
+        self.assertEqual(("gpt-5.6-sol", "high"), (bridge.codexModel, bridge.codexEffort))
+        self.fake_providers(bridge, [self.codex_line(["gpt-6-astra", "gpt-6-sol"], {"gpt-5.6-sol": "gpt-6-sol"})])
+        self.assertEqual(("gpt-6-sol", "high"), (bridge.codexModel, bridge.codexEffort))
+        self.assertEqual(["Codex model updated from gpt-5.6-sol to gpt-6-sol"], self.notes(bridge))
+        self.fake_providers(bridge, [self.codex_line(["gpt-6-astra", "gpt-6-sol"], {"gpt-5.6-sol": "gpt-6-sol"})])
+        self.assertEqual(1, len(self.notes(bridge)))
+        again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+        self.assertEqual(("gpt-6-sol", "high"), (again.codexModel, again.codexEffort))
+        # A choice that simply vanished, with no declared successor, stays as it was.
+        again.setCodexModel("gpt-6-sol", "low")
+        self.fake_providers(again, [self.codex_line(["gpt-6-astra"])])
+        self.assertEqual(("gpt-6-sol", "low", []), (again.codexModel, again.codexEffort, self.notes(again)))
+
+    def test_the_selector_records_the_lane_and_a_full_id_row_keeps_its_long_context(self) -> None:
+        bridge = self.bridge()
+        self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])
+        root = self.window(bridge)
+        self.click(root, "modelTrigger"); pump(300)
+        self.click(root, "claudeModelField"); pump(200)
+        QMetaObject.invokeMethod(self.item(root, "claudeModel_claude-fable-5-1[1m]"), "chosen"); pump(150)
+        self.assertEqual("claude-fable-5-1[1m]", self.store.load().settings.claude_model)       # [1m] kept
+        self.assertEqual(("", "claude-fable-5-1[1m]"), tuple(UiPreferences(self.prefs_path).data["chat"][k] for k in ("claude_lane", "claude_lane_model")))
+        self.click(root, "claudeModelField"); pump(200)
+        QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen"); pump(150)
+        self.assertEqual("claude-opus-5-5[1m]", self.store.load().settings.claude_model)
+        self.assertEqual("opus[1m]", UiPreferences(self.prefs_path).data["chat"]["claude_lane"])
+
+    def test_preferences_from_before_lanes_load_unchanged(self) -> None:
+        old = canonical_preferences()
+        old["chat"] = {"provider": "codex", "codex_model": "gpt-5.6-sol", "codex_effort": "medium"}
+        self.prefs_path.write_text(json.dumps(old), encoding="utf-8")
+        chat = UiPreferences(self.prefs_path).data["chat"]
+        self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-sol", "codex_effort": "medium", "claude_lane": "", "claude_lane_model": ""}, chat)
+        self.assertEqual(canonical_preferences()["chat"], validate_preferences({**old, "chat": {**old["chat"], "claude_lane": "bad lane!", "claude_lane_model": ""}})["chat"])
 
 
 class ConversationUxTests(UiTestCase):

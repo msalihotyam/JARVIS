@@ -190,8 +190,11 @@ def codex_state() -> dict[str, Any]:
 
     ``status``: available / not_installed / not_logged_in / api_key_route /
     unavailable. ``models``: the account's listed models whose tools all fail
-    closed here (id, name, efforts, default effort). ``quota``: the plan's
-    usage windows as the service reported them, or absent."""
+    closed here (id, name, efforts, default effort, priority, specialty), in
+    Codex's own priority order. ``upgrades``: what Codex declares about
+    replacing ANY model it returned, listed or not - ``{id: {"model",
+    "retirement_at", "specialty"}}``. ``quota``: the plan's usage windows as
+    the service reported them, or absent."""
     executable = codex_executable()
     if executable is None:
         return {"status": "not_installed", "models": []}
@@ -203,7 +206,7 @@ def codex_state() -> dict[str, Any]:
         return {"status": "not_logged_in" if answers.get("account/read") is not None else "unavailable", "models": []}
     if account.get("type") != "chatgpt":
         return {"status": "api_key_route", "models": []}
-    state: dict[str, Any] = {"status": "available", "plan": str(account.get("planType") or "")[:32], "models": []}
+    state: dict[str, Any] = {"status": "available", "plan": str(account.get("planType") or "")[:32], "models": [], "upgrades": {}}
     limits = (answers.get("account/rateLimits/read") or {}).get("rateLimits")
     if isinstance(limits, dict):
         quota = {name: window for name in ("primary", "secondary") if (window := _window(limits.get(name)))}
@@ -217,13 +220,24 @@ def codex_state() -> dict[str, Any]:
             state["quota"] = quota
     for model in _catalog(executable):
         slug = model.get("slug")
-        if (model.get("visibility") != "list" or model.get("tool_mode") != CODEX_SAFE_TOOL_MODE
-                or type(slug) is not str or not CODEX_MODEL_PATTERN.match(slug)):
+        if type(slug) is not str or not CODEX_MODEL_PATTERN.match(slug):
+            continue
+        specialty = model.get("model_specialty") if type(model.get("model_specialty")) is str else ""
+        upgrade = model.get("upgrade") if isinstance(model.get("upgrade"), dict) else {}
+        target = upgrade.get("model") if type(upgrade.get("model")) is str and CODEX_MODEL_PATTERN.match(upgrade["model"]) else ""
+        retirement = upgrade.get("retirement_at") if type(upgrade.get("retirement_at")) is str else ""
+        if target or retirement:
+            state["upgrades"][slug] = {"model": target, "retirement_at": retirement[:40], "specialty": specialty[:32]}
+        if model.get("visibility") != "list" or model.get("tool_mode") != CODEX_SAFE_TOOL_MODE:
             continue
         efforts = [level.get("effort") for level in model.get("supported_reasoning_levels") or []
                    if isinstance(level, dict) and level.get("effort") in CODEX_EFFORT_VALUES]
         state["models"].append({"id": slug, "name": str(model.get("display_name") or slug)[:64], "efforts": efforts,
-                                "default_effort": model.get("default_reasoning_level") if model.get("default_reasoning_level") in efforts else ""})
+                                "default_effort": model.get("default_reasoning_level") if model.get("default_reasoning_level") in efforts else "",
+                                "priority": model.get("priority") if type(model.get("priority")) is int else None,
+                                "specialty": specialty[:32]})
+    # Codex's own order; a model without a priority goes last, ties by id.
+    state["models"].sort(key=lambda m: (m["priority"] is None, m["priority"] or 0, m["id"]))
     return state
 
 
