@@ -103,6 +103,42 @@ acceptance, and do not bundle unrelated cleanup into the acceptance commit.
 Never push without explicit authorization from Salih. This applies every
 time — prior authorization does not carry forward to the next push.
 
+## Release (Windows package)
+
+The packaged app is managed locally by `scripts/JarvisRelease.psm1`; the
+entry points are thin:
+
+```
+.\scripts\build_release.ps1            # build only (disposable output under %TEMP%)
+.\scripts\build_release.ps1 -Install   # build + validate + install + activate
+.\scripts\release.ps1 -Status          # what is installed and active (read-only)
+.\scripts\release.ps1 -List            # every installed release (read-only)
+.\scripts\release.ps1 -Rollback        # current -> the previously active release
+.\scripts\release.ps1 -Activate <id>   # current -> that installed release
+```
+
+Layout under `%USERPROFILE%\Apps\JARVIS`:
+
+- `releases\<version>-<git short sha>\` — one complete, immutable
+  `--onedir` tree per release plus its `release.json` (no secrets, no
+  operator data). The imported pre-manager flat install is
+  `legacy-<version>-<exe sha7>`.
+- `current\` — a directory junction to the active release. Activation,
+  rollback and install only re-point it; nothing is copied.
+- `release-state.json` — active / previous / history, written atomically.
+- The Desktop shortcut `JARVIS.lnk` targets `current\JARVIS.exe` permanently,
+  so a new release never changes it.
+
+Rules: the release id comes from the committed tree — `-Install` refuses a
+tree with uncommitted release-relevant changes (`uv.lock` and `dev/` are the
+known non-release dirtiness and are ignored). JARVIS must be closed for any
+change of the active release; the manager refuses otherwise and kills
+nothing. Retention keeps the active release, the rollback target and the most
+recently active others, 3 in total, and prunes only after a successful
+activation. A state/junction disagreement is reported by `-Status` and
+blocks install/rollback; it is never repaired by guesswork. Tests:
+`powershell -File tests\release-manager-tests.ps1` (isolated temp roots).
+
 ## Dashboard
 
 Update `dev/dashboard/status.json` only after the accepted work is canonical
