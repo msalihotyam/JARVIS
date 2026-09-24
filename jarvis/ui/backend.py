@@ -214,43 +214,52 @@ class Backend:
         list; Codex's app-server account, plan limits and model catalog; whether
         the Antigravity CLI is installed (a file check - agy is never started).
         Qwen is deferred past V1."""
-        loaded = self.store.load()
-        if not loaded.usable:
-            status, evidence, models = "unavailable", "config_refused", []
-        else:
+        return [self.provider_line(pid) for pid in ("claude", "codex", "google")] + [self.qwen_line()]
+
+    @staticmethod
+    def qwen_line() -> dict:
+        return {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [],
+                "research": False, "attachments": dict(ATTACHMENT_SUPPORT["qwen"])}
+
+    def provider_line(self, pid: str) -> dict:
+        """One provider's line (see ``providers``). Each line depends on no other,
+        so different providers may be checked at the same time."""
+        if pid == "claude":
+            loaded = self.store.load()
+            if not loaded.usable:
+                status, evidence, models = "unavailable", "config_refused", []
+            else:
+                try:
+                    billing_class, evidence = ClaudeCodeConnector().billing_route()
+                except Exception:  # noqa: BLE001 - an unreadable probe establishes nothing
+                    billing_class, evidence = BillingClass.UNKNOWN, "claude_auth_status:unavailable"
+                status = ("available" if billing_class is BillingClass.SUBSCRIPTION_INCLUDED
+                          else "not_logged_in" if evidence == AUTH_NOT_LOGGED_IN_EVIDENCE else "unavailable")
+                models = self.claude_catalog() if status == "available" else []
+            return {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": status,
+                    "evidence": evidence, "models": models, "research": status == "available",
+                    "attachments": dict(ATTACHMENT_SUPPORT["claude"])}
+        if pid == "codex":
             try:
-                billing_class, evidence = ClaudeCodeConnector().billing_route()
-            except Exception:  # noqa: BLE001 - an unreadable probe establishes nothing
-                billing_class, evidence = BillingClass.UNKNOWN, "claude_auth_status:unavailable"
-            status = ("available" if billing_class is BillingClass.SUBSCRIPTION_INCLUDED
-                      else "not_logged_in" if evidence == AUTH_NOT_LOGGED_IN_EVIDENCE else "unavailable")
-            models = self.claude_catalog() if status == "available" else []
-        claude = {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": status,
-                  "evidence": evidence, "models": models, "research": status == "available",
-                  "attachments": dict(ATTACHMENT_SUPPORT["claude"])}
-        try:
-            state = self.codex_state()
-        except Exception:  # noqa: BLE001
-            state = {"status": "unavailable", "models": []}
-        if self.codex_state is codex_state:
-            remember_codex_state(state)          # the panel's fresh check serves the next chat too
-        # DISCOVERED (the account lists it) is not USABLE: each model carries what
-        # a real call in this session showed - "usable", "failed" + reason, or
-        # nothing yet ("" = discovered, not verified).
-        models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))}
-                  for model in state.get("models", []) if isinstance(model, dict)]
-        codex = {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
-                 "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
-                 "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
+                state = self.codex_state()
+            except Exception:  # noqa: BLE001
+                state = {"status": "unavailable", "models": []}
+            if self.codex_state is codex_state:
+                remember_codex_state(state)          # the panel's fresh check serves the next chat too
+            # DISCOVERED (the account lists it) is not USABLE: each model carries what
+            # a real call in this session showed - "usable", "failed" + reason, or
+            # nothing yet ("" = discovered, not verified).
+            models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))}
+                      for model in state.get("models", []) if isinstance(model, dict)]
+            return {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
+                    "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
+                    "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
         try:
             google = self.google_state()
         except Exception:  # noqa: BLE001 - an unreadable check establishes nothing
             google = {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "unavailable", "models": [], "research": False}
         # Never selectable in V1: no chat, no research, read-only quota at most.
-        google = {**google, "attachments": dict(ATTACHMENT_SUPPORT["google"])}
-        return [claude, codex, google,
-                {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [],
-                 "research": False, "attachments": dict(ATTACHMENT_SUPPORT["qwen"])}]
+        return {**google, "attachments": dict(ATTACHMENT_SUPPORT["google"])}
 
     # -- natural language -----------------------------------------------------
 

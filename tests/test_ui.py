@@ -96,6 +96,21 @@ class UiTestCase(unittest.TestCase):
         self.reader = StubConnector("local-file-read", ("file_read",))
         self.gmail = None
         self.engine = None
+        # Every bridge checks its providers at start: the Claude route answers from
+        # here, never from a real `claude auth status` (a test may patch it again).
+        from unittest.mock import patch
+        from jarvis.connectors.claude_code import ClaudeCodeConnector
+        from jarvis.contracts import BillingClass
+        route = patch.object(ClaudeCodeConnector, "billing_route",
+                             return_value=(BillingClass.SUBSCRIPTION_INCLUDED, "claude_auth_status:oauth_subscription"))
+        route.start()
+        self.addCleanup(route.stop)
+
+    def fake_providers(self, bridge: Bridge, lines: list[dict]) -> None:
+        """Fixed provider lines, delivered through the real catalog path."""
+        by_id = {line["id"]: line for line in lines}
+        bridge.backend.provider_line = lambda pid: by_id.get(pid, {"id": pid, "status": "not_installed", "models": []})
+        bridge.refreshProviders(force=True)
 
     def factory(self, settings):
         connectors = [self.claude, self.reader]
@@ -1260,11 +1275,11 @@ class CommandHeaderTests(UiTestCase):
 
         # No free-text model field any more: the models the CLI lists are the choice.
         self.assertEqual([], [i for i in visual_items(root) if i.objectName() == "modelField"])
-        bridge.backend.providers = lambda: [
+        self.fake_providers(bridge, [
             {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
              "models": [{"id": "opus[1m]", "name": "Opus", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "medium", "high"]}]},
-            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "not_installed", "models": [], "research": False}]
-        bridge.refreshProviders(); pump(300)
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "not_installed", "models": [], "research": False}])
+        pump(300)
         self.click(root, "claudeModelField"); pump(300)
         QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen"); pump(250)
         self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
@@ -1697,6 +1712,7 @@ from jarvis.ui import app as ui_app
 tmp = Path(tempfile.mkdtemp(prefix="jarvis-shutdown-test-"))
 Backend, Prefs, engine_of, sweeps = ui_app.Backend, ui_app.UiPreferences, ui_app.create_engine, ui_app.install_scheduler_sweeps
 ui_app.Backend = lambda: Backend(ConfigStore(tmp / "config.json"))
+Backend.provider_line = lambda self, pid: {"id": pid, "status": "not_installed", "models": []}   # no real provider CLI
 ui_app.UiPreferences = lambda: Prefs(tmp / "prefs.json")
 say = lambda what: os.write(2, (what + "\n").encode())
 def create_engine(bridge, *, icon=None):
@@ -3737,12 +3753,12 @@ class ProviderSelectionTests(UiTestCase):
                      {"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]
 
     def open_panel(self, bridge, billing="available"):
-        bridge.backend.providers = lambda: [
+        self.fake_providers(bridge, [
             {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": billing, "models": self.CLAUDE_MODELS, "research": True},
             {"id": "codex", "vendor": "OpenAI", "name": "Codex", **self.CODEX, "research": False},
             {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False,
              "quota": {"groups": self.GOOGLE_GROUPS}},
-            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
         self.click(root, "modelTrigger"); pump(400)
         return root
@@ -3853,7 +3869,7 @@ class ProviderSelectionTests(UiTestCase):
             self.assertEqual("Status unavailable - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
             self.assertEqual(("available", "available"), (bridge.providers[0]["status"], bridge.providers[1]["status"]))
             with patch.object(antigravity, "agy_executable", return_value=None):
-                bridge.refreshProviders(); pump(100)
+                bridge.refreshProviders(force=True); pump(100)
             self.assertEqual(("not_installed", False), (bridge.providers[2]["status"], "quota" in bridge.providers[2]))
         self.assertEqual([], [argv for argv in spawned if any("agy" in part.lower() for part in argv)])
 
@@ -3891,6 +3907,78 @@ class ProviderSelectionTests(UiTestCase):
         self.click(root, "modelTrigger"); pump(400)
         self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
         self.assertEqual(0, len(self.model.calls))
+
+
+class ProviderCatalogUiTests(UiTestCase):
+    """The selector reads a last-known-good catalog: nothing waits on a provider CLI."""
+    item = PresentationTests.item
+    window = PresentationTests.window
+    click = PresentationTests.click
+    LINES = ProviderSelectionTests.CLAUDE_MODELS
+
+    def counted(self, bridge, block: threading.Event | None = None) -> list[tuple[str, str]]:
+        """Replace the provider probe with fixed lines; record (provider, thread) per probe."""
+        calls: list[tuple[str, str]] = []
+        lines = {"claude": {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "models": self.LINES, "research": True},
+                 "codex": {"id": "codex", "vendor": "OpenAI", "name": "Codex", **ProviderSelectionTests.CODEX, "research": False},
+                 "google": {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "not_installed", "models": [], "research": False}}
+
+        def probe(pid):
+            calls.append((pid, threading.current_thread().name))
+            if block is not None:
+                block.wait(10)
+            return lines[pid]
+        bridge.backend.provider_line = probe
+        return calls
+
+    def wait(self, condition, seconds: float = 10) -> None:
+        deadline = time.monotonic() + seconds
+        while not condition() and time.monotonic() < deadline:
+            pump(20)
+        self.assertTrue(condition())
+
+    def test_a_cached_catalog_is_there_at_construction_and_ten_opens_start_no_probe(self) -> None:
+        first = self.bridge()
+        self.counted(first)
+        first.refreshProviders(force=True)                                # a previous run left its catalog behind
+        again = Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+        calls = self.counted(again)
+        self.assertEqual(["claude", "codex", "google", "qwen"], [p["id"] for p in again.providers])   # synchronously
+        self.assertEqual(self.LINES, again.providers[0]["models"])
+        self.assertEqual([], calls)
+        root = self.window(again)                                         # start(): the one launch refresh
+        self.assertEqual(["claude", "codex", "google"], sorted(pid for pid, _ in calls))
+        calls.clear()
+        for _ in range(10):
+            self.click(root, "modelTrigger"); pump(60)
+            self.assertTrue(root.property("modelOpen"))
+            self.assertEqual("Subscription route verified", self.item(root, "providerRow_claude").property("meta"))
+            self.click(root, "modelTrigger"); pump(40)
+        self.assertEqual([], calls)                                       # within the TTL: zero probe sets
+        self.assertEqual(0, self.execute_calls())
+
+    def test_first_run_start_never_waits_and_chat_runs_while_discovery_is_blocked(self) -> None:
+        release = threading.Event()
+        bridge = self.bridge(proposal(kind="chat", reply="Merhaba!"), sync=False)
+        calls = self.counted(bridge, block=release)
+        self.assertEqual([], bridge.providers)                            # first run: nothing cached yet
+        self.addCleanup(release.set)
+        t0 = time.monotonic()
+        bridge.start()
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.wait(lambda: len(calls) == 3)
+        # Discovery is on its own threads; the shared chat/task worker stays free.
+        self.assertTrue(all(name.startswith("jarvis-catalog-") for _, name in calls), calls)
+        bridge.submitText("Merhaba")
+        self.wait(lambda: not bridge.busy and self.kinds(bridge)[-1] == "jarvis")
+        self.assertEqual(("Merhaba!", []), (bridge.feed[-1]["text"], bridge.providers))   # answered while discovery waits
+        release.set()
+        self.wait(lambda: len(bridge.providers) == 4)
+        self.assertEqual(("available", "available"), (bridge.providers[0]["status"], bridge.providers[1]["status"]))
+        stored = json.loads((self.root / "provider-catalog.json").read_text(encoding="utf-8"))
+        self.assertEqual({"claude", "codex", "google"}, set(stored["providers"]))
+        self.assertEqual(3, len(calls))
+        bridge.waitIdle()
 
 
 class ConversationUxTests(UiTestCase):
@@ -4435,15 +4523,15 @@ class ModelCardTests(SurfaceCase):
     ]
 
     def providers(self, bridge):
-        bridge.backend.providers = lambda: [
+        self.fake_providers(bridge, [
             {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "models": self.CLAUDE_MODELS, "research": True},
             {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
              "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low", "medium"], "default_effort": "medium"}],
              "quota": {"primary": {"used_percent": 8.0, "window_minutes": 300, "resets_at": 1789560046},
                        "secondary": {"used_percent": 26.0, "window_minutes": 10080, "resets_at": 1789814410}, "has_credits": False}},
             {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False},
-            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
-        bridge.refreshProviders(); pump(200)
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
+        pump(200)
 
     def test_the_name_is_short_the_canonical_id_is_untouched_and_the_brand_line_is_plain(self) -> None:
         bridge = self.bridge()
@@ -6350,14 +6438,14 @@ class PrePolishTests(SurfaceCase):
 
     def test_the_provider_panel_lost_its_clutter_and_says_web_research_plainly(self) -> None:
         bridge = self.bridge()
-        bridge.backend.providers = lambda: [
+        self.fake_providers(bridge, [
             {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
              "models": [{"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5", "description": "", "efforts": ["low", "medium"]}]},
             {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
              "models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "efforts": ["low"], "default_effort": "low", "verified": {}}]},
             {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "chat_unavailable", "models": [], "research": False,
              "quota": {"groups": [{"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]}},
-            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}]
+            {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
         self.click(root, "modelTrigger"); pump(400)
         names = [str(i.objectName()) for i in self.all_items(root)]

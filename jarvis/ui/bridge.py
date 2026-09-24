@@ -44,6 +44,7 @@ from jarvis.context_items import (
     same_reference,
 )
 from jarvis.conversation import ConversationStore, task_title, turn_refs
+from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
@@ -226,7 +227,13 @@ class Bridge(QObject):
         self._started_frozen = False
         # One in-app scheduler sweep at a time (see ``sweepDueWork``).
         self._sweeping = False
+        # The selector's provider lines: last-known-good from the local catalog at
+        # once, refreshed on the catalog's own threads (never the chat worker).
         self._providers: list[dict] = []
+        self._catalog = ProviderCatalog(default_catalog_path(self.prefs.path), lambda pid: self.backend.provider_line(pid),
+                                        self._catalog_changed, sync=sync)
+        self._catalogDone.connect(self._show_catalog, Qt.QueuedConnection)
+        self._show_catalog()
         # The last understanding / General Chat call's usage, as its envelope reported it.
         self._chat_usage: dict = {}
         # Plan limits exactly as each provider last REPORTED them, with when that was.
@@ -1272,15 +1279,40 @@ class Bridge(QObject):
         empty until the first local check has answered."""
         return [dict(provider) for provider in self._providers]
 
+    _catalogDone = Signal()
+
     @Slot()
-    def refreshProviders(self) -> None:
-        self._run("providers", self.backend.providers, self._set_providers)
+    def refreshProviders(self, force: bool = False) -> None:
+        """Never waits: re-checks, in the background, only the provider lines
+        older than the catalog's TTL (all of them when ``force``); a provider
+        already being checked is not checked twice."""
+        self._catalog.refresh(force)
+
+    def _catalog_changed(self) -> None:
+        if self.sync:
+            self._show_catalog()
+            return
+        with self._weather_lock:            # the shutdown lock: after quit begins, nothing is delivered
+            if not self._shutting_down:
+                self._catalogDone.emit()
+
+    def _show_catalog(self) -> None:
+        if self._shutting_down:
+            return
+        lines = self._catalog.snapshot()
+        self._set_providers(lines + [self.backend.qwen_line()] if lines else [])
 
     def _set_providers(self, payload: Any) -> None:
-        self._providers = [p for p in payload if isinstance(p, dict)] if isinstance(payload, list) else []
+        self._providers = [dict(p) for p in payload if isinstance(p, dict)] if isinstance(payload, list) else []
+        verified = getattr(self.backend, "codex_verified", None) or {}
         for provider in self._providers:
             if isinstance(provider.get("quota"), dict) and provider["quota"]:
-                provider["quota"] = {**provider["quota"], "seen_at": int(time.time())}
+                quota = provider["quota"]
+                provider["quota"] = {**quota, "seen_at": int(quota.get("checked_at") or time.time())}
+            if provider.get("id") == "codex":
+                # What real calls showed this session (never cached) rides on the listed models.
+                provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))}
+                                      for m in provider.get("models") or [] if isinstance(m, dict)]
         self.providersChanged.emit()
 
     def _provider_route(self) -> dict:
@@ -2269,6 +2301,7 @@ class Bridge(QObject):
         self.refreshHistory()
         self.refreshJobs(False)
         self.refreshMemory("", False)
+        self.refreshProviders(force=True)       # once per launch, in the background
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS interface started"), ()), "system")
         if self.devFixture:
             self._seed_dev_fixture()
