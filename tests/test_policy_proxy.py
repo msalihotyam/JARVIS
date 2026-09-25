@@ -520,8 +520,31 @@ class BrowserConfigurationTests(unittest.TestCase):
         browser resolving names itself is the thing being taken away."""
         arguments = self.arguments()
         self.assertIn("--disable-quic", arguments)
-        self.assertIn("--disable-features=DnsOverHttps,AsyncDns", arguments)
+        self.assertIn("--disable-features=DnsOverHttps,AsyncDns,MediaRouter", arguments)
         self.assertIn("--dns-over-https-mode=off", arguments)
+
+    def test_one_disable_features_switch_carries_every_disabled_feature(self) -> None:
+        """Gate 3B. Chromium keeps only the LAST ``--disable-features``, so a
+        second switch would silently re-enable everything the first named.
+        MediaRouter is there because Cast discovery opened a direct TCP
+        connection to a LAN receiver (port 8009) that no proxy saw."""
+        for arguments in (
+            self.arguments(),
+            browser_arguments(profile_dir="C:/jarvis/chrome-profile", port=9333, proxy_port=45678),
+        ):
+            switches = [one for one in arguments if one.startswith("--disable-features")]
+            self.assertEqual(1, len(switches), switches)
+            features = switches[0].split("=", 1)[1].split(",")
+            self.assertEqual(["DnsOverHttps", "AsyncDns", "MediaRouter"], features)
+            self.assertEqual(len(features), len(set(features)))
+            for flag in (
+                "--disable-quic",
+                "--dns-over-https-mode=off",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--proxy-server=http://127.0.0.1:45678",
+                "--proxy-bypass-list=<-loopback>",
+            ):
+                self.assertIn(flag, arguments)
 
     def test_webrtc_cannot_open_its_own_udp_path(self) -> None:
         """Requirement 18's other half: ICE would let a page's script pick a

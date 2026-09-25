@@ -833,7 +833,7 @@ class WebRtcPolicyLaunchTests(unittest.TestCase):
                 "--proxy-server=http://127.0.0.1:1",
                 "--proxy-bypass-list=<-loopback>",
                 "--disable-quic",
-                "--disable-features=DnsOverHttps,AsyncDns",
+                "--disable-features=DnsOverHttps,AsyncDns,MediaRouter",
                 "--dns-over-https-mode=off",
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "about:blank",

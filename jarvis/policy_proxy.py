@@ -560,12 +560,20 @@ def proxy_arguments(proxy_port: int) -> tuple[str, ...]:
     ``disable_non_proxied_udp`` is Chromium's own control for exactly that: it
     forces WebRTC through the configured proxy and forbids the direct UDP path,
     so a transport that cannot be mediated cannot be used.
+
+    MEDIA ROUTER is off for the same reason. Opening any tab starts Cast
+    discovery (mDNS on 5353 from the browser process), and the network
+    service then opens a Cast channel - a DIRECT TCP connection to whatever
+    receiver answered on the LAN (port 8009) - that no proxy ever sees
+    (measured on Chrome 153 and Edge 153). Casting is not something JARVIS
+    does, so the feature is disabled rather than mediated. It is in the ONE
+    ``--disable-features`` switch: a second one would replace the first.
     """
     return (
         f"--proxy-server=http://127.0.0.1:{proxy_port}",
         "--proxy-bypass-list=<-loopback>",
         "--disable-quic",
-        "--disable-features=DnsOverHttps,AsyncDns",
+        "--disable-features=DnsOverHttps,AsyncDns,MediaRouter",
         "--dns-over-https-mode=off",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     )
