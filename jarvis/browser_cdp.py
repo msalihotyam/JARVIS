@@ -478,6 +478,82 @@ def browser_arguments(*, profile_dir: str, port: int, proxy_port: int) -> tuple[
     )
 
 
+#: The WebRTC IP handling policy the browser profile is held to. The
+#: ``--force-webrtc-ip-handling-policy`` switch in ``proxy_arguments`` reaches
+#: only the browser process's command line; Chrome 153 (and Edge 153) still
+#: let the NetworkService gather host candidates and send STUN over UDP from a
+#: page, straight past the proxy. The profile PREFERENCE is what the network
+#: service honours (measured: 0 candidates, 0 STUN packets), so it is written
+#: into the JARVIS-owned profile before every spawn. The switch stays as
+#: defence in depth.
+WEBRTC_IP_HANDLING_POLICY = "disable_non_proxied_udp"
+
+
+def _preferences_path(profile_dir: str) -> Path:
+    return Path(profile_dir) / "Default" / "Preferences"
+
+
+def enforce_profile_policy(profile_dir: str) -> Path:
+    """Hold the JARVIS-owned profile's ``Default/Preferences`` to the WebRTC policy.
+
+    Called on the SPAWN path only, when no browser JARVIS owns is running,
+    so nothing is writing the file concurrently. Every other preference is
+    preserved: the file is parsed, one value is set, and the result replaces
+    the file atomically through a same-directory temporary file. A file that
+    cannot be read or parsed is not guessed at - the browser is NOT started
+    (fail closed), and the original is left exactly as it was. Nothing of
+    the file's content is ever put in an error message.
+    """
+    path = _preferences_path(profile_dir)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        preferences: Any = {}
+    except OSError as exc:
+        raise BrowserCommandFailed(
+            f"the browser profile's Preferences file could not be read, so the "
+            f"WebRTC policy could not be enforced and the browser was not started: "
+            f"{exc.__class__.__name__}"
+        ) from exc
+    else:
+        try:
+            preferences = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise BrowserCommandFailed(
+                "the browser profile's Preferences file is not readable JSON, so the "
+                "WebRTC policy could not be enforced and the browser was not started"
+            ) from exc
+    webrtc = preferences.get("webrtc") if isinstance(preferences, dict) else None
+    if not isinstance(preferences, dict) or (webrtc is not None and not isinstance(webrtc, dict)):
+        raise BrowserCommandFailed(
+            "the browser profile's Preferences file does not have the structure the "
+            "WebRTC policy is written into, so the browser was not started"
+        )
+    if webrtc is None:
+        webrtc = preferences["webrtc"] = {}
+    if webrtc.get("ip_handling_policy") == WEBRTC_IP_HANDLING_POLICY:
+        return path
+    webrtc["ip_handling_policy"] = WEBRTC_IP_HANDLING_POLICY
+    temporary = path.with_name(f"{path.name}.jarvis-{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(preferences, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise BrowserCommandFailed(
+            f"the browser profile's Preferences file could not be updated with the "
+            f"WebRTC policy, so the browser was not started: {exc.__class__.__name__}"
+        ) from exc
+    return path
+
+
 #: The browser this process launched and still owns, by debugging port. The
 #: value is the OS-level lifetime binding, and holding it here is what keeps
 #: the browser alive: drop it and the job closes and Windows kills the tree.
@@ -603,6 +679,12 @@ def attached_browser(
             "rather than driven; close it and try again"
         )
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    # THE PROFILE POLICY BEFORE THE PROCESS. Only a browser this process
+    # spawned is ever reused (above), and every spawn passes through here
+    # first, so no browser JARVIS drives was started against a profile that
+    # lacked the policy. On this path nothing JARVIS owns is running, so the
+    # file is not being written by a browser while it is replaced.
+    enforce_profile_policy(profile_dir)
     trusted = executable_lookup()
     # THE BOUNDARY FIRST. The browser is told to reach the network only
     # through this, so it exists before the browser does (DB-002B-02).
@@ -1732,15 +1814,32 @@ def release_browser_policies(policies: dict[str, BrowserPolicy] | None = None) -
 atexit.register(release_browser_policies)
 
 
-def tab_boundary(socket_url: str) -> PolicyProxy:
+def tab_boundary(socket_url: str, *, origin: str) -> PolicyProxy:
     """A pre-connect boundary serving ONE tab, started before that tab exists.
 
     Its own listener, so the browser context pointed at it carries exactly one
     tab's traffic, and its own authority, so what arrives may only go to that
     tab's approved origin. Both die with the tab (BROWSER-WS-01).
+
+    BOUND BEFORE IT IS RETURNED. The browser context that will be pointed at
+    this listener does not exist yet, but the moment it does the browser may
+    preconnect through it - so the authority is in place before any caller
+    can hand the port to the browser, not once the tab is mediated later.
+    A boundary that cannot be bound is stopped and not returned.
     """
     proxy = PolicyProxy()
     proxy.start()
+    try:
+        proxy.bind_origin(origin)
+        proxy.authorize(origin)
+        if proxy.authority() is None:
+            raise ValueError("no authority")
+    except Exception as exc:
+        proxy.stop()
+        raise BrowserCommandFailed(
+            "the tab's boundary could not be bound to its approved origin, so no "
+            "tab was opened"
+        ) from exc
     return proxy
 
 
@@ -1961,7 +2060,15 @@ def _perform(
         try:
             target: dict[str, Any] = {"url": BROWSER_BLANK_PAGE}
             if policies is not None:
-                boundary = tab_boundary(socket_url)
+                boundary = tab_boundary(socket_url, origin=origin)
+                # VERIFIED BOUND before the browser learns the port. A tab
+                # proxy the browser can reach while it serves no authority is
+                # a way out for whatever the browser preconnects on its own.
+                if boundary.authority() is None:
+                    raise BrowserCommandFailed(
+                        "the tab's boundary carries no authority, so the browser "
+                        "was not given it and no tab was opened"
+                    )
                 context_id = str(
                     connection.command(
                         "Target.createBrowserContext",
@@ -2140,6 +2247,7 @@ __all__ = [
     "browser_arguments",
     "browser_executable",
     "browser_policy_proxy",
+    "enforce_profile_policy",
     "mediated_tab",
     "tab_boundary",
     "owned_browser",

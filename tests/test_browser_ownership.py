@@ -36,6 +36,7 @@ from pathlib import Path
 
 from jarvis import browser_cdp as cdp_module
 from jarvis.browser_cdp import (
+    enforce_profile_policy,
     BrowserCommandFailed,
     attached_browser,
     browser_arguments,
@@ -647,6 +648,198 @@ class ChromeProfileTests(unittest.TestCase):
         for url in ("ws://[::1]:9333/devtools/browser/x", "ws://0.0.0.0:9333/x", "ws://192.168.1.2:9333/x", "wss://127.0.0.1:9333/x"):
             with self.subTest(url=url), self.assertRaises(BrowserCommandFailed):
                 cdp_module._WebSocket(url, timeout=0.2)
+
+
+
+class WebRtcPreferenceTests(unittest.TestCase):
+    """V2 M1 Gate 3A. ``--force-webrtc-ip-handling-policy`` reaches only the
+    browser process; Chrome's NetworkService still sent STUN over UDP from a
+    page. The profile preference is what it honours, so the JARVIS-owned
+    profile is held to it before every spawn - preserving everything else in
+    the file, atomically, and never guessing at a file it cannot read."""
+
+    POLICY = {"webrtc": {"ip_handling_policy": "disable_non_proxied_udp"}}
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.profile = str(Path(self.temp.name) / "chrome-profile")
+        self.preferences = Path(self.profile) / "Default" / "Preferences"
+
+    def write(self, content: str | dict) -> None:
+        self.preferences.parent.mkdir(parents=True, exist_ok=True)
+        text = content if isinstance(content, str) else json.dumps(content)
+        self.preferences.write_text(text, encoding="utf-8")
+
+    def read(self) -> dict:
+        return json.loads(self.preferences.read_text(encoding="utf-8"))
+
+    def test_a_missing_file_gets_the_minimal_policy(self) -> None:
+        self.assertFalse(Path(self.profile).exists())
+        self.assertEqual(self.preferences, enforce_profile_policy(self.profile))
+        self.assertEqual(self.POLICY, self.read())
+
+    def test_a_missing_default_directory_is_created_beside_nothing_else(self) -> None:
+        Path(self.profile).mkdir()
+        enforce_profile_policy(self.profile)
+        self.assertEqual(["Default"], [p.name for p in Path(self.profile).iterdir()])
+        self.assertEqual(["Preferences"], [p.name for p in self.preferences.parent.iterdir()])
+
+    def test_unrelated_preferences_survive(self) -> None:
+        before = {
+            "profile": {"name": "Ümit", "avatar_index": 3, "list": [1, 2, {"x": None}]},
+            "browser": {"show_home_button": True},
+            "session": {"restore_on_startup": 5},
+        }
+        self.write(before)
+        enforce_profile_policy(self.profile)
+        self.assertEqual({**before, **self.POLICY}, self.read())
+
+    def test_webrtc_siblings_survive_and_a_wrong_value_is_corrected(self) -> None:
+        self.write(
+            {"webrtc": {"ip_handling_policy": "default", "multiple_routes_enabled": False}, "other": 1}
+        )
+        enforce_profile_policy(self.profile)
+        self.assertEqual(
+            {
+                "webrtc": {"ip_handling_policy": "disable_non_proxied_udp", "multiple_routes_enabled": False},
+                "other": 1,
+            },
+            self.read(),
+        )
+
+    def test_the_correct_value_is_left_exactly_as_it_is(self) -> None:
+        self.write('{"webrtc": {"ip_handling_policy": "disable_non_proxied_udp"}, "k": "v"}')
+        before = (self.preferences.read_bytes(), self.preferences.stat().st_mtime_ns)
+        enforce_profile_policy(self.profile)
+        self.assertEqual(before, (self.preferences.read_bytes(), self.preferences.stat().st_mtime_ns))
+        self.assertEqual([self.preferences], list(self.preferences.parent.iterdir()))
+
+    def test_malformed_preferences_fail_closed_and_are_left_alone(self) -> None:
+        cases = ('{"webrtc": {', "[1, 2]", '{"webrtc": "not an object"}', "\xff\xfe\x00")
+        for content in cases:
+            with self.subTest(content=content):
+                self.write(content)
+                before = self.preferences.read_bytes()
+                with self.assertRaises(BrowserCommandFailed) as raised:
+                    enforce_profile_policy(self.profile)
+                self.assertEqual(before, self.preferences.read_bytes(), "the original was touched")
+                self.assertEqual(
+                    [self.preferences], list(self.preferences.parent.iterdir()), "a temporary was left"
+                )
+                self.assertNotIn("not an object", str(raised.exception), "file content leaked")
+
+    def test_a_replace_that_fails_preserves_the_original(self) -> None:
+        """Windows refuses to replace a file another handle holds open without
+        delete sharing - which is exactly a browser still writing it."""
+        self.write({"keep": "me"})
+        with open(self.preferences, "rb") as held:
+            with self.assertRaises(BrowserCommandFailed) as raised:
+                enforce_profile_policy(self.profile)
+            self.assertIn("could not be updated", str(raised.exception))
+            held.seek(0)
+            self.assertEqual(b'{"keep": "me"}', held.read())
+        self.assertEqual({"keep": "me"}, self.read())
+        self.assertEqual([self.preferences], list(self.preferences.parent.iterdir()), "a temporary was left")
+
+    def test_only_the_jarvis_profile_is_written(self) -> None:
+        """Requirements 8 and 9: the production profile path, and nothing beside
+        it - not the Edge rollback profile, not the operator's own Chrome."""
+        from dataclasses import replace
+
+        from jarvis.settings import ConfigStore
+
+        root = Path(tempfile.mkdtemp(prefix="jarvis-webrtc-")).resolve()
+        self.addCleanup(shutil.rmtree, root, True)
+        settings = replace(
+            ConfigStore(root / "config.json").load().settings, memory_database=root / "jarvis.db"
+        )
+        (root / "browser-profile").mkdir()  # the Edge rollback profile, beside it
+        edge_before = sorted(p.name for p in (root / "browser-profile").iterdir())
+        written = enforce_profile_policy(str(settings.browser_profile_dir))
+        self.assertEqual(root / "chrome-profile" / "Default" / "Preferences", written)
+        self.assertEqual(edge_before, sorted(p.name for p in (root / "browser-profile").iterdir()))
+        self.assertEqual({"browser-profile", "chrome-profile"}, {p.name for p in root.iterdir()} - {"config.json"})
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            self.assertFalse(written.is_relative_to(Path(local) / "Google" / "Chrome" / "User Data"))
+
+
+class WebRtcPolicyLaunchTests(unittest.TestCase):
+    """The policy is enforced before the spawn, and only on the spawn path."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.profile = str(Path(self.temp.name) / "chrome-profile")
+        self.preferences = Path(self.profile) / "Default" / "Preferences"
+        self.addCleanup(release_owned_browsers)
+
+    def stand_in(self, port: int):
+        process = launch_owned([sys.executable, "-c", _STAND_IN, str(port)])
+        self.addCleanup(process.close)
+        return process
+
+    def test_no_spawn_when_enforcement_fails(self) -> None:
+        self.preferences.parent.mkdir(parents=True)
+        self.preferences.write_text('{"webrtc": {', encoding="utf-8")
+        port = _free_port()
+        launched: list = []
+
+        def spawn(argv):
+            launched.append(argv)
+            raise AssertionError("a browser was started against an unenforced profile")
+
+        with self.assertRaises(BrowserCommandFailed) as raised:
+            attached_browser(
+                profile_dir=self.profile, port=port, executable_lookup=_trusted_stand_in, spawn=spawn
+            )
+        self.assertIn("not readable JSON", str(raised.exception))
+        self.assertEqual([], launched)
+        self.assertIsNone(owned_browser(port))
+        self.assertNotIn(port, cdp_module._POLICY_PROXIES, "a boundary was started for a browser that never was")
+
+    def test_spawn_happens_only_after_enforcement_and_reuse_never_rewrites(self) -> None:
+        port = _free_port()
+        seen_at_spawn: list = []
+
+        def spawn(argv):
+            seen_at_spawn.append(json.loads(self.preferences.read_text(encoding="utf-8")))
+            return self.stand_in(port)
+
+        self.assertFalse(self.preferences.exists())
+        attached_browser(profile_dir=self.profile, port=port, executable_lookup=_trusted_stand_in, spawn=spawn)
+        self.assertEqual([{"webrtc": {"ip_handling_policy": "disable_non_proxied_udp"}}], seen_at_spawn)
+        # The browser is now running (the stand-in) and may be writing the
+        # file. The reuse path must not touch it - not even to repair it.
+        self.preferences.write_text('{"webrtc": {', encoding="utf-8")
+        attached_browser(profile_dir=self.profile, port=port, executable_lookup=_trusted_stand_in, spawn=spawn)
+        self.assertEqual(1, len(seen_at_spawn), "a second browser was spawned")
+        self.assertEqual('{"webrtc": {', self.preferences.read_text(encoding="utf-8"))
+
+    def test_the_launch_flags_are_unchanged_with_the_switch_retained(self) -> None:
+        arguments = browser_arguments(profile_dir=self.profile, port=9333, proxy_port=1)
+        self.assertIn("--force-webrtc-ip-handling-policy=disable_non_proxied_udp", arguments)
+        self.assertEqual(
+            (
+                "--remote-debugging-port=9333",
+                f"--user-data-dir={self.profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--no-service-autorun",
+                "--proxy-server=http://127.0.0.1:1",
+                "--proxy-bypass-list=<-loopback>",
+                "--disable-quic",
+                "--disable-features=DnsOverHttps,AsyncDns",
+                "--dns-over-https-mode=off",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "about:blank",
+            ),
+            arguments,
+        )
 
 
 #: What ``executable_lookup`` hands ``attached_browser`` here: a trusted

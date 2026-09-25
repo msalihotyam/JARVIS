@@ -29,6 +29,7 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import jarvis.browser_cdp as cdp
 from jarvis.browser import (
@@ -79,10 +80,13 @@ class StartupCase(unittest.TestCase):
         #: one was left listening.
         self.boundaries: list[PolicyProxy] = []
         original = cdp.tab_boundary
+        self.real_tab_boundary = original
 
-        def watched(socket_url):
+        def watched(socket_url, *, origin):
             made = PolicyProxy(resolver=resolver_for())
             made.start()
+            made.bind_origin(origin)
+            made.authorize(origin)
             self.boundaries.append(made)
             return made
 
@@ -331,9 +335,11 @@ class CleanupThatItselfFailsTests(StartupCase):
         original = cdp.tab_boundary
         raised: list[str] = []
 
-        def brittle(socket_url):
+        def brittle(socket_url, *, origin):
             made = PolicyProxy(resolver=resolver_for())
             made.start()
+            made.bind_origin(origin)
+            made.authorize(origin)
             real_stop = made.stop
 
             def angry():
@@ -424,3 +430,151 @@ class SuccessPathTests(StartupCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class BoundBeforeExposureTests(StartupCase):
+    """V2 M1 Gate 3A. Live Chrome preconnected to public Google hosts through
+    a per-tab boundary in the interval between ``Target.createBrowserContext``
+    and ``mediated_tab()``, because the boundary was started UNBOUND and only
+    bound at mediation. A per-tab boundary now carries its authority before
+    the browser can learn its port."""
+
+    @property
+    def a_port(self) -> int:
+        return int(urlsplit(self.origin).port)
+
+    def _connect(self, proxy: PolicyProxy, target: str) -> bytes:
+        with socket.create_connection(("127.0.0.1", proxy.port), timeout=15) as sock:
+            sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
+            return sock.recv(4096)
+
+    def test_the_boundary_is_bound_before_the_browser_receives_its_port(self) -> None:
+        seen: list = []
+        self.start_browser()
+
+        def at_context_creation():
+            params = [p for m, p in self.browser.sent if m == "Target.createBrowserContext"][-1]
+            seen.append(
+                (
+                    params.get("proxyServer"),
+                    [(b.port, b.authority()) for b in self.boundaries],
+                    dict(self.policies),
+                    read_current_tab(self.profile),
+                )
+            )
+
+        self.browser.triggers["Target.createBrowserContext"] = at_context_creation
+        self.open_tab()
+        (proxy_server, boundaries, policies_then, note_then), = seen
+        (port, authority), = boundaries
+        self.assertEqual(f"http://127.0.0.1:{port}", proxy_server)
+        self.assertEqual(("127.0.0.1", self.a_port), authority, "the browser was handed an unbound boundary")
+        self.assertEqual({}, policies_then, "mediation existed before the context did")
+        self.assertEqual("", note_then, "current-tab was published before the tab existed")
+
+    def test_a_connection_before_mediation_is_already_constrained(self) -> None:
+        """The Gate 3 observation, as a regression: what arrives at the tab
+        proxy while the browser has its port but the tab is not yet mediated
+        may only go to the approved origin."""
+        answers: list = []
+
+        def loopback_bound(socket_url, *, origin):
+            # The fixture's resolver answers every name with a public address;
+            # this tab's approved origin is loopback, so resolve it as such.
+            made = PolicyProxy(resolver=resolver_for("127.0.0.1"))
+            made.start()
+            made.bind_origin(origin)
+            made.authorize(origin)
+            self.boundaries.append(made)
+            return made
+
+        cdp.tab_boundary = loopback_bound
+        self.start_browser()
+
+        def preconnect_like_chrome():
+            boundary = self.boundaries[-1]
+            self.assertEqual({}, self.policies, "not before mediation")
+            answers.append(("public", self._connect(boundary, f"{OFF_ORIGIN}:443")))
+            answers.append(("private", self._connect(boundary, "192.168.1.10:443")))
+            answers.append(("approved", self._connect(boundary, f"127.0.0.1:{self.a_port}")))
+
+        self.browser.triggers["Target.createBrowserContext"] = preconnect_like_chrome
+        self.open_tab()
+        outcome = dict(answers)
+        self.assertIn(b"403", outcome["public"])
+        self.assertIn(b"403", outcome["private"])
+        self.assertIn(b"200", outcome["approved"])
+        boundary = self.boundaries[-1]
+        self.assertEqual([("127.0.0.1", self.a_port)], boundary.connected, "something else got out")
+        self.assertEqual(2, len(boundary.refused))
+
+    def test_binding_failure_creates_no_context_and_stops_the_boundary(self) -> None:
+        """Through the REAL tab_boundary: a proxy that cannot bind is stopped
+        and the browser is never asked for a context."""
+        made: list = []
+        real_proxy = cdp.PolicyProxy
+
+        class Unbindable(real_proxy):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                made.append(self)
+
+            def bind_origin(self, origin):
+                raise ValueError("cannot bind")
+
+        cdp.tab_boundary = self.real_tab_boundary
+        cdp.PolicyProxy = Unbindable
+        self.addCleanup(setattr, cdp, "PolicyProxy", real_proxy)
+        self.start_browser()
+        with self.assertRaises(BrowserCommandFailed) as raised:
+            self.open_tab()
+        self.assertIn("could not be bound", str(raised.exception))
+        self.assertEqual(1, len(made))
+        self.assertFalse(made[0].running, "an unbindable boundary was left listening")
+        self.assertNotIn("Target.createBrowserContext", [m for m, _ in self.browser.sent])
+        self.assert_nothing_reusable()
+
+    def test_an_unbound_boundary_is_never_handed_to_the_browser(self) -> None:
+        """Even if a boundary somehow arrives unbound, the transaction refuses
+        to expose it: no context, boundary stopped, nothing reusable."""
+
+        def unbound(socket_url, *, origin):
+            proxy = PolicyProxy(resolver=resolver_for())
+            proxy.start()
+            self.boundaries.append(proxy)
+            return proxy
+
+        cdp.tab_boundary = unbound
+        self.start_browser()
+        with self.assertRaises(BrowserCommandFailed) as raised:
+            self.open_tab()
+        self.assertIn("carries no authority", str(raised.exception))
+        self.assertNotIn("Target.createBrowserContext", [m for m, _ in self.browser.sent])
+        self.assert_nothing_reusable()
+
+    def test_a_failure_after_binding_still_stops_the_bound_boundary(self) -> None:
+        self.start_browser(**{"Target.attachToTarget": "the target went away"})
+        with self.assertRaises(BrowserCommandFailed):
+            self.open_tab()
+        (boundary,) = self.boundaries
+        self.assertEqual(("127.0.0.1", self.a_port), boundary.authority())
+        self.assertFalse(boundary.running)
+        self.assert_nothing_reusable()
+
+    def test_the_real_boundary_is_born_bound(self) -> None:
+        boundary = self.real_tab_boundary("ws://127.0.0.1:1/x", origin="https://approved.test:8443")
+        self.addCleanup(boundary.stop)
+        self.assertEqual(("approved.test", 8443), boundary.authority())
+        self.assertTrue(boundary.running)
+
+    def test_the_profile_level_proxy_is_still_unbound(self) -> None:
+        """The browser's own boundary serves every tab's vendor traffic and is
+        NOT a tab boundary: it keeps its ``None`` authority (Gate 3A leaves
+        it exactly as it was)."""
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        proxy = cdp.browser_policy_proxy(port)
+        self.addCleanup(cdp.release_owned_browsers, port)
+        self.assertIsNone(proxy.authority())
+        self.assertTrue(proxy.running)

@@ -232,12 +232,15 @@ class CrossTabTests(WebSocketCase):
         self.assertEqual([], second.connected)
 
     def test_each_tab_gets_a_boundary_of_its_own(self) -> None:
-        one = tab_boundary("ws://127.0.0.1:1/x")
+        one = tab_boundary("ws://127.0.0.1:1/x", origin="http://a.example:8080")
         self.addCleanup(one.stop)
-        two = tab_boundary("ws://127.0.0.1:1/x")
+        two = tab_boundary("ws://127.0.0.1:1/x", origin="http://b.example")
         self.addCleanup(two.stop)
         self.assertNotEqual(one.port, two.port)
-        self.assertIsNone(one.authority(), "a fresh boundary carries no authority")
+        # Gate 3A: a boundary is BORN bound - there is no moment in which it
+        # listens for a tab while serving every authority.
+        self.assertEqual(("a.example", 8080), one.authority())
+        self.assertEqual(("b.example", 80), two.authority())
 
     def test_an_explicit_local_grant_belongs_to_the_policy_that_made_it(self) -> None:
         """Requirement 14: the grant still works, for its own tab only."""
