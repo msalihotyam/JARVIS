@@ -498,7 +498,7 @@ class BrowserConfigurationTests(unittest.TestCase):
 
     def arguments(self) -> tuple[str, ...]:
         return browser_arguments(
-            profile_dir="C:/jarvis/browser-profile", port=9333, proxy_port=45678
+            profile_dir="C:/jarvis/chrome-profile", port=9333, proxy_port=45678
         )
 
     def test_the_proxy_is_the_only_route_and_there_is_no_direct_fallback(self) -> None:
@@ -556,7 +556,7 @@ class BrowserConfigurationTests(unittest.TestCase):
     def test_the_dedicated_profile_is_still_the_only_one_touched(self) -> None:
         """Requirement 21: the operator's own browser is not in scope."""
         arguments = self.arguments()
-        self.assertIn("--user-data-dir=C:/jarvis/browser-profile", arguments)
+        self.assertIn("--user-data-dir=C:/jarvis/chrome-profile", arguments)
         self.assertIn("--remote-debugging-port=9333", arguments)
         self.assertIn("about:blank", arguments)
 

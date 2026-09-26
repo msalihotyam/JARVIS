@@ -2519,6 +2519,41 @@ Her modda aşağıdakiler açık onay gerektirir:
 
 Dosya okuma, yerel analiz, özetleme ve normal yerel testler düşük riskli kabul edilebilir. İzinler capability ile değil; normalize hedef/path, işlem, connector/destination, veri sınıfı, task ve session ile sınırlandırılır. Süresi dolmuş, başka task/session'a ait veya fingerprint'i değişmiş grant hiçbir işi çalıştırmaz. Dışarı gönderilecek verinin yalnızca redacted önizleme/metadata bilgisi onay ekranında gösterilir.
 
+### 5.1 Tarayıcı çalışma zamanı sınırı
+
+- **Yürütülebilir dosya:** Yalnızca sistem genelinde kurulu Google Chrome
+  (`Program Files` / `Program Files (x86)` altındaki `Google\Chrome\Application\chrome.exe`).
+  `PATH` araması, `%LOCALAPPDATA%` altındaki kullanıcı kurulumu ve başka bir
+  tarayıcıya geri düşme yoktur. Doğrulanan kimlik, süreç başlatılmadan hemen
+  önce yeniden denetlenir.
+- **Profil:** JARVIS'e ayrılmış `data\chrome-profile` (hafıza veritabanının
+  yanında, türetilmiş, yapılandırılamaz). Operatörün kendi Chrome profili hiçbir
+  zaman kullanılmaz. Yanındaki `data\browser-profile`, eski Edge çalışma
+  zamanının profilidir; yalnızca Chrome öncesi bir sürüme geri dönüş için
+  geçici olarak saklanır, Chrome onu hiç açmaz.
+- **Sahiplik:** Tarayıcı ağacı JARVIS'in Job Object'i içinde başlar ve JARVIS
+  ile birlikte sonlanır; hata ayıklama ucu yalnızca `127.0.0.1:9333`'tür ve
+  dinleyen süreç Job içinde değilse sürülmez.
+- **Ağ çıkışı:** Tüm trafik JARVIS'in loopback `PolicyProxy`'sinden geçer
+  (`DIRECT` yedeği yok, loopback baypası kaldırılmış). Proxy her DNS cevabını
+  sınıflandırır ve yalnızca yargıladığı sayısal adrese bağlanır. QUIC ve
+  tarayıcının kendi DoH/asenkron DNS'i kapalıdır.
+- **Sekme sınırı:** Her sekme kendi browser context'inde, kendi `PolicyProxy`'si
+  arkasında açılır. Bu proxy, onaylı origin'e bağlanmış ve bu doğrulanmış
+  olarak Chrome'a verilir; bağlanmamış bir sekme proxy'si tarayıcıya hiç
+  gösterilmez. WebSocket dahil, sekmenin onaylı origin'i dışındaki her bağlantı
+  bağlantı açılmadan reddedilir.
+- **WebRTC:** `webrtc.ip_handling_policy = disable_non_proxied_udp` her yeni
+  Chrome başlatılmadan önce profil tercihine atomik olarak yazılır (bozuk tercih
+  dosyası başlatmayı engeller). `--force-webrtc-ip-handling-policy` bayrağı
+  derinlemesine savunma olarak kalır; tek başına NetworkService'e ulaşmadığı
+  ölçülmüştür.
+- **Media Router:** Kapalıdır (`--disable-features` içinde `MediaRouter`). Açıkken
+  bir sekme açılması Cast keşfini (mDNS) başlatıyor ve LAN'daki alıcıya proxy
+  dışı doğrudan TCP bağlantısı açıyordu. Kapatılacak özellikler tek bir
+  `--disable-features` anahtarında tutulur; ikinci bir anahtar ilkini geçersiz
+  kılar.
+
 ## 6. Hafıza ve çalışma durumu
 
 Hafıza yalnızca sohbet geçmişi değildir. En az iki katman olacaktır:

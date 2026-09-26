@@ -635,9 +635,9 @@ class ScopeTests(unittest.TestCase):
     def test_the_profile_and_port_are_never_the_operators_own(self) -> None:
         self.assertNotEqual(9222, BROWSER_DEBUG_PORT)
         arguments = browser_arguments(
-            profile_dir="C:/jarvis/browser-profile", port=BROWSER_DEBUG_PORT, proxy_port=1
+            profile_dir="C:/jarvis/chrome-profile", port=BROWSER_DEBUG_PORT, proxy_port=1
         )
-        self.assertIn("--user-data-dir=C:/jarvis/browser-profile", arguments)
+        self.assertIn("--user-data-dir=C:/jarvis/chrome-profile", arguments)
         self.assertIn(f"--remote-debugging-port={BROWSER_DEBUG_PORT}", arguments)
 
     def test_a_tab_that_cannot_be_mediated_is_never_treated_as_mediated(self) -> None:

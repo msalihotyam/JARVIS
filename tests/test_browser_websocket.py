@@ -28,6 +28,10 @@ own browser context sends ALL of its traffic - WebSockets included - to that
 context's own proxy. That gives the one thing a renderer gate cannot: per-tab
 attribution for a connection nobody announced.
 
+The runtime is now Google Chrome; the same property was re-verified live on
+Chrome 153.0.8010.54 (in-origin WebSocket answered, off-origin and LAN
+WebSockets refused at the tab boundary, denied listeners reached 0 times).
+
 SO THE FIX IS AUTHORITY AT THE BOUNDARY. Each JARVIS tab gets its own context
 and its own boundary, bound to that tab's approved origin. Everything the page
 may legitimately request was already judged by the renderer gate and is on that
@@ -300,7 +304,7 @@ class PreservedHardeningTests(unittest.TestCase):
 
     def arguments(self) -> tuple[str, ...]:
         return browser_arguments(
-            profile_dir="C:/jarvis/browser-profile", port=9333, proxy_port=45678
+            profile_dir="C:/jarvis/chrome-profile", port=9333, proxy_port=45678
         )
 
     def test_the_proxy_is_still_mandatory_with_no_direct_fallback(self) -> None:

@@ -70,7 +70,6 @@ from jarvis.contracts import (
     ActionScope,
     AgentRun,
     AttemptState,
-    AttemptState,
     ErrorCode,
     PermissionGrant,
     RunStatus,
@@ -457,7 +456,7 @@ def connector(*, answer=None, ran=None) -> BrowserCdpConnector:
             return BrowserCommandOutput({"content": RENDERING})
         return BrowserCommandOutput({"tab_id": TAB, "url": URL})
 
-    made = BrowserCdpConnector("C:/jarvis/browser-profile", plan_runner=runner)
+    made = BrowserCdpConnector("C:/jarvis/chrome-profile", plan_runner=runner)
     made.ran = ran  # type: ignore[attr-defined]
     return made
 

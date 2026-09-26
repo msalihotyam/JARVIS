@@ -139,6 +139,12 @@ activation. A state/junction disagreement is reported by `-Status` and
 blocks install/rollback; it is never repaired by guesswork. Tests:
 `powershell -File tests\release-manager-tests.ps1` (isolated temp roots).
 
+Browser runtime and rollback: current releases drive trusted system Google
+Chrome on `data\chrome-profile`. A release built before the Chrome migration
+drives Microsoft Edge on `data\browser-profile`, so that profile is kept,
+unmodified, as long as such a release is a rollback target. Deleting it, or
+that release, is a separate explicit decision.
+
 ## Dashboard
 
 Update `dev/dashboard/status.json` only after the accepted work is canonical
