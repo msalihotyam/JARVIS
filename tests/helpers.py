@@ -33,6 +33,17 @@ from jarvis.destinations import CLAUDE_CODE_DESTINATION
 from jarvis.registry import ToolRegistry
 
 
+def isolated_settings(test, **fields):
+    """Code-default ``Settings`` except for a temporary ``memory_database``,
+    cleaned up with ``test``. For tests that exercise the production
+    composition: the code default database is the operator's live one."""
+    from jarvis.settings import Settings
+
+    temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    test.addCleanup(safe_cleanup, temp)
+    return Settings(memory_database=Path(temp.name) / "jarvis.db", **fields)
+
+
 def safe_cleanup(temp: tempfile.TemporaryDirectory) -> None:
     """Remove a test temp directory, tolerating Windows delete-pending files.
 

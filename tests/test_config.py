@@ -67,7 +67,7 @@ from jarvis.settings import (
     Settings,
     load_settings,
 )
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_core, safe_cleanup
 
 EXIT_OK = 0
 EXIT_INVALID_INPUT = 64
@@ -818,7 +818,9 @@ class PrecedenceTests(ConfigTestCase):
     def test_a_flag_beats_the_store_but_never_writes_it(self) -> None:
         self.store.reset_all()
         self.store.mutate(
-            lambda s: replace(s, permission_mode=PermissionMode.SESSION)
+            lambda s: replace(
+                s, permission_mode=PermissionMode.SESSION, memory_database=self.root / "jarvis.db"
+            )
         )
         before = self.path.read_bytes()
         out = io.StringIO()
@@ -830,11 +832,41 @@ class PrecedenceTests(ConfigTestCase):
 
     def test_the_store_beats_the_code_defaults(self) -> None:
         self.store.reset_all()
-        self.store.mutate(lambda s: replace(s, permission_mode=PermissionMode.STRICT))
+        self.store.mutate(
+            lambda s: replace(
+                s, permission_mode=PermissionMode.STRICT, memory_database=self.root / "jarvis.db"
+            )
+        )
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cli.main(["status"])
         self.assertEqual(json.loads(out.getvalue())["permission_mode"], "strict")
+
+
+class LiveDatabaseIsolationTests(unittest.TestCase):
+    """Tests can never reach the operator's live database.
+
+    The code default for ``memory_database`` is ``<repo>/data/jarvis.db``,
+    which in the canonical checkout is the live database; the ``tests``
+    package refuses to open that exact path, so a test that lets the default
+    through fails instead of writing to it. Production behaviour is not
+    changed: the default itself stays what it is."""
+
+    def test_the_production_default_is_unchanged_and_is_what_is_guarded(self) -> None:
+        from tests import LIVE_DATABASE
+
+        self.assertEqual(settings_module.PROJECT_ROOT / "data" / "jarvis.db", Settings().memory_database)
+        self.assertEqual(LIVE_DATABASE, Settings().memory_database.resolve())
+
+    def test_opening_the_live_database_from_a_test_is_refused_before_any_io(self) -> None:
+        from jarvis.memory import SQLiteMemoryStore
+        from tests import LIVE_DATABASE
+
+        before = (LIVE_DATABASE.stat().st_mtime_ns, LIVE_DATABASE.stat().st_size) if LIVE_DATABASE.exists() else None
+        with self.assertRaises(AssertionError):
+            SQLiteMemoryStore(LIVE_DATABASE)
+        after = (LIVE_DATABASE.stat().st_mtime_ns, LIVE_DATABASE.stat().st_size) if LIVE_DATABASE.exists() else None
+        self.assertEqual(before, after)
 
 
 class KillSwitchTestCase(unittest.TestCase):

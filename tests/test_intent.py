@@ -86,7 +86,7 @@ from jarvis.intent import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, safe_cleanup
+from tests.helpers import DummyConnector, isolated_settings, safe_cleanup
 
 # The phase-1A timezone fixture, reused verbatim: it installs a TZif fallback
 # so a Daily schedule is expressible on a machine with no tzdata.
@@ -727,7 +727,7 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(base.prompt_prefix.startswith("JARVIS read-only planning request."))
 
     def test_production_composition_holds_the_adapter_but_never_registers_it(self) -> None:
-        app = build_default_app(Settings())
+        app = build_default_app(isolated_settings(self))
         self.assertIsInstance(app.intent_model, ClaudeIntentAdapter)
         self.assertNotIn("claude-intent", app.core.registry.list_names())
         self.assertIsNone(app.core.registry.get("claude-code-plan").manifest.capabilities.count(INTENT_CAPABILITY) or None)
@@ -1149,12 +1149,12 @@ class GeneralChatTests(IntentTestCase):
         self.assertIn("use context.response_language", INTENT_SYSTEM_PROMPT)
 
     def test_the_selected_model_and_effort_reach_the_chat_call(self) -> None:
-        app = build_default_app(Settings(claude_model="sonnet", claude_effort="high"))
+        app = build_default_app(isolated_settings(self, claude_model="sonnet", claude_effort="high"))
         command = app.intent_model._command("p")
         self.assertEqual("sonnet", command[command.index("--model") + 1])
         self.assertEqual("high", command[command.index("--effort") + 1])
         self.assertEqual("", command[command.index("--tools") + 1])            # still no tools
-        default = build_default_app(Settings()).intent_model._command("p")
+        default = build_default_app(isolated_settings(self)).intent_model._command("p")
         self.assertNotIn("--model", default)
         self.assertNotIn("--effort", default)
 

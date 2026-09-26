@@ -24,7 +24,6 @@ from jarvis.app import (
     MAX_TASK_JSON_BYTES,
     CommandResult,
     TaskInputError,
-    create_app,
 )
 from jarvis.connectors import claude_code
 from jarvis.contracts import (
@@ -46,7 +45,7 @@ from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis import settings as settings_module
 from jarvis.settings import ConfigStore, Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, safe_cleanup
 from tests.test_app import task_document
 
 
@@ -456,7 +455,11 @@ class CliTestCase(unittest.TestCase):
         with mock.patch.object(settings_module, "default_config_path", lambda: store_path):
             ConfigStore(store_path).reset_all()
             ConfigStore(store_path).mutate(
-                lambda current: replace(current, permission_mode=PermissionMode.SESSION)
+                lambda current: replace(
+                    current,
+                    permission_mode=PermissionMode.SESSION,
+                    memory_database=self.root / "jarvis.db",
+                )
             )
             before = store_path.read_bytes()
             out = io.StringIO()

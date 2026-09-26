@@ -103,7 +103,7 @@ from jarvis.github import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DummyConnector, make_task, safe_cleanup
+from tests.helpers import DummyConnector, isolated_settings, make_task, safe_cleanup
 
 
 # --------------------------------------------------------------------------
@@ -1208,7 +1208,7 @@ class OfflineTests(unittest.TestCase):
         identity, policy = github_authority(Settings())
         self.assertIsNone(identity)
         self.assertEqual(frozenset(), policy)
-        application = build_default_app(Settings())
+        application = build_default_app(isolated_settings(self))
         self.assertIsNone(application.core.github_identity)
         self.assertNotIn(GITHUB_CONNECTOR, application.core.registry.list_names())
 
