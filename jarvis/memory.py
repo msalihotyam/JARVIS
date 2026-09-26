@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from jarvis.conditions import ConditionResult
@@ -150,6 +151,18 @@ from jarvis.contracts import (
     validate_project_id,
 )
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
+from jarvis.conversation import (
+    CONVERSATION_ID,
+    CONVERSATION_ORIGINS,
+    CONVERSATION_TITLE_MAX,
+    ConversationRecord,
+    ConversationState,
+    CorruptConversation,
+    decode_state,
+    encode_state,
+    new_conversation_id,
+    read_verified,
+)
 from jarvis.lifecycle import is_terminal
 from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
@@ -618,6 +631,86 @@ def _add_scheduler_lease_column(connection: sqlite3.Connection) -> None:
         connection.execute(_SCHEDULER_LEASE_SQL)
 
 
+# --------------------------------------------------------------------------
+# The additive compatibility layer (V2 Projects foundation)
+# --------------------------------------------------------------------------
+#
+# NOT schema migration 11, on purpose. Releases built for schema 10 are kept
+# as rollback targets and share this database, and every one of them REFUSES
+# a database whose ``schema_version`` is newer than 10. What they do tolerate
+# is an extra, isolated table: they name their columns on every read and
+# write and never enumerate the schema. So while such a release remains a
+# supported rollback target, V2 adds only NEW tables and indexes here -
+# created ``IF NOT EXISTS`` on every open, never an ALTER of a schema-10
+# table, never a change to what schema-10 code reads or writes - and
+# ``schema_version`` / ``schema_migrations`` stay exactly at 10. Once those
+# releases are retired these objects can be adopted by an ordinary numbered
+# migration.
+#
+# ``conversation_sessions.session_id`` deliberately has NO foreign key to
+# ``sessions``: a schema-10 release keeps creating sessions without knowing
+# this table exists.
+
+COMPATIBILITY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NULL REFERENCES projects(id),
+    title TEXT NOT NULL DEFAULT '',
+    state_json TEXT NOT NULL,
+    integrity TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    archived_at TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_owner
+    ON conversations(project_id, archived_at, updated_at);
+CREATE TABLE IF NOT EXISTS conversation_sessions (
+    session_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_legacy_imports (
+    digest TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    imported_at TEXT NOT NULL
+);
+"""
+
+def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
+    """Idempotent on every open. Statement by statement, NOT ``executescript``
+    (which would commit the open transaction first), so the layer is created
+    inside the same write transaction as the rest of the open."""
+    for statement in COMPATIBILITY_SCHEMA_SQL.split(";"):
+        if statement.strip():
+            connection.execute(statement)
+
+
+#: Every object the compatibility layer owns - kept apart from the numbered
+#: schema's objects so a migration test can still say exactly what ITS step
+#: added.
+COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
+    {
+        "conversations",
+        "idx_conversations_owner",
+        "conversation_sessions",
+        "conversation_legacy_imports",
+    }
+)
+
+#: The one pre-V2 copy, beside the database: ``<stem>.pre-v2<suffix>``.
+PRE_V2_BACKUP_TAG = ".pre-v2"
+
+#: A caller that does not filter conversations by owner.
+ANY_OWNER = object()
+
+
+def pre_v2_backup_path(database_path: Path) -> Path:
+    return database_path.with_name(
+        f"{database_path.stem}{PRE_V2_BACKUP_TAG}{database_path.suffix}"
+    )
+
+
 class SQLiteMemoryStore:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -658,12 +751,68 @@ class SQLiteMemoryStore:
         finally:
             connection.close()
 
+    def _ensure_pre_v2_backup(self) -> None:
+        """One consistent copy of a real pre-V2 database, taken before the V2
+        compatibility tables are first established in it.
+
+        WHEN: only if the database already holds JARVIS data (a ``sessions``
+        table) and the compatibility layer does not exist yet. A brand-new
+        database has nothing to preserve, and once ``conversations`` exists
+        the layer is established and nothing is copied again - so this is
+        one read of ``sqlite_master`` on every later open.
+
+        HOW: SQLite's online backup API (consistent under WAL and concurrent
+        readers, unlike a file copy) into a private temporary file, verified
+        with ``integrity_check``, then ``os.rename`` into place. A rename
+        never replaces an existing file, so an existing backup is never
+        overwritten and a concurrent opener that loses the race discards its
+        own copy. The winner renames BEFORE it creates any V2 table, so a copy
+        that already contains V2 tables can never be the one that lands.
+        A failure raises: the V2 layer is never established without it.
+        """
+        target = pre_v2_backup_path(self.database_path)
+        probe = self._connect()
+        try:
+            tables = {
+                row[0]
+                for row in probe.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        finally:
+            probe.close()
+        if "sessions" not in tables or "conversations" in tables or target.exists():
+            return
+        temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+        source = self._connect()
+        try:
+            copy = sqlite3.connect(temporary)
+            try:
+                source.backup(copy)
+                copy.execute("PRAGMA journal_mode = DELETE")
+                verdict = copy.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                copy.close()
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        finally:
+            source.close()
+        if verdict is None or verdict[0] != "ok":
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError("The pre-V2 database backup did not verify; nothing was changed.")
+        try:
+            os.rename(temporary, target)
+        except FileExistsError:
+            temporary.unlink(missing_ok=True)
+
     def _initialize(self) -> None:
         wal_connection = self._connect()
         try:
             wal_connection.execute("PRAGMA journal_mode = WAL")
         finally:
             wal_connection.close()
+        self._ensure_pre_v2_backup()
         with self._connection(write=True) as connection:
             tables = {
                 row[0]
@@ -704,6 +853,7 @@ class SQLiteMemoryStore:
                 )
                 current = target
             self._create_current_schema(connection)
+            _create_compatibility_schema(connection)
             # Provenance hygiene that must hold on EVERY open, not only while
             # a migration fires: a database migrated by the pre-correction
             # build is already at the current schema version and still
@@ -4340,6 +4490,307 @@ class SQLiteMemoryStore:
             except (TypeError, ValueError):
                 continue
         return projects
+
+    # ------------------------------------------------------------------
+    # Conversations (V2 Projects foundation; the additive compatibility layer)
+    #
+    # A conversation is CONTEXT: who owns it (Global = ``project_id`` NULL, or
+    # one existing project) organizes history and later scopes retrieval. No
+    # authority reads any of this - not a grant, fingerprint, destination,
+    # root, identity, billing decision or the execution barrier.
+    # ------------------------------------------------------------------
+
+    _CONVERSATION_COLUMNS = (
+        "id, project_id, title, origin, created_at, updated_at, archived_at"
+    )
+
+    @staticmethod
+    def _conversation_record(row: sqlite3.Row) -> ConversationRecord | None:
+        """A row's metadata, or ``None`` when the row is not one this build
+        could have written (it is then never used)."""
+        record = ConversationRecord(
+            id=row["id"],
+            project_id=row["project_id"],
+            title=row["title"],
+            origin=row["origin"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            archived_at=row["archived_at"],
+        )
+        if (
+            type(record.id) is not str
+            or not CONVERSATION_ID.fullmatch(record.id)
+            or record.origin not in CONVERSATION_ORIGINS
+            or type(record.title) is not str
+            or len(record.title) > CONVERSATION_TITLE_MAX
+        ):
+            return None
+        if record.project_id is not None:
+            try:
+                validate_project_id(record.project_id)
+            except ValueError:
+                return None
+        return record
+
+    @staticmethod
+    def _require_conversation_id(conversation_id: Any) -> str:
+        if type(conversation_id) is not str or not CONVERSATION_ID.fullmatch(conversation_id):
+            raise ValueError("conversation id must be 'c-' followed by 32 lowercase hex digits")
+        return conversation_id
+
+    @staticmethod
+    def _insert_conversation(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str | None,
+        title: str,
+        origin: str,
+        state: ConversationState,
+    ) -> ConversationRecord:
+        state_json, integrity = encode_state(state)
+        now = utc_now()
+        record = ConversationRecord(
+            id=new_conversation_id(),
+            project_id=project_id,
+            title=title,
+            origin=origin,
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            """
+            INSERT INTO conversations (
+                id, project_id, title, state_json, integrity, origin,
+                created_at, updated_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (record.id, project_id, title, state_json, integrity, origin, now, now),
+        )
+        return record
+
+    def create_conversation(
+        self, project_id: str | None = None, *, title: str = ""
+    ) -> ConversationRecord:
+        """A new, empty conversation owned by ``project_id`` (``None`` =
+        Global). The owner must be an existing ACTIVE project - nothing here
+        creates one - and it can never be changed afterwards."""
+        if type(title) is not str or len(title) > CONVERSATION_TITLE_MAX:
+            raise ValueError(
+                f"conversation title must be text of at most {CONVERSATION_TITLE_MAX} characters"
+            )
+        if project_id is not None:
+            validate_project_id(project_id)
+        with self._connection(write=True) as connection:
+            if project_id is not None:
+                row = connection.execute(
+                    "SELECT active FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                if row is None or row["active"] != 1:
+                    raise ValueError(f"Unknown or inactive project: {project_id}")
+            return self._insert_conversation(
+                connection,
+                project_id=project_id,
+                title=title,
+                origin="jarvis",
+                state=ConversationState(),
+            )
+
+    def load_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        self._require_conversation_id(conversation_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return None if row is None else self._conversation_record(row)
+
+    def load_conversation_state(self, conversation_id: str) -> ConversationState:
+        """The conversation's state, integrity-verified before it is returned.
+
+        Raises ``KeyError`` for an unknown conversation and
+        ``CorruptConversation`` for a row that does not verify - nothing is
+        repaired or partially used."""
+        self._require_conversation_id(conversation_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT state_json, integrity FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return decode_state(row["state_json"], row["integrity"])
+
+    def list_conversations(
+        self, *, project_id: Any = ANY_OWNER, include_archived: bool = False
+    ) -> list[ConversationRecord]:
+        """Newest first. ``project_id=None`` lists Global conversations, a
+        project id lists that project's, and the default lists every owner.
+        A row this build could not have written is skipped, never shown."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is None:
+            clauses.append("project_id IS NULL")
+        elif project_id is not ANY_OWNER:
+            validate_project_id(project_id)
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if not include_archived:
+            clauses.append("archived_at IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations{where} "
+                "ORDER BY updated_at DESC, id",
+                params,
+            ).fetchall()
+        records = (self._conversation_record(row) for row in rows)
+        return [record for record in records if record is not None]
+
+    def update_conversation_state(
+        self,
+        conversation_id: str,
+        change: Callable[[ConversationState], ConversationState],
+    ) -> ConversationState:
+        """Read, verify, change and write one conversation in ONE write
+        transaction, so two writers can never lose each other's turns.
+
+        ``change`` receives the verified current state and returns the next
+        one. An archived conversation is read-only; an unknown one raises
+        ``KeyError``; one that does not verify raises ``CorruptConversation``
+        and is left exactly as it was."""
+        self._require_conversation_id(conversation_id)
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT state_json, integrity, archived_at FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            if row["archived_at"] is not None:
+                raise ValueError(f"Conversation is archived: {conversation_id}")
+            current = decode_state(row["state_json"], row["integrity"])
+            updated = change(current)
+            if not isinstance(updated, ConversationState):
+                raise TypeError("a conversation change must return a ConversationState")
+            state_json, integrity = encode_state(updated)
+            connection.execute(
+                "UPDATE conversations SET state_json = ?, integrity = ?, updated_at = ? "
+                "WHERE id = ?",
+                (state_json, integrity, utc_now(), conversation_id),
+            )
+        return updated
+
+    def archive_conversation(self, conversation_id: str) -> ConversationRecord:
+        """Mark a conversation archived: kept, read-only. Idempotent - an
+        archived conversation keeps its first archive time. Nothing is
+        deleted, and there is no unarchive, move or delete here."""
+        self._require_conversation_id(conversation_id)
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "UPDATE conversations SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+                (utc_now(), conversation_id),
+            )
+            row = connection.execute(
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        record = self._conversation_record(row)
+        if record is None:
+            raise CorruptConversation(f"conversation row is malformed: {conversation_id}")
+        return record
+
+    def link_session_conversation(self, session_id: str, conversation_id: str) -> None:
+        """Record, once and permanently, that ``session_id`` belongs to
+        ``conversation_id``: the same link again is a no-op, another link is
+        refused. The session and the conversation must exist, the
+        conversation must not be archived, and a session already bound to a
+        project may only belong to a conversation of THAT project - a
+        context-consistency rule, never an authorization."""
+        self._require_conversation_id(conversation_id)
+        if type(session_id) is not str or not session_id:
+            raise ValueError("session id must be a non-empty string")
+        with self._connection(write=True) as connection:
+            conversation = connection.execute(
+                "SELECT project_id, archived_at FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise KeyError(conversation_id)
+            session = connection.execute(
+                "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise KeyError(session_id)
+            existing = connection.execute(
+                "SELECT conversation_id FROM conversation_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["conversation_id"] != conversation_id:
+                    raise ValueError(
+                        f"Session {session_id} already belongs to another conversation"
+                    )
+                return
+            if conversation["archived_at"] is not None:
+                raise ValueError(f"Conversation is archived: {conversation_id}")
+            if (
+                session["project_id"] is not None
+                and session["project_id"] != conversation["project_id"]
+            ):
+                raise ValueError("Session project does not match the conversation's owner")
+            connection.execute(
+                "INSERT INTO conversation_sessions (session_id, conversation_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (session_id, conversation_id, utc_now()),
+            )
+
+    def conversation_for_session(self, session_id: str) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT conversation_id FROM conversation_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else row["conversation_id"]
+
+    def import_legacy_conversation(self, path: str | Path) -> ConversationRecord | None:
+        """Preserve the legacy ``conversation.json`` as a Global conversation.
+
+        The file is only READ (``read_verified``): never renamed, locked,
+        truncated or rewritten, because a schema-10 rollback release may
+        still be using it. Idempotent BY CONTENT DIGEST, enforced by the
+        primary key of ``conversation_legacy_imports`` inside one write
+        transaction: a digest already imported adds nothing, while a valid
+        digest never seen before - e.g. what a rollback release wrote in the
+        meantime - becomes one more recovered Global conversation. Histories
+        are never merged.
+
+        Returns the new record, or ``None`` when the file is absent or its
+        digest was already imported. A file that does not verify raises
+        ``CorruptConversation`` and nothing is created."""
+        path = Path(path)
+        if not path.exists():
+            return None
+        state, digest = read_verified(path)
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                "SELECT 1 FROM conversation_legacy_imports WHERE digest = ?", (digest,)
+            ).fetchone() is not None:
+                return None
+            record = self._insert_conversation(
+                connection,
+                project_id=None,
+                title="",
+                origin="legacy-import",
+                state=state,
+            )
+            connection.execute(
+                "INSERT INTO conversation_legacy_imports (digest, conversation_id, imported_at) "
+                "VALUES (?, ?, ?)",
+                (digest, record.id, record.created_at),
+            )
+            return record
 
     def save_memory_item(
         self, item: ProjectMemoryItem, *, supersedes: str | None = None

@@ -35,12 +35,12 @@ Sonnet is **no longer the default coder**: in real use it is too slow.
 
 | Model / effort | Use for |
 |---|---|
-| Fable 5.1, High | Primary choice: normal and complex coding, design + implementation |
-| Opus 5, High | Critical blocker, debug, security, concurrency, recovery — and whenever wall-clock speed matters |
-| Sonnet 5, High | Only with a clear reason: a small, mechanical task |
+| Opus 5.5, High | Primary/default: architecture, implementation, debugging, refactors, security, gates |
+| Fable 5.1, High | Strong secondary lane: an independent perspective or specific bounded work |
+| Sonnet 5, High | Narrow, mechanical, lower-risk work |
 
-`xhigh` / `max` stay exceptional — justified by the task at hand, never a
-default.
+`xhigh` / `max` stay exceptional — only when the concrete task genuinely
+requires escalation, never a routine default.
 
 Choose on **wall-clock time + correctness + turn count + Claude Max quota
 impact**, not token count alone.

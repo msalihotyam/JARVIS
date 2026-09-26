@@ -60,7 +60,7 @@ from jarvis.contracts import (
     schedule_to_dict,
     utc_now,
 )
-from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.schedules import Daily, Interval, OneTime, ScheduleError, Weekday, Weekly
 from tests.helpers import safe_cleanup
 
@@ -465,7 +465,13 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(10, store.schema_version())
         after = self.schema_objects()
-        self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
+        # The numbered 7 -> 8 step adds exactly the scheduler objects; the
+        # additive compatibility layer (not a numbered migration) is created
+        # on every open and is accounted for separately.
+        self.assertEqual(
+            _SCHEDULER_OBJECTS, set(after) - set(before) - COMPATIBILITY_SCHEMA_OBJECTS
+        )
+        self.assertLessEqual(COMPATIBILITY_SCHEMA_OBJECTS, set(after))
         # Every pre-existing object is byte-identical: the upgrade adds, and
         # touches nothing that was already there.
         for name, sql in before.items():
@@ -477,7 +483,10 @@ class SchemaMigrationTests(unittest.TestCase):
         store = SQLiteMemoryStore(self.database)
         self.assertEqual(10, store.schema_version())
         after = self.schema_objects()
-        self.assertEqual(_SCHEDULER_OBJECTS, set(after) - set(before))
+        self.assertEqual(
+            _SCHEDULER_OBJECTS, set(after) - set(before) - COMPATIBILITY_SCHEMA_OBJECTS
+        )
+        self.assertLessEqual(COMPATIBILITY_SCHEMA_OBJECTS, set(after))
         connection = raw(self.database)
         try:
             # Legacy rows across every authority table survive untouched.

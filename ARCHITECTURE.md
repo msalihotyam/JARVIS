@@ -3110,3 +3110,49 @@ bir çağıran değeridir, gizli olmadığı iddia edilemez.
 
 Zamanlayıcı bu nedenle **hâlâ uçtan uca kullanılabilir değildir**. Bu fazın
 tamamladığı şey depolama, yönetim ve **koordinasyon** temelidir.
+
+### 4.22 Konuşma kalıcılığı ve kapsam temeli (V2 Projects, uygulandı)
+
+Konuşma artık Core SQLite deposunda kalıcıdır; `conversation.py`'nin durum
+ve bütünlük semantiği aynen kullanılır (aynı `state_from_dict` doğrulayıcısı,
+`{"version","state"}` üzerinden aynı sha256 bütünlük özeti). Bir satır
+kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılmaz
+(`CorruptConversation`).
+
+- **Kimlik:** konuşma kimliği opak ve kararlıdır (`c-` + uuid4 hex); başlık,
+  sağlayıcı, model, oturum, proje adı veya zaman damgasından türetilmez.
+- **Kapsam:** Global = `project_id` NULL; sentetik bir "Global proje" satırı
+  yoktur. NULL olmayan sahip mevcut ve aktif bir `projects` satırı olmalıdır;
+  hiçbir yol proje yaratmaz. Sahip oluşturulurken sabitlenir; taşıma ve silme
+  yoktur. Arşivlenmiş konuşma saklanır ve salt okunurdur.
+- **Oturum bağı:** bir Core oturumu en çok bir konuşmaya, kalıcı olarak
+  bağlanır; bir projeye bağlı oturum yalnız o projenin konuşmasına girebilir
+  (bağlam tutarlılığı, yetki değil).
+- **Yetki değildir:** konuşma ve proje kapsamı yalnız bağlamdır. Onay, grant,
+  fingerprint, hatırlanan grant, hedef politikası, izinli kökler, tarayıcı
+  origin'leri, Gmail/GitHub kimliği, connector seçimi, faturalandırma ve genel
+  yürütme bariyeri bunları okumaz.
+- **Şema-10 uyumluluk katmanı:** şema-10 için derlenmiş sürümler geri dönüş
+  hedefi olarak tutulur ve aynı veritabanını paylaşır; hepsi `schema_version`
+  10'dan büyük bir veritabanını açmayı reddeder, fakat yalıtılmış ek tabloları
+  yok sayar. Bu yüzden böyle bir sürüm desteklenen bir geri dönüş hedefi
+  olduğu sürece V2 yalnızca YENİ tablo/indeks ekler (her açılışta
+  `IF NOT EXISTS`), şema-10 tablolarını ALTER etmez, şema-10 kodunun okuduğu
+  veya yazdığı hiçbir şeyin anlamını/düzenini değiştirmez; `schema_version`
+  ve `schema_migrations` 10'da kalır. Bu nesneler numaralı bir migration
+  değildir (`COMPATIBILITY_SCHEMA_OBJECTS`); eski sürümler emekliye
+  ayrıldığında olağan numaralı bir migration'a alınabilirler.
+  `conversation_sessions.session_id`'nin `sessions`'a yabancı anahtarı yoktur,
+  böylece şema-10 kodu oturum yazmaya devam eder.
+- **V2 öncesi yedek:** JARVIS verisi taşıyan bir veritabanında katman ilk kez
+  kurulmadan önce, SQLite çevrimiçi yedek API'siyle tutarlı ve doğrulanmış tek
+  bir kopya (`<ad>.pre-v2<uzantı>`) veritabanının yanına alınır; var olan bir
+  yedeğin üzerine asla yazılmaz, katman kurulduktan sonra yeniden alınmaz.
+- **Eski `conversation.json`:** V2 bu dosyayı yalnızca OKUR; asla yeniden
+  adlandırmaz, kilitlemez, kısaltmaz veya yeniden yazmaz, çünkü geri dönüş
+  sürümü onu kullanmaya devam edebilir. İçe aktarma içerik özetiyle
+  idempotenttir (özet başına tek satır, veritabanı birincil anahtarıyla):
+  aynı özet hiçbir şey eklemez; daha önce görülmemiş geçerli bir özet (ör. bir
+  geri dönüş sürümünün bu arada yazdığı içerik) ayrı bir kurtarılmış Global
+  konuşma olur. Geçmişler birleştirilmez; doğrulanmayan dosya olduğu gibi
+  bırakılır ve hiçbir şey oluşturulmaz.

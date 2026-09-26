@@ -32,7 +32,6 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -52,7 +51,7 @@ from jarvis.contracts import (
     ProjectRecord,
     canonical_utc_timestamp,
 )
-from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.schedules import Daily, Interval, OneTime, Weekday, Weekly
 from tests.helpers import safe_cleanup
 
@@ -320,8 +319,12 @@ class Schema9MigrationTests(unittest.TestCase):
         store = SQLiteMemoryStore(self.database)
         self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual(10, store.schema_version())
-        # ONE column. No new table, no dropped table, no new index.
-        self.assertEqual(before, table_names(self.database))
+        # ONE column. No new table, no dropped table, no new index - from the
+        # numbered 8 -> 9 step. The additive compatibility layer, created on
+        # every open and never a numbered migration, is accounted for apart.
+        after = table_names(self.database)
+        self.assertEqual(before, after - COMPATIBILITY_SCHEMA_OBJECTS)
+        self.assertLessEqual(after - before, COMPATIBILITY_SCHEMA_OBJECTS)
         self.assertIn("lease_expires_at_utc", run_columns(self.database))
 
     def test_populated_schema_eight_database_upgrades_without_data_loss(self) -> None:

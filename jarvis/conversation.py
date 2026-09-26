@@ -54,6 +54,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol
+from uuid import uuid4
 
 SCHEMA_VERSION = 1
 
@@ -814,6 +815,13 @@ class ConversationStore:
 
 
 def load_state(path: str | Path) -> ConversationState:
+    return read_verified(path)[0]
+
+
+def read_verified(path: str | Path) -> tuple[ConversationState, str]:
+    """The conversation file's state AND the integrity digest it was verified
+    against. READ ONLY: nothing is renamed, locked or rewritten here, so the
+    legacy file of a rollback release can be read without disturbing it."""
     try:
         document = json.loads(_retry_busy(lambda: Path(path).read_text(encoding="utf-8")))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
@@ -821,9 +829,65 @@ def load_state(path: str | Path) -> ConversationState:
     if not isinstance(document, dict) or document.get("version") != SCHEMA_VERSION:
         raise CorruptConversation("unknown conversation schema version")
     body = {"version": document.get("version"), "state": document.get("state")}
-    if document.get("integrity") != _integrity(body):
+    integrity = _integrity(body)
+    if document.get("integrity") != integrity:
         raise CorruptConversation("the conversation file does not match its integrity digest")
-    return state_from_dict(document.get("state"))
+    return state_from_dict(document.get("state")), integrity
+
+
+# --------------------------------------------------------------------------
+# The same record, stored as a database row instead of a file
+# --------------------------------------------------------------------------
+#
+# The row keeps exactly what the file keeps - the state and its integrity
+# digest over ``{"version", "state"}`` - so one validator (``state_from_dict``)
+# and one digest (``_integrity``) serve both. A conversation's identity is its
+# id, never its title, provider, project name or timestamps.
+
+CONVERSATION_ID = re.compile(r"^c-[0-9a-f]{32}$")
+CONVERSATION_ORIGINS = ("jarvis", "legacy-import")
+CONVERSATION_TITLE_MAX = 120
+
+
+def new_conversation_id() -> str:
+    return "c-" + uuid4().hex
+
+
+def encode_state(state: ConversationState) -> tuple[str, str]:
+    """``(state_json, integrity)`` for a row, from a state already built by
+    this module - never from unvalidated input."""
+    data = state.to_dict()
+    return json_text(data), _integrity({"version": SCHEMA_VERSION, "state": data})
+
+
+def decode_state(state_json: Any, integrity: Any) -> ConversationState:
+    """A stored row back into a state, verified BEFORE anything is used.
+    Nothing is repaired: a mismatch or a malformed record raises."""
+    if type(state_json) is not str or type(integrity) is not str:
+        raise CorruptConversation("the stored conversation is not text")
+    try:
+        data = json.loads(state_json)
+    except ValueError as exc:
+        raise CorruptConversation("the stored conversation is not JSON") from exc
+    if _integrity({"version": SCHEMA_VERSION, "state": data}) != integrity:
+        raise CorruptConversation("the stored conversation does not match its integrity digest")
+    return state_from_dict(data)
+
+
+@dataclass(frozen=True)
+class ConversationRecord:
+    """What a conversation IS, apart from what was said in it.
+
+    ``project_id`` is its owner: ``None`` means Global. The owner is fixed at
+    creation and is context, never authority - it grants nothing."""
+
+    id: str
+    project_id: str | None
+    title: str
+    origin: str
+    created_at: str
+    updated_at: str
+    archived_at: str | None = None
 
 
 # --------------------------------------------------------------------------
