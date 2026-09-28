@@ -43,7 +43,7 @@ from jarvis.context_items import (
     safe_name,
     same_reference,
 )
-from jarvis.conversation import ConversationStore, task_title, turn_refs
+from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
@@ -247,19 +247,15 @@ class Bridge(QObject):
         self._task: dict[str, Any] = {}
         self._feed: list[dict[str, str]] = []
         self._activity: list[dict[str, str]] = []
-        # THE canonical conversation (jarvis.conversation): what later calls are
-        # given, durable across a restart, whichever provider answers. The feed
-        # above is what is SHOWN; this is what is remembered. A record that does
-        # not verify is set aside and nothing from it is used.
-        self._conversation_store, problem = ConversationStore.open(self.prefs.path.parent / "conversation.json")
+        # THE canonical conversation (jarvis.conversation), held in the Core
+        # store: what later calls are given, durable across a restart, whichever
+        # provider answers. The feed above is what is SHOWN; this is what is
+        # remembered. Several conversations exist; this is the open one. A record
+        # that does not verify is never opened and nothing from it is used.
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
-        if problem:
-            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The saved conversation could not be read, so JARVIS "
-                                                              "started a new one and remembers nothing from it: %1"),
-                        (problem,)), "error")
-        elif self._conversation_store.state.turns:
-            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (%1 turns)"),
-                        (len(self._conversation_store.state.turns),)), "system")
+        self._conversation_list: list[dict] = []
+        self._conversation_store = self._open_startup_conversation()
+        self._refresh_conversations()
         self._approval: dict[str, Any] = {}
         self._ticket: ApprovalTicket | None = None
         self._clarification: dict[str, Any] = {}
@@ -358,7 +354,8 @@ class Bridge(QObject):
             return (context, source, tuple(Bridge._redacted(a) for a in args))
         return redact_text(str(message))
 
-    def _say(self, kind: str, message: Any, chat: bool = False, refs: Any = None, **extra: Any) -> None:
+    def _say(self, kind: str, message: Any, chat: bool = False, refs: Any = None,
+             owner: PersistedConversation | None = None, **extra: Any) -> None:
         if isinstance(extra.get("sources"), list):   # untrusted links: redacted like everything shown
             extra["sources"] = [{key: redact_text(str(source.get(key) or "")) for key in ("title", "url")}
                                 for source in extra["sources"] if isinstance(source, dict)]
@@ -367,12 +364,17 @@ class Bridge(QObject):
                  "id": f"m{self._entry_seq}", **extra}
         if chat:
             entry["chat"] = True         # a General Chat reply: part of the conversation window
+        if owner is not None and owner.id != self._conversation_store.id:
+            # It belongs to ANOTHER conversation: remembered there, never shown
+            # in (or added to the history of) the one that is open now.
+            self._remember(entry, refs, owner)
+            return
         self._feed.append(entry)
         del self._feed[:-FEED_LIMIT]
         self._remember(entry, refs)
         self.feedChanged.emit()
 
-    def _remember(self, entry: dict, refs: Any) -> None:
+    def _remember(self, entry: dict, refs: Any, owner: PersistedConversation | None = None) -> None:
         """Enter one shown entry into the canonical conversation, if it is one.
 
         What the person typed, General Chat's completed replies and the task
@@ -383,11 +385,14 @@ class Bridge(QObject):
         identity; a result keeps its provenance as a marker, not as the content.
         """
         kind, message = entry["kind"], entry["msg"]
-        store = self._conversation_store
+        store = owner or self._conversation_store
         if kind == "user" and isinstance(message, str):
-            store.append(role="user", kind="user", message=message,
-                         text=history_text(message, entry.get("groups"), entry.get("attachments")),
-                         refs=refs or (), key=f"{self._store_run}:{entry['id']}")
+            first = not any(turn.kind == "user" for turn in store.state.turns)
+            turn = store.append(role="user", kind="user", message=message,
+                                text=history_text(message, entry.get("groups"), entry.get("attachments")),
+                                refs=refs or (), key=f"{self._store_run}:{entry['id']}")
+            if first and turn is not None:
+                self._name_conversation(store, message)
         elif kind == "jarvis" and entry.get("chat") and isinstance(message, str):
             store.append(role="assistant", kind="reply", text=message, key=f"{self._store_run}:{entry['id']}")
         elif kind == "result":
@@ -403,6 +408,9 @@ class Bridge(QObject):
             store.append(role="assistant", kind="result", key=key,
                          text=result_history(shown, entry.get("capability"), entry.get("destination")),
                          capability=str(entry.get("capability") or ""), destination=str(entry.get("destination") or ""))
+        if store.store is not None and store.diagnostic:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation could not be saved: %1"),
+                        (store.diagnostic,)), "error")
 
     def _conversation(self) -> tuple:
         """The canonical conversation's raw turns as ``{role, text}``.
@@ -421,6 +429,246 @@ class Bridge(QObject):
         snapshot (turns, compacted digests, pins) - the provider's budget is
         applied where the call is assembled (jarvis.conversation)."""
         return self._conversation_store.state
+
+    # -- conversations -------------------------------------------------------
+    #
+    # Several persisted Global conversations, one of them open. Which one is
+    # open at start comes from Core state (the most recently updated one), so
+    # there is no second record of it. A Core session belongs to exactly one
+    # conversation (``conversation_sessions``): whatever a session produces is
+    # remembered by THAT conversation, whichever one is open when it arrives.
+    # None of this is authority - nothing here reaches an approval, a grant, a
+    # destination, a root, an identity or billing.
+
+    conversationChanged = Signal()
+
+    def _conversation_db(self) -> Any:
+        getter = getattr(self.backend, "conversations", None)
+        return getter() if callable(getter) else None
+
+    def _open_startup_conversation(self) -> PersistedConversation:
+        store = self._conversation_db()
+        if store is None:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation store is unavailable, so this "
+                                                              "window's conversation will not be saved."), ()), "error")
+            return PersistedConversation(None, None)
+        # The previous version's single conversation file is only READ: a digest
+        # never seen before becomes one more conversation; the file stays as it is.
+        try:
+            if store.import_legacy_conversation(self.prefs.path.parent / "conversation.json") is not None:
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Recovered the conversation saved by the previous version"), ()),
+                           "system")
+        except CorruptConversation as exc:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The previous version's conversation could not be read, "
+                                                              "so it was left untouched and not used: %1"), (str(exc),)), "error")
+        except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The previous version's conversation could not be recovered: %1"),
+                        (type(exc).__name__,)), "error")
+        opened = None
+        try:
+            records = store.list_conversations(project_id=None)
+        except Exception:  # noqa: BLE001 - storage boundary
+            records = []
+        for record in records:
+            opened = self._load_conversation(store, record.id)
+            if opened is not None:
+                break
+        if opened is None:
+            try:
+                opened = PersistedConversation(store, store.create_conversation().id)
+            except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
+                            (type(exc).__name__,)), "error")
+                return PersistedConversation(None, None)
+        if opened.state.turns:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (%1 turns)"),
+                        (len(opened.state.turns),)), "system")
+        self._restore_feed(opened.state)
+        return opened
+
+    def _load_conversation(self, store: Any, conversation_id: str) -> PersistedConversation | None:
+        """The conversation, verified; ``None`` (and a note) when it cannot be trusted."""
+        try:
+            state = store.load_conversation_state(conversation_id)
+        except Exception as exc:  # noqa: BLE001 - storage boundary; fail closed
+            problem = str(exc) if isinstance(exc, CorruptConversation) else type(exc).__name__
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A saved conversation could not be read, so it was not "
+                                                              "opened and nothing from it is used: %1"), (problem,)), "error")
+            return None
+        return PersistedConversation(store, conversation_id, state)
+
+    def _restore_feed(self, state: Any) -> None:
+        """The opened conversation's remembered turns, shown again - the same
+        words that were shown, never re-remembered."""
+        feed = []
+        for turn in state.turns:
+            if turn.kind == "user":
+                entry: dict[str, Any] = {"kind": "user", "msg": self._redacted(turn.message or turn.text)}
+            elif turn.kind == "reply":
+                entry = {"kind": "jarvis", "msg": self._redacted(turn.text), "chat": True}
+            else:
+                text = turn.text.split("\n", 1)[1] if turn.text.startswith("[Task result") and "\n" in turn.text else turn.text
+                entry = {"kind": "result", "msg": self._redacted(text), "capability": turn.capability,
+                         "destination": turn.destination}
+            self._entry_seq += 1
+            entry.update(ts=float(turn.ts), id=f"m{self._entry_seq}", restored=True)
+            feed.append(entry)
+        self._feed = feed[-FEED_LIMIT:]
+        self.feedChanged.emit()
+
+    def _name_conversation(self, conversation: PersistedConversation, message: str) -> None:
+        """A conversation is named from its first message, once."""
+        title = task_title(message)[:120]
+        if not title or conversation.store is None:
+            return
+        try:
+            conversation.store.set_conversation_title(conversation.id, title)
+        except Exception:  # noqa: BLE001 - a label only; the conversation is unaffected
+            return
+        self._refresh_conversations()
+
+    def _refresh_conversations(self) -> None:
+        store = self._conversation_db()
+        try:
+            records = store.list_conversations(project_id=None) if store is not None else []
+        except Exception:  # noqa: BLE001 - storage boundary
+            records = []
+        self._conversation_list = [
+            {"id": r.id, "origin": r.origin, "updated_at": r.updated_at,
+             "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                  if r.origin == "legacy-import"
+                                  else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()))}
+            for r in records
+        ]
+        self.conversationChanged.emit()
+
+    @Property("QVariantList", notify=conversationChanged)
+    def conversations(self) -> list:
+        """The Global conversations, newest first, the open one marked."""
+        return [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                 "active": row["id"] == self._conversation_store.id} for row in self._conversation_list]
+
+    @Property(str, notify=conversationChanged)
+    def conversationId(self) -> str:
+        return self._conversation_store.id or ""
+
+    def _activate(self, opened: PersistedConversation) -> None:
+        """Open ``opened``: its history on screen, a fresh Core session for it."""
+        self._conversation_store = opened
+        self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
+        self._decision = {}
+        self._discard_snapshots()
+        self._last_outcome = "idle"
+        self._end_stream()
+        self._restore_feed(opened.state)
+        self._refresh_conversations()
+        self.approvalChanged.emit()
+        self._refresh_core_state()
+
+    @Slot(result=bool)
+    def newConversation(self) -> bool:
+        """Start a new Global conversation and open it."""
+        if self._busy:
+            return False
+        store = self._conversation_db()
+        if store is None:
+            return False
+        try:
+            record = store.create_conversation()
+        except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
+                        (type(exc).__name__,)), "error")
+            return False
+        self._activate(PersistedConversation(store, record.id))
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()), "system")
+        return True
+
+    @Slot(str, result=bool)
+    def openConversation(self, conversation_id: str) -> bool:
+        """Open a saved conversation; its history returns to the screen."""
+        conversation_id = str(conversation_id)
+        if self._busy:
+            return False
+        if conversation_id == self._conversation_store.id:
+            return True
+        store = self._conversation_db()
+        if store is None:
+            return False
+        opened = self._load_conversation(store, conversation_id)
+        if opened is None:
+            return False
+        self._activate(opened)
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"),
+                    (len(opened.state.turns),)), "system")
+        return True
+
+    def _session_conversation(self, session_id: str) -> str | None:
+        store = self._conversation_db()
+        if store is None or not session_id:
+            return None
+        try:
+            return store.conversation_for_session(str(session_id))
+        except Exception:  # noqa: BLE001 - storage boundary
+            return None
+
+    def _payload_owner(self, payload: Any, origin: PersistedConversation) -> PersistedConversation:
+        """The conversation a run's envelope belongs to.
+
+        A session already linked belongs to ITS conversation. A session seen for
+        the first time is linked to ``origin``, the conversation the request came
+        from. Without a session the envelope belongs to ``origin``."""
+        run = payload.get("run") if isinstance(payload, dict) and isinstance(payload.get("run"), dict) else payload
+        session = run.get("session") if isinstance(run, dict) else None
+        session_id = session.get("id") if isinstance(session, dict) else None
+        store = origin.store
+        if not isinstance(session_id, str) or not session_id or store is None:
+            return origin
+        linked = self._session_conversation(session_id)
+        if linked is None:
+            try:
+                store.link_session_conversation(session_id, origin.id)
+            except Exception:  # noqa: BLE001 - an unlinkable session stays with its origin
+                pass
+            return origin
+        if linked == origin.id:
+            return origin
+        if linked == self._conversation_store.id:
+            return self._conversation_store
+        return self._load_conversation(store, linked) or origin
+
+    def _delivered(self, handler: Callable[[Any], None]) -> Callable[[Any], None]:
+        """``handler`` for the conversation open NOW; anything that turns out to
+        belong to another conversation is remembered there instead."""
+        origin = self._conversation_store
+
+        def deliver(payload: Any) -> None:
+            owner = self._payload_owner(payload, origin)
+            if owner.id == self._conversation_store.id:
+                handler(payload)
+                return
+            self._remember_elsewhere(payload, owner)
+
+        return deliver
+
+    def _remember_elsewhere(self, payload: Any, owner: PersistedConversation) -> None:
+        """What a conversation that is not open would have remembered: its
+        completed replies and its task results. Nothing on screen changes."""
+        intent = payload.get("intent") if isinstance(payload, dict) and isinstance(payload.get("intent"), dict) else None
+        status = str((intent or {}).get("status") or "")
+        if intent is not None:
+            for entry in text_entries(payload):
+                if status in ("conversation", "research") and isinstance(entry.get("text"), str):
+                    self._say(entry.pop("kind"), entry.pop("text"), chat=True, owner=owner)
+        run = payload.get("run") if intent is not None and isinstance(payload, dict) else payload
+        if isinstance(run, dict) and isinstance(run.get("task"), dict):
+            facts = {key: task_status(run, intent).get(key, "") for key in ("capability", "destination")}
+            task_id = str(run["task"].get("id") or "")
+            run_status = str(run.get("run_status") or "")
+            for entry in run_entries(run, facts):
+                if entry.get("kind") == "result":
+                    self._say(entry.pop("kind"), entry.pop("text"), owner=owner, task_id=task_id,
+                              run_status=run_status, **entry)
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A reply for another conversation was saved there"), ()), "system")
 
     def _tell(self, kind: str, source: str, *args: Any) -> None:
         """Say a JARVIS-owned notice (a ``Bridge`` catalog source)."""
@@ -962,7 +1210,7 @@ class Bridge(QObject):
         self._request_id = request_id
         if self._task.get("status") == "awaiting_clarification" and session_id and self._task.get("task_id"):
             task_id = self._task["task_id"]
-            self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._apply_run)
+            self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._delivered(self._apply_run))
             return True
         self._task = {}
         language = self.language           # the default reply language for General Chat
@@ -975,7 +1223,7 @@ class Bridge(QObject):
                                              conversation=conversation, context_groups=groups,
                                              context_attachments=attachments, response_mode=mode,
                                              on_reply_preview=relay, **route),
-            lambda payload: self._apply_text(payload, text),
+            self._delivered(lambda payload: self._apply_text(payload, text)),
         )
         return True
 
@@ -1005,7 +1253,7 @@ class Bridge(QObject):
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
                                              response_language=language, conversation=conversation,
                                              on_reply_preview=relay, **route),
-            lambda payload: self._apply_text(payload, label, request=previous),
+            self._delivered(lambda payload: self._apply_text(payload, label, request=previous)),
         )
 
     @Slot()
@@ -1040,7 +1288,7 @@ class Bridge(QObject):
                           "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
         call = self.backend.approve if verb == "approve" else self.backend.reject
-        self._run("task", lambda: call(ticket), lambda payload: self._apply_decision(payload, verb, ticket, shown),
+        self._run("task", lambda: call(ticket), self._delivered(lambda payload: self._apply_decision(payload, verb, ticket, shown)),
                   executing=verb == "approve")
         return True
 
@@ -1104,7 +1352,7 @@ class Bridge(QObject):
             return
         self._ticket, self._approval = None, {}
         self.approvalChanged.emit()
-        self._run("cancel", lambda: self.backend.cancel(session_id, task_id), self._apply_run)
+        self._run("cancel", lambda: self.backend.cancel(session_id, task_id), self._delivered(self._apply_run))
 
     def _discard_snapshots(self) -> None:
         """Throw away every attachment snapshot JARVIS copied for this session."""
@@ -1123,9 +1371,14 @@ class Bridge(QObject):
         self.approvalChanged.emit()
         self._refresh_core_state()
 
+    def _open_owner_of(self, session_id: str) -> bool:
+        """Open the conversation that owns ``session_id`` (if one does)."""
+        owner = self._session_conversation(session_id)
+        return owner is None or self.openConversation(owner)
+
     @Slot(str)
     def useSession(self, session_id: str) -> None:
-        if session_id and not self._busy:
+        if session_id and not self._busy and self._open_owner_of(str(session_id)):
             self._session_id, self._task, self._ticket, self._approval, self._decision = str(session_id), {}, None, {}, {}
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), (session_id,)), "system")
             self.approvalChanged.emit()
@@ -1133,10 +1386,11 @@ class Bridge(QObject):
 
     @Slot(str, str)
     def resumeTask(self, session_id: str, task_id: str) -> None:
-        if self._busy:
+        if self._busy or not self._open_owner_of(str(session_id)):
             return
         self._session_id = str(session_id)
-        self._run("task", lambda: self.backend.resume(str(session_id), str(task_id)), self._apply_run, executing=True)
+        self._run("task", lambda: self.backend.resume(str(session_id), str(task_id)), self._delivered(self._apply_run),
+                  executing=True)
 
     # -- slots: read-only data ---------------------------------------------
 
@@ -1164,15 +1418,33 @@ class Bridge(QObject):
         self._tasks = self._titled(rows(payload, "tasks", "task_id"), "task_id")
         self.dataChanged.emit()
 
+    def _owner_store(self, session_id: str, cache: dict) -> PersistedConversation:
+        """The conversation holding a session's (and its tasks') titles."""
+        owner = self._session_conversation(session_id)
+        if owner is None or owner == self._conversation_store.id:
+            return self._conversation_store
+        if owner not in cache:
+            store = self._conversation_db()
+            try:
+                cache[owner] = PersistedConversation(store, owner, store.load_conversation_state(owner))
+            except Exception:  # noqa: BLE001 - a label only: unreadable reads as untitled
+                cache[owner] = PersistedConversation(None, None)
+        return cache[owner]
+
     def _titled(self, listing: list, key: str) -> list:
         """Each row with its display name ("" when it has none); the id stays."""
-        return [{**row, "title": self._conversation_store.title(str(row.get(key) or ""))} for row in listing]
+        cache: dict = {}
+        return [{**row, "title": self._owner_store(str(row.get("session_id") or ""), cache).title(str(row.get(key) or ""))}
+                for row in listing]
 
     @Slot(str, str, result=bool)
     def renameTask(self, item_id: str, title: str) -> bool:
         """The person's own name for a task or session; it always wins over the
         automatic one. An empty name changes nothing (False)."""
-        if not self._conversation_store.rename(str(item_id), str(title)):
+        session_id = next((str(row.get("session_id") or "") for row in (*self._sessions, *self._tasks)
+                           if item_id in (row.get("session_id"), row.get("task_id"))), "")
+        owner = self._owner_store(session_id, {})
+        if not owner.rename(str(item_id), str(title)):
             return False
         self._sessions = self._titled(self._sessions, "session_id")
         self._tasks = self._titled(self._tasks, "task_id")

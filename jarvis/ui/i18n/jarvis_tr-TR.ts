@@ -292,7 +292,52 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <name>Bridge</name>
     <message>
         <source>JARVIS frozen</source>
+        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing). The token fields a provider reports that together are what one call used. Claude counts cache reads and writes apart from ``input_tokens``; Codex counts its cached input INSIDE ``input_tokens`` and its reasoning INSIDE ``output_tokens``, so those two are never added again. Of those, the ones a cache serves at a fraction of the normal input price. Reported at face value alongside the total - never estimated, never implied for a provider (Codex) that folds its cached share INSIDE input_tokens.</extracomment>
         <translation>JARVIS donduruldu</translation>
+    </message>
+    <message>
+        <source>The conversation could not be saved: %1</source>
+        <translation>Konuşma kaydedilemedi: %1</translation>
+    </message>
+    <message>
+        <source>The conversation store is unavailable, so this window&apos;s conversation will not be saved.</source>
+        <translation>Konuşma deposu kullanılamıyor; bu penceredeki konuşma kaydedilmeyecek.</translation>
+    </message>
+    <message>
+        <source>Recovered the conversation saved by the previous version</source>
+        <translation>Önceki sürümün kaydettiği konuşma geri yüklendi</translation>
+    </message>
+    <message>
+        <source>The previous version&apos;s conversation could not be read, so it was left untouched and not used: %1</source>
+        <translation>Önceki sürümün konuşması okunamadı; olduğu gibi bırakıldı ve kullanılmadı: %1</translation>
+    </message>
+    <message>
+        <source>The previous version&apos;s conversation could not be recovered: %1</source>
+        <translation>Önceki sürümün konuşması geri yüklenemedi: %1</translation>
+    </message>
+    <message>
+        <source>A new conversation could not be created: %1</source>
+        <translation>Yeni konuşma oluşturulamadı: %1</translation>
+    </message>
+    <message>
+        <source>A saved conversation could not be read, so it was not opened and nothing from it is used: %1</source>
+        <translation>Kayıtlı bir konuşma okunamadı; açılmadı ve içeriğinden hiçbir şey kullanılmıyor: %1</translation>
+    </message>
+    <message>
+        <source>Previous conversation</source>
+        <translation>Önceki konuşma</translation>
+    </message>
+    <message>
+        <source>New conversation</source>
+        <translation>Yeni konuşma</translation>
+    </message>
+    <message>
+        <source>Opened a conversation (%1 turns)</source>
+        <translation>Bir konuşma açıldı (%1 tur)</translation>
+    </message>
+    <message>
+        <source>A reply for another conversation was saved there</source>
+        <translation>Başka bir konuşmaya ait yanıt o konuşmaya kaydedildi</translation>
     </message>
     <message>
         <source>Approval required: %1 -&gt; %2</source>
@@ -468,11 +513,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Dondurma istendi</translation>
     </message>
     <message>
-        <source>The saved conversation could not be read, so JARVIS started a new one and remembers nothing from it: %1</source>
-        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing). The token fields a provider reports that together are what one call used. Claude counts cache reads and writes apart from ``input_tokens``; Codex counts its cached input INSIDE ``input_tokens`` and its reasoning INSIDE ``output_tokens``, so those two are never added again.</extracomment>
-        <translation>Kayıtlı konuşma okunamadı; JARVIS yeni bir konuşma başlattı ve ondan hiçbir şey hatırlamıyor: %1</translation>
-    </message>
-    <message>
         <source>Continuing the previous conversation (%1 turns)</source>
         <translation>Önceki konuşma sürdürülüyor (%1 tur)</translation>
     </message>
@@ -633,6 +673,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>New session</source>
         <translation>Yeni oturum</translation>
+    </message>
+    <message>
+        <source>New conversation</source>
+        <translation>Yeni konuşma</translation>
     </message>
     <message>
         <source>Open Command Center</source>
@@ -1172,6 +1216,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>THIS INTERFACE SESSION</source>
         <translation>BU ARAYÜZ OTURUMU</translation>
+    </message>
+    <message>
+        <source>CONVERSATIONS</source>
+        <translation>KONUŞMALAR</translation>
+    </message>
+    <message>
+        <source>New conversation</source>
+        <translation>Yeni konuşma</translation>
+    </message>
+    <message>
+        <source>open</source>
+        <translation>açık</translation>
     </message>
     <message>
         <source>DURABLE SESSIONS (most recent %1)</source>
@@ -3549,7 +3605,7 @@ DOĞRULANMADI</translation>
     <name>Tray</name>
     <message>
         <source>Frozen</source>
-        <extracomment>Ring colours for the restrained state badge: normal, frozen, attention.</extracomment>
+        <extracomment>Ring colours for the restrained state badge: normal, frozen, attention. The approved mark ships pre-tinted per state as ``tray-&lt;state&gt;.png``; this stays as the one place the mapping from badge name to meaning is written down, even though nothing here mixes a colour at runtime any more. One ``QIcon`` per badge state, loaded once from the approved artwork and reused - ``refresh()`` asks for one on every bridge state change.</extracomment>
         <translation>Donduruldu</translation>
     </message>
     <message>

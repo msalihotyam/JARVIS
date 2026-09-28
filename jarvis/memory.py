@@ -4680,6 +4680,22 @@ class SQLiteMemoryStore:
             )
         return updated
 
+    def set_conversation_title(self, conversation_id: str, title: str) -> None:
+        """A conversation's display name (a label only; the id stays the
+        identity). Refused for an archived or unknown conversation."""
+        self._require_conversation_id(conversation_id)
+        if type(title) is not str or len(title) > CONVERSATION_TITLE_MAX:
+            raise ValueError(
+                f"conversation title must be text of at most {CONVERSATION_TITLE_MAX} characters"
+            )
+        with self._connection(write=True) as connection:
+            changed = connection.execute(
+                "UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL",
+                (title, conversation_id),
+            ).rowcount
+        if changed != 1:
+            raise KeyError(conversation_id)
+
     def archive_conversation(self, conversation_id: str) -> ConversationRecord:
         """Mark a conversation archived: kept, read-only. Idempotent - an
         archived conversation keeps its first archive time. Nothing is

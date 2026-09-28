@@ -131,6 +131,9 @@ class Backend:
         #: The application instance whose understanding call is running, so
         #: ``cancel_text`` reaches the same adapter that owns the process.
         self._text_app: JarvisApp | None = None
+        #: The Core store the window's conversations live in, for the database
+        #: the configuration names now: ``(path, store)``.
+        self._conversations: tuple[Any, SQLiteMemoryStore] | None = None
 
     # -- plumbing -------------------------------------------------------------
 
@@ -172,6 +175,21 @@ class Backend:
     @staticmethod
     def _memory(settings: Settings) -> SQLiteMemoryStore:
         return SQLiteMemoryStore(settings.memory_database)
+
+    def conversations(self) -> SQLiteMemoryStore | None:
+        """The Core store holding the conversations, or ``None`` when the
+        configuration is refused or the database cannot be opened (the window
+        then says its conversation cannot be saved)."""
+        loaded = self.store.load()
+        if not loaded.usable:
+            return None
+        path = loaded.settings.memory_database
+        if self._conversations is None or self._conversations[0] != path:
+            try:
+                self._conversations = (path, SQLiteMemoryStore(path))
+            except Exception:  # noqa: BLE001 - storage boundary
+                return None
+        return self._conversations[1]
 
     # -- configuration: the kill switch and the model selection --------------
 

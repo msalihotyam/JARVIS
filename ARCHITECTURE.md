@@ -3156,3 +3156,13 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   geri dönüş sürümünün bu arada yazdığı içerik) ayrı bir kurtarılmış Global
   konuşma olur. Geçmişler birleştirilmez; doğrulanmayan dosya olduğu gibi
   bırakılır ve hiçbir şey oluşturulmaz.
+- **Çalışma zamanı:** pencerenin konuşmaları bu depodadır; tek doğruluk
+  kaynağı odur. Açılışta eski dosya yukarıdaki kuralla içe aktarılır, sonra en
+  son güncellenmiş, doğrulanan Global konuşma açılır (ayrı bir "açık konuşma"
+  kaydı tutulmaz); hiç yoksa yeni bir konuşma oluşturulur. Açılan konuşmanın
+  hatırlanan turları ekrana yeniden gelir. Bir Core oturumunun ürettiği her
+  yanıt ve sonuç, o an hangi konuşma açık olursa olsun, oturumun bağlı olduğu
+  konuşmaya yazılır; ilk kez görülen bir oturum, isteğin geldiği konuşmaya
+  bağlanır. Sağlayıcı/model değişimi konuşma kimliğini ve geçmişini
+  değiştirmez. Yapılandırma reddedildiğinde konuşma yalnızca pencere ömrü
+  boyunca tutulur ve kaydedilemediği söylenir.

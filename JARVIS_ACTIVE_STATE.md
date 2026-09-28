@@ -12,14 +12,17 @@ Memory).
 Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+); active
 section "V2.0 — Projects".
 
-Active gate: Projects Gate 2 — conversation bridge cutover. NOT STARTED.
+Active gate: Projects Gate 3 — project lifecycle + scope propagation.
+NOT STARTED.
 
-Status: Gate 1 is complete on main — Core SQLite conversation store as an
-additive schema-10 compatibility layer (`ARCHITECTURE.md` §4.22), plus test
-isolation so no test can open the live database. Nothing is in flight.
+Status: Gates 1–2 are complete on main. The window's conversations live in
+the Core SQLite store (additive schema-10 layer, `ARCHITECTURE.md` §4.22):
+several Global conversations, restored on open, results routed to the
+conversation that owns their session; the legacy `conversation.json` is only
+read. Nothing is in flight.
 
-Starting/base commit: `f16b181` test: keep every test off the live database
-(on `f81188c` feat(projects): add conversation persistence foundation).
+Starting/base commit: the `feat(projects): enable persisted conversations`
+commit on main.
 
 Current installed release: `1.0.0-1c68161` (Chrome runtime), active and
 consistent; previous = `1.0.0-4f5a93d`.
@@ -38,14 +41,14 @@ consistent; previous = `1.0.0-4f5a93d`.
   owner fixed at creation (no move in V2.0); project scope is context, never
   authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
   targets (additive tables only, no ALTER of schema-10 tables).
-- Gate 1 test live-DB isolation (guard in `tests/__init__.py`).
+- Gates 1–2: conversation store, test live-DB isolation (guard in
+  `tests/__init__.py`), bridge cutover to the Core store.
 
 ## Uncommitted / external decisions
 
-- The remaining V2.0 gate plan exists only in the Gate 0 report: 2 bridge
-  cutover → 3 project lifecycle + scope propagation → 4 project
-  instructions → 5 project files foundation → 6 Projects UX → 7 E2E +
-  packaged dogfood + rollback proof.
+- The remaining V2.0 gate plan exists only in the Gate 0 report: 3 project
+  lifecycle + scope propagation → 4 project instructions → 5 project files
+  foundation → 6 Projects UX → 7 E2E + packaged dogfood + rollback proof.
 - Gate 4B physical Edge retirement is deferred until a normal-use period
   and an explicit user decision.
 - External: the installed app's Claude CLI OAuth session was expired at the
@@ -54,12 +57,13 @@ consistent; previous = `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Projects Gate 2 (Opus 5.5 High): the UI bridge switches from
-  `~/.jarvis/conversation.json` to the Core store — legacy import by digest
-  at startup, conversation list, feed restored from stored turns, new
-  conversation, session → conversation link, results routed to their own
-  conversation, titles per conversation, research replies marked as
-  web-derived. Global only; no Projects UI yet.
+- Projects Gate 3 (Opus 5.5 High): create (opaque id) / rename / archive /
+  unarchive projects in Core; a conversation's owner set at creation;
+  chat-started tasks carry the typed `Task.project_id` of their
+  conversation (session binding → project memory retrieval); the intent
+  catalog's project comes from the conversation. Prove approval
+  fingerprints, grants, destinations, roots and attestation are identical
+  with and without a project. No Projects UI yet.
 
 ## Rollback / safety anchors
 

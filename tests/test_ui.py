@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -35,6 +36,7 @@ from jarvis.app import create_app  # noqa: E402
 from jarvis.contracts import ErrorCode, ProjectRecord, SideEffect, StructuredError  # noqa: E402
 from jarvis.destinations import CLAUDE_CODE_DESTINATION, DestinationGrant  # noqa: E402
 from jarvis.gmail import GMAIL_CONNECTOR, GMAIL_ENABLED_CAPABILITIES, GmailIdentityBinding  # noqa: E402
+from jarvis.conversation import ConversationStore  # noqa: E402
 from jarvis.memory import SQLiteMemoryStore  # noqa: E402
 from jarvis.registry import ToolRegistry  # noqa: E402
 from jarvis.settings import ConfigStore  # noqa: E402
@@ -4408,8 +4410,9 @@ class StreamingChatTests(UiTestCase):
         self.assertIn("INTERRUPTED - INCOMPLETE ANSWER", self.item(root, "feedInterrupted").property("text"))
         self.assertEqual("", bridge.streamText)
         before = self.streaming(previews=(), error=failure)
+        restored = len(before.feed)             # the same database: the conversation reopens with its history
         before.submitText("Merhaba")
-        self.assertEqual(["user", "error"], self.kinds(before))
+        self.assertEqual(["user", "error"], self.kinds(before)[restored:])
         self.assertNotIn("{", self.feed_text(before))
 
     def test_a_stale_preview_never_shows(self) -> None:
@@ -6094,23 +6097,6 @@ class ConversationContextTests(UiTestCase):
         self.assertEqual(["Önemli karar: rapor dili Türkçe olsun."], [p["text"] for p in context["pinned"]])
         self.assertEqual({"role": "assistant", "text": "Anlaşıldı."}, context["conversation"][-1])
 
-    def test_an_unreadable_conversation_is_set_aside_and_reported(self) -> None:
-        bridge = self.bridge(proposal(kind="chat", reply="Anlaşıldı."))
-        bridge.submitText("Önemli karar: rapor dili Türkçe olsun.")
-        path = self.prefs_path.parent / "conversation.json"
-        path.write_text(path.read_text(encoding="utf-8").replace("Türkçe", "Almanca"), encoding="utf-8")   # tampered
-        again = self.reopen()
-        self.assertEqual((), again._conversation())                                   # nothing invented
-        self.assertEqual((), again._conversation_store.state.pins)
-        notes = [n for n in again.activity if n["kind"] == "error"]
-        self.assertEqual(1, len(notes))
-        self.assertIn("could not be read", notes[0]["text"])
-        self.assertTrue(list(self.prefs_path.parent.glob("conversation.corrupt-*.json")))
-        self.model.answers = [proposal(kind="chat", reply="Bilmiyorum.")]
-        again.submitText("Rapor hangi dilde?")
-        self.assertEqual([], self.model.calls[-1].context["conversation"])
-        self.assertNotIn("pinned", self.model.calls[-1].context)
-
     def test_new_session_is_a_new_task_session_in_the_same_conversation(self) -> None:
         """Review 2: "New session" lives in the Active Workflow panel and resets
         Core's TASK session (task, approval, project binding, chain). The chat on
@@ -6192,6 +6178,252 @@ class ConversationContextTests(UiTestCase):
         self.assertIn({"role": "assistant", "text": "Codex: Türkçe, kısa."}, claude["conversation"])
         self.assertEqual(codex["pinned"], claude["pinned"])
         self.assertEqual(["Rapor dili Türkçe olsun."], [p["text"] for p in claude["pinned"]])
+
+
+class PersistedConversationTests(UiTestCase):
+    """The window's conversations live in the Core store: several of them,
+    each with its own history, opened from Core state, and whatever a session
+    produces is remembered by the conversation that owns that session. The
+    previous version's single ``conversation.json`` is only ever read."""
+
+    def reopen(self):
+        return Bridge(self.backend, UiPreferences(self.prefs_path), sync=True)
+
+    def db(self) -> SQLiteMemoryStore:
+        return SQLiteMemoryStore(self.database)
+
+    @property
+    def legacy(self) -> Path:
+        return self.prefs_path.parent / "conversation.json"
+
+    def legacy_file(self, *texts: str) -> bytes:
+        """What a schema-10 release leaves behind, written through its own semantics."""
+        store = ConversationStore(self.legacy)
+        for number, text in enumerate(texts):
+            store.append(role="user", kind="user", text=text, message=text, key=f"old-{number}")
+            store.append(role="assistant", kind="reply", text=f"yanıt {number}", key=f"old-r{number}")
+        return self.legacy.read_bytes()
+
+    def turns(self, conversation_id: str) -> list[str]:
+        return [turn.text for turn in self.db().load_conversation_state(conversation_id).turns]
+
+    def test_the_first_v2_start_recovers_the_legacy_conversation_and_never_touches_it(self) -> None:
+        before = self.legacy_file("V1'deki karar: rapor Türkçe.")
+        beside = sorted(p.name for p in self.prefs_path.parent.iterdir() if p.name.startswith("conversation"))
+        bridge = self.bridge(proposal(kind="chat", reply="Anlaşıldı."))
+        self.assertEqual(1, len(bridge.conversations))
+        recovered = bridge.conversations[0]
+        self.assertTrue(recovered["active"])
+        self.assertEqual("legacy-import", recovered["origin"])
+        self.assertEqual("Previous conversation", recovered["title"])
+        self.assertEqual(["V1'deki karar: rapor Türkçe.", "yanıt 0"], [e["text"] for e in bridge.feed])
+        self.assertIn("Recovered the conversation saved by the previous version", [n["text"] for n in bridge.activity])
+        bridge.submitText("Rapor hangi dilde?")
+        self.assertEqual(["V1'deki karar: rapor Türkçe."], [p["text"] for p in self.model.calls[-1].context["pinned"]])
+        # Nothing about the legacy file changed, and nothing appeared beside it.
+        again = self.reopen()
+        self.assertEqual(1, len(again.conversations))                                  # the same digest: no duplicate
+        self.assertEqual(before, self.legacy.read_bytes())
+        self.assertEqual(beside, sorted(p.name for p in self.prefs_path.parent.iterdir() if p.name.startswith("conversation")))
+
+    def test_v2_never_writes_the_legacy_file(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
+        bridge.submitText("Merhaba.")
+        self.assertFalse(self.legacy.exists())
+        self.assertEqual(["Merhaba.", "Tamam."], self.turns(bridge.conversationId))
+
+    def test_a_restart_reopens_the_conversation_and_restores_its_feed(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Anlaşıldı."))
+        bridge.submitText("Önemli karar: rapor dili Türkçe olsun.")
+        opened = bridge.conversationId
+        again = self.reopen()
+        self.assertEqual(opened, again.conversationId)
+        self.assertEqual(["user", "jarvis"], self.kinds(again))
+        self.assertEqual(["Önemli karar: rapor dili Türkçe olsun.", "Anlaşıldı."], [e["text"] for e in again.feed])
+        self.assertIn("Continuing the previous conversation (2 turns)", [n["text"] for n in again.activity])
+
+    def test_conversations_keep_isolated_histories_and_can_be_switched(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A yanıtı."), proposal(kind="chat", reply="B yanıtı."),
+                             proposal(kind="chat", reply="A tekrar."))
+        bridge.submitText("A konuşması: Postgres kullan.")
+        first = bridge.conversationId
+        self.assertTrue(bridge.newConversation())
+        second = bridge.conversationId
+        self.assertNotEqual(first, second)
+        self.assertEqual([], bridge.feed)                                              # a new one starts empty
+        bridge.submitText("B konuşması: hava nasıl?")
+        self.assertEqual([], [t for t in self.model.calls[-1].context["conversation"] if "Postgres" in t["text"]])
+        self.assertEqual(["B konuşması: hava nasıl?", "B yanıtı."], self.turns(second))
+        self.assertEqual([first, second], sorted([first, second]) if first < second else [first, second])
+        self.assertEqual({first, second}, {row["id"] for row in bridge.conversations})
+        self.assertEqual([second], [row["id"] for row in bridge.conversations if row["active"]])
+        self.assertTrue(bridge.openConversation(first))
+        self.assertEqual(["A konuşması: Postgres kullan.", "A yanıtı."], [e["text"] for e in bridge.feed])
+        bridge.submitText("Hangi veritabanı?")
+        context = [t["text"] for t in self.model.calls[-1].context["conversation"]]
+        self.assertIn("A konuşması: Postgres kullan.", context)
+        self.assertFalse(any("B konuşması" in text for text in context))
+        self.assertEqual(4, len(self.turns(first)))
+        self.assertEqual(2, len(self.turns(second)))
+        # Named from its first message; new ones are Global.
+        titles = {row["id"]: row["title"] for row in bridge.conversations}
+        self.assertTrue(titles[first] and titles[second] and titles[first] != titles[second])
+        for conversation_id in (first, second):
+            self.assertIsNone(self.db().load_conversation(conversation_id).project_id)
+
+    def test_an_unknown_or_malformed_conversation_is_not_opened(self) -> None:
+        bridge = self.bridge()
+        opened = bridge.conversationId
+        self.assertFalse(bridge.openConversation("c-" + "0" * 32))
+        self.assertFalse(bridge.openConversation("not-an-id"))
+        self.assertEqual(opened, bridge.conversationId)
+
+    def test_a_session_opens_the_conversation_that_owns_it(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
+        bridge.submitText("Bu projeyi incele.")
+        session, owner = bridge.sessionId, bridge.conversationId
+        self.assertTrue(session)
+        self.assertEqual(owner, self.db().conversation_for_session(session))
+        self.assertTrue(bridge.newConversation())
+        self.assertNotEqual(owner, bridge.conversationId)
+        bridge.useSession(session)
+        self.assertEqual(owner, bridge.conversationId)
+        self.assertEqual(session, bridge.sessionId)
+
+    def test_a_reply_that_arrives_after_a_switch_lands_in_its_own_conversation(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Geç gelen yanıt."))
+        origin = bridge.conversationId
+        other = self.db().create_conversation().id
+        submit = self.backend.submit_text
+
+        def slow(*args, **kwargs):
+            # While the call is in flight, ANOTHER conversation becomes the open one.
+            bridge._activate(bridge._load_conversation(self.db(), other))
+            return submit(*args, **kwargs)
+
+        self.backend.submit_text = slow
+        bridge.submitText("Bu soru A'da soruldu.")
+        self.assertEqual(other, bridge.conversationId)
+        self.assertEqual([], bridge.feed)                                              # nothing shown in B
+        self.assertEqual([], self.turns(other))                                        # nothing remembered in B
+        self.assertEqual(["Bu soru A'da soruldu.", "Geç gelen yanıt."], self.turns(origin))
+        self.assertIn("A reply for another conversation was saved there", [n["text"] for n in bridge.activity])
+
+    def test_a_task_result_follows_its_session_not_the_open_conversation(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
+        bridge.submitText("Bu projeyi incele.")
+        session, owner = bridge.sessionId, bridge.conversationId
+        task = self.db().list_tasks(session, 5)[0].id
+        bridge._ticket = None
+        self.assertTrue(bridge.newConversation())
+        other = bridge.conversationId
+        envelope = {"command": "run", "run_status": "completed", "session": {"id": session},
+                    "task": {"id": task, "selected_connector": "claude-code-plan", "status": "completed", "stage": "outcome"},
+                    "model_answer": {"content": "Geç sonuç: iki bulgu.", "truncated": False}}
+        bridge._delivered(bridge._apply_run)(envelope)                                 # a result delivered late
+        self.assertEqual(other, bridge.conversationId)
+        self.assertNotIn("result", self.kinds(bridge))
+        self.assertEqual([], self.turns(other))
+        self.assertTrue(any("Geç sonuç" in text for text in self.turns(owner)))
+
+    def test_a_provider_switch_keeps_the_conversation_and_its_history(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Claude."))
+        self.codex.answers = [proposal(kind="chat", reply="Codex.")]
+        bridge.submitText("İlk soru.")
+        opened = bridge.conversationId
+        bridge.setChatProvider("codex")
+        bridge.submitText("İkinci soru.")
+        self.assertEqual(opened, bridge.conversationId)
+        self.assertEqual(1, len(bridge.conversations))
+        self.assertIn({"role": "assistant", "text": "Claude."}, self.codex.calls[0].context["conversation"])
+        self.assertEqual(["İlk soru.", "Claude.", "İkinci soru.", "Codex."], self.turns(opened))
+
+    def test_a_conversation_that_does_not_verify_is_never_opened_or_repaired(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="Anlaşıldı."))
+        bridge.submitText("Önemli karar: rapor dili Türkçe olsun.")
+        broken = bridge.conversationId
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute("UPDATE conversations SET state_json = replace(state_json, 'Türkçe', 'Almanca') WHERE id = ?",
+                               (broken,))
+            connection.commit()
+            tampered = connection.execute("SELECT state_json, integrity FROM conversations WHERE id = ?", (broken,)).fetchone()
+        finally:
+            connection.close()
+        again = self.reopen()
+        self.assertNotEqual(broken, again.conversationId)                              # a new, empty one instead
+        self.assertEqual([], again.feed)
+        self.assertTrue(any("could not be read" in n["text"] for n in again.activity if n["kind"] == "error"))
+        self.assertFalse(again.openConversation(broken))
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(tampered, connection.execute(
+                "SELECT state_json, integrity FROM conversations WHERE id = ?", (broken,)).fetchone())
+        finally:
+            connection.close()
+        self.model.answers = [proposal(kind="chat", reply="Bilmiyorum.")]
+        again.submitText("Rapor hangi dilde?")
+        self.assertEqual([], [t for t in self.model.calls[-1].context["conversation"] if "Türkçe" in t["text"] or "Almanca" in t["text"]])
+
+    def test_a_refused_configuration_keeps_a_window_only_conversation(self) -> None:
+        bridge = self.bridge()
+        self.backend.conversations = lambda: None
+        again = self.reopen()
+        self.assertEqual("", again.conversationId)
+        self.assertTrue(any("will not be saved" in n["text"] for n in again.activity if n["kind"] == "error"))
+        self.assertFalse(again.newConversation())
+        del bridge
+
+
+class ConversationEntryTests(SurfaceCase):
+    """The History page lists the saved conversations and opens or starts one;
+    the palette starts one too. Every entry is a bridge slot."""
+
+    def press(self, root, item):
+        from PySide6.QtCore import QPointF
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, centre)
+        pump(300)
+
+    def history(self, root):
+        self.click(root, "navigationTrigger")
+        self.click(root, "navigate_history")
+        return [i for i in self.all_items(root) if i.objectName() == "historyConversationRow" and i.isVisible()]
+
+    def test_history_opens_and_starts_conversations_and_the_palette_starts_one(self) -> None:
+        bridge = self.bridge(proposal(kind="chat", reply="A yanıtı."))
+        bridge.submitText("A konuşması: Postgres kullan.")
+        first = bridge.conversationId
+        self.assertTrue(bridge.newConversation())
+        second = bridge.conversationId
+        root = self.window(bridge)
+        rows = self.history(root)
+        self.assertEqual("history", bridge.page)
+        self.assertEqual(2, len(rows))
+        title = next(r["title"] for r in bridge.conversations if r["id"] == first)
+        target = [r for r in rows if r.childItems()[0].property("text").startswith(title)]
+        self.assertEqual(1, len(target))
+        self.press(root, target[0])
+        self.assertEqual((first, "home"), (bridge.conversationId, bridge.page))
+        self.assertEqual(["A konuşması: Postgres kullan.", "A yanıtı."], [e["text"] for e in bridge.feed])
+        # A new one from the page: distinct, open, empty.
+        self.history(root)
+        self.click(root, "historyNewConversation")
+        third = bridge.conversationId
+        self.assertNotIn(third, (first, second))
+        self.assertEqual("home", bridge.page)
+        self.assertEqual([], bridge.feed)
+        self.assertEqual(3, len(bridge.conversations))
+        # The palette entry does the same.
+        QTest.keyClick(root, Qt.Key_K, Qt.ControlModifier)
+        pump(100)
+        root.activeFocusItem().setProperty("text", "New conversation")      # the palette's search field
+        pump(50)
+        QTest.keyClick(root, Qt.Key_Return)
+        pump(300)
+        self.assertNotIn(bridge.conversationId, (first, second, third))
+        self.assertEqual(4, len(bridge.conversations))
+        self.assertEqual(0, self.execute_calls())
 
 
 class PresentationTypographyTests(SurfaceCase):

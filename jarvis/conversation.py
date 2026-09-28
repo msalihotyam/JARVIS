@@ -814,6 +814,71 @@ class ConversationStore:
         _retry_busy(lambda: os.replace(temporary, self.path))
 
 
+class PersistedConversation:
+    """One conversation held in the Core store, with the surface the window
+    uses: ``state``, ``append``, ``name_auto``, ``rename``, ``title``.
+
+    Every change is applied to the STORED record inside one store transaction
+    (``update_conversation_state``: read, verify, change, write), so two
+    windows never lose each other's turns, and ``state`` is then what was
+    written. A change the store refuses - a record that does not verify, an
+    archived conversation, a storage failure - is NOT kept anywhere: the
+    verified state stays as it was and ``diagnostic`` says why (fail closed).
+
+    ``store`` ``None`` is a conversation that cannot be saved at all (the
+    configuration was refused): it lives in memory for this window only and
+    ``diagnostic`` says so from the start.
+    """
+
+    def __init__(self, store: Any, conversation_id: str | None, state: ConversationState | None = None,
+                 raw_turns_max: int = RAW_TURNS_MAX) -> None:
+        self.store = store
+        self.id = conversation_id
+        self.state = state or ConversationState()
+        self.raw_turns_max = raw_turns_max
+        self.diagnostic = "" if store is not None else "the conversation store is unavailable"
+        self._instance = hashlib.sha256(f"{os.getpid()}:{time.time_ns()}:{id(self)}".encode()).hexdigest()[:12]
+        self._auto = 0
+
+    def append(self, **fields: Any) -> Turn | None:
+        if not fields.get("key"):
+            self._auto += 1
+            fields["key"] = f"auto:{self._instance}:{self._auto}"
+        state, turn = append_turn(self.state, raw_turns_max=self.raw_turns_max, **fields)
+        if turn is None:
+            return None
+        fields = dict(fields, now=turn.ts)
+        return turn if self._change(lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, **fields)[0]) else None
+
+    def name_auto(self, ids: Iterable[str], auto: str) -> None:
+        ids = tuple(ids)
+        if name_titles(self.state, ids, auto) is not self.state:
+            self._change(lambda base: name_titles(base, ids, auto))
+
+    def rename(self, id: str, custom: str) -> bool:
+        if rename_title(self.state, id, custom) is self.state:
+            return False
+        return self._change(lambda base: rename_title(base, id, custom))
+
+    def title(self, id: str) -> str:
+        return next((t.shown for t in self.state.titles if t.id == id), "")
+
+    def flush(self) -> None:
+        """Nothing is ever pending: every change was written, or refused."""
+
+    def _change(self, apply) -> bool:
+        if self.store is None or self.id is None:
+            self.state = apply(self.state)
+            return False
+        try:
+            self.state = self.store.update_conversation_state(self.id, apply)
+        except Exception as exc:  # noqa: BLE001 - storage boundary; fail closed
+            self.diagnostic = f"the conversation could not be saved: {type(exc).__name__}"
+            return False
+        self.diagnostic = ""
+        return True
+
+
 def load_state(path: str | Path) -> ConversationState:
     return read_verified(path)[0]
 

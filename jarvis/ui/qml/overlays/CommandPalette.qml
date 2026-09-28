@@ -17,6 +17,7 @@ Item {
     readonly property var commands: [
         { label: qsTr("New task (focus composer)"), run: function() { bridge.setPage("home"); palette.focusComposer() } },
         { label: qsTr("New session"), run: function() { bridge.newSession(); bridge.setPage("home") } },
+        { label: qsTr("New conversation"), run: function() { bridge.newConversation(); bridge.setPage("home") } },
         { label: qsTr("Open Command Center"), run: function() { bridge.setPage("home") } },
         { label: qsTr("Open Tasks"), run: function() { bridge.setPage("tasks") } },
         { label: qsTr("Open Automations"), run: function() { bridge.setPage("automations") } },
