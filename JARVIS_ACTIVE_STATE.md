@@ -1,101 +1,72 @@
 # JARVIS Active State
 
-Short, current-state snapshot. Keep this file small and update it whenever
-the state below actually changes — see `JARVIS_RUNBOOK.md` for the rules this
-state is tracked under.
+Overwrite-style snapshot of NOW (rules: `JARVIS_RUNBOOK.md` → "Active state
+file"; freshness: "Session bootstrap"). History lives in git.
 
-- **Current work:** Natural-Language Intent Understanding — COMPLETED and
-  integrated (`d38c3b1`); the accepted task line ended at task commit
-  `aeeeb56`, and the integrated tree is byte-identical to it.
-  `JarvisApp.submit_text(...)` (CLI `jarvis text`) is the app-level
-  natural-language entry seam. The intent model's output has ZERO authority:
-  it is an untrusted proposal. Capability and destination are validated
-  deterministically — a capability is offered only when a registered manifest
-  serves it AND an exact `DestinationGrant` row exists, a destination only
-  from that capability's grant rows — and the proposal becomes an ordinary
-  task document judged by `decode_task_json`. With several authorized
-  destinations neither the model nor a mention inside a sentence selects one:
-  only a follow-up reply exactly equal to a backend-offered `intent.choices`
-  label does. The existing Core / approval / execution path stays
-  authoritative; understanding creates no grant, skips no approval, runs no
-  connector and never produces UNKNOWN_OUTCOME. The understanding call reuses
-  the hardened Claude Code CLI seam (subscription route only) and is never
-  registered as a connector. Targeted intent suite: **59 tests, green**.
-  Gemini gate: PASS. Final GPT-5.6 Sol narrow gate: PASS.
-- **Previous closure:** Windows Desktop basic usable-v1 (`ca8f780`, task
-  commit `2f8ed55`). Six capabilities in the closed
-  vocabulary: `desktop_app_launch`, `desktop_window_list`,
-  `desktop_window_inspect`, `desktop_window_focus`, `desktop_click`,
-  `desktop_type`. `desktop_key`, `desktop_screenshot`,
-  `desktop_clipboard_read`, `desktop_clipboard_write`, `desktop_window_close`,
-  `desktop_window_move`, `desktop_drag`, `desktop_field_value_read` and
-  `desktop_command_run` are refused BY NAME. The backend is standard-library
-  `ctypes` over user32/kernel32 and Windows' own UI Automation client — the
-  project keeps `dependencies = []`. Authority is configuration: each
-  `desktop_apps` entry (`desktop/<canonical exe path>`) becomes exact
-  `DestinationGrant` rows; shells, terminals, script hosts, explorer and the
-  UWP frame host are refused by the grammar. A window is hwnd + pid + process
-  creation time; a target is a `ref` an inspection printed plus that
-  inspection's digest. Actions are TARGET-BOUND, never global input: a click
-  is `InvokePattern.Invoke` and typing is `ValuePattern.SetValue`, called on
-  the pattern object of the element just re-inspected and digest-verified;
-  the global `SendInput` path was removed (Gemini finding). After the pattern
-  is acquired and before dispatch, window ownership (hwnd, pid, creation
-  time, image, class) is re-proven, so HWND/process reuse is a definite
-  pre-dispatch refusal (Codex final-gate finding). Password fields are never
-  written, field values are never read, credential-shaped text is never
-  typed; an uncertain post-dispatch outcome is UNKNOWN_OUTCOME and is never
-  replayed. Targeted Desktop suite: **48 tests, green**. Gemini independent
-  review: PASS. Codex final independent gate: PASS. Before it: Browser basic
-  usable-v1 (`e3d5d14`, task commit `5ceb270`).
-- **Live validation (Intent):** on the task tree, once, through the real
-  Claude Code CLI adapter against a temporary database: "Bu projeyi incele."
-  became a `code_analysis` task parked at `awaiting_approval` (not approved,
-  nothing executed); "Son maillerimi kontrol et." was reported
-  `unsupported_capability` because no Gmail is configured. With
-  `ANTHROPIC_BASE_URL` present the adapter correctly refused as
-  `model_unavailable` before any process started.
-- **Live validation (Desktop):** on real Windows, once per property: the UIA
-  vtable slots were cross-checked against Win32's own answers (winver), and
-  target-bound dispatch was shown with an unrelated app in front and covering
-  the target — charmap's field received the text while winver covered it, and
-  winver's OK button was invoked while charmap covered it and stayed in
-  front. Nothing launched was left running.
-- **Dashboard:** 71% (Desktop capability 75%, Browser 75%, Gmail 75%, GitHub
-  60%, Scheduler 92%), as computed by the renderer from
-  `dev/dashboard/status.json`.
-- **Latest canonical main** is `d38c3b1` and includes the Windows Desktop
-  basic series `62b669b` → `47af4e2` → `ca8f780` and the Natural-Language
-  Intent Understanding series `12f7429` → `4fce6d8` → `d38c3b1`.
-  Housekeeping commits after those do not change the product state recorded
-  here.
-- **Next implementation (product):** the high-end PySide6/QML Minimal UI,
-  built on `JarvisApp.submit_text(...)` for natural-language input. Desktop
-  `desktop_key`, packaged/UWP apps, checkbox/radio/selection patterns and
-  Desktop/Browser end-to-end hardening stay out of scope.
-- **Contracts:** SQLite schema 10; output envelope 7. Neither Windows Desktop
-  basic nor Intent Understanding changed them — Desktop reuses the bounded
-  `external_read` block (`desktop-uia`), and the new `text` command envelope
-  carries the unchanged v7 run envelope under `run`.
-- **Test coverage note:** the last FULL canonical product-suite run is still
-  the Gmail one (3593 tests). Intent Understanding ran the full suite once on
-  its own task tree (exit 0) because the shared application surface changed;
-  its two later corrections were intent-local and verified by the targeted
-  intent suite only (59 tests), per the runbook. Windows Desktop basic did the
-  same before it (3713 tests OK, 1 skipped; later corrections verified by 48
-  targeted tests).
-- **Active implementation worktree:** the separate Minimal UI task worktree
-  `JARVIS-Claude-minimal-ui` (`claude/minimal-ui`, `430c5fd`, tkinter
-  functional prototype) still exists and is ACTIVE in `dev.ps1 status`; it
-  was not touched. The intent worktree `JARVIS-Claude-intent-understanding`
-  and its branch `claude/intent-understanding` were finished and cleaned up
-  after integration; this persistent chat is rebound to canonical
-  `C:\Users\realk\Masaüstü\JARVIS`. `dev.ps1 status` still
-  reports the old `claude/scheduler-phase1b` recovery residue (PARTIAL
-  REMOVAL — RECOVERY REQUIRED); it is left untouched on purpose and needs an
-  explicit human recovery checkpoint.
-- **Push:** forbidden unless explicitly authorized by Salih. Nothing has been
-  pushed; canonical main is ahead of `origin/main`.
-- **Before any worktree lifecycle operation:** the persistent Scheduler
-  Development chat must be on canonical JARVIS
-  (`C:\Users\realk\Masaüstü\JARVIS`).
+## PROJECT STATE
+
+Active milestone: V2.0 Projects (first structural V2 layer; dogfood-capable,
+not the official V2 daily-driver gate — that is V2.1 Projects + Advanced
+Memory).
+
+Active gate: Projects Gate 2 — conversation bridge cutover. NOT STARTED.
+
+Status: Gate 1 is complete on main — Core SQLite conversation store as an
+additive schema-10 compatibility layer (`ARCHITECTURE.md` §4.22), plus test
+isolation so no test can open the live database. Nothing is in flight.
+
+Starting/base commit: `f16b181` test: keep every test off the live database
+(on `f81188c` feat(projects): add conversation persistence foundation).
+
+Current installed release: `1.0.0-1c68161` (Chrome runtime), active and
+consistent; previous = `1.0.0-4f5a93d`.
+
+## Open blockers
+
+- None for Gate 2.
+
+## Do not reopen
+
+- V2 M1 Edge → Chrome migration: complete (trusted Chrome, chrome-profile,
+  WebRTC preference + switch, per-tab boundary bound before exposure,
+  MediaRouter disabled, packaged + rollback proven).
+- Projects Gate 0 decisions: reuse the existing `projects` table; Global =
+  `project_id` NULL (no synthetic Global project); opaque ids; conversation
+  owner fixed at creation (no move in V2.0); project scope is context, never
+  authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
+  targets (additive tables only, no ALTER of schema-10 tables).
+- Gate 1 test live-DB isolation (guard in `tests/__init__.py`).
+
+## Uncommitted / external decisions
+
+- The V2 roadmap (V2.0–V2.6, including the V2.4B Orchestrated Tasks item)
+  is not yet in the repo; its canonical placement is still to be decided.
+- The remaining V2.0 gate plan exists only in the Gate 0 report: 2 bridge
+  cutover → 3 project lifecycle + scope propagation → 4 project
+  instructions → 5 project files foundation → 6 Projects UX → 7 E2E +
+  packaged dogfood + rollback proof.
+- Gate 4B physical Edge retirement is deferred until a normal-use period
+  and an explicit user decision.
+- External: the installed app's Claude CLI OAuth session was expired at the
+  last packaged smoke (2026-09-26); the user must re-login.
+- Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
+
+## Next action
+
+- Projects Gate 2 (Opus 5.5 High): the UI bridge switches from
+  `~/.jarvis/conversation.json` to the Core store — legacy import by digest
+  at startup, conversation list, feed restored from stored turns, new
+  conversation, session → conversation link, results routed to their own
+  conversation, titles per conversation, research replies marked as
+  web-derived. Global only; no Projects UI yet.
+
+## Rollback / safety anchors
+
+- Releases: `1.0.0-1c68161` active, `1.0.0-4f5a93d` pre-Chrome rollback
+  retained, `legacy-1.0.0-5976769` retained.
+- `data\browser-profile` (Edge rollback profile) kept unmodified.
+- `data\jarvis.pre-v2.db`: verified pre-V2 copy of the live database.
+- `SCHEMA_VERSION` stays 10 while any schema-10 release is a rollback target.
+- `~/.jarvis/conversation.json` is only ever read by V2.
+- Never touch `uv.lock`; never stage the dashboard WIP
+  (`dev/dashboard/UPDATE.md`, `render_dashboard.py`, `status.json`).

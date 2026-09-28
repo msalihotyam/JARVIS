@@ -29,6 +29,24 @@ Do not repeat closed architecture or project history in the prompt — the
 worker can read `ARCHITECTURE.md`, `PROJECT_CONTEXT.md`, and prior commits
 itself. State only what changed and what is now being asked for.
 
+## Orchestration — chief and subagents
+
+The main Claude Code session is the **chief**: it plans, delegates,
+integrates and verifies. It is not forbidden from writing code.
+
+- **Delegate** a task when it has its own file/surface ownership, clear
+  boundaries and an independent acceptance test.
+- **The chief writes** central single-owner surfaces (core, contracts,
+  schema, migrations), cross-module glue and integration fixes, and small
+  work where delegation costs more than doing it.
+- **Sequential by default.** Parallel or worktree fan-out is opt-in and only
+  when ownership is genuinely disjoint. A central shared surface has exactly
+  one owner at a time.
+- **Brief:** objective, owned surface, forbidden scope, invariants,
+  acceptance proof — nothing else.
+- **Return:** concise, target <= 15 lines. Raw logs stay with the subagent;
+  they are not promoted into the chief's context.
+
 ## Model policy
 
 Sonnet is **no longer the default coder**: in real use it is too slow.
@@ -36,7 +54,7 @@ Sonnet is **no longer the default coder**: in real use it is too slow.
 | Model / effort | Use for |
 |---|---|
 | Opus 5.5, High | Primary/default: architecture, implementation, debugging, refactors, security, gates |
-| Fable 5.1, High | Strong secondary lane: an independent perspective or specific bounded work |
+| Fable 5.1, High | Exceptional secondary lane: an independent/review perspective or specific bounded work |
 | Sonnet 5, High | Narrow, mechanical, lower-risk work |
 
 `xhigh` / `max` stay exceptional — only when the concrete task genuinely
@@ -63,10 +81,54 @@ a chat's scrollback.
   > Read JARVIS_RUNBOOK.md and JARVIS_ACTIVE_STATE.md first. Continue from the
   > current canonical state.
 
+## Session bootstrap
+
+Every new session bootstraps from the repo, not from a handoff chain:
+
+1. Read this runbook, `JARVIS_ACTIVE_STATE.md` and the roadmap section it
+   names as active.
+2. Find the last commit that changed the state file:
+   `git log -1 --format=%H -- JARVIS_ACTIVE_STATE.md`
+3. Inspect what came after it: `git log --oneline <state_commit>..HEAD`
+4. Inspect local work: `git status --short`
+5. Later commits do not by themselves make the state stale. Read only those
+   commits and decide whether they materially change the milestone, gate or
+   status the state file describes.
+6. Consistent: continue without asking for redundant confirmation.
+7. Contradictory, or relevant uncommitted work the state file does not
+   represent: stop and report the mismatch.
+
+## Active state file
+
+`JARVIS_ACTIVE_STATE.md` is a short, overwrite-style snapshot of NOW:
+active milestone and gate, status, base commit, installed release, open
+blockers, what must not be reopened, uncommitted/external decisions, next
+action and rollback/safety anchors.
+
+- Target <= 60–80 lines and <= ~5 KB. Rewrite it; never append.
+- Closed gates and resolved blockers are removed. History lives in git and
+  the roadmap.
+- It carries no "current HEAD" field: its freshness is checked by the
+  bootstrap above.
+- Update it on canonical main when the milestone, gate or status changes.
+
+## Evidence and handoffs
+
+- Durable security, release or review evidence with long-term value may be
+  committed, in the existing docs structure (architecture invariants in
+  `ARCHITECTURE.md`, procedure here, the proof summary in the commit
+  message). Raw terminal or test dumps are never committed.
+- A chat/session handoff carries only what the repo does not yet hold:
+  uncommitted decisions, unresolved questions, external state. Target
+  <= half a page.
+
 ## Independent review (Work)
 
 Reserve an independent Work gate for genuinely critical blockers only — not
 for routine changes. Most work does not need one.
+
+Codex is an independent reviewer: it is never the implementation worker of
+the same change it reviews.
 
 ## Testing discipline — TEST BUDGET
 
@@ -149,7 +211,12 @@ that release, is a separate explicit decision.
 
 Update `dev/dashboard/status.json` only after the accepted work is canonical
 on main. See `dev/dashboard/UPDATE.md` for the full contract (percentages are
-computed by the renderer, never written by hand).
+computed by the renderer, never written by hand). Also:
+
+- Keep dashboard summaries short and human-facing.
+- Do not change roadmap weights or progress rules unless explicitly told to.
+- After a canonical milestone update, commit the resulting tracked
+  `status.json` change in a small dev-tooling commit so main is clean again.
 
 ## Worktree lifecycle — HARD RULE
 
