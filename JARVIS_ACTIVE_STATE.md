@@ -9,6 +9,9 @@ Active milestone: V2.0 Projects (first structural V2 layer; dogfood-capable,
 not the official V2 daily-driver gate — that is V2.1 Projects + Advanced
 Memory).
 
+Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+); active
+section "V2.0 — Projects".
+
 Active gate: Projects Gate 2 — conversation bridge cutover. NOT STARTED.
 
 Status: Gate 1 is complete on main — Core SQLite conversation store as an
@@ -39,8 +42,6 @@ consistent; previous = `1.0.0-4f5a93d`.
 
 ## Uncommitted / external decisions
 
-- The V2 roadmap (V2.0–V2.6, including the V2.4B Orchestrated Tasks item)
-  is not yet in the repo; its canonical placement is still to be decided.
 - The remaining V2.0 gate plan exists only in the Gate 0 report: 2 bridge
   cutover → 3 project lifecycle + scope propagation → 4 project
   instructions → 5 project files foundation → 6 Projects UX → 7 E2E +

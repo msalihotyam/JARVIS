@@ -85,8 +85,9 @@ a chat's scrollback.
 
 Every new session bootstraps from the repo, not from a handoff chain:
 
-1. Read this runbook, `JARVIS_ACTIVE_STATE.md` and the roadmap section it
-   names as active.
+1. Read this runbook, `JARVIS_ACTIVE_STATE.md` and the section of the
+   canonical roadmap (`JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`) it names as
+   active.
 2. Find the last commit that changed the state file:
    `git log -1 --format=%H -- JARVIS_ACTIVE_STATE.md`
 3. Inspect what came after it: `git log --oneline <state_commit>..HEAD`

@@ -1,7 +1,7 @@
 # JARVIS V2+ — Roadmap, Decisions & Reference Architecture
 
 **Belge tarihi:** 2026-09-19  
-**Son güncelleme:** 2026-09-26 — Jev Decision Engine evaluation/roadmap kararı eklendi.  
+**Son güncelleme:** 2026-09-28 — V2.4B Orchestrated Tasks / Parent–Child Task Graph kararı eklendi.  
 **Amaç:** JARVIS V1 sonrasında uygulanması planlanan V2 ve daha ileri ürün kararlarını tek yerde korumak.  
 **Bu belge canlı proje durumu değildir.** Commit, branch, milestone ilerlemesi veya `JARVIS_ACTIVE_STATE.md` anlık bilgileri burada tutulmaz.
 
@@ -426,6 +426,35 @@ Kalite avantajı kanıtlanmayan decision class deterministik/Opus tabanlı mevcu
 - Mevcut Edge → Chrome güvenlik migration’ı tamamlanmadan bu özellik için implementation başlatılmaz.
 - POC, büyük Work/Subagent/Automation ölçeklenmesinden önce veya onun erken safhasında yapılması tercih edilen cross-cutting V2 işi olarak tutulur.
 - Exact SDK/provider/retention koşulları implementation milestone’u başında yeniden doğrulanır.
+
+---
+
+## V2.4B — Orchestrated Tasks / Parent–Child Task Graph
+**Statü: KESİN** — Faz 1 kapsamı kesin; sonraki fazlar sırasıyla ve her biri kendi gate’iyle açılır.
+
+Orchestrator işi **parçalar**; authority **yaratmaz**.
+
+### KESİN authority kuralları
+- Parent / orchestrator’ın blanket connector authority’si yoktur.
+- Child task’lar normal Core pipeline’ından geçerek yürür.
+- **Plan onayı ≠ blanket execution authority.**
+- Child scope, onaylanan parent plan/scope’un içinde kalmak zorundadır.
+- Plan, kanonik child scope’larını içerir; plandaki materyal bir değişiklik o planın onayını geçersiz kılar.
+- Mevcut Core approval / grant / connector / identity / güvenlik gereksinimleri her child action için ayrıca ve bağımsız olarak uygulanır.
+- Parent, ham child çıktısını değil, sınırlı ve yeniden doğrulanmış özetleri alır.
+
+### Faz 1
+- tek orchestration seviyesi
+- sıralı (sequential) yürütme
+- yalnız read-only connector’lar
+- en çok 5 child task
+
+### Sonraki fazlar
+1. paralel read-only child’lar
+2. verifier child
+3. yazan (writing) child’lar
+
+Yazan child’lar, etkinleştirilmeden önce ayrı bir threat model ve ayrı bir implementation milestone’u/gate’i gerektirir.
 
 ---
 
