@@ -3361,6 +3361,27 @@ class AgentCore:
                 ),
                 False,
             )
+        if (
+            grant.approved
+            and grant.remember_for_session
+            and not self._remembered_permission_allowed(request)
+        ):
+            # A remembered grant is admitted only where the loop itself would
+            # reuse one. Refused BEFORE any write: no grant row, no attempt,
+            # and the task stays waiting on the same request.
+            return (
+                AgentRun(
+                    waiting_status,
+                    session,
+                    task,
+                    permission_request=request,
+                    error=StructuredError(
+                        ErrorCode.INVALID_GRANT,
+                        "This approval may not be remembered for the session.",
+                    ),
+                ),
+                False,
+            )
         if not grant.approved:
             # P1-A: resolution and terminal rejection are ONE transaction, so
             # no observable state has a rejected request with a resumable task.

@@ -4008,13 +4008,8 @@ class JarvisApp:
         return self._present(command, self.core.resume(session_id, task_id, grant))
 
     def _remembrance_allowed(self, request: PermissionRequest) -> bool:
-        """The same reuse conditions the loop itself applies."""
-        return (
-            self.settings.permission_mode is PermissionMode.SESSION
-            and not request.side_effect.mandatory
-            and request.risk_level < RiskLevel.HIGH
-            and request.side_effect.reversible
-        )
+        """The ONE reuse predicate the loop itself applies (never a copy)."""
+        return self.core._remembered_permission_allowed(request)
 
     def _ownership_failure(
         self, command: str, session_id: str, task_id: str

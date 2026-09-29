@@ -2726,13 +2726,21 @@ class SQLiteMemoryStore:
         Expiry is enforced here: a recorded grant whose window has closed can
         never re-authorize execution, so an expired grant returns the task to
         a fresh gate rather than silently clearing it.
+
+        Only an unconsumed ONE-SHOT grant counts - exactly the grant the
+        execution claim can consume (``begin_execution``). A remembered grant
+        proves reuse only through ``has_remembered_scope_grant``, which Core
+        consults solely for a rememberable request; counting it here would
+        pass the gate with a grant the claim can never consume, leaving the
+        task stuck instead of back at approval.
         """
         with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT 1 FROM permission_grants
                 WHERE session_id = ? AND task_id = ? AND fingerprint = ?
-                  AND approved = 1 AND expires_at > ?
+                  AND approved = 1 AND remember_for_session = 0
+                  AND consumed_by_attempt IS NULL AND expires_at > ?
                 LIMIT 1
                 """,
                 (session_id, task_id, fingerprint, utc_now()),

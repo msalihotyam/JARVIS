@@ -76,7 +76,7 @@ Onay semantiği:
 - `approve` ve `reject` yalnızca `load_pending_approval(task_id, session_id)` ile yüklenen tam kaydı kullanır. Verilen request ID ve fingerprint yalnızca karşılaştırma kanıtıdır; grant'e kopyalanmaz.
 - Eşleşmeyen veya süresi dolmuş istek yeniden hesaplanmaz, değiştirilmez ve iş çalıştırılmaz.
 - Grant yalnızca `PermissionGrant.for_request(...)` ile üretilir. Varsayılan onay tek seferliktir.
-- `--remember-for-session` yalnızca mevcut yeniden kullanım koşullarının tamamı sağlanırsa kabul edilir: etkin mod `session`, yan etki zorunlu değil, risk `HIGH` altında ve işlem geri alınabilir. Aksi halde grant üretilmeden durur. Zorunlu onaylı dışarı veri gönderimi bu nedenle tek seferlik kalır.
+- `--remember-for-session` yalnızca mevcut yeniden kullanım koşullarının tamamı sağlanırsa kabul edilir: etkin mod `session`, yan etki zorunlu değil, risk `HIGH` altında ve işlem geri alınabilir. Aksi halde grant üretilmeden durur. Zorunlu onaylı dışarı veri gönderimi bu nedenle tek seferlik kalır. Kural Core'da tek bir yüklemdir (`AgentCore._remembered_permission_allowed`; uygulama katmanı onu çağırır, kopyalamaz): Core da bu koşulları sağlamayan bir hatırlanan grant'i `INVALID_GRANT` ile, hiçbir şey yazmadan reddeder. İzin kapısını yalnız tam fingerprint için onaylı, süresi dolmamış, tüketilmemiş tek seferlik bir grant geçer; hatırlanan grant yalnız yeniden kullanılabilir bir istek için geçerlidir, aksi halde görev yeniden onaya döner (asla takılı bir claim'e değil).
 
 Çıktı ve çıkış kodları:
 
