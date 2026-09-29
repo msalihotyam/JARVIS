@@ -3345,7 +3345,7 @@ değildir (yol haritası V2.0).
   görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
   metni tutmaz.
 
-### 4.25 Projects penceresi (V2 Projects Gate 6A, uygulandı)
+### 4.25 Projects penceresi (V2 Projects Gate 6A/6B, uygulandı)
 
 Pencere proje modelini gösterir ve mevcut kanonik yolları çağırır; hiçbir şeye
 kendisi karar vermez.
@@ -3358,8 +3358,32 @@ kendisi karar vermez.
   sahiplik mantığını eklemez. Taşıma yoktur. Arşivlenmiş projede besteleyicinin
   kapatılması yalnız sunumdur; zorlama §4.22'deki Core reddidir.
 - **Adlar, kimlikler değil:** pencere proje ADINI gösterir; opak kimlikler
-  içeride kalır. Üst çubuktaki rozet açık konuşmanın sahibini (veya Global'i)
-  gösterir ve yalnız o projenin sayfasına (Global -> History) götürür.
+  içeride kalır.
+- **Proje seçici (6B, Salih kararı 2026-09-30; 6A rozetinin yerinde):** açık
+  konuşmanın sahibini (veya Global'i) gösterir; menüsü etkin projeler, Global
+  ve "Tüm projeler"dir (arşivli proje listelenmez). Seçim yalnız bir konuşma
+  AÇAR: o sahibin arşivlenmemiş en yeni konuşması, yoksa mevcut yollarla yeni
+  bir konuşma. "+ Yeni sohbet" açık konuşmanın sahibinde (Global'de Global)
+  yeni konuşma açar; arşivli sahipte gerekçesiyle kapalıdır. Seçim hiçbir
+  konuşmanın sahibini değiştirmez ve hiçbir grant, onay, hedef veya connector
+  kararı vermez; zorlama §4.22'deki Core sahip bağıdır. Fare önceliklidir;
+  hiçbir özellik kısayola bağlı değildir.
+- **Talimat editörü (6B):** düz metin, canlı "x / 2000" sayacı, zorunlu
+  PUBLIC/INTERNAL seçimi (kayıtlı sürümden doldurulur, yoksa seçili değildir),
+  §4.23 önceliğinin görünür satırı; Kaydet ve Boşalt (boş metin = temizleme)
+  `project_instruction_result` üzerinden. Kayıttan sonra DEPOLANAN metin
+  gösterilir; deponun redaksiyonu metni değiştirdiyse bu söylenir. Sınır,
+  sınıf ve arşiv reddi deponundur; arşivli projede editör salt-okunurdur.
+- **Dosya paneli (6B):** "Etkin x/20", "Tutulan x/40", "Karakter x/2.000.000"
+  sayaçları deponun listesinden hesaplanır; ekleme (FileDialog, zorunlu
+  sınıf), retire/restore ve purge `project_file_result` üzerinden; depo
+  retleri olduğu gibi gösterilir. Purge retire -> purge'ün ikinci adımıdır:
+  etkin projede yalnız EMEKLİ satırlarda; arşivli projede (retire reddedilir,
+  gizlilik silmesi engellenmez, §4.24) AKTİF ve EMEKLİ satırlarda sunulur
+  (orkestratör kararı). Onay penceresi satırı tam tanımlar (ad, sınıf, boyut,
+  eklenme zamanı; ad tekil değildir), §4.24 kalıntısını dürüstçe söyler ve o
+  satırın dosya adı aynen yazılmadan hiçbir çağrı yapmaz; eşleşince deponun
+  onayı olarak o SATIRIN kimliği verilir (deponun kapısı değişmez).
 - **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
   tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
 - **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje

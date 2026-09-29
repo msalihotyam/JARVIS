@@ -360,6 +360,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Genel</translation>
     </message>
     <message>
+        <source>Saved. The store redacted credentials or local paths, so the stored text shown here differs from what you typed.</source>
+        <translation>Kaydedildi. Depo kimlik bilgilerini veya yerel yolları gizledi; bu yüzden burada gösterilen kayıtlı metin yazdığınızdan farklı.</translation>
+    </message>
+    <message>
         <source>A reply for another conversation was saved there</source>
         <translation>Başka bir konuşmaya ait yanıt o konuşmaya kaydedildi</translation>
     </message>
@@ -2592,6 +2596,30 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Yenile</translation>
     </message>
     <message>
+        <source>%1 MB</source>
+        <translation>%1 MB</translation>
+    </message>
+    <message>
+        <source>%1 KB</source>
+        <translation>%1 KB</translation>
+    </message>
+    <message>
+        <source>%1 bytes</source>
+        <translation>%1 bayt</translation>
+    </message>
+    <message>
+        <source>active</source>
+        <translation>etkin</translation>
+    </message>
+    <message>
+        <source>retired</source>
+        <translation>emekli</translation>
+    </message>
+    <message>
+        <source>added %1</source>
+        <translation>eklendi %1</translation>
+    </message>
+    <message>
         <source>Unarchive</source>
         <translation>Arşivden çıkar</translation>
     </message>
@@ -2636,6 +2664,18 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Arşivle</translation>
     </message>
     <message>
+        <source>Conversations</source>
+        <translation>Sohbetler</translation>
+    </message>
+    <message>
+        <source>Instruction</source>
+        <translation>Talimat</translation>
+    </message>
+    <message>
+        <source>Files</source>
+        <translation>Dosyalar</translation>
+    </message>
+    <message>
         <source>CONVERSATIONS</source>
         <translation>KONUŞMALAR</translation>
     </message>
@@ -2678,6 +2718,98 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>No scheduled job for this project.</source>
         <translation>Bu proje için zamanlanmış iş yok.</translation>
+    </message>
+    <message>
+        <source>Order: JARVIS safety rules and Core decisions, then your current message, then this instruction, then retrieved memory. The instruction guides the model; it never grants a permission or approves anything.</source>
+        <translation>Öncelik: JARVIS güvenlik kuralları ve Core kararları, sonra güncel mesajınız, sonra bu talimat, sonra getirilen hafıza. Talimat modele yol gösterir; asla izin vermez ve hiçbir şeyi onaylamaz.</translation>
+    </message>
+    <message>
+        <source>%1 / %2</source>
+        <translation>%1 / %2</translation>
+    </message>
+    <message>
+        <source>Classification:</source>
+        <translation>Sınıflandırma:</translation>
+    </message>
+    <message>
+        <source>Clear</source>
+        <translation>Boşalt</translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Kaydet</translation>
+    </message>
+    <message>
+        <source>Archived project: the instruction is read-only.</source>
+        <translation>Arşivlenmiş proje: talimat salt okunur.</translation>
+    </message>
+    <message>
+        <source>Choose PUBLIC or INTERNAL before saving.</source>
+        <translation>Kaydetmeden önce PUBLIC veya INTERNAL seçin.</translation>
+    </message>
+    <message>
+        <source>Active %1/%2</source>
+        <translation>Etkin %1/%2</translation>
+    </message>
+    <message>
+        <source>Retained %1/%2</source>
+        <translation>Tutulan %1/%2</translation>
+    </message>
+    <message>
+        <source>Characters %1/%2</source>
+        <translation>Karakter %1/%2</translation>
+    </message>
+    <message>
+        <source>Add file…</source>
+        <translation>Dosya ekle…</translation>
+    </message>
+    <message>
+        <source>Archived project: files cannot be added, retired or restored. Purge stays available.</source>
+        <translation>Arşivlenmiş proje: dosya eklenemez, emekliye ayrılamaz veya geri getirilemez. Kalıcı silme açık kalır.</translation>
+    </message>
+    <message>
+        <source>Choose a classification before adding a file. SECRET files are stored but never retrieved.</source>
+        <translation>Dosya eklemeden önce bir sınıflandırma seçin. SECRET dosyalar saklanır ama asla getirilmez.</translation>
+    </message>
+    <message>
+        <source>Retire</source>
+        <translation>Emekliye ayır</translation>
+    </message>
+    <message>
+        <source>Restore</source>
+        <translation>Geri getir</translation>
+    </message>
+    <message>
+        <source>Purge…</source>
+        <translation>Kalıcı sil…</translation>
+    </message>
+    <message>
+        <source>No file in this project yet.</source>
+        <translation>Bu projede henüz dosya yok.</translation>
+    </message>
+    <message>
+        <source>Text and code (%1)</source>
+        <translation>Metin ve kod (%1)</translation>
+    </message>
+    <message>
+        <source>Purge this file permanently?</source>
+        <translation>Bu dosya kalıcı olarak silinsin mi?</translation>
+    </message>
+    <message>
+        <source>Purge deletes this file&apos;s text from the project store for good and frees its quota; a tombstone (id, fingerprint, time) remains. It does NOT reach: copies already sent to a provider, approval previews and audit records that showed excerpts, task results and conversation history, database backups (such as jarvis.pre-v2.db), or leftover data in database free pages, the WAL, the file system or the disk.</source>
+        <translation>Kalıcı silme bu dosyanın metnini proje deposundan geri dönüşsüz siler ve kotasını boşaltır; bir mezar taşı (kimlik, parmak izi, zaman) kalır. ŞUNLARA ULAŞMAZ: bir sağlayıcıya zaten gönderilmiş kopyalar, alıntı gösteren onay önizlemeleri ve denetim kayıtları, görev sonuçları ve sohbet geçmişi, veritabanı yedekleri (jarvis.pre-v2.db gibi) veya veritabanının boş sayfalarında, WAL&apos;da, dosya sisteminde ya da diskte kalan veriler.</translation>
+    </message>
+    <message>
+        <source>Type the file name to confirm: %1</source>
+        <translation>Onaylamak için dosya adını yazın: %1</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Purge</source>
+        <translation>Kalıcı sil</translation>
     </message>
 </context>
 <context>
@@ -3609,6 +3741,30 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>archived</source>
         <translation>arşivlendi</translation>
+    </message>
+    <message>
+        <source>The project is archived: unarchive it to start a new conversation.</source>
+        <translation>Proje arşivlendi: yeni sohbet başlatmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>Wait for the current run to finish.</source>
+        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>+ New conversation</source>
+        <translation>+ Yeni sohbet</translation>
+    </message>
+    <message>
+        <source>PROJECTS</source>
+        <translation>PROJELER</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>All projects</source>
+        <translation>Tüm projeler</translation>
     </message>
     <message>
         <source>Pending</source>

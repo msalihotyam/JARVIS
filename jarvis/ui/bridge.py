@@ -43,6 +43,8 @@ from jarvis.context_items import (
     safe_name,
     same_reference,
 )
+from jarvis import project_files
+from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration
@@ -266,6 +268,14 @@ class Bridge(QObject):
         self._project_jobs: list[dict] = []
         self._project_jobs_bounded = False
         self._project_notice = ""
+        # Gate 6B: the open project's CURRENT stored instruction version ({} =
+        # none), the key of the one the editor last loaded, the last answer to
+        # a save, its file listing and the last answer to a file operation.
+        self._project_instruction: dict[str, Any] = {}
+        self._project_instruction_key: tuple | None = None
+        self._project_instruction_notice = ""
+        self._project_files: list[dict] = []
+        self._project_file_notice = ""
         # The Projects page is window-only: never persisted, so a release that
         # does not know it never reads it (preferences stay rollback-safe).
         self._page_override = ""
@@ -700,6 +710,8 @@ class Bridge(QObject):
 
     def _load_project_detail(self) -> None:
         self._project_conversations, self._project_jobs, self._project_jobs_bounded = [], [], False
+        self._load_project_instruction()
+        self._load_project_files()
         if not self._open_project:
             return
         store = self._conversation_db()
@@ -722,18 +734,9 @@ class Bridge(QObject):
     def showProject(self, project_id: str) -> None:
         """Open a project's detail on the Projects page ("" = the list)."""
         self._open_project = str(project_id)
-        self._project_notice = ""
+        self._project_notice = self._project_instruction_notice = self._project_file_notice = ""
         self.setPage("projects")
         self.refreshProjects()
-
-    @Slot()
-    def showOwner(self) -> None:
-        """The top-bar badge: the open conversation's project, or History."""
-        owner = self._conversation_owner
-        if owner:
-            self.showProject(owner["id"])
-        else:
-            self.setPage("history")
 
     def _project_answer(self, payload: Any) -> None:
         error = payload.get("error") if isinstance(payload, dict) else None
@@ -778,6 +781,182 @@ class Bridge(QObject):
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()), "system")
         self.refreshProjects()
         return True
+
+    # -- Gate 6B: instruction editor, file panel, top-bar project selector ----
+    #
+    # Presentation over the existing explicit-user app paths
+    # (project_instruction_result / project_file_result); the store decides
+    # and its refusals are shown as returned. Nothing here grants, approves
+    # or selects a destination or connector.
+
+    projectInstructionLoaded = Signal()
+
+    @staticmethod
+    def _error_message(payload: Any) -> str:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return str(error.get("message") or "") if isinstance(error, dict) else ""
+
+    def _load_project_instruction(self) -> None:
+        current: dict[str, Any] = {}
+        if self._open_project:
+            payload = self.backend.project_instruction("history", self._open_project)
+            versions = payload.get("versions") if isinstance(payload, dict) else None
+            current = next((dict(v) for v in versions or () if v.get("superseded_by") is None), {})
+        self._project_instruction = current
+        key = (self._open_project, current.get("id"))
+        if key != self._project_instruction_key:
+            # Only a different stored version reloads the editor: a refresh
+            # for any other reason never overwrites what is being typed.
+            self._project_instruction_key = key
+            self.projectInstructionLoaded.emit()
+
+    def _load_project_files(self) -> None:
+        self._project_files = []
+        if not self._open_project:
+            return
+        payload = self.backend.project_file("list", self._open_project)
+        error = self._error_message(payload)
+        if error:
+            self._project_file_notice = error
+            return
+        self._project_files = [dict(row) for row in payload.get("files") or ()]
+
+    @Property(dict, notify=projectsChanged)
+    def projectInstruction(self) -> dict:
+        """The CURRENT stored version: text (possibly an empty clear) and its
+        classification, or {} when the project never had one."""
+        return dict(self._project_instruction)
+
+    @Property(int, constant=True)
+    def projectInstructionCap(self) -> int:
+        return PROJECT_INSTRUCTION_TEXT_CAP
+
+    @Property(str, notify=projectsChanged)
+    def projectInstructionNotice(self) -> str:
+        return self._project_instruction_notice
+
+    @Slot(str, str, str)
+    def saveProjectInstruction(self, project_id: str, text: str, classification: str) -> None:
+        """Save (or, with empty text, clear) through the app path. The editor
+        then shows the STORED text; when the store's hygiene changed it, that
+        is said."""
+        typed = str(text)
+
+        def done(payload: Any) -> None:
+            error = self._error_message(payload)
+            if error:
+                # Refused, nothing written: what was typed stays in the editor.
+                self._project_instruction_notice = error
+            else:
+                stored = (payload.get("instruction") or {}).get("text", "")
+                self._project_instruction_notice = "" if stored == normalize_retrieved_text(typed) else tx(
+                    "Bridge", QT_TRANSLATE_NOOP("Bridge", "Saved. The store redacted credentials or local paths, "
+                                                          "so the stored text shown here differs from what you typed."))
+                self._project_instruction_key = None
+            self.refreshProjects()
+
+        self._run("project-instruction", lambda: self.backend.project_instruction(
+            "set", str(project_id), typed, str(classification) or None), done)
+
+    @Property("QVariantList", notify=projectsChanged)
+    def projectFiles(self) -> list:
+        """The open project's files as the store lists them, oldest first.
+        Purge is the second step of retire -> purge: offered on RETIRED rows;
+        on an archived project (where retire is refused) also on ACTIVE rows,
+        because a privacy deletion is never blocked (ARCHITECTURE 4.24)."""
+        archived = self.openProject.get("active") is False
+        return [{**row, "purgeable": row.get("lifecycle") == project_files.RETIRED
+                 or (archived and row.get("lifecycle") == project_files.ACTIVE)}
+                for row in self._project_files]
+
+    @Property(dict, notify=projectsChanged)
+    def projectFileCounts(self) -> dict:
+        kept = [row for row in self._project_files if row.get("lifecycle") != project_files.PURGED]
+        return {"active": sum(row.get("lifecycle") == project_files.ACTIVE for row in kept),
+                "active_max": project_files.PROJECT_FILE_ACTIVE_MAX,
+                "retained": len(kept), "retained_max": project_files.PROJECT_FILE_RETAINED_MAX,
+                "chars": sum(int(row.get("char_count") or 0) for row in kept),
+                "chars_max": project_files.PROJECT_FILE_RETAINED_CHARS_MAX}
+
+    @Property(str, notify=projectsChanged)
+    def projectFileNotice(self) -> str:
+        return self._project_file_notice
+
+    def _file_answer(self, payload: Any) -> None:
+        self._project_file_notice = self._error_message(payload)
+        self.refreshProjects()
+
+    def _file_action(self, action: str, project_id: str, **options: Any) -> None:
+        self._run("project-file", lambda: self.backend.project_file(action, str(project_id), **options),
+                  self._file_answer)
+
+    @Slot(str, str, str)
+    def addProjectFile(self, project_id: str, url: str, classification: str) -> None:
+        """Add the ONE file the person picked, with the classification they chose."""
+        local = QUrl(str(url)).toLocalFile() if str(url).startswith("file:") else str(url)
+        self._file_action("add", project_id, path=local, classification=str(classification) or None)
+
+    @Slot(str, str)
+    def retireProjectFile(self, project_id: str, file_id: str) -> None:
+        self._file_action("retire", project_id, file_id=str(file_id))
+
+    @Slot(str, str)
+    def restoreProjectFile(self, project_id: str, file_id: str) -> None:
+        self._file_action("restore", project_id, file_id=str(file_id))
+
+    @Slot(str, str, str, result=bool)
+    def purgeProjectFile(self, project_id: str, file_id: str, typed_name: str) -> bool:
+        """Permanent purge of exactly the chosen row. The typed file name is
+        the window's gate (display names are not unique, so the ROW's id is
+        what the store is given as its own confirmation); a mismatch, or a
+        row the panel does not offer purge on, calls nothing."""
+        row = next((r for r in self.projectFiles if r.get("id") == str(file_id)), None)
+        if row is None or not row["purgeable"] or str(typed_name) != row.get("display_name"):
+            return False
+        self._file_action("purge", project_id, file_id=row["id"], confirm=row["id"])
+        return True
+
+    @Slot(result="QVariantList")
+    def projectChoices(self) -> list:
+        """The selector's projects: active ones only, by name."""
+        return [{"id": r["id"], "name": r["name"]} for r in self.backend.project_records() if r.get("active")]
+
+    @Slot(str, result=bool)
+    def openProjectScope(self, project_id: str) -> bool:
+        """The top-bar selector ("" = Global): open that owner's newest
+        non-archived conversation, or create one through the existing paths.
+        Opening a conversation decides nothing: Core binds the session to its
+        conversation's owner (ARCHITECTURE 4.22)."""
+        project_id = str(project_id)
+        if self._busy:
+            return False
+        if project_id and project_id not in {choice["id"] for choice in self.projectChoices()}:
+            return False
+        store = self._conversation_db()
+        if store is None:
+            return False
+        try:
+            records = store.list_conversations(project_id=project_id or None)
+        except Exception:  # noqa: BLE001 - storage boundary: create instead
+            records = []
+        if records:
+            opened = self.openConversation(records[0].id)
+        else:
+            opened = self.newProjectConversation(project_id) if project_id else self.newConversation()
+        if opened:
+            self.setPage("home")
+        return opened
+
+    @Slot(result=bool)
+    def newConversationInScope(self) -> bool:
+        """The "+ New conversation" button: in the open conversation's owner
+        (Global when Global); never in an archived project."""
+        owner = self._conversation_owner
+        if not owner:
+            return self.newConversation()
+        if not owner.get("active"):
+            return False
+        return self.newProjectConversation(owner["id"])
 
     def _session_conversation(self, session_id: str) -> str | None:
         store = self._conversation_db()

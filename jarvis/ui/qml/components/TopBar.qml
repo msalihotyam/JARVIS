@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
+import QtQuick.Controls.Basic
 import "../theme"
 
 // The canonical command header. Left: the identity mark (which is also the
@@ -30,6 +31,21 @@ Item {
     property bool settingsOpen: false
     property bool modelOpen: false
     property Item controlLayer: null
+
+    // One row of the project selector's menu.
+    component ScopeChoice: Rectangle {
+        property string label: ""
+        property bool current: false
+        signal chosen()
+        width: 264; height: 32; radius: 6
+        enabled: !bridge.busy
+        opacity: enabled ? 1 : 0.45
+        color: current ? Theme.alpha(Theme.accent, 0.14) : choiceArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
+        Text { x: 10; width: parent.width - 20; anchors.verticalCenter: parent.verticalCenter; text: parent.label
+               textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.text; font: Theme.body }
+        MouseArea { id: choiceArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: parent.chosen() }
+    }
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
     readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
     readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
@@ -258,41 +274,111 @@ Item {
     Text { objectName: "brandTagline"; x: 122; y: 55; text: qsTr("THINKS AHEAD FOR YOU"); color: Theme.textLabel; font: Theme.hudLabel
            lineHeightMode: Text.FixedHeight; lineHeight: 16 }
 
-    // The open conversation's project, or Global (V2.0 Gate 6A). A label and a
-    // way to that project's page - never a switch: a conversation's owner is
-    // fixed at creation. Context only, never authority.
-    Rectangle {
-        id: projectBadge
-        objectName: "projectBadge"
+    // The project selector and "+ New conversation" (V2.0 Gate 6B, Salih
+    // decision 2026-09-30; supersedes the 6A badge). The selector names the
+    // open conversation's owner (or Global) and opens a menu: active projects,
+    // Global, All projects. Choosing one only OPENS a conversation (its newest
+    // non-archived one, or a new one) - it never changes a conversation's
+    // owner, and it grants, approves or selects nothing: Core binds a session
+    // to its conversation's owner. Mouse first; no shortcut is needed.
+    Item {
+        id: scopeGroup
+        objectName: "projectScope"
         parent: bar.controlLayer || bar
         visible: bridge.page === "home"
         readonly property var owner: bridge.conversationProject || ({})
         readonly property color tone: owner.archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
+        // Both controls stay within the room before the core, whatever the name.
+        readonly property real room: core.x - x - 16
+        readonly property bool compactNew: room < 60 + 8 + newFull.implicitWidth + 24
         x: wordmark.x + wordmark.width + 16
         y: wordmark.y + 4
-        height: 26; radius: 13
-        // Never wider than the room before the core, whatever the name.
-        width: Math.max(60, Math.min(badgeText.implicitWidth + 13 + 24, 280, core.x - x - 16))
-        color: badgeArea.containsMouse ? Theme.alpha(tone, 0.14) : Theme.alpha(tone, 0.07)
-        border.width: 1; border.color: Theme.alpha(tone, 0.55)
-        activeFocusOnTab: true
-        Accessible.role: Accessible.Button; Accessible.name: badgeText.text
-        Keys.onReturnPressed: bridge.showOwner()
-        Keys.onSpacePressed: bridge.showOwner()
-        Row {
-            id: badgeRow
-            x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 7
-            Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: projectBadge.tone }
-            Text {
-                id: badgeText
-                objectName: "projectBadgeText"
-                width: Math.min(implicitWidth, projectBadge.width - 24 - 13)
-                textFormat: Text.PlainText; elide: Text.ElideRight
-                text: (projectBadge.owner.name || "") + (projectBadge.owner.archived ? " · " + qsTr("archived") : "")
-                color: projectBadge.owner.global ? Theme.textLabel : Theme.text; font: Theme.caption
+        height: 26
+        width: projectSelector.width + 8 + newChatButton.width
+
+        Rectangle {
+            id: projectSelector
+            objectName: "projectSelector"
+            height: 26; radius: 13
+            width: Math.max(60, Math.min(selectorText.implicitWidth + 13 + 24 + 16, 280,
+                                         scopeGroup.room - 8 - newChatButton.width))
+            color: selectorArea.containsMouse || selectorMenu.visible ? Theme.alpha(scopeGroup.tone, 0.14) : Theme.alpha(scopeGroup.tone, 0.07)
+            border.width: 1; border.color: Theme.alpha(scopeGroup.tone, 0.55)
+            Accessible.role: Accessible.ButtonMenu; Accessible.name: selectorText.text
+            Row {
+                x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 7
+                Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: scopeGroup.tone }
+                Text {
+                    id: selectorText
+                    objectName: "projectSelectorText"
+                    width: Math.min(implicitWidth, projectSelector.width - 24 - 13 - 16)
+                    textFormat: Text.PlainText; elide: Text.ElideRight
+                    text: (scopeGroup.owner.name || "") + (scopeGroup.owner.archived ? " · " + qsTr("archived") : "")
+                    color: scopeGroup.owner.global ? Theme.textLabel : Theme.text; font: Theme.caption
+                }
+            }
+            Text { anchors { right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                   text: "▾"; color: Theme.textLabel; font: Theme.caption }
+            MouseArea { id: selectorArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        onClicked: selectorMenu.visible ? selectorMenu.close() : selectorMenu.open() }
+        }
+
+        Rectangle {
+            id: newChatButton
+            objectName: "newConversationButton"
+            // Disabled with its reason while the open conversation's project
+            // is archived (the store refuses a new conversation there anyway).
+            readonly property bool allowed: !bridge.conversationReadOnly && !bridge.busy
+            readonly property string reason: bridge.conversationReadOnly
+                ? qsTr("The project is archived: unarchive it to start a new conversation.")
+                : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+            x: projectSelector.width + 8
+            height: 26; radius: 13
+            width: (scopeGroup.compactNew ? newPlus.implicitWidth : newFull.implicitWidth) + 24
+            opacity: allowed ? 1 : 0.45
+            color: newArea.containsMouse && allowed ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+            border.width: 1; border.color: Theme.borderStrong
+            Accessible.role: Accessible.Button; Accessible.name: newFull.text; Accessible.description: reason
+            Text { id: newFull; visible: !scopeGroup.compactNew; anchors.centerIn: parent; text: qsTr("+ New conversation")
+                   color: Theme.text; font: Theme.caption }
+            Text { id: newPlus; visible: scopeGroup.compactNew; anchors.centerIn: parent; text: "+"; color: Theme.text; font: Theme.captionStrong }
+            MouseArea { id: newArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        onClicked: if (newChatButton.allowed) bridge.newConversationInScope() }
+            Rectangle {
+                objectName: "newConversationTip"
+                visible: newArea.containsMouse && (newChatButton.reason !== "" || scopeGroup.compactNew)
+                anchors.top: parent.bottom; anchors.topMargin: 8; x: 0
+                width: tip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised
+                border.width: 1; border.color: Theme.borderStrong; z: 50
+                Text { id: tip; anchors.centerIn: parent; color: Theme.text; font: Theme.caption
+                       text: newChatButton.reason || newFull.text }
             }
         }
-        MouseArea { id: badgeArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bridge.showOwner() }
+
+        Popup {
+            id: selectorMenu
+            objectName: "projectSelectorMenu"
+            property var choices: []
+            y: projectSelector.height + 8; x: 0
+            width: 280; padding: 8
+            onAboutToShow: choices = bridge.projectChoices()
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
+                WheelHandler { } }
+            contentItem: Column {
+                spacing: 2
+                Text { text: qsTr("PROJECTS"); color: Theme.textMuted; font: Theme.label; leftPadding: 10 }
+                Repeater {
+                    model: selectorMenu.choices
+                    delegate: ScopeChoice { objectName: "projectSelectorItem"; label: modelData.name
+                                       current: modelData.id === scopeGroup.owner.id
+                                       onChosen: { selectorMenu.close(); bridge.openProjectScope(modelData.id) } }
+                }
+                ScopeChoice { objectName: "projectSelectorGlobal"; label: qsTr("Global"); current: !!scopeGroup.owner.global
+                         onChosen: { selectorMenu.close(); bridge.openProjectScope("") } }
+                Rectangle { width: 264; height: 1; color: Theme.border }
+                ScopeChoice { objectName: "projectSelectorAll"; label: qsTr("All projects"); onChosen: { selectorMenu.close(); bridge.showProject("") } }
+            }
+        }
     }
 
     LeftContextCard {

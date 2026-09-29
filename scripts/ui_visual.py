@@ -27,7 +27,8 @@ def main() -> int:
     parser.add_argument("--page", choices=("home", "tasks", "automations", "memory", "history", "projects"), default="home")
     parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
-                                            "projects", "project", "badge", "archived"), default="home")
+                                            "projects", "project", "badge", "archived",
+                                            "instruction", "files", "purge", "selector"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -38,7 +39,7 @@ def main() -> int:
     os.environ["JARVIS_UI_DEV_FIXTURE"] = "1" if args.fixture else "0"
     os.environ["JARVIS_UI_DEV_REFERENCE"] = args.reference
 
-    from PySide6.QtCore import QTimer, QMetaObject, Q_ARG, qInstallMessageHandler
+    from PySide6.QtCore import QObject, QTimer, QMetaObject, Q_ARG, qInstallMessageHandler
     from PySide6.QtGui import QShortcut, QKeySequence
     from tests.test_ui import UiTestCase, _APP
 
@@ -71,7 +72,7 @@ def main() -> int:
         bridge.setEditMode(True)
     elif args.scene == "focus":
         bridge.setFocusMode(True)
-    elif args.scene in ("projects", "project", "badge", "archived"):
+    elif args.scene in ("projects", "project", "badge", "archived", "instruction", "files", "purge", "selector"):
         # V2.0 Gate 6A: sample projects in the ISOLATED store only (fixture copy,
         # nobody's data): two active, one archived, each with conversations.
         if not args.fixture:
@@ -86,7 +87,33 @@ def main() -> int:
             for record, title in zip(seeded[name][1], titles):
                 store.set_conversation_title(record.id, title)
         store.set_project_active(seeded["Thesis 2025"][0].id, False)
-        if args.scene == "projects":
+        home = seeded["Home renovation"][0]
+        if args.scene in ("instruction", "files", "purge"):
+            # Gate 6B: a stored instruction and three files (one retired),
+            # written through the same explicit-user paths, fixture store only.
+            store.save_explicit_user_project_instruction(
+                home.id, "Answer in Turkish. Keep estimates in TRY and say which quote they come from.", "internal")
+            for name, text, classification in (("kitchen-quotes.md", "Quote A: 42,000 TRY\n" * 40, "internal"),
+                                               ("floor-plan-notes.txt", "Living room 24 m2\n" * 60, "public"),
+                                               ("old-budget.csv", "item,cost\ntiles,9000\n" * 30, "sensitive")):
+                path = case.root / "fixture-files" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                bridge.backend.project_file("add", home.id, path=str(path), classification=classification)
+            retired = store.list_project_files(home.id)[-1]
+            bridge.backend.project_file("retire", home.id, file_id=retired["id"])
+            bridge.showProject(home.id)
+            page = window.findChild(QObject, "projectsPage")
+            page.setProperty("section", "instruction" if args.scene == "instruction" else "files")
+            if args.scene == "purge":
+                row = next(r for r in bridge.projectFiles if r["id"] == retired["id"])
+                QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(
+                    window.findChild(QObject, "purgeDialog"), "openFor", Q_ARG("QVariant", row)))
+        elif args.scene == "selector":
+            bridge.openConversation(seeded["JARVIS development"][1][0].id)
+            bridge.setPage("home")
+            QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "projectSelectorMenu"), "open"))
+        elif args.scene == "projects":
             bridge.setPage("projects")
             bridge.refreshProjects()
         elif args.scene == "project":

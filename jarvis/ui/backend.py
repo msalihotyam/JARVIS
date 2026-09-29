@@ -36,6 +36,8 @@ from jarvis.app import (
     job_list_result,
     memory_list_result,
     project_create_result,
+    project_file_result,
+    project_instruction_result,
     project_lifecycle_result,
     sessions_result,
     show_result,
@@ -428,6 +430,19 @@ class Backend:
         """rename / archive / unarchive through the existing app path."""
         return self._call(f"project-{action}", lambda s: project_lifecycle_result(
             self._memory(s), s, action, project_id, name
+        ))
+
+    def project_instruction(self, action: str, project_id: str, text: str | None = None,
+                            classification: str | None = None) -> dict:
+        """set / show / history through the existing explicit-user app path."""
+        return self._call(f"project-instruction-{action}", lambda s: project_instruction_result(
+            self._memory(s), s, action, project_id, text, classification
+        ))
+
+    def project_file(self, action: str, project_id: str, **options: Any) -> dict:
+        """add / list / retire / restore / purge through the existing app path."""
+        return self._call(f"project-file-{action}", lambda s: project_file_result(
+            self._memory(s), s, action, project_id, **options
         ))
 
     def memory_list(self, project_id: str, include_inactive: bool = False) -> dict:

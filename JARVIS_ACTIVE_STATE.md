@@ -5,83 +5,67 @@ file"; freshness: "Session bootstrap"). History lives in git.
 
 ## PROJECT STATE
 
-Active milestone: V2.0 Projects (first structural V2 layer; dogfood-capable,
-not the official V2 daily-driver gate — that is V2.1 Projects + Advanced
-Memory). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+),
-section "V2.0 — Projects".
+Active milestone: V2.0 Projects (dogfood-capable; the official V2
+daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
+"V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
-Active gate: Projects Gate 6B (top-bar project selector + "+ Yeni sohbet",
-instruction editor, file panel, purge UI; mouse-first, no shortcut-dependent
-feature). NOT STARTED.
+Active gate: Projects Gate 6C "Projeye bağla". NOT STARTED.
 
-Status: Gates 1–5 and 6A complete on main; nothing in flight. §4.22
-conversations/lifecycle/archive, §4.23 instructions (R1), §4.24 files (purge
-residue), §4.25 window: Projects page (Ctrl+6, window-only), lifecycle via
-app paths, detail + jobs ("first N"), owner badge, read-only archived view,
-approval card shows instruction + excerpts complete as plain text. F1/F2
-(Codex review): Core binds a conversation-linked session only to its
-owner; the app refuses an archived conversation. Base commit: `fix(core):
-bind conversation-linked sessions only to their conversation's owner`.
-Installed release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
+Status: Gates 1–5, 6A, 6B complete on main; nothing in flight. 6B (§4.25):
+top-bar project selector + "+ Yeni sohbet" (replaced the 6A badge), instruction
+editor, file panel with counters and typed-name purge. Base commit:
+`feat(projects): add instruction editor, file panel and project selector to
+the window`. Installed release: `1.0.0-1c68161` (Chrome); previous
+`1.0.0-4f5a93d`.
 
 ## Roles
 
-- Orchestrator: Claude (linked Cowork session, repo access); reviewer:
-  ChatGPT (one-pass); final decisions: Salih. Salih decision (2026-09-29);
-  trial concluded 2026-09-29. Protocol: RUNBOOK "Governance and prompt review".
+- Orchestrator: Claude; reviewer: ChatGPT (one-pass); final decisions: Salih
+  (2026-09-29). Protocol: RUNBOOK "Governance and prompt review".
 
 ## Open blockers: none.
 
 ## Do not reopen
 
-- V2 M1 Edge → Chrome migration complete (trusted Chrome, chrome-profile,
-  WebRTC switch, per-tab boundary, MediaRouter off, packaged + rollback).
-- Projects Gate 0: reuse `projects`; Global = `project_id` NULL (no synthetic
-  project); opaque ids; owner fixed (no move in V2.0, except the narrow Gate 6C "Projeye bağla":
-Global → project, one-way, preview + confirm; Salih 2026-09-29); scope is context, never
+- V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).
+- Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner fixed
+  (no move in V2.0, except the narrow 6C "Projeye bağla": Global → project,
+  one-way, preview + confirm; Salih 2026-09-29); scope is context, never
   authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
   targets (additive tables only, no ALTER).
-- Gates 1–3 (§4.22): conversation store, live-DB test guard, bridge cutover,
-  lifecycle, owner scope, archive (Salih 2026-09-29); no Global-conversation jobs.
-- Gate 4 (orchestrator, 2026-09-29; §4.23): instructions are model guidance,
-  never authority; precedence safety/Core > current message > instruction >
-  retrieved memory; R1: attested outbound content, E = authority-only.
-- Gate 5 (§4.24): files are untrusted data; remove = retire + explicit purge
-  (Salih, 2026-09-29), allowed on archived projects.
-- Gate 6 UX (Salih, 2026-09-29): Projects on Ctrl+6 (Settings stays on orb
-  / palette), History keeps Global, badge never switches, no recents
-  grouping; 6B: instruction/file UI, purge confirmed by typing the name.
+- Gates 1–3 (§4.22) incl. archive; no Global-conversation jobs.
+- Gate 4 (§4.23): instructions are guidance, never authority; precedence
+  safety/Core > current message > instruction > retrieved memory; R1.
+- Gate 5 (§4.24): files are untrusted data; retire + explicit purge, purge
+  allowed on archived projects.
+- Gate 6 UX (Salih 2026-09-29/30): Projects on Ctrl+6, History keeps Global,
+  no recents grouping; mouse-first, no shortcut-dependent feature; selector
+  lists active projects only; purge confirmed by typing the row's name.
 
 ## Uncommitted / external decisions
 
-- Remaining V2.0 order (Salih, 2026-09-30): 6B (Opus 5.5 high) → 6C (Opus 5.5
-  xhigh; "Projeye bağla", guard for conversations that used V2.1 "all projects
-  memory") → Gate 7 (E2E + packaged dogfood + rollback, incl. archive/unarchive
-  E2E). Salih decides purge-residue privacy before Gate 7. No release before
-  Gate 6 UX is complete.
-- V2.1 (Salih, 2026-09-29): Global-conversation "all projects memory" toggle —
-  memory only (no instructions/files), read-only, per-conversation, default
-  off, provenance labels. Also: PreCompact capture, full archive retrieval,
-  context-usage indicator, "Hatırla" button.
-- Codex review queue (Salih runs on Windows, standard Codex model, one commit
-  per session): session1 remainder (instruction channel, grant fix, schema-10),
-  Gate 5, 6A, fix commits. Known findings: F1+F2 fixed in `74adbd0`, F3 by
-  design (§4.22), F4 fixed in 6A.
-- Backlog: known full-suite timing flake
+- Remaining V2.0: 6C (Opus 5.5 xhigh; guard for conversations that used V2.1
+  "all projects memory") → Gate 7 (E2E + packaged dogfood + rollback, incl.
+  archive/unarchive E2E). Salih decides purge-residue privacy before Gate 7.
+  No release before Gate 6 UX is complete.
+- V2.1 (Salih 2026-09-29): "all projects memory" toggle (memory only,
+  read-only, per-conversation, default off, provenance); PreCompact capture,
+  full archive retrieval, context-usage indicator, "Hatırla" button.
+- Codex review queue (Salih, Windows, standard model, one commit per session):
+  session1 remainder (instruction channel, grant fix, schema-10), Gate 5, 6A,
+  6B, fix commits. F1+F2 fixed in `74adbd0`, F3 by design (§4.22), F4 fixed in 6A.
+- Backlog: full-suite timing flake
   `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`
-  (animation frame timing under load; passes alone) - fix later.
-- Backlog: a project-filtered jobs query (today's listing is the oldest 20).
-- Catalog test skips on a system Python (`linguist_tool` looks only next to
-  python.exe; tools are on PATH). Gate 4B Edge retirement deferred.
-- External: the installed app's Claude CLI OAuth session was expired at the
-  last packaged smoke (2026-09-26); the user must re-login.
+  (passes alone); project-filtered jobs query (listing is the oldest 20);
+  catalog test skips on a system Python (Linguist tools on PATH, not next to
+  python.exe); Gate 4B Edge retirement deferred.
+- External: installed app's Claude CLI OAuth expired (2026-09-26); re-login.
 - Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
 
 ## Next action
 
-- Projects Gate 6B (Opus 5.5 high): project selector + "+ Yeni sohbet",
-  instruction editor, file panel and purge UI over the existing app paths; no
-  new authority.
+- Projects Gate 6C design (Opus 5.5 xhigh): "Projeye bağla" over the existing
+  store paths; no new authority.
 
 ## Rollback / safety anchors
 

@@ -7,7 +7,8 @@ B. List: active + archived sections; create / rename / archive / unarchive
    through the app paths; Core refusals shown as returned; names, never ids.
 C. Detail: only the project's conversations; new conversation with that
    owner; no move control; archived / unknown owner refused by the store.
-D. Badge: name or Global, and where a click goes; no overlap in the top bar.
+D. Selector (the 6A badge, Gate 6B): name or Global, opens its menu; no
+   overlap in the top bar.
 E. Archived: banner + disabled composer + jobs (bounded label honest); a
    forced submit is still refused by Core.
 F. Memory page shows names.
@@ -159,24 +160,25 @@ class DetailTests(ProjectsUiCase):
 
 
 class BadgeTests(ProjectsUiCase):
-    def test_d_badge_names_the_owner_and_routes(self) -> None:
+    # Gate 6B (Salih decision 2026-09-30): the 6A badge became the project
+    # selector in the same slot; it names the owner and opens a menu (the
+    # selector itself is covered in tests/test_projects_ui_6b.py).
+    def test_d_selector_names_the_owner_and_opens_its_menu(self) -> None:
         store = self.db()
         project = store.create_project("Evim")
         owned = store.create_conversation(project.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual("Global", self.item(root, "projectBadgeText").property("text"))
+        self.assertEqual("Global", self.item(root, "projectSelectorText").property("text"))
         bridge.openConversation(owned.id); pump(300)
-        self.assertEqual("Evim", self.item(root, "projectBadgeText").property("text"))
-        self.click(root, "projectBadge"); pump(300)
-        self.assertEqual(("projects", project.id), (bridge.page, bridge.openProject["id"]))
-        bridge.setPage("home"); pump(300)
+        self.assertEqual("Evim", self.item(root, "projectSelectorText").property("text"))
+        self.click(root, "projectSelector"); pump(300)
+        self.assertTrue(self.item(root, "projectSelectorAll").isVisible())
+        self.assertEqual("home", bridge.page)
         bridge.newConversation(); pump(300)
-        self.assertEqual("Global", self.item(root, "projectBadgeText").property("text"))
-        self.click(root, "projectBadge"); pump(300)
-        self.assertEqual("history", bridge.page)
+        self.assertEqual("Global", self.item(root, "projectSelectorText").property("text"))
 
-    def test_d_badge_never_overlaps_the_top_bar(self) -> None:
+    def test_d_selector_never_overlaps_the_top_bar(self) -> None:
         store = self.db()
         project = store.create_project("A rather long project name that has to elide somewhere")
         owned = store.create_conversation(project.id)
@@ -190,8 +192,8 @@ class BadgeTests(ProjectsUiCase):
             for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
                 with self.subTest(theme=theme, size=(width, height)):
                     root.resize(width, height); pump(500)
-                    badge = self.rect(self.item(root, "projectBadge"))
-                    self.assertTrue(self.item(root, "projectBadge").isVisible())
+                    badge = self.rect(self.item(root, "projectSelector"))
+                    self.assertTrue(self.item(root, "projectSelector").isVisible())
                     for name in others:
                         for other in self.all_items(root, name):
                             if other.isVisible() and other.width() > 0:
@@ -224,7 +226,7 @@ class ArchivedTests(ProjectsUiCase):
         self.assertTrue(self.item(root, "readOnlyBanner").isVisible())
         self.assertIn("Tez", self.item(root, "readOnlyReason").property("text"))
         self.assertFalse(self.item(root, "composerInput").isEnabled())
-        self.assertEqual("Tez · archived", self.item(root, "projectBadgeText").property("text"))
+        self.assertEqual("Tez · archived", self.item(root, "projectSelectorText").property("text"))
         # A submit forced through the bridge still meets Core's refusal.
         bridge.submitText("zorla gönder"); pump(200)
         self.assertEqual([], self.model.calls)
