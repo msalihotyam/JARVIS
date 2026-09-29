@@ -40,6 +40,7 @@ from jarvis.app import (
     project_create_result,
     project_lifecycle_result,
     project_instruction_result,
+    project_file_result,
     sessions_result,
     show_result,
     status_payload,
@@ -363,6 +364,29 @@ def _build_parser() -> _ArgumentParser:
     )
     for action in ("show", "history"):
         instruction_actions.add_parser(action).add_argument("--id", required=True, dest="project_id")
+    # Gate 5: explicit-user project files (untrusted data, never authority).
+    file_actions = project_actions.add_parser(
+        "file", help="The project's text files (untrusted reference data)."
+    ).add_subparsers(dest="file_action")
+    file_add = file_actions.add_parser("add", help="Add one text file you choose.")
+    file_add.add_argument("--id", required=True, dest="project_id")
+    file_add.add_argument("--path", required=True)
+    file_add.add_argument(
+        "--classification",
+        required=True,
+        choices=[classification.value for classification in DataClassification],
+    )
+    file_list = file_actions.add_parser("list")
+    file_list.add_argument("--id", required=True, dest="project_id")
+    file_list.add_argument("--all", dest="include_purged", action="store_true",
+                           help="Include purged tombstones.")
+    for action in ("retire", "restore", "purge"):
+        file_parser = file_actions.add_parser(action)
+        file_parser.add_argument("--id", required=True, dest="project_id")
+        file_parser.add_argument("--file", required=True, dest="file_id")
+        if action == "purge":
+            file_parser.add_argument("--confirm", required=True,
+                                help="Permanent: repeat the file id to confirm.")
 
     memory_command = commands.add_parser(
         "memory", help="Explicit project-scoped memory (untrusted reference data)."
@@ -475,6 +499,14 @@ def _dispatch_memory_command(
                 memory, settings, args.project_id, args.name
             )
         action = getattr(args, "project_action", None)
+        if action == "file" and getattr(args, "file_action", None):
+            return project_file_result(
+                memory, settings, args.file_action, args.project_id,
+                path=getattr(args, "path", None), file_id=getattr(args, "file_id", None),
+                classification=getattr(args, "classification", None),
+                confirm=getattr(args, "confirm", None),
+                include_purged=getattr(args, "include_purged", False),
+            )
         if action == "instruction" and getattr(args, "instruction_action", None):
             return project_instruction_result(
                 memory, settings, args.instruction_action, args.project_id,
@@ -488,8 +520,8 @@ def _dispatch_memory_command(
             "project",
             settings.permission_mode,
             ErrorCode.INVALID_TASK,
-            "'project' requires a sub-command: create, rename, archive, unarchive "
-            "or instruction set|show|history.",
+            "'project' requires a sub-command: create, rename, archive, unarchive, "
+            "instruction set|show|history or file add|list|retire|restore|purge.",
             EXIT_INVALID_INPUT,
         )
     if getattr(args, "memory_action", None) == "add":

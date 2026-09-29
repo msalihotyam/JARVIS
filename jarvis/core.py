@@ -12,6 +12,11 @@ from typing import AbstractSet, Any, Callable
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
     project_instruction_delivery,
+    PROJECT_FILE_NOTICE,
+    normalize_retrieved_text,
+    redact_credentials,
+    redact_local_paths,
+    truncate_retrieved_text,
     CANONICAL_TARGET_CAPABILITIES,
     CHAIN_ENABLED_WRITE_MODES,
     CHAIN_NO_PREDECESSOR,
@@ -168,6 +173,7 @@ from jarvis.progress import (
     set_issue,
     set_waiting_issue,
 )
+from jarvis import project_files
 from jarvis.registry import (
     AmbiguousConnectorError,
     ConnectorNotFoundError,
@@ -927,6 +933,9 @@ class AgentCore:
         # task snapshot or input (the field is not persisted). It is attested
         # outbound content like any other byte; it is never authority.
         self._deliver_project_instruction(session, task)
+        # Gate 5: the project-files block is likewise rebuilt from the store
+        # (re-proving the persisted references) on every advance.
+        self._deliver_project_files(session, task)
         # Memory V2 correction: a task resumed from persisted state carries a
         # retrieved-memory SNAPSHOT, which is untrusted data. Before any
         # consumer (plan step, connector payload, later stage logic) sees it,
@@ -1129,6 +1138,14 @@ class AgentCore:
                         exc,
                     )
                 task.retrieved_context = retrieved
+                # Gate 5: project-file excerpts, a SEPARATE bounded channel
+                # (<= 3 excerpts / 4,000 chars) that never touches the memory
+                # quota. Only the chunk identities are persisted.
+                file_refs, ineligible = self._retrieve_project_files(
+                    session, task, query.query_text
+                )
+                task.project_file_refs = file_refs
+                self._deliver_project_files(session, task, ineligible=ineligible)
                 # Compatibility count: selected outbound-eligible items only.
                 task.context["retrieved_decision_count"] = len(retrieved.items)
                 mark_stage_completed(task, LoopStage.CONTEXT_RETRIEVAL)
@@ -1461,6 +1478,11 @@ class AgentCore:
                 # boundary is recomputed here and must be backed by a consumed
                 # grant (or be policy-exempt); otherwise the task goes back to
                 # the gate it lacks and a fresh approval is required.
+                # Gate 5: re-prove the project-file excerpts NOW. An excerpt
+                # invalidated since approval changes the attested bytes, so
+                # the gate below sends the task back to approval rather than
+                # ever sending a different block.
+                self._deliver_project_files(session, task)
                 open_stage, current = self._unsatisfied_gate(
                     session, task, connector, projected
                 )
@@ -4909,6 +4931,92 @@ class AgentCore:
         task.project_instruction, task.project_instruction_status = project_instruction_delivery(
             instruction, task.scope.data_classification
         )
+
+    def _retrieve_project_files(
+        self, session: SessionState, task: Task, query_text: str
+    ) -> tuple[tuple, int]:
+        """The deterministic excerpt selection for a P-bound task; Global gets
+        nothing. A storage fault selects nothing (fail closed)."""
+        if session.project_id is None:
+            return (), 0
+        try:
+            return self.memory.retrieve_project_file_refs(
+                session.project_id, query_text, task.scope.data_classification
+            )
+        except Exception:  # noqa: BLE001 - storage boundary; select nothing
+            return (), 0
+
+    def _deliver_project_files(
+        self, session: SessionState, task: Task, *, ineligible: int = 0
+    ) -> None:
+        """Re-prove every persisted reference against the store and render
+        ONE canonical block from STORE data only (never snapshot text):
+        file ACTIVE, same file sha256, same chunk text hash, classification
+        still eligible. Failures are dropped; what was dropped and why is
+        LOCAL metadata only (``task.project_file_status``)."""
+        task.project_files_block = None
+        status: list[str] = [f"ineligible: {ineligible}"] if ineligible else []
+        excerpts: list[dict[str, Any]] = []
+        used = 0
+        for ref in task.project_file_refs:
+            reason = ""
+            row = None
+            if session.project_id is None:
+                reason = "not project-scoped"
+            else:
+                try:
+                    row = self.memory.load_project_file_chunk(
+                        session.project_id, ref.file_id, ref.chunk_index
+                    )
+                except Exception:  # noqa: BLE001 - storage boundary; drop
+                    row = None
+                if row is None:
+                    reason = "missing"
+                elif row["lifecycle"] != project_files.ACTIVE:
+                    reason = "not active"
+                elif row["sha256"] != ref.file_sha256:
+                    reason = "file changed"
+                elif (
+                    row["text_sha256"] != ref.text_sha256
+                    or project_files.text_digest(row["text"]) != ref.text_sha256
+                ):
+                    reason = "text changed"
+                else:
+                    try:
+                        eligible = retrieval_eligible(
+                            task.scope.data_classification,
+                            DataClassification(row["classification"]),
+                        )
+                    except (TypeError, ValueError):
+                        eligible = False
+                    if not eligible:
+                        reason = "ineligible"
+            if not reason and len(excerpts) >= project_files.PROJECT_FILE_EXCERPT_MAX_ITEMS:
+                reason = "budget"
+            remaining = project_files.PROJECT_FILE_EXCERPT_MAX_CHARS - used
+            if not reason and remaining <= 0:
+                reason = "budget"
+            if reason:
+                status.append(f"dropped {ref.file_id}#{ref.chunk_index}: {reason}")
+                continue
+            text = normalize_retrieved_text(row["text"])
+            text, _ = redact_credentials(text)
+            text = redact_local_paths(text)
+            text, _ = truncate_retrieved_text(text, remaining)
+            used += len(text)
+            excerpts.append(
+                {
+                    "file_id": row["id"],
+                    "name": row["display_name"],
+                    "sha256": row["sha256"],
+                    "chunk_index": row["chunk_index"],
+                    "classification": row["classification"],
+                    "text": text,
+                }
+            )
+        if excerpts:
+            task.project_files_block = {"notice": PROJECT_FILE_NOTICE, "excerpts": excerpts}
+        task.project_file_status = tuple(status)
 
     def _inactive_project_refusal(
         self, session: SessionState, task: Task | None, project_id: str | None = None

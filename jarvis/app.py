@@ -36,6 +36,7 @@ from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
 )
+from jarvis import project_files
 from jarvis.contracts import (
     PROJECT_INSTRUCTION_KEY,
     project_instruction_block,
@@ -1635,6 +1636,54 @@ def project_instruction_result(
                 EXIT_OK,
             )
         raise ValueError(f"Unknown instruction action: {action}")
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+
+
+def project_file_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    action: str,
+    project_id: str,
+    *,
+    path: str | None = None,
+    file_id: str | None = None,
+    classification: str | None = None,
+    confirm: str | None = None,
+    include_purged: bool = False,
+) -> CommandResult:
+    """``add`` / ``list`` / ``retire`` / ``restore`` / ``purge`` one project
+    file (Gate 5). ``add`` is THE audited production caller of the store's
+    explicit-user file boundary: the path and classification are the
+    person's own CLI/app input. ``purge`` is permanent and needs ``confirm``
+    equal to the file id; the store verifies it before any mutation."""
+    command = f"project-file-{action}"
+    try:
+        if action == "add":
+            content = project_files.read_project_file(path)
+            stored = memory.save_explicit_user_project_file(project_id, content, classification)
+            return CommandResult({"command": command, "file": stored}, EXIT_OK)
+        if action == "list":
+            validate_project_id(project_id)
+            if memory.load_project(project_id) is None:
+                raise ValueError(f"Unknown project: {project_id}")
+            files = memory.list_project_files(project_id, include_purged=include_purged)
+            return CommandResult(
+                {"command": command, "project_id": project_id, "files": files}, EXIT_OK
+            )
+        if action in ("retire", "restore"):
+            stored = memory.set_project_file_active(project_id, file_id, action == "restore")
+            return CommandResult({"command": command, "file": stored}, EXIT_OK)
+        if action == "purge":
+            stored = memory.purge_project_file(project_id, file_id, confirm=confirm)
+            return CommandResult({"command": command, "file": stored}, EXIT_OK)
+        raise ValueError(f"Unknown project file action: {action}")
     except ValueError as exc:
         return failure_result(
             command,

@@ -3264,3 +3264,79 @@ açık bir kanaldır.
   önizlemesi (`OutboundDataPreview.project_instruction`, boşken sözlükte hiç
   yer almaz) onaylanan talimat bloğunu gösterir. Onaydan sonra değişen talimat
   yürütme anı tasdik kontrolünde kapalı başarısız olur.
+
+### 4.24 Proje dosyaları temeli (V2 Projects Gate 5, uygulandı)
+
+Bir proje, açık kullanıcı tarafından eklenen metin dosyaları tutabilir.
+İçerikleri güvenilmez VERİDİR: Core görev model çağrılarına seçici ve
+provenance ile girer; asla topluca yüklenmez, asla talimat, asla yetki
+değildir (yol haritası V2.0).
+
+- **Yazım (yalnız açık kullanıcı):** `jarvis project file
+  add|list|retire|restore|purge` ve aynı Core/app API'si
+  (`save_explicit_user_project_file`'ın tek üretim çağıranı
+  `project_file_result`). Model çıktısı, connector'lar, niyet sonuçları,
+  getirilen hafıza ve dosya içeriği dosya ekleyemez, değiştiremez, geri
+  getiremez veya purge edemez. Okuma `context_items.attach_file` kurallarını
+  izler (yalnız sıradan okunabilir dosya; klasör/aygıt/boru reddedilir).
+  Yalnız metin (`TEXT_MEDIA_TYPES`; `UNSUPPORTED_SUFFIXES` reddedilir), en çok
+  5 MB, geçerli UTF-8, satır sonu normalleştirmesinden sonra en çok 200.000
+  karakter; aşan reddedilir, kırpılmaz. Proje başına en çok 20 AKTİF dosya;
+  purge edilmemiş tüm dosyalar (AKTİF + EMEKLİ) en çok 40 dosya ve toplam
+  2.000.000 karakter; yer yalnız purge ile açılır, bu yüzden ekle -> emekli
+  -> ekle döngüsü kotayı aşamaz. Sınıflandırma eklemede zorunludur; SECRET
+  saklanabilir ama asla getirilmez. Yalnız görünen ad (`safe_name`) saklanır,
+  tam yol asla; özgün baytlar saklanmaz (yalnız sha256 ve 2.000 karakterlik
+  normalleştirilmiş metin parçaları). Proje başına aynı sha256'dan en çok bir
+  AKTİF dosya (ekleme ve geri getirmede). Her ret hiçbir şey yazmaz.
+- **Depo:** yeni ek uyumluluk tabloları `project_files` (+ kısmi tekil
+  `idx_project_files_active_sha`) ve `project_file_chunks`; şema 10'da kalır,
+  şema-10 tabloları ALTER edilmez.
+- **Yaşam döngüsü:** retire (geri alınabilir; içerik ve kota kalır), restore
+  (aktif sınırı ve AKTİF-sha tekilliği altında), purge (Salih kararı
+  2026-09-29: kaldırma = geri alınabilir retire + ayrı, açık, kalıcı purge).
+  Purge kanonik proje-dosyası deposunda geri alınamaz: aynı metadata satırı
+  mezar taşı olur (PURGED; opak id, proje, sha256, purged_at kalır; ad,
+  boyutlar ve sınıflandırma NULL), tüm parçalar silinir; hepsi TEK işlemde,
+  herhangi bir hata tamamını geri alır. API, silinen dosya kimliğine eşit bir
+  onay argümanını her mutasyondan önce ister. `secure_delete` en iyi çaba
+  olarak açılır ve bağlantının önceki ayarı başarıda da hatada da geri
+  yüklenir; WAL, dosya sistemi veya SSD'den fiziksel silme iddia edilmez.
+  Arşivlenmiş projede add/retire/restore reddedilir; purge her zaman
+  serbesttir (gizlilik silmesi asla engellenmez); list çalışır.
+- **Getirme (yalnız Core görev yolu; niyet yoluna dosya adı veya alıntı asla
+  girmez):** P'ye bağlı oturumda CONTEXT_RETRIEVAL'da `retrieval_tokens` ile
+  deterministik anahtar kelime puanı, P'nin görevin sınıfı için uygun AKTİF
+  parçaları üzerinde; en çok 3 alıntı / 4.000 karakter, hafızanın 5 öğe /
+  4.000 karakter kotasından AYRI; puan 0 hiçbir şey; sabit eşitlik sırası.
+  Global ve diğer projeler hiçbir şey almaz. Görevde yalnız parça kimlikleri
+  (`ProjectFileRef`: dosya id, dosya sha256, parça sırası, metin sha256)
+  kalıcıdır, metin asla.
+- **Tek kanonik blok:** AgentCore her ilerlemede ve yürütme kapısından hemen
+  önce kimlikleri depoya karşı yeniden kanıtlar (dosya AKTİF, aynı sha256,
+  aynı parça metin özeti, sınıf hâlâ uygun; başarısız olan düşer), metni
+  YALNIZ depodan normalleştirir/sınırlar/redakte eder ve provenance'lı tek
+  bloğu kurar. O blok kendi anahtarı `project_files` altında, sabit
+  `PROJECT_FILE_NOTICE` ile (`LOCAL_READ_NOTICE` modeli) connector'a olduğu
+  gibi gider; tasdik edilir, onay önizlemesinde
+  (`OutboundDataPreview.project_files`, `render_project_files_block`)
+  bayt-bayt gösterilir ve fingerprint'e bağlanır. Onaydan sonra geçersizleşen
+  bir alıntı (retire, purge, değişen metin) blok baytlarını değiştirir; kapı
+  görevi onaya geri gönderir, farklı bir blok onaysız asla gönderilmez.
+  Alıntı yoksa blok da uyarı da yoktur. Düşen/uygun olmayan alıntılar yalnız
+  yerel meta veride görünür (`task.project_file_status`), yükte asla.
+- **Yetki değildir (§4.22):** dosya içeriği veya varlığı, tasdikli blok
+  baytları dışında hiçbir yetki kararı tarafından okunmaz (onay/grant/
+  hatırlanan grant, hedef politikası ve seçimi, izinli kökler, tarayıcı
+  origin'leri, Gmail/GitHub kimliği, connector seçimi, faturalandırma,
+  yürütme bariyeri). Dosya içeriği asla proje talimatı, RULE hafızası veya
+  açık-kullanıcı kaydı olamaz. Öncelik (§4.23) değişmez: alıntılar getirilen
+  hafızayla birlikte güvenilmez başvuru verisidir, talimatın altındadır.
+- **Purge'ün ulaşmadığı kalıntı:** (a) SQLite serbest sayfaları/WAL,
+  dosya sistemi ve depolama katmanı; `jarvis.pre-v2.db` gibi yedekler.
+  (b) Uygulama düzeyi kopyalar: onay önizlemesi (blok metni) hem
+  `pending_approvals.request_json` içinde hem `approval_requested` denetim
+  olayının yükünde; yürütülmüş görevin model yanıtı/sonuç anlık görüntüsü;
+  konuşma geçmişi; sağlayıcıya zaten gönderilmiş içerik. Görev anlık
+  görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
+  metni tutmaz.

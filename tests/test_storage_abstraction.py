@@ -521,6 +521,13 @@ class InMemoryStore:
         # This contract store has no instruction writer: never an instruction.
         return None
 
+    def retrieve_project_file_refs(self, project_id, query_text, classification):
+        # Nor a project-file writer: never an excerpt.
+        return (), 0
+
+    def load_project_file_chunk(self, project_id, file_id, chunk_index):
+        return None
+
     def list_projects(self) -> list[ProjectRecord]:
         return copy.deepcopy(
             sorted(self.projects.values(), key=lambda p: (p.created_at, p.id))

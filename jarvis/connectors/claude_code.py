@@ -14,6 +14,8 @@ from typing import Any
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
+    PROJECT_FILES_KEY,
+    render_project_files_block,
     PROJECT_INSTRUCTION_KEY,
     PROJECT_INSTRUCTION_PRECEDENCE,
     project_instruction_block,
@@ -516,6 +518,9 @@ class ClaudeCodeConnector(BaseConnector):
             summary="Objective and redacted task context will leave the local machine.",
             # Gate 4: the instruction block being approved, exactly as sent.
             project_instruction=instruction["text"] if isinstance(instruction, dict) else "",
+            # Gate 5: the canonical project-files block, byte-for-byte as it
+            # appears inside the attested prompt.
+            project_files=render_project_files_block(payload.get(PROJECT_FILES_KEY)),
         )
 
     def canonical_outbound(self, task: Task) -> bytes:
@@ -1107,6 +1112,13 @@ class ClaudeCodeConnector(BaseConnector):
         instruction, instruction_redactions = self._project_instruction(task)
         if instruction is not None:
             payload[PROJECT_INSTRUCTION_KEY] = instruction
+        # Gate 5: the ONE canonical project-files block AgentCore rendered
+        # from the store after re-proof (normalized, capped and redacted
+        # there). Carried as-is, so what is attested, previewed and sent is
+        # the same bytes; absent means no block and no notice.
+        block = task.project_files_block
+        if isinstance(block, dict) and block.get("excerpts"):
+            payload[PROJECT_FILES_KEY] = block
         return (
             payload,
             redactions

@@ -114,7 +114,10 @@ class StoreCase(unittest.TestCase):
         store.save_session(SessionState(objective="v1 work", project_id="alpha-proj"))
         connection = sqlite3.connect(self.database)
         try:
-            for name in ("project_instructions", "conversation_legacy_imports", "conversation_sessions", "conversations"):
+            # Every table the layer owns, whatever later gates add to it.
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            for name in sorted(COMPATIBILITY_SCHEMA_OBJECTS & tables):
                 connection.execute(f"DROP TABLE {name}")
             connection.commit()
         finally:

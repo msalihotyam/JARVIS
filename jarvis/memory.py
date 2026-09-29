@@ -90,6 +90,8 @@ from jarvis.contracts import (
     ProjectMemoryItem,
     ProjectMemoryKind,
     ProgressIssueKind,
+    ProjectFileRef,
+    PROJECT_FILE_ID,
     ProjectInstruction,
     ProjectRecord,
     ReconciliationOutcome,
@@ -115,6 +117,7 @@ from jarvis.contracts import (
     memory_lifecycle_refusal,
     normalize_session_next_step,
     normalize_retrieved_text,
+    retrieval_eligible,
     retrieval_tokens,
     truncate_retrieved_text,
     RETRIEVAL_SUMMARY_CAP,
@@ -169,6 +172,7 @@ from jarvis.conversation import (
 from jarvis.lifecycle import is_terminal
 from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
+from jarvis import project_files
 
 
 SCHEMA_VERSION = 10
@@ -688,6 +692,27 @@ CREATE TABLE IF NOT EXISTS project_instructions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_instructions_current
     ON project_instructions(project_id) WHERE superseded_by IS NULL;
+CREATE TABLE IF NOT EXISTS project_files (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    display_name TEXT NULL,
+    sha256 TEXT NOT NULL,
+    byte_size INTEGER NULL,
+    char_count INTEGER NULL,
+    classification TEXT NULL,
+    added_at TEXT NOT NULL,
+    lifecycle TEXT NOT NULL,
+    purged_at TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_files_active_sha
+    ON project_files(project_id, sha256) WHERE lifecycle = 'active';
+CREATE TABLE IF NOT EXISTS project_file_chunks (
+    file_id TEXT NOT NULL REFERENCES project_files(id),
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    text_sha256 TEXT NOT NULL,
+    PRIMARY KEY (file_id, chunk_index)
+);
 """
 
 def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
@@ -710,6 +735,9 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "conversation_legacy_imports",
         "project_instructions",
         "idx_project_instructions_current",
+        "project_files",
+        "idx_project_files_active_sha",
+        "project_file_chunks",
     }
 )
 
@@ -4715,6 +4743,304 @@ class SQLiteMemoryStore:
             ).fetchall()
         records = (self._instruction_from_row(row) for row in rows)
         return [record for record in records if record is not None]
+
+    # ------------------------------------------------------------------
+    # Project files (Gate 5): explicit-user text files, untrusted DATA.
+    # Lifecycle ACTIVE <-> RETIRED, plus a separate explicit, permanent PURGE
+    # (Salih decision 2026-09-29) that leaves a metadata tombstone. Only the
+    # display name is kept, never the path; the original bytes are never
+    # kept, only the normalized text in chunks.
+    # ------------------------------------------------------------------
+
+    _FILE_COLUMNS = (
+        "id, project_id, display_name, sha256, byte_size, char_count, "
+        "classification, added_at, lifecycle, purged_at"
+    )
+
+    @staticmethod
+    def _file_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        return None if row is None else {key: row[key] for key in row.keys()}
+
+    @staticmethod
+    def _project_row_for_files(
+        connection: sqlite3.Connection, project_id: Any, *, need_active: bool
+    ) -> None:
+        validate_project_id(project_id)
+        row = connection.execute(
+            "SELECT active FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown project: {project_id}")
+        if need_active and not row["active"]:
+            raise ValueError(f"Project is archived: {project_id}")
+
+    def _file_for_update(
+        self, connection: sqlite3.Connection, project_id: str, file_id: Any
+    ) -> dict[str, Any]:
+        if type(file_id) is not str or not PROJECT_FILE_ID.fullmatch(file_id):
+            raise ValueError("file id must be 'pf-' followed by 32 lowercase hex digits")
+        row = self._file_row(connection.execute(
+            f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE id = ? AND project_id = ?",
+            (file_id, project_id),
+        ).fetchone())
+        if row is None or row["lifecycle"] not in project_files.LIFECYCLES:
+            raise ValueError(f"Unknown project file: {file_id}")
+        return row
+
+    @staticmethod
+    def _require_file_quota(
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        active_add: int,
+        files_add: int,
+        chars_add: int,
+    ) -> None:
+        active, retained, chars = connection.execute(
+            "SELECT COALESCE(SUM(lifecycle = 'active'), 0), "
+            "COALESCE(SUM(lifecycle != 'purged'), 0), "
+            "COALESCE(SUM(CASE WHEN lifecycle != 'purged' THEN char_count ELSE 0 END), 0) "
+            "FROM project_files WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if active + active_add > project_files.PROJECT_FILE_ACTIVE_MAX:
+            raise ValueError(
+                f"A project can have at most {project_files.PROJECT_FILE_ACTIVE_MAX} active files."
+            )
+        if retained + files_add > project_files.PROJECT_FILE_RETAINED_MAX:
+            raise ValueError(
+                f"A project can keep at most {project_files.PROJECT_FILE_RETAINED_MAX} files; "
+                "purge a retired file first."
+            )
+        if chars + chars_add > project_files.PROJECT_FILE_RETAINED_CHARS_MAX:
+            raise ValueError(
+                f"A project can keep at most {project_files.PROJECT_FILE_RETAINED_CHARS_MAX} "
+                "characters of files; purge a retired file first."
+            )
+
+    @staticmethod
+    def _require_unique_active_sha(
+        connection: sqlite3.Connection, project_id: str, sha256: str
+    ) -> None:
+        if connection.execute(
+            "SELECT 1 FROM project_files WHERE project_id = ? AND sha256 = ? AND lifecycle = 'active'",
+            (project_id, sha256),
+        ).fetchone() is not None:
+            raise ValueError("An identical file is already active in this project.")
+
+    def save_explicit_user_project_file(
+        self,
+        project_id: str,
+        content: "project_files.ProjectFileContent",
+        classification: DataClassification | str,
+    ) -> dict[str, Any]:
+        """THE explicit-user add boundary, reached only from the local
+        CLI/app composition path with a file the person chose
+        (``project_files.read_project_file``). Classification is required;
+        SECRET may be stored but is never retrieval-eligible. Refused on an
+        archived project. Every refusal writes nothing."""
+        try:
+            classification = DataClassification(classification)
+        except (TypeError, ValueError):
+            raise ValueError("a file classification is required") from None
+        if type(content) is not project_files.ProjectFileContent:
+            raise ValueError("a project file must be read through read_project_file")
+        chunks = project_files.chunk_text(content.text)
+        record = {
+            "id": "pf-" + uuid4().hex,
+            "project_id": project_id,
+            "display_name": content.display_name,
+            "sha256": content.sha256,
+            "byte_size": content.byte_size,
+            "char_count": len(content.text),
+            "classification": classification.value,
+            "added_at": utc_now(),
+            "lifecycle": project_files.ACTIVE,
+            "purged_at": None,
+        }
+        with self._connection(write=True) as connection:
+            self._project_row_for_files(connection, project_id, need_active=True)
+            self._require_unique_active_sha(connection, project_id, content.sha256)
+            self._require_file_quota(
+                connection, project_id, active_add=1, files_add=1, chars_add=record["char_count"]
+            )
+            connection.execute(
+                f"INSERT INTO project_files ({self._FILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(record[key] for key in self._FILE_COLUMNS.split(", ")),
+            )
+            connection.executemany(
+                "INSERT INTO project_file_chunks (file_id, chunk_index, text, text_sha256) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (record["id"], index, text, project_files.text_digest(text))
+                    for index, text in enumerate(chunks)
+                ],
+            )
+        return record
+
+    def list_project_files(
+        self, project_id: str, *, include_purged: bool = False
+    ) -> list[dict[str, Any]]:
+        """Oldest first. Works on an archived project."""
+        validate_project_id(project_id)
+        where = "" if include_purged else " AND lifecycle != 'purged'"
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE project_id = ?{where} "
+                "ORDER BY added_at, id",
+                (project_id,),
+            ).fetchall()
+        return [self._file_row(row) for row in rows]
+
+    def set_project_file_active(
+        self, project_id: str, file_id: str, active: bool
+    ) -> dict[str, Any]:
+        """retire (``False``) / restore (``True``). Refused on an archived
+        project; restore is subject to the active cap and active-SHA
+        uniqueness; a purged file never changes again."""
+        if type(active) is not bool:
+            raise ValueError("active must be a bool")
+        wanted = project_files.ACTIVE if active else project_files.RETIRED
+        with self._connection(write=True) as connection:
+            self._project_row_for_files(connection, project_id, need_active=True)
+            row = self._file_for_update(connection, project_id, file_id)
+            if row["lifecycle"] == project_files.PURGED:
+                raise ValueError(f"Project file is purged: {file_id}")
+            if row["lifecycle"] == wanted:
+                raise ValueError(f"Project file is already {wanted}: {file_id}")
+            if active:
+                self._require_unique_active_sha(connection, project_id, row["sha256"])
+                self._require_file_quota(
+                    connection, project_id, active_add=1, files_add=0, chars_add=0
+                )
+            connection.execute(
+                "UPDATE project_files SET lifecycle = ? WHERE id = ?", (wanted, file_id)
+            )
+        return {**row, "lifecycle": wanted}
+
+    def purge_project_file(
+        self, project_id: str, file_id: str, *, confirm: Any
+    ) -> dict[str, Any]:
+        """Permanent, explicit removal (Salih decision 2026-09-29).
+
+        ``confirm`` must equal ``file_id``, checked before anything is
+        touched. ONE transaction deletes every chunk and turns the metadata
+        row into a tombstone (PURGED; name, sizes and classification NULL),
+        which also releases the quota; any failure rolls all of it back.
+        Allowed on an archived project. ``secure_delete`` is enabled for the
+        transaction as best-effort defense in depth and the connection's
+        previous setting is restored either way; nothing here claims physical
+        erasure from WAL, filesystem or storage."""
+        if type(confirm) is not str or confirm != file_id:
+            raise ValueError("Purge needs a confirmation equal to the file id.")
+        connection = self._connect()
+        try:
+            previous = int(connection.execute("PRAGMA secure_delete").fetchone()[0])
+            connection.execute("PRAGMA secure_delete = ON")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._project_row_for_files(connection, project_id, need_active=False)
+                    row = self._file_for_update(connection, project_id, file_id)
+                    if row["lifecycle"] == project_files.PURGED:
+                        raise ValueError(f"Project file is already purged: {file_id}")
+                    connection.execute(
+                        "DELETE FROM project_file_chunks WHERE file_id = ?", (file_id,)
+                    )
+                    purged_at = self._purge_file_metadata(connection, file_id)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+            finally:
+                connection.execute(f"PRAGMA secure_delete = {previous}")
+        finally:
+            connection.close()
+        return {
+            **row,
+            "display_name": None,
+            "byte_size": None,
+            "char_count": None,
+            "classification": None,
+            "lifecycle": project_files.PURGED,
+            "purged_at": purged_at,
+        }
+
+    @staticmethod
+    def _purge_file_metadata(connection: sqlite3.Connection, file_id: str) -> str:
+        purged_at = utc_now()
+        connection.execute(
+            "UPDATE project_files SET lifecycle = 'purged', purged_at = ?, display_name = NULL, "
+            "byte_size = NULL, char_count = NULL, classification = NULL WHERE id = ?",
+            (purged_at, file_id),
+        )
+        return purged_at
+
+    def retrieve_project_file_refs(
+        self, project_id: str, query_text: str, classification: DataClassification
+    ) -> tuple[tuple[ProjectFileRef, ...], int]:
+        """Deterministic excerpt selection for one Core task (a pure read).
+
+        Keyword overlap (``retrieval_tokens``) over the project's ACTIVE
+        chunks whose classification is eligible for the task; score 0 is
+        never selected; ties by file ``added_at``, file id, chunk index; at
+        most 3 excerpts and 4,000 characters. Returns the references and how
+        many matching chunks were skipped as ineligible (LOCAL metadata)."""
+        query = retrieval_tokens(query_text)
+        if not query:
+            return (), 0
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT f.id, f.sha256, f.classification, f.added_at, c.chunk_index, "
+                "c.text, c.text_sha256 "
+                "FROM project_files f JOIN project_file_chunks c ON c.file_id = f.id "
+                "WHERE f.project_id = ? AND f.lifecycle = 'active'",
+                (project_id,),
+            ).fetchall()
+        scored = []
+        ineligible = 0
+        for row in rows:
+            score = len(query & retrieval_tokens(row["text"]))
+            if score == 0:
+                continue
+            try:
+                eligible = retrieval_eligible(
+                    classification, DataClassification(row["classification"])
+                )
+            except (TypeError, ValueError):
+                eligible = False
+            if not eligible:
+                ineligible += 1
+                continue
+            scored.append((-score, row["added_at"], row["id"], row["chunk_index"], row))
+        scored.sort(key=lambda item: item[:4])
+        refs: list[ProjectFileRef] = []
+        used = 0
+        for *_, row in scored:
+            if len(refs) >= project_files.PROJECT_FILE_EXCERPT_MAX_ITEMS:
+                break
+            if used + len(row["text"]) > project_files.PROJECT_FILE_EXCERPT_MAX_CHARS:
+                continue
+            used += len(row["text"])
+            refs.append(
+                ProjectFileRef(row["id"], row["sha256"], row["chunk_index"], row["text_sha256"])
+            )
+        return tuple(refs), ineligible
+
+    def load_project_file_chunk(
+        self, project_id: str, file_id: str, chunk_index: int
+    ) -> dict[str, Any] | None:
+        """One chunk and its file's CURRENT state, for re-proof (a pure read)."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT f.id, f.display_name, f.sha256, f.classification, f.lifecycle, "
+                "c.chunk_index, c.text, c.text_sha256 "
+                "FROM project_files f JOIN project_file_chunks c ON c.file_id = f.id "
+                "WHERE f.project_id = ? AND f.id = ? AND c.chunk_index = ?",
+                (project_id, file_id, chunk_index),
+            ).fetchone()
+        return self._file_row(row)
+
 
     @staticmethod
     def _require_writable_owner(

@@ -10,18 +10,17 @@ not the official V2 daily-driver gate — that is V2.1 Projects + Advanced
 Memory). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+),
 section "V2.0 — Projects".
 
-Active gate: Projects Gate 5 — project files foundation. NOT STARTED.
+Active gate: Projects Gate 6 — Projects UX. NOT STARTED.
 
-Status: Gates 1–4 complete on main; nothing in flight. Conversations live in
-the Core SQLite store (§4.22). Gate 3: project create/rename/archive/unarchive,
-conversation owner = the only chat project scope, archive semantics. Gate 4
-(§4.23): one explicit-user instruction per project (`project_instructions`
-compatibility table, INSERT-only + supersede, 2,000 chars, PUBLIC/INTERNAL,
-`jarvis project instruction set|show|history`), always-on under its own
-payload key and notice to the Claude/Codex intent adapters and claude_code
-task calls; fixed precedence clause; attested outbound content (R1).
-Base commit: `fix(core): refuse remembered grants on non-rememberable
-requests` on main. Installed release: `1.0.0-1c68161` (Chrome runtime),
+Status: Gates 1–5 complete on main; nothing in flight. Conversations in the
+Core store (§4.22); Gate 3 lifecycle + owner scope + archive; Gate 4 project
+instructions (§4.23, attested, R1). Gate 5 (§4.24): explicit-user text files
+(`jarvis project file add|list|retire|restore|purge`, new `project_files` +
+`project_file_chunks` tables, 20 active / 40 retained / 2M chars, 200k chars
+per file, purge = tombstone + chunk delete in one transaction), selected per
+Core task (<= 3 excerpts / 4,000 chars) and sent as one re-proved, attested,
+previewed block; never on the intent path. Purge residue: §4.24.
+Base commit: `feat(projects): add project files foundation` on main. Installed release: `1.0.0-1c68161` (Chrome runtime),
 active and consistent; previous = `1.0.0-4f5a93d`.
 
 ## Roles
@@ -51,11 +50,13 @@ active and consistent; previous = `1.0.0-4f5a93d`.
 - Gate 4 (orchestrator, 2026-09-29; §4.23): instructions are model guidance,
   never authority; precedence safety/Core > current message > instruction >
   retrieved memory; R1: attested outbound content, E = authority-only.
+- Gate 5 (§4.24): files are untrusted data; remove = retire + explicit purge
+  (Salih, 2026-09-29); purge allowed on archived projects.
 
 ## Uncommitted / external decisions
 
-- The remaining V2.0 gate plan exists only in the Gate 0 report: 5 project
-  files foundation → 6 Projects UX → 7 E2E + packaged dogfood + rollback proof.
+- The remaining V2.0 gate plan exists only in the Gate 0 report: 6 Projects
+  UX → 7 E2E + packaged dogfood + rollback proof.
 - Gate 4B physical Edge retirement is deferred until a normal-use period and
   an explicit user decision.
 - External: the installed app's Claude CLI OAuth session was expired at the
@@ -64,9 +65,8 @@ active and consistent; previous = `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Projects Gate 5 (Opus 5.5 High): project files foundation. Roadmap V2.0:
-  selective retrieval + provenance, never bulk prompt stuffing; a project file
-  is data, never a trusted instruction, cannot widen Core authority. No UI.
+- Projects Gate 6 (Opus 5.5 High): Projects UX over the existing Core/app
+  APIs (projects, conversations, instructions, files); no new authority.
 
 ## Rollback / safety anchors
 
