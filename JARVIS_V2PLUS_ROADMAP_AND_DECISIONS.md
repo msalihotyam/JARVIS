@@ -109,6 +109,12 @@ Her kayıtta mümkün olduğunca:
 - Provider switch memory scope’u bozmamalı.
 - Stale/conflicting/orphan kayıtlar görünür ve düzeltilebilir olmalı.
 
+### Salih kararı (2026-09-29): "tüm projelerin hafızası" anahtarı
+- Global sohbette conversation başına açılıp kapanan anahtar; varsayılan kapalı.
+- Yalnız memory: instruction ve dosya yok. Salt-okunur; gösterdiği her şeyde kaynak (provenance) etiketi.
+- Yukarıdaki "Başka Project'e memory sızmamalı" ilkesine tek, adlandırılmış, kullanıcı-açık istisna budur.
+- V2.1 bağlam kalemleri: PreCompact capture, tam arşiv retrieval, context-usage göstergesi, "Hatırla" butonu.
+
 ### Memory Doctor / Health
 Planlanan kontroller:
 - stale records
@@ -934,6 +940,11 @@ JARVIS deterministic Core authority/security modelinin yerine Hermes yaklaşım�
 - Egress kuralının web fetch/search/MCP'yi kapsamaması.
 - Chat taşınınca instruction/dosya context'inin sessizce devralınması.
 - Cascade eden kalıcı project delete; geri dönüşü olmayan archive.
+
+### Salih kararları — V2.0 Gate 6 (2026-09-29/30)
+- **Gate 6B ek kapsam (2026-09-30):** üst çubukta çekirdeğin soluna proje seçici + "+ Yeni sohbet" butonu. Fare öncelikli: Salih kısayol kullanmaz, hiçbir özellik kısayola bağlı olamaz. Proje seçmek onun en son arşivlenmemiş sohbetini açar (yoksa yeni sohbet); "Tüm projeler" girdisi Projects sayfasını açar; arşivli projeler seçicide gizlenir. 6B'nin geri kalanı planlandığı gibi: instruction editörü (x/2000 sayaç, PUBLIC/INTERNAL sınıflandırma, görünür precedence satırı); dosya paneli (Active x/20, Retained x/40, karakter x/2.000.000, FileDialog ile ekleme, retire/restore, purge yalnız retired satırlarda, dosya adı yazarak onay + dürüst kalıntı metni).
+- **Gate 6C "Projeye bağla" (2026-09-29):** bir Global sohbeti projeye taşı; yalnız tek yönlü; hedef mevcut proje ya da akış içinde yeni oluşturulan proje; önizleme + açık onay. Gate 0 "owner sabit / V2.0'da taşıma yok" kuralına dar, adlandırılmış istisnadır; kural aksi halde geçerli kalır. V2.1 "tüm projelerin hafızası"nı kullanmış sohbetler için guard içerir (kesin guard 6C'de tasarlanır).
+- **Kalan V2.0 sırası:** 6B → 6C → Gate 7 (E2E + paketlenmiş dogfood + rollback; archive/unarchive E2E dahil). Purge kalıntı gizliliğini Gate 7'den önce Salih karara bağlar. Gate 6 UX tamamlanmadan release yok.
 
 ---
 

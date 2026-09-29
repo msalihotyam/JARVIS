@@ -10,8 +10,9 @@ not the official V2 daily-driver gate — that is V2.1 Projects + Advanced
 Memory). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+),
 section "V2.0 — Projects".
 
-Active gate: Projects Gate 6B (instruction editor, file panel, purge UI).
-NOT STARTED.
+Active gate: Projects Gate 6B (top-bar project selector + "+ Yeni sohbet",
+instruction editor, file panel, purge UI; mouse-first, no shortcut-dependent
+feature). NOT STARTED.
 
 Status: Gates 1–5 and 6A complete on main; nothing in flight. §4.22
 conversations/lifecycle/archive, §4.23 instructions (R1), §4.24 files (purge
@@ -36,7 +37,8 @@ Installed release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 - V2 M1 Edge → Chrome migration complete (trusted Chrome, chrome-profile,
   WebRTC switch, per-tab boundary, MediaRouter off, packaged + rollback).
 - Projects Gate 0: reuse `projects`; Global = `project_id` NULL (no synthetic
-  project); opaque ids; owner fixed (no move in V2.0); scope is context, never
+  project); opaque ids; owner fixed (no move in V2.0, except the narrow Gate 6C "Projeye bağla":
+Global → project, one-way, preview + confirm; Salih 2026-09-29); scope is context, never
   authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
   targets (additive tables only, no ALTER).
 - Gates 1–3 (§4.22): conversation store, live-DB test guard, bridge cutover,
@@ -52,9 +54,19 @@ Installed release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Uncommitted / external decisions
 
-- Remaining V2.0 plan (Gate 0 report): 6B → 7 E2E + dogfood + rollback.
-- Independent Codex review of Gates 3–5 is PARTIAL; the remaining reviews
-  are queued for after the ChatGPT quota reset.
+- Remaining V2.0 order (Salih, 2026-09-30): 6B (Opus 5.5 high) → 6C (Opus 5.5
+  xhigh; "Projeye bağla", guard for conversations that used V2.1 "all projects
+  memory") → Gate 7 (E2E + packaged dogfood + rollback, incl. archive/unarchive
+  E2E). Salih decides purge-residue privacy before Gate 7. No release before
+  Gate 6 UX is complete.
+- V2.1 (Salih, 2026-09-29): Global-conversation "all projects memory" toggle —
+  memory only (no instructions/files), read-only, per-conversation, default
+  off, provenance labels. Also: PreCompact capture, full archive retrieval,
+  context-usage indicator, "Hatırla" button.
+- Codex review queue (Salih runs on Windows, standard Codex model, one commit
+  per session): session1 remainder (instruction channel, grant fix, schema-10),
+  Gate 5, 6A, fix commits. Known findings: F1+F2 fixed in `74adbd0`, F3 by
+  design (§4.22), F4 fixed in 6A.
 - Backlog: known full-suite timing flake
   `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`
   (animation frame timing under load; passes alone) - fix later.
@@ -67,8 +79,9 @@ Installed release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Projects Gate 6B (Opus 5.5 High): instruction editor, file panel and
-  purge UI over the existing app paths; no new authority.
+- Projects Gate 6B (Opus 5.5 high): project selector + "+ Yeni sohbet",
+  instruction editor, file panel and purge UI over the existing app paths; no
+  new authority.
 
 ## Rollback / safety anchors
 

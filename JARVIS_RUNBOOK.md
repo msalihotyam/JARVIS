@@ -49,16 +49,23 @@ integrates and verifies. It is not forbidden from writing code.
 
 ## Model policy
 
-Sonnet is **no longer the default coder**: in real use it is too slow.
+Salih decision (2026-09-30):
 
 | Model / effort | Use for |
 |---|---|
-| Opus 5.5, High | Primary/default: architecture, implementation, debugging, refactors, security, gates |
-| Fable 5.1, High | Exceptional secondary lane: an independent/review perspective or specific bounded work |
-| Sonnet 5, High | Narrow, mechanical, lower-risk work |
+| Sonnet 5.5, medium | Docs, test reruns |
+| Sonnet 5.5, high | Well-scoped implementation |
+| Opus 5.5, high | Design, preflight, diagnosis (default for gates) |
+| Opus 5.5, xhigh | Security-critical Core (authority / approval / attestation / scope) |
 
-`xhigh` / `max` stay exceptional — only when the concrete task genuinely
-requires escalation, never a routine default.
+- Never below medium, never above xhigh.
+- Fable 5.1 only with Salih's explicit approval.
+- Every prompt carries `MODEL:` / `EFFORT:` lines.
+- Orchestrator chat default effort is high. When a turn needs more (6C design,
+  V2.1 memory design, verifying Codex findings, unclear root cause), the
+  orchestrator ends the prior message with "Sonraki tur için effort: xhigh".
+- ChatGPT "Astra" = ChatGPT's Fable-equivalent tier; quota-hungry, use
+  sparingly.
 
 Choose on **wall-clock time + correctness + turn count + Claude Max quota
 impact**, not token count alone.
@@ -69,7 +76,9 @@ Persistent Claude chats are **disposable working context**. Canonical
 continuity lives in this runbook, `JARVIS_ACTIVE_STATE.md` and Git — never in
 a chat's scrollback.
 
-- Let auto-compaction run normally; it is not a reason to rotate.
+- Salih decision (2026-09-30): the orchestrator proactively proposes rotation
+  with a short handoff. Claude Code chats past ~400–500k are retired, not
+  compacted (supersedes "let auto-compaction run normally" for them).
 - Rotate at **milestone boundaries**, when Messages/context is roughly
   400–500k+ or the chat is noticeably slow.
 - Do **not** rotate mid-implementation unless the session is unusable.
