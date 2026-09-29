@@ -1,7 +1,7 @@
 # JARVIS V2+ — Roadmap, Decisions & Reference Architecture
 
 **Belge tarihi:** 2026-09-19  
-**Son güncelleme:** 2026-09-28 — V2.4B Orchestrated Tasks / Parent–Child Task Graph kararı eklendi.  
+**Son güncelleme:** 2026-09-29 — Claude / ChatGPT desktop 2026-09 referansı (§3.7) ve yeni DO NOT COPY maddeleri (§12) eklendi.
 **Amaç:** JARVIS V1 sonrasında uygulanması planlanan V2 ve daha ileri ürün kararlarını tek yerde korumak.  
 **Bu belge canlı proje durumu değildir.** Commit, branch, milestone ilerlemesi veya `JARVIS_ACTIVE_STATE.md` anlık bilgileri burada tutulmaz.
 
@@ -909,6 +909,34 @@ JARVIS deterministic Core authority/security modelinin yerine Hermes yaklaşım�
 
 ---
 
+## 3.7 Claude Desktop / ChatGPT Desktop (2026-09)
+**Ana eşleşme:** V2.0 Projects UX + V2.1–V2.6 + P7/P8
+**Kaynak:** "Claude ve ChatGPT masaüstü analizi" araştırması (2026-09-29; resmi help sayfaları, tek/ikincil kaynaklı iddialar orada işaretli). Ürün özellikleri hızla değişir; ilgili milestone başında yeniden doğrulanır (§13).
+
+### Alınacak fikirler (milestone eşlemesi)
+- V2.0 (Gate 6/7): her zaman erişilebilen Archived bölümü + unarchive; project sayfasında konuşmalar / instruction / dosyalar; instruction editöründe karakter sayacı, sınıflandırma seçimi ve görünür precedence satırı; dosya limit sayaçları ve yükleme öncesi red; retrieval provenance yalnız Core task ve approval preview'da; retire → purge iki adım, kalan kopyaları dürüstçe söyleyen onay metni; arşivli project için salt-okunur banner; archive/unarchive akışının paketlenmiş build'de E2E testi.
+- V2.1: Pause ve Reset ayrımı; Core'da deterministik "hiç saklanmaz" kategori filtresi; memory kullanımında kaynak kaydı; "bastır" işlemi silme değil supersession.
+- V2.2: yeni skill/connector yetenekleri kullanıcı açana kadar kapalı; secret'lar Windows Credential Manager / DPAPI'de.
+- V2.3: kaynak allowlist'i kullanıcıda; bütün web içeriği untrusted.
+- V2.4: sandbox/capability sınırı ile approval politikası iki ayrı Core nesnesi; en az yetkili araç önce (connector > browser > ekran).
+- V2.4A: risk sınıfları (exfiltration, credential probing, destructive) yalnız tavsiye etiketi.
+- V2.5: aktif task sınırı; onay bekleyenler için kuyruk; bilgisayar kapalıyken kaçan çalıştırmalar için açık missed-run politikası; konuşarak kurulan job'ın son spec'i kullanıcıya onaylatılır.
+- V2.6: moddan bağımsız hard-block listesi (satın alma, kalıcı silme, kimlik/kart vb.); site/app + oturum kapsamlı izin; global hotkey Alt+Space olmaz; yakalanan ekran/pencere metni untrusted; kullanıcı devraldığında yakalama durur.
+- P7: push onayında tam action fingerprint'i ve imzalı onay; QR ile eşleştirme.
+- P8: Voice gelse de sesle approval verilmez.
+
+### Alınmayacak
+- AI reviewer'ın kullanıcı adına onay verdiği modlar (Claude "Automatically approve", ChatGPT "Approve for me").
+- Onayı tamamen kaldıran modlar (Claude "Skip all approvals", ChatGPT "Full access").
+- Connector tool'larının onaysız çağrılması (Claude Research modu).
+- Uygulama çapında kalıcı "Always allow".
+- Diff'in onaysız otomatik uygulanması (auto-apply).
+- Egress kuralının web fetch/search/MCP'yi kapsamaması.
+- Chat taşınınca instruction/dosya context'inin sessizce devralınması.
+- Cascade eden kalıcı project delete; geri dönüşü olmayan archive.
+
+---
+
 # 4. MASTER DESIGN PRINCIPLES — DEĞİŞMEMESİ GEREKENLER
 
 1. **Core final authority’dir.**
@@ -1180,6 +1208,11 @@ Bunların çoğu roadmap’te vardır; **deferred = cancelled değildir.**
 - Fake progress / fake telemetry / fake background activity.
 - Browser/desktop içeriğini executable authority kabul etmek.
 - Default olarak büyük bir agent swarm açmak.
+- AI reviewer'ın kullanıcı adına approval vermesi (auto-approve / "Approve for me").
+- Onay katmanını kaldıran "Skip all approvals" / "Full access" modları.
+- Kapsamı action/destination'a bağlı olmayan kalıcı "Always allow".
+- Bazı çıkış yollarını (web fetch/search, MCP) egress politikası dışında bırakmak.
+- Project/chat taşımada context'i kullanıcıya göstermeden devretmek.
 
 ---
 
