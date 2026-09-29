@@ -12,7 +12,8 @@ Memory).
 Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+); active
 section "V2.0 — Projects".
 
-Active gate: Projects Gate 4 — project instructions. NOT STARTED.
+Active gate: Projects Gate 4 — project instructions. BLOCKED at preflight
+(no implementation; nothing uncommitted besides the known dirt).
 
 Status: Gates 1–3 are complete on main. Conversations live in the Core
 SQLite store (additive schema-10 layer, `ARCHITECTURE.md` §4.22). Gate 3
@@ -20,7 +21,8 @@ added project create (opaque `p-` id) / rename / archive / unarchive (Core +
 `jarvis project` CLI, no UI, no delete) and made the conversation owner the
 only chat project scope (Task.project_id, session binding, project memory,
 job project; Global = None, no single-project fallback for conversation
-requests). Archive semantics are canonical in §4.22. Nothing is in flight.
+requests). Archive semantics are canonical in §4.22. Gate 3 proof: full
+direct suite on db78224 = 4472 run, 0 failures, 0 errors, 2 skipped.
 
 Starting/base commit: the `feat(projects): add project lifecycle and scope
 propagation` commit on main.
@@ -30,7 +32,18 @@ consistent; previous = `1.0.0-4f5a93d`.
 
 ## Open blockers
 
-- None.
+- Gate 4 acceptance E contradicts the egress contract. The claude_code
+  connector attests every outbound byte (`canonical_outbound` = prefix +
+  payload -> `outbound_digest` -> approval fingerprint; display digest
+  covers the outbound preview). An instruction in that payload (B) must
+  change attestation + fingerprint across absent/present/hostile, so E's
+  "identical fingerprint and attestation" cannot hold without unattested
+  egress. Intent paths (Claude, Codex) have no attestation: not affected.
+- Decision needed: R1 = E compares authority-bearing parts only (approval
+  needed, grant decision, scope, risk/effect, destination, working dir,
+  allowed roots, tool grants, billing gate); outbound digest / fingerprint
+  differ exactly by the attested instruction bytes. R2 = no instruction on
+  Core connector calls in Gate 4 (intent path only).
 
 ## Do not reopen
 
@@ -54,9 +67,14 @@ consistent; previous = `1.0.0-4f5a93d`.
 - The remaining V2.0 gate plan exists only in the Gate 0 report: 4 project
   instructions → 5 project files foundation → 6 Projects UX → 7 E2E +
   packaged dogfood + rollback proof.
-- Gate 3 test run used `uv run` once, which created `.venv` (ignored) and
-  rewrote the untracked `uv.lock`; no prior copy existed to compare. Tests
-  run with `python -m unittest` (as `scripts/test.ps1`).
+- Gate 4 orchestrator decisions (2026-09-29, prompt only): instructions
+  are model guidance, never authority; always-on, not RULE memory or
+  retrieval; precedence safety/Core > current message > instruction >
+  retrieved memory; own payload key + notice, `request` unchanged; new
+  compatibility table, INSERT-only + supersede, 2,000-char cap; write
+  PUBLIC/INTERNAL only; explicit-user CLI path; refused while archived.
+- Gate 3 ran `uv run` once: created `.venv` (ignored), rewrote untracked
+  `uv.lock` (no prior copy). Tests: `python -m unittest discover -s tests`.
 - Gate 4B physical Edge retirement is deferred until a normal-use period
   and an explicit user decision.
 - External: the installed app's Claude CLI OAuth session was expired at the
@@ -65,10 +83,8 @@ consistent; previous = `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Projects Gate 4 (Opus 5.5 High): project instructions / user decisions
-  as explicit-user project context. Instructions stay context, never
-  authority (§4.22 "Yetki değildir"); imported or external content is never
-  a trusted instruction. No Projects UI yet.
+- Resolve the Gate 4 blocker (R1 or R2 above), then rerun Gate 4 (Opus 5.5
+  High) from preflight with the chosen acceptance E.
 
 ## Rollback / safety anchors
 
