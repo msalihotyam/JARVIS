@@ -22,7 +22,7 @@ Item {
         id: navigation; x: 0; y: 0; width: cockpit.navWidth; height: upper.height
         visible: width > 0; level: 1; padding: cockpit.wide ? 12 : 5; brackets: true
         Column { width: parent.width; spacing: 6
-            Repeater { model: [{label:qsTr("Home"),page:"home",glyph:"⌂"},{label:qsTr("Tasks"),page:"tasks",glyph:"◇"},{label:qsTr("Automations"),page:"automations",glyph:"⟳"},{label:qsTr("Memory"),page:"memory",glyph:"▤"},{label:qsTr("History"),page:"history",glyph:"◷"}]
+            Repeater { model: [{label:qsTr("Home"),page:"home",glyph:"⌂"},{label:qsTr("Tasks"),page:"tasks",glyph:"◇"},{label:qsTr("Automations"),page:"automations",glyph:"⟳"},{label:qsTr("Memory"),page:"memory",glyph:"▤"},{label:qsTr("History"),page:"history",glyph:"◷"},{label:qsTr("Projects"),page:"projects",glyph:"▦"}]
                 Rectangle { width: parent.width; height: 43; radius: 5; color: bridge.page === modelData.page ? Theme.alpha(Theme.accent, 0.10) : "transparent"
                     Text { x: cockpit.wide ? 10 : 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.glyph; color: Theme.accent; font.pixelSize: 21 }
                     Text { visible: cockpit.wide; x: 43; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.textLabel; font: Theme.caption }

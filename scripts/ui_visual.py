@@ -24,9 +24,10 @@ def main() -> int:
     parser.add_argument("--capture-dir", type=Path)
     parser.add_argument("--capture-name", default="preview")
     parser.add_argument("--size", default="1920x1080")
-    parser.add_argument("--page", choices=("home", "tasks", "automations", "memory", "history"), default="home")
+    parser.add_argument("--page", choices=("home", "tasks", "automations", "memory", "history", "projects"), default="home")
     parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
-    parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running"), default="home")
+    parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
+                                            "projects", "project", "badge", "archived"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -61,12 +62,41 @@ def main() -> int:
         if not args.fixture:
             parser.error("approval scene requires --fixture")
         window.setProperty("devApprovalVisible", True)
+        # MAIN / DARK show approvals in the conversation's safety card (the same
+        # display-only fixture Ctrl+Shift+A selects).
+        bridge.setDevSafetyScenario("approval")
     elif args.scene in ("settings", "model", "nav"):
         QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "model":"toggleModel", "nav":"toggleNav"}[args.scene])
     elif args.scene == "edit":
         bridge.setEditMode(True)
     elif args.scene == "focus":
         bridge.setFocusMode(True)
+    elif args.scene in ("projects", "project", "badge", "archived"):
+        # V2.0 Gate 6A: sample projects in the ISOLATED store only (fixture copy,
+        # nobody's data): two active, one archived, each with conversations.
+        if not args.fixture:
+            parser.error(f"{args.scene} scene requires --fixture")
+        store = bridge._conversation_db()
+        seeded = {}
+        for name, titles in (("Home renovation", ("Kitchen plan", "Invoices to check")),
+                             ("JARVIS development", ("Gate 6 interface notes",)),
+                             ("Thesis 2025", ("Reading list draft",))):
+            project = store.create_project(name)
+            seeded[name] = (project, [store.create_conversation(project.id) for _ in titles])
+            for record, title in zip(seeded[name][1], titles):
+                store.set_conversation_title(record.id, title)
+        store.set_project_active(seeded["Thesis 2025"][0].id, False)
+        if args.scene == "projects":
+            bridge.setPage("projects")
+            bridge.refreshProjects()
+        elif args.scene == "project":
+            bridge.showProject(seeded["Home renovation"][0].id)
+        elif args.scene == "badge":
+            bridge.openConversation(seeded["JARVIS development"][1][0].id)
+            bridge.setPage("home")
+        else:
+            bridge.openConversation(seeded["Thesis 2025"][1][0].id)
+            bridge.setPage("home")
     elif args.scene == "running":
         if not args.fixture:
             parser.error("running scene requires --fixture")

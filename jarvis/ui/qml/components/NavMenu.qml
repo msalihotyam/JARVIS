@@ -5,7 +5,7 @@ ContextPanel {
     id: nav
     heading: qsTr("NAVIGATE")
     surfaceName: "navSurface"
-    panelWidth: 300; panelHeight: 326
+    panelWidth: 300; panelHeight: 372
     function go(page) { bridge.setPage(page); nav.open = false }
     Column {
         width: parent.width; spacing: 4
@@ -15,7 +15,8 @@ ContextPanel {
                 { page: "tasks", label: qsTr("Tasks"), key: "2", glyph: "◇" },
                 { page: "automations", label: qsTr("Automations"), key: "3", glyph: "⟳" },
                 { page: "memory", label: qsTr("Memory"), key: "4", glyph: "▤" },
-                { page: "history", label: qsTr("History"), key: "5", glyph: "◷" }
+                { page: "history", label: qsTr("History"), key: "5", glyph: "◷" },
+                { page: "projects", label: qsTr("Projects"), key: "6", glyph: "▦" }
             ]
             Rectangle {
                 id: entry

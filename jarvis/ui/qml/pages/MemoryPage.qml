@@ -23,9 +23,10 @@ SecondaryPage {
         Row {
             spacing: 8
             Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("PROJECT"); color: Theme.textLabel; font: Theme.pageSection }
+            // Names are shown; the id stays internal (Gate 3 ids are opaque).
             Repeater {
-                model: bridge.projects
-                ActionButton { label: modelData; primary: modelData === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData; bridge.refreshMemory(modelData, page.includeInactive) } }
+                model: bridge.projectRecords.filter(function(p) { return p.active })
+                ActionButton { objectName: "memoryProject"; label: modelData.name; primary: modelData.id === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData.id; bridge.refreshMemory(modelData.id, page.includeInactive) } }
             }
             Text { visible: bridge.projects.length === 0; anchors.verticalCenter: parent.verticalCenter; text: qsTr("No project exists yet (%1).").arg("'jarvis project create'"); color: Theme.textMuted; font: Theme.pageMeta }
         }

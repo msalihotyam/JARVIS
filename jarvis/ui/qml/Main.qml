@@ -189,7 +189,7 @@ Window {
                 id: pageLoader
                 anchors.fill: parent
                 property string current: bridge.page
-                sourceComponent: current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : homePage
+                sourceComponent: current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : current === "projects" ? projectsPage : homePage
                 onCurrentChanged: pageIn.restart()
                 opacity: 1
                 transform: Translate { id: pageSlide; y: 0 }
@@ -214,6 +214,7 @@ Window {
         Component { id: automationsPage; AutomationsPage { onConfirmArchive: function(job) { confirm.ask(qsTr("Archive job"), qsTr("Archive '%1'? There is no un-archive.").arg(job.label), qsTr("Archive"), true, function() { bridge.archiveJob(job.id, job.revision) }) } } }
         Component { id: memoryPage; MemoryPage {} }
         Component { id: historyPage; HistoryPage {} }
+        Component { id: projectsPage; ProjectsPage {} }
 
         // Column width grip (Edit Mode): direct while dragging, snapped on release.
         Rectangle {
@@ -396,7 +397,7 @@ Window {
         SequentialAnimation { id: auditionFade; PauseAnimation { duration: 900 } NumberAnimation { target: auditionLabel; property: "opacity"; to: 0; duration: 250 } }
     }
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
-    Shortcut { sequence: "Ctrl+6"; onActivated: root.toggleSettings() }
+    Shortcut { sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }
     Shortcut { sequence: "Escape"; onActivated: {
         if (attachmentPreview.open) attachmentPreview.close()
         else if (palette.open) palette.hide()

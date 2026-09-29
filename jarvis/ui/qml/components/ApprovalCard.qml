@@ -14,9 +14,40 @@ GlassPanel {
         expires_at: qsTr("VISUAL FIXTURE · not an authorization"), session_id:"SAMPLE-SESSION", task_id:"SAMPLE-TASK",
         request_id:"SAMPLE-REQUEST", fingerprint: qsTr("SAMPLE — no approval fingerprint exists"),
         outbound_preview: qsTr("Review the interface composition and summarize the visual differences.\n\nThis text is a non-executable development sample."),
-        attestation: qsTr("No attestation. This fixture cannot approve, deny or execute an action.")
+        attestation: qsTr("No attestation. This fixture cannot approve, deny or execute an action."),
+        project_instruction: qsTr("[Project instruction, exactly as attested]"),
+        project_files: [{ name: "notes.md", chunk_index: 0, classification: "internal", text: qsTr("[Project file excerpt, exactly as attested]") }]
     }) : bridge.approval
     readonly property bool actionable: !fixture && bridge.approvalPending && !bridge.busy
+    // What Core attested beyond the scope (V2.0 Gate 6A): the project
+    // instruction and project-file excerpts, complete and exactly as attested.
+    // Inert plain text: no rich text, no links, no transformation; long
+    // content scrolls inside its section.
+    component AttestedText: Rectangle {
+        id: section
+        property string label: ""
+        property string body: ""
+        property string sectionName: ""
+        width: parent ? parent.width : 0
+        height: visible ? heading.height + Math.min(220, attested.contentHeight + 20) + 6 : 0
+        color: "transparent"
+        Text { id: heading; width: parent.width; text: parent.label; textFormat: Text.PlainText; wrapMode: Text.Wrap
+               color: Theme.textMuted; font: Theme.label }
+        Rectangle {
+            y: heading.height + 6; width: parent.width; height: Math.min(220, attested.contentHeight + 20)
+            radius: 7; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.border
+            Flickable {
+                anchors.fill: parent; anchors.margins: 10; contentHeight: attested.contentHeight; clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                TextEdit { id: attested; objectName: section.sectionName; width: parent.width
+                           text: section.body; readOnly: true; selectByMouse: true
+                           textFormat: TextEdit.PlainText; wrapMode: TextEdit.WrapAnywhere
+                           color: Theme.textLabel; font: Theme.code }
+            }
+        }
+    }
+
     signal dismissFixture()
     raised: true; padding: width < 600 ? 20 : 28; brackets: true
     border.color: Theme.alpha(Theme.warning, 0.65)
@@ -58,6 +89,17 @@ GlassPanel {
                     TextEdit { id: outbound; objectName: "approvalOutbound"; width: parent.width; text: card.snapshot.outbound_preview || ""; readOnly: true; selectByMouse: true; wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; color: Theme.textLabel; font: Theme.code }
                     ScrollBar.vertical: ScrollBar {}
                 }
+            }
+            AttestedText { visible: !!card.snapshot.project_instruction; sectionName: "approvalInstruction"
+                           label: qsTr("PROJECT INSTRUCTION · attested, sent with this request")
+                           body: card.snapshot.project_instruction || "" }
+            Repeater {
+                model: card.snapshot.project_files || []
+                AttestedText { sectionName: "approvalExcerpt"
+                               label: modelData.chunk_index >= 0
+                                      ? qsTr("PROJECT FILE EXCERPT · %1 · part %2 · %3").arg(modelData.name).arg(modelData.chunk_index + 1).arg(modelData.classification)
+                                      : qsTr("PROJECT FILE EXCERPTS")
+                               body: modelData.text }
             }
             Column { width: parent.width
                 Repeater { model: [

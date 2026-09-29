@@ -280,6 +280,39 @@ def _compact(block: Any, limit: int = 3000) -> str:
     return text if len(text) <= limit else text[:limit] + "\n... [truncated for display]"
 
 
+#: Preview fields shown as their own sections, never inside the compact dump.
+_ATTESTED_SECTIONS = ("project_instruction", "project_files")
+
+
+def _preview_rest(preview: Any) -> Any:
+    if not isinstance(preview, dict):
+        return preview
+    return {key: value for key, value in preview.items() if key not in _ATTESTED_SECTIONS}
+
+
+def _attested_text(value: Any) -> str:
+    """Exactly the attested characters - no trimming, no truncation."""
+    return value if isinstance(value, str) else ""
+
+
+def _attested_excerpts(value: Any) -> list[dict[str, Any]]:
+    """The attested project-files block as sections: provenance and the exact
+    excerpt text, complete. A block that cannot be read as the canonical
+    shape is shown whole as one raw section rather than dropped."""
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        block = json.loads(value)
+        excerpts = block["excerpts"]
+        return [
+            {"name": str(item["name"]), "chunk_index": int(item["chunk_index"]),
+             "classification": str(item.get("classification") or ""), "text": item["text"]}
+            for item in excerpts if isinstance(item.get("text"), str)
+        ]
+    except (ValueError, TypeError, KeyError):
+        return [{"name": "", "chunk_index": -1, "classification": "", "text": value}]
+
+
 def error_entries(error: Any) -> list[dict[str, str]]:
     code, message = str(_get(error, "code")), str(_get(error, "message"))
     if code == UNKNOWN_CODE:
@@ -535,9 +568,14 @@ def approval_card(payload: Any) -> dict[str, Any]:
         "expires_at": str(approval.get("expires_at") or ""),
         "request_id": str(approval.get("request_id") or ""),
         "fingerprint": str(approval.get("fingerprint") or ""),
+        # The rest of the preview keeps its compact display; the attested
+        # project instruction and project-file excerpts are shown on their
+        # own, complete and exactly as attested (Gate 6A).
         "outbound_preview": (
-            _compact(approval["outbound_preview"], 2000) if approval.get("outbound_preview") else ""
+            _compact(_preview_rest(approval["outbound_preview"]), 2000) if approval.get("outbound_preview") else ""
         ),
+        "project_instruction": _attested_text(_get(preview, "project_instruction")),
+        "project_files": _attested_excerpts(_get(preview, "project_files")),
         "attestation": _compact(approval["attestation"], 2000) if approval.get("attestation") else "",
         "task_id": str(_get(_get(payload, "task"), "id") or ""),
         "session_id": str(_get(_get(payload, "session"), "id") or ""),

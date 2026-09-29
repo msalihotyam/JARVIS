@@ -46,7 +46,7 @@ from jarvis.context_items import (
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration
-from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
+from jarvis.ui.backend import ATTACHMENT_SUPPORT, HISTORY_LIMIT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
 from jarvis.ui.telemetry import Sampler
@@ -254,6 +254,21 @@ class Bridge(QObject):
         # that does not verify is never opened and nothing from it is used.
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
         self._conversation_list: list[dict] = []
+        # Gate 6A: the open conversation's owner, as the store reports it
+        # ({} = Global). Context only: nothing here is authority.
+        self._conversation_owner: dict[str, Any] = {}
+        # The Projects page: every project (names shown, ids internal), the
+        # one whose detail is open, its conversations and its jobs, and the
+        # last answer Core gave to a lifecycle request (shown as returned).
+        self._project_records: list[dict] = []
+        self._open_project = ""
+        self._project_conversations: list[dict] = []
+        self._project_jobs: list[dict] = []
+        self._project_jobs_bounded = False
+        self._project_notice = ""
+        # The Projects page is window-only: never persisted, so a release that
+        # does not know it never reads it (preferences stay rollback-safe).
+        self._page_override = ""
         self._conversation_store = self._open_startup_conversation()
         self._refresh_conversations()
         self._approval: dict[str, Any] = {}
@@ -540,7 +555,25 @@ class Bridge(QObject):
                                   else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()))}
             for r in records
         ]
+        self._conversation_owner = self._owner_of(store, self._conversation_store.id if hasattr(self, "_conversation_store") else None)
         self.conversationChanged.emit()
+
+    @staticmethod
+    def _owner_of(store: Any, conversation_id: str | None) -> dict[str, Any]:
+        """The owner project of a conversation as the store reports it:
+        ``{}`` for Global (or when it cannot be read)."""
+        if store is None or not conversation_id:
+            return {}
+        try:
+            record = store.load_conversation(conversation_id)
+            if record is None or record.project_id is None:
+                return {}
+            project = store.load_project(record.project_id)
+        except Exception:  # noqa: BLE001 - a label only
+            return {}
+        if project is None:
+            return {"id": record.project_id, "name": record.project_id, "active": False}
+        return {"id": project.id, "name": project.name, "active": bool(project.active)}
 
     @Property("QVariantList", notify=conversationChanged)
     def conversations(self) -> list:
@@ -600,6 +633,150 @@ class Bridge(QObject):
         self._activate(opened)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"),
                     (len(opened.state.turns),)), "system")
+        return True
+
+    # -- projects (Gate 6A): the window's view of the Gate 1-5 project model --
+    #
+    # Presentation and existing canonical paths only. Lifecycle changes go
+    # through the app-level explicit-user results; a new project conversation
+    # goes through the store's own creation path, which refuses an unknown or
+    # archived owner by itself. Core's refusals are shown as returned.
+
+    projectsChanged = Signal()
+
+    @Property(dict, notify=conversationChanged)
+    def conversationProject(self) -> dict:
+        """The open conversation's owner: name and state, or Global."""
+        owner = self._conversation_owner
+        if not owner:
+            return {"id": "", "name": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Global")), "global": True, "archived": False}
+        return {"id": owner["id"], "name": owner["name"], "global": False, "archived": not owner["active"]}
+
+    @Property(bool, notify=conversationChanged)
+    def conversationReadOnly(self) -> bool:
+        """The open conversation belongs to an archived project. Presentation
+        only: Core's archive refusals remain the enforcement."""
+        return bool(self._conversation_owner) and not self._conversation_owner.get("active", False)
+
+    @Property("QVariantList", notify=projectsChanged)
+    def projectRecords(self) -> list:
+        return [dict(record) for record in self._project_records]
+
+    @Property(dict, notify=projectsChanged)
+    def openProject(self) -> dict:
+        return next((dict(r) for r in self._project_records if r["id"] == self._open_project), {})
+
+    @Property("QVariantList", notify=projectsChanged)
+    def projectConversations(self) -> list:
+        return [{**row, "active": row["id"] == self._conversation_store.id} for row in self._project_conversations]
+
+    @Property("QVariantList", notify=projectsChanged)
+    def projectJobs(self) -> list:
+        return list(self._project_jobs)
+
+    @Property(bool, notify=projectsChanged)
+    def projectJobsBounded(self) -> bool:
+        """The job listing is the store's FIRST N by creation: when it is full,
+        this project may have more jobs than it shows."""
+        return self._project_jobs_bounded
+
+    @Property(int, constant=True)
+    def projectJobsLimit(self) -> int:
+        return HISTORY_LIMIT
+
+    @Property(str, notify=projectsChanged)
+    def projectNotice(self) -> str:
+        return self._project_notice
+
+    @Slot()
+    def refreshProjects(self) -> None:
+        self._project_records = self.backend.project_records()
+        if self._open_project and not any(r["id"] == self._open_project for r in self._project_records):
+            self._open_project = ""
+        self._load_project_detail()
+        self._conversation_owner = self._owner_of(self._conversation_db(), self._conversation_store.id)
+        self.conversationChanged.emit()
+        self.projectsChanged.emit()
+
+    def _load_project_detail(self) -> None:
+        self._project_conversations, self._project_jobs, self._project_jobs_bounded = [], [], False
+        if not self._open_project:
+            return
+        store = self._conversation_db()
+        try:
+            records = store.list_conversations(project_id=self._open_project) if store is not None else []
+        except Exception:  # noqa: BLE001 - storage boundary
+            records = []
+        self._project_conversations = [
+            {"id": r.id, "updated_at": r.updated_at,
+             "title": r.title or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"))}
+            for r in records
+        ]
+        payload = self.backend.jobs(True)
+        listing = rows(payload, "jobs", "id")
+        self._project_jobs = [job for job in listing if job.get("project_id") == self._open_project]
+        limit = payload.get("limit") if isinstance(payload, dict) else None
+        self._project_jobs_bounded = isinstance(limit, int) and len(listing) >= limit
+
+    @Slot(str)
+    def showProject(self, project_id: str) -> None:
+        """Open a project's detail on the Projects page ("" = the list)."""
+        self._open_project = str(project_id)
+        self._project_notice = ""
+        self.setPage("projects")
+        self.refreshProjects()
+
+    @Slot()
+    def showOwner(self) -> None:
+        """The top-bar badge: the open conversation's project, or History."""
+        owner = self._conversation_owner
+        if owner:
+            self.showProject(owner["id"])
+        else:
+            self.setPage("history")
+
+    def _project_answer(self, payload: Any) -> None:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        self._project_notice = str(error.get("message") or "") if isinstance(error, dict) else ""
+        self.refreshProjects()
+
+    @Slot(str)
+    def createProject(self, name: str) -> None:
+        self._run("project", lambda: self.backend.project_create(str(name)), self._project_answer)
+
+    @Slot(str, str)
+    def renameProject(self, project_id: str, name: str) -> None:
+        self._run("project", lambda: self.backend.project_lifecycle("rename", str(project_id), str(name)),
+                  self._project_answer)
+
+    @Slot(str)
+    def archiveProject(self, project_id: str) -> None:
+        self._run("project", lambda: self.backend.project_lifecycle("archive", str(project_id)), self._project_answer)
+
+    @Slot(str)
+    def unarchiveProject(self, project_id: str) -> None:
+        self._run("project", lambda: self.backend.project_lifecycle("unarchive", str(project_id)), self._project_answer)
+
+    @Slot(str, result=bool)
+    def newProjectConversation(self, project_id: str) -> bool:
+        """A new conversation OWNED by ``project_id``, opened. The store's own
+        creation path decides: an unknown or archived owner is refused inside
+        its write transaction and nothing is created. The owner is fixed."""
+        if self._busy:
+            return False
+        store = self._conversation_db()
+        if store is None:
+            return False
+        try:
+            record = store.create_conversation(str(project_id))
+        except Exception as exc:  # noqa: BLE001 - storage boundary: shown as returned
+            self._project_notice = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            self.projectsChanged.emit()
+            return False
+        self._project_notice = ""
+        self._activate(PersistedConversation(store, record.id))
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()), "system")
+        self.refreshProjects()
         return True
 
     def _session_conversation(self, session_id: str) -> str | None:
@@ -2129,6 +2306,8 @@ class Bridge(QObject):
     @Slot(str, bool)
     def refreshMemory(self, project_id: str, include_inactive: bool) -> None:
         self._projects = self.backend.projects()
+        self._project_records = self.backend.project_records()
+        self.projectsChanged.emit()
         project = str(project_id) if project_id in self._projects else (self._projects[0] if self._projects else "")
         if not project:
             self._memory = []
@@ -2405,6 +2584,9 @@ class Bridge(QObject):
                         "reason": ph(QT_TRANSLATE_NOOP("Bridge", "[Why approval is required]")),
                         "expires_at": ph(QT_TRANSLATE_NOOP("Bridge", "[expiry]")), "request_id": "DEV-FIXTURE", "fingerprint": "DEV-FIXTURE",
                         "outbound_preview": ph(QT_TRANSLATE_NOOP("Bridge", "[Outbound preview]")), "complete": complete, "actionable": False,
+                        "project_instruction": ph(QT_TRANSLATE_NOOP("Bridge", "[Project instruction, exactly as attested]")),
+                        "project_files": [{"name": "notes.md", "chunk_index": 0, "classification": "internal",
+                                           "text": ph(QT_TRANSLATE_NOOP("Bridge", "[Project file excerpt, exactly as attested]"))}],
                         "hold": ph(QT_TRANSLATE_NOOP("Bridge", "DEV FIXTURE · not a live approval request")) if complete
                                 else ph(QT_TRANSLATE_NOOP("Bridge", "Approval details unavailable"))}
             items.append({"key": "approval", "level": 2, "tone": "warning", "label": ph(QT_TRANSLATE_NOOP("Bridge", "Your approval is required"))})
@@ -2515,11 +2697,18 @@ class Bridge(QObject):
 
     @Property(str, notify=prefsChanged)
     def page(self) -> str:
-        return self.prefs.data["page"]
+        return self._page_override or self.prefs.data["page"]
 
     @Slot(str)
     def setPage(self, page: str) -> None:
+        if page == "projects":
+            if not self._page_override:
+                self._page_override = "projects"
+                self.refreshProjects()
+            self.prefsChanged.emit()
+            return
         if page in PAGES:
+            self._page_override = ""
             self.prefs.data["page"] = page
             self.prefs.save()
             self.prefsChanged.emit()

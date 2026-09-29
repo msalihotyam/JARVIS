@@ -35,6 +35,8 @@ from jarvis.app import (
     job_enablement_result,
     job_list_result,
     memory_list_result,
+    project_create_result,
+    project_lifecycle_result,
     sessions_result,
     show_result,
     status_payload,
@@ -405,6 +407,28 @@ class Backend:
             return [p.id for p in self._memory(loaded.settings).list_projects() if p.active]
         except Exception:  # noqa: BLE001 - a broken store lists nothing
             return []
+
+    def project_records(self) -> list[dict[str, Any]]:
+        """Every readable project (active and archived) as the store lists it:
+        id, name, active, created_at. Names are what the window shows; ids
+        stay internal."""
+        loaded = self.store.load()
+        if not loaded.usable:
+            return []
+        try:
+            return [p.to_dict() for p in self._memory(loaded.settings).list_projects()]
+        except Exception:  # noqa: BLE001 - a broken store lists nothing
+            return []
+
+    def project_create(self, name: str) -> dict:
+        """The existing explicit-user create path (opaque id)."""
+        return self._call("project-create", lambda s: project_create_result(self._memory(s), s, None, name))
+
+    def project_lifecycle(self, action: str, project_id: str, name: str | None = None) -> dict:
+        """rename / archive / unarchive through the existing app path."""
+        return self._call(f"project-{action}", lambda s: project_lifecycle_result(
+            self._memory(s), s, action, project_id, name
+        ))
 
     def memory_list(self, project_id: str, include_inactive: bool = False) -> dict:
         return self._call("memory-list", lambda s: memory_list_result(

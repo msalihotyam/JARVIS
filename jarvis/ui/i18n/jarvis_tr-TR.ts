@@ -32,6 +32,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Onay belgesi yok. Bu örnek bir işlemi onaylayamaz, reddedemez veya yürütemez.</translation>
     </message>
     <message>
+        <source>[Project instruction, exactly as attested]</source>
+        <translation>[Proje talimatı, tasdik edildiği haliyle]</translation>
+    </message>
+    <message>
+        <source>[Project file excerpt, exactly as attested]</source>
+        <translation>[Proje dosyası alıntısı, tasdik edildiği haliyle]</translation>
+    </message>
+    <message>
         <source>AUTHORIZATION REQUIRED</source>
         <translation>YETKİLENDİRME GEREKLİ</translation>
     </message>
@@ -70,6 +78,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>OUTBOUND PREVIEW</source>
         <translation>GİDEN VERİ ÖNİZLEMESİ</translation>
+    </message>
+    <message>
+        <source>PROJECT INSTRUCTION · attested, sent with this request</source>
+        <translation>PROJE TALİMATI · tasdikli, bu istekle gönderilir</translation>
+    </message>
+    <message>
+        <source>PROJECT FILE EXCERPT · %1 · part %2 · %3</source>
+        <translation>PROJE DOSYASI ALINTISI · %1 · bölüm %2 · %3</translation>
+    </message>
+    <message>
+        <source>PROJECT FILE EXCERPTS</source>
+        <translation>PROJE DOSYASI ALINTILARI</translation>
     </message>
     <message>
         <source>Connector</source>
@@ -334,6 +354,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Opened a conversation (%1 turns)</source>
         <translation>Bir konuşma açıldı (%1 tur)</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
     </message>
     <message>
         <source>A reply for another conversation was saved there</source>
@@ -621,6 +645,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>[Giden veri önizlemesi]</translation>
     </message>
     <message>
+        <source>[Project instruction, exactly as attested]</source>
+        <translation>[Proje talimatı, tasdik edildiği haliyle]</translation>
+    </message>
+    <message>
+        <source>[Project file excerpt, exactly as attested]</source>
+        <translation>[Proje dosyası alıntısı, tasdik edildiği haliyle]</translation>
+    </message>
+    <message>
         <source>DEV FIXTURE · not a live approval request</source>
         <translation>DEV FIXTURE · gerçek bir onay isteği değil</translation>
     </message>
@@ -786,6 +818,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Geçmiş</translation>
     </message>
     <message>
+        <source>Projects</source>
+        <translation>Projeler</translation>
+    </message>
+    <message>
         <source>Good morning, %1.</source>
         <translation>Günaydın, %1.</translation>
     </message>
@@ -921,6 +957,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Metin ve kod (%1)</translation>
     </message>
     <message>
+        <source>Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.</source>
+        <translation>Salt okunur: bu konuşma arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.</translation>
+    </message>
+    <message>
         <source>Permission mode: %1</source>
         <translation>İzin modu: %1</translation>
     </message>
@@ -951,6 +991,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Only the item you choose is read. JARVIS gets no access to your files.</source>
         <translation>Yalnızca seçtiğiniz öge okunur. JARVIS dosyalarınıza erişim kazanmaz.</translation>
+    </message>
+    <message>
+        <source>Read-only: the project is archived</source>
+        <translation>Salt okunur: proje arşivlendi</translation>
     </message>
     <message>
         <source>Answer the pending approval first</source>
@@ -1917,6 +1961,10 @@ yok</translation>
         <source>History</source>
         <translation>Geçmiş</translation>
     </message>
+    <message>
+        <source>Projects</source>
+        <translation>Projeler</translation>
+    </message>
 </context>
 <context>
     <name>PanelColumn</name>
@@ -2435,6 +2483,7 @@ Konu: %4
     <message>
         <source>OUTCOME UNKNOWN [%1]: %2
 The action may or may not have happened. JARVIS will NOT retry it. Operator resolution is required (&apos;jarvis task orphan&apos; / &apos;jarvis task resolve&apos;) before doing it again.</source>
+        <extracomment>Preview fields shown as their own sections, never inside the compact dump.</extracomment>
         <translation>SONUÇ BİLİNMİYOR [%1]: %2
 İşlem gerçekleşmiş de olabilir, gerçekleşmemiş de. JARVIS bunu yeniden DENEMEYECEK. Tekrar yapmadan önce operatör çözümü gerekir (&apos;jarvis task orphan&apos; / &apos;jarvis task resolve&apos;).</translation>
     </message>
@@ -2530,6 +2579,105 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Awaiting approval - resume this task to review the exact request.</source>
         <translation>Onay bekleniyor - isteğin kendisini incelemek için bu görevi sürdürün.</translation>
+    </message>
+</context>
+<context>
+    <name>ProjectsPage</name>
+    <message>
+        <source>Projects</source>
+        <translation>Projeler</translation>
+    </message>
+    <message>
+        <source>Refresh</source>
+        <translation>Yenile</translation>
+    </message>
+    <message>
+        <source>Unarchive</source>
+        <translation>Arşivden çıkar</translation>
+    </message>
+    <message>
+        <source>New project name</source>
+        <translation>Yeni proje adı</translation>
+    </message>
+    <message>
+        <source>Create</source>
+        <translation>Oluştur</translation>
+    </message>
+    <message>
+        <source>ACTIVE</source>
+        <translation>ETKİN</translation>
+    </message>
+    <message>
+        <source>No active project yet.</source>
+        <translation>Henüz etkin proje yok.</translation>
+    </message>
+    <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİVLENMİŞ</translation>
+    </message>
+    <message>
+        <source>Choose a project to see its conversations.</source>
+        <translation>Konuşmalarını görmek için bir proje seçin.</translation>
+    </message>
+    <message>
+        <source>Archived: this project is read-only. Its conversations are kept and can be read, but nothing new runs in it until you unarchive it.</source>
+        <translation>Arşivlendi: bu proje salt okunur. Konuşmaları saklanır ve okunabilir, ama arşivden çıkarana kadar bu projede yeni bir iş çalışmaz.</translation>
+    </message>
+    <message>
+        <source>New name</source>
+        <translation>Yeni ad</translation>
+    </message>
+    <message>
+        <source>Rename</source>
+        <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Archive</source>
+        <translation>Arşivle</translation>
+    </message>
+    <message>
+        <source>CONVERSATIONS</source>
+        <translation>KONUŞMALAR</translation>
+    </message>
+    <message>
+        <source>New conversation in %1</source>
+        <translation>%1 içinde yeni konuşma</translation>
+    </message>
+    <message>
+        <source>open</source>
+        <translation>açık</translation>
+    </message>
+    <message>
+        <source>No conversation in this project yet.</source>
+        <translation>Bu projede henüz konuşma yok.</translation>
+    </message>
+    <message>
+        <source>SCHEDULED JOBS · among the first %1 jobs created; this project may have more</source>
+        <translation>ZAMANLANMIŞ İŞLER · oluşturulan ilk %1 iş arasından; bu projenin daha fazla işi olabilir</translation>
+    </message>
+    <message>
+        <source>SCHEDULED JOBS</source>
+        <translation>ZAMANLANMIŞ İŞLER</translation>
+    </message>
+    <message>
+        <source>(unreadable definition)</source>
+        <translation>(okunamayan tanım)</translation>
+    </message>
+    <message>
+        <source>archived</source>
+        <translation>arşivlendi</translation>
+    </message>
+    <message>
+        <source>enabled</source>
+        <translation>etkin</translation>
+    </message>
+    <message>
+        <source>disabled</source>
+        <translation>devre dışı</translation>
+    </message>
+    <message>
+        <source>No scheduled job for this project.</source>
+        <translation>Bu proje için zamanlanmış iş yok.</translation>
     </message>
 </context>
 <context>
@@ -2683,6 +2831,18 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>not reversible</source>
         <translation>geri alınamaz</translation>
+    </message>
+    <message>
+        <source>PROJECT INSTRUCTION · attested, sent with this request</source>
+        <translation>PROJE TALİMATI · tasdikli, bu istekle gönderilir</translation>
+    </message>
+    <message>
+        <source>PROJECT FILE EXCERPT · %1 · part %2 · %3</source>
+        <translation>PROJE DOSYASI ALINTISI · %1 · bölüm %2 · %3</translation>
+    </message>
+    <message>
+        <source>PROJECT FILE EXCERPTS</source>
+        <translation>PROJE DOSYASI ALINTILARI</translation>
     </message>
     <message>
         <source>Hide action details</source>
@@ -3445,6 +3605,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>THINKS AHEAD FOR YOU</source>
         <translation>SİZİN İÇİN ÖNCEDEN DÜŞÜNÜR</translation>
+    </message>
+    <message>
+        <source>archived</source>
+        <translation>arşivlendi</translation>
     </message>
     <message>
         <source>Pending</source>

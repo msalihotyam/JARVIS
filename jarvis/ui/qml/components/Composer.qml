@@ -23,8 +23,11 @@ Item {
     property int maxHeight: 180
     readonly property int vpad: 8
     readonly property int barHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
-    implicitHeight: strip.height + barHeight
-    property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused
+    implicitHeight: readOnlyBanner.height + (readOnlyBanner.visible ? 6 : 0) + strip.height + barHeight
+    // An archived project's conversation is read-only (V2.0 Gate 6A). Presentation
+    // only: Core refuses the work anyway (ARCHITECTURE 4.22).
+    property bool readOnly: bridge.conversationReadOnly
+    property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused || readOnly
     // Attached items travel WITH a message; the request itself is still the words
     // the person writes, so an empty draft sends nothing.
     property bool canSend: !blocked && input.text.trim() !== ""
@@ -76,10 +79,22 @@ Item {
     }
 
     // The draft's context items, above the bar and in their own order.
+    Rectangle {
+        id: readOnlyBanner
+        objectName: "readOnlyBanner"
+        anchors { left: parent.left; right: parent.right; top: parent.top }
+        visible: composer.readOnly
+        height: visible ? readOnlyText.height + 18 : 0
+        radius: 8; color: Theme.alpha(Theme.warning, 0.10); border.width: 1; border.color: Theme.alpha(Theme.warning, 0.5)
+        Text { id: readOnlyText; objectName: "readOnlyReason"; x: 12; y: 9; width: parent.width - 24; wrapMode: Text.Wrap
+               color: Theme.warning; font: Theme.caption
+               text: qsTr("Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.").arg((bridge.conversationProject || {}).name || "") }
+    }
+
     ContextStrip {
         id: strip
         objectName: "composerContext"
-        anchors { left: parent.left; right: parent.right; top: parent.top }
+        anchors { left: parent.left; right: parent.right; top: readOnlyBanner.bottom; topMargin: readOnlyBanner.visible ? 6 : 0 }
         onPickRequested: function(kind, groupId) { composer.pick(kind, groupId) }
     }
 
@@ -121,7 +136,7 @@ Item {
         anchors.left: parent.left; anchors.leftMargin: 8; anchors.bottom: parent.bottom; anchors.bottomMargin: 10
         width: chipRow.width + 18; height: 32
         readonly property var current: composer.modeInfo(bridge.permissionMode)
-        enabled: !bridge.busy && !bridge.configRefused
+        enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
         opacity: enabled ? 1 : 0.5
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Permission mode: %1").arg(current ? current.name : qsTr("Unknown"))
@@ -179,7 +194,7 @@ Item {
         anchors.left: permissionChip.right; anchors.leftMargin: 6
         anchors.bottom: parent.bottom; anchors.bottomMargin: 10
         width: 32; height: 32
-        enabled: !bridge.busy && !bridge.configRefused
+        enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
         opacity: enabled ? 1 : 0.5
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Attach a file or an image")
@@ -232,7 +247,8 @@ Item {
             padding: 0
             wrapMode: TextArea.Wrap
             verticalAlignment: TextEdit.AlignVCenter
-            placeholderText: bridge.approvalPending ? qsTr("Answer the pending approval first")
+            placeholderText: composer.readOnly ? qsTr("Read-only: the project is archived")
+                            : bridge.approvalPending ? qsTr("Answer the pending approval first")
                             : bridge.configRefused ? qsTr("Configuration refused - repair it with: %1").arg("jarvis config reset --all")
                             : (bridge.task.status === "awaiting_clarification" ? qsTr("Answer JARVIS's question…") : qsTr("Message JARVIS…"))
             // The invitation has a face of its own (Inter Medium, Theme.composerPlaceholder):
@@ -250,7 +266,7 @@ Item {
             Binding { target: input.placeholderItem; property: "font"; value: Theme.composerPlaceholder; when: input.placeholderItem !== null }
             background: null
             selectByMouse: true
-            enabled: !bridge.configRefused
+            enabled: !bridge.configRefused && !composer.readOnly
             Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
             Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else composer.submit() }
             // Paste: the same single route as the menu's Paste (composer.paste).

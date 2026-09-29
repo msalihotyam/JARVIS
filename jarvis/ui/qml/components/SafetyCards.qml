@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls.Basic
 import "../theme"
 
 // The conversation's safety cards, at the end of the stream on the JARVIS
@@ -71,6 +72,35 @@ Column {
                    color: parent.vColor; font: Theme.uiValue }
         Rectangle { width: parent.width; height: 1; anchors.bottom: parent.bottom; color: Theme.glassSeparator }
     }
+    // What Core attested beyond the scope (V2.0 Gate 6A): the project
+    // instruction and project-file excerpts, complete and exactly as attested.
+    // Inert plain text: no rich text, no links, no transformation; long
+    // content scrolls inside its section.
+    component AttestedText: Rectangle {
+        id: section
+        property string label: ""
+        property string body: ""
+        property string sectionName: ""
+        width: parent ? parent.width : 0
+        height: visible ? heading.height + Math.min(220, attested.contentHeight + 20) + 6 : 0
+        color: "transparent"
+        Text { id: heading; width: parent.width; text: parent.label; textFormat: Text.PlainText; wrapMode: Text.Wrap
+               color: Theme.textMuted; font: Theme.label }
+        Rectangle {
+            y: heading.height + 6; width: parent.width; height: Math.min(220, attested.contentHeight + 20)
+            radius: 7; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.border
+            Flickable {
+                anchors.fill: parent; anchors.margins: 10; contentHeight: attested.contentHeight; clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                TextEdit { id: attested; objectName: section.sectionName; width: parent.width
+                           text: section.body; readOnly: true; selectByMouse: true
+                           textFormat: TextEdit.PlainText; wrapMode: TextEdit.WrapAnywhere
+                           color: Theme.textLabel; font: Theme.code }
+            }
+        }
+    }
+
     component Heading: Text {
         renderType: Theme.textRender
         activeFocusOnTab: true
@@ -138,6 +168,17 @@ Column {
                 Field { k: qsTr("Authority"); v: approvalCard.a.data_classification ? qsTr("This request only · %1 data").arg(approvalCard.a.data_classification) : qsTr("This request only") }
                 Field { visible: !!approvalCard.a.effect; k: qsTr("Consequence")
                         v: cards.effectWord(approvalCard.a.effect || "") + " · " + (approvalCard.a.reversible ? qsTr("reversible") : qsTr("not reversible")) }
+            }
+            AttestedText { visible: !!approvalCard.a.project_instruction; sectionName: "approvalInstruction"
+                           label: qsTr("PROJECT INSTRUCTION · attested, sent with this request")
+                           body: approvalCard.a.project_instruction || "" }
+            Repeater {
+                model: approvalCard.a.project_files || []
+                AttestedText { sectionName: "approvalExcerpt"
+                               label: modelData.chunk_index >= 0
+                                      ? qsTr("PROJECT FILE EXCERPT · %1 · part %2 · %3").arg(modelData.name).arg(modelData.chunk_index + 1).arg(modelData.classification)
+                                      : qsTr("PROJECT FILE EXCERPTS")
+                               body: modelData.text }
             }
             // Review action details: what Core attached to the exact request.
             Item {

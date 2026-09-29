@@ -3340,3 +3340,30 @@ değildir (yol haritası V2.0).
   konuşma geçmişi; sağlayıcıya zaten gönderilmiş içerik. Görev anlık
   görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
   metni tutmaz.
+
+### 4.25 Projects penceresi (V2 Projects Gate 6A, uygulandı)
+
+Pencere proje modelini gösterir ve mevcut kanonik yolları çağırır; hiçbir şeye
+kendisi karar vermez.
+
+- **Yalnız sunum:** proje oluşturma/yeniden adlandırma/arşivleme/arşivden
+  çıkarma mevcut açık-kullanıcı app yollarından (`project_create_result`,
+  `project_lifecycle_result`) geçer ve Core'un reddi olduğu gibi gösterilir.
+  Proje konuşması deponun kendi yolu `create_conversation(project_id)` ile
+  oluşturulur; bilinmeyen veya arşivlenmiş sahibi o yol reddeder, köprü kendi
+  sahiplik mantığını eklemez. Taşıma yoktur. Arşivlenmiş projede besteleyicinin
+  kapatılması yalnız sunumdur; zorlama §4.22'deki Core reddidir.
+- **Adlar, kimlikler değil:** pencere proje ADINI gösterir; opak kimlikler
+  içeride kalır. Üst çubuktaki rozet açık konuşmanın sahibini (veya Global'i)
+  gösterir ve yalnız o projenin sayfasına (Global -> History) götürür.
+- **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
+  tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
+- **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje
+  dosyası alıntılarını (dosya adı, parça sırası, sınıf ile) ayrı, kaydırılabilir
+  bölümlerde, kırpmadan ve tasdik edildiği karakterlerle gösterir. Gösterim
+  eylemsiz düz metindir (PlainText; zengin metin/HTML/markdown yorumu, bağlantı
+  algılama veya etkinleştirme, metin dönüştürme yoktur). Yalnız gösterimdir:
+  fingerprint, tasdik ve yük baytları değişmez.
+- **İş listesi dürüstlüğü:** projenin işleri mevcut sınırlı listeden süzülür;
+  liste deponun oluşturma sırasına göre İLK N kaydıdır, bu yüzden dolduğunda
+  "ilk N iş arasından; daha fazlası olabilir" denir, asla "tümü" denmez.

@@ -729,11 +729,12 @@ class LayoutTests(UiTestCase):
         self.assertTrue(root.property("settingsOpen"))
         click("settingsOrb")
         self.assertFalse(root.property("settingsOpen"))
-        # Ctrl+6 toggles both ways; the close control closes.
-        QTest.keyClick(root, Qt.Key_6, Qt.ControlModifier)
+        # toggleSettings toggles both ways; the close control closes. (Ctrl+6 is
+        # the Projects page since V2.0 Gate 6A - Salih decision 2026-09-29.)
+        QMetaObject.invokeMethod(root, "toggleSettings")
         pump(40)
         self.assertTrue(root.property("settingsOpen"))
-        QTest.keyClick(root, Qt.Key_6, Qt.ControlModifier)
+        QMetaObject.invokeMethod(root, "toggleSettings")
         pump(40)
         self.assertFalse(root.property("settingsOpen"))
         QMetaObject.invokeMethod(root, "toggleSettings")

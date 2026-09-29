@@ -253,10 +253,47 @@ Item {
             Text { id: tipText; anchors.centerIn: parent; text: qsTr("Settings"); color: Theme.text; font: Theme.caption }
         }
     }
-    Text { objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
+    Text { id: wordmark; objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
            lineHeightMode: Text.FixedHeight; lineHeight: 34 }
     Text { objectName: "brandTagline"; x: 122; y: 55; text: qsTr("THINKS AHEAD FOR YOU"); color: Theme.textLabel; font: Theme.hudLabel
            lineHeightMode: Text.FixedHeight; lineHeight: 16 }
+
+    // The open conversation's project, or Global (V2.0 Gate 6A). A label and a
+    // way to that project's page - never a switch: a conversation's owner is
+    // fixed at creation. Context only, never authority.
+    Rectangle {
+        id: projectBadge
+        objectName: "projectBadge"
+        parent: bar.controlLayer || bar
+        visible: bridge.page === "home"
+        readonly property var owner: bridge.conversationProject || ({})
+        readonly property color tone: owner.archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
+        x: wordmark.x + wordmark.width + 16
+        y: wordmark.y + 4
+        height: 26; radius: 13
+        // Never wider than the room before the core, whatever the name.
+        width: Math.max(60, Math.min(badgeText.implicitWidth + 13 + 24, 280, core.x - x - 16))
+        color: badgeArea.containsMouse ? Theme.alpha(tone, 0.14) : Theme.alpha(tone, 0.07)
+        border.width: 1; border.color: Theme.alpha(tone, 0.55)
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button; Accessible.name: badgeText.text
+        Keys.onReturnPressed: bridge.showOwner()
+        Keys.onSpacePressed: bridge.showOwner()
+        Row {
+            id: badgeRow
+            x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 7
+            Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: projectBadge.tone }
+            Text {
+                id: badgeText
+                objectName: "projectBadgeText"
+                width: Math.min(implicitWidth, projectBadge.width - 24 - 13)
+                textFormat: Text.PlainText; elide: Text.ElideRight
+                text: (projectBadge.owner.name || "") + (projectBadge.owner.archived ? " · " + qsTr("archived") : "")
+                color: projectBadge.owner.global ? Theme.textLabel : Theme.text; font: Theme.caption
+            }
+        }
+        MouseArea { id: badgeArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bridge.showOwner() }
+    }
 
     LeftContextCard {
         visible: !Theme.command
