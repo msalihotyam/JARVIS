@@ -30,6 +30,14 @@ on main.
 Current installed release: `1.0.0-1c68161` (Chrome runtime), active and
 consistent; previous = `1.0.0-4f5a93d`.
 
+## Roles
+
+- Operational orchestrator: Claude (linked Cowork session with repo
+  access). Architecture/authority reviewer: ChatGPT (one-pass protocol).
+  Final decisions: Salih. Salih decision (2026-09-29); orchestrator trial
+  concluded 2026-09-29. Protocol: `JARVIS_RUNBOOK.md` → "Governance and
+  prompt review".
+
 ## Open blockers
 
 - None.
@@ -63,8 +71,6 @@ consistent; previous = `1.0.0-4f5a93d`.
 - Observed in Gate 4 tests, not investigated: `AgentCore.resume` with a
   `remember_for_session` grant on a non-rememberable claude_code request
   returns EXECUTION_IN_PROGRESS and leaves the task unexecutable.
-- Gate 3 ran `uv run` once: created `.venv` (ignored), rewrote untracked
-  `uv.lock` (no prior copy). Tests: `python -m unittest discover -s tests`.
 - Gate 4B physical Edge retirement is deferred until a normal-use period
   and an explicit user decision.
 - External: the installed app's Claude CLI OAuth session was expired at the

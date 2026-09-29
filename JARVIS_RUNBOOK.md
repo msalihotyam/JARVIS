@@ -99,6 +99,10 @@ Every new session bootstraps from the repo, not from a handoff chain:
 7. Contradictory, or relevant uncommitted work the state file does not
    represent: stop and report the mismatch.
 
+Read-only git inspection from a remote/linked session sets
+`GIT_OPTIONAL_LOCKS=0`, so it never writes the index or leaves
+`.git/index.lock`.
+
 ## Active state file
 
 `JARVIS_ACTIVE_STATE.md` is a short, overwrite-style snapshot of NOW:
@@ -131,7 +135,44 @@ for routine changes. Most work does not need one.
 Codex is an independent reviewer: it is never the implementation worker of
 the same change it reviews.
 
+## Governance and prompt review
+
+Current role holders live in `JARVIS_ACTIVE_STATE.md`, not here.
+
+- **Operational orchestrator:** owns gate planning and orchestration /
+  implementation decisions within the approved scope. Marks every design
+  choice in a prompt as "orchestrator decision" with its source.
+- **Architecture/authority reviewer:** may block a gate only for a concrete
+  conflict with canonical architecture, authority or security invariants.
+- **Salih decides:** unresolved orchestrator/reviewer disagreements and
+  anything genuinely his (product-visible behaviour, security policy, cost,
+  hard to reverse). Recorded as "Salih decision (date)".
+
+**Prompt review protocol:**
+
+- Only gate prompts that contain design go to review. Evidence-completion
+  and small fix prompts go without review.
+- The reviewer gets the prompt AND the orchestrator's evidence pack
+  (file:line facts) together.
+- One pass with ALL findings, each labelled BLOCKER (canonical conflict,
+  security/correctness defect, unsourced assumption the worker would act
+  on) or NIT (wording/clarity). Verdict: READY / READY-WITH-NITS / BLOCKED.
+- Exactly one revision round, then the prompt ships. Re-review only if a
+  fix introduces a new design decision.
+
+**Orchestrator pre-send checklist:**
+
+- Every assumption has a file:line or doc source.
+- Every design choice is marked orchestrator or Salih decision.
+- Empty / cleared / ineligible states are defined.
+- Untrusted text has a tested serialization/escaping boundary.
+- "Visible" says to whom (model payload vs local user).
+- Verification wording matches what will actually run.
+
 ## Testing discipline — TEST BUDGET
+
+Tests run with `python -m unittest discover -s tests` (as
+`scripts/test.ps1`), never `uv run`.
 
 **During implementation:**
 
@@ -149,7 +190,8 @@ the same change it reviews.
 **Full product suite:**
 
 - Run only when the task explicitly requires it.
-- Run it ONCE, at the end.
+- Run it ONCE, at the end, on the exact tree that is committed, with no
+  edits after that run.
 
 If a new concrete blocker or uncovered acceptance criterion appears after the
 final green run, report it instead of silently expanding the task.
