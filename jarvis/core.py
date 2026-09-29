@@ -905,6 +905,11 @@ class AgentCore:
         grant: PermissionGrant | None,
     ) -> AgentRun:
         """Drive the loop, stopping at once if lifecycle authority is lost."""
+        # Gate 3: a persisted task of an archived project does not move
+        # (resume, clarify, chain step); unarchiving lets it continue as-is.
+        refusal = self._inactive_project_refusal(session, task)
+        if refusal is not None:
+            return refusal
         try:
             return self._advance_loop(session, task, grant)
         except _LifecycleLost as lost:
@@ -4837,31 +4842,52 @@ class AgentCore:
         nothing here can auto-create one - and once a session is bound, a
         conflicting reference fails closed. Binding only scopes retrieval; it
         grants no authority of any kind.
+
+        Gate 3: an ALREADY-bound session is re-proved too, so no new task
+        runs under an archived project, even through a session bound to it
+        before the archive.
         """
         requested = task.project_id
-        if requested is None:
-            return None
-        if session.project_id is not None:
-            if session.project_id != requested:
-                return self._input_failure(
-                    task,
-                    ErrorCode.INVALID_TASK,
-                    "Task project does not match the session's project.",
-                    session,
-                )
+        if (
+            requested is not None
+            and session.project_id is not None
+            and session.project_id != requested
+        ):
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                "Task project does not match the session's project.",
+                session,
+            )
+        refusal = self._inactive_project_refusal(session, task, requested)
+        if refusal is not None:
+            return refusal
+        if requested is not None:
+            session.project_id = requested
+        return None
+
+    def _inactive_project_refusal(
+        self, session: SessionState, task: Task | None, project_id: str | None = None
+    ) -> AgentRun | None:
+        """A non-mutating refusal when the session's project (or
+        ``project_id``) is unknown or archived; ``None`` means proceed.
+
+        Project LIFECYCLE, not authority: it is not the execution barrier,
+        and Global (no project) is never refused here."""
+        scope = session.project_id or project_id
+        if scope is None:
             return None
         try:
-            project = self.memory.load_project(requested)
+            project = self.memory.load_project(scope)
         except Exception:  # noqa: BLE001 - storage boundary; fail closed
             project = None
         if project is None or not project.active:
             return self._input_failure(
                 task,
                 ErrorCode.INVALID_TASK,
-                f"Unknown or inactive project: {requested}",
+                f"Unknown or inactive project: {scope}",
                 session,
             )
-        session.project_id = requested
         return None
 
     # ------------------------------------------------------------------
@@ -4977,6 +5003,12 @@ class AgentCore:
                 ),
                 "blocked",
             )
+        # Gate 3: like the kill-switch, an archived project's chain gains no
+        # new step task. Blocked, not failed: unarchiving lets it continue.
+        refusal = self._inactive_project_refusal(session, None)
+        if refusal is not None:
+            bound = chain.step_task_ids[index] if index < len(chain.step_task_ids) else ""
+            return (self.resume(session.id, bound) if bound else refusal), "blocked"
         task, reason = self.build_chain_step_task(session, chain, index)
         if task is None:
             return (

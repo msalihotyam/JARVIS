@@ -1544,12 +1544,46 @@ def _memory_item_payload(item: ProjectMemoryItem) -> dict[str, Any]:
 
 
 def project_create_result(
-    memory: SQLiteMemoryStore, settings: Settings, project_id: str, name: str
+    memory: SQLiteMemoryStore, settings: Settings, project_id: str | None, name: str
 ) -> CommandResult:
+    """Create a project. Without ``project_id`` it gets an opaque id (Gate 3);
+    an explicit slug keeps the original M1 path."""
     command = "project-create"
     try:
-        project = ProjectRecord(id=validate_project_id(project_id), name=name)
-        memory.save_project(project)
+        if project_id is None:
+            project = memory.create_project(name)
+        else:
+            project = ProjectRecord(id=validate_project_id(project_id), name=name)
+            memory.save_project(project)
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+    return CommandResult(
+        {"command": command, "project": project.to_dict()}, EXIT_OK
+    )
+
+
+def project_lifecycle_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    action: str,
+    project_id: str,
+    name: str | None = None,
+) -> CommandResult:
+    """``rename`` / ``archive`` / ``unarchive`` one project. No delete."""
+    command = f"project-{action}"
+    try:
+        if action == "rename":
+            project = memory.rename_project(project_id, name)
+        elif action in ("archive", "unarchive"):
+            project = memory.set_project_active(project_id, action == "unarchive")
+        else:
+            raise ValueError(f"Unknown project action: {action}")
     except ValueError as exc:
         return failure_result(
             command,
@@ -3134,6 +3168,7 @@ class JarvisApp:
         context_attachments: Iterable[Mapping[str, Any]] = (),
         response_mode: str = DEFAULT_RESPONSE_MODE,
         on_reply_preview: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
     ) -> CommandResult:
         """Free text in, the authoritative envelope out.
 
@@ -3170,6 +3205,13 @@ class JarvisApp:
         answered separately. All of it is context: it never selects a
         destination, never grants anything and never changes what JARVIS may
         do - the person's own message does that.
+
+        ``conversation_id`` names the persisted conversation the request came
+        from. Its owner is then the ONLY source of project scope: the task's
+        ``project_id`` (hence session binding and project memory) and the
+        catalog's job project are the owner, Global = none. An unknown
+        conversation, an archived owner or a session bound to another scope
+        is refused before anything runs. Scope is context, never authority.
         """
         request_id = request_id or str(uuid4())
         mode = self.settings.permission_mode
@@ -3201,6 +3243,12 @@ class JarvisApp:
                     mode, IntentStatus.INVALID_INPUT, request_id,
                     message=f"Unknown session: {session_id}", exit_code=EXIT_NOT_FOUND,
                 )
+        scoped = conversation_id is not None
+        owner = session.project_id if session is not None else None
+        if scoped:
+            owner, reason = self._conversation_scope(conversation_id, session)
+            if reason is not None:
+                return refused(IntentStatus.INVALID_INPUT, f"{reason} Nothing was executed.")
         model = self.intent_model
         if model is None:
             return refused(
@@ -3224,8 +3272,9 @@ class JarvisApp:
             self.core.registry,
             self.core.destination_policy,
             self.memory.list_projects(),
-            session.project_id if session is not None else None,
+            owner,
             now,
+            conversation_scoped=scoped,
         )
         if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
             # Strict isolation: one call per group, merged into one reply.
@@ -3339,6 +3388,8 @@ class JarvisApp:
                     IntentStatus.MALFORMED_MODEL_OUTPUT,
                     f"The proposal was refused by the task boundary: {exc} Nothing was executed.",
                 )
+            if scoped:
+                task.project_id = owner
             # From here on the ordinary lifecycle owns everything. No grant
             # is passed: a natural-language request cannot approve itself.
             run = self.core.run(task, session_id)
@@ -3383,6 +3434,39 @@ class JarvisApp:
             destination=resolution.destination,
             choices=resolution.choices,
         )
+
+    def _conversation_scope(
+        self, conversation_id: str, session: SessionState | None
+    ) -> tuple[str | None, str | None]:
+        """``(owner, None)`` or ``(None, refusal)`` for a conversation request.
+
+        Fails closed: an unknown conversation, an archived owner project, or
+        a session bound to a different project or linked to a conversation of
+        a different owner. ``""`` is the window's UNSAVED conversation (no
+        store): Global by construction."""
+        owner = None
+        if conversation_id != "":
+            try:
+                record = self.memory.load_conversation(conversation_id)
+            except (TypeError, ValueError):
+                record = None
+            if record is None:
+                return None, f"Unknown conversation: {conversation_id}."
+            owner = record.project_id
+        if owner is not None:
+            project = self.memory.load_project(owner)
+            if project is None or not project.active:
+                return None, "This conversation's project is archived; it is read-only."
+        if session is None:
+            return owner, None
+        if session.project_id is not None and session.project_id != owner:
+            return None, "The session is bound to another project scope."
+        linked = self.memory.conversation_for_session(session.id)
+        if linked is not None and linked != conversation_id:
+            other = self.memory.load_conversation(linked)
+            if other is None or other.project_id != owner:
+                return None, "The session belongs to a conversation of another project scope."
+        return owner, None
 
     def _research(
         self, query: str, text: str, request_id: str, response_language: str,

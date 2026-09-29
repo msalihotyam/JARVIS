@@ -306,6 +306,9 @@ class IntentCatalog:
     #: The project a job would be created under, when that is unambiguous.
     project_id: str | None
     local_time: str
+    #: True when the request came from a conversation: its owner is then the
+    #: ONLY source of project scope (Global = none, no fallback).
+    conversation_scoped: bool = False
 
     def entry(self, capability: Any) -> CatalogEntry | None:
         for entry in self.entries:
@@ -334,6 +337,8 @@ def build_catalog(
     projects: Iterable[ProjectRecord],
     session_project_id: str | None,
     now: datetime,
+    *,
+    conversation_scoped: bool = False,
 ) -> IntentCatalog:
     """What THIS installation can do right now, from the composed truth.
 
@@ -342,6 +347,10 @@ def build_catalog(
     Its destinations are exactly those rows' destinations. Nothing is read
     from a task, a manifest description, a model answer or a config string
     the composition root did not already turn into a grant.
+
+    ``conversation_scoped``: ``session_project_id`` is the conversation
+    owner and is taken as-is; the single-active-project fallback applies
+    only to requests that do not come from a conversation (the CLI).
     """
     entries: list[CatalogEntry] = []
     for name in registry.list_names():
@@ -368,14 +377,15 @@ def build_catalog(
             entries.append(CatalogEntry(capability, manifest.name, destinations, hint, kind))
     entries.sort(key=lambda entry: entry.capability)
     project_ids = tuple(sorted(p.id for p in projects if p.active))
-    if session_project_id is not None:
+    if session_project_id is not None or conversation_scoped:
         project_id: str | None = session_project_id
     elif len(project_ids) == 1:
         project_id = project_ids[0]
     else:
         project_id = None
     return IntentCatalog(
-        tuple(entries), project_ids, project_id, now.isoformat(timespec="minutes")
+        tuple(entries), project_ids, project_id, now.isoformat(timespec="minutes"),
+        conversation_scoped,
     )
 
 
@@ -790,6 +800,16 @@ def _resolve_job(
     if refusal is not None:
         return refusal
     if catalog.project_id is None:
+        if catalog.conversation_scoped:
+            return Resolution(
+                IntentStatus.UNSUPPORTED,
+                message=(
+                    "Scheduled work belongs to a project, and this is a Global "
+                    "conversation. Schedule it from a project conversation. "
+                    "Nothing was created."
+                ),
+                capability=entry.capability,
+            )
         if not catalog.project_ids:
             return Resolution(
                 IntentStatus.UNSUPPORTED,

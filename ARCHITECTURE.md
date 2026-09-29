@@ -3166,3 +3166,31 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   bağlanır. Sağlayıcı/model değişimi konuşma kimliğini ve geçmişini
   değiştirmez. Yapılandırma reddedildiğinde konuşma yalnızca pencere ömrü
   boyunca tutulur ve kaydedilemediği söylenir.
+- **Proje yaşam döngüsü (Gate 3, uygulandı):** Core oluşturma / yeniden
+  adlandırma / arşivleme / arşivden çıkarma sağlar; silme yoktur. Yeni proje
+  kimliği opaktır (`p-` + uuid4 hex), ad, zaman, sağlayıcı veya modelden
+  türetilmez ve `PROJECT_ID_PATTERN` ile uyumludur (şema-10 sürümleri satırı
+  aynen yükler). Yeniden adlandırma yalnız `name`, arşivleme/çıkarma yalnız
+  `active` sütununu değiştirir; bilinmeyen kimlik, yinelenen ad (büyük/küçük
+  harf duyarsız), boş/sınır üstü ad ve tekrarlanan işlem deterministik
+  olarak reddedilir ve hiçbir şey yazmaz. Mevcut slug projeler dokunulmaz.
+- **Kapsam yayılımı:** sohbette proje kapsamının TEK kaynağı konuşma
+  sahibidir: `conversation.project_id` → oturum bağı → `Task.project_id` →
+  `_bind_project` → proje hafızası. Niyet kataloğunun iş projesi de sahiptir;
+  Global uçtan uca `None`'dır ve tek-aktif-proje geri dönüşü konuşmadan gelen
+  isteğe uygulanmaz (yalnız CLI yolunda kalır), bu yüzden Global konuşmadan
+  zamanlanmış iş oluşturma reddedilir. Sahip/bağ uyuşmazlığı (başka projeye
+  bağlı ya da başka sahipli konuşmaya bağlı oturum, bilinmeyen konuşma)
+  model çağrılmadan kapalı başarısız olur.
+- **Arşiv semantiği (Salih kararı, 2026-09-29):** arşivlenmiş projenin
+  konuşmaları saklanır, okunabilir ve salt okunurdur (durum, başlık, arşiv,
+  oturum bağı yazılamaz); bu projede yeni görev çalışmaz - projeye önceden
+  bağlı bir oturum üzerinden de - ve bekleyen bir görev devam etmez (Core
+  `_bind_project` / `_advance` / zincir adımı; genel yürütme bariyerinden
+  ayrı bir yaşam döngüsü kontrolüdür, yetki değildir); proje hafızasına
+  yazılmaz (ekleme, emekliye ayırma). Zamanlanmış işleri çalışmaz ve ret
+  görünürdür: yeni üretim `_bind_dispatch`'te `not_bindable: Unknown or
+  inactive project` ile reddedilir, zaten bağlı üretim RUNNING/blocked kalır;
+  hiçbiri sonuçlandırılmaz. Hiçbir şey silinmez; arşivden çıkarma birebir
+  geri getirir ve bekleyen iş kaldığı yerden sürer. Aktif olmayan projeye
+  yeni konuşma veya yeni oturum bağı zaten yoktur.

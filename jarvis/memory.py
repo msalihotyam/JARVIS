@@ -4492,6 +4492,113 @@ class SQLiteMemoryStore:
         return projects
 
     # ------------------------------------------------------------------
+    # Project lifecycle (V2 Projects Gate 3): create / rename / archive /
+    # unarchive. No delete. Each operation writes exactly one schema-10
+    # column of one row (``name`` or ``active``) with its schema-10 meaning;
+    # every refusal is deterministic and writes nothing.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _project_for_update(
+        connection: sqlite3.Connection, project_id: Any
+    ) -> ProjectRecord:
+        validate_project_id(project_id)
+        row = connection.execute(
+            "SELECT id, name, active, created_at FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        try:
+            if row is None:
+                raise ValueError
+            return ProjectRecord(
+                id=row["id"],
+                name=row["name"],
+                active=bool(row["active"]),
+                created_at=str(row["created_at"]),
+            )
+        except (TypeError, ValueError):
+            # A malformed row is refused exactly like a missing one.
+            raise ValueError(f"Unknown project: {project_id}") from None
+
+    @staticmethod
+    def _refuse_duplicate_project_name(
+        connection: sqlite3.Connection, name: str, *, exclude: str | None = None
+    ) -> None:
+        wanted = name.casefold()
+        for row in connection.execute("SELECT id, name FROM projects"):
+            if (
+                row["id"] != exclude
+                and isinstance(row["name"], str)
+                and row["name"].strip().casefold() == wanted
+            ):
+                raise ValueError(f"A project with that name already exists: {name}")
+
+    def create_project(self, name: str) -> ProjectRecord:
+        """A new ACTIVE project with an opaque id (``p-`` + uuid4 hex).
+
+        The id is never derived from the name, a time, a provider or a model,
+        and it matches ``PROJECT_ID_PATTERN``, so schema-10 releases load the
+        row unchanged."""
+        if not isinstance(name, str):
+            raise ValueError("project name must be a non-blank string")
+        project = ProjectRecord(id="p-" + uuid4().hex, name=name.strip())
+        with self._connection(write=True) as connection:
+            self._refuse_duplicate_project_name(connection, project.name)
+            connection.execute(
+                "INSERT INTO projects (id, name, active, created_at) VALUES (?, ?, 1, ?)",
+                (project.id, project.name, project.created_at),
+            )
+        return project
+
+    def rename_project(self, project_id: str, name: str) -> ProjectRecord:
+        """Change only ``name``. The id, owner links and ``active`` stay."""
+        if not isinstance(name, str):
+            raise ValueError("project name must be a non-blank string")
+        with self._connection(write=True) as connection:
+            current = self._project_for_update(connection, project_id)
+            renamed = replace(current, name=name.strip())
+            if renamed.name == current.name:
+                raise ValueError(f"Project already has that name: {project_id}")
+            self._refuse_duplicate_project_name(
+                connection, renamed.name, exclude=project_id
+            )
+            connection.execute(
+                "UPDATE projects SET name = ? WHERE id = ?", (renamed.name, project_id)
+            )
+        return renamed
+
+    def set_project_active(self, project_id: str, active: bool) -> ProjectRecord:
+        """Archive (``False``) or unarchive (``True``): only ``active`` changes.
+
+        Archiving deletes nothing; unarchiving restores exactly what was
+        there. Repeating the current state is refused, not ignored."""
+        if type(active) is not bool:
+            raise ValueError("active must be a bool")
+        with self._connection(write=True) as connection:
+            current = self._project_for_update(connection, project_id)
+            if current.active is active:
+                state = "active" if active else "archived"
+                raise ValueError(f"Project is already {state}: {project_id}")
+            connection.execute(
+                "UPDATE projects SET active = ? WHERE id = ?", (int(active), project_id)
+            )
+        return replace(current, active=active)
+
+    @staticmethod
+    def _require_writable_owner(
+        connection: sqlite3.Connection, conversation_id: str
+    ) -> None:
+        """A conversation of an archived project is kept and readable, but
+        read-only until the project is unarchived."""
+        row = connection.execute(
+            "SELECT p.active FROM conversations c JOIN projects p ON p.id = c.project_id "
+            "WHERE c.id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is not None and row["active"] != 1:
+            raise ValueError(f"Conversation belongs to an archived project: {conversation_id}")
+
+    # ------------------------------------------------------------------
     # Conversations (V2 Projects foundation; the additive compatibility layer)
     #
     # A conversation is CONTEXT: who owns it (Global = ``project_id`` NULL, or
@@ -4668,6 +4775,7 @@ class SQLiteMemoryStore:
                 raise KeyError(conversation_id)
             if row["archived_at"] is not None:
                 raise ValueError(f"Conversation is archived: {conversation_id}")
+            self._require_writable_owner(connection, conversation_id)
             current = decode_state(row["state_json"], row["integrity"])
             updated = change(current)
             if not isinstance(updated, ConversationState):
@@ -4689,6 +4797,7 @@ class SQLiteMemoryStore:
                 f"conversation title must be text of at most {CONVERSATION_TITLE_MAX} characters"
             )
         with self._connection(write=True) as connection:
+            self._require_writable_owner(connection, conversation_id)
             changed = connection.execute(
                 "UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL",
                 (title, conversation_id),
@@ -4702,6 +4811,7 @@ class SQLiteMemoryStore:
         deleted, and there is no unarchive, move or delete here."""
         self._require_conversation_id(conversation_id)
         with self._connection(write=True) as connection:
+            self._require_writable_owner(connection, conversation_id)
             connection.execute(
                 "UPDATE conversations SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
                 (utc_now(), conversation_id),
@@ -4751,6 +4861,7 @@ class SQLiteMemoryStore:
                 return
             if conversation["archived_at"] is not None:
                 raise ValueError(f"Conversation is archived: {conversation_id}")
+            self._require_writable_owner(connection, conversation_id)
             if (
                 session["project_id"] is not None
                 and session["project_id"] != conversation["project_id"]
@@ -5043,6 +5154,11 @@ class SQLiteMemoryStore:
                 raise ValueError(
                     "retire must reference a memory item of exactly this project"
                 )
+            project_row = connection.execute(
+                "SELECT active FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project_row is None or not project_row["active"]:
+                raise ValueError(f"Unknown or inactive project: {project_id}")
             lifecycle_refusal = memory_lifecycle_refusal(
                 row["active"], row["superseded_by"]
             )

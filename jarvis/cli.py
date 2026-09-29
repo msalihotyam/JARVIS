@@ -38,6 +38,7 @@ from jarvis.app import (
     memory_list_result,
     memory_retire_result,
     project_create_result,
+    project_lifecycle_result,
     sessions_result,
     show_result,
     status_payload,
@@ -336,8 +337,17 @@ def _build_parser() -> _ArgumentParser:
     project_create = project_actions.add_parser(
         "create", help="Create a project identity (never automatic)."
     )
-    project_create.add_argument("--id", required=True, dest="project_id")
+    project_create.add_argument(
+        "--id", dest="project_id", help="Explicit slug; omitted = an opaque id."
+    )
     project_create.add_argument("--name", required=True)
+    project_rename = project_actions.add_parser("rename", help="Rename a project.")
+    project_rename.add_argument("--id", required=True, dest="project_id")
+    project_rename.add_argument("--name", required=True)
+    for action in ("archive", "unarchive"):
+        project_actions.add_parser(action, help=f"{action.capitalize()} a project.").add_argument(
+            "--id", required=True, dest="project_id"
+        )
 
     memory_command = commands.add_parser(
         "memory", help="Explicit project-scoped memory (untrusted reference data)."
@@ -449,11 +459,16 @@ def _dispatch_memory_command(
             return project_create_result(
                 memory, settings, args.project_id, args.name
             )
+        action = getattr(args, "project_action", None)
+        if action in ("rename", "archive", "unarchive"):
+            return project_lifecycle_result(
+                memory, settings, action, args.project_id, getattr(args, "name", None)
+            )
         return failure_result(
             "project",
             settings.permission_mode,
             ErrorCode.INVALID_TASK,
-            "'project' requires the 'create' sub-command.",
+            "'project' requires a sub-command: create, rename, archive or unarchive.",
             EXIT_INVALID_INPUT,
         )
     if getattr(args, "memory_action", None) == "add":

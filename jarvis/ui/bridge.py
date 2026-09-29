@@ -1215,6 +1215,7 @@ class Bridge(QObject):
         self._task = {}
         language = self.language           # the default reply language for General Chat
         route = self._provider_route()
+        owner = self._conversation_store.id or ""     # its owner scopes the request ("" = unsaved Global)
         self._end_stream()
         relay = self._preview_relay(request_id)
         self._run(
@@ -1222,7 +1223,7 @@ class Bridge(QObject):
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
                                              conversation=conversation, context_groups=groups,
                                              context_attachments=attachments, response_mode=mode,
-                                             on_reply_preview=relay, **route),
+                                             on_reply_preview=relay, conversation_id=owner, **route),
             self._delivered(lambda payload: self._apply_text(payload, text)),
         )
         return True
@@ -1246,13 +1247,14 @@ class Bridge(QObject):
         self._request_id = request_id
         language = self.language
         route = self._provider_route()
+        owner = self._conversation_store.id or ""
         self._end_stream()
         relay = self._preview_relay(request_id)
         self._run(
             "task",
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
                                              response_language=language, conversation=conversation,
-                                             on_reply_preview=relay, **route),
+                                             on_reply_preview=relay, conversation_id=owner, **route),
             self._delivered(lambda payload: self._apply_text(payload, label, request=previous)),
         )
 

@@ -290,7 +290,7 @@ class Backend:
         self, text: str, session_id: str | None, *, previous_text: str = "", request_id: str = "",
         response_language: str = "", conversation: tuple = (), provider: str = "claude", model: str = "",
         effort: str = "", context_groups: tuple = (), context_attachments: tuple = (), response_mode: str = "together",
-        on_reply_preview: Callable[[str], None] | None = None,
+        on_reply_preview: Callable[[str], None] | None = None, conversation_id: str | None = None,
     ) -> dict:
         request_id = request_id or str(uuid4())
 
@@ -309,7 +309,7 @@ class Backend:
                     text, session_id, previous_text=previous_text, request_id=request_id,
                     response_language=response_language, conversation=conversation,
                     context_groups=context_groups, context_attachments=context_attachments, response_mode=response_mode,
-                    on_reply_preview=on_reply_preview,
+                    on_reply_preview=on_reply_preview, conversation_id=conversation_id,
                 )
             finally:
                 self._text_app = None

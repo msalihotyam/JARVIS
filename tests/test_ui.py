@@ -276,8 +276,15 @@ class ComposerTests(UiTestCase):
     def test_a_scheduled_result_is_rendered_and_listed(self) -> None:
         SQLiteMemoryStore(self.database).save_project(ProjectRecord(id="evim", name="Evim"))
         at = (datetime.now().astimezone() + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-        bridge = self.bridge(proposal(kind="job", label="fatura", schedule={"kind": "one_time", "at": at.isoformat(timespec="minutes")},
-                                      step={"objective": "Faturayı hatırlat", "capability": "code_analysis", "target": ""}))
+        job = proposal(kind="job", label="fatura", schedule={"kind": "one_time", "at": at.isoformat(timespec="minutes")},
+                       step={"objective": "Faturayı hatırlat", "capability": "code_analysis", "target": ""})
+        bridge = self.bridge(job, job)
+        # Gate 3: the window's Global conversation schedules nothing, even with one active project.
+        bridge.submitText("Yarın saat 10'da faturayı ödemeyi hatırlat.")
+        self.assertNotIn("scheduled", self.kinds(bridge))
+        self.assertEqual(0, len(bridge.jobs))
+        # The conversation owner is the job's project.
+        self.assertTrue(bridge.openConversation(SQLiteMemoryStore(self.database).create_conversation("evim").id))
         bridge.submitText("Yarın saat 10'da faturayı ödemeyi hatırlat.")
         self.assertIn("scheduled", self.kinds(bridge))
         self.assertIn("SCHEDULED: 'fatura' (one_time)", self.feed_text(bridge))
