@@ -9185,6 +9185,13 @@ class MemoryStore(Protocol):
     #: pure read; the only writer is the store's explicit-user boundary.
     def load_project_instruction(self, project_id: str) -> "ProjectInstruction | None": ...
 
+    #: V2 Projects: pure reads of a session's persistent conversation link and
+    #: of a conversation's record (its owner), so Core can bind a
+    #: conversation-linked session only to that conversation's owner.
+    def conversation_for_session(self, session_id: str) -> str | None: ...
+
+    def load_conversation(self, conversation_id: str) -> "ConversationRecord | None": ...
+
     #: Gate 5. Pure reads: the deterministic excerpt selection for a task, and
     #: one chunk with its file's current state for re-proof.
     def retrieve_project_file_refs(

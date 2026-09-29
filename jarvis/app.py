@@ -3581,6 +3581,8 @@ class JarvisApp:
                 record = None
             if record is None:
                 return None, f"Unknown conversation: {conversation_id}."
+            if record.archived_at is not None:
+                return None, "This conversation is archived; it is read-only."
             owner = record.project_id
         if owner is not None:
             project = self.memory.load_project(owner)

@@ -3128,6 +3128,10 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
 - **Oturum bağı:** bir Core oturumu en çok bir konuşmaya, kalıcı olarak
   bağlanır; bir projeye bağlı oturum yalnız o projenin konuşmasına girebilir
   (bağlam tutarlılığı, yetki değil).
+  Core bunu her giriş noktasında uygular: konuşmaya bağlı bir oturum yalnız o
+  konuşmanın sahibine bağlanabilir; başka bir projeyi (Global konuşma için
+  herhangi bir projeyi) adlandıran görev ya da okunamayan bağ INVALID_TASK ile
+  kapalı başarısız olur.
 - **Yetki değildir:** konuşma ve proje kapsamı yalnız bağlamdır. Onay, grant,
   fingerprint, hatırlanan grant, hedef politikası, izinli kökler, tarayıcı
   origin'leri, Gmail/GitHub kimliği, connector seçimi, faturalandırma ve genel

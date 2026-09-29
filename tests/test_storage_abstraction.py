@@ -528,6 +528,13 @@ class InMemoryStore:
     def load_project_file_chunk(self, project_id, file_id, chunk_index):
         return None
 
+    def conversation_for_session(self, session_id):
+        # This contract store has no conversation layer: no session is linked.
+        return None
+
+    def load_conversation(self, conversation_id):
+        return None
+
     def list_projects(self) -> list[ProjectRecord]:
         return copy.deepcopy(
             sorted(self.projects.values(), key=lambda p: (p.created_at, p.id))

@@ -4897,6 +4897,9 @@ class AgentCore:
         before the archive.
         """
         requested = task.project_id
+        owner_refusal = self._conversation_owner_refusal(session, task, requested)
+        if owner_refusal is not None:
+            return owner_refusal
         if (
             requested is not None
             and session.project_id is not None
@@ -4913,6 +4916,34 @@ class AgentCore:
             return refusal
         if requested is not None:
             session.project_id = requested
+        return None
+
+    def _conversation_owner_refusal(
+        self, session: SessionState, task: Task, requested: str | None
+    ) -> AgentRun | None:
+        """A session linked to a conversation binds ONLY to that
+        conversation's owner (ARCHITECTURE 4.22), whatever entry point the
+        task came through. A task naming another project - or any project
+        for a Global conversation - fails closed, as does a link or
+        conversation that cannot be read. A task naming no project, and a
+        session with no link, are unchanged. Context consistency, never
+        authority. (Independent Codex review finding.)"""
+        if requested is None:
+            return None
+        try:
+            conversation_id = self.memory.conversation_for_session(session.id)
+            record = None if conversation_id is None else self.memory.load_conversation(conversation_id)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            conversation_id, record = "", None
+        if conversation_id is None:
+            return None
+        if record is None or record.project_id != requested:
+            return self._input_failure(
+                task,
+                ErrorCode.INVALID_TASK,
+                "Task project does not match the owner of the session's conversation.",
+                session,
+            )
         return None
 
     def _deliver_project_instruction(self, session: SessionState, task: Task) -> None:
