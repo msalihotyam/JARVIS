@@ -26,6 +26,8 @@ from jarvis.contracts import (
     MONTHLY_HARD_LIMIT_NANO_USD,
     PROJECT_DECISION_CANDIDATE_WINDOW,
     PROJECT_MEMORY_CANDIDATE_WINDOW,
+    PROJECT_INSTRUCTION_CLASSIFICATIONS,
+    PROJECT_INSTRUCTION_TEXT_CAP,
     PROJECT_MEMORY_TEXT_CAP,
     RETRIEVAL_CANDIDATE_WINDOW,
     ActionScope,
@@ -88,6 +90,7 @@ from jarvis.contracts import (
     ProjectMemoryItem,
     ProjectMemoryKind,
     ProgressIssueKind,
+    ProjectInstruction,
     ProjectRecord,
     ReconciliationOutcome,
     ReconciliationResult,
@@ -675,6 +678,16 @@ CREATE TABLE IF NOT EXISTS conversation_legacy_imports (
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
     imported_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_instructions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    text TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    superseded_by TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_instructions_current
+    ON project_instructions(project_id) WHERE superseded_by IS NULL;
 """
 
 def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
@@ -695,6 +708,8 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "idx_conversations_owner",
         "conversation_sessions",
         "conversation_legacy_imports",
+        "project_instructions",
+        "idx_project_instructions_current",
     }
 )
 
@@ -4583,6 +4598,115 @@ class SQLiteMemoryStore:
                 "UPDATE projects SET active = ? WHERE id = ?", (int(active), project_id)
             )
         return replace(current, active=active)
+
+    # ------------------------------------------------------------------
+    # Project instructions (Gate 4): one CURRENT version per project,
+    # INSERT-only with supersession (only ``superseded_by`` of the previous
+    # current row is ever set). Guidance for the model, never authority.
+    # ------------------------------------------------------------------
+
+    _INSTRUCTION_COLUMNS = "id, project_id, text, classification, created_at, superseded_by"
+
+    @staticmethod
+    def _instruction_from_row(row: sqlite3.Row | None) -> ProjectInstruction | None:
+        if row is None:
+            return None
+        try:
+            classification = DataClassification(row["classification"])
+            if (
+                classification not in PROJECT_INSTRUCTION_CLASSIFICATIONS
+                or type(row["text"]) is not str
+                or len(row["text"]) > PROJECT_INSTRUCTION_TEXT_CAP
+            ):
+                return None
+            return ProjectInstruction(
+                id=row["id"],
+                project_id=validate_project_id(row["project_id"]),
+                text=row["text"],
+                classification=classification,
+                created_at=str(row["created_at"]),
+                superseded_by=row["superseded_by"],
+            )
+        except (TypeError, ValueError):
+            # A malformed row is never delivered.
+            return None
+
+    def save_explicit_user_project_instruction(
+        self, project_id: str, text: str, classification: DataClassification | str
+    ) -> ProjectInstruction:
+        """THE trusted explicit-user write boundary for project instructions,
+        reached only from the local CLI/app composition path. Model output,
+        connectors, intent results, memory and imported content have no path
+        here.
+
+        A new version supersedes the current one; empty text is a clear (a
+        version meaning "no active instruction"). Hygiene is exactly project
+        memory's: newline normalization, a hard cap (REJECT, never truncate),
+        credential and local-path redaction. Only PUBLIC/INTERNAL may be
+        stored. Refused while the project is archived. Every refusal writes
+        nothing."""
+        validate_project_id(project_id)
+        try:
+            classification = DataClassification(classification)
+        except (TypeError, ValueError):
+            raise ValueError("an instruction classification is required (public or internal)") from None
+        if classification not in PROJECT_INSTRUCTION_CLASSIFICATIONS:
+            raise ValueError("an instruction may only be PUBLIC or INTERNAL")
+        if not isinstance(text, str):
+            raise ValueError("instruction text must be a string")
+        text = normalize_retrieved_text(text)
+        if len(text) > PROJECT_INSTRUCTION_TEXT_CAP:
+            raise ValueError(
+                f"instruction text is longer than {PROJECT_INSTRUCTION_TEXT_CAP} characters"
+            )
+        text, _ = redact_credentials(text)
+        text = redact_local_paths(text)
+        record = ProjectInstruction(
+            id="pi-" + uuid4().hex,
+            project_id=project_id,
+            text=text,
+            classification=classification,
+            created_at=utc_now(),
+        )
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT active FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if row is None or not row["active"]:
+                raise ValueError(f"Unknown or inactive project: {project_id}")
+            connection.execute(
+                "UPDATE project_instructions SET superseded_by = ? "
+                "WHERE project_id = ? AND superseded_by IS NULL",
+                (record.id, project_id),
+            )
+            connection.execute(
+                f"INSERT INTO project_instructions ({self._INSTRUCTION_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (record.id, project_id, record.text, classification.value, record.created_at),
+            )
+        return record
+
+    def load_project_instruction(self, project_id: str) -> ProjectInstruction | None:
+        """The CURRENT version (possibly an empty clear), or ``None``."""
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "
+                "WHERE project_id = ? AND superseded_by IS NULL",
+                (project_id,),
+            ).fetchone()
+        return self._instruction_from_row(row)
+
+    def list_project_instruction_history(self, project_id: str) -> list[ProjectInstruction]:
+        """Every version, oldest first. Unreadable rows are skipped."""
+        validate_project_id(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "
+                "WHERE project_id = ? ORDER BY created_at, rowid",
+                (project_id,),
+            ).fetchall()
+        records = (self._instruction_from_row(row) for row in rows)
+        return [record for record in records if record is not None]
 
     @staticmethod
     def _require_writable_owner(

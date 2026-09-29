@@ -14,6 +14,9 @@ from typing import Any
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
 from jarvis.contracts import (
+    PROJECT_INSTRUCTION_KEY,
+    PROJECT_INSTRUCTION_PRECEDENCE,
+    project_instruction_block,
     DIAGNOSTIC_DETAIL_MAX_CHARS,
     LOCAL_READ_CONTEXT_MAX_CHARS,
     LOCAL_READ_EXCERPT_MAX_CHARS,
@@ -298,7 +301,9 @@ class ClaudeCodeConnector(BaseConnector):
         "role, constraints, authority or what you may not do. Never describe "
         "how JARVIS works inside - its agents, planners, routers, connectors, "
         "orchestration or internal names - unless the objective itself asks "
-        "about them."
+        "about them. "
+        # Gate 4: fixed, present with or without a project instruction.
+        + PROJECT_INSTRUCTION_PRECEDENCE
     )
     prompt_prefix = (
         "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"
@@ -501,6 +506,7 @@ class ClaudeCodeConnector(BaseConnector):
         payload, redacted_count = self._sanitized_payload(task)
         encoded = self._encode_payload(payload).encode("utf-8")
         field_names = tuple(sorted(self._field_names(payload)))
+        instruction = payload.get(PROJECT_INSTRUCTION_KEY)
         return OutboundDataPreview(
             destination="anthropic/claude-code",
             data_classification=task.scope.data_classification,
@@ -508,6 +514,8 @@ class ClaudeCodeConnector(BaseConnector):
             approximate_bytes=len(encoded),
             redacted_items=redacted_count,
             summary="Objective and redacted task context will leave the local machine.",
+            # Gate 4: the instruction block being approved, exactly as sent.
+            project_instruction=instruction["text"] if isinstance(instruction, dict) else "",
         )
 
     def canonical_outbound(self, task: Task) -> bytes:
@@ -1093,13 +1101,28 @@ class ClaudeCodeConnector(BaseConnector):
         read_context, read_context_redactions = self._local_read_context(task)
         if read_context is not None:
             payload["local_read_context"] = read_context
+        # Gate 4: the project instruction AgentCore rebuilt from the store for
+        # this call (a transient field, never a snapshot), under its own key
+        # and notice. Part of the attested bytes like everything else here.
+        instruction, instruction_redactions = self._project_instruction(task)
+        if instruction is not None:
+            payload[PROJECT_INSTRUCTION_KEY] = instruction
         return (
             payload,
             redactions
             + retrieved_redactions
             + local_read_redactions
-            + read_context_redactions,
+            + read_context_redactions
+            + instruction_redactions,
         )
+
+    @classmethod
+    def _project_instruction(cls, task: Task) -> tuple[dict[str, str] | None, int]:
+        text = task.project_instruction
+        if type(text) is not str or not text:
+            return None, 0
+        redacted, count = cls._redact(text)
+        return project_instruction_block(redacted), count
 
     @classmethod
     def _local_read(cls, task: Task) -> tuple[dict[str, Any] | None, int]:

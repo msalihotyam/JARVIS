@@ -3194,3 +3194,73 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   hiçbiri sonuçlandırılmaz. Hiçbir şey silinmez; arşivden çıkarma birebir
   geri getirir ve bekleyen iş kaldığı yerden sürer. Aktif olmayan projeye
   yeni konuşma veya yeni oturum bağı zaten yoktur.
+
+### 4.23 Proje talimatları (V2 Projects Gate 4, uygulandı)
+
+Her proje, sahibinin JARVIS'in o projede nasıl çalışacağına dair açık,
+kullanıcı kaynaklı talimatını taşıyabilir. Talimat model davranışı
+rehberidir (içerik, üslup, yaklaşım, planlama bağlamı); Core yürütme
+yetkisi değildir. RULE hafızası da, retrieval da değildir: ayrı, her zaman
+açık bir kanaldır.
+
+- **Öncelik (sabit sözleşme):** JARVIS güvenlik kuralları ve Core kararları
+  > kullanıcının güncel mesajı > proje talimatı > getirilen hafıza (güvenilmez
+  başvuru verisi, asla talimat değil). Güncel mesajla çelişen talimat o istek
+  için kaybeder. Öncelik cümlesi (`PROJECT_INSTRUCTION_PRECEDENCE`) her model
+  yolunun sistem isteminde / sabit önekinde sabittir ve talimat olsa da olmasa
+  da bayt-bayt aynıdır. Talimat metni yalnız istek başına yükte kendi
+  anahtarı `project_instruction` altında, kendi sabit uyarısıyla
+  (`PROJECT_INSTRUCTION_NOTICE`, getirilen hafıza uyarısından ayrı) gider;
+  asla sistem isteminde, önekte veya `request` içinde değil; `request`
+  kullanıcının güncel girdisiyle bayt-bayt aynıdır. Claude yollarında roller
+  ayrıdır (`--system-prompt`). Codex niyet adaptörünün ayrı bir sistem rolü
+  yoktur (önek + yük tek istemdir): orada yalnız sıra/sınır sözleşmesi vardır,
+  rol düzeyinde öncelik iddia edilmez.
+- **Depo:** proje başına tek güncel sürüm, INSERT-only + supersede (§4.10
+  deseni) yeni ek uyumluluk tablosu `project_instructions` içinde (kısmi tekil
+  indeks: proje başına tek `superseded_by IS NULL`); `projects` ALTER edilmez,
+  şema 10'da kalır. Temizleme = boş yeni sürüm = "etkin talimat yok": hiçbir
+  şey, boş blok veya uyarı gönderilmez. Sınır 2.000 karakter; aşan metin
+  reddedilir, kırpılmaz. Yazım hijyeni proje hafızasıyla aynıdır (satır sonu
+  normalleştirme, `redact_credentials`, `redact_local_paths`).
+- **Sınıflandırma:** yazımda zorunludur ve yalnız PUBLIC/INTERNAL olabilir
+  (SENSITIVE/SECRET reddedilir, hiçbir şey saklanmaz). Teslim ancak
+  `retrieval_eligible(istek sınıfı, talimat sınıfı)` iken olur; niyet yolunda
+  istek sınıfı kendi `ActionScope`'u (INTERNAL), Core görevinde
+  `task.scope.data_classification`. Uygun değilse talimat çıkarılır; bu yalnız
+  yerel sonuç/tanı meta verisinde görünür (Core: geçici
+  `task.project_instruction_status`; niyet: `usage.project_instruction`),
+  metni asla açmaz ve yüke asla eklenmez.
+- **Yazım sınırı:** tek yazıcı `save_explicit_user_project_instruction`'dır;
+  tek üretim çağıranı yerel CLI/app yolu (`jarvis project instruction
+  set|show|history`). Model çıktısı, connector'lar, niyet sonuçları, getirilen
+  hafıza ve içe aktarılan/dosya/web içeriği talimat oluşturamaz veya
+  değiştiremez. Arşivlenmiş projede yazım reddedilir, okuma açıktır.
+- **Teslim:** P kapsamındaki istek (konuşma sahibi / oturum bağı; tek-aktif-
+  proje geri dönüşü yok) için P'nin güncel, boş olmayan talimatı (a) niyet/
+  sohbet yoluna (Claude ve Codex adaptörleri, niyet bağlam bütçesine sayılır)
+  ve (b) Core görev model çağrılarına (claude_code connector) çağrı anında
+  yetkili depodan yeniden kurulur. Görev alanı `project_instruction` geçicidir:
+  kalıcılaştırılmaz, anlık görüntüden veya girdiden okunmaz; AgentCore her
+  ilerlemede (`_advance_loop`) depodan yeniden yazar. Global ve diğer projeler
+  hiçbir şey almaz. 5 öğe / 4.000 karakterlik getirilen hafıza kotası dışında
+  kalır; RULE hafızası değişmez. Sağlayıcı/model değişimi hangi talimatın
+  uygulandığını değiştirmez. Niyet yolunun "yalnız istek ve katalog" kuralı
+  yalnız bu açık-kullanıcı alanıyla genişler; getirilen hafıza, planlar ve
+  dosya alıntıları niyet yoluna yine asla girmez.
+- **Yetki değildir (§4.22 ile aynı):** talimatın metni veya varlığı onay
+  fingerprint'i hesaplamaları dışında hiçbir yetki kararı tarafından okunmaz:
+  grant/hatırlanan grant, hedef politikası ve seçimi
+  (`intent._resolve_destination` yalnız güncel girdiyi kullanır), izinli
+  kökler, tarayıcı origin'leri, Gmail/GitHub kimliği, connector seçimi,
+  faturalandırma ve genel yürütme bariyeri. Aynı eylem için talimat yokken /
+  varken / düşmancayken onay gereksinimi, grant ve hatırlanan grant kararı,
+  kapsam, risk/yan etki sınıfı, hedef, çalışma dizini, izinli kökler, araç
+  grant'leri, faturalandırma kapısı ve yürütme bariyeri aynıdır.
+- **Tasdik (R1, 2026-09-29):** connector yükündeki talimat giden içeriktir ve
+  tasdik edilir. Giden tasdik özeti ve onay fingerprint'i yalnız tasdikli
+  talimat baytlarıyla farklılaşır: alan çıkarıldığında kanonik giden bayt
+  yok-durumunu bayt-bayt verir; tasdiksiz bayt makineden çıkmaz. Onay
+  önizlemesi (`OutboundDataPreview.project_instruction`, boşken sözlükte hiç
+  yer almaz) onaylanan talimat bloğunu gösterir. Onaydan sonra değişen talimat
+  yürütme anı tasdik kontrolünde kapalı başarısız olur.

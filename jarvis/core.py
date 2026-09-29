@@ -11,6 +11,7 @@ from typing import AbstractSet, Any, Callable
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.contracts import (
+    project_instruction_delivery,
     CANONICAL_TARGET_CAPABILITIES,
     CHAIN_ENABLED_WRITE_MODES,
     CHAIN_NO_PREDECESSOR,
@@ -921,6 +922,11 @@ class AgentCore:
         task: Task,
         grant: PermissionGrant | None,
     ) -> AgentRun:
+        # Gate 4: the project instruction for every model call this advance
+        # makes is rebuilt HERE from the authoritative store - never from the
+        # task snapshot or input (the field is not persisted). It is attested
+        # outbound content like any other byte; it is never authority.
+        self._deliver_project_instruction(session, task)
         # Memory V2 correction: a task resumed from persisted state carries a
         # retrieved-memory SNAPSHOT, which is untrusted data. Before any
         # consumer (plan step, connector payload, later stage logic) sees it,
@@ -4865,6 +4871,23 @@ class AgentCore:
         if requested is not None:
             session.project_id = requested
         return None
+
+    def _deliver_project_instruction(self, session: SessionState, task: Task) -> None:
+        """Set the task's TRANSIENT instruction from the session's project:
+        the current non-empty version iff its classification is eligible for
+        the task's; Global and unbound sessions get nothing."""
+        task.project_instruction, task.project_instruction_status = None, ""
+        if session.project_id is None:
+            return
+        try:
+            instruction = self.memory.load_project_instruction(session.project_id)
+        except Exception:  # noqa: BLE001 - storage boundary; deliver nothing
+            instruction = None
+        if instruction is not None and instruction.project_id != session.project_id:
+            instruction = None
+        task.project_instruction, task.project_instruction_status = project_instruction_delivery(
+            instruction, task.scope.data_classification
+        )
 
     def _inactive_project_refusal(
         self, session: SessionState, task: Task | None, project_id: str | None = None

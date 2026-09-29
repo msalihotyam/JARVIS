@@ -114,7 +114,7 @@ class StoreCase(unittest.TestCase):
         store.save_session(SessionState(objective="v1 work", project_id="alpha-proj"))
         connection = sqlite3.connect(self.database)
         try:
-            for name in ("conversation_legacy_imports", "conversation_sessions", "conversations"):
+            for name in ("project_instructions", "conversation_legacy_imports", "conversation_sessions", "conversations"):
                 connection.execute(f"DROP TABLE {name}")
             connection.commit()
         finally:

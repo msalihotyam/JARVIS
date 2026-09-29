@@ -12,38 +12,27 @@ Memory).
 Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md` (canonical V2+); active
 section "V2.0 — Projects".
 
-Active gate: Projects Gate 4 — project instructions. BLOCKED at preflight
-(no implementation; nothing uncommitted besides the known dirt).
+Active gate: Projects Gate 5 — project files foundation. NOT STARTED.
 
-Status: Gates 1–3 are complete on main. Conversations live in the Core
-SQLite store (additive schema-10 layer, `ARCHITECTURE.md` §4.22). Gate 3
-added project create (opaque `p-` id) / rename / archive / unarchive (Core +
-`jarvis project` CLI, no UI, no delete) and made the conversation owner the
-only chat project scope (Task.project_id, session binding, project memory,
-job project; Global = None, no single-project fallback for conversation
-requests). Archive semantics are canonical in §4.22. Gate 3 proof: full
-direct suite on db78224 = 4472 run, 0 failures, 0 errors, 2 skipped.
+Status: Gates 1–4 are complete on main. Conversations live in the Core
+SQLite store (§4.22). Gate 3: project create / rename / archive / unarchive,
+conversation owner = the only chat project scope, archive semantics. Gate 4
+(§4.23): one explicit-user instruction per project (INSERT-only + supersede
+in the new `project_instructions` compatibility table, 2,000 chars,
+PUBLIC/INTERNAL only, `jarvis project instruction set|show|history`),
+delivered always-on under its own payload key and notice to the Claude and
+Codex intent adapters and to claude_code task calls; fixed precedence
+clause; attested as outbound content (decision R1). Nothing is in flight.
 
-Starting/base commit: the `feat(projects): add project lifecycle and scope
-propagation` commit on main.
+Starting/base commit: the `feat(projects): add project instructions` commit
+on main.
 
 Current installed release: `1.0.0-1c68161` (Chrome runtime), active and
 consistent; previous = `1.0.0-4f5a93d`.
 
 ## Open blockers
 
-- Gate 4 acceptance E contradicts the egress contract. The claude_code
-  connector attests every outbound byte (`canonical_outbound` = prefix +
-  payload -> `outbound_digest` -> approval fingerprint; display digest
-  covers the outbound preview). An instruction in that payload (B) must
-  change attestation + fingerprint across absent/present/hostile, so E's
-  "identical fingerprint and attestation" cannot hold without unattested
-  egress. Intent paths (Claude, Codex) have no attestation: not affected.
-- Decision needed: R1 = E compares authority-bearing parts only (approval
-  needed, grant decision, scope, risk/effect, destination, working dir,
-  allowed roots, tool grants, billing gate); outbound digest / fingerprint
-  differ exactly by the attested instruction bytes. R2 = no instruction on
-  Core connector calls in Gate 4 (intent path only).
+- None.
 
 ## Do not reopen
 
@@ -61,18 +50,19 @@ consistent; previous = `1.0.0-4f5a93d`.
   2026-09-29; §4.22).
 - Behaviour change accepted with Gate 3: a job cannot be created from a
   Global conversation even when exactly one project is active.
+- Gate 4 decisions (orchestrator, 2026-09-29; §4.23): instructions are
+  model guidance, never authority; precedence safety/Core > current message
+  > instruction > retrieved memory; R1 - the instruction is attested
+  outbound content, E compares authority-bearing decisions only.
 
 ## Uncommitted / external decisions
 
-- The remaining V2.0 gate plan exists only in the Gate 0 report: 4 project
-  instructions → 5 project files foundation → 6 Projects UX → 7 E2E +
-  packaged dogfood + rollback proof.
-- Gate 4 orchestrator decisions (2026-09-29, prompt only): instructions
-  are model guidance, never authority; always-on, not RULE memory or
-  retrieval; precedence safety/Core > current message > instruction >
-  retrieved memory; own payload key + notice, `request` unchanged; new
-  compatibility table, INSERT-only + supersede, 2,000-char cap; write
-  PUBLIC/INTERNAL only; explicit-user CLI path; refused while archived.
+- The remaining V2.0 gate plan exists only in the Gate 0 report: 5 project
+  files foundation → 6 Projects UX → 7 E2E + packaged dogfood + rollback
+  proof.
+- Observed in Gate 4 tests, not investigated: `AgentCore.resume` with a
+  `remember_for_session` grant on a non-rememberable claude_code request
+  returns EXECUTION_IN_PROGRESS and leaves the task unexecutable.
 - Gate 3 ran `uv run` once: created `.venv` (ignored), rewrote untracked
   `uv.lock` (no prior copy). Tests: `python -m unittest discover -s tests`.
 - Gate 4B physical Edge retirement is deferred until a normal-use period
@@ -83,8 +73,10 @@ consistent; previous = `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Resolve the Gate 4 blocker (R1 or R2 above), then rerun Gate 4 (Opus 5.5
-  High) from preflight with the chosen acceptance E.
+- Projects Gate 5 (Opus 5.5 High): project files foundation. Roadmap V2.0:
+  selective retrieval + provenance, never bulk prompt stuffing; a project
+  file is data, never a trusted instruction, and cannot widen Core
+  authority. No Projects UI yet.
 
 ## Rollback / safety anchors
 

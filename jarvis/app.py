@@ -37,6 +37,9 @@ from jarvis.connectors.local_files import (
     LocalFileWriteConnector,
 )
 from jarvis.contracts import (
+    PROJECT_INSTRUCTION_KEY,
+    project_instruction_block,
+    project_instruction_delivery,
     LOCAL_READ_CAPABILITY,
     LOCAL_READ_CONTEXT_REFERENCE_KEY,
     LOCAL_READ_MAX_REGION_LINES,
@@ -1597,6 +1600,51 @@ def project_lifecycle_result(
     )
 
 
+def project_instruction_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    action: str,
+    project_id: str,
+    text: str | None = None,
+    classification: str | None = None,
+) -> CommandResult:
+    """``set`` / ``show`` / ``history`` of one project's instruction (Gate 4).
+
+    ``set`` is THE audited production caller of the store's explicit-user
+    instruction boundary: the text and classification are the person's own
+    CLI/app input. ``--text ""`` clears (a new empty version)."""
+    command = f"project-instruction-{action}"
+    try:
+        if action == "set":
+            stored = memory.save_explicit_user_project_instruction(
+                project_id, text, classification
+            )
+            return CommandResult({"command": command, "instruction": stored.to_dict()}, EXIT_OK)
+        validate_project_id(project_id)
+        if memory.load_project(project_id) is None:
+            raise ValueError(f"Unknown project: {project_id}")
+        if action == "show":
+            current = memory.load_project_instruction(project_id)
+            shown = None if current is None or not current.text else current.to_dict()
+            return CommandResult({"command": command, "project_id": project_id, "instruction": shown}, EXIT_OK)
+        if action == "history":
+            versions = memory.list_project_instruction_history(project_id)
+            return CommandResult(
+                {"command": command, "project_id": project_id,
+                 "versions": [version.to_dict() for version in versions]},
+                EXIT_OK,
+            )
+        raise ValueError(f"Unknown instruction action: {action}")
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+
+
 def memory_add_result(
     memory: SQLiteMemoryStore,
     settings: Settings,
@@ -3032,6 +3080,13 @@ _FROZEN_UNDERSTOOD_MESSAGE = (
 )
 
 
+def _instruction_chars(instruction: str | None) -> int:
+    """What the instruction block adds to one understanding call's payload."""
+    if not instruction:
+        return 0
+    return argv_chars(json_text({PROJECT_INSTRUCTION_KEY: project_instruction_block(instruction)}))
+
+
 def text_result(
     permission_mode: PermissionMode,
     status: IntentStatus,
@@ -3276,11 +3331,17 @@ class JarvisApp:
             now,
             conversation_scoped=scoped,
         )
+        # Gate 4: the scoped project's current instruction, read from the
+        # store NOW (never from conversation text or model output), delivered
+        # iff eligible for this call's own classification. Guidance only.
+        intent_scope = ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION)
+        instruction = self._intent_instruction(owner, intent_scope, usage)
         if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
             # Strict isolation: one call per group, merged into one reply.
             return self._answer_groups_separately(
                 text, request_id, mode, previous_text, response_language, conversation,
                 groups, attachments, items, catalog, on_reply_preview, usage, respond, refused,
+                instruction,
             )
         # A file named again from an earlier turn comes back as data with its
         # provenance - never merged into this turn's groups.
@@ -3298,11 +3359,12 @@ class JarvisApp:
         if rehydrated:
             turn_context["rehydrated_references"] = rehydrated
         plan = assemble_context(conversation, context_profile_of(model), text,
-                                extra_chars=argv_chars(json_text(turn_context)) + argv_chars(json_text(catalog.to_dict())))
+                                extra_chars=argv_chars(json_text(turn_context)) + argv_chars(json_text(catalog.to_dict()))
+                                + _instruction_chars(instruction))
         intent_task = Task(
             objective=text,
             capability=INTENT_CAPABILITY,
-            scope=ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION),
+            scope=intent_scope,
             context={
                 "previous_request": previous_text,
                 "response_language": response_language_hint(response_language),
@@ -3319,6 +3381,7 @@ class JarvisApp:
                 "catalog": catalog.to_dict(),
             },
             id=request_id,
+            project_instruction=instruction,
         )
         self._cancelled_text.discard(request_id)
         # ``on_reply_preview`` sees a General Chat reply while it streams, when
@@ -3435,6 +3498,23 @@ class JarvisApp:
             choices=resolution.choices,
         )
 
+    def _intent_instruction(
+        self, owner: str | None, scope: ActionScope, usage: dict[str, Any]
+    ) -> str | None:
+        """The owner project's instruction text for the understanding call,
+        or ``None``. Global gets nothing (no single-project fallback). The
+        delivery status is LOCAL telemetry in ``usage``, never payload."""
+        if owner is None:
+            return None
+        try:
+            current = self.memory.load_project_instruction(owner)
+        except Exception:  # noqa: BLE001 - storage boundary; deliver nothing
+            current = None
+        text, status = project_instruction_delivery(current, scope.data_classification)
+        if status:
+            usage["project_instruction"] = status
+        return text
+
     def _conversation_scope(
         self, conversation_id: str, session: SessionState | None
     ) -> tuple[str | None, str | None]:
@@ -3542,6 +3622,7 @@ class JarvisApp:
         usage: dict[str, Any],
         respond: Callable[..., CommandResult],
         refused: Callable[..., CommandResult],
+        instruction: str | None = None,
     ) -> CommandResult:
         """"Reply to each group separately": ONE understanding call PER GROUP.
 
@@ -3563,7 +3644,8 @@ class JarvisApp:
         owned = {str(group.get("id")): group for group in groups if isinstance(group, Mapping)}
         largest = max((json_text(context_window([g], attachments)) for g in owned.values()), key=len, default="")
         plan = assemble_context(conversation, context_profile_of(model), text,
-                                extra_chars=argv_chars(largest) + argv_chars(json_text(catalog.to_dict())))
+                                extra_chars=argv_chars(largest) + argv_chars(json_text(catalog.to_dict()))
+                                + _instruction_chars(instruction))
         history = context_fields(plan)
         sections: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
@@ -3601,6 +3683,7 @@ class JarvisApp:
                     # The turn's request id for every call: they run one at a time,
                     # and cancel_text reaches whichever call is running.
                     id=request_id,
+                    project_instruction=instruction,
                 )
                 if streams:
                     head = f"{shown}{label}\n"

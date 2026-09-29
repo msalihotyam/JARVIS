@@ -39,6 +39,7 @@ from jarvis.app import (
     memory_retire_result,
     project_create_result,
     project_lifecycle_result,
+    project_instruction_result,
     sessions_result,
     show_result,
     status_payload,
@@ -348,6 +349,20 @@ def _build_parser() -> _ArgumentParser:
         project_actions.add_parser(action, help=f"{action.capitalize()} a project.").add_argument(
             "--id", required=True, dest="project_id"
         )
+    # Gate 4: the project owner's explicit instruction (guidance, never authority).
+    instruction_actions = project_actions.add_parser(
+        "instruction", help="The project's standing instruction for JARVIS."
+    ).add_subparsers(dest="instruction_action")
+    instruction_set = instruction_actions.add_parser("set", help="Set a new version; --text '' clears.")
+    instruction_set.add_argument("--id", required=True, dest="project_id")
+    instruction_set.add_argument("--text", required=True)
+    instruction_set.add_argument(
+        "--classification",
+        required=True,
+        choices=[classification.value for classification in DataClassification],
+    )
+    for action in ("show", "history"):
+        instruction_actions.add_parser(action).add_argument("--id", required=True, dest="project_id")
 
     memory_command = commands.add_parser(
         "memory", help="Explicit project-scoped memory (untrusted reference data)."
@@ -460,6 +475,11 @@ def _dispatch_memory_command(
                 memory, settings, args.project_id, args.name
             )
         action = getattr(args, "project_action", None)
+        if action == "instruction" and getattr(args, "instruction_action", None):
+            return project_instruction_result(
+                memory, settings, args.instruction_action, args.project_id,
+                getattr(args, "text", None), getattr(args, "classification", None),
+            )
         if action in ("rename", "archive", "unarchive"):
             return project_lifecycle_result(
                 memory, settings, action, args.project_id, getattr(args, "name", None)
@@ -468,7 +488,8 @@ def _dispatch_memory_command(
             "project",
             settings.permission_mode,
             ErrorCode.INVALID_TASK,
-            "'project' requires a sub-command: create, rename, archive or unarchive.",
+            "'project' requires a sub-command: create, rename, archive, unarchive "
+            "or instruction set|show|history.",
             EXIT_INVALID_INPUT,
         )
     if getattr(args, "memory_action", None) == "add":

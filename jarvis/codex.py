@@ -35,6 +35,7 @@ from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.trusted_exec import NO_CONSOLE_WINDOW, resolve_trusted_executable, trusted_environment
 from jarvis.conversation import ContextProfile
 from jarvis.contracts import (
+    PROJECT_INSTRUCTION_KEY,
     MODEL_ANSWER_RESULT_KEY,
     Availability,
     ErrorCode,
@@ -349,6 +350,11 @@ class CodexIntentAdapter:
         context = dict(task.context)
         images = [str(path) for _, _, path in (context.pop("attachment_files", None) or [])]
         payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": context})
+        # Gate 4: one concatenated prompt (no system role): the fixed prefix,
+        # then the payload, whose own key carries the project instruction.
+        instruction, _ = ClaudeCodeConnector._project_instruction(task)
+        if instruction is not None:
+            payload[PROJECT_INSTRUCTION_KEY] = instruction
         prompt = (self.system_prompt + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
                   + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")))
         workdir = tempfile.mkdtemp(prefix="jarvis-codex-")

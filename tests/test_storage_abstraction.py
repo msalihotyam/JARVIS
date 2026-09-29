@@ -517,6 +517,10 @@ class InMemoryStore:
     def load_project(self, project_id: str) -> ProjectRecord | None:
         return copy.deepcopy(self.projects.get(project_id))
 
+    def load_project_instruction(self, project_id: str):
+        # This contract store has no instruction writer: never an instruction.
+        return None
+
     def list_projects(self) -> list[ProjectRecord]:
         return copy.deepcopy(
             sorted(self.projects.values(), key=lambda p: (p.created_at, p.id))
