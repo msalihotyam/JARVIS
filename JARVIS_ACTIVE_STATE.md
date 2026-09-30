@@ -10,10 +10,14 @@ daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
 Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). IN PROGRESS:
-phase A (E2E test gaps, tests only) done; phase B (build + install) next.
+phase A (E2E test gaps) done; phase B (build + install) waits for Gate 6D and
+the model-list fix below.
 
-Status: Gates 1–5 and 6A–6C complete on main; Gate 6 UX complete; nothing in
-flight. 6C (§4.22/§4.25): one-way attach of a Global conversation to a project
+Status: Gates 1–5 and 6A–6D-a complete on main; nothing in flight. 6D-a
+(§4.25, Salih 2026-09-30): top-bar conversation switcher + right-click rename
+(`conversation_rename_result`; auto-naming never overwrites a set title;
+rename off while busy; edit bound to its conversation). Conversation
+archive/unarchive/delete = 6D-b, not built. 6C (§4.22/§4.25): one-way attach of a Global conversation to a project
 (`attach_global_conversation_to_project`, sole caller
 `conversation_attach_result`; additive `conversation_moves`; V2.1 reserved-table
 guard), selector-menu dialog with preview + single confirm. Base commit:
@@ -82,8 +86,9 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Gate 7 phase B: build + install the release from the phase A commit (needs
-  Salih's go), then D-1..D-4 below.
+- Gate 6D-b design preflight (conversation archive/unarchive/permanent
+  delete; Opus 5.5 high). Then the model-list diagnosis/fix. Then Gate 7
+  phase B: build + install (needs Salih's go) and D-1..D-4 above.
 
 ## Rollback / safety anchors
 

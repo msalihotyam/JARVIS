@@ -3386,7 +3386,7 @@ değildir (yol haritası V2.0).
   görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
   metni tutmaz.
 
-### 4.25 Projects penceresi (V2 Projects Gate 6A/6B/6C, uygulandı)
+### 4.25 Projects penceresi (V2 Projects Gate 6A/6B/6C/6D-a, uygulandı)
 
 Pencere proje modelini gösterir ve mevcut kanonik yolları çağırır; hiçbir şeye
 kendisi karar vermez.
@@ -3434,6 +3434,31 @@ kendisi karar vermez.
   reddi önizlemeyi yeniler, kendiliğinden yeniden denemez. Başarıdan sonra
   konuşma yeniden açılır (sonraki görev yeni oturum) ve seçici / Geçmiş /
   Projects yenilenir. Köprü store'u değil app sonuçlarını çağırır.
+- **Sohbet değiştirici + yeniden adlandırma (6D-a, Salih kararı 2026-09-30):**
+  üst çubukta proje seçici | değiştirici | "+ Yeni sohbet". Değiştirici açık
+  konuşmanın adını gösterir (adsız: "Yeni Sohbet"; sığmazsa kısaltılır, tam ad
+  ipucundadır). Tıklama GEÇERLİ kapsamın (açık konuşmanın sahibi; Global'de
+  Global) arşivlenmemiş konuşmalarını en yeniden eskiye listeler, açık olan
+  işaretlidir; seçim mevcut `openConversation` yoludur. Sağ tık -> tek öğe
+  "Yeniden adlandır" -> düzenleme (Enter/Kaydet uygular, Escape/İptal geri
+  alır). Sıra: pencere önce kırpar ve satır sonu/kontrol karakterlerini tek
+  boşluğa çevirir; sonuç boşsa ÇAĞRI YAPILMAZ (eski ad kalır); aksi halde
+  normalleştirilmiş ad değiştirilmeden `conversation_rename_result`'a gider ve
+  120 karakter sınırını ile arşiv retlerini yalnız depo (`set_conversation_title`)
+  belirler, ret olduğu gibi gösterilir. `conversation_rename_result`, manuel
+  yeniden adlandırmanın denetlenen açık-kullanıcı çağıranıdır (backend onu
+  çağırır, depoyu değil); `set_conversation_title`'ın diğer tek üretim
+  çağıranı köprünün otomatik adlandırmasıdır. Başlıklar ETİKETTİR: hiçbir
+  yetki kararı okumaz, PlainText gösterilir; onay kartı, görev başlıkları ve
+  geçmiş turları değişmez.
+  Yarış güvenliği: otomatik ad (kural tabanlı, model çağrısı yok) yalnız
+  ilk mesajda ve yalnız konuşmanın adı BOŞKEN yazılır, kullanıcının verdiği
+  adın üzerine asla yazmaz; yeniden adlandırma denetimi ve uygulaması `_busy`
+  iken kapalıdır; bir düzenleme BAŞLADIĞI konuşma kimliğine bağlıdır: uygulama
+  anında açık konuşma değiştiyse düzenleme iptal edilir, yakalanan kimlik dışında
+  hiçbir konuşma adlandırılmaz. Arşivli projenin konuşmasında denetim
+  gerekçesiyle kapalıdır (zorlama deponun reddidir). Konuşma arşivleme/geri
+  alma/kalıcı silme 6D-b'nin konusudur; burada YOKTUR.
 - **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
   tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
 - **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje

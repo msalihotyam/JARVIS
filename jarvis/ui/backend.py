@@ -31,6 +31,7 @@ from jarvis.app import (
     config_show_result,
     conversation_attach_preview_result,
     conversation_attach_result,
+    conversation_rename_result,
     failure_result,
     job_archive_result,
     job_create_result,
@@ -457,6 +458,12 @@ class Backend:
         """Gate 6C: the confirmed attach, through THE audited app path."""
         return self._call("conversation-attach", lambda s: conversation_attach_result(
             self._memory(s), s, conversation_id, expected_next_seq=expected_next_seq, **target
+        ))
+
+    def conversation_rename(self, conversation_id: str, title: str) -> dict:
+        """Gate 6D-a: a manual rename, through the audited explicit-user app path."""
+        return self._call("conversation-rename", lambda s: conversation_rename_result(
+            self._memory(s), s, conversation_id, title
         ))
 
     def memory_list(self, project_id: str, include_inactive: bool = False) -> dict:

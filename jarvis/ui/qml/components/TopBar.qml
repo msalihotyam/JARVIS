@@ -36,9 +36,10 @@ Item {
     component ScopeChoice: Rectangle {
         property string label: ""
         property bool current: false
+        property bool available: true
         signal chosen()
         width: 264; height: 32; radius: 6
-        enabled: !bridge.busy
+        enabled: !bridge.busy && available
         opacity: enabled ? 1 : 0.45
         color: current ? Theme.alpha(Theme.accent, 0.14) : choiceArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
         Text { x: 10; width: parent.width - 20; anchors.verticalCenter: parent.verticalCenter; text: parent.label
@@ -290,18 +291,22 @@ Item {
         readonly property color tone: owner.archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
         // Both controls stay within the room before the core, whatever the name.
         readonly property real room: core.x - x - 16
-        readonly property bool compactNew: room < 60 + 8 + newFull.implicitWidth + 24
+        readonly property bool compactNew: room < 60 + 8 + 90 + 8 + newFull.implicitWidth + 24
+        // What the selector and the conversation switcher share, after "+ New".
+        readonly property real shared: room - newChatButton.width - 16
+        // An edit of a name is bound to the conversation it STARTED on.
+        property string editId: ""
         x: wordmark.x + wordmark.width + 16
         y: wordmark.y + 4
         height: 26
-        width: projectSelector.width + 8 + newChatButton.width
+        width: projectSelector.width + 8 + switcher.width + 8 + newChatButton.width
 
         Rectangle {
             id: projectSelector
             objectName: "projectSelector"
             height: 26; radius: 13
-            width: Math.max(60, Math.min(selectorText.implicitWidth + 13 + 24 + 16, 280,
-                                         scopeGroup.room - 8 - newChatButton.width))
+            width: Math.max(Math.min(60, scopeGroup.shared / 2),
+                            Math.min(selectorText.implicitWidth + 13 + 24 + 16, 280, scopeGroup.shared - Math.min(90, scopeGroup.shared / 2)))
             color: selectorArea.containsMouse || selectorMenu.visible ? Theme.alpha(scopeGroup.tone, 0.14) : Theme.alpha(scopeGroup.tone, 0.07)
             border.width: 1; border.color: Theme.alpha(scopeGroup.tone, 0.55)
             Accessible.role: Accessible.ButtonMenu; Accessible.name: selectorText.text
@@ -311,7 +316,7 @@ Item {
                 Text {
                     id: selectorText
                     objectName: "projectSelectorText"
-                    width: Math.min(implicitWidth, projectSelector.width - 24 - 13 - 16)
+                    width: Math.max(0, Math.min(implicitWidth, projectSelector.width - 24 - 13 - 16))
                     textFormat: Text.PlainText; elide: Text.ElideRight
                     text: (scopeGroup.owner.name || "") + (scopeGroup.owner.archived ? " · " + qsTr("archived") : "")
                     color: scopeGroup.owner.global ? Theme.textLabel : Theme.text; font: Theme.caption
@@ -323,6 +328,56 @@ Item {
                         onClicked: selectorMenu.visible ? selectorMenu.close() : selectorMenu.open() }
         }
 
+        // Gate 6D-a (Salih decision 2026-09-30): the open conversation's name.
+        // Click: the current scope's conversations, to switch. Right-click:
+        // rename. A label only - it selects, grants and approves nothing.
+        Rectangle {
+            id: switcher
+            objectName: "conversationSwitcher"
+            readonly property string shown: bridge.conversationTitle || qsTr("New Chat")
+            readonly property bool renameAllowed: bridge.conversationId !== "" && !bridge.conversationReadOnly && !bridge.busy
+            readonly property string renameReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
+                : bridge.conversationReadOnly ? qsTr("The project is archived: unarchive it to rename this conversation.")
+                : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+            x: projectSelector.width + 8
+            height: 26; radius: 13
+            width: Math.max(Math.min(60, scopeGroup.shared / 2),
+                            Math.min(switcherText.implicitWidth + 13 + 24 + 16, 260, scopeGroup.shared - projectSelector.width))
+            color: switcherArea.containsMouse || switcherMenu.visible ? Theme.alpha(Theme.text, 0.10) : Theme.alpha(Theme.text, 0.04)
+            border.width: 1; border.color: Theme.borderStrong
+            Accessible.role: Accessible.ButtonMenu; Accessible.name: switcherText.text
+            Text {
+                id: switcherText
+                objectName: "conversationSwitcherText"
+                x: 12; anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(0, Math.min(implicitWidth, switcher.width - 12 - 22))
+                textFormat: Text.PlainText; elide: Text.ElideRight
+                text: switcher.shown
+                color: bridge.conversationTitle ? Theme.text : Theme.textLabel; font: Theme.caption
+            }
+            Text { anchors { right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                   text: "▾"; color: Theme.textLabel; font: Theme.caption }
+            MouseArea {
+                id: switcherArea
+                anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onClicked: function (mouse) {
+                    if (mouse.button === Qt.RightButton) { switcherMenu.close(); switcherContext.open() }
+                    else { switcherContext.close(); switcherMenu.visible ? switcherMenu.close() : switcherMenu.open() }
+                }
+            }
+            Rectangle {
+                objectName: "conversationSwitcherTip"
+                visible: switcherArea.containsMouse && bridge.conversationTitle !== "" && !switcherMenu.visible && !switcherContext.visible
+                anchors.top: parent.bottom; anchors.topMargin: 8; x: 0
+                width: Math.min(switcherTip.implicitWidth, 404) + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised
+                border.width: 1; border.color: Theme.borderStrong; z: 50
+                Text { id: switcherTip; objectName: "conversationSwitcherTipText"; anchors.centerIn: parent
+                       width: Math.min(implicitWidth, 404); elide: Text.ElideRight
+                       textFormat: Text.PlainText; text: bridge.conversationTitle; color: Theme.text; font: Theme.caption }
+            }
+        }
+
         Rectangle {
             id: newChatButton
             objectName: "newConversationButton"
@@ -332,7 +387,7 @@ Item {
             readonly property string reason: bridge.conversationReadOnly
                 ? qsTr("The project is archived: unarchive it to start a new conversation.")
                 : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-            x: projectSelector.width + 8
+            x: projectSelector.width + 8 + switcher.width + 8
             height: 26; radius: 13
             width: (scopeGroup.compactNew ? newPlus.implicitWidth : newFull.implicitWidth) + 24
             opacity: allowed ? 1 : 0.45
@@ -356,6 +411,89 @@ Item {
         }
 
         AttachDialog { id: attachDialog }
+
+        // The current scope's conversations, newest first; the open one marked.
+        Popup {
+            id: switcherMenu
+            objectName: "conversationSwitcherMenu"
+            y: switcher.height + 8; x: switcher.x
+            width: 280; padding: 8
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
+            contentItem: Column {
+                spacing: 2
+                Text { text: qsTr("CONVERSATIONS"); color: Theme.textMuted; font: Theme.label; leftPadding: 10 }
+                ListView {
+                    width: 264; height: Math.min(contentHeight, 320); clip: true; spacing: 2
+                    boundsBehavior: Flickable.StopAtBounds
+                    model: bridge.scopeConversations
+                    delegate: ScopeChoice { objectName: "conversationSwitcherItem"
+                                            label: modelData.title || qsTr("New Chat"); current: modelData.active
+                                            onChosen: { switcherMenu.close(); bridge.openConversation(modelData.id) } }
+                }
+            }
+        }
+
+        // Right-click: the one item in 6D-a. Disabled with its reason while the
+        // project is archived or a run is busy; the store still refuses.
+        Popup {
+            id: switcherContext
+            objectName: "conversationSwitcherContext"
+            y: switcher.height + 8; x: switcher.x
+            width: 280; padding: 8
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
+            contentItem: Column {
+                spacing: 4
+                ScopeChoice { objectName: "conversationRenameItem"; label: qsTr("Rename"); available: switcher.renameAllowed
+                              onChosen: { switcherContext.close(); scopeGroup.editId = bridge.conversationId
+                                          bridge.clearRenameNotice(); switcherEditor.open() } }
+                Text { objectName: "conversationRenameReason"; visible: !switcher.renameAllowed; width: 264; wrapMode: Text.Wrap
+                       textFormat: Text.PlainText; text: switcher.renameReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
+            }
+        }
+
+        // The edit. Enter / Save commits the normalized name to the conversation
+        // the edit STARTED on; Escape / Cancel / a change of conversation reverts.
+        Popup {
+            id: switcherEditor
+            objectName: "conversationRenameEditor"
+            y: switcher.height + 8; x: switcher.x
+            width: 320; padding: 10
+            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+            onAboutToShow: { renameField.text = bridge.conversationTitle }
+            onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
+            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
+            function commit() {
+                if (!bridge.busy && bridge.renameConversation(scopeGroup.editId, renameField.text)) switcherEditor.close()
+            }
+            Connections {
+                target: bridge
+                function onConversationChanged() {
+                    if (switcherEditor.visible && bridge.conversationId !== scopeGroup.editId) switcherEditor.close()
+                }
+            }
+            contentItem: Column {
+                spacing: 8
+                TextField {
+                    id: renameField
+                    objectName: "conversationRenameField"
+                    width: 300; height: 34; selectByMouse: true; color: Theme.text; font: Theme.body
+                    placeholderText: qsTr("Conversation name")
+                    background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
+                                            border.color: renameField.activeFocus ? Theme.commandEdge : Theme.border }
+                    onAccepted: switcherEditor.commit()
+                }
+                Text { objectName: "conversationRenameNotice"; visible: bridge.conversationRenameNotice !== ""; width: 300
+                       wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationRenameNotice
+                       color: Theme.warning; font: Theme.caption }
+                Row {
+                    spacing: 8
+                    ActionButton { objectName: "conversationRenameSave"; label: qsTr("Save"); primary: true; height: 32
+                                   enabled: !bridge.busy; onClicked: switcherEditor.commit() }
+                    ActionButton { objectName: "conversationRenameCancel"; label: qsTr("Cancel"); height: 32
+                                   onClicked: switcherEditor.close() }
+                }
+            }
+        }
 
         Popup {
             id: selectorMenu

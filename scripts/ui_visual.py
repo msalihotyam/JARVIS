@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
                                             "projects", "project", "badge", "archived",
-                                            "instruction", "files", "purge", "selector", "attach"), default="home")
+                                            "instruction", "files", "purge", "selector", "attach", "switcher"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -73,7 +73,7 @@ def main() -> int:
     elif args.scene == "focus":
         bridge.setFocusMode(True)
     elif args.scene in ("projects", "project", "badge", "archived", "instruction", "files", "purge", "selector",
-                        "attach"):
+                        "attach", "switcher"):
         # V2.0 Gate 6A: sample projects in the ISOLATED store only (fixture copy,
         # nobody's data): two active, one archived, each with conversations.
         if not args.fixture:
@@ -114,6 +114,15 @@ def main() -> int:
             bridge.openConversation(seeded["JARVIS development"][1][0].id)
             bridge.setPage("home")
             QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "projectSelectorMenu"), "open"))
+        elif args.scene == "switcher":
+            # Gate 6D-a: the conversation switcher's menu over a project scope
+            # with three conversations (fixture store only).
+            dev = seeded["JARVIS development"][0]
+            for title in ("Switcher and rename design", "Release checklist"):
+                store.set_conversation_title(store.create_conversation(dev.id).id, title)
+            bridge.openConversation(seeded["JARVIS development"][1][0].id)
+            bridge.setPage("home")
+            QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "conversationSwitcherMenu"), "open"))
         elif args.scene == "attach":
             # Gate 6C: the open Global conversation (fixture store only), with a
             # title and two turns, previewed against "Home renovation".

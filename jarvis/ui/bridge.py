@@ -17,6 +17,7 @@ import os
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable
@@ -256,6 +257,8 @@ class Bridge(QObject):
         # that does not verify is never opened and nothing from it is used.
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
         self._conversation_list: list[dict] = []
+        self._scope_conversations: list[dict] = []
+        self._rename_notice = ""
         # Gate 6A: the open conversation's owner, as the store reports it
         # ({} = Global). Context only: nothing here is authority.
         self._conversation_owner: dict[str, Any] = {}
@@ -551,6 +554,10 @@ class Bridge(QObject):
         if not title or conversation.store is None:
             return
         try:
+            # Never over a name the person already gave (Gate 6D-a).
+            record = conversation.store.load_conversation(conversation.id)
+            if record is None or record.title:
+                return
             conversation.store.set_conversation_title(conversation.id, title)
         except Exception:  # noqa: BLE001 - a label only; the conversation is unaffected
             return
@@ -570,6 +577,15 @@ class Bridge(QObject):
             for r in records
         ]
         self._conversation_owner = self._owner_of(store, self._conversation_store.id if hasattr(self, "_conversation_store") else None)
+        try:
+            scope = store.list_conversations(project_id=self._conversation_owner.get("id") or None) if store is not None else []
+        except Exception:  # noqa: BLE001 - storage boundary
+            scope = []
+        self._scope_conversations = [
+            {"id": r.id, "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                              if r.origin == "legacy-import" else "")}
+            for r in scope
+        ]
         self.conversationChanged.emit()
 
     @staticmethod
@@ -598,6 +614,66 @@ class Bridge(QObject):
     @Property(str, notify=conversationChanged)
     def conversationId(self) -> str:
         return self._conversation_store.id or ""
+
+    # -- Gate 6D-a: the top-bar conversation switcher and its rename ----------
+    #
+    # A label only: a title is never read by any authority decision. The
+    # switcher lists the CURRENT scope's conversations (the open one's owner,
+    # Global when Global), newest first; switching is openConversation. A
+    # rename goes through the app's explicit-user result; the store alone
+    # decides the length limit and the archived refusals.
+
+    renameNoticeChanged = Signal()
+
+    @Property("QVariantList", notify=conversationChanged)
+    def scopeConversations(self) -> list:
+        """Non-archived conversations of the open conversation's scope; an
+        untitled one has title "" (the window says "New Chat")."""
+        return [{"id": row["id"], "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                 "active": row["id"] == self._conversation_store.id} for row in self._scope_conversations]
+
+    @Property(str, notify=conversationChanged)
+    def conversationTitle(self) -> str:
+        """The open conversation's stored name, "" when it has none."""
+        return next((row["title"] for row in self.scopeConversations if row["active"]), "")
+
+    @Property(str, notify=renameNoticeChanged)
+    def conversationRenameNotice(self) -> str:
+        return self._rename_notice
+
+    @staticmethod
+    def _normalized_title(text: str) -> str:
+        """Newlines and control characters become single spaces, then trimmed."""
+        return " ".join("".join(" " if ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf") else ch
+                                for ch in str(text)).split())
+
+    @Slot()
+    def clearRenameNotice(self) -> None:
+        self._rename_notice = ""
+        self.renameNoticeChanged.emit()
+
+    @Slot(str, str, result=bool)
+    def renameConversation(self, conversation_id: str, title: str) -> bool:
+        """Commit a rename of EXACTLY ``conversation_id`` (the one captured
+        when the edit started, never whichever is open now). Refused while a
+        run is busy. Empty after normalizing: no call, the old name stays."""
+        self._rename_notice = ""
+        normalized = self._normalized_title(title)
+        if self._busy:
+            self._rename_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
+        elif not str(conversation_id):
+            self._rename_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This conversation is not saved yet."))
+        elif not normalized:
+            self._rename_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Type a name; the old name is kept."))
+        else:
+            payload = self.backend.conversation_rename(str(conversation_id), normalized)
+            self._rename_notice = self._error_message(payload)
+        ok = self._rename_notice == ""
+        if ok:
+            self._refresh_conversations()
+            self.refreshProjects()
+        self.renameNoticeChanged.emit()
+        return ok
 
     def _activate(self, opened: PersistedConversation) -> None:
         """Open ``opened``: its history on screen, a fresh Core session for it."""

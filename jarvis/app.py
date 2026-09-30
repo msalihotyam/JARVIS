@@ -1745,6 +1745,30 @@ def conversation_attach_result(
     return CommandResult({"command": command, "attached": attached}, EXIT_OK)
 
 
+def conversation_rename_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+    title: str,
+) -> CommandResult:
+    """A manual rename of one conversation (Gate 6D-a): the person's own
+    window input, a label only - never read by any authority decision. The
+    store alone decides the length limit and the archived refusals."""
+    command = "conversation-rename"
+    try:
+        memory.set_conversation_title(conversation_id, title)
+    except KeyError:
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK,
+            f"Unknown or archived conversation: {conversation_id}", EXIT_INVALID_INPUT,
+        )
+    except ValueError as exc:
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK, str(exc), EXIT_INVALID_INPUT
+        )
+    return CommandResult({"command": command, "conversation_id": conversation_id, "title": title}, EXIT_OK)
+
+
 def memory_add_result(
     memory: SQLiteMemoryStore,
     settings: Settings,

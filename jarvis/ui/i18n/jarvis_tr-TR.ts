@@ -447,6 +447,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yeni konuşma</translation>
     </message>
     <message>
+        <source>Wait for the current run to finish.</source>
+        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>This conversation is not saved yet.</source>
+        <translation>Bu sohbet henüz kaydedilmedi.</translation>
+    </message>
+    <message>
+        <source>Type a name; the old name is kept.</source>
+        <translation>Bir ad yazın; eski ad korunur.</translation>
+    </message>
+    <message>
         <source>Opened a conversation (%1 turns)</source>
         <translation>Bir konuşma açıldı (%1 tur)</translation>
     </message>
@@ -3854,8 +3866,40 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Süren çalışmanın bitmesini bekleyin.</translation>
     </message>
     <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>This conversation is not saved yet.</source>
+        <translation>Bu sohbet henüz kaydedilmedi.</translation>
+    </message>
+    <message>
+        <source>The project is archived: unarchive it to rename this conversation.</source>
+        <translation>Proje arşivlendi: bu sohbeti yeniden adlandırmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
         <source>+ New conversation</source>
         <translation>+ Yeni sohbet</translation>
+    </message>
+    <message>
+        <source>CONVERSATIONS</source>
+        <translation>SOHBETLER</translation>
+    </message>
+    <message>
+        <source>Rename</source>
+        <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Conversation name</source>
+        <translation>Sohbet adı</translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Kaydet</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>İptal</translation>
     </message>
     <message>
         <source>PROJECTS</source>
