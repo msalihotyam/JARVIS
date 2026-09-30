@@ -82,6 +82,11 @@ a chat's scrollback.
 - Rotate at **milestone boundaries**, when Messages/context is roughly
   400–500k+ or the chat is noticeably slow.
 - Do **not** rotate mid-implementation unless the session is unusable.
+- Salih decision (2026-09-30): keep one Opus chat and one Sonnet chat. Each
+  prompt goes to the chat matching its `MODEL:` line, so the model is never
+  switched inside a chat (a switch forces a full re-read of the session). The
+  two chats share canonical main and must never run at the same time.
+  Rotation rules above are unchanged, per chat.
 - Before retiring a chat: the accepted work must be canonical, and the chat
   must be rebound to `C:\Users\realk\Masaüstü\JARVIS`.
 - Archive old chats; do not delete them.

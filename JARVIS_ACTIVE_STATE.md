@@ -49,7 +49,11 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 - Remaining V2.0: Gate 7 (E2E + packaged dogfood + rollback, incl.
   archive/unarchive E2E and a packaged rollback over a moved conversation).
-  Salih decides purge-residue privacy before Gate 7.
+  Purge residue (Salih 2026-09-30): V2.0 purge stays as in §4.24 (canonical
+  file store purged; approval preview/audit payload, model responses, history,
+  provider-sent content, WAL/backups remain, disclosed in the purge dialog).
+  Scrubbing those copies is deferred to a later design (touches audit
+  append-only integrity), not a V2.0 gate; Gate 7 is not waiting on it.
 - V2.1 (Salih 2026-09-29): "all projects memory" toggle (memory only,
   read-only, per-conversation, default off, provenance); PreCompact capture,
   full archive retrieval, context-usage indicator, "Hatırla" button. V2.1
@@ -68,7 +72,7 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Gate 7 preflight (Opus 5.5 high) after Salih's purge-residue decision.
+- Gate 7 preflight (Opus 5.5 high).
 
 ## Rollback / safety anchors
 
