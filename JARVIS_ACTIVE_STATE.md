@@ -10,19 +10,18 @@ daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
 Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). IN PROGRESS:
-phase A (E2E test gaps) done; phase B (build + install) waits for Gate 6D and
-the model-list fix below.
+phase A done; phase B ran early (see Installed); rest in "Next action".
 
-Status: Gates 1–5 and 6A–6D-a complete on main; nothing in flight. 6D-a
-(§4.25, Salih 2026-09-30): top-bar conversation switcher + right-click rename
-(`conversation_rename_result`; auto-naming never overwrites a set title;
-rename off while busy; edit bound to its conversation). Conversation
-archive/unarchive/delete = 6D-b, not built. 6C (§4.22/§4.25): one-way attach of a Global conversation to a project
-(`attach_global_conversation_to_project`, sole caller
-`conversation_attach_result`; additive `conversation_moves`; V2.1 reserved-table
-guard), selector-menu dialog with preview + single confirm. Base commit:
-`feat(projects): attach a Global conversation to a project`. Installed
-release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
+Status: Gates 1–5 and 6A–6D-b complete on main; nothing in flight. 6D-b
+(§4.22/§4.25, Salih S1–S4 2026-09-30): reversible conversation archive →
+permanent delete (tombstone + additive `conversation_deletions`, schema 10),
+archived sections, open-conversation transition, GAP A drop, 6C re-open with
+state. Base commit: `feat(projects): archive, unarchive and permanently delete
+conversations`.
+
+Installed: `1.0.0-8fbbaef` active since 2026-09-30T11:22Z (predates
+6D-a/6D-b); previous `1.0.0-1c68161`; legacy pruned by that install. Live DB
+opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
 
 ## Roles
 
@@ -35,66 +34,59 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 - V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).
 - Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner fixed
-  (only exception: 6C "Projeye bağla", Global → project, one-way, once;
-  never P→Q or P→Global; Salih 2026-09-29); scope is context, never
-  authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
-  targets (additive tables only, no ALTER).
-- Gates 1–3 (§4.22) incl. archive; no Global-conversation jobs.
-- Gate 4 (§4.23): instructions are guidance, never authority; precedence
-  safety/Core > current message > instruction > retrieved memory; R1.
-- Gate 5 (§4.24): files are untrusted data; retire + explicit purge, purge
-  allowed on archived projects.
-- Gate 6 UX (Salih 2026-09-29/30): Projects on Ctrl+6, History keeps Global,
-  no recents grouping; mouse-first, no shortcut-dependent feature; selector
-  lists active projects only; purge confirmed by typing the row's name;
-  6C: entry only in the selector menu, preview + single "Projeye bağla"
-  button; a conversation that ever used "all projects memory" never moves.
+  (only exception 6C, Global → project, one-way, once); scope is context,
+  never authority; no `SCHEMA_VERSION` bump while schema-10 releases are
+  rollback targets (additive tables only, no ALTER).
+- Gates 1–5 (§4.22–§4.24) incl. project archive, instructions, files.
+- Gate 6 UX (Salih 2026-09-29/30): Projects on Ctrl+6, History keeps Global;
+  mouse-first; selector lists active projects; purge by typing the row's name;
+  6C entry only in the selector menu; 6D-a switcher + rename.
+- 6D-b: S1 two-step archive → "Kalıcı sil", single-button honest dialog; S2
+  delete only from archived / archived-project; S3 GAP B (`jarvis run/text
+  --session-id`, no project, on a deleted conversation's session) accepted
+  for V2.0, no Core change; S4 a deleted legacy import keeps
+  `~/.jarvis/conversation.json`.
 
 ## Uncommitted / external decisions
 
-- Remaining V2.0: Gate 7 (E2E + packaged dogfood + rollback, incl.
-  archive/unarchive E2E and a packaged rollback over a moved conversation).
-  Purge residue (Salih 2026-09-30): V2.0 purge stays as in §4.24 (canonical
-  file store purged; approval preview/audit payload, model responses, history,
-  provider-sent content, WAL/backups remain, disclosed in the purge dialog).
-  Scrubbing those copies is deferred to a later design (touches audit
-  append-only integrity), not a V2.0 gate; Gate 7 is not waiting on it.
-- Gate 7 phase A done (tests only; full suite 4576 OK, 2 skipped).
-- Gate 7 decisions (Salih 2026-09-30): D-1 copy
-  `releases\legacy-1.0.0-5976769` outside Apps\JARVIS, then let the install
-  prune it (4f5a93d stays the Edge anchor; `data\browser-profile` kept);
-  D-2 dogfood on the live DB after a hashed backup (JARVIS closed:
-  `data\jarvis.db` + -wal/-shm, `~\.jarvis\*.json`); D-3 one approved live
-  Claude call after Salih's own CLI re-login; D-4 real packaged -Rollback to
-  1c68161 and back (pending approvals cleared, conversation.json backed up
-  and restored).
-- V2.1 (Salih 2026-09-29): "all projects memory" toggle (memory only,
-  read-only, per-conversation, default off, provenance); PreCompact capture,
-  full archive retrieval, context-usage indicator, "Hatırla" button. V2.1
-  must own `conversation_global_memory_toggles` (roadmap contract).
-- Codex review queue (Salih, Windows, standard model, one commit per session):
-  session1 remainder (instruction channel, grant fix, schema-10), Gate 5, 6A,
-  6B, 6C, fix commits. F1+F2 fixed in `74adbd0`, F3 by design (§4.22), F4
-  fixed in 6A.
-- Backlog: full-suite timing flake
-  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`
-  (passes alone); project-filtered jobs query (listing is the oldest 20);
-  catalog test skips on a system Python (Linguist tools on PATH, not next to
-  python.exe); Gate 4B Edge retirement deferred.
-- External: installed app's Claude CLI OAuth expired (2026-09-26); re-login.
+- S5 model list (Salih 2026-09-30, next gate): per model NAME keep only the
+  highest version (Sol, Luna, Terra, Astra, Opus, Sonnet, Haiku, Fable are
+  separate names that never hide each other); unversioned/-latest, preview,
+  context variants ([1m]) and unparseable ids stay; the selected model is
+  never hidden (a move is offered); "Eski modelleri göster" toggle, default
+  off; Codex's own declared upgrades still apply first.
+- S6 (Salih 2026-09-30): Gate 6E visual polish of all 6A–6D surfaces before
+  the re-install and dogfood (incl. "Yeni Sohbet" in History/project lists).
+- Gate 7: D-1 and D-2 done; D-3 one approved live Claude call after Salih's
+  own CLI re-login; D-4 packaged -Rollback to 1c68161 and back (approvals
+  cleared, conversation.json backed up and restored).
+- Purge residue (Salih 2026-09-30): §4.24 as is; scrubbing copies deferred.
+  V2.1 owns `conversation_global_memory_toggles` (roadmap contract).
+- Codex review queue (Salih, Windows, standard model, one commit per
+  session): session1 remainder, Gate 5, 6A, 6B, 6C, 6D-a, 6D-b, fixes.
+- Backlog: `build_release.ps1 -Install` exits 1 after a successful install
+  (F1: no final `exit 0`, robocopy's 1 leaks); timing flake
+  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`;
+  project-filtered jobs query; catalog test skips on a system Python;
+  Gate 4B Edge retirement deferred.
 - Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
 
-## Next action
+## Next action (in order)
 
-- Gate 6D-b design preflight (conversation archive/unarchive/permanent
-  delete; Opus 5.5 high). Then the model-list diagnosis/fix. Then Gate 7
-  phase B: build + install (needs Salih's go) and D-1..D-4 above.
+1. Model-list gate (S5). 2. Gate 6E visual polish (S6). 3. Back up
+`releases\1.0.0-4f5a93d` (the next install prunes it), then re-install
+(Salih's go). 4. Dogfood + D-3. 5. Rollback proof (D-4). 6. Close.
 
 ## Rollback / safety anchors
 
-- Releases: `1.0.0-1c68161` active; `1.0.0-4f5a93d`, `legacy-1.0.0-5976769`
-  retained. `data\browser-profile` kept; `data\jarvis.pre-v2.db` verified.
-- `SCHEMA_VERSION` stays 10 while any schema-10 release is a rollback target;
-  `~/.jarvis/conversation.json` is only ever read by V2.
+- Releases: `1.0.0-8fbbaef` active; `1.0.0-1c68161` previous (Chrome);
+  `1.0.0-4f5a93d` retained (Edge; `data\browser-profile` kept).
+- `%USERPROFILE%\JARVIS-backups`: `releases\legacy-1.0.0-5976769` (+
+  `.manifest.sha256`, 2929 files verified) and `2026-09-30-gate7`
+  (`data\jarvis.db` + `~\.jarvis\*.json`, SHA-256 manifest, taken before
+  8fbbaef first opened the DB).
+- `data\jarvis.pre-v2.db` verified; `SCHEMA_VERSION` stays 10 while any
+  schema-10 release is a rollback target; V2 only reads
+  `~/.jarvis/conversation.json`.
 - Never touch `uv.lock`; never stage the dashboard WIP
   (`dev/dashboard/UPDATE.md`, `render_dashboard.py`, `status.json`).

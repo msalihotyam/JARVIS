@@ -163,7 +163,7 @@ class AttachStoreTests(StoreCase):
         for target in ({"project_id": self.q.id}, {"project_id": self.p.id}, {"new_project_name": "Back"}):
             with self.subTest(repeat=target):
                 self.assertRefusedNothingWritten(lambda: self.attach(**target), "Only a Global conversation")
-        for name in ("move_conversation", "set_conversation_project", "delete_conversation"):
+        for name in ("move_conversation", "set_conversation_project"):      # 6D-b's delete moves nothing
             self.assertFalse(hasattr(self.memory, name), name)
 
     def test_a_open_work_in_a_linked_session_blocks(self) -> None:

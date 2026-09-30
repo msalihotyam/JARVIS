@@ -28,7 +28,8 @@ def main() -> int:
     parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
                                             "projects", "project", "badge", "archived",
-                                            "instruction", "files", "purge", "selector", "attach", "switcher"), default="home")
+                                            "instruction", "files", "purge", "selector", "attach", "switcher",
+                                            "archive", "delete"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -73,7 +74,7 @@ def main() -> int:
     elif args.scene == "focus":
         bridge.setFocusMode(True)
     elif args.scene in ("projects", "project", "badge", "archived", "instruction", "files", "purge", "selector",
-                        "attach", "switcher"):
+                        "attach", "switcher", "archive", "delete"):
         # V2.0 Gate 6A: sample projects in the ISOLATED store only (fixture copy,
         # nobody's data): two active, one archived, each with conversations.
         if not args.fixture:
@@ -123,6 +124,27 @@ def main() -> int:
             bridge.openConversation(seeded["JARVIS development"][1][0].id)
             bridge.setPage("home")
             QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "conversationSwitcherMenu"), "open"))
+        elif args.scene == "archive":
+            # Gate 6D-b: the switcher's right-click menu - rename, archive and
+            # the permanent delete ("archive it first") - fixture store only.
+            bridge.openConversation(seeded["JARVIS development"][1][0].id)
+            bridge.setPage("home")
+            QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "conversationSwitcherContext"), "open"))
+        elif args.scene == "delete":
+            # Gate 6D-b: History's ARCHIVED section and the permanent-delete
+            # dialog over it (fixture store only, two archived conversations).
+            from jarvis.conversation import append_turn
+            archived = []
+            for title in ("Old tax notes", "Holiday ideas"):
+                record = store.create_conversation(title=title)
+                store.update_conversation_state(record.id, lambda state, text=title: append_turn(
+                    state, role="user", kind="user", text=text, message=text, key=text)[0])
+                store.archive_conversation(record.id)
+                archived.append(record)
+            bridge._refresh_conversations()
+            bridge.setPage("history")
+            QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(
+                window.findChild(QObject, "conversationDeleteDialog"), "openFor", Q_ARG("QVariant", archived[0].id)))
         elif args.scene == "attach":
             # Gate 6C: the open Global conversation (fixture store only), with a
             # title and two turns, previewed against "Home renovation".

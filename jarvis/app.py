@@ -1769,6 +1769,83 @@ def conversation_rename_result(
     return CommandResult({"command": command, "conversation_id": conversation_id, "title": title}, EXIT_OK)
 
 
+def _conversation_lifecycle_failure(command: str, settings: Settings, conversation_id: str, exc: Exception) -> CommandResult:
+    message = f"Unknown or deleted conversation: {conversation_id}" if isinstance(exc, KeyError) else str(exc)
+    return failure_result(command, settings.permission_mode, ErrorCode.INVALID_TASK, message, EXIT_INVALID_INPUT)
+
+
+def conversation_archive_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+) -> CommandResult:
+    """Archive ONE conversation (Gate 6D-b, Salih decision 2026-09-30): the
+    reversible first step. THE audited production caller of the store's
+    archive; the conversation is the person's own window choice. No model,
+    connector, intent, scheduler or Core path reaches it."""
+    command = "conversation-archive"
+    try:
+        record = memory.archive_conversation(conversation_id)
+    except (KeyError, ValueError) as exc:
+        return _conversation_lifecycle_failure(command, settings, conversation_id, exc)
+    return CommandResult({"command": command, "conversation_id": record.id, "archived_at": record.archived_at}, EXIT_OK)
+
+
+def conversation_unarchive_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+) -> CommandResult:
+    """Undo an archive exactly (Gate 6D-b). THE audited production caller of
+    the store's unarchive; explicit window input only."""
+    command = "conversation-unarchive"
+    try:
+        record = memory.unarchive_conversation(conversation_id)
+    except (KeyError, ValueError) as exc:
+        return _conversation_lifecycle_failure(command, settings, conversation_id, exc)
+    return CommandResult({"command": command, "conversation_id": record.id}, EXIT_OK)
+
+
+def conversation_delete_preview_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+) -> CommandResult:
+    """What a permanent delete would remove (Gate 6D-b), read-only;
+    ``blocked`` carries the refusal the confirm would meet."""
+    command = "conversation-delete-preview"
+    try:
+        preview = memory.conversation_delete_preview(conversation_id)
+    except (KeyError, ValueError) as exc:
+        return _conversation_lifecycle_failure(command, settings, conversation_id, exc)
+    return CommandResult({"command": command, "preview": preview}, EXIT_OK)
+
+
+def conversation_delete_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+    *,
+    confirm: str,
+    expected_next_seq: int,
+    expected_title: str,
+) -> CommandResult:
+    """Permanently delete ONE conversation (Gate 6D-b, Salih decision
+    2026-09-30): the second step after archive. THE audited production
+    caller of the store's writer: the conversation, the confirmation and
+    the previewed ``next_seq`` and title are the person's own confirmed
+    window input. No model, connector, intent, scheduler or Core path
+    reaches it, and there is no CLI for it."""
+    command = "conversation-delete"
+    try:
+        deleted = memory.delete_conversation(
+            conversation_id, confirm=confirm, expected_next_seq=expected_next_seq, expected_title=expected_title
+        )
+    except (KeyError, ValueError) as exc:
+        return _conversation_lifecycle_failure(command, settings, conversation_id, exc)
+    return CommandResult({"command": command, "deleted": deleted}, EXIT_OK)
+
+
 def memory_add_result(
     memory: SQLiteMemoryStore,
     settings: Settings,

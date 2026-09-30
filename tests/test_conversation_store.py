@@ -315,7 +315,8 @@ class ConversationStoreTests(StoreCase):
         # Gate 6C: the ONE owner change is the one-way Global -> project
         # attach (tests/test_conversation_attach.py); a project-owned
         # conversation never moves again and there is no generic mover.
-        for name in ("move_conversation", "set_conversation_project", "delete_conversation"):
+        # (Gate 6D-b adds a permanent delete, which never changes an owner.)
+        for name in ("move_conversation", "set_conversation_project"):
             self.assertFalse(hasattr(self.memory, name), name)
         project = self.memory.create_project("P")
         owned = self.memory.create_conversation(project.id)
@@ -583,6 +584,44 @@ print(json.dumps({"schema": store.schema_version(), "projects": projects,
         self.assertEqual({kept["id"]: "active", gone["id"]: "purged"}, {f["id"]: f["lifecycle"] for f in listed})
         self.assertFalse(reopened.load_project(old.id).active)
         self.assertTrue(reopened.load_project(live.id).active)
+        self.assertEqual("touched by the old release", reopened.load_session(session.id).next_step)
+
+    def test_the_rollback_release_ignores_archived_and_deleted_conversations(self) -> None:
+        # Gate 6D-b: an archived conversation and two tombstones (one of them a
+        # deleted legacy import, one with a linked session) in a V2 database.
+        memory = self.store()
+        session = SessionState(objective="linked session")
+        memory.save_session(session)
+        archived = memory.create_conversation(title="Arşivli")
+        memory.update_conversation_state(archived.id, lambda s: say(s, "arşivde", "a1"))
+        memory.archive_conversation(archived.id)
+        doomed = memory.create_conversation(title="Silinecek")
+        memory.update_conversation_state(doomed.id, lambda s: say(s, "silinecek", "d1"))
+        memory.link_session_conversation(session.id, doomed.id)
+        self.legacy_file("eski")
+        imported = memory.import_legacy_conversation(self.legacy)
+        for conversation in (doomed, imported):
+            memory.archive_conversation(conversation.id)
+            preview = memory.conversation_delete_preview(conversation.id)
+            memory.delete_conversation(conversation.id, confirm=conversation.id,
+                                       expected_next_seq=preview["expected_next_seq"], expected_title=preview["title"])
+        tables = ("conversations", "conversation_sessions", "conversation_legacy_imports", "conversation_deletions")
+        before = {name: rows(self.database, f"SELECT * FROM {name} ORDER BY rowid") for name in tables}
+        self.assertEqual(2, len(before["conversation_deletions"]))
+        # The old release opens it, reads and writes what it knows.
+        out = self.old(self.OLD_OPERATIONS, str(self.database), session.id, str(self.old_tree))
+        self.assertEqual({"constant": 10, "schema": 10}, {k: out[k] for k in ("constant", "schema")})
+        self.assertEqual("touched by the old release", out["next_step"])
+        self.assertEqual(before, {name: rows(self.database, f"SELECT * FROM {name} ORDER BY rowid") for name in tables})
+        # V2 reopens: the archived one kept, the tombstones still hidden, nothing re-imported.
+        reopened = self.store()
+        self.assertEqual(10, reopened.schema_version())
+        self.assertEqual([archived.id], [c.id for c in reopened.list_conversations(include_archived=True)])
+        self.assertEqual(["arşivde"], [t.message for t in reopened.load_conversation_state(archived.id).turns])
+        self.assertIsNone(reopened.load_conversation(doomed.id))
+        self.assertIsNone(reopened.load_conversation(imported.id))
+        self.assertEqual(doomed.id, reopened.conversation_for_session(session.id))
+        self.assertIsNone(reopened.import_legacy_conversation(self.legacy))
         self.assertEqual("touched by the old release", reopened.load_session(session.id).next_step)
 
     def add_file(self, memory, project_id: str, name: str, text: str) -> dict:

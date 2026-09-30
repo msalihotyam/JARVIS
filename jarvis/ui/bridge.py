@@ -259,6 +259,15 @@ class Bridge(QObject):
         self._conversation_list: list[dict] = []
         self._scope_conversations: list[dict] = []
         self._rename_notice = ""
+        # Gate 6D-b: History's archived Global conversations, whether the open
+        # one is itself archived (read-only) and its name, the held delete
+        # preview (what the confirm will send) and the last lifecycle answer.
+        self._archived_conversations: list[dict] = []
+        self._conversation_archived = False
+        self._open_title: Any = ""
+        self._delete_preview: dict[str, Any] = {}
+        self._lifecycle_notice = ""
+        self._project_archived_conversations: list[dict] = []
         # Gate 6A: the open conversation's owner, as the store reports it
         # ({} = Global). Context only: nothing here is authority.
         self._conversation_owner: dict[str, Any] = {}
@@ -563,20 +572,37 @@ class Bridge(QObject):
             return
         self._refresh_conversations()
 
+    @staticmethod
+    def _listed_title(record: Any) -> Any:
+        return record.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                if record.origin == "legacy-import"
+                                else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()))
+
     def _refresh_conversations(self) -> None:
         store = self._conversation_db()
         try:
-            records = store.list_conversations(project_id=None) if store is not None else []
+            records = store.list_conversations(project_id=None, include_archived=True) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
             records = []
         self._conversation_list = [
-            {"id": r.id, "origin": r.origin, "updated_at": r.updated_at,
-             "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
-                                  if r.origin == "legacy-import"
-                                  else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()))}
-            for r in records
+            {"id": r.id, "origin": r.origin, "updated_at": r.updated_at, "title": self._listed_title(r)}
+            for r in records if r.archived_at is None
         ]
-        self._conversation_owner = self._owner_of(store, self._conversation_store.id if hasattr(self, "_conversation_store") else None)
+        # Gate 6D-b: History's ARCHIVED section (Global only; a project's are on its page).
+        self._archived_conversations = [
+            {"id": r.id, "origin": r.origin, "updated_at": r.updated_at, "archived_at": r.archived_at,
+             "title": self._listed_title(r)}
+            for r in records if r.archived_at is not None
+        ]
+        open_id = self._conversation_store.id if hasattr(self, "_conversation_store") else None
+        try:
+            open_record = store.load_conversation(open_id) if store is not None and open_id else None
+        except Exception:  # noqa: BLE001 - a label only
+            open_record = None
+        self._conversation_archived = open_record is not None and open_record.archived_at is not None
+        self._open_title = "" if open_record is None else (open_record.title or (
+            ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
+        self._conversation_owner = self._owner_of(store, open_id)
         try:
             scope = store.list_conversations(project_id=self._conversation_owner.get("id") or None) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
@@ -634,8 +660,10 @@ class Bridge(QObject):
 
     @Property(str, notify=conversationChanged)
     def conversationTitle(self) -> str:
-        """The open conversation's stored name, "" when it has none."""
-        return next((row["title"] for row in self.scopeConversations if row["active"]), "")
+        """The open conversation's stored name, "" when it has none (also
+        while it is archived and so not in the switcher's list)."""
+        title = self._open_title
+        return render(title) if isinstance(title, tuple) else title
 
     @Property(str, notify=renameNoticeChanged)
     def conversationRenameNotice(self) -> str:
@@ -744,9 +772,16 @@ class Bridge(QObject):
 
     @Property(bool, notify=conversationChanged)
     def conversationReadOnly(self) -> bool:
-        """The open conversation belongs to an archived project. Presentation
-        only: Core's archive refusals remain the enforcement."""
-        return bool(self._conversation_owner) and not self._conversation_owner.get("active", False)
+        """The open conversation belongs to an archived project, or is itself
+        archived (Gate 6D-b). Presentation only: Core's archive refusals
+        remain the enforcement."""
+        project_archived = bool(self._conversation_owner) and not self._conversation_owner.get("active", False)
+        return project_archived or self._conversation_archived
+
+    @Property(bool, notify=conversationChanged)
+    def conversationArchived(self) -> bool:
+        """The open conversation itself is archived (read-only until unarchived)."""
+        return self._conversation_archived
 
     @Property("QVariantList", notify=projectsChanged)
     def projectRecords(self) -> list:
@@ -758,7 +793,17 @@ class Bridge(QObject):
 
     @Property("QVariantList", notify=projectsChanged)
     def projectConversations(self) -> list:
-        return [{**row, "active": row["id"] == self._conversation_store.id} for row in self._project_conversations]
+        """The open project's non-archived conversations. Under an archived
+        project each one is deletable at once: the project's archive is the
+        reversible first step (Gate 6D-b, Salih decision 2026-09-30)."""
+        archived = self.openProject.get("active") is False
+        return [{**row, "active": row["id"] == self._conversation_store.id, "deletable": archived}
+                for row in self._project_conversations]
+
+    @Property("QVariantList", notify=projectsChanged)
+    def projectArchivedConversations(self) -> list:
+        """The open project's archived conversations (its ARCHIVED section)."""
+        return [{**row, "active": row["id"] == self._conversation_store.id} for row in self._project_archived_conversations]
 
     @Property("QVariantList", notify=projectsChanged)
     def projectJobs(self) -> list:
@@ -790,20 +835,24 @@ class Bridge(QObject):
 
     def _load_project_detail(self) -> None:
         self._project_conversations, self._project_jobs, self._project_jobs_bounded = [], [], False
+        self._project_archived_conversations = []
         self._load_project_instruction()
         self._load_project_files()
         if not self._open_project:
             return
         store = self._conversation_db()
         try:
-            records = store.list_conversations(project_id=self._open_project) if store is not None else []
+            records = (store.list_conversations(project_id=self._open_project, include_archived=True)
+                       if store is not None else [])
         except Exception:  # noqa: BLE001 - storage boundary
             records = []
-        self._project_conversations = [
-            {"id": r.id, "updated_at": r.updated_at,
+        rows_of = [
+            {"id": r.id, "updated_at": r.updated_at, "archived_at": r.archived_at,
              "title": r.title or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"))}
             for r in records
         ]
+        self._project_conversations = [row for row in rows_of if row["archived_at"] is None]
+        self._project_archived_conversations = [row for row in rows_of if row["archived_at"] is not None]
         payload = self.backend.jobs(True)
         listing = rows(payload, "jobs", "id")
         self._project_jobs = [job for job in listing if job.get("project_id") == self._open_project]
@@ -1109,11 +1158,159 @@ class Bridge(QObject):
             return False
         store = self._conversation_db()
         self._attach_preview, self._attach_notice = {}, ""
-        self._activate(PersistedConversation(store, conversation_id))
+        # Re-opened WITH its verified stored state, so the feed and the next
+        # request's history keep the earlier messages.
+        opened = self._load_conversation(store, conversation_id)
+        if opened is None:
+            self._leave_open_conversation(*self._open_scope())
+        else:
+            self._activate(opened)
         self.refreshProjects()
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation attached to %1"),
                     (str(payload["attached"]["target"]["name"]),)), "system")
         self.attachChanged.emit()
+        return True
+
+    # -- Gate 6D-b: archive, unarchive, permanent delete (Salih 2026-09-30) ----
+    #
+    # Two steps, like a project file's retire -> purge: archive (reversible),
+    # then a permanent delete confirmed from a preview. Every change goes
+    # through the explicit-user app results; the store decides and its
+    # refusals are shown as returned. Each action carries the conversation id
+    # captured when it started. The open conversation is never left open once
+    # archived or deleted.
+
+    conversationLifecycleChanged = Signal()
+
+    @Property("QVariantList", notify=conversationChanged)
+    def archivedConversations(self) -> list:
+        """History's ARCHIVED section: the archived Global conversations."""
+        return [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                 "active": row["id"] == self._conversation_store.id} for row in self._archived_conversations]
+
+    @Property(str, notify=conversationLifecycleChanged)
+    def conversationNotice(self) -> str:
+        return self._lifecycle_notice
+
+    @Property(dict, notify=conversationLifecycleChanged)
+    def deletePreview(self) -> dict:
+        return dict(self._delete_preview)
+
+    def _open_scope(self) -> tuple[str | None, bool]:
+        """The open conversation's scope (``None`` = Global) and whether a
+        new conversation may be opened in it (Global, or an active project)."""
+        owner = self._conversation_owner
+        return (owner.get("id") or None, bool(owner.get("active"))) if owner else (None, True)
+
+    def _leave_open_conversation(self, scope: str | None, writable: bool) -> None:
+        """The open conversation was archived or deleted: never stay on it.
+        The newest non-archived conversation of its scope when that scope is
+        writable, else the newest non-archived Global one, else a new Global
+        one (the startup rule); then that conversation's own list surface."""
+        store = self._conversation_db()
+        opened = None
+        for owner in ([scope] if writable and scope is not None else []) + [None]:
+            try:
+                records = store.list_conversations(project_id=owner) if store is not None else []
+            except Exception:  # noqa: BLE001 - storage boundary
+                records = []
+            for record in records:
+                opened = self._load_conversation(store, record.id)
+                if opened is not None:
+                    break
+            if opened is not None:
+                break
+        if opened is None:
+            try:
+                opened = PersistedConversation(store, store.create_conversation().id)
+            except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
+                            (type(exc).__name__,)), "error")
+                opened = PersistedConversation(None, None)
+        self._activate(opened)
+        owner = self._conversation_owner
+        if owner:
+            self.showProject(owner["id"])
+        else:
+            self.refreshProjects()
+            self.setPage("history")
+
+    def _lifecycle_done(self, conversation_id: str, payload: Any, leaves: bool,
+                        scope: tuple[str | None, bool]) -> bool:
+        self._lifecycle_notice = self._error_message(payload)
+        if not self._lifecycle_notice:
+            if leaves and conversation_id == self._conversation_store.id:
+                self._leave_open_conversation(*scope)
+            else:
+                self._refresh_conversations()
+                self.refreshProjects()
+        self.conversationLifecycleChanged.emit()
+        return self._lifecycle_notice == ""
+
+    def _lifecycle_refused(self, conversation_id: str) -> bool:
+        if self._busy:
+            self._lifecycle_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
+        elif not conversation_id:
+            self._lifecycle_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This conversation is not saved yet."))
+        else:
+            return False
+        self.conversationLifecycleChanged.emit()
+        return True
+
+    @Slot(str, result=bool)
+    def archiveConversation(self, conversation_id: str) -> bool:
+        """Archive EXACTLY ``conversation_id`` (reversible)."""
+        conversation_id = str(conversation_id)
+        if self._lifecycle_refused(conversation_id):
+            return False
+        scope = self._open_scope()
+        return self._lifecycle_done(conversation_id, self.backend.conversation_archive(conversation_id), True, scope)
+
+    @Slot(str, result=bool)
+    def unarchiveConversation(self, conversation_id: str) -> bool:
+        """Undo an archive of EXACTLY ``conversation_id``; the store refuses
+        under an archived project (unarchive the project first)."""
+        conversation_id = str(conversation_id)
+        if self._lifecycle_refused(conversation_id):
+            return False
+        return self._lifecycle_done(conversation_id, self.backend.conversation_unarchive(conversation_id), False,
+                                    self._open_scope())
+
+    @Slot(str)
+    def previewDeleteConversation(self, conversation_id: str) -> None:
+        """Hold what a permanent delete of ``conversation_id`` would remove
+        ("" clears it); the dialog shows it and the confirm sends it."""
+        self._delete_preview, self._lifecycle_notice = {}, ""
+        if str(conversation_id):
+            payload = self.backend.conversation_delete_preview(str(conversation_id))
+            self._lifecycle_notice = self._error_message(payload)
+            if not self._lifecycle_notice:
+                self._delete_preview = dict(payload["preview"])
+        self.conversationLifecycleChanged.emit()
+
+    @Slot(str, result=bool)
+    def confirmDeleteConversation(self, conversation_id: str) -> bool:
+        """The single "Kalıcı sil" button: delete exactly what was previewed
+        (id, next_seq and title). A refusal - e.g. the conversation changed -
+        refreshes the preview and is never retried."""
+        conversation_id = str(conversation_id)
+        held = self._delete_preview
+        if self._busy or not held or held.get("blocked") or held.get("conversation_id") != conversation_id:
+            return False
+        scope = self._open_scope()
+        payload = self.backend.conversation_delete(conversation_id, confirm=conversation_id,
+                                                   expected_next_seq=held["expected_next_seq"],
+                                                   expected_title=held["title"])
+        error = self._error_message(payload)
+        if error:
+            self.previewDeleteConversation(conversation_id)          # shown fresh; never retried
+            self._lifecycle_notice = error
+            self.conversationLifecycleChanged.emit()
+            return False
+        self._delete_preview = {}
+        self._lifecycle_done(conversation_id, payload, True, scope)
+        self._set_sessions({"sessions": self._sessions})
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation deleted permanently"), ()), "system")
         return True
 
     def _session_conversation(self, session_id: str) -> str | None:
@@ -1125,12 +1322,15 @@ class Bridge(QObject):
         except Exception:  # noqa: BLE001 - storage boundary
             return None
 
-    def _payload_owner(self, payload: Any, origin: PersistedConversation) -> PersistedConversation:
-        """The conversation a run's envelope belongs to.
+    def _payload_owner(self, payload: Any, origin: PersistedConversation) -> PersistedConversation | None:
+        """The conversation a run's envelope belongs to, or ``None``: DROP it.
 
         A session already linked belongs to ITS conversation. A session seen for
         the first time is linked to ``origin``, the conversation the request came
-        from. Without a session the envelope belongs to ``origin``."""
+        from. Without a session the envelope belongs to ``origin``. A linked
+        conversation that cannot be loaded - deleted (Gate 6D-b) or corrupt -
+        owns it all the same: it is dropped, never handed to the open
+        conversation or to any other owner."""
         run = payload.get("run") if isinstance(payload, dict) and isinstance(payload.get("run"), dict) else payload
         session = run.get("session") if isinstance(run, dict) else None
         session_id = session.get("id") if isinstance(session, dict) else None
@@ -1144,19 +1344,26 @@ class Bridge(QObject):
             except Exception:  # noqa: BLE001 - an unlinkable session stays with its origin
                 pass
             return origin
-        if linked == origin.id:
-            return origin
         if linked == self._conversation_store.id:
             return self._conversation_store
-        return self._load_conversation(store, linked) or origin
+        try:
+            return PersistedConversation(store, linked, store.load_conversation_state(linked))
+        except Exception:  # noqa: BLE001 - deleted or unreadable: dropped by the caller
+            return None
 
     def _delivered(self, handler: Callable[[Any], None]) -> Callable[[Any], None]:
         """``handler`` for the conversation open NOW; anything that turns out to
-        belong to another conversation is remembered there instead."""
+        belong to another conversation is remembered there instead, and
+        anything whose conversation cannot be loaded is dropped: the only trace
+        is a transient window notice, saved nowhere."""
         origin = self._conversation_store
 
         def deliver(payload: Any) -> None:
             owner = self._payload_owner(payload, origin)
+            if owner is None:
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A reply for a conversation that was deleted or cannot "
+                                                                  "be read was dropped; it was saved nowhere."), ()), "system")
+                return
             if owner.id == self._conversation_store.id:
                 handler(payload)
                 return
@@ -1920,8 +2127,22 @@ class Bridge(QObject):
     def refreshHistory(self) -> None:
         self._run("sessions", self.backend.sessions, self._set_sessions)
 
+    def _of_deleted_conversation(self, session_id: str) -> bool:
+        """The session belongs to a permanently deleted conversation (Gate 6D-b)."""
+        linked, store = self._session_conversation(session_id), self._conversation_db()
+        if linked is None or store is None:
+            return False
+        try:
+            return store.is_conversation_deleted(linked)
+        except Exception:  # noqa: BLE001 - storage boundary: listed as before
+            return False
+
     def _set_sessions(self, payload: Any) -> None:
-        self._sessions = self._titled(rows(payload, "sessions", "session_id"), "session_id")
+        # A deleted conversation's sessions leave the list (it cannot be opened);
+        # their tasks and results stay on the Tasks page.
+        listing = [row for row in rows(payload, "sessions", "session_id")
+                   if not self._of_deleted_conversation(str(row.get("session_id") or ""))]
+        self._sessions = self._titled(listing, "session_id")
         if isinstance(payload, dict) and payload.get("error") is not None:
             self._last_error = str(payload["error"].get("message"))
         self.dataChanged.emit()

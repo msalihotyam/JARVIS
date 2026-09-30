@@ -168,22 +168,69 @@ SecondaryPage {
                         ListView {
                             id: conversationList
                             objectName: "projectConversationList"
-                            width: parent.width; height: Math.min(Math.max(contentHeight, 40), parent.height * 0.5); clip: true; spacing: 4
+                            width: parent.width; height: Math.min(Math.max(contentHeight, 40), parent.height * (archivedConversationList.count > 0 ? 0.3 : 0.5))
+                            clip: true; spacing: 4
                             model: bridge.projectConversations
                             ScrollBar.vertical: ScrollBar {}
                             delegate: Rectangle {
                                 objectName: "projectConversationRow"
+                                property var row: modelData
                                 width: ListView.view.width; height: 40; radius: Theme.radiusSmall
-                                color: modelData.active ? Theme.alpha(Theme.accent, 0.10) : "transparent"
-                                border.width: 1; border.color: modelData.active ? Theme.alpha(Theme.accent, 0.6) : Theme.border
-                                Text { anchors { left: parent.left; leftMargin: 10; right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                                       text: modelData.title + "  ·  " + (modelData.active ? qsTr("open") : page.when(modelData.updated_at))
-                                       textFormat: Text.PlainText; color: modelData.active ? Theme.accent : Theme.text; font: Theme.pageRowStrong; elide: Text.ElideRight }
-                                MouseArea { anchors.fill: parent; onClicked: { var b = bridge, id = modelData.id; b.openConversation(id); b.setPage("home") } }
+                                color: row.active ? Theme.alpha(Theme.accent, 0.10) : "transparent"
+                                border.width: 1; border.color: row.active ? Theme.alpha(Theme.accent, 0.6) : Theme.border
+                                Text { anchors { left: parent.left; leftMargin: 10; right: rowDelete.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                                       text: row.title + "  ·  " + (row.active ? qsTr("open") : page.when(row.updated_at))
+                                       textFormat: Text.PlainText; color: row.active ? Theme.accent : Theme.text; font: Theme.pageRowStrong; elide: Text.ElideRight }
+                                MouseArea { anchors.fill: parent; onClicked: { var b = bridge, id = row.id; b.openConversation(id); b.setPage("home") } }
+                                // Gate 6D-b: under an archived project the project's archive is
+                                // the reversible first step, so the delete is offered at once.
+                                ActionButton { id: rowDelete; objectName: "projectConversationDelete"; compact: true; danger: true
+                                               visible: row.deletable === true; width: visible ? implicitWidth : 0
+                                               anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
+                                               label: qsTr("Delete permanently…"); enabled: !bridge.busy
+                                               onClicked: deleteDialog.openFor(row.id) }
                             }
                             Text { visible: conversationList.count === 0; anchors.centerIn: parent; text: qsTr("No conversation in this project yet.")
                                    color: Theme.textMuted; font: Theme.pageMeta }
                         }
+                        // Gate 6D-b: the project's archived conversations. A row opens
+                        // read-only; unarchiving waits for the project's own unarchive.
+                        Text { objectName: "projectArchivedConversationsHeading"; visible: archivedConversationList.count > 0
+                               text: qsTr("ARCHIVED"); color: Theme.textLabel; font: Theme.pageSection }
+                        Text { objectName: "projectConversationNotice"; visible: text !== "" && !deleteDialog.visible; width: parent.width
+                               wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.pageMeta }
+                        ListView {
+                            id: archivedConversationList
+                            objectName: "projectArchivedConversationList"
+                            visible: count > 0
+                            width: parent.width; height: count > 0 ? Math.min(contentHeight, parent.height * 0.25) : 0; clip: true; spacing: 4
+                            model: bridge.projectArchivedConversations
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: Rectangle {
+                                objectName: "projectArchivedConversationRow"
+                                property var row: modelData
+                                width: ListView.view.width; height: 40; radius: Theme.radiusSmall
+                                color: row.active ? Theme.alpha(Theme.accent, 0.10) : "transparent"
+                                border.width: 1; border.color: row.active ? Theme.alpha(Theme.accent, 0.6) : Theme.border
+                                Text { anchors { left: parent.left; leftMargin: 10; right: archivedButtons.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                                       text: row.title + "  ·  " + qsTr("archived %1").arg(page.when(row.archived_at))
+                                       textFormat: Text.PlainText; color: Theme.textMuted; font: Theme.pageRowStrong; elide: Text.ElideRight }
+                                MouseArea { anchors.fill: parent; onClicked: { var b = bridge, id = row.id; b.openConversation(id); b.setPage("home") } }
+                                Row {
+                                    id: archivedButtons
+                                    anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
+                                    spacing: 6
+                                    ActionButton { objectName: "projectConversationUnarchive"; compact: true; label: qsTr("Unarchive")
+                                                   enabled: page.current.active === true && !bridge.busy
+                                                   onClicked: { var b = bridge, id = row.id; b.unarchiveConversation(id) } }
+                                    ActionButton { objectName: "projectArchivedConversationDelete"; compact: true; danger: true
+                                                   label: qsTr("Delete permanently…"); enabled: !bridge.busy; onClicked: deleteDialog.openFor(row.id) }
+                                }
+                            }
+                        }
+                        Text { objectName: "projectConversationUnarchiveReason"; visible: archivedConversationList.count > 0 && page.current.active === false
+                               width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.pageMeta
+                               text: qsTr("Unarchive the project first") }
                         Text { objectName: "projectJobsHeading"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageSection
                                text: bridge.projectJobsBounded
                                      ? qsTr("SCHEDULED JOBS · among the first %1 jobs created; this project may have more").arg(bridge.projectJobsLimit)
@@ -337,6 +384,8 @@ SecondaryPage {
             }
         }
     }
+
+    ConversationDeleteDialog { id: deleteDialog }
 
     FileDialog {
         id: filePicker

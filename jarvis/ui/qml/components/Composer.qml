@@ -88,7 +88,9 @@ Item {
         radius: 8; color: Theme.alpha(Theme.warning, 0.10); border.width: 1; border.color: Theme.alpha(Theme.warning, 0.5)
         Text { id: readOnlyText; objectName: "readOnlyReason"; x: 12; y: 9; width: parent.width - 24; wrapMode: Text.Wrap
                color: Theme.warning; font: Theme.caption
-               text: qsTr("Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.").arg((bridge.conversationProject || {}).name || "") }
+               text: bridge.conversationArchived
+                     ? qsTr("Read-only: this conversation is archived. Unarchive it to continue it.")
+                     : qsTr("Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.").arg((bridge.conversationProject || {}).name || "") }
     }
 
     ContextStrip {

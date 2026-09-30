@@ -688,6 +688,10 @@ CREATE TABLE IF NOT EXISTS conversation_moves (
     boundary_seq INTEGER NOT NULL,
     moved_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversation_deletions (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+    deleted_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS project_instructions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -740,6 +744,7 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "conversation_sessions",
         "conversation_legacy_imports",
         "conversation_moves",
+        "conversation_deletions",
         "project_instructions",
         "idx_project_instructions_current",
         "project_files",
@@ -5062,17 +5067,22 @@ class SQLiteMemoryStore:
 
 
     @staticmethod
-    def _require_writable_owner(
-        connection: sqlite3.Connection, conversation_id: str
-    ) -> None:
-        """A conversation of an archived project is kept and readable, but
-        read-only until the project is unarchived."""
+    def _owner_archived(connection: sqlite3.Connection, conversation_id: str) -> bool:
+        """The conversation belongs to a project that is not active."""
         row = connection.execute(
             "SELECT p.active FROM conversations c JOIN projects p ON p.id = c.project_id "
             "WHERE c.id = ?",
             (conversation_id,),
         ).fetchone()
-        if row is not None and row["active"] != 1:
+        return row is not None and row["active"] != 1
+
+    @classmethod
+    def _require_writable_owner(
+        cls, connection: sqlite3.Connection, conversation_id: str
+    ) -> None:
+        """A conversation of an archived project is kept and readable, but
+        read-only until the project is unarchived."""
+        if cls._owner_archived(connection, conversation_id):
             raise ValueError(f"Conversation belongs to an archived project: {conversation_id}")
 
     # ------------------------------------------------------------------
@@ -5087,6 +5097,12 @@ class SQLiteMemoryStore:
     _CONVERSATION_COLUMNS = (
         "id, project_id, title, origin, created_at, updated_at, archived_at"
     )
+    #: Gate 6D-b: a permanently deleted conversation is gone for every reader
+    #: and writer. Its row stays only as a tombstone (empty title and state),
+    #: so its session links, its move and its legacy digest keep their meaning:
+    #: the links keep Core's owner checks failing closed, and the digest keeps
+    #: ``conversation.json`` from being imported again.
+    _NOT_DELETED = "id NOT IN (SELECT conversation_id FROM conversation_deletions)"
 
     @staticmethod
     def _conversation_record(row: sqlite3.Row) -> ConversationRecord | None:
@@ -5185,7 +5201,7 @@ class SQLiteMemoryStore:
         self._require_conversation_id(conversation_id)
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ?",
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
                 (conversation_id,),
             ).fetchone()
         return None if row is None else self._conversation_record(row)
@@ -5193,13 +5209,13 @@ class SQLiteMemoryStore:
     def load_conversation_state(self, conversation_id: str) -> ConversationState:
         """The conversation's state, integrity-verified before it is returned.
 
-        Raises ``KeyError`` for an unknown conversation and
+        Raises ``KeyError`` for an unknown (or deleted) conversation and
         ``CorruptConversation`` for a row that does not verify - nothing is
         repaired or partially used."""
         self._require_conversation_id(conversation_id)
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT state_json, integrity FROM conversations WHERE id = ?",
+                f"SELECT state_json, integrity FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
                 (conversation_id,),
             ).fetchone()
         if row is None:
@@ -5211,8 +5227,9 @@ class SQLiteMemoryStore:
     ) -> list[ConversationRecord]:
         """Newest first. ``project_id=None`` lists Global conversations, a
         project id lists that project's, and the default lists every owner.
-        A row this build could not have written is skipped, never shown."""
-        clauses: list[str] = []
+        A row this build could not have written is skipped, never shown, and
+        a deleted conversation is never listed, whatever the mode."""
+        clauses: list[str] = [self._NOT_DELETED]
         params: list[Any] = []
         if project_id is None:
             clauses.append("project_id IS NULL")
@@ -5222,7 +5239,7 @@ class SQLiteMemoryStore:
             params.append(project_id)
         if not include_archived:
             clauses.append("archived_at IS NULL")
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = f" WHERE {' AND '.join(clauses)}"
         with self._connection() as connection:
             rows = connection.execute(
                 f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations{where} "
@@ -5241,13 +5258,13 @@ class SQLiteMemoryStore:
         transaction, so two writers can never lose each other's turns.
 
         ``change`` receives the verified current state and returns the next
-        one. An archived conversation is read-only; an unknown one raises
-        ``KeyError``; one that does not verify raises ``CorruptConversation``
-        and is left exactly as it was."""
+        one. An archived conversation is read-only; an unknown (or deleted)
+        one raises ``KeyError``; one that does not verify raises
+        ``CorruptConversation`` and is left exactly as it was."""
         self._require_conversation_id(conversation_id)
         with self._connection(write=True) as connection:
             row = connection.execute(
-                "SELECT state_json, integrity, archived_at FROM conversations WHERE id = ?",
+                f"SELECT state_json, integrity, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
                 (conversation_id,),
             ).fetchone()
             if row is None:
@@ -5278,33 +5295,210 @@ class SQLiteMemoryStore:
         with self._connection(write=True) as connection:
             self._require_writable_owner(connection, conversation_id)
             changed = connection.execute(
-                "UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL",
+                f"UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL AND {self._NOT_DELETED}",
                 (title, conversation_id),
             ).rowcount
         if changed != 1:
             raise KeyError(conversation_id)
 
-    def archive_conversation(self, conversation_id: str) -> ConversationRecord:
-        """Mark a conversation archived: kept, read-only. Idempotent - an
-        archived conversation keeps its first archive time. Nothing is
-        deleted, and there is no unarchive, move or delete here."""
-        self._require_conversation_id(conversation_id)
-        with self._connection(write=True) as connection:
-            self._require_writable_owner(connection, conversation_id)
-            connection.execute(
-                "UPDATE conversations SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
-                (utc_now(), conversation_id),
-            )
-            row = connection.execute(
-                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
+    def _live_conversation_row(self, connection: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
+        """The row of a conversation that exists and is not deleted, else ``KeyError``."""
+        row = connection.execute(
+            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "
+            f"WHERE id = ? AND {self._NOT_DELETED}",
+            (conversation_id,),
+        ).fetchone()
         if row is None:
             raise KeyError(conversation_id)
+        return row
+
+    def _require_record(self, row: sqlite3.Row, conversation_id: str) -> ConversationRecord:
         record = self._conversation_record(row)
         if record is None:
             raise CorruptConversation(f"conversation row is malformed: {conversation_id}")
         return record
+
+    def archive_conversation(self, conversation_id: str) -> ConversationRecord:
+        """Mark a conversation archived: kept, read-only, reversible
+        (``unarchive_conversation``, Gate 6D-b). Idempotent - an archived
+        conversation keeps its first archive time. Refused for an unknown or
+        deleted conversation, under an archived project, and while a linked
+        session has open work (the same check the 6C attach uses). Nothing is
+        deleted here."""
+        self._require_conversation_id(conversation_id)
+        with self._connection(write=True) as connection:
+            row = self._live_conversation_row(connection, conversation_id)
+            self._require_writable_owner(connection, conversation_id)
+            if row["archived_at"] is None:
+                refusal = self._conversation_open_work(connection, conversation_id, "archived")
+                if refusal is not None:
+                    raise ValueError(refusal)
+                connection.execute(
+                    "UPDATE conversations SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+                    (utc_now(), conversation_id),
+                )
+                row = self._live_conversation_row(connection, conversation_id)
+        return self._require_record(row, conversation_id)
+
+    def unarchive_conversation(self, conversation_id: str) -> ConversationRecord:
+        """Undo an archive exactly (Gate 6D-b; roadmap: no irreversible
+        archive): only ``archived_at`` changes - state, title and times stay
+        as they were. Refused for an unknown or deleted conversation, for one
+        that is not archived, and under an archived project."""
+        self._require_conversation_id(conversation_id)
+        with self._connection(write=True) as connection:
+            row = self._live_conversation_row(connection, conversation_id)
+            if self._owner_archived(connection, conversation_id):
+                raise ValueError(
+                    "Conversation belongs to an archived project; unarchive the project first."
+                )
+            if row["archived_at"] is None:
+                raise ValueError(f"Conversation is not archived: {conversation_id}")
+            connection.execute(
+                "UPDATE conversations SET archived_at = NULL WHERE id = ?", (conversation_id,)
+            )
+            row = self._live_conversation_row(connection, conversation_id)
+        return self._require_record(row, conversation_id)
+
+    # ------------------------------------------------------------------
+    # Gate 6D-b permanent delete (Salih decision 2026-09-30): the SECOND step
+    # after archive (or after the owner project's archive), confirmed from a
+    # preview. The row becomes a tombstone - never a hard DELETE: the links,
+    # the move and the legacy digest reference it, and nothing tied to a
+    # session (tasks, approvals, checkpoints, audit, billing) is touched.
+    # ------------------------------------------------------------------
+
+    def _delete_check(
+        self, connection: sqlite3.Connection, conversation_id: Any
+    ) -> tuple[dict[str, Any], str | None]:
+        """``(preview, refusal or None)`` from one read. An unknown, deleted
+        or malformed conversation raises; a well-formed one that may not be
+        deleted returns its refusal, so the preview can show it."""
+        self._require_conversation_id(conversation_id)
+        try:
+            row = self._live_conversation_row(connection, conversation_id)
+        except KeyError:
+            raise ValueError(f"Unknown conversation: {conversation_id}") from None
+        record = self._conversation_record(row)
+        if record is None:
+            raise ValueError(f"Unknown conversation: {conversation_id}")
+        state = decode_state(row["state_json"], row["integrity"])
+        owner = None
+        if record.project_id is not None:
+            project = connection.execute(
+                "SELECT name, active FROM projects WHERE id = ?", (record.project_id,)
+            ).fetchone()
+            owner = {
+                "project_id": record.project_id,
+                "name": project["name"] if project is not None else record.project_id,
+                "active": project is not None and project["active"] == 1,
+            }
+        preview: dict[str, Any] = {
+            "conversation_id": record.id,
+            "title": record.title,
+            "turns": len(state.turns),
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "archived_at": record.archived_at,
+            "owner": owner,
+            "origin": record.origin,
+            "expected_next_seq": state.next_seq,
+        }
+        refusal: str | None = None
+        if record.archived_at is None and (owner is None or owner["active"]):
+            refusal = "Archive this conversation first; only an archived conversation can be deleted."
+        refusal = refusal or self._conversation_open_work(connection, record.id, "deleted")
+        preview["blocked"] = refusal or ""
+        return preview, refusal
+
+    def conversation_delete_preview(self, conversation_id: str) -> dict[str, Any]:
+        """What deleting would remove, from ONE consistent read: title, turn
+        count, dates, owner, origin, ``expected_next_seq`` (which the confirm
+        must carry with the title) and the refusal it would meet (``blocked``)."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                preview, _ = self._delete_check(connection, conversation_id)
+            finally:
+                connection.rollback()
+        return preview
+
+    @staticmethod
+    def _record_conversation_deletion(
+        connection: sqlite3.Connection, conversation_id: str, deleted_at: str
+    ) -> None:
+        connection.execute(
+            "INSERT INTO conversation_deletions (conversation_id, deleted_at) VALUES (?, ?)",
+            (conversation_id, deleted_at),
+        )
+
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        confirm: Any,
+        expected_next_seq: Any,
+        expected_title: Any,
+    ) -> dict[str, Any]:
+        """Permanent, explicit deletion of ONE conversation, reached only from
+        the local app path (``conversation_delete_result``) after a preview
+        and the person's confirm.
+
+        ``confirm`` must equal ``conversation_id`` (checked before anything
+        is touched). ONE transaction: the shared check (archived, or its
+        owner project archived; no open work in a linked session), the
+        preview binding (``next_seq`` AND title unchanged), then the
+        tombstone - title emptied, state replaced by the verified empty
+        state, ``updated_at`` = the deletion time, ``archived_at`` kept or
+        set - and the ``conversation_deletions`` row. Any failure rolls all
+        of it back. ``secure_delete`` is on for the transaction as
+        best-effort defense in depth and the connection's previous setting
+        is restored either way; nothing here claims physical erasure from
+        the WAL, free pages, the file system, storage or backups."""
+        if type(confirm) is not str or confirm != conversation_id:
+            raise ValueError("Delete needs a confirmation equal to the conversation id.")
+        if type(expected_next_seq) is not int:
+            raise ValueError("expected_next_seq must be the integer the preview returned")
+        if type(expected_title) is not str:
+            raise ValueError("expected_title must be the title the preview returned")
+        empty_json, empty_integrity = encode_state(ConversationState())
+        connection = self._connect()
+        try:
+            previous = int(connection.execute("PRAGMA secure_delete").fetchone()[0])
+            connection.execute("PRAGMA secure_delete = ON")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    preview, refusal = self._delete_check(connection, conversation_id)
+                    if refusal is None and (
+                        preview["expected_next_seq"] != expected_next_seq
+                        or preview["title"] != expected_title
+                    ):
+                        refusal = "The conversation changed after the preview; preview again."
+                    if refusal is not None:
+                        raise ValueError(refusal)
+                    deleted_at = utc_now()
+                    changed = connection.execute(
+                        "UPDATE conversations SET title = '', state_json = ?, integrity = ?, "
+                        "updated_at = ?, archived_at = COALESCE(archived_at, ?) WHERE id = ?",
+                        (empty_json, empty_integrity, deleted_at, deleted_at, conversation_id),
+                    ).rowcount
+                    if changed != 1:
+                        raise ValueError(f"Unknown conversation: {conversation_id}")
+                    self._record_conversation_deletion(connection, conversation_id, deleted_at)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                try:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.OperationalError:
+                    pass                                 # a reader holds the WAL; a later writer retries
+            finally:
+                connection.execute(f"PRAGMA secure_delete = {previous}")
+        finally:
+            connection.close()
+        return {**preview, "blocked": "", "deleted_at": deleted_at}
 
     def link_session_conversation(self, session_id: str, conversation_id: str) -> None:
         """Record, once and permanently, that ``session_id`` belongs to
@@ -5318,7 +5512,7 @@ class SQLiteMemoryStore:
             raise ValueError("session id must be a non-empty string")
         with self._connection(write=True) as connection:
             conversation = connection.execute(
-                "SELECT project_id, archived_at FROM conversations WHERE id = ?",
+                f"SELECT project_id, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
                 (conversation_id,),
             ).fetchone()
             if conversation is None:
@@ -5351,6 +5545,13 @@ class SQLiteMemoryStore:
                 "VALUES (?, ?, ?)",
                 (session_id, conversation_id, utc_now()),
             )
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        """The conversation is a Gate 6D-b tombstone (read-only query)."""
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM conversation_deletions WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone() is not None
 
     def conversation_for_session(self, session_id: str) -> str | None:
         with self._connection() as connection:
@@ -5385,7 +5586,8 @@ class SQLiteMemoryStore:
         if (project_id is None) == (new_project_name is None):
             raise ValueError("Name exactly one target: an existing project or a new project name.")
         row = connection.execute(
-            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations WHERE id = ?",
+            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "
+            f"WHERE id = ? AND {self._NOT_DELETED}",
             (conversation_id,),
         ).fetchone()
         record = None if row is None else self._conversation_record(row)
@@ -5424,17 +5626,20 @@ class SQLiteMemoryStore:
             refusal = "Only a Global conversation can be attached to a project."
         elif record.archived_at is not None:
             refusal = "This conversation is archived; it is read-only."
-        refusal = refusal or self._attach_open_work(connection, record.id) or self._attach_toggle_refusal(
+        refusal = refusal or self._conversation_open_work(connection, record.id, "attached") or self._attach_toggle_refusal(
             connection, record.id
         )
         preview["blocked"] = refusal or ""
         return preview, new_project, refusal
 
     @staticmethod
-    def _attach_open_work(connection: sqlite3.Connection, conversation_id: str) -> str | None:
+    def _conversation_open_work(
+        connection: sqlite3.Connection, conversation_id: str, action: str
+    ) -> str | None:
         """A linked session with unfinished work - a non-terminal task, a
-        pending approval or a non-terminal chain - blocks the move, and so
-        does a linked session that cannot be read (fail closed)."""
+        pending approval or a non-terminal chain - blocks the move (6C), the
+        archive and the delete (6D-b), and so does a linked session that
+        cannot be read (fail closed). ``action`` only words the refusal."""
         terminal_chain = {ChainStatus.COMPLETED, ChainStatus.FAILED, ChainStatus.CANCELLED}
         for linked in connection.execute(
             "SELECT s.state_json FROM conversation_sessions cs "
@@ -5444,7 +5649,7 @@ class SQLiteMemoryStore:
             try:
                 session = SessionState.from_dict(json.loads(linked["state_json"]))
             except Exception:  # noqa: BLE001 - an unreadable session fails closed
-                return "A session of this conversation cannot be read, so it cannot be attached."
+                return f"A session of this conversation cannot be read, so it cannot be {action}."
             if session.chain is not None and session.chain.status not in terminal_chain:
                 return "A chain in this conversation is not finished; finish or cancel it first."
         terminal = sorted(_TERMINAL_STATUS_VALUES)

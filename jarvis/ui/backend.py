@@ -29,9 +29,13 @@ from jarvis.app import (
     config_failure_result,
     config_mutation_result,
     config_show_result,
+    conversation_archive_result,
     conversation_attach_preview_result,
     conversation_attach_result,
+    conversation_delete_preview_result,
+    conversation_delete_result,
     conversation_rename_result,
+    conversation_unarchive_result,
     failure_result,
     job_archive_result,
     job_create_result,
@@ -464,6 +468,32 @@ class Backend:
         """Gate 6D-a: a manual rename, through the audited explicit-user app path."""
         return self._call("conversation-rename", lambda s: conversation_rename_result(
             self._memory(s), s, conversation_id, title
+        ))
+
+    def conversation_archive(self, conversation_id: str) -> dict:
+        """Gate 6D-b: archive (reversible), through the audited explicit-user app path."""
+        return self._call("conversation-archive", lambda s: conversation_archive_result(
+            self._memory(s), s, conversation_id
+        ))
+
+    def conversation_unarchive(self, conversation_id: str) -> dict:
+        """Gate 6D-b: undo an archive, through the audited explicit-user app path."""
+        return self._call("conversation-unarchive", lambda s: conversation_unarchive_result(
+            self._memory(s), s, conversation_id
+        ))
+
+    def conversation_delete_preview(self, conversation_id: str) -> dict:
+        """Gate 6D-b: what a permanent delete would remove (read-only), through the app path."""
+        return self._call("conversation-delete-preview", lambda s: conversation_delete_preview_result(
+            self._memory(s), s, conversation_id
+        ))
+
+    def conversation_delete(self, conversation_id: str, *, confirm: str, expected_next_seq: int,
+                            expected_title: str) -> dict:
+        """Gate 6D-b: the confirmed permanent delete, through THE audited app path."""
+        return self._call("conversation-delete", lambda s: conversation_delete_result(
+            self._memory(s), s, conversation_id, confirm=confirm, expected_next_seq=expected_next_seq,
+            expected_title=expected_title,
         ))
 
     def memory_list(self, project_id: str, include_inactive: bool = False) -> dict:

@@ -479,6 +479,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Sohbet %1 projesine bağlandı</translation>
     </message>
     <message>
+        <source>Conversation deleted permanently</source>
+        <translation>Sohbet kalıcı olarak silindi</translation>
+    </message>
+    <message>
+        <source>A reply for a conversation that was deleted or cannot be read was dropped; it was saved nowhere.</source>
+        <translation>Silinmiş ya da okunamayan bir sohbete ait yanıt bırakıldı; hiçbir yere kaydedilmedi.</translation>
+    </message>
+    <message>
         <source>A reply for another conversation was saved there</source>
         <translation>Başka bir konuşmaya ait yanıt o konuşmaya kaydedildi</translation>
     </message>
@@ -1076,6 +1084,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Metin ve kod (%1)</translation>
     </message>
     <message>
+        <source>Read-only: this conversation is archived. Unarchive it to continue it.</source>
+        <translation>Salt okunur: bu sohbet arşivlendi. Devam etmek için arşivden çıkarın.</translation>
+    </message>
+    <message>
         <source>Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.</source>
         <translation>Salt okunur: bu konuşma arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.</translation>
     </message>
@@ -1223,6 +1235,53 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>+ Note</source>
         <translation>+ Not</translation>
+    </message>
+</context>
+<context>
+    <name>ConversationDeleteDialog</name>
+    <message>
+        <source>Delete this conversation permanently?</source>
+        <translation>Bu sohbet kalıcı olarak silinsin mi?</translation>
+    </message>
+    <message>
+        <source>«%1» · %2 messages · created %3 · last changed %4 · %5</source>
+        <translation>«%1» · %2 mesaj · oluşturma %3 · son değişiklik %4 · %5</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>Cannot be deleted: %1</source>
+        <translation>Silinemez: %1</translation>
+    </message>
+    <message>
+        <source>REMOVED: this conversation&apos;s messages and title (including the task titles kept inside the conversation) from the JARVIS conversation store. The conversation no longer appears in any list and cannot be opened.</source>
+        <translation>SİLİNECEK: bu sohbetin mesajları ve başlığı (sohbetin içinde tutulan görev başlıkları dahil) JARVIS sohbet deposundan. Sohbet hiçbir listede görünmez ve açılamaz.</translation>
+    </message>
+    <message>
+        <source>KEPT: the session, task, checkpoint, approval and audit records linked to this conversation (task results stay in the Tasks list); content already sent to providers; the database&apos;s WAL file, free pages and copies that may remain in the storage layer; backups.</source>
+        <translation>KALANLAR: bu sohbete bağlı oturum, görev, checkpoint, onay ve denetim kayıtları (görev sonuçları Görevler listesinde kalır); sağlayıcılara zaten gönderilmiş içerik; veritabanının WAL dosyası, boş sayfaları ve depolama katmanında kalabilecek kopyalar; yedekler.</translation>
+    </message>
+    <message>
+        <source>The previous version&apos;s conversation file (~/.jarvis/conversation.json) also stays where it is.</source>
+        <translation>Ayrıca eski sürümün sohbet dosyası (~/.jarvis/conversation.json) yerinde kalır.</translation>
+    </message>
+    <message>
+        <source>This cannot be undone.</source>
+        <translation>Bu işlem geri alınamaz.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Delete permanently</source>
+        <translation>Kalıcı sil</translation>
     </message>
 </context>
 <context>
@@ -1391,6 +1450,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>open</source>
         <translation>açık</translation>
+    </message>
+    <message>
+        <source>ARCHIVED CONVERSATIONS</source>
+        <translation>ARŞİVLENMİŞ SOHBETLER</translation>
+    </message>
+    <message>
+        <source>archived %1</source>
+        <translation>arşivlendi %1</translation>
+    </message>
+    <message>
+        <source>Unarchive</source>
+        <translation>Arşivden çıkar</translation>
+    </message>
+    <message>
+        <source>Delete permanently…</source>
+        <translation>Kalıcı sil…</translation>
     </message>
     <message>
         <source>DURABLE SESSIONS (most recent %1)</source>
@@ -2803,8 +2878,20 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>açık</translation>
     </message>
     <message>
+        <source>Delete permanently…</source>
+        <translation>Kalıcı sil…</translation>
+    </message>
+    <message>
         <source>No conversation in this project yet.</source>
         <translation>Bu projede henüz konuşma yok.</translation>
+    </message>
+    <message>
+        <source>archived %1</source>
+        <translation>arşivlendi %1</translation>
+    </message>
+    <message>
+        <source>Unarchive the project first</source>
+        <translation>Önce projeyi arşivden çıkarın</translation>
     </message>
     <message>
         <source>SCHEDULED JOBS · among the first %1 jobs created; this project may have more</source>
@@ -3874,8 +3961,24 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Bu sohbet henüz kaydedilmedi.</translation>
     </message>
     <message>
+        <source>This conversation is archived: unarchive it to rename it.</source>
+        <translation>Bu sohbet arşivlendi: yeniden adlandırmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
         <source>The project is archived: unarchive it to rename this conversation.</source>
         <translation>Proje arşivlendi: bu sohbeti yeniden adlandırmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>This conversation is already archived.</source>
+        <translation>Bu sohbet zaten arşivlendi.</translation>
+    </message>
+    <message>
+        <source>The project is archived: its conversations are already read-only.</source>
+        <translation>Proje arşivlendi: sohbetleri zaten salt okunur.</translation>
+    </message>
+    <message>
+        <source>Archive it first</source>
+        <translation>Önce arşivleyin</translation>
     </message>
     <message>
         <source>+ New conversation</source>
@@ -3888,6 +3991,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Rename</source>
         <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Archive</source>
+        <translation>Arşivle</translation>
+    </message>
+    <message>
+        <source>Delete permanently…</source>
+        <translation>Kalıcı sil…</translation>
     </message>
     <message>
         <source>Conversation name</source>

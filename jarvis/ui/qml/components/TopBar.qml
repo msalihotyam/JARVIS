@@ -337,8 +337,21 @@ Item {
             readonly property string shown: bridge.conversationTitle || qsTr("New Chat")
             readonly property bool renameAllowed: bridge.conversationId !== "" && !bridge.conversationReadOnly && !bridge.busy
             readonly property string renameReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
+                : bridge.conversationArchived ? qsTr("This conversation is archived: unarchive it to rename it.")
                 : bridge.conversationReadOnly ? qsTr("The project is archived: unarchive it to rename this conversation.")
                 : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+            // Gate 6D-b: archive (reversible), then the permanent delete - offered
+            // only on an archived conversation or under an archived project.
+            readonly property bool archiveAllowed: renameAllowed
+            readonly property string archiveReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
+                : bridge.conversationArchived ? qsTr("This conversation is already archived.")
+                : bridge.conversationReadOnly ? qsTr("The project is archived: its conversations are already read-only.")
+                : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+            readonly property bool deleteAllowed: bridge.conversationId !== "" && !bridge.busy
+                                                  && (bridge.conversationArchived || !!scopeGroup.owner.archived)
+            readonly property string deleteReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
+                : bridge.busy ? qsTr("Wait for the current run to finish.")
+                : !deleteAllowed ? qsTr("Archive it first") : ""
             x: projectSelector.width + 8
             height: 26; radius: 13
             width: Math.max(Math.min(60, scopeGroup.shared / 2),
@@ -383,8 +396,9 @@ Item {
             objectName: "newConversationButton"
             // Disabled with its reason while the open conversation's project
             // is archived (the store refuses a new conversation there anyway).
-            readonly property bool allowed: !bridge.conversationReadOnly && !bridge.busy
-            readonly property string reason: bridge.conversationReadOnly
+            // An archived GLOBAL conversation does not stop a new one.
+            readonly property bool allowed: !scopeGroup.owner.archived && !bridge.busy
+            readonly property string reason: scopeGroup.owner.archived
                 ? qsTr("The project is archived: unarchive it to start a new conversation.")
                 : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
             x: projectSelector.width + 8 + switcher.width + 8
@@ -411,6 +425,7 @@ Item {
         }
 
         AttachDialog { id: attachDialog }
+        ConversationDeleteDialog { id: deleteDialog }
 
         // The current scope's conversations, newest first; the open one marked.
         Popup {
@@ -433,13 +448,16 @@ Item {
             }
         }
 
-        // Right-click: the one item in 6D-a. Disabled with its reason while the
-        // project is archived or a run is busy; the store still refuses.
+        // Right-click: rename (6D-a), archive and the permanent delete (6D-b).
+        // Each is disabled with its reason (archived project or conversation,
+        // not archived yet, a busy run); the store still refuses. Each acts on
+        // the conversation open when it was chosen.
         Popup {
             id: switcherContext
             objectName: "conversationSwitcherContext"
             y: switcher.height + 8; x: switcher.x
             width: 280; padding: 8
+            onAboutToShow: bridge.previewDeleteConversation("")
             background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
             contentItem: Column {
                 spacing: 4
@@ -448,6 +466,16 @@ Item {
                                           bridge.clearRenameNotice(); switcherEditor.open() } }
                 Text { objectName: "conversationRenameReason"; visible: !switcher.renameAllowed; width: 264; wrapMode: Text.Wrap
                        textFormat: Text.PlainText; text: switcher.renameReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
+                ScopeChoice { objectName: "conversationArchiveItem"; label: qsTr("Archive"); available: switcher.archiveAllowed
+                              onChosen: { var id = bridge.conversationId; if (bridge.archiveConversation(id)) switcherContext.close() } }
+                Text { objectName: "conversationArchiveReason"; visible: !switcher.archiveAllowed; width: 264; wrapMode: Text.Wrap
+                       textFormat: Text.PlainText; text: switcher.archiveReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
+                ScopeChoice { objectName: "conversationDeleteItem"; label: qsTr("Delete permanently…"); available: switcher.deleteAllowed
+                              onChosen: { var id = bridge.conversationId; switcherContext.close(); deleteDialog.openFor(id) } }
+                Text { objectName: "conversationDeleteReason"; visible: !switcher.deleteAllowed; width: 264; wrapMode: Text.Wrap
+                       textFormat: Text.PlainText; text: switcher.deleteReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
+                Text { objectName: "conversationLifecycleNotice"; visible: bridge.conversationNotice !== ""; width: 264; wrapMode: Text.Wrap
+                       textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.caption; leftPadding: 10 }
             }
         }
 

@@ -3124,8 +3124,9 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
 - **Kapsam:** Global = `project_id` NULL; sentetik bir "Global proje" satırı
   yoktur. NULL olmayan sahip mevcut ve aktif bir `projects` satırı olmalıdır;
   konuşma oluşturma yolu proje yaratmaz. Sahip oluşturulurken sabitlenir;
-  silme yoktur ve tek taşıma aşağıdaki Gate 6C istisnasıdır (Global -> proje,
-  tek yönlü). Arşivlenmiş konuşma saklanır ve salt okunurdur.
+  tek taşıma aşağıdaki Gate 6C istisnasıdır (Global -> proje, tek yönlü).
+  Arşivlenmiş konuşma saklanır ve salt okunurdur; arşiv geri alınabilir ve
+  kalıcı silme yalnız aşağıdaki Gate 6D-b kurallarıyla vardır.
 - **Oturum bağı:** bir Core oturumu en çok bir konuşmaya, kalıcı olarak
   bağlanır; bir projeye bağlı oturum yalnız o projenin konuşmasına girebilir
   (bağlam tutarlılığı, yetki değil).
@@ -3227,6 +3228,54 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   sonrası P kapsamındadır. Kabul edilen risk: bağlamadan önce başlamış bir
   istek bağlamadan sonra taşınan konuşmada Global kapsamlı bir görev olarak
   kaydolabilir (daha az bağlam, asla daha fazla değil).
+- **Konuşma arşivi ve kalıcı silme (Gate 6D-b, Salih kararları 2026-09-30):**
+  iki adım, proje dosyasının retire -> purge'ü gibi. (1) `archive_conversation`
+  geri alınabilir: yalnız `archived_at` yazılır; arşivlenmiş projede ve bağlı
+  bir oturumda açık iş varken (bitmemiş görev, bekleyen onay, bitmemiş zincir;
+  okunamayan bağlı oturum kapalı başarısız - 6C'nin aynı denetimi) reddedilir.
+  `unarchive_conversation` arşivi birebir geri alır (durum, başlık, zamanlar
+  değişmez); silinmiş konuşmada, arşivsiz konuşmada ve arşivlenmiş projede
+  ("önce projeyi arşivden çıkarın") reddedilir. (2) `delete_conversation`
+  kalıcıdır ve yalnız arşivlenmiş bir konuşmaya ya da sahibi arşivlenmiş
+  projenin konuşmasına uygulanır (projenin arşivi geri alınabilir ilk adımdır;
+  gizlilik silmesi §4.24'teki gibi engellenmez). TEK `BEGIN IMMEDIATE` işlemi:
+  paylaşılan denetim (açık iş yok), önizleme bağı (`next_seq` VE başlık
+  önizlenenle aynı, değilse "önizlemeyi yenile"), onay = konuşma kimliği; sonra
+  MEZAR TAŞI: başlık boşaltılır, durum doğrulanmış boş durumla değiştirilir,
+  `updated_at` silme zamanı olur, `archived_at` korunur ya da atanır ve yeni ek
+  tablo `conversation_deletions` (konuşma başına tek satır, silme zamanı)
+  satırı eklenir. Satır SİLİNMEZ (DELETE yok): `conversation_sessions`,
+  `conversation_moves` ve `conversation_legacy_imports` ona başvurur; bağlar
+  Core'un sahip denetimlerini kapalı başarısız tutar, eski dosyanın özeti
+  `conversation.json`'ın yeniden içe aktarılmasını önler. Oturumlar ve onlara
+  bağlı görev, onay, checkpoint, denetim ve faturalama satırları silinmez
+  (oturum silmek bunları zincirleme silerdi). Her ret hiçbir şey yazmaz;
+  herhangi bir hata tümünü geri alır. `secure_delete` işlem boyunca en iyi
+  çaba olarak açılır ve bağlantının önceki değeri her durumda geri yüklenir;
+  WAL'dan, boş sayfalardan, dosya sisteminden, depolamadan veya yedeklerden
+  fiziksel silme İDDİA EDİLMEZ. Silinen konuşma her okuyucu için yoktur
+  (listeler her kipte gizler, `load_conversation` None, durum okuma
+  `KeyError`) ve her yazıcı (durum, başlık, arşiv, geri alma, bağ, 6C bağlama,
+  silme) reddeder. Kalıntı (silme penceresinde dürüstçe söylenir): bağlı
+  oturum/görev/checkpoint/onay/denetim kayıtları (görev sonuçları Görevler
+  listesinde kalır), sağlayıcılara gönderilmiş içerik, WAL/boş sayfalar/
+  depolama kopyaları, yedekler. Eski dosyadan içe aktarılmış bir konuşma
+  silinse de `~/.jarvis/conversation.json` yerinde kalır (V2 onu yalnız okur;
+  Salih kararı S4) ve pencere bunu söyler; bir geri dönüş sürümünün dosyaya
+  yazdığı YENİ özet olağan kuralla yeni bir konuşma olur. Tek üretim
+  çağıranları açık-kullanıcı app sonuçlarıdır (`conversation_archive_result`,
+  `conversation_unarchive_result`, `conversation_delete_preview_result`,
+  `conversation_delete_result`); CLI yoktur; model çıktısı, niyet kataloğu,
+  connector, zamanlayıcı, dosyalar ve hafıza erişemez. Şema 10'da kalır,
+  ALTER yoktur; şema-10 sürümleri `conversations`'ı ve ek tabloları okumaz.
+  Silmeden sonra Core: pencere yolu F2 ile bilinmeyen konuşma olarak reddedilir
+  (bağlı oturum başka bir konuşmayla kullanılsa da); projeyi adlandıran görev
+  F1 ile INVALID_TASK olur. KABUL EDİLEN BOŞLUK (GAP B, Salih kararı S3,
+  2026-09-30; V2.0 için, Core değişmedi): silinmiş bir konuşmaya bağlı bir
+  oturumda PROJE ADLANDIRMAYAN görev (`jarvis run/text --session-id`) Core
+  tarafından reddedilmez (`_conversation_owner_refusal` proje adlandırılmadıkça
+  bağa bakmaz); o görev hiçbir konuşmaya yazılmaz ve yalnız kalan kalıntıyı
+  (oturum kararları) görür.
 - **Arşiv semantiği (Salih kararı, 2026-09-29):** arşivlenmiş projenin
   konuşmaları saklanır, okunabilir ve salt okunurdur (durum, başlık, arşiv,
   oturum bağı yazılamaz); bu projede yeni görev çalışmaz - projeye önceden
@@ -3386,7 +3435,7 @@ değildir (yol haritası V2.0).
   görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
   metni tutmaz.
 
-### 4.25 Projects penceresi (V2 Projects Gate 6A/6B/6C/6D-a, uygulandı)
+### 4.25 Projects penceresi (V2 Projects Gate 6A/6B/6C/6D-a/6D-b, uygulandı)
 
 Pencere proje modelini gösterir ve mevcut kanonik yolları çağırır; hiçbir şeye
 kendisi karar vermez.
@@ -3432,8 +3481,9 @@ kendisi karar vermez.
   alınamazlık) -> tek "Projeye bağla" düğmesi, önizlenen `next_seq` ve hedefi
   gönderir. Engelli önizleme gerekçesini gösterir, düğme yoktur; "değişti"
   reddi önizlemeyi yeniler, kendiliğinden yeniden denemez. Başarıdan sonra
-  konuşma yeniden açılır (sonraki görev yeni oturum) ve seçici / Geçmiş /
-  Projects yenilenir. Köprü store'u değil app sonuçlarını çağırır.
+  konuşma doğrulanmış kayıtlı DURUMUYLA yeniden açılır (ekran ve sonraki
+  isteğin geçmişi önceki mesajları korur; sonraki görev yeni oturum) ve seçici
+  / Geçmiş / Projects yenilenir. Köprü store'u değil app sonuçlarını çağırır.
 - **Sohbet değiştirici + yeniden adlandırma (6D-a, Salih kararı 2026-09-30):**
   üst çubukta proje seçici | değiştirici | "+ Yeni sohbet". Değiştirici açık
   konuşmanın adını gösterir (adsız: "Yeni Sohbet"; sığmazsa kısaltılır, tam ad
@@ -3457,8 +3507,35 @@ kendisi karar vermez.
   iken kapalıdır; bir düzenleme BAŞLADIĞI konuşma kimliğine bağlıdır: uygulama
   anında açık konuşma değiştiyse düzenleme iptal edilir, yakalanan kimlik dışında
   hiçbir konuşma adlandırılmaz. Arşivli projenin konuşmasında denetim
-  gerekçesiyle kapalıdır (zorlama deponun reddidir). Konuşma arşivleme/geri
-  alma/kalıcı silme 6D-b'nin konusudur; burada YOKTUR.
+  gerekçesiyle kapalıdır (zorlama deponun reddidir).
+- **Arşivle / Arşivden çıkar / Kalıcı sil (6D-b, Salih kararları 2026-09-30,
+  §4.22):** değiştiricinin sağ tık menüsü: "Yeniden adlandır", "Arşivle",
+  "Kalıcı sil…". "Kalıcı sil…" arşivlenmemiş konuşmada "Önce arşivleyin"
+  gerekçesiyle kapalıdır; arşivlenmiş konuşmada ve arşivlenmiş projenin
+  konuşmasında açıktır. Her öğe `_busy` iken kapalıdır ve seçildiği andaki
+  konuşma kimliğine bağlıdır; retler olduğu gibi gösterilir. Açık konuşma
+  arşivlenir ya da silinirse pencere onda KALMAZ: kapsamı yazılabilirse
+  (Global ya da etkin proje) o kapsamın arşivlenmemiş en yeni konuşması, yoksa
+  arşivlenmemiş en yeni Global konuşma, yoksa yeni bir Global konuşma
+  (başlangıç kuralı) açılır; ardından YENİ açılan konuşmanın liste yüzeyi
+  gösterilir (Global -> Geçmiş, proje -> proje ayrıntısı). Arşiv bölümleri:
+  Geçmiş'te "ARŞİVLENMİŞ SOHBETLER" (Global), proje ayrıntısında "ARŞİVLENMİŞ";
+  satırlarda "Arşivden çıkar" ve "Kalıcı sil…". Satıra tıklamak konuşmayı salt
+  okunur açar (`conversationReadOnly` konuşmanın kendi arşivini de kapsar;
+  besteleyici "Salt okunur: bu sohbet arşivlendi…" der; arşivli Global konuşma
+  yeni Global konuşmayı engellemez). Arşivlenmiş projede satırlarda "Kalıcı
+  sil…" doğrudan sunulur, "Arşivden çıkar" "Önce projeyi arşivden çıkarın"
+  gerekçesiyle kapalıdır. Silinen konuşmanın oturumları Geçmiş'in oturum
+  listesinden çıkar (görevleri Görevler sayfasında kalır). Silme penceresi
+  `conversation_delete_preview`'dan beslenir, düz metindir: kimlik (başlık ya
+  da "Yeni Sohbet", mesaj sayısı, oluşturma ve son değişiklik zamanı, Genel ya
+  da proje adı), SİLİNECEK, KALANLAR, yalnız eski dosyadan içe aktarılmış
+  konuşmada eski dosya satırı ve geri alınamazlık; tek "Kalıcı sil" düğmesi
+  önizlenen kimlik, `next_seq` ve başlığı gönderir; "değişti" reddi önizlemeyi
+  yeniler, asla kendiliğinden yeniden denemez; "Vazgeç" hiçbir şey yazmaz.
+  Geç teslim (GAP A): bir çalıştırma zarfının bağlı konuşması yüklenemiyorsa
+  (silinmiş ya da bozuk) zarf BIRAKILIR - açık konuşmaya ya da başka bir sahibe
+  asla verilmez; tek iz kalıcı olmayan bir pencere notudur.
 - **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
   tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
 - **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje
