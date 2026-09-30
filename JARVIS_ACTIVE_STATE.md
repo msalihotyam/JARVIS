@@ -28,7 +28,19 @@ opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
 - Orchestrator: Claude; reviewer: ChatGPT (one-pass); final decisions: Salih
   (2026-09-29). Protocol: RUNBOOK "Governance and prompt review".
 
-## Open blockers: none.
+## Open blockers
+
+- Model-list gate (S5) BLOCKED at the full-suite step. Implementation and
+  tests are complete but UNCOMMITTED in the tree: `jarvis/model_retirement.py`,
+  `jarvis/ui/bridge.py`, `jarvis/ui/qml/overlays/ModelPanel.qml`,
+  `jarvis/ui/i18n/jarvis_tr-TR.ts` + `.qm`, `scripts/ui_visual.py`,
+  `ARCHITECTURE.md`, new `tests/test_model_list_newest.py`. Targeted: 52 OK
+  (17 new). Full direct suite: 4640 run, 2 failures, neither the sourced
+  RailSwitch exception: `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
+  and `test_ui.TypographyTests.test_normal_launch_path_is_clean` (QML
+  "devFixture of null" at launch). Both PASS when run alone; run took 1630 s
+  (load). Not shown to be caused by S5. Salih decides: rerun the full suite,
+  or accept these two as load flakes, then commit.
 
 ## Do not reopen
 
