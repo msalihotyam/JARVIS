@@ -276,6 +276,10 @@ class Bridge(QObject):
         self._project_instruction_notice = ""
         self._project_files: list[dict] = []
         self._project_file_notice = ""
+        # Gate 6C: the held attach preview (what the confirm will send) and
+        # the last answer to a preview or confirm.
+        self._attach_preview: dict[str, Any] = {}
+        self._attach_notice = ""
         # The Projects page is window-only: never persisted, so a release that
         # does not know it never reads it (preferences stay rollback-safe).
         self._page_override = ""
@@ -957,6 +961,84 @@ class Bridge(QObject):
         if not owner.get("active"):
             return False
         return self.newProjectConversation(owner["id"])
+
+    # -- Gate 6C "Projeye bağla": attach the open Global conversation --------
+    #
+    # Preview, then the person's explicit confirm, through the app paths; the
+    # store's shared check decides and its refusals are shown as returned.
+    # The confirm carries exactly what was previewed (target + next_seq); a
+    # different choice or a changed conversation refreshes the preview and
+    # is never retried on its own.
+
+    attachChanged = Signal()
+
+    @Property(bool, notify=conversationChanged)
+    def canAttach(self) -> bool:
+        """The open conversation is a stored, writable GLOBAL conversation."""
+        store, conversation_id = self._conversation_db(), self._conversation_store.id
+        if store is None or not conversation_id or self._conversation_owner:
+            return False
+        try:
+            record = store.load_conversation(conversation_id)
+        except Exception:  # noqa: BLE001 - storage boundary: not offered
+            return False
+        return record is not None and record.project_id is None and record.archived_at is None
+
+    @Property(dict, notify=attachChanged)
+    def attachPreview(self) -> dict:
+        return dict(self._attach_preview)
+
+    @Property(str, notify=attachChanged)
+    def attachNotice(self) -> str:
+        return self._attach_notice
+
+    @staticmethod
+    def _attach_target(project_id: str, new_name: str) -> dict[str, str]:
+        return {"project_id": str(project_id)} if project_id else {"new_project_name": str(new_name)}
+
+    @Slot(str, str)
+    def previewAttach(self, project_id: str, new_name: str) -> None:
+        """Preview attaching the open conversation to ``project_id`` or to a
+        new project named ``new_name`` ("" / "" clears the preview)."""
+        self._attach_preview, self._attach_notice = {}, ""
+        if project_id or new_name:
+            target = self._attach_target(project_id, new_name)
+            payload = self.backend.conversation_attach_preview(str(self._conversation_store.id or ""), **target)
+            self._attach_notice = self._error_message(payload)
+            if not self._attach_notice:
+                self._attach_preview = {**payload["preview"], "request": target}
+        self.attachChanged.emit()
+
+    @Slot(str, str, result=bool)
+    def confirmAttach(self, project_id: str, new_name: str) -> bool:
+        """The single "Projeye bağla" button: attach exactly what was
+        previewed. Afterwards the conversation is re-opened, so the next task
+        starts a fresh Core session."""
+        held = self._attach_preview
+        if self._busy or not held or held.get("blocked"):
+            return False
+        if held["request"] != self._attach_target(project_id, new_name):
+            self.previewAttach(project_id, new_name)
+            self._attach_notice = tx("Bridge", QT_TRANSLATE_NOOP(
+                "Bridge", "The choice changed after the preview; check the new preview and confirm again."))
+            self.attachChanged.emit()
+            return False
+        conversation_id = held["conversation_id"]
+        payload = self.backend.conversation_attach(conversation_id, held["expected_next_seq"], **held["request"])
+        error = self._error_message(payload)
+        if error:
+            self.previewAttach(project_id, new_name)          # shown fresh; never retried
+            self._attach_notice = error
+            self.attachChanged.emit()
+            return False
+        store = self._conversation_db()
+        self._attach_preview, self._attach_notice = {}, ""
+        self._activate(PersistedConversation(store, conversation_id))
+        self.refreshProjects()
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation attached to %1"),
+                    (str(payload["attached"]["target"]["name"]),)), "system")
+        self.attachChanged.emit()
+        return True
 
     def _session_conversation(self, session_id: str) -> str | None:
         store = self._conversation_db()

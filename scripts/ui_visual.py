@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("--peek", choices=("Tasks", "Updates", "Focus", "Plan"))
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
                                             "projects", "project", "badge", "archived",
-                                            "instruction", "files", "purge", "selector"), default="home")
+                                            "instruction", "files", "purge", "selector", "attach"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -72,7 +72,8 @@ def main() -> int:
         bridge.setEditMode(True)
     elif args.scene == "focus":
         bridge.setFocusMode(True)
-    elif args.scene in ("projects", "project", "badge", "archived", "instruction", "files", "purge", "selector"):
+    elif args.scene in ("projects", "project", "badge", "archived", "instruction", "files", "purge", "selector",
+                        "attach"):
         # V2.0 Gate 6A: sample projects in the ISOLATED store only (fixture copy,
         # nobody's data): two active, one archived, each with conversations.
         if not args.fixture:
@@ -113,6 +114,24 @@ def main() -> int:
             bridge.openConversation(seeded["JARVIS development"][1][0].id)
             bridge.setPage("home")
             QTimer.singleShot(400, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "projectSelectorMenu"), "open"))
+        elif args.scene == "attach":
+            # Gate 6C: the open Global conversation (fixture store only), with a
+            # title and two turns, previewed against "Home renovation".
+            from jarvis.conversation import append_turn
+            open_id = bridge.conversationId
+            store.set_conversation_title(open_id, "Kitchen budget questions")
+            for text in ("What did the tiler quote?", "Compare it with the second quote."):
+                store.update_conversation_state(open_id, lambda state, text=text: append_turn(
+                    state, role="user", kind="user", text=text, message=text, key=text)[0])
+            bridge.openConversation(open_id)
+            bridge.setPage("home")
+
+            def show_attach() -> None:
+                dialog = window.findChild(QObject, "attachDialog")
+                QMetaObject.invokeMethod(dialog, "openDialog")
+                dialog.setProperty("chosenId", home.id)
+                bridge.previewAttach(home.id, "")
+            QTimer.singleShot(400, show_attach)
         elif args.scene == "projects":
             bridge.setPage("projects")
             bridge.refreshProjects()

@@ -165,6 +165,101 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
 </context>
 <context>
+    <name>AttachDialog</name>
+    <message>
+        <source>Attach this conversation to a project</source>
+        <translation>Bu sohbeti bir projeye bağla</translation>
+    </message>
+    <message>
+        <source>PROJECT</source>
+        <translation>PROJE</translation>
+    </message>
+    <message>
+        <source>or a new project:</source>
+        <translation>ya da yeni bir proje:</translation>
+    </message>
+    <message>
+        <source>New project name</source>
+        <translation>Yeni proje adı</translation>
+    </message>
+    <message>
+        <source>&quot;%1&quot; · %2 turns · created %3</source>
+        <translation>&quot;%1&quot; · %2 mesaj · oluşturuldu %3</translation>
+    </message>
+    <message>
+        <source>New conversation</source>
+        <translation>Yeni sohbet</translation>
+    </message>
+    <message>
+        <source>Target: new project: %1</source>
+        <translation>Hedef: yeni proje: %1</translation>
+    </message>
+    <message>
+        <source>Target: %1</source>
+        <translation>Hedef: %1</translation>
+    </message>
+    <message>
+        <source>Cannot be attached: %1</source>
+        <translation>Bağlanamaz: %1</translation>
+    </message>
+    <message>
+        <source>WHAT CHANGES</source>
+        <translation>NE DEĞİŞİR</translation>
+    </message>
+    <message>
+        <source>• The owner becomes %1, permanently.</source>
+        <translation>• Sahip kalıcı olarak %1 olur.</translation>
+    </message>
+    <message>
+        <source>• It leaves History and appears in %1&apos;s list.</source>
+        <translation>• Geçmiş&apos;ten çıkar ve %1 projesinin listesinde görünür.</translation>
+    </message>
+    <message>
+        <source>• From the next message, %1&apos;s instruction, file excerpts and memory may be used.</source>
+        <translation>• Bir sonraki mesajdan itibaren %1 projesinin talimatı, dosya alıntıları ve hafızası kullanılabilir.</translation>
+    </message>
+    <message>
+        <source>• The model will see this conversation&apos;s earlier messages together with %1&apos;s context.</source>
+        <translation>• Model bu sohbetin önceki mesajlarını %1 projesinin bağlamıyla birlikte görür.</translation>
+    </message>
+    <message>
+        <source>WHAT DOES NOT CHANGE</source>
+        <translation>NE DEĞİŞMEZ</translation>
+    </message>
+    <message>
+        <source>• Earlier messages and answers are kept as they were.</source>
+        <translation>• Önceki mesajlar ve yanıtlar olduğu gibi kalır.</translation>
+    </message>
+    <message>
+        <source>• Past runs stay Global (results, approvals, audit).</source>
+        <translation>• Geçmiş çalışmalar Genel kalır (sonuçlar, onaylar, denetim kayıtları).</translation>
+    </message>
+    <message>
+        <source>• Nothing already sent to a provider changes.</source>
+        <translation>• Bir sağlayıcıya zaten gönderilmiş hiçbir şey değişmez.</translation>
+    </message>
+    <message>
+        <source>• No memory moves.</source>
+        <translation>• Hiçbir hafıza taşınmaz.</translation>
+    </message>
+    <message>
+        <source>• Permissions, grants and approvals are unaffected: a project is context, not authority.</source>
+        <translation>• İzinler, yetkiler ve onaylar etkilenmez: proje bağlamdır, yetki değildir.</translation>
+    </message>
+    <message>
+        <source>This cannot be undone: the conversation can never return to Global or move to another project.</source>
+        <translation>Bu geri alınamaz: sohbet bir daha Genel&apos;e dönemez ve başka bir projeye taşınamaz.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Attach to project</source>
+        <translation>Projeye bağla</translation>
+    </message>
+</context>
+<context>
     <name>AttachmentCard</name>
     <message>
         <source>%1 B</source>
@@ -362,6 +457,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Saved. The store redacted credentials or local paths, so the stored text shown here differs from what you typed.</source>
         <translation>Kaydedildi. Depo kimlik bilgilerini veya yerel yolları gizledi; bu yüzden burada gösterilen kayıtlı metin yazdığınızdan farklı.</translation>
+    </message>
+    <message>
+        <source>The choice changed after the preview; check the new preview and confirm again.</source>
+        <translation>Seçim önizlemeden sonra değişti; yeni önizlemeyi kontrol edip yeniden onaylayın.</translation>
+    </message>
+    <message>
+        <source>Conversation attached to %1</source>
+        <translation>Sohbet %1 projesine bağlandı</translation>
     </message>
     <message>
         <source>A reply for another conversation was saved there</source>
@@ -3761,6 +3864,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Global</source>
         <translation>Genel</translation>
+    </message>
+    <message>
+        <source>Attach to a project…</source>
+        <translation>Projeye bağla…</translation>
     </message>
     <message>
         <source>All projects</source>

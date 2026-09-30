@@ -311,8 +311,17 @@ class ConversationStoreTests(StoreCase):
             self.memory.load_conversation("not-an-id")
 
     def test_ownership_cannot_be_moved(self) -> None:
+        # Gate 6C: the ONE owner change is the one-way Global -> project
+        # attach (tests/test_conversation_attach.py); a project-owned
+        # conversation never moves again and there is no generic mover.
         for name in ("move_conversation", "set_conversation_project", "delete_conversation"):
             self.assertFalse(hasattr(self.memory, name), name)
+        project = self.memory.create_project("P")
+        owned = self.memory.create_conversation(project.id)
+        with self.assertRaises(ValueError):
+            self.memory.attach_global_conversation_to_project(
+                owned.id, expected_next_seq=1, new_project_name="Q")
+        self.assertEqual(project.id, self.memory.load_conversation(owned.id).project_id)
 
     def test_a_session_links_to_one_conversation_permanently(self) -> None:
         conversation = self.memory.create_conversation()

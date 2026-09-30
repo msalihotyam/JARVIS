@@ -682,6 +682,12 @@ CREATE TABLE IF NOT EXISTS conversation_legacy_imports (
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
     imported_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversation_moves (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+    project_id TEXT NOT NULL,
+    boundary_seq INTEGER NOT NULL,
+    moved_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS project_instructions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -733,6 +739,7 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "idx_conversations_owner",
         "conversation_sessions",
         "conversation_legacy_imports",
+        "conversation_moves",
         "project_instructions",
         "idx_project_instructions_current",
         "project_files",
@@ -746,6 +753,11 @@ PRE_V2_BACKUP_TAG = ".pre-v2"
 
 #: A caller that does not filter conversations by owner.
 ANY_OWNER = object()
+
+#: RESERVED for V2.1 (future compatibility contract; never created here): the
+#: per-conversation "all projects memory" record. A conversation with any row
+#: in it can never be attached to a project (Gate 6C, Salih decision).
+CONVERSATION_GLOBAL_MEMORY_TOGGLES = "conversation_global_memory_toggles"
 
 
 def pre_v2_backup_path(database_path: Path) -> Path:
@@ -4590,16 +4602,23 @@ class SQLiteMemoryStore:
         The id is never derived from the name, a time, a provider or a model,
         and it matches ``PROJECT_ID_PATTERN``, so schema-10 releases load the
         row unchanged."""
+        project = self._new_project_record(name)
+        with self._connection(write=True) as connection:
+            self._insert_new_project(connection, project)
+        return project
+
+    @staticmethod
+    def _new_project_record(name: Any) -> ProjectRecord:
         if not isinstance(name, str):
             raise ValueError("project name must be a non-blank string")
-        project = ProjectRecord(id="p-" + uuid4().hex, name=name.strip())
-        with self._connection(write=True) as connection:
-            self._refuse_duplicate_project_name(connection, project.name)
-            connection.execute(
-                "INSERT INTO projects (id, name, active, created_at) VALUES (?, ?, 1, ?)",
-                (project.id, project.name, project.created_at),
-            )
-        return project
+        return ProjectRecord(id="p-" + uuid4().hex, name=name.strip())
+
+    def _insert_new_project(self, connection: sqlite3.Connection, project: ProjectRecord) -> None:
+        self._refuse_duplicate_project_name(connection, project.name)
+        connection.execute(
+            "INSERT INTO projects (id, name, active, created_at) VALUES (?, ?, 1, ?)",
+            (project.id, project.name, project.created_at),
+        )
 
     def rename_project(self, project_id: str, name: str) -> ProjectRecord:
         """Change only ``name``. The id, owner links and ``active`` stay."""
@@ -5138,7 +5157,9 @@ class SQLiteMemoryStore:
     ) -> ConversationRecord:
         """A new, empty conversation owned by ``project_id`` (``None`` =
         Global). The owner must be an existing ACTIVE project - nothing here
-        creates one - and it can never be changed afterwards."""
+        creates one - and it can never be changed afterwards, except by the one
+        named one-way exception: a Global conversation attached to a project
+        (``attach_global_conversation_to_project``, Gate 6C)."""
         if type(title) is not str or len(title) > CONVERSATION_TITLE_MAX:
             raise ValueError(
                 f"conversation title must be text of at most {CONVERSATION_TITLE_MAX} characters"
@@ -5338,6 +5359,187 @@ class SQLiteMemoryStore:
                 (session_id,),
             ).fetchone()
         return None if row is None else row["conversation_id"]
+
+    # ------------------------------------------------------------------
+    # Gate 6C "Projeye bağla" (Salih decision 2026-09-29): the ONE named
+    # exception to "the owner is fixed". A GLOBAL conversation may be
+    # attached to a project once, one-way; nothing else ever changes an
+    # owner (P -> Q and P -> Global are impossible: the UPDATE only matches
+    # a NULL owner and ``conversation_moves`` allows one row per
+    # conversation). Context, never authority. The preview and the writer
+    # share one check, so what the person is shown is what is enforced.
+    # ------------------------------------------------------------------
+
+    def _attach_check(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: Any,
+        project_id: Any,
+        new_project_name: Any,
+    ) -> tuple[dict[str, Any], ProjectRecord | None, str | None]:
+        """``(preview, new project record or None, refusal or None)``.
+
+        Malformed arguments raise; a well-formed request that may not proceed
+        returns its refusal, so the preview can show it."""
+        self._require_conversation_id(conversation_id)
+        if (project_id is None) == (new_project_name is None):
+            raise ValueError("Name exactly one target: an existing project or a new project name.")
+        row = connection.execute(
+            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        record = None if row is None else self._conversation_record(row)
+        if record is None:
+            raise ValueError(f"Unknown conversation: {conversation_id}")
+        state = decode_state(row["state_json"], row["integrity"])
+        preview: dict[str, Any] = {
+            "conversation_id": record.id,
+            "title": record.title,
+            "turns": len(state.turns),
+            "created_at": record.created_at,
+            "expected_next_seq": state.next_seq,
+        }
+        new_project: ProjectRecord | None = None
+        refusal: str | None = None
+        if project_id is not None:
+            validate_project_id(project_id)
+            target = connection.execute(
+                "SELECT name, active FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            preview["target"] = {"project_id": project_id, "new": False,
+                                 "name": target["name"] if target is not None else project_id}
+            if target is None:
+                refusal = f"Unknown project: {project_id}"
+            elif target["active"] != 1:
+                refusal = f"Project is archived: {project_id}"
+        else:
+            name = new_project_name.strip() if isinstance(new_project_name, str) else new_project_name
+            preview["target"] = {"project_id": None, "new": True, "name": name if isinstance(name, str) else ""}
+            try:
+                new_project = self._new_project_record(new_project_name)
+                self._refuse_duplicate_project_name(connection, new_project.name)
+            except ValueError as exc:
+                new_project, refusal = None, str(exc)
+        if record.project_id is not None:
+            refusal = "Only a Global conversation can be attached to a project."
+        elif record.archived_at is not None:
+            refusal = "This conversation is archived; it is read-only."
+        refusal = refusal or self._attach_open_work(connection, record.id) or self._attach_toggle_refusal(
+            connection, record.id
+        )
+        preview["blocked"] = refusal or ""
+        return preview, new_project, refusal
+
+    @staticmethod
+    def _attach_open_work(connection: sqlite3.Connection, conversation_id: str) -> str | None:
+        """A linked session with unfinished work - a non-terminal task, a
+        pending approval or a non-terminal chain - blocks the move, and so
+        does a linked session that cannot be read (fail closed)."""
+        terminal_chain = {ChainStatus.COMPLETED, ChainStatus.FAILED, ChainStatus.CANCELLED}
+        for linked in connection.execute(
+            "SELECT s.state_json FROM conversation_sessions cs "
+            "LEFT JOIN sessions s ON s.id = cs.session_id WHERE cs.conversation_id = ?",
+            (conversation_id,),
+        ).fetchall():
+            try:
+                session = SessionState.from_dict(json.loads(linked["state_json"]))
+            except Exception:  # noqa: BLE001 - an unreadable session fails closed
+                return "A session of this conversation cannot be read, so it cannot be attached."
+            if session.chain is not None and session.chain.status not in terminal_chain:
+                return "A chain in this conversation is not finished; finish or cancel it first."
+        terminal = sorted(_TERMINAL_STATUS_VALUES)
+        if connection.execute(
+            "SELECT 1 FROM tasks t JOIN conversation_sessions cs ON cs.session_id = t.session_id "
+            f"WHERE cs.conversation_id = ? AND t.status NOT IN ({', '.join('?' * len(terminal))}) LIMIT 1",
+            (conversation_id, *terminal),
+        ).fetchone() is not None:
+            return "A task in this conversation is not finished; finish or cancel it first."
+        if connection.execute(
+            "SELECT 1 FROM pending_approvals pa JOIN conversation_sessions cs ON cs.session_id = pa.session_id "
+            "WHERE cs.conversation_id = ? AND pa.status = 'pending' LIMIT 1",
+            (conversation_id,),
+        ).fetchone() is not None:
+            return "An approval in this conversation is still pending; answer it first."
+        return None
+
+    @staticmethod
+    def _attach_toggle_refusal(connection: sqlite3.Connection, conversation_id: str) -> str | None:
+        """FUTURE COMPATIBILITY CONTRACT (V2.1): a conversation that EVER had
+        "all projects memory" on can never be attached (Salih decision). V2.1
+        owns the reserved table ``conversation_global_memory_toggles``
+        (append-only, explicit-user writes only, keyed by conversation_id);
+        6C never creates it. Evaluated on every call: absent -> no refusal; a
+        row for the conversation -> refused; present but unreadable -> refused."""
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (CONVERSATION_GLOBAL_MEMORY_TOGGLES,),
+        ).fetchone() is None:
+            return None
+        try:
+            used = connection.execute(
+                f"SELECT 1 FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? LIMIT 1",
+                (conversation_id,),
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return "This conversation's \"all projects memory\" record cannot be read, so it cannot be attached."
+        return "This conversation used \"all projects memory\"; it can never be attached to a project." if used else None
+
+    def conversation_attach_preview(
+        self, conversation_id: str, *, project_id: str | None = None, new_project_name: str | None = None
+    ) -> dict[str, Any]:
+        """What attaching would do, from ONE consistent read: title, turn
+        count, created date, the target, ``expected_next_seq`` (which the
+        confirm must carry) and the refusal it would meet (``blocked``)."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                preview, _, _ = self._attach_check(connection, conversation_id, project_id, new_project_name)
+            finally:
+                connection.rollback()
+        return preview
+
+    def attach_global_conversation_to_project(
+        self,
+        conversation_id: str,
+        *,
+        expected_next_seq: int,
+        project_id: str | None = None,
+        new_project_name: str | None = None,
+    ) -> dict[str, Any]:
+        """THE one owner change there is, reached only from the local app
+        composition path (``conversation_attach_result``) after a preview and
+        the person's explicit confirm. ONE write transaction: the shared
+        check, the preview binding (the conversation's ``next_seq`` must be
+        the previewed one), an optional new project, the guarded owner UPDATE
+        and the ``conversation_moves`` row. Every refusal writes nothing."""
+        if type(expected_next_seq) is not int:
+            raise ValueError("expected_next_seq must be the integer the preview returned")
+        with self._connection(write=True) as connection:
+            preview, new_project, refusal = self._attach_check(
+                connection, conversation_id, project_id, new_project_name
+            )
+            if refusal is None and preview["expected_next_seq"] != expected_next_seq:
+                refusal = "The conversation changed after the preview; preview again."
+            if refusal is not None:
+                raise ValueError(refusal)
+            if new_project is not None:
+                self._insert_new_project(connection, new_project)
+                project_id = new_project.id
+            changed = connection.execute(
+                "UPDATE conversations SET project_id = ? "
+                "WHERE id = ? AND project_id IS NULL AND archived_at IS NULL",
+                (project_id, conversation_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("Only a Global conversation can be attached to a project.")
+            moved_at = utc_now()
+            connection.execute(
+                "INSERT INTO conversation_moves (conversation_id, project_id, boundary_seq, moved_at) "
+                "VALUES (?, ?, ?, ?)",
+                (conversation_id, project_id, expected_next_seq, moved_at),
+            )
+        return {**preview, "target": {**preview["target"], "project_id": project_id},
+                "boundary_seq": expected_next_seq, "moved_at": moved_at}
 
     def import_legacy_conversation(self, path: str | Path) -> ConversationRecord | None:
         """Preserve the legacy ``conversation.json`` as a Global conversation.

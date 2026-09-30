@@ -29,6 +29,8 @@ from jarvis.app import (
     config_failure_result,
     config_mutation_result,
     config_show_result,
+    conversation_attach_preview_result,
+    conversation_attach_result,
     failure_result,
     job_archive_result,
     job_create_result,
@@ -443,6 +445,18 @@ class Backend:
         """add / list / retire / restore / purge through the existing app path."""
         return self._call(f"project-file-{action}", lambda s: project_file_result(
             self._memory(s), s, action, project_id, **options
+        ))
+
+    def conversation_attach_preview(self, conversation_id: str, **target: Any) -> dict:
+        """Gate 6C: what attaching would do (read-only), through the app path."""
+        return self._call("conversation-attach-preview", lambda s: conversation_attach_preview_result(
+            self._memory(s), s, conversation_id, **target
+        ))
+
+    def conversation_attach(self, conversation_id: str, expected_next_seq: int, **target: Any) -> dict:
+        """Gate 6C: the confirmed attach, through THE audited app path."""
+        return self._call("conversation-attach", lambda s: conversation_attach_result(
+            self._memory(s), s, conversation_id, expected_next_seq=expected_next_seq, **target
         ))
 
     def memory_list(self, project_id: str, include_inactive: bool = False) -> dict:

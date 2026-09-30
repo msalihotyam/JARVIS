@@ -1694,6 +1694,57 @@ def project_file_result(
         )
 
 
+def conversation_attach_preview_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+    *,
+    project_id: str | None = None,
+    new_project_name: str | None = None,
+) -> CommandResult:
+    """What attaching a Global conversation to a project would do (Gate 6C),
+    read-only; ``blocked`` carries the refusal the confirm would meet."""
+    command = "conversation-attach-preview"
+    try:
+        preview = memory.conversation_attach_preview(
+            conversation_id, project_id=project_id, new_project_name=new_project_name
+        )
+    except ValueError as exc:
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK, str(exc), EXIT_INVALID_INPUT
+        )
+    return CommandResult({"command": command, "preview": preview}, EXIT_OK)
+
+
+def conversation_attach_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    conversation_id: str,
+    *,
+    expected_next_seq: int,
+    project_id: str | None = None,
+    new_project_name: str | None = None,
+) -> CommandResult:
+    """Attach ONE Global conversation to a project, one-way (Gate 6C, Salih
+    decision 2026-09-29). THE audited production caller of the store's
+    writer: the conversation, the target and the previewed ``next_seq`` are
+    the person's own confirmed app input. No model, connector, intent,
+    scheduler or Core path reaches it."""
+    command = "conversation-attach"
+    try:
+        attached = memory.attach_global_conversation_to_project(
+            conversation_id,
+            expected_next_seq=expected_next_seq,
+            project_id=project_id,
+            new_project_name=new_project_name,
+        )
+    except ValueError as exc:
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK, str(exc), EXIT_INVALID_INPUT
+        )
+    return CommandResult({"command": command, "attached": attached}, EXIT_OK)
+
+
 def memory_add_result(
     memory: SQLiteMemoryStore,
     settings: Settings,

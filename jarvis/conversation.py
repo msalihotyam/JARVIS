@@ -944,7 +944,9 @@ class ConversationRecord:
     """What a conversation IS, apart from what was said in it.
 
     ``project_id`` is its owner: ``None`` means Global. The owner is fixed at
-    creation and is context, never authority - it grants nothing."""
+    creation - the one exception is the one-way attach of a Global
+    conversation to a project (Gate 6C) - and is context, never authority: it
+    grants nothing."""
 
     id: str
     project_id: str | None

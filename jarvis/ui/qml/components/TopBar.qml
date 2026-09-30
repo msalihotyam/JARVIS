@@ -355,6 +355,8 @@ Item {
             }
         }
 
+        AttachDialog { id: attachDialog }
+
         Popup {
             id: selectorMenu
             objectName: "projectSelectorMenu"
@@ -375,6 +377,10 @@ Item {
                 }
                 ScopeChoice { objectName: "projectSelectorGlobal"; label: qsTr("Global"); current: !!scopeGroup.owner.global
                          onChosen: { selectorMenu.close(); bridge.openProjectScope("") } }
+                // Gate 6C: only while the open conversation is a writable Global one.
+                ScopeChoice { objectName: "projectSelectorAttach"; visible: bridge.canAttach
+                              label: qsTr("Attach to a project…")
+                              onChosen: { selectorMenu.close(); attachDialog.openDialog() } }
                 Rectangle { width: 264; height: 1; color: Theme.border }
                 ScopeChoice { objectName: "projectSelectorAll"; label: qsTr("All projects"); onChosen: { selectorMenu.close(); bridge.showProject("") } }
             }

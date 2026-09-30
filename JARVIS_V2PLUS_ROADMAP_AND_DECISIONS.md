@@ -114,6 +114,7 @@ Her kayıtta mümkün olduğunca:
 - Yalnız memory: instruction ve dosya yok. Salt-okunur; gösterdiği her şeyde kaynak (provenance) etiketi.
 - Yukarıdaki "Başka Project'e memory sızmamalı" ilkesine tek, adlandırılmış, kullanıcı-açık istisna budur.
 - V2.1 bağlam kalemleri: PreCompact capture, tam arşiv retrieval, context-usage göstergesi, "Hatırla" butonu.
+- **Gelecek uyumluluk sözleşmesi (Gate 6C, 2026-09-30):** anahtar kaydı ayrılmış tablo `conversation_global_memory_toggles`'da tutulur (V2.1 sahiplenir; append-only, yalnız açık-kullanıcı yazımı, `conversation_id` anahtarlı). V2.1 kabulü: "Projeye bağla", anahtarı bir kez açılmış bir konuşmayı reddeder (6C bu tabloyu her bağlamada okur; satır varsa veya tablo okunamıyorsa ret).
 
 ### Memory Doctor / Health
 Planlanan kontroller:

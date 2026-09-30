@@ -140,7 +140,8 @@ class DetailTests(ProjectsUiCase):
         self.assertEqual(a.id, store.load_conversation(bridge.conversationId).project_id)
         bridge.showProject(a.id); pump(300)
         self.assertEqual(2, len(bridge.projectConversations))
-        # There is no move control anywhere in the window.
+        # No move control here: the only owner change is the Gate 6C
+        # Global -> project attach, offered in the top-bar selector alone.
         self.assertEqual([], [n for n in ("projectMove", "conversationMove", "moveConversation")
                               if self.all_items(root, n)])
 

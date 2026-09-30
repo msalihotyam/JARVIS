@@ -3123,8 +3123,9 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   sağlayıcı, model, oturum, proje adı veya zaman damgasından türetilmez.
 - **Kapsam:** Global = `project_id` NULL; sentetik bir "Global proje" satırı
   yoktur. NULL olmayan sahip mevcut ve aktif bir `projects` satırı olmalıdır;
-  hiçbir yol proje yaratmaz. Sahip oluşturulurken sabitlenir; taşıma ve silme
-  yoktur. Arşivlenmiş konuşma saklanır ve salt okunurdur.
+  konuşma oluşturma yolu proje yaratmaz. Sahip oluşturulurken sabitlenir;
+  silme yoktur ve tek taşıma aşağıdaki Gate 6C istisnasıdır (Global -> proje,
+  tek yönlü). Arşivlenmiş konuşma saklanır ve salt okunurdur.
 - **Oturum bağı:** bir Core oturumu en çok bir konuşmaya, kalıcı olarak
   bağlanır; bir projeye bağlı oturum yalnız o projenin konuşmasına girebilir
   (bağlam tutarlılığı, yetki değil).
@@ -3186,6 +3187,46 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   zamanlanmış iş oluşturma reddedilir. Sahip/bağ uyuşmazlığı (başka projeye
   bağlı ya da başka sahipli konuşmaya bağlı oturum, bilinmeyen konuşma)
   model çağrılmadan kapalı başarısız olur.
+- **Projeye bağla (Gate 6C, Salih kararı 2026-09-29; Gate 0 "sahip sabit"
+  kuralının tek, adlandırılmış istisnası):** bir GLOBAL konuşma bir kez, tek
+  yönlü olarak mevcut aktif bir projeye ya da akış içinde oluşturulan yeni bir
+  projeye bağlanabilir. Tek yazıcı `attach_global_conversation_to_project`,
+  tek üretim çağıranı yerel app yolu `conversation_attach_result`'tır (CLI
+  yoktur; model çıktısı, connector, niyet kataloğu, zamanlayıcı ve Core
+  erişemez). TEK `BEGIN IMMEDIATE` işlemi: önizlemeyle paylaşılan denetim
+  (konuşma var, doğrulanıyor, Global, arşivsiz; hedef aktif ya da yeni proje
+  `create_project` kurallarıyla; bağlı oturumlarda bitmemiş görev, bekleyen
+  onay veya bitmemiş zincir yok, okunamayan bağlı oturum kapalı başarısız;
+  V2.1 guard), önizleme bağı (konuşmanın `next_seq`'i önizlenenle aynı; değilse
+  "önizlemeyi yenile" reddi), isteğe bağlı yeni proje INSERT'i,
+  `UPDATE ... WHERE project_id IS NULL AND archived_at IS NULL` (tam bir satır)
+  ve yeni ek tablo `conversation_moves` satırı (konuşma başına tek satır,
+  `boundary_seq` = önizlenen `next_seq`). Her ret hiçbir şey yazmaz; yeni proje
+  adımı başarısız bir bağlamada proje bırakmaz. P -> Q ve P -> Global
+  WHERE koşulu ve birincil anahtarla imkânsızdır; genel bir sahip değiştirici
+  yoktur. Seçilen hedefin önizlenenle aynı olması önizlemeyi tutan pencerede
+  zorlanır (yazıcının imzası hedef taşır, önizleme kimliği taşımaz).
+  V2.1 guard (gelecek uyumluluk sözleşmesi): "tüm projelerin hafızası" bir kez
+  açılmış konuşma asla bağlanamaz; V2.1'in sahipleneceği ayrılmış tablo
+  `conversation_global_memory_toggles`'da konuşmaya ait satır varsa ret, tablo
+  var ama okunamıyorsa ret; tablo yokken de her çağrıda değerlendirilir, 6C
+  tabloyu oluşturmaz. Şema 10'da kalır, ALTER yoktur; şema-10 sürümleri
+  `conversations`'ı hiç okumaz.
+  Bağlamadan sonra: sonraki istek sahibi P olarak okur (niyet kataloğu, P'nin
+  talimatı), pencere konuşmayı yeniden açtığı için yeni bir oturum P'ye bağlanır
+  ve P'nin talimatı, dosya alıntıları ve hafızası uygulanır; F1 başka bir
+  projeyi yine reddeder, F2 arşivlenmiş konuşmayı yine reddeder. Önceki hiçbir
+  şey P'ye atfedilmez: eski görevler `project_id` None kalır, eski oturumlar
+  bağsız kalır, hafıza/onay/denetim satırı değişmez (Global konuşmanın proje
+  hafızası yoktur). Konuşmanın önceki turları sonraki model çağrılarında P
+  bağlamıyla birlikte bağlam olarak görülür; önizleme bunu söyler.
+  Gözlenen davranış (test edildi, Core değişmedi): bağlamadan sonra ESKİ bir
+  Global dönem oturumu yeniden seçilirse (pencerede oturum seçimi ya da
+  `--session-id`), proje adlandırmayan görev bağsız, Global kapsamlı çalışır
+  (talimat/dosya yok); P'yi adlandıran görev o eski oturumu P'ye bağlar ve
+  sonrası P kapsamındadır. Kabul edilen risk: bağlamadan önce başlamış bir
+  istek bağlamadan sonra taşınan konuşmada Global kapsamlı bir görev olarak
+  kaydolabilir (daha az bağlam, asla daha fazla değil).
 - **Arşiv semantiği (Salih kararı, 2026-09-29):** arşivlenmiş projenin
   konuşmaları saklanır, okunabilir ve salt okunurdur (durum, başlık, arşiv,
   oturum bağı yazılamaz); bu projede yeni görev çalışmaz - projeye önceden
@@ -3345,7 +3386,7 @@ değildir (yol haritası V2.0).
   görüntüleri yalnız parça kimliği tutar, `context_retrieved` olayı alıntı
   metni tutmaz.
 
-### 4.25 Projects penceresi (V2 Projects Gate 6A/6B, uygulandı)
+### 4.25 Projects penceresi (V2 Projects Gate 6A/6B/6C, uygulandı)
 
 Pencere proje modelini gösterir ve mevcut kanonik yolları çağırır; hiçbir şeye
 kendisi karar vermez.
@@ -3355,7 +3396,7 @@ kendisi karar vermez.
   `project_lifecycle_result`) geçer ve Core'un reddi olduğu gibi gösterilir.
   Proje konuşması deponun kendi yolu `create_conversation(project_id)` ile
   oluşturulur; bilinmeyen veya arşivlenmiş sahibi o yol reddeder, köprü kendi
-  sahiplik mantığını eklemez. Taşıma yoktur. Arşivlenmiş projede besteleyicinin
+  sahiplik mantığını eklemez. Tek taşıma §4.22'deki Gate 6C bağlamasıdır. Arşivlenmiş projede besteleyicinin
   kapatılması yalnız sunumdur; zorlama §4.22'deki Core reddidir.
 - **Adlar, kimlikler değil:** pencere proje ADINI gösterir; opak kimlikler
   içeride kalır.
@@ -3384,6 +3425,15 @@ kendisi karar vermez.
   eklenme zamanı; ad tekil değildir), §4.24 kalıntısını dürüstçe söyler ve o
   satırın dosya adı aynen yazılmadan hiçbir çağrı yapmaz; eşleşince deponun
   onayı olarak o SATIRIN kimliği verilir (deponun kapısı değişmez).
+- **Projeye bağla (6C, Salih kararı 2026-09-29):** giriş yalnız üst çubuk
+  seçici menüsündedir ve yalnız açık konuşma yazılabilir bir Global konuşma
+  iken görünür. Pencere: aktif bir proje seçilir ya da yeni ad yazılır ->
+  önizleme (düz metin: kimlik, hedef, ne değişir, ne değişmez, geri
+  alınamazlık) -> tek "Projeye bağla" düğmesi, önizlenen `next_seq` ve hedefi
+  gönderir. Engelli önizleme gerekçesini gösterir, düğme yoktur; "değişti"
+  reddi önizlemeyi yeniler, kendiliğinden yeniden denemez. Başarıdan sonra
+  konuşma yeniden açılır (sonraki görev yeni oturum) ve seçici / Geçmiş /
+  Projects yenilenir. Köprü store'u değil app sonuçlarını çağırır.
 - **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
   tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
 - **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje

@@ -9,14 +9,15 @@ Active milestone: V2.0 Projects (dogfood-capable; the official V2
 daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
-Active gate: Projects Gate 6C "Projeye bağla". NOT STARTED.
+Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). NOT STARTED.
 
-Status: Gates 1–5, 6A, 6B complete on main; nothing in flight. 6B (§4.25):
-top-bar project selector + "+ Yeni sohbet" (replaced the 6A badge), instruction
-editor, file panel with counters and typed-name purge. Base commit:
-`feat(projects): add instruction editor, file panel and project selector to
-the window`. Installed release: `1.0.0-1c68161` (Chrome); previous
-`1.0.0-4f5a93d`.
+Status: Gates 1–5 and 6A–6C complete on main; Gate 6 UX complete; nothing in
+flight. 6C (§4.22/§4.25): one-way attach of a Global conversation to a project
+(`attach_global_conversation_to_project`, sole caller
+`conversation_attach_result`; additive `conversation_moves`; V2.1 reserved-table
+guard), selector-menu dialog with preview + single confirm. Base commit:
+`feat(projects): attach a Global conversation to a project`. Installed
+release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Roles
 
@@ -29,8 +30,8 @@ the window`. Installed release: `1.0.0-1c68161` (Chrome); previous
 
 - V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).
 - Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner fixed
-  (no move in V2.0, except the narrow 6C "Projeye bağla": Global → project,
-  one-way, preview + confirm; Salih 2026-09-29); scope is context, never
+  (only exception: 6C "Projeye bağla", Global → project, one-way, once;
+  never P→Q or P→Global; Salih 2026-09-29); scope is context, never
   authority; no `SCHEMA_VERSION` bump while schema-10 releases are rollback
   targets (additive tables only, no ALTER).
 - Gates 1–3 (§4.22) incl. archive; no Global-conversation jobs.
@@ -40,20 +41,23 @@ the window`. Installed release: `1.0.0-1c68161` (Chrome); previous
   allowed on archived projects.
 - Gate 6 UX (Salih 2026-09-29/30): Projects on Ctrl+6, History keeps Global,
   no recents grouping; mouse-first, no shortcut-dependent feature; selector
-  lists active projects only; purge confirmed by typing the row's name.
+  lists active projects only; purge confirmed by typing the row's name;
+  6C: entry only in the selector menu, preview + single "Projeye bağla"
+  button; a conversation that ever used "all projects memory" never moves.
 
 ## Uncommitted / external decisions
 
-- Remaining V2.0: 6C (Opus 5.5 xhigh; guard for conversations that used V2.1
-  "all projects memory") → Gate 7 (E2E + packaged dogfood + rollback, incl.
-  archive/unarchive E2E). Salih decides purge-residue privacy before Gate 7.
-  No release before Gate 6 UX is complete.
+- Remaining V2.0: Gate 7 (E2E + packaged dogfood + rollback, incl.
+  archive/unarchive E2E and a packaged rollback over a moved conversation).
+  Salih decides purge-residue privacy before Gate 7.
 - V2.1 (Salih 2026-09-29): "all projects memory" toggle (memory only,
   read-only, per-conversation, default off, provenance); PreCompact capture,
-  full archive retrieval, context-usage indicator, "Hatırla" button.
+  full archive retrieval, context-usage indicator, "Hatırla" button. V2.1
+  must own `conversation_global_memory_toggles` (roadmap contract).
 - Codex review queue (Salih, Windows, standard model, one commit per session):
   session1 remainder (instruction channel, grant fix, schema-10), Gate 5, 6A,
-  6B, fix commits. F1+F2 fixed in `74adbd0`, F3 by design (§4.22), F4 fixed in 6A.
+  6B, 6C, fix commits. F1+F2 fixed in `74adbd0`, F3 by design (§4.22), F4
+  fixed in 6A.
 - Backlog: full-suite timing flake
   `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`
   (passes alone); project-filtered jobs query (listing is the oldest 20);
@@ -64,8 +68,7 @@ the window`. Installed release: `1.0.0-1c68161` (Chrome); previous
 
 ## Next action
 
-- Projects Gate 6C design (Opus 5.5 xhigh): "Projeye bağla" over the existing
-  store paths; no new authority.
+- Gate 7 preflight (Opus 5.5 high) after Salih's purge-residue decision.
 
 ## Rollback / safety anchors
 
