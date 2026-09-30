@@ -53,6 +53,7 @@ from jarvis.memory import (
     SQLiteMemoryStore,
     pre_v2_backup_path,
 )
+from jarvis.project_files import read_project_file
 from tests.helpers import safe_cleanup
 
 REPO = Path(__file__).resolve().parents[1]
@@ -516,6 +517,78 @@ print(json.dumps(out))
         self.assertEqual(owned.id, reopened.conversation_for_session(session.id))
         self.assertEqual("touched by the old release", reopened.load_session(session.id).next_step)
         self.assertEqual(10, reopened.schema_version())
+
+    OLD_READS_V2_PROJECT_DATA = r"""
+import json, sys, jarvis.memory as m
+assert m.__file__.startswith(sys.argv[2]), m.__file__
+store = m.SQLiteMemoryStore(sys.argv[1])
+projects = {p.id: p.active for p in store.list_projects()}
+print(json.dumps({"schema": store.schema_version(), "projects": projects,
+                  "sessions": sorted(s.id for s in store.list_sessions(50)),
+                  "bound": sorted((s.id, s.project_id) for s in store.list_sessions(50))}))
+"""
+
+    V2_PROJECT_TABLES = ("conversations", "conversation_sessions", "conversation_moves", "project_instructions",
+                         "project_files", "project_file_chunks")
+
+    def test_the_rollback_release_leaves_gate_1_to_6_project_data_byte_identical(self) -> None:
+        # A V2 database holding every Gate 1-6 table: a moved conversation, an
+        # instruction with history, files with chunks plus a purge tombstone,
+        # and an archived project.
+        memory = self.store()
+        live, old = memory.create_project("Live"), memory.create_project("Old")
+        session = SessionState(objective="bound session", project_id=live.id)
+        memory.save_session(session)
+        moved = memory.create_conversation()
+        memory.update_conversation_state(moved.id, lambda s: say(s, "taşınan sohbet", "m1"))
+        memory.attach_global_conversation_to_project(moved.id, expected_next_seq=2, project_id=live.id)
+        memory.link_session_conversation(session.id, moved.id)
+        for text in ("birinci", "ikinci", ""):
+            memory.save_explicit_user_project_instruction(live.id, text, "internal")
+        kept = self.add_file(memory, live.id, "kept.md", "alpha " * 600)        # two chunks
+        gone = self.add_file(memory, live.id, "gone.md", "beta " * 40)
+        memory.set_project_file_active(live.id, gone["id"], False)
+        memory.purge_project_file(live.id, gone["id"], confirm=gone["id"])
+        memory.set_project_active(old.id, False)
+        before = {name: rows(self.database, f"SELECT * FROM {name} ORDER BY rowid") for name in self.V2_PROJECT_TABLES}
+        self.assertEqual([(moved.id, live.id, 2)], [r[:3] for r in before["conversation_moves"]])
+        self.assertEqual(3, len(before["project_instructions"]))
+        self.assertEqual(2, len(before["project_files"]))
+        self.assertGreater(len(before["project_file_chunks"]), 1)
+        projects_before = rows(self.database, "SELECT * FROM projects ORDER BY id")
+        # The old release opens it without error and reads what it knows.
+        out = self.old(self.OLD_READS_V2_PROJECT_DATA, str(self.database), str(self.old_tree))
+        self.assertEqual(10, out["schema"])
+        self.assertEqual({live.id: True, old.id: False}, out["projects"])
+        self.assertEqual([session.id], out["sessions"])
+        self.assertEqual([[session.id, live.id]], out["bound"])
+        # The old write path too (a new project and a touched session).
+        self.old(self.OLD_OPERATIONS, str(self.database), session.id, str(self.old_tree))
+        # Every V2 row is byte-identical; the known rows are untouched.
+        after = {name: rows(self.database, f"SELECT * FROM {name} ORDER BY rowid") for name in self.V2_PROJECT_TABLES}
+        self.assertEqual(before, after)
+        self.assertEqual(projects_before, [r for r in rows(self.database, "SELECT * FROM projects ORDER BY id")
+                                           if r[0] != "legacy-proj"])
+        # V2 reopens with everything intact.
+        reopened = self.store()
+        self.assertEqual(10, reopened.schema_version())
+        self.assertEqual(live.id, reopened.load_conversation(moved.id).project_id)
+        self.assertEqual(["taşınan sohbet"], [t.message for t in reopened.load_conversation_state(moved.id).turns])
+        self.assertEqual([moved.id], [c.id for c in reopened.list_conversations(project_id=live.id)])
+        self.assertEqual(moved.id, reopened.conversation_for_session(session.id))
+        history = reopened.list_project_instruction_history(live.id)
+        self.assertEqual(["birinci", "ikinci", ""], [v.text for v in history])
+        self.assertEqual("", reopened.load_project_instruction(live.id).text)
+        listed = reopened.list_project_files(live.id, include_purged=True)
+        self.assertEqual({kept["id"]: "active", gone["id"]: "purged"}, {f["id"]: f["lifecycle"] for f in listed})
+        self.assertFalse(reopened.load_project(old.id).active)
+        self.assertTrue(reopened.load_project(live.id).active)
+        self.assertEqual("touched by the old release", reopened.load_session(session.id).next_step)
+
+    def add_file(self, memory, project_id: str, name: str, text: str) -> dict:
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return memory.save_explicit_user_project_file(project_id, read_project_file(path), "internal")
 
     def test_a_database_the_rollback_release_created_is_upgraded_additively(self) -> None:
         create = r"""

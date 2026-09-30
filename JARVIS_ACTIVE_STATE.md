@@ -9,7 +9,8 @@ Active milestone: V2.0 Projects (dogfood-capable; the official V2
 daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
-Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). NOT STARTED.
+Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). IN PROGRESS:
+phase A (E2E test gaps, tests only) done; phase B (build + install) next.
 
 Status: Gates 1–5 and 6A–6C complete on main; Gate 6 UX complete; nothing in
 flight. 6C (§4.22/§4.25): one-way attach of a Global conversation to a project
@@ -54,6 +55,15 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
   provider-sent content, WAL/backups remain, disclosed in the purge dialog).
   Scrubbing those copies is deferred to a later design (touches audit
   append-only integrity), not a V2.0 gate; Gate 7 is not waiting on it.
+- Gate 7 phase A done (tests only; full suite 4576 OK, 2 skipped).
+- Gate 7 decisions (Salih 2026-09-30): D-1 copy
+  `releases\legacy-1.0.0-5976769` outside Apps\JARVIS, then let the install
+  prune it (4f5a93d stays the Edge anchor; `data\browser-profile` kept);
+  D-2 dogfood on the live DB after a hashed backup (JARVIS closed:
+  `data\jarvis.db` + -wal/-shm, `~\.jarvis\*.json`); D-3 one approved live
+  Claude call after Salih's own CLI re-login; D-4 real packaged -Rollback to
+  1c68161 and back (pending approvals cleared, conversation.json backed up
+  and restored).
 - V2.1 (Salih 2026-09-29): "all projects memory" toggle (memory only,
   read-only, per-conversation, default off, provenance); PreCompact capture,
   full archive retrieval, context-usage indicator, "Hatırla" button. V2.1
@@ -72,7 +82,8 @@ release: `1.0.0-1c68161` (Chrome); previous `1.0.0-4f5a93d`.
 
 ## Next action
 
-- Gate 7 preflight (Opus 5.5 high).
+- Gate 7 phase B: build + install the release from the phase A commit (needs
+  Salih's go), then D-1..D-4 below.
 
 ## Rollback / safety anchors
 
