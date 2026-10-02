@@ -47,12 +47,9 @@ complete on main; nothing in flight. Installed: `1.0.0-8fbbaef` (predates
 - Load-sensitive list (RUNBOOK rule D; only the orchestrator edits):
   `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b` and
   `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
-  (both hardened, stable under 14 CPU hogs) and
-  `test_ui.TypographyTests.test_normal_launch_path_is_clean`.
-- PRODUCT DEFECT (unfixed; launch-path test left as is): `Bridge._catalog_changed`
-  emits `_catalogDone` from `jarvis-catalog-*` threads after the Bridge is
-  deleted at shutdown -> "Signal source has been deleted" traceback (9/30
-  launches under load, exit 0). Needs a shutdown guard/join in the bridge.
+  (both hardened, stable under 14 CPU hogs). `TypographyTests.test_normal_launch_path_is_clean`
+  left the list: its cause (catalog threads emitting into a deleted Bridge) is
+  fixed in `Bridge._deliver`; 0/30 simultaneous launches fail (was 9/30).
 - Test speed: `-Parallel` 916 s vs serial 1577 s (same 4640 tests, 2
   skipped); slowest are test_ui window tests (max 26.6 s), non-UI max 11.6 s.
 - Backlog: project-filtered jobs query; catalog test skips on a system

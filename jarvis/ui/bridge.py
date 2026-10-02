@@ -25,6 +25,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QWindow
+import shiboken6
 
 from jarvis.context_items import (
     DEFAULT_RESPONSE_MODE,
@@ -2333,10 +2334,26 @@ class Bridge(QObject):
         if self.sync:
             self._follow_models(pid, line)
         else:
-            with self._weather_lock:
-                if not self._shutting_down:
-                    self._liveLine.emit(pid, line)
+            self._deliver("_liveLine", pid, line)
         return line
+
+    def _deliver(self, signal_name: str, *args: Any) -> None:
+        """Emit the signal named ``signal_name`` from a worker thread, only into a live Bridge.
+
+        Never after ``shutdown()``, and never into a Bridge whose C++ object is
+        gone: ``shutdown()`` guards a teardown that runs it, but a Bridge
+        deleted WITHOUT it (an early return from ``main``, a launch path that
+        does not tear down) would otherwise raise "Signal source has been
+        deleted" in the probe thread. A late result is dropped here; the
+        catalog has already saved it to its own file. Nothing blocks or joins.
+        """
+        with self._weather_lock:            # the shutdown lock: after quit begins, nothing is delivered
+            if self._shutting_down or not shiboken6.isValid(self):
+                return
+            try:
+                getattr(self, signal_name).emit(*args)
+            except RuntimeError:            # deleted between the check and the emit
+                pass
 
     def _follow_models(self, pid: str, line: Any) -> None:
         """A saved choice follows its provider-declared successor (see
@@ -2394,9 +2411,7 @@ class Bridge(QObject):
         if self.sync:
             self._show_catalog()
             return
-        with self._weather_lock:            # the shutdown lock: after quit begins, nothing is delivered
-            if not self._shutting_down:
-                self._catalogDone.emit()
+        self._deliver("_catalogDone")
 
     def _show_catalog(self) -> None:
         if self._shutting_down:

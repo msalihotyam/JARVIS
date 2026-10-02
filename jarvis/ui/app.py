@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge = Bridge(Backend(), UiPreferences(), weather_key=weather_key)
     engine = create_engine(bridge, icon=icon)
     if not engine.rootObjects():
+        teardown(bridge, engine)      # the same orderly end: no late delivery into a deleted bridge
         return 1
     # Window X hides to the tray when there is one; Quit JARVIS (tray) is the
     # orderly exit, so a hidden last window must not end the process.
