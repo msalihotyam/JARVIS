@@ -9,80 +9,61 @@ Active milestone: V2.0 Projects (dogfood-capable; the official V2
 daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
-Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). IN PROGRESS:
-phase A done; phase B ran early (see Installed); rest in "Next action".
+Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). Phase A
+done; phase B ran early; rest in "Next action". Status: Gates 1–5, 6A–6D-b and
+S5 (model list, §4.25) complete on main; nothing in flight.
 
-Status: Gates 1–5 and 6A–6D-b complete on main; nothing in flight. 6D-b
-(§4.22/§4.25, Salih S1–S4 2026-09-30): reversible conversation archive →
-permanent delete (tombstone + additive `conversation_deletions`, schema 10),
-archived sections, open-conversation transition, GAP A drop, 6C re-open with
-state. Base commit: `feat(projects): archive, unarchive and permanently delete
-conversations`.
-
-Installed: `1.0.0-8fbbaef` active since 2026-09-30T11:22Z (predates
-6D-a/6D-b); previous `1.0.0-1c68161`; legacy pruned by that install. Live DB
-opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
-
-## Roles
-
-- Orchestrator: Claude; reviewer: ChatGPT (one-pass); final decisions: Salih
-  (2026-09-29). Protocol: RUNBOOK "Governance and prompt review".
+Installed: `1.0.0-8fbbaef` (predates 6D-a/6D-b/S5); previous `1.0.0-1c68161`.
+Live DB opened by 8fbbaef (project "deneme").
 
 ## Open blockers: none.
 
 ## Do not reopen
 
 - V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).
-- Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner fixed
-  (only exception 6C, Global → project, one-way, once); scope is context,
-  never authority; no `SCHEMA_VERSION` bump while schema-10 releases are
-  rollback targets (additive tables only, no ALTER).
+- Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner
+  fixed (only exception 6C, Global → project, one-way, once); scope is
+  context, never authority; no `SCHEMA_VERSION` bump while schema-10 releases
+  are rollback targets (additive tables only, no ALTER).
 - Gates 1–5 (§4.22–§4.24) incl. project archive, instructions, files.
-- Gate 6 UX (Salih 2026-09-29/30): Projects on Ctrl+6, History keeps Global;
-  mouse-first; selector lists active projects; purge by typing the row's name;
-  6C entry only in the selector menu; 6D-a switcher + rename.
+- Gate 6 UX: Projects on Ctrl+6, History keeps Global; mouse-first; selector
+  lists active projects; purge by typing the row's name; 6C entry only in the
+  selector menu; 6D-a switcher + rename.
 - 6D-b: S1 two-step archive → "Kalıcı sil", single-button honest dialog; S2
   delete only from archived / archived-project; S3 GAP B (`jarvis run/text
-  --session-id`, no project, on a deleted conversation's session) accepted
-  for V2.0, no Core change; S4 a deleted legacy import keeps
+  --session-id` on a deleted conversation's session, no project) accepted for
+  V2.0, no Core change; S4 a deleted legacy import keeps
   `~/.jarvis/conversation.json`.
+- S5: per model NAME the highest version only; selected never hidden; toggle
+  window-only, default off. Purge residue: §4.24 as is, scrubbing deferred.
+  V2.1 owns `conversation_global_memory_toggles`.
 
-## Uncommitted / external decisions
+## Decisions / external / backlog
 
-- S5 model list (Salih 2026-09-30) DONE (`newest_per_name`, §4.25; display
-  only). Evidence: full suite 4640, 2 failures (PrePolishTests gauges,
-  TypographyTests launch path; both passed alone); then targeted + whole
-  test_ui, idle machine: 338 OK (skipped=1), 584 s. Rule: per model NAME keep only the
-  highest version (Sol, Luna, Terra, Astra, Opus, Sonnet, Haiku, Fable are
-  separate names that never hide each other); unversioned/-latest, preview,
-  context variants ([1m]) and unparseable ids stay; the selected model is
-  never hidden (a move is offered); "Eski modelleri göster" toggle, default
-  off; Codex's own declared upgrades still apply first.
-- S6 (Salih 2026-09-30): Gate 6E visual polish of all 6A–6D surfaces before
-  the re-install and dogfood (incl. "Yeni Sohbet" in History/project lists).
-- Gate 7: D-1 and D-2 done; D-3 one approved live Claude call after Salih's
-  own CLI re-login; D-4 packaged -Rollback to 1c68161 and back (approvals
+- S6: Gate 6E visual polish of all 6A–6D surfaces + the model panel before
+  the re-install (incl. "Yeni Sohbet" in History/project lists).
+- Gate 7: D-1, D-2 done. D-3 one approved live Claude call after Salih's own
+  CLI re-login. D-4 packaged -Rollback to 1c68161 and back (approvals
   cleared, conversation.json backed up and restored).
-- Purge residue (Salih 2026-09-30): §4.24 as is; scrubbing copies deferred.
-  V2.1 owns `conversation_global_memory_toggles` (roadmap contract).
-- Codex review queue (Salih, Windows, standard model, one commit per
-  session): session1 remainder, Gate 5, 6A, 6B, 6C, 6D-a, 6D-b, fixes.
+- Codex review queue (Salih, one commit per session): session1 remainder,
+  Gate 5, 6A–6D-b, fixes.
 - Backlog: `build_release.ps1 -Install` exits 1 after a successful install
-  (F1: no final `exit 0`, robocopy's 1 leaks); timing flake
-  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`; suspected
-  load-sensitive (one full run, passed alone): `test_ui.PrePolishTests.
-  test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`,
-  `test_ui.TypographyTests.test_normal_launch_path_is_clean`;
-  project-filtered jobs query; catalog test skips on a system Python;
-  Gate 4B Edge retirement deferred.
+  (no final `exit 0`; robocopy's 1 leaks); timing flake
+  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`;
+  suspected load-sensitive (one full run, passed alone):
+  `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
+  and `test_ui.TypographyTests.test_normal_launch_path_is_clean`;
+  project-filtered jobs query; catalog test skips on a system Python; Gate 4B
+  Edge retirement deferred; roadmap item "Dağıtım: installer + onboarding"
+  (after V2.1).
 - Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
 
 ## Next action (in order)
 
-1. Gate 6E visual polish (S6). 2. Full suite once on the HEAD to be released
-(before the re-install). 3. Back up `releases\1.0.0-4f5a93d` (the next install
-prunes it), then re-install (Salih's go). 4. Dogfood + D-3. 5. Rollback proof
-(D-4). 6. Close.
+1. Test-speed task (parallel runner + `--durations`). 2. Gate 6E visual
+polish of all 6A–6D surfaces + model panel. 3. Full suite once on the release
+HEAD. 4. Back up `releases\1.0.0-4f5a93d` outside Apps, then re-install
+(Salih's go). 5. Dogfood (D-2/D-3). 6. Rollback (D-4). 7. V2.0 close.
 
 ## Rollback / safety anchors
 

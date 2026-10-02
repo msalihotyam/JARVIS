@@ -49,17 +49,20 @@ integrates and verifies. It is not forbidden from writing code.
 
 ## Model policy
 
-Salih decision (2026-09-30):
+Salih decisions (2026-09-30, 2026-10-02):
 
 | Model / effort | Use for |
 |---|---|
 | Sonnet 5.5, medium | Docs, test reruns |
 | Sonnet 5.5, high | Well-scoped implementation |
-| Opus 5.5, high | Design, preflight, diagnosis (default for gates) |
-| Opus 5.5, xhigh | Security-critical Core (authority / approval / attestation / scope) |
+| Opus 5.5, high | Design, preflight, diagnosis; DEFAULT for gates, including security-sensitive store/bridge/UI work backed by strong acceptance tests |
+| Opus 5.5, xhigh | Changes to Core authority / approval / attestation code, or after a high run got stuck once on the same problem |
 
-- Never below medium, never above xhigh.
-- Fable 5.1 only with Salih's explicit approval.
+- Effort floor stays medium (no low), never above xhigh.
+- Opus stuck twice on the same problem: the orchestrator PROPOSES Fable 5.1.
+  Fable 5.1 still runs only with Salih's explicit approval.
+- Read-only search / log / scan subagents may run on Sonnet 5.5; code-writing
+  and decision work stays on Opus.
 - Every prompt carries `MODEL:` / `EFFORT:` lines.
 - Orchestrator chat default effort is high. When a turn needs more (6C design,
   V2.1 memory design, verifying Codex findings, unclear root cause), the
@@ -201,9 +204,21 @@ Tests run with `python -m unittest discover -s tests` (as
   mutation probes, or self-review work.
 - Commit and STOP.
 
+**Tiers (Salih 2026-10-02) - what the frozen tree must run, once:**
+
+| Change | Required run |
+|---|---|
+| Docs / state only | No tests |
+| Tests only | The touched test modules |
+| Window layer: QML, bridge, pure helper functions (no core / contracts / memory / app / schema / authority code) | Targeted suites + the whole `test_ui` module |
+| Core / contracts / memory / store / app / schema / authority / security code | Full suite |
+| Before any release build / install | One full suite on that exact HEAD (covers every window-layer commit since the last full run) |
+
+Planned: a parallel test runner (separate task).
+
 **Full product suite:**
 
-- Run only when the task explicitly requires it.
+- Run only when the tier above requires it.
 - Run it ONCE, at the end, on the exact tree that is committed, with no
   edits after that run.
 
@@ -211,6 +226,33 @@ If a new concrete blocker or uncovered acceptance criterion appears after the
 final green run, report it instead of silently expanding the task.
 
 **Canonical stop rule: GREEN MEANS STOP.**
+
+## Standard gate order & exits
+
+Prompts reference this section instead of repeating it.
+
+**Order:** implement (smallest related tests only) -> freeze -> targeted ONCE ->
+the tier's required run ONCE on the frozen tree (sole flake exception:
+`test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`, run
+alone once; record both results) -> only if green update
+`JARVIS_ACTIVE_STATE.md` -> `git diff --check` -> commit -> report (hash, files,
+real counts, `git status --short`, pushed or not) -> STOP.
+
+**BLOCKED exits:** before any implementation edit -> ACTIVE_STATE-only commit
+`docs(state): <gate> blocked - <reason>`. Mid-implementation -> leave the work
+uncommitted, record the blocker and the exact uncommitted files in
+ACTIVE_STATE, stage only that file, same commit form. Then report and STOP.
+
+**Standing hard rules:** never touch `uv.lock`; never stage `dev/dashboard/*`;
+stage explicit paths only; no push without Salih's explicit authorization; no
+reset / restore / delete / stash of work; no live connector / model / auth /
+network calls unless authorized; tests never open the live DB;
+`python -m unittest` only (UI tests on the system Python, as
+`scripts/test.ps1`); do not start or reinstall the packaged app unless the
+step says so.
+
+**Amend:** an unpushed local commit may be amended only to complete that same
+commit; say so on the first line of the report.
 
 ## Acceptance and commit
 

@@ -158,6 +158,18 @@ V1 Context Manager, Advanced Memory yerine sayılmaz.
 
 ---
 
+## Dağıtım: installer + onboarding
+
+**Durum: ONAYLI YÖN** (Salih 2026-09-30). Zamanlama: V2.1'den sonra; kesin tasarım o milestone başında yapılır.
+
+- kullanıcı-başına (per-user) installer
+- veri depodan `%LOCALAPPDATA%`'ya taşınır, bir göç (migration) ile
+- ilk-çalıştırma sihirbazı: sağlayıcı CLI'larını (Claude, Codex/ChatGPT, Antigravity) tespit eder / kurar / oturum açtırır ve Chrome'u denetler; kendiliğinden hiçbir izin vermez (fail-closed başlangıç); sırlar Windows Credential Manager'da
+- kod imzalama (maliyet = Salih kararı)
+- imzalı güncellemeler
+
+---
+
 ## V2.2 — Skills + Experience Learning
 **Statü: KESİN**
 
