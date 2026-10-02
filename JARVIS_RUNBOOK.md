@@ -226,6 +226,11 @@ Tests run with `python -m unittest discover -s tests` (as
   full suite 1577 s serial vs 916 s parallel, identical counts.
 - Slowest tests: add `-Durations N` (either mode; serial prints them natively).
 
+**CI (Salih 2026-10-02):** a required FULL suite may be satisfied by a green
+GitHub Actions run (`scripts\ci.ps1`) on the EXACT commit (same SHA), reported
+with the run URL. The local serial runner stays the reference when results
+disagree.
+
 **Load-sensitive rerun rule D (Salih 2026-10-02; replaces the idle-machine
 requirement):** the machine is not idle. If, in a required run, the ONLY
 failures are tests on the load-sensitive list in `JARVIS_ACTIVE_STATE.md`
@@ -280,6 +285,13 @@ acceptance, and do not bundle unrelated cleanup into the acceptance commit.
 
 Never push without explicit authorization from Salih. This applies every
 time — prior authorization does not carry forward to the next push.
+
+**Standing exception (Salih 2026-10-02): `ci/*` branches.** Claude Code may
+push and force-push branches named `ci/*` (disposable test branches that run
+the suite on GitHub Actions, `.github/workflows/tests.yml`; helper
+`scripts\ci.ps1 [-Name x]`). Pushing `main` or any other branch still needs
+Salih's explicit authorization every time. The workflow runs only on `ci/**`
+pushes and manual dispatch, with read-only permissions and no secrets.
 
 ## Release (Windows package)
 

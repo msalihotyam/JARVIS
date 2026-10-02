@@ -1,0 +1,65 @@
+# The full JARVIS test suite on GitHub Actions, so Salih's machine is not loaded.
+#
+# Triggers: a push to a ci/** branch, or a manual dispatch. NEVER on main,
+# pull requests or a schedule (Salih decision 2026-10-02). ci/* branches are
+# disposable test branches (see JARVIS_RUNBOOK.md "Push"); scripts/ci.ps1
+# pushes one and waits for this run.
+#
+# No secrets, no tokens (read-only), no network calls from the tests. Every
+# third-party action is pinned to a full commit SHA.
+name: tests
+
+on:
+  push:
+    branches: ["ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      # v7.0.1. Full history: the rollback-compatibility tests extract the
+      # retained release's commit with `git archive`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+
+      # The suite needs exactly PySide6 (same version as the local system Python).
+      - name: Install PySide6
+        shell: pwsh
+        run: python -m pip install "PySide6==6.11.2"
+
+      # The parallel runner: UI modules serially in ONE worker, the rest over N
+      # workers; it applies the load-sensitive rerun rule (RUNBOOK rule D).
+      - name: Run the full suite
+        shell: pwsh
+        run: |
+          python scripts/test_parallel.py --durations 30 *> ci-summary.txt
+          $code = $LASTEXITCODE
+          Get-Content ci-summary.txt
+          exit $code
+
+      # v7.0.1
+      - name: Upload the runner summary and failing traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ci-summary
+          path: ci-summary.txt
+          if-no-files-found: warn

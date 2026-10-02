@@ -58,7 +58,8 @@ complete on main; nothing in flight. Installed: `1.0.0-8fbbaef` (predates
 - Backlog: project-filtered jobs query; catalog test skips on a system
   Python; Gate 4B Edge retirement deferred; roadmap item "Dağıtım: installer
   + onboarding" (after V2.1). F1 (`build_release.ps1` exit code) fixed.
-- Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
+- Push: `main` not authorized (ahead of `origin/main` `4f5a93d`); `ci/*`
+  branches are standing-authorized (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
 
 ## Next action (in order)
 
