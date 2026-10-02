@@ -64,6 +64,11 @@ ContextPanel {
     // row is applied as listed, so a variant it names ("[1m]": the long context) is never dropped.
     function claudeValue(m) { return m.id === "default" ? "" : m.id.indexOf("claude-") === 0 ? m.id : (m.resolved || m.id) }
     function claudeEntry(id) { var key = id || "default"; return claudeModels.filter(function(m) { return m.id === key || (id && m.resolved === id) })[0] || null }
+    // S5: only the newest version per model name is offered (display only; the lists above stay complete).
+    // ``bridge.modelLists`` names what is shown and which newer row replaces a hidden one.
+    readonly property var lists: bridge.modelLists || ({})
+    function listed(pid, id) { var l = lists[pid]; return !l || l.shown.indexOf(id) >= 0 }
+    function keeperOf(pid, id) { var l = lists[pid]; return l && id && l.hidden[id] ? l.hidden[id] : "" }
     function codexEntry(id) { return codexModels.filter(function(m) { return m.id === id })[0] || null }
     // The short display name; the canonical id never changes with it.
     function shortName(id, fallback) { return bridge.modelLabel(id || "", fallback || "") }
@@ -111,6 +116,33 @@ ContextPanel {
         Pill { objectName: parent.objectName ? parent.objectName + "Badge" : ""
                anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                text: on ? onText : offText; tint: on ? Theme.success : Theme.textMuted }
+    }
+    // "Eski modelleri göster": window-only, off at every launch.
+    component OldModelsToggle: Item {
+        objectName: "showOldModelsToggle"
+        width: parent ? parent.width : 0; height: 28
+        Accessible.role: Accessible.CheckBox; Accessible.name: label.text; Accessible.checked: bridge.showOldModels
+        Rectangle { id: box; x: 2; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
+                    color: bridge.showOldModels ? Theme.alpha(Theme.commandEdge, 0.25) : "transparent"
+                    border.width: 1; border.color: bridge.showOldModels ? Theme.commandEdge : Theme.borderStrong
+                    Text { anchors.centerIn: parent; visible: bridge.showOldModels; text: "✓"; color: Theme.commandEdge; font: Theme.caption } }
+        Text { id: label; x: box.x + box.width + 8; anchors.verticalCenter: parent.verticalCenter
+               text: qsTr("Show older models"); color: Theme.textLabel; font: Theme.caption }
+        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setShowOldModels(!bridge.showOldModels) }
+    }
+    // A selected model that has a newer version: offered, never applied on its own.
+    component NewerHint: Rectangle {
+        property string keeperTitle: ""
+        signal chosen()
+        objectName: "modelNewerHint"
+        width: parent ? parent.width : 0; height: 30; radius: Theme.radiusSmall
+        color: hintArea.containsMouse ? Theme.alpha(Theme.commandEdge, 0.12) : Theme.alpha(Theme.commandEdge, 0.05)
+        border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.4)
+        Accessible.role: Accessible.Button; Accessible.name: hintText.text
+        Text { id: hintText; objectName: "modelNewerHintText"; x: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 24
+               elide: Text.ElideRight; textFormat: Text.PlainText; color: Theme.text; font: Theme.caption
+               text: qsTr("New version: %1").arg(parent.keeperTitle) }
+        MouseArea { id: hintArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: parent.chosen() }
     }
     component Choice: Rectangle {
         id: choice
@@ -207,7 +239,7 @@ ContextPanel {
                         onChosen: { modelPanel.applyClaude("", claudeDraft.effort); claudeField.open = false }
                     }
                     Repeater {
-                        model: modelPanel.claudeModels.filter(function(m) { return m.id !== "default" })
+                        model: modelPanel.claudeModels.filter(function(m) { return m.id !== "default" && modelPanel.listed("claude", m.id) })
                         Choice {
                             objectName: "claudeModel_" + modelData.id
                             title: modelPanel.shortName(modelPanel.claudeValue(modelData), modelData.name)
@@ -221,6 +253,17 @@ ContextPanel {
                         }
                     }
                 }
+                NewerHint {
+                    readonly property string keeper: modelPanel.keeperOf("claude", claudeDraft.model)
+                    readonly property var row: modelPanel.claudeModels.filter(function(m) { return m.id === keeper })[0] || null
+                    visible: !!row; height: visible ? 30 : 0
+                    keeperTitle: row ? modelPanel.shortName(modelPanel.claudeValue(row), row.name) : ""
+                    onChosen: {
+                        var keep = claudeDraft.effort && row.efforts.indexOf(claudeDraft.effort) >= 0 ? claudeDraft.effort : ""
+                        modelPanel.applyClaude(modelPanel.claudeValue(row), keep, row.id)
+                    }
+                }
+                OldModelsToggle { }
                 Line { visible: modelPanel.claude && modelPanel.claude.status === "available" && modelPanel.claudeModels.length === 0
                        text: qsTr("The CLI did not list its models.") }
                 Caption { text: qsTr("Effort") }
@@ -304,7 +347,7 @@ ContextPanel {
                     title: bridge.codexModel ? modelPanel.shortName(bridge.codexModel, bridge.codexModel) : qsTr("No model chosen")
                     meta: bridge.codexModel ? bridge.codexModel : qsTr("Choose one of the models Codex lists")
                     Repeater {
-                        model: modelPanel.codexModels
+                        model: modelPanel.codexModels.filter(function(m) { return modelPanel.listed("codex", m.id) })
                         Choice {
                             objectName: "codexModel_" + modelData.id
                             title: modelPanel.shortName(modelData.id, modelData.name)
@@ -321,6 +364,14 @@ ContextPanel {
                         }
                     }
                 }
+                NewerHint {
+                    readonly property string keeper: modelPanel.keeperOf("codex", bridge.codexModel)
+                    readonly property var row: modelPanel.codexEntry(keeper)
+                    visible: !!row; height: visible ? 30 : 0
+                    keeperTitle: row ? modelPanel.shortName(row.id, row.name) : ""
+                    onChosen: bridge.setCodexModel(row.id, row.efforts.indexOf(bridge.codexEffort) >= 0 ? bridge.codexEffort : row.default_effort)
+                }
+                OldModelsToggle { }
                 Line { visible: !!modelPanel.codex && modelPanel.codex.status === "available" && modelPanel.codexModels.length === 0
                        text: qsTr("Codex listed no model that JARVIS can run with every tool disabled.") }
                 Line { visible: !!bridge.codexModel && !codexBlock.current && modelPanel.codexModels.length > 0

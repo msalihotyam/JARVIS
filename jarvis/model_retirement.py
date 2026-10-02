@@ -143,3 +143,74 @@ def codex_migration(selected: str, effort: str, offered: list[dict[str, Any]],
         return target, effort
     default = row.get("default_effort")
     return target, default if default in efforts else ""
+
+
+# -- The newest version per model name (display only) -------------------------
+
+_CLAUDE_FULL = re.compile(r"\Aclaude-([a-z]+(?:-[a-z]+)*)-(\d+)(?:-(\d{1,2}))?(?:-(\d{8}))?\Z")
+_CODEX_FULL = re.compile(r"\Agpt-(\d+)(?:\.(\d+))?-([a-z]+(?:-[a-z]+)*)\Z")
+
+
+def _bypass(model_id: str) -> bool:
+    """An id the rule never touches: a preview, a context variant, -latest."""
+    lowered = model_id.lower()
+    return "preview" in lowered or "[" in model_id or lowered.endswith("-latest")
+
+
+def _parse_version(provider: str, model_id: Any) -> tuple[str, tuple[int, int]] | None:
+    """``(name key, (major, minor))`` of a full model id, or ``None`` when it
+    is not one (an alias, unversioned, a variant, a preview, unparseable). A
+    date suffix is a snapshot of the same version and never part of it."""
+    if not isinstance(model_id, str) or not model_id or _bypass(model_id):
+        return None
+    if provider == "claude":
+        match = _CLAUDE_FULL.match(model_id)
+        return (match.group(1), (int(match.group(2)), int(match.group(3) or 0))) if match else None
+    if provider == "codex":
+        match = _CODEX_FULL.match(model_id)
+        return (match.group(3), (int(match.group(1)), int(match.group(2) or 0))) if match else None
+    return None
+
+
+def newest_per_name(models: Any, *, provider: str,
+                    selected: str = "") -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """``(rows to show, {hidden id: keeper id})`` - DISPLAY ONLY.
+
+    Per model NAME only the highest numeric version stays (Sol, Luna, Opus,
+    Sonnet ... are separate names). Aliases, ``-latest``/unversioned ids,
+    previews, context variants and anything unparseable always stay and never
+    hide anything. A date suffix is a snapshot: every id at the highest
+    version stays. A Claude alias is read through its catalog ``resolved``
+    id; a full id below the version an alias resolves to is hidden and the
+    ALIAS is its keeper. An alias whose ``resolved`` is missing or
+    unparseable keeps nothing hidden. The selected id is never hidden (its
+    keeper is still named). Codex's declared upgrades apply BEFORE this.
+    """
+    rows = [m for m in models or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    full: dict[str, list[tuple[tuple[int, int], str]]] = {}
+    for row in rows:
+        parsed = _parse_version(provider, row["id"])
+        if parsed:
+            full.setdefault(parsed[0], []).append((parsed[1], row["id"]))
+    aliases: dict[str, list[tuple[tuple[int, int], str]]] = {}
+    if provider == "claude":
+        for row in rows:
+            if is_claude_alias(row["id"]):
+                parsed = _parse_version(provider, row.get("resolved"))
+                if parsed:
+                    aliases.setdefault(parsed[0], []).append((parsed[1], row["id"]))
+    hidden: dict[str, str] = {}
+    for key, entries in full.items():
+        top_full = max(version for version, _ in entries)
+        top_alias = max((version for version, _ in aliases.get(key, [])), default=None)
+        if top_alias is not None and top_alias > top_full:
+            keeper = next(alias for version, alias in aliases[key] if version == top_alias)
+            ceiling = top_alias
+        else:
+            keeper = next(model_id for version, model_id in entries if version == top_full)
+            ceiling = top_full
+        for version, model_id in entries:
+            if version < ceiling:
+                hidden[model_id] = keeper
+    shown = [row for row in rows if row["id"] not in hidden or row["id"] == selected]
+    return shown, hidden

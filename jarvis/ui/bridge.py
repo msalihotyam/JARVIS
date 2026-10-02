@@ -48,7 +48,7 @@ from jarvis import project_files
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
-from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration
+from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration, newest_per_name
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, HISTORY_LIMIT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
@@ -258,6 +258,7 @@ class Bridge(QObject):
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
         self._conversation_list: list[dict] = []
         self._scope_conversations: list[dict] = []
+        self._show_old_models = False
         self._rename_notice = ""
         # Gate 6D-b: History's archived Global conversations, whether the open
         # one is itself archived (read-only) and its name, the held delete
@@ -2289,6 +2290,38 @@ class Bridge(QObject):
         """The provider lines and their REAL route state (``Backend.providers``);
         empty until the first local check has answered."""
         return [dict(provider) for provider in self._providers]
+
+    @Property(bool, notify=providersChanged)
+    def showOldModels(self) -> bool:
+        """Window-only (never written to the preferences): show every model
+        the providers listed, not just the newest version per model name."""
+        return self._show_old_models
+
+    @Slot(bool)
+    def setShowOldModels(self, show: bool) -> None:
+        if bool(show) != self._show_old_models:
+            self._show_old_models = bool(show)
+            self.providersChanged.emit()
+
+    @Property(dict, notify=providersChanged)
+    def modelLists(self) -> dict:
+        """DISPLAY ONLY (S5): per provider the ids the selector shows and
+        ``{hidden id: keeper id}`` for the older versions of a model name. The
+        cache and ``providers`` keep the full lists; nothing here routes,
+        verifies or authorizes anything."""
+        selected = {"claude": str(self._config.get("claude_model") or ""),
+                    "codex": str(self.prefs.data["chat"]["codex_model"] or "")}
+        lists: dict[str, dict] = {}
+        for provider in self._providers:
+            pid = provider.get("id")
+            if pid not in selected:
+                continue
+            models = provider.get("models") or []
+            shown, hidden = newest_per_name(models, provider=pid, selected=selected[pid])
+            if self._show_old_models:
+                shown = models
+            lists[pid] = {"shown": [m["id"] for m in shown if isinstance(m, dict) and "id" in m], "hidden": hidden}
+        return lists
 
     _catalogDone = Signal()
     _liveLine = Signal(str, object)

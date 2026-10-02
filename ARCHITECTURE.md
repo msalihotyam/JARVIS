@@ -3536,6 +3536,30 @@ kendisi karar vermez.
   Geç teslim (GAP A): bir çalıştırma zarfının bağlı konuşması yüklenemiyorsa
   (silinmiş ya da bozuk) zarf BIRAKILIR - açık konuşmaya ya da başka bir sahibe
   asla verilmez; tek iz kalıcı olmayan bir pencere notudur.
+- **Model listesi: model adı başına en yeni sürüm (S5, Salih kararı
+  2026-09-30; YALNIZ GÖSTERİM):** model paneli her model ADI (Sol, Luna, Terra,
+  Astra, Opus, Sonnet, Haiku, Fable ayrı adlardır; uzmanlık adları da ayrı
+  anahtardır) için yalnız en yüksek sayısal sürümü gösterir. Saf kural
+  `model_retirement.newest_per_name` (G/Ç yok); yalnız köprü çağırır. Takma adlar
+  (default, opus, sonnet, haiku ...), `-latest`/sürümsüz, `preview`, bağlam
+  varyantı (`[1m]`) ve ayrıştırılamayan kimlikler HER ZAMAN görünür ve hiçbir
+  şeyi gizlemez. Tam kimlikler Claude için `claude-<ad>-<major>[-<minor>][-<YYYYMMDD>]`,
+  Codex için `gpt-<major>[.<minor>]-<ad>` olarak ayrıştırılır; eksik minor 0'dır;
+  tarih eki bir anlık görüntüdür, ASLA sürüm ya da eşitlik bozucu değildir (aynı en
+  yüksek sürümün tüm tarihleri kalır). Claude takma adı, katalog satırının
+  `resolved` değerinden (aynı kuralla ayrıştırılır, sabit sürüm yok) okunur; bir
+  takma ad aynı ad anahtarının DAHA yüksek sürümüne çözülüyorsa daha düşük tam
+  kimlik gizlenir ve "tutucusu" seçilebilir takma ad satırıdır; `resolved`
+  yoksa/ayrıştırılamıyorsa o takma ad hiçbir şeyi gizlemez. Seçili model asla
+  gizlenmez (tutucusu yine adlandırılır). Codex'te kural, Codex'in kendi ilan
+  ettiği yükseltmelerden (`codex_retirement`) SONRA, değişmeden çalışır.
+  Pencere: "Eski modelleri göster" anahtarı varsayılan KAPALI, yalnız pencerede
+  tutulur (`ui-preferences.json`'a yazılmaz; her açılışta kapalı). Seçili modelin
+  daha yeni bir sürümü varsa küçük "Yeni sürüm: <ad>" ipucu çıkar; yalnız tıklamayla,
+  mevcut seçim yoluyla o satırı seçer (Claude için takma ad satırı: mevcut
+  `claude_lane` kaydı geçerlidir); asla kendiliğinden değil. Katalog önbelleği,
+  sağlayıcı satırları, yönlendirme, faturalama, doğrulama ve kayıtlı seçim göçü
+  (`_follow_*`) değişmez: önbellekteki "available" hiçbir şey vermez.
 - **Geri dönüş güvenliği:** Projects sayfası tercihlere yazılmaz; şema-10
   tercih doğrulayıcısı bilinmeyen bir sayfa değerini görmez.
 - **Tasdikli içeriğin gösterimi:** onay kartı proje talimatını ve proje

@@ -29,7 +29,7 @@ def main() -> int:
     parser.add_argument("--scene", choices=("home", "approval", "settings", "model", "nav", "edit", "focus", "running",
                                             "projects", "project", "badge", "archived",
                                             "instruction", "files", "purge", "selector", "attach", "switcher",
-                                            "archive", "delete"), default="home")
+                                            "archive", "delete", "models"), default="home")
     args = parser.parse_args()
     if args.exercise and not args.fixture:
         parser.error("--exercise requires --fixture")
@@ -69,6 +69,29 @@ def main() -> int:
         bridge.setDevSafetyScenario("approval")
     elif args.scene in ("settings", "model", "nav"):
         QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "model":"toggleModel", "nav":"toggleNav"}[args.scene])
+    elif args.scene == "models":
+        # S5: the provider lines exactly as live discovery listed them (2026-09-30),
+        # filtered to the newest version per name; an older Claude model is selected
+        # so the "New version" hint shows. Fixture store only, no CLI.
+        if not args.fixture:
+            parser.error("models scene requires --fixture")
+        efforts = ["low", "medium", "high"]
+        claude = [{"id": "default", "name": "Default", "resolved": "claude-opus-5-5", "efforts": efforts},
+                  {"id": "opus", "name": "Opus", "resolved": "claude-opus-5-5", "efforts": efforts},
+                  {"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5-5", "efforts": efforts},
+                  {"id": "haiku", "name": "Haiku", "resolved": "claude-haiku-4-5-20251001", "efforts": []}]
+        claude += [{"id": i, "name": i, "efforts": efforts} for i in (
+            "claude-fable-5-1", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7",
+            "claude-opus-4-6", "claude-sonnet-4-6")]
+        codex = [{"id": i, "name": i, "efforts": efforts, "default_effort": "medium"} for i in (
+            "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest")]
+        case.fake_providers(bridge, [
+            {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True, "models": claude},
+            {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
+             "models": codex, "retired": {}}])
+        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
+        QTimer.singleShot(300, lambda: QMetaObject.invokeMethod(window, "toggleModel"))
     elif args.scene == "edit":
         bridge.setEditMode(True)
     elif args.scene == "focus":

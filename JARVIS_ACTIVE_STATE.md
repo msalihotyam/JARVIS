@@ -28,19 +28,7 @@ opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
 - Orchestrator: Claude; reviewer: ChatGPT (one-pass); final decisions: Salih
   (2026-09-29). Protocol: RUNBOOK "Governance and prompt review".
 
-## Open blockers
-
-- Model-list gate (S5) BLOCKED at the full-suite step. Implementation and
-  tests are complete but UNCOMMITTED in the tree: `jarvis/model_retirement.py`,
-  `jarvis/ui/bridge.py`, `jarvis/ui/qml/overlays/ModelPanel.qml`,
-  `jarvis/ui/i18n/jarvis_tr-TR.ts` + `.qm`, `scripts/ui_visual.py`,
-  `ARCHITECTURE.md`, new `tests/test_model_list_newest.py`. Targeted: 52 OK
-  (17 new). Full direct suite: 4640 run, 2 failures, neither the sourced
-  RailSwitch exception: `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
-  and `test_ui.TypographyTests.test_normal_launch_path_is_clean` (QML
-  "devFixture of null" at launch). Both PASS when run alone; run took 1630 s
-  (load). Not shown to be caused by S5. Salih decides: rerun the full suite,
-  or accept these two as load flakes, then commit.
+## Open blockers: none.
 
 ## Do not reopen
 
@@ -61,7 +49,10 @@ opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
 
 ## Uncommitted / external decisions
 
-- S5 model list (Salih 2026-09-30, next gate): per model NAME keep only the
+- S5 model list (Salih 2026-09-30) DONE (`newest_per_name`, §4.25; display
+  only). Evidence: full suite 4640, 2 failures (PrePolishTests gauges,
+  TypographyTests launch path; both passed alone); then targeted + whole
+  test_ui, idle machine: 338 OK (skipped=1), 584 s. Rule: per model NAME keep only the
   highest version (Sol, Luna, Terra, Astra, Opus, Sonnet, Haiku, Fable are
   separate names that never hide each other); unversioned/-latest, preview,
   context variants ([1m]) and unparseable ids stay; the selected model is
@@ -78,16 +69,20 @@ opened by 8fbbaef at 14:48 with project "deneme". Codex CLI updated by Salih.
   session): session1 remainder, Gate 5, 6A, 6B, 6C, 6D-a, 6D-b, fixes.
 - Backlog: `build_release.ps1 -Install` exits 1 after a successful install
   (F1: no final `exit 0`, robocopy's 1 leaks); timing flake
-  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`;
+  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`; suspected
+  load-sensitive (one full run, passed alone): `test_ui.PrePolishTests.
+  test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`,
+  `test_ui.TypographyTests.test_normal_launch_path_is_clean`;
   project-filtered jobs query; catalog test skips on a system Python;
   Gate 4B Edge retirement deferred.
 - Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
 
 ## Next action (in order)
 
-1. Model-list gate (S5). 2. Gate 6E visual polish (S6). 3. Back up
-`releases\1.0.0-4f5a93d` (the next install prunes it), then re-install
-(Salih's go). 4. Dogfood + D-3. 5. Rollback proof (D-4). 6. Close.
+1. Gate 6E visual polish (S6). 2. Full suite once on the HEAD to be released
+(before the re-install). 3. Back up `releases\1.0.0-4f5a93d` (the next install
+prunes it), then re-install (Salih's go). 4. Dogfood + D-3. 5. Rollback proof
+(D-4). 6. Close.
 
 ## Rollback / safety anchors
 

@@ -1942,6 +1942,14 @@ yok</translation>
         <translation>Sağlayıcı</translation>
     </message>
     <message>
+        <source>Show older models</source>
+        <translation>Eski modelleri göster</translation>
+    </message>
+    <message>
+        <source>New version: %1</source>
+        <translation>Yeni sürüm: %1</translation>
+    </message>
+    <message>
         <source>Model</source>
         <translation>Model</translation>
     </message>
