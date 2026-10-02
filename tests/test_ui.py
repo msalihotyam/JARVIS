@@ -6766,15 +6766,25 @@ class PrePolishTests(SurfaceCase):
                 self.assertTrue(0 <= sample[key] <= 100)
         bridge = self.bridge()
         root = self.window(bridge)
+        def settle(condition, timeout=10.0):
+            """Turn the loop until the asserted condition holds (bounded), not for a fixed time."""
+            deadline = time.monotonic() + timeout
+            while not condition() and time.monotonic() < deadline:
+                pump(20)
+
         bridge._telemetry = {"available": True, "cpu": 43, "ram": 67, "disk": 89}
-        bridge.telemetryChanged.emit(); pump(200)
+        bridge.telemetryChanged.emit()
+        settle(lambda: self.item(root, "systemGauges").isVisible()
+               and abs(self.item(root, "gaugeCpu").property("ratio") - 0.43) < 0.001)
         self.assertTrue(self.item(root, "systemGauges").isVisible())
         self.assertEqual(("43%", "67%", "89%"), tuple(self.item(root, n).property("value") for n in ("gaugeCpu", "gaugeRam", "gaugeDisk")))
         self.assertAlmostEqual(0.43, self.item(root, "gaugeCpu").property("ratio"), places=3)
         self.assertEqual("This machine, now", self.item(root, "systemNote").property("text"))
         # Nothing readable: no ring, no note, no dash - the metadata takes the width.
         bridge._telemetry = {"available": False}
-        bridge.telemetryChanged.emit(); pump(200)
+        bridge.telemetryChanged.emit()
+        settle(lambda: not self.item(root, "systemGauges").isVisible() and not self.item(root, "systemNote").isVisible()
+               and self.item(root, "systemMetadata").x() == 0)
         self.assertFalse(self.item(root, "systemGauges").isVisible())
         self.assertFalse(self.item(root, "systemNote").isVisible())
         self.assertEqual(0, self.item(root, "systemMetadata").x())
@@ -7120,15 +7130,48 @@ class RailSwitchTests(SurfaceCase):
         centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, centre)
 
-    def frames(self, root, ms):
-        """(open, key, surface opacity) every ~10 ms for ``ms``."""
+    def watch(self, root):
+        """(open, key, surface opacity) at EVERY change of the surface's opacity,
+        of its open state and of the content key, from now on.
+
+        Event-driven, not sampled on a timer: a loaded machine that stalls the
+        loop between two polls can no longer hide the moment the content is
+        swapped. The key is the content the surface is showing, open or
+        closing. Returns the live list and a function that stops recording."""
+        from PySide6.QtCore import QObject, Slot
         surface = self.item(root, "summaryPeek")
-        seen, deadline = [], time.monotonic() + ms / 1000
-        while time.monotonic() < deadline:
+        holder = surface.parentItem()
+
+        def now():
+            return (root.property("peekOpen"), holder.property("key"), round(surface.property("opacity"), 3))
+        seen = []
+
+        class Receiver(QObject):
+            @Slot()
+            def changed(self):
+                seen.append(now())
+        receiver = Receiver()
+        links = []
+        for sender, name in ((root, "peekOpen"), (holder, "key")):         # QML properties: via their notify signals
+            meta = sender.metaObject()
+            signal = meta.property(meta.indexOfProperty(name)).notifySignal()
+            slot = receiver.metaObject().method(receiver.metaObject().indexOfSlot("changed()"))
+            links.append(QObject.connect(sender, signal, receiver, slot))
+        record = lambda: seen.append(now())
+        surface.opacityChanged.connect(record)
+
+        def stop():
+            surface.opacityChanged.disconnect(record)
+            for link in links:
+                QObject.disconnect(link)
+            receiver.deleteLater()         # alive (and connected) until here
+        return seen, stop
+
+    def settle(self, seen, final, timeout=10.0):
+        """Turn the loop until the transition has reached ``final`` (bounded)."""
+        deadline = time.monotonic() + timeout
+        while (not seen or seen[-1] != final) and time.monotonic() < deadline:
             pump(10)
-            # The key of the content the surface is showing, open or closing.
-            seen.append((root.property("peekOpen"), surface.parentItem().property("key"), round(surface.property("opacity"), 3)))
-        return seen
 
     def active(self, root):
         return [k for k in ("Tasks", "Updates", "Focus", "Plan") if self.item(root, "rail" + k).property("active")]
@@ -7141,9 +7184,11 @@ class RailSwitchTests(SurfaceCase):
         self.press(root, "railTasks")
         pump(400)
         self.assertEqual((True, "Tasks"), (root.property("peekOpen"), root.property("peekKey")))
+        frames, stop = self.watch(root)
         self.press(root, "railUpdates")
         self.assertEqual(["Updates"], self.active(root))                          # the pick shows at once
-        frames = self.frames(root, 600)
+        self.settle(frames, (True, "Updates", 1.0))
+        stop()
         # A leaves first: its own content fades out, still A's.
         closing = [f for f in frames if f[1] == "Tasks"]
         self.assertTrue(closing and min(f[2] for f in closing) < 0.2, frames[:12])

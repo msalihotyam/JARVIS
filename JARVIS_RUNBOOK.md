@@ -214,7 +214,24 @@ Tests run with `python -m unittest discover -s tests` (as
 | Core / contracts / memory / store / app / schema / authority / security code | Full suite |
 | Before any release build / install | One full suite on that exact HEAD (covers every window-layer commit since the last full run) |
 
-Planned: a parallel test runner (separate task).
+**How to run (Salih 2026-10-02):**
+
+- Serial, the REFERENCE when a result is disputed: `scripts\test.ps1`
+  (`python -m unittest discover -s tests`).
+- Parallel, same tests in several processes: `scripts\test.ps1 -Parallel
+  [-Workers N]` (or `python scripts\test_parallel.py [modules]`). UI modules
+  (anything importing PySide6 / `jarvis.ui`) run serially in ONE worker; the
+  rest are spread over N workers (default `min(cpu_count - 1, 6)`), each with
+  its own TEMP. One combined summary; non-zero exit on any failure. Measured:
+  full suite 1577 s serial vs 916 s parallel, identical counts.
+- Slowest tests: add `-Durations N` (either mode; serial prints them natively).
+
+**Load-sensitive rerun rule D (Salih 2026-10-02; replaces the idle-machine
+requirement):** the machine is not idle. If, in a required run, the ONLY
+failures are tests on the load-sensitive list in `JARVIS_ACTIVE_STATE.md`
+(only the orchestrator adds to it), each is rerun ALONE once; if all pass the
+run counts as green and both results are recorded. Any other failure blocks.
+The parallel runner applies this itself.
 
 **Full product suite:**
 
@@ -232,9 +249,9 @@ final green run, report it instead of silently expanding the task.
 Prompts reference this section instead of repeating it.
 
 **Order:** implement (smallest related tests only) -> freeze -> targeted ONCE ->
-the tier's required run ONCE on the frozen tree (sole flake exception:
-`test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`, run
-alone once; record both results) -> only if green update
+the tier's required run ONCE on the frozen tree (load-sensitive rerun rule D,
+see "Testing discipline": only listed tests failing -> each rerun alone once;
+record both results) -> only if green update
 `JARVIS_ACTIVE_STATE.md` -> `git diff --check` -> commit -> report (hash, files,
 real counts, `git status --short`, pushed or not) -> STOP.
 

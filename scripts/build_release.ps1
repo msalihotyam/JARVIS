@@ -100,3 +100,7 @@ try {
 } finally {
     Pop-Location
 }
+
+# Every failure path above exits non-zero explicitly; reaching here means success.
+# A native command's leftover $LASTEXITCODE (robocopy's 1 = files copied) must not leak.
+exit 0

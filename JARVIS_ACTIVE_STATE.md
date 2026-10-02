@@ -9,12 +9,10 @@ Active milestone: V2.0 Projects (dogfood-capable; the official V2
 daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "V2.0 — Projects" + "Salih kararları — V2.0 Gate 6".
 
-Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback). Phase A
-done; phase B ran early; rest in "Next action". Status: Gates 1–5, 6A–6D-b and
-S5 (model list, §4.25) complete on main; nothing in flight.
-
-Installed: `1.0.0-8fbbaef` (predates 6D-a/6D-b/S5); previous `1.0.0-1c68161`.
-Live DB opened by 8fbbaef (project "deneme").
+Active gate: Projects Gate 7 (E2E + packaged dogfood + rollback); phase A
+done, phase B ran early. Gates 1–5, 6A–6D-b and S5 (model list, §4.25) are
+complete on main; nothing in flight. Installed: `1.0.0-8fbbaef` (predates
+6D-a/6D-b/S5); previous `1.0.0-1c68161`; live DB opened by 8fbbaef.
 
 ## Open blockers: none.
 
@@ -44,26 +42,30 @@ Live DB opened by 8fbbaef (project "deneme").
   the re-install (incl. "Yeni Sohbet" in History/project lists).
 - Gate 7: D-1, D-2 done. D-3 one approved live Claude call after Salih's own
   CLI re-login. D-4 packaged -Rollback to 1c68161 and back (approvals
-  cleared, conversation.json backed up and restored).
-- Codex review queue (Salih, one commit per session): session1 remainder,
-  Gate 5, 6A–6D-b, fixes.
-- Backlog: `build_release.ps1 -Install` exits 1 after a successful install
-  (no final `exit 0`; robocopy's 1 leaks); timing flake
-  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`;
-  suspected load-sensitive (one full run, passed alone):
+  cleared, conversation.json backed up and restored). Codex review queue
+  (one commit per session): session1 remainder, Gate 5, 6A–6D-b, fixes.
+- Load-sensitive list (RUNBOOK rule D; only the orchestrator edits):
+  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b` and
   `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
-  and `test_ui.TypographyTests.test_normal_launch_path_is_clean`;
-  project-filtered jobs query; catalog test skips on a system Python; Gate 4B
-  Edge retirement deferred; roadmap item "Dağıtım: installer + onboarding"
-  (after V2.1).
+  (both hardened, stable under 14 CPU hogs) and
+  `test_ui.TypographyTests.test_normal_launch_path_is_clean`.
+- PRODUCT DEFECT (unfixed; launch-path test left as is): `Bridge._catalog_changed`
+  emits `_catalogDone` from `jarvis-catalog-*` threads after the Bridge is
+  deleted at shutdown -> "Signal source has been deleted" traceback (9/30
+  launches under load, exit 0). Needs a shutdown guard/join in the bridge.
+- Test speed: `-Parallel` 916 s vs serial 1577 s (same 4640 tests, 2
+  skipped); slowest are test_ui window tests (max 26.6 s), non-UI max 11.6 s.
+- Backlog: project-filtered jobs query; catalog test skips on a system
+  Python; Gate 4B Edge retirement deferred; roadmap item "Dağıtım: installer
+  + onboarding" (after V2.1). F1 (`build_release.ps1` exit code) fixed.
 - Push: not authorized; main is ahead of `origin/main` (`4f5a93d`).
 
 ## Next action (in order)
 
-1. Test-speed task (parallel runner + `--durations`). 2. Gate 6E visual
-polish of all 6A–6D surfaces + model panel. 3. Full suite once on the release
-HEAD. 4. Back up `releases\1.0.0-4f5a93d` outside Apps, then re-install
-(Salih's go). 5. Dogfood (D-2/D-3). 6. Rollback (D-4). 7. V2.0 close.
+1. Gate 6E visual polish (6A–6D + model panel). 2. Full suite once on the
+release HEAD (`-Parallel` ok). 3. Back up `releases\1.0.0-4f5a93d` outside
+Apps, re-install (Salih's go). 4. Dogfood (D-2/D-3). 5. Rollback (D-4). 6.
+V2.0 close.
 
 ## Rollback / safety anchors
 
