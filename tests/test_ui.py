@@ -2145,14 +2145,37 @@ class ReactorStateTests(UiTestCase):
         root = self.window(bridge)
         root.resize(1920, 1080); pump(2800)
         core = self.item(root, "jarvisCore")
+        names = ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual")
+
+        def settle(condition, timeout=10.0):
+            """Turn the loop until the asserted condition holds (bounded), not for a fixed time."""
+            deadline = time.monotonic() + timeout
+            while not condition() and time.monotonic() < deadline:
+                pump(20)
+
+        # (circulation, nucleus) at EVERY change of circulation - event-driven,
+        # so a starved loop cannot hide the moment circulation went out.
+        from PySide6.QtCore import QObject, Slot
+        drained = []
+
+        class Receiver(QObject):
+            @Slot()
+            def changed(self):
+                drained.append((core.property("circulation"), core.property("nucleus")))
+        receiver = Receiver()
+        meta = core.metaObject()
+        link = QObject.connect(core, meta.property(meta.indexOfProperty("circulation")).notifySignal(), receiver,
+                               receiver.metaObject().method(receiver.metaObject().indexOfSlot("changed()")))
         # OFF is real at 0 ms; the 720 ms confirmation drains circulation,
         # ring, nucleus, then the last emission.
         bridge.setExecutionEnabled(False)
         self.assertEqual("disabled", bridge.coreState); self.assertFalse(bridge.executionEnabled)
-        pump(250)
-        self.assertEqual(0, core.property("circulation")); self.assertGreater(core.property("nucleus"), 0.9)
-        pump(700)
-        for name in ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual"):
+        settle(lambda: bool(drained) and drained[-1][0] == 0)
+        QObject.disconnect(link)
+        self.assertEqual(0, drained[-1][0])
+        self.assertGreater(drained[-1][1], 0.9)                       # circulation first: the nucleus still lit
+        settle(lambda: all(core.property(name) == 0 for name in names))
+        for name in names:
             self.assertEqual(0, core.property(name), name)
         self.assertTrue(core.property("booted"))
         # Nothing semantic while dormant, and no pulse of any kind.
@@ -2164,11 +2187,12 @@ class ReactorStateTests(UiTestCase):
         self.assertEqual("idle", bridge.coreState)
         pump(500)
         self.assertGreater(core.property("bootFocus"), 0.5); self.assertLess(core.property("spin"), 1)
-        pump(2300)
-        for name in ("spin", "spin2", "circulation", "ringEnergy", "nucleus", "residual"):
+        settle(lambda: all(core.property(name) == 1 for name in names) and core.property("booted"))
+        for name in names:
             self.assertEqual(1, core.property(name), name)
         self.assertTrue(core.property("booted"))
-        # Rapid toggles cancel obsolete transitions instead of queuing them.
+        # Rapid toggles cancel obsolete transitions instead of queuing them
+        # (fixed budgets on purpose: a queue would still be running here).
         bridge.setExecutionEnabled(False); pump(120); bridge.setExecutionEnabled(True); pump(2800)
         for name in ("spin", "circulation", "ringEnergy", "nucleus", "residual"):
             self.assertEqual(1, core.property(name), name)
@@ -7964,17 +7988,45 @@ class ProductionIsolationTests(UiTestCase):
     and keeps it true: a representative session must never touch the real
     per-user store or the real memory_database, no matter what it does."""
 
-    def real_state_files(self) -> dict[Path, str]:
+    STORE_FILES = ("config.json", "ui-preferences.json", "conversation.json", "provider-catalog.json",
+                   "weather-location.json")
+
+    def sentinel_home(self) -> Path:
+        """The per-user store at the product's DEFAULT location, populated with
+        sentinels in a home of its own (HOME / USERPROFILE redirected), so the
+        tripwire always guards real files - on a clean machine too - and the
+        default-path functions are proven to point at what is guarded."""
+        from unittest import mock
+        from jarvis.settings import default_config_path
+        from jarvis.ui.preferences import default_preferences_path
+        home = self.root / "sentinel-home"
+        store = home / ".jarvis"
+        store.mkdir(parents=True)
+        for name in self.STORE_FILES:
+            (store / name).write_text(json.dumps({"sentinel": name}), encoding="utf-8")
+        redirect = mock.patch.dict(os.environ, {"USERPROFILE": str(home), "HOME": str(home)})
+        redirect.start()
+        self.addCleanup(redirect.stop)
+        self.assertEqual((store / "config.json", store / "ui-preferences.json"),
+                         (default_config_path(), default_preferences_path()))
+        return store
+
+    def real_state_files(self, stores: tuple[Path, ...]) -> dict[Path, str]:
+        """Every file in the guarded stores (the sentinel one always has
+        files; the operator's real one where it exists) and the code-default
+        database if it exists. A new file counts as a change."""
         import hashlib
-        candidates = list((Path.home() / ".jarvis").glob("*.json"))
+        candidates = [p for store in stores for p in store.glob("*") if p.is_file()]
         real_db = Path(__file__).resolve().parents[1] / "data" / "jarvis.db"
         if real_db.exists():
             candidates.append(real_db)
-        self.assertTrue(candidates, "no real production files found - sentinel paths need updating")
+        self.assertGreaterEqual(len(candidates), len(self.STORE_FILES), "the sentinel store was not guarded")
         return {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in candidates}
 
     def test_a_full_chat_and_memory_session_never_writes_the_real_store(self) -> None:
-        before = self.real_state_files()
+        operator_store = Path.home() / ".jarvis"                     # before the redirect
+        stores = (self.sentinel_home(), *((operator_store,) if operator_store.is_dir() else ()))
+        before = self.real_state_files(stores)
 
         bridge = self.bridge(proposal(kind="chat", reply="Sabit yanıt."))
         self.load(bridge)
@@ -7990,7 +8042,7 @@ class ProductionIsolationTests(UiTestCase):
         bridge.refreshHistory()
         pump(300)
 
-        after = self.real_state_files()
+        after = self.real_state_files(stores)
         self.assertEqual(before, after, "a UI test flow modified the real per-user JARVIS store")
         self.assertGreater(len(bridge._conversation_store.state.turns), 0)          # it really did write - just isolated
         self.assertNotEqual(self.database, Path.home() / ".jarvis")
