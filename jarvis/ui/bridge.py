@@ -524,8 +524,9 @@ class Bridge(QObject):
                             (type(exc).__name__,)), "error")
                 return PersistedConversation(None, None)
         if opened.state.turns:
-            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (%1 turns)"),
-                        (len(opened.state.turns),)), "system")
+            count = len(opened.state.turns)
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (1 turn)") if count == 1
+                        else QT_TRANSLATE_NOOP("Bridge", "Continuing the previous conversation (%1 turns)"), (count,)), "system")
         self._restore_feed(opened.state)
         return opened
 
@@ -578,7 +579,7 @@ class Bridge(QObject):
     def _listed_title(record: Any) -> Any:
         return record.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
                                 if record.origin == "legacy-import"
-                                else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()))
+                                else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"), ()))
 
     def _refresh_conversations(self) -> None:
         store = self._conversation_db()
@@ -751,8 +752,9 @@ class Bridge(QObject):
         if opened is None:
             return False
         self._activate(opened)
-        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"),
-                    (len(opened.state.turns),)), "system")
+        count = len(opened.state.turns)
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (1 turn)") if count == 1
+                    else QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"), (count,)), "system")
         return True
 
     # -- projects (Gate 6A): the window's view of the Gate 1-5 project model --
@@ -850,7 +852,7 @@ class Bridge(QObject):
             records = []
         rows_of = [
             {"id": r.id, "updated_at": r.updated_at, "archived_at": r.archived_at,
-             "title": r.title or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"))}
+             "title": r.title or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"))}
             for r in records
         ]
         self._project_conversations = [row for row in rows_of if row["archived_at"] is None]

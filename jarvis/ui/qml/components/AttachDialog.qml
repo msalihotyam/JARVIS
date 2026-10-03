@@ -89,8 +89,9 @@ Popup {
             visible: dialog.shown
             width: parent.width; spacing: 8
             Line { objectName: "attachIdentity"; font: Theme.pageRowStrong
-                   text: qsTr("\"%1\" · %2 turns · created %3").arg(dialog.preview.title || qsTr("New conversation"))
-                         .arg(dialog.preview.turns || 0).arg(dialog.when(dialog.preview.created_at)) }
+                   text: qsTr("\"%1\" · %2 · created %3").arg(dialog.preview.title || qsTr("New Chat"))
+                         .arg(dialog.preview.turns === 1 ? qsTr("1 turn") : qsTr("%1 turns").arg(dialog.preview.turns || 0))
+                         .arg(dialog.when(dialog.preview.created_at)) }
             Line { objectName: "attachTarget"
                    text: dialog.target.new ? qsTr("Target: new project: %1").arg(dialog.target.name || "")
                                            : qsTr("Target: %1").arg(dialog.target.name || "") }

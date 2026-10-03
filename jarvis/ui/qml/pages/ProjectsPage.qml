@@ -104,7 +104,7 @@ SecondaryPage {
                     Text { visible: page.active.length === 0; text: qsTr("No active project yet."); color: Theme.textMuted; font: Theme.pageMeta }
                     Repeater { model: page.active; ProjectRow { project: modelData } }
                     Item { width: 1; height: 8; visible: page.archived.length > 0 }
-                    Text { objectName: "projectsArchivedHeading"; visible: page.archived.length > 0; text: qsTr("ARCHIVED"); color: Theme.textLabel; font: Theme.pageSection }
+                    Text { objectName: "projectsArchivedHeading"; visible: page.archived.length > 0; text: qsTr("ARCHIVED PROJECTS"); color: Theme.textLabel; font: Theme.pageSection }
                     Repeater { model: page.archived; ProjectRow { project: modelData } }
                 }
             }
@@ -196,7 +196,7 @@ SecondaryPage {
                         // Gate 6D-b: the project's archived conversations. A row opens
                         // read-only; unarchiving waits for the project's own unarchive.
                         Text { objectName: "projectArchivedConversationsHeading"; visible: archivedConversationList.count > 0
-                               text: qsTr("ARCHIVED"); color: Theme.textLabel; font: Theme.pageSection }
+                               text: qsTr("ARCHIVED CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
                         Text { objectName: "projectConversationNotice"; visible: text !== "" && !deleteDialog.visible; width: parent.width
                                wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.pageMeta }
                         ListView {

@@ -36,8 +36,9 @@ Popup {
         spacing: 10
         Text { objectName: "deleteTitle"; text: qsTr("Delete this conversation permanently?"); color: Theme.text; font: Theme.uiValue }
         Line { objectName: "deleteIdentity"; visible: dialog.shown; font: Theme.pageRowStrong
-               text: qsTr("«%1» · %2 messages · created %3 · last changed %4 · %5")
-                     .arg(dialog.preview.title || qsTr("New Chat")).arg(dialog.preview.turns || 0)
+               text: qsTr("«%1» · %2 · created %3 · last changed %4 · %5")
+                     .arg(dialog.preview.title || qsTr("New Chat"))
+                     .arg(dialog.preview.turns === 1 ? qsTr("1 message") : qsTr("%1 messages").arg(dialog.preview.turns || 0))
                      .arg(dialog.when(dialog.preview.created_at)).arg(dialog.when(dialog.preview.updated_at))
                      .arg(dialog.preview.owner ? dialog.preview.owner.name : qsTr("Global")) }
         Line { objectName: "deleteNotice"; visible: text !== ""; text: bridge.conversationNotice; color: Theme.warning }

@@ -183,12 +183,20 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yeni proje adı</translation>
     </message>
     <message>
-        <source>&quot;%1&quot; · %2 turns · created %3</source>
-        <translation>&quot;%1&quot; · %2 mesaj · oluşturuldu %3</translation>
+        <source>&quot;%1&quot; · %2 · created %3</source>
+        <translation>&quot;%1&quot; · %2 · oluşturuldu %3</translation>
     </message>
     <message>
-        <source>New conversation</source>
-        <translation>Yeni sohbet</translation>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>1 turn</source>
+        <translation>1 mesaj</translation>
+    </message>
+    <message>
+        <source>%1 turns</source>
+        <translation>%1 mesaj</translation>
     </message>
     <message>
         <source>Target: new project: %1</source>
@@ -412,43 +420,51 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>The conversation could not be saved: %1</source>
-        <translation>Konuşma kaydedilemedi: %1</translation>
+        <translation>Sohbet kaydedilemedi: %1</translation>
     </message>
     <message>
         <source>The conversation store is unavailable, so this window&apos;s conversation will not be saved.</source>
-        <translation>Konuşma deposu kullanılamıyor; bu penceredeki konuşma kaydedilmeyecek.</translation>
+        <translation>Sohbet deposu kullanılamıyor; bu penceredeki sohbet kaydedilmeyecek.</translation>
     </message>
     <message>
         <source>Recovered the conversation saved by the previous version</source>
-        <translation>Önceki sürümün kaydettiği konuşma geri yüklendi</translation>
+        <translation>Önceki sürümün kaydettiği sohbet geri yüklendi</translation>
     </message>
     <message>
         <source>The previous version&apos;s conversation could not be read, so it was left untouched and not used: %1</source>
-        <translation>Önceki sürümün konuşması okunamadı; olduğu gibi bırakıldı ve kullanılmadı: %1</translation>
+        <translation>Önceki sürümün sohbeti okunamadı; olduğu gibi bırakıldı ve kullanılmadı: %1</translation>
     </message>
     <message>
         <source>The previous version&apos;s conversation could not be recovered: %1</source>
-        <translation>Önceki sürümün konuşması geri yüklenemedi: %1</translation>
+        <translation>Önceki sürümün sohbeti geri yüklenemedi: %1</translation>
     </message>
     <message>
         <source>A new conversation could not be created: %1</source>
-        <translation>Yeni konuşma oluşturulamadı: %1</translation>
+        <translation>Yeni sohbet oluşturulamadı: %1</translation>
     </message>
     <message>
         <source>A saved conversation could not be read, so it was not opened and nothing from it is used: %1</source>
-        <translation>Kayıtlı bir konuşma okunamadı; açılmadı ve içeriğinden hiçbir şey kullanılmıyor: %1</translation>
+        <translation>Kayıtlı bir sohbet okunamadı; açılmadı ve içeriğinden hiçbir şey kullanılmıyor: %1</translation>
     </message>
     <message>
         <source>Previous conversation</source>
-        <translation>Önceki konuşma</translation>
+        <translation>Önceki sohbet</translation>
     </message>
     <message>
         <source>New conversation</source>
-        <translation>Yeni konuşma</translation>
+        <translation>Yeni sohbet</translation>
     </message>
     <message>
         <source>Wait for the current run to finish.</source>
         <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>Continuing the previous conversation (1 turn)</source>
+        <translation>Önceki sohbet sürdürülüyor (1 mesaj)</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
     </message>
     <message>
         <source>This conversation is not saved yet.</source>
@@ -459,8 +475,12 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bir ad yazın; eski ad korunur.</translation>
     </message>
     <message>
+        <source>Opened a conversation (1 turn)</source>
+        <translation>Bir sohbet açıldı (1 mesaj)</translation>
+    </message>
+    <message>
         <source>Opened a conversation (%1 turns)</source>
-        <translation>Bir konuşma açıldı (%1 tur)</translation>
+        <translation>Bir sohbet açıldı (%1 mesaj)</translation>
     </message>
     <message>
         <source>Global</source>
@@ -488,7 +508,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>A reply for another conversation was saved there</source>
-        <translation>Başka bir konuşmaya ait yanıt o konuşmaya kaydedildi</translation>
+        <translation>Başka bir sohbete ait yanıt o sohbete kaydedildi</translation>
     </message>
     <message>
         <source>Approval required: %1 -&gt; %2</source>
@@ -665,7 +685,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>Continuing the previous conversation (%1 turns)</source>
-        <translation>Önceki konuşma sürdürülüyor (%1 tur)</translation>
+        <translation>Önceki sohbet sürdürülüyor (%1 mesaj)</translation>
     </message>
     <message>
         <source>JARVIS resumed</source>
@@ -835,7 +855,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>New conversation</source>
-        <translation>Yeni konuşma</translation>
+        <translation>Yeni sohbet</translation>
     </message>
     <message>
         <source>Open Command Center</source>
@@ -1089,7 +1109,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it.</source>
-        <translation>Salt okunur: bu konuşma arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.</translation>
+        <translation>Salt okunur: bu sohbet arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.</translation>
     </message>
     <message>
         <source>Permission mode: %1</source>
@@ -1244,12 +1264,20 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bu sohbet kalıcı olarak silinsin mi?</translation>
     </message>
     <message>
-        <source>«%1» · %2 messages · created %3 · last changed %4 · %5</source>
-        <translation>«%1» · %2 mesaj · oluşturma %3 · son değişiklik %4 · %5</translation>
+        <source>«%1» · %2 · created %3 · last changed %4 · %5</source>
+        <translation>«%1» · %2 · oluşturma %3 · son değişiklik %4 · %5</translation>
     </message>
     <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>1 message</source>
+        <translation>1 mesaj</translation>
+    </message>
+    <message>
+        <source>%1 messages</source>
+        <translation>%1 mesaj</translation>
     </message>
     <message>
         <source>Global</source>
@@ -1441,11 +1469,11 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>CONVERSATIONS</source>
-        <translation>KONUŞMALAR</translation>
+        <translation>SOHBETLER</translation>
     </message>
     <message>
         <source>New conversation</source>
-        <translation>Yeni konuşma</translation>
+        <translation>Yeni sohbet</translation>
     </message>
     <message>
         <source>open</source>
@@ -1486,6 +1514,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>UNREADABLE</source>
         <translation>OKUNAMADI</translation>
+    </message>
+    <message>
+        <source>1 task</source>
+        <translation>1 görev</translation>
     </message>
 </context>
 <context>
@@ -2838,16 +2870,16 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Henüz etkin proje yok.</translation>
     </message>
     <message>
-        <source>ARCHIVED</source>
-        <translation>ARŞİVLENMİŞ</translation>
+        <source>ARCHIVED PROJECTS</source>
+        <translation>ARŞİVLENMİŞ PROJELER</translation>
     </message>
     <message>
         <source>Choose a project to see its conversations.</source>
-        <translation>Konuşmalarını görmek için bir proje seçin.</translation>
+        <translation>Sohbetlerini görmek için bir proje seçin.</translation>
     </message>
     <message>
         <source>Archived: this project is read-only. Its conversations are kept and can be read, but nothing new runs in it until you unarchive it.</source>
-        <translation>Arşivlendi: bu proje salt okunur. Konuşmaları saklanır ve okunabilir, ama arşivden çıkarana kadar bu projede yeni bir iş çalışmaz.</translation>
+        <translation>Arşivlendi: bu proje salt okunur. Sohbetleri saklanır ve okunabilir, ama arşivden çıkarana kadar bu projede yeni bir iş çalışmaz.</translation>
     </message>
     <message>
         <source>New name</source>
@@ -2875,11 +2907,11 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>CONVERSATIONS</source>
-        <translation>KONUŞMALAR</translation>
+        <translation>SOHBETLER</translation>
     </message>
     <message>
         <source>New conversation in %1</source>
-        <translation>%1 içinde yeni konuşma</translation>
+        <translation>%1 içinde yeni sohbet</translation>
     </message>
     <message>
         <source>open</source>
@@ -2891,7 +2923,11 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>No conversation in this project yet.</source>
-        <translation>Bu projede henüz konuşma yok.</translation>
+        <translation>Bu projede henüz sohbet yok.</translation>
+    </message>
+    <message>
+        <source>ARCHIVED CONVERSATIONS</source>
+        <translation>ARŞİVLENMİŞ SOHBETLER</translation>
     </message>
     <message>
         <source>archived %1</source>

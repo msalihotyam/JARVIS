@@ -961,6 +961,12 @@ JARVIS deterministic Core authority/security modelinin yerine Hermes yaklaşım�
 - **Purge kalıntısı (2026-09-30):** V2.0'da purge ARCHITECTURE §4.24'te uygulandığı gibi kalır: kanonik project-dosya deposu temizlenir; ona ulaşmayan uygulama düzeyi kopyalar (`pending_approvals` içindeki onay önizlemesi + `approval_requested` audit payload'ı, model yanıtları/sonuç snapshot'ları, konuşma geçmişi, sağlayıcılara zaten gönderilmiş içerik, WAL/yedekler) kalır ve purge diyaloğunda dürüstçe belirtilir. Bu karar Gate 7'yi bloklamaz.
 - **Ertelenen (V2.0 gate'i değil):** purge'ün yukarıdaki uygulama düzeyi kopyaları da temizlemesi — ayrı, sonraki bir tasarım (audit append-only bütünlüğüne dokunur).
 
+### Salih kararları — V2.0 Gate 6E görsel cila (2026-10-03)
+- **Q5:** liste satırı ekleme/silme anlık kalır (satır animasyonu ve ListModel diff adaptörü yok).
+- **Q6:** Projects yeniden adlandırma alanı yalnız "Yeniden adlandır"a basılınca görünür.
+- **Q1–Q4 ve Q7–Q9:** preflight'ın önerdiği gibi kabul edildi (Q1 başlıksız sohbet adı için ayrı "New Chat" kaynağı; Q2 canlı dil değişiminde Bridge etiketlerinin yenilenmesi, ayrı commit C7; Q3 etkinlik notlarında çoğul düzeltmesi ve tr "mesaj"; Q4 6A–6D yüzeylerinde "sohbet"; Q7 klavye yolu; Q8 tr efor etiketleri; Q9 History arşiv bölümü kapalı başlamaz).
+- **Dilimler:** C1 metin/çoğul/katalog, C2 token ve ortak parçalar, C3 üst çubuk kapsam grubu, C4 diyaloglar, C5 History + Projects listeleri, C6 model paneli, C7 canlı dil yenileme. Plan: `build/6e/PREFLIGHT.txt` (COMMIT SLICING).
+
 ---
 
 # 4. MASTER DESIGN PRINCIPLES — DEĞİŞMEMESİ GEREKENLER

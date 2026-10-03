@@ -848,7 +848,7 @@ class CatalogTests(UiTestCase):
         self.assertEqual("Yeniden adlandır", tx("TopBar", "Rename"))
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", tx("HistoryPage", "ARCHIVED CONVERSATIONS"))
         self.assertEqual("Arşivden çıkar", tx("HistoryPage", "Unarchive"))
-        self.assertEqual("ARŞİVLENMİŞ", tx("ProjectsPage", "ARCHIVED"))
+        self.assertEqual("ARŞİVLENMİŞ PROJELER", tx("ProjectsPage", "ARCHIVED PROJECTS"))
         self.assertEqual("Önce projeyi arşivden çıkarın", tx("ProjectsPage", "Unarchive the project first"))
         self.assertEqual("Salt okunur: bu sohbet arşivlendi. Devam etmek için arşivden çıkarın.",
                          tx("Composer", "Read-only: this conversation is archived. Unarchive it to continue it."))

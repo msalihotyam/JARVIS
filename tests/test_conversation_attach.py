@@ -376,7 +376,7 @@ class AttachWindowTests(ProjectsUiCase):
         self.open_dialog(root)
         self.choose(root, "Evim")
         identity = self.text(root, "attachIdentity")
-        for part in ("Mutfak planı", "1 turns", "created"):
+        for part in ("Mutfak planı", "· 1 turn ·", "created"):
             self.assertIn(part, identity)
         self.assertEqual("Target: Evim", self.text(root, "attachTarget"))
         changes = self.text(root, "attachChanges")
