@@ -12,7 +12,7 @@ Menu {
     property string current: ""
     function openFor(item, position, id, title) {
         if (!id) return
-        targetId = id; current = title || ""
+        targetId = id; current = title || ""; origin = item
         popup(item, position)
     }
 
@@ -38,39 +38,36 @@ Menu {
         onTriggered: menu.dialog.openFor(menu.targetId, menu.current)
     }
 
-    property Popup dialog: Popup {
+    // Gate 6E: on the shared dialog shell (accent tone). Focus starts in the
+    // field with the name selected; Enter there saves, Esc cancels, and focus
+    // returns to the row that was right-clicked.
+    property Item origin: null
+    property JarvisDialog dialog: JarvisDialog {
+        id: renameDialog
         objectName: "renameDialog"
         property string targetId: ""
-        parent: Overlay.overlay
-        anchors.centerIn: parent
-        width: 380; padding: 18
-        modal: true; focus: true
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        function openFor(id, title) { targetId = id; field.text = title; open(); field.selectAll(); field.forceActiveFocus() }
+        preferredWidth: 420
+        label: qsTr("Rename")
+        initialFocus: field
+        confirmItem: saveButton
+        enterConfirms: true
+        function openFor(id, title) { targetId = id; field.text = title; openFrom(menu.origin); field.selectAll() }
         function save() { bridge.renameTask(targetId, field.text); close() }
-        background: Rectangle { radius: 12; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
-        contentItem: Column {
-            spacing: 12
-            Text { text: qsTr("Rename"); color: Theme.text; renderType: Theme.textRender; font: Theme.uiValue }
-            TextField {
-                id: field
-                objectName: "renameField"
-                width: parent.width
-                maximumLength: 120
-                selectByMouse: true
-                color: Theme.text
-                font: Theme.body
-                background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
-                                        border.color: field.activeFocus ? Theme.commandEdge : Theme.border }
-                onAccepted: menu.dialog.save()
-            }
-            Row {
-                anchors.right: parent.right
-                spacing: 8
-                ActionButton { objectName: "renameCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: menu.dialog.close() }
-                ActionButton { objectName: "renameSave"; label: qsTr("Save"); primary: true; height: 36; width: 110
-                               onClicked: menu.dialog.save() }
-            }
+        TextField {
+            id: field
+            objectName: "renameField"
+            width: parent ? parent.width : 0; height: 36
+            maximumLength: 120
+            selectByMouse: true
+            color: Theme.text
+            font: Theme.body
+            background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
+                                    border.color: field.activeFocus ? Theme.commandEdge : Theme.border }
         }
+        buttons: [
+            ActionButton { objectName: "renameCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: renameDialog.close() },
+            ActionButton { id: saveButton; objectName: "renameSave"; label: qsTr("Save"); primary: true; height: 36; width: 110
+                           onClicked: renameDialog.save() }
+        ]
     }
 }

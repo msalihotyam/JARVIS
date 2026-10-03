@@ -7,6 +7,7 @@ Rectangle {
     property string text: ""
     property color tint: Theme.success
     property bool dot: true
+    property font font: Theme.label            // a page gives its own face (pages read at 14 px and up)
     implicitHeight: 22
     implicitWidth: row.width + 22
     radius: 11
@@ -20,6 +21,6 @@ Rectangle {
         Rectangle { visible: pill.dot; width: 6; height: 6; radius: 3; color: pill.tint; anchors.verticalCenter: parent.verticalCenter
             Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: pill.tint; opacity: 0.25 } }
         Text { anchors.verticalCenter: parent.verticalCenter; text: i18n.upper(pill.text); color: pill.tint
-            font: Theme.label }
+            font: pill.font }
     }
 }

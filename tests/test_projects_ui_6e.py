@@ -937,5 +937,365 @@ class DialogMotionTests(DialogAdoptionCase):
             self.assertFalse(other.property("visible"), name)
 
 
+# -- slice C5: the History and Projects lists, rows and empty states; RenameMenu on the shell --
+# AC whole rows, every button inside its clip (D15, D20); AD headings and actions never
+# meet, a long project name included (D17, D19); AE row states, keys, Tab and names (D18);
+# AF archived = ARŞİV pill + textLabel (G5, D21, D28); AG empty states (D16, D23); AH Q6
+# rename; AI no "konuşma" on either page; AJ the RenameMenu dialog on the shell; AK the
+# project switch fade.
+
+class ListCase(DialogAdoptionCase):
+    def lists(self, archived: int = 3):
+        store = self.db()
+        self.project = store.create_project(LONG_PROJECT)
+        for title in ("Mutfak planı", LONG_NAME, ""):
+            store.create_conversation(self.project.id, title=title)
+        kept = store.create_conversation(self.project.id, title="Eski teklif notları")
+        store.archive_conversation(kept.id)
+        store.create_conversation(title="Mutfak bütçesi soruları")
+        store.create_conversation(title=LONG_NAME)
+        self.archived = []
+        for n in range(archived):
+            record = store.create_conversation(title=f"Arşiv {n + 1}")
+            say(store, record.id, "bir")
+            store.archive_conversation(record.id)
+            self.archived.append(record.id)
+        self.thesis = store.create_project("Tez 2025")
+        store.set_project_active(self.thesis.id, False)
+        bridge = self.bridge()
+        root = self.window(bridge)
+        return store, bridge, root
+
+    def sessions(self, bridge, count: int = 3) -> None:
+        bridge._sessions = [{"session_id": f"s{n}", "title": f"Oturum {n}", "updated_at": 1_790_000_000.0 + n,
+                             "task_count": n, "active_task_id": "", "readable": True} for n in range(count)]
+        bridge.dataChanged.emit()
+
+    def under(self, item, name) -> list:
+        found = []
+
+        def walk(node):
+            if node.objectName() == name and node.isVisible():
+                found.append(node)
+            for child in node.childItems():
+                walk(child)
+        walk(item)
+        return found
+
+    def shown_texts(self, item) -> list:
+        found = []
+
+        def walk(node):
+            if not node.isVisible():
+                return
+            text = node.property("text")
+            if isinstance(text, str) and text:
+                found.append(text)
+            for child in node.childItems():
+                walk(child)
+        walk(item)
+        return found
+
+    def projects(self, bridge, root, project_id, section="conversations") -> None:
+        bridge.showProject(project_id); bridge.setPage("projects"); pump(400)
+        self.item(root, "projectsPage").setProperty("section", section); pump(150)
+
+    def apart(self, items) -> None:
+        boxes = [(i.objectName() or i.metaObject().className(), self.rect(i)) for i in items if i.isVisible() and i.width() > 0]
+        for a in range(len(boxes)):
+            for b in range(a + 1, len(boxes)):
+                self.assertFalse(boxes[a][1].intersects(boxes[b][1]), (boxes[a], boxes[b]))
+
+
+class ListLayoutTests(ListCase):
+    def test_ac_whole_rows_and_every_button_inside_the_clip(self) -> None:
+        store, bridge, root = self.lists()
+        self.tr(bridge)
+        # D15 exactly: three archived, nothing scrolled - every row and its buttons whole, at every size.
+        for width, height in SIZES:
+            with self.subTest(size=(width, height), archived=3):
+                root.resize(width, height); pump(300)
+                bridge.setPage("history"); pump(400)
+                self.item(root, "historyRightColumn").setProperty("contentY", 0); pump(100)
+                clip = self.rect(self.item(root, "historyArchivedList")).intersected(self.rect(self.item(root, "historyRightColumn")))
+                rows = self.visible(root, "historyArchivedRow")
+                self.assertEqual(3, len(rows))
+                for row in rows:
+                    self.assertTrue(clip.contains(self.rect(row)), (self.rect(row), clip))
+                    for name in ("historyUnarchive", "historyDelete"):
+                        self.assertTrue(clip.contains(self.rect(self.under(row, name)[0])), name)
+                # Projects: the archived conversations are whole rows with their buttons inside.
+                self.projects(bridge, root, self.project.id)
+                box = self.rect(self.item(root, "projectArchivedConversationList"))
+                for row in self.visible(root, "projectArchivedConversationRow"):
+                    self.assertTrue(box.contains(self.rect(row)))
+                    for name in ("projectConversationUnarchive", "projectArchivedConversationDelete"):
+                        self.assertTrue(self.rect(row).contains(self.rect(self.under(row, name)[0])), name)
+        # Seven: five whole rows, then the list's own scroll; the column scrolls to it.
+        for n in range(4):
+            record = store.create_conversation(title=f"Daha eski {n + 1}")
+            store.archive_conversation(record.id)
+        bridge.refreshHistory(); bridge._refresh_conversations(); pump(200)
+        for width, height in SIZES:
+            with self.subTest(size=(width, height), archived=7):
+                root.resize(width, height); pump(300)
+                bridge.setPage("history"); pump(400)
+                column, listview = self.item(root, "historyRightColumn"), self.item(root, "historyArchivedList")
+                column.setProperty("contentY", max(0.0, min(listview.y(), column.property("contentHeight") - column.height())))
+                pump(100)
+                box, view = self.rect(listview), self.rect(column)
+                rows = [r for r in self.visible(root, "historyArchivedRow") if self.rect(r).intersects(box)]
+                self.assertEqual(5, len(rows))
+                for row in rows:
+                    self.assertTrue(box.contains(self.rect(row)) and view.contains(self.rect(row)), (self.rect(row), box, view))
+                    for name in ("historyUnarchive", "historyDelete"):
+                        self.assertTrue(self.rect(row).contains(self.rect(self.under(row, name)[0])), name)
+
+    def test_ad_headings_and_actions_never_meet_with_a_long_name(self) -> None:
+        store, bridge, root = self.lists()
+        self.tr(bridge)
+        for width, height in SIZES:
+            with self.subTest(size=(width, height)):
+                root.resize(width, height); pump(300)
+                bridge.setPage("history"); pump(400)
+                self.apart([self.item(root, "historyConversationsHeading"), self.item(root, "historyNewConversation")])
+                for row in self.visible(root, "historyConversationRow") + self.visible(root, "historyArchivedRow"):
+                    parts = [row.childItems()[0], *self.under(row, "listRowBadge"), *self.under(row, "listRowMeta"),
+                             *self.under(row, "historyUnarchive"), *self.under(row, "historyDelete")]
+                    self.apart(parts)
+                    self.assertGreaterEqual(self.painted(row.childItems()[0]), min(6, len(row.property("title"))))
+                self.projects(bridge, root, self.project.id)
+                self.apart([self.item(root, "projectConversationsHeading"), self.item(root, "projectNewConversation")])
+                name = self.item(root, "projectDetailName")
+                self.apart([name, self.item(root, "projectStatePill"), self.item(root, "projectRename"),
+                            self.item(root, "projectArchive")])
+                self.assertGreaterEqual(self.painted(name), 6)
+                self.assertEqual("+ Yeni sohbet", self.item(root, "projectNewConversation").property("label"))
+                self.assertEqual(f"{LONG_PROJECT} içinde yeni sohbet", self.item(root, "projectNewConversationTip").property("text"))
+                for row in self.visible(root, "projectConversationRow") + self.visible(root, "projectArchivedConversationRow"):
+                    self.apart([row.childItems()[0], *self.under(row, "listRowBadge"), *self.under(row, "listRowMeta"),
+                                *self.under(row, "projectConversationUnarchive"),
+                                *self.under(row, "projectArchivedConversationDelete")])
+                self.projects(bridge, root, self.thesis.id)
+                self.apart([self.item(root, "projectDetailName"), self.item(root, "projectStatePill"),
+                            self.item(root, "projectDetailUnarchive")])
+                self.assertEqual("Önce projeyi arşivden çıkarın", self.item(root, "projectNewConversationTip").property("text"))
+
+
+class ListStateTests(ListCase):
+    def test_ae_hover_open_mark_focus_ring_tab_keys_and_names(self) -> None:
+        from PySide6.QtGui import QAccessible
+        store, bridge, root = self.lists()
+        self.tr(bridge)
+        bridge.setPage("history"); pump(400)
+        rows = self.visible(root, "historyConversationRow")
+        opened = next(r for r in rows if r.property("current"))
+        other = next(r for r in rows if not r.property("current"))
+        edge = lambda row: self.under(row, "listRowEdge")[0]  # noqa: E731
+        self.assertEqual((1.0, 0.0), (edge(opened).opacity(), edge(other).opacity()))
+        # The open row: its edge mark and the AÇIK pill; its name is only its name.
+        self.assertEqual(["AÇIK"], [t for t in self.shown_texts(self.under(opened, "listRowBadge")[0]) if t.isupper()])
+        self.assertEqual(opened.property("title"), opened.childItems()[0].property("text"))
+        self.assertFalse([t for t in self.shown_texts(self.item(root, "historyPage")) if "· açık" in t])
+        # Hover: a tonal lift, eased in.
+        self.assertEqual(0.0, other.property("color").alphaF())
+        QTest.mouseMove(root, other.mapToScene(QPointF(other.width() / 2, other.height() / 2)).toPoint())
+        settle(lambda: other.property("color").alphaF() > 0.03)
+        # Tab reaches the rows; each shows the ring; Return opens the focused one.
+        self.item(root, "historyNewConversation").forceActiveFocus()
+        QTest.keyClick(root, Qt.Key_Tab); pump(60)
+        first = root.activeFocusItem()
+        self.assertEqual("historyConversationRow", first.objectName())
+        self.assertTrue(self.under(first, "listRowFocusRing"))
+        QTest.keyClick(root, Qt.Key_Tab); pump(60)
+        self.assertEqual("historyConversationRow", root.activeFocusItem().objectName())
+        self.assertIsNot(first, root.activeFocusItem())
+        # Accessible: a button named by the conversation (and its state).
+        face = QAccessible.queryAccessibleInterface(opened)
+        self.assertEqual(QAccessible.Role.Button, face.role())
+        self.assertEqual(f"{opened.property('title')}, AÇIK", face.text(QAccessible.Text.Name))
+        target = bridge.conversations[0]["id"]
+        first.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(300)
+        self.assertEqual((target, "home"), (bridge.conversationId, bridge.page))
+        # Projects: Tab from Create reaches the project rows; Return opens one; the tabs take arrows.
+        bridge.showProject(""); bridge.setPage("projects"); pump(400)
+        self.item(root, "projectCreate").forceActiveFocus()
+        QTest.keyClick(root, Qt.Key_Tab); pump(60)
+        self.assertEqual("projectRow", root.activeFocusItem().objectName())
+        QTest.keyClick(root, Qt.Key_Return); pump(300)
+        self.assertEqual(bridge.projectRecords[0]["id"], bridge.openProject["id"])
+        tabs = self.item(root, "projectTabs")
+        tabs.forceActiveFocus(); pump(60)
+        self.assertTrue(self.under(tabs, "segmentedFocusRing"))
+        page = self.item(root, "projectsPage")
+        QTest.keyClick(root, Qt.Key_Right); pump(60)
+        self.assertEqual("instruction", page.property("section"))
+        QTest.keyClick(root, Qt.Key_Left); pump(60)
+        self.assertEqual("conversations", page.property("section"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_af_archived_is_a_pill_and_a_readable_name_never_colour_alone(self) -> None:
+        store, bridge, root = self.lists()
+        self.tr(bridge)
+        bridge.setPage("history"); pump(400)
+        label = self.item(root, "historyArchivedHeading").property("color")              # Theme.textLabel
+        for row in self.visible(root, "historyArchivedRow"):
+            self.assertEqual("ARŞİV", self.under(row, "listRowBadge")[0].property("text"))
+            self.assertEqual(label, row.childItems()[0].property("color"))
+        for row in self.visible(root, "historyConversationRow"):
+            if not row.property("current"):
+                self.assertEqual([], self.under(row, "listRowBadge"))
+                self.assertNotEqual(label, row.childItems()[0].property("color"))
+        self.projects(bridge, root, self.project.id)
+        thesis = next(r for r in self.visible(root, "projectRow") if r.property("title") == "Tez 2025")
+        self.assertEqual("ARŞİV", self.under(thesis, "listRowBadge")[0].property("text"))
+        self.assertEqual(label, self.under(thesis, "projectRowName")[0].property("color"))
+        self.assertIn("ETKİN", self.shown_texts(self.item(root, "projectStatePill")))
+        for row in self.visible(root, "projectArchivedConversationRow"):
+            self.assertEqual("ARŞİV", self.under(row, "listRowBadge")[0].property("text"))
+            self.assertEqual(label, row.childItems()[0].property("color"))
+        self.projects(bridge, root, self.thesis.id)
+        self.assertIn("ARŞİVLENDİ", self.shown_texts(self.item(root, "projectStatePill")))
+
+    def test_ag_empty_states_are_compact_lines_at_the_top(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.tr(bridge)
+        bridge.setPage("projects"); pump(400)
+        empty = self.item(root, "projectsEmpty")
+        self.assertTrue(empty.isVisible())
+        self.assertEqual("Henüz proje yok. Soldaki alana bir ad yazıp Oluştur'a basın.", empty.property("text"))
+        self.assertEqual((0.0, 0.0), (empty.x(), empty.y()))
+        bridge.setPage("history"); pump(400)
+        self.assertEqual(["Henüz kalıcı oturum yok."], [i.property("text") for i in self.visible(root, "historySessionsEmpty")])
+        self.sessions(bridge); pump(200)
+        self.assertEqual([], self.visible(root, "historySessionsEmpty"))
+        self.assertEqual(3, len(self.visible(root, "historySessionRow")))
+        # A project without conversations or jobs: its lines and its action, at the left.
+        bridge.createProject("Bahçe"); pump(100)
+        garden = bridge.projectRecords[0]["id"]
+        bridge.showProject(""); bridge.setPage("projects"); pump(300)
+        self.assertEqual("Sohbetlerini görmek için bir proje seçin.", self.item(root, "projectsEmpty").property("text"))
+        bridge.showProject(garden); pump(300)
+        for name, text in (("projectConversationsEmpty", "Bu projede henüz sohbet yok."),
+                           ("projectJobsEmpty", "Bu proje için zamanlanmış iş yok.")):
+            line = self.item(root, name)
+            self.assertEqual((True, text, 0.0), (line.isVisible(), line.property("text"), line.x()))
+        self.assertTrue(self.item(root, "projectNewConversation").isEnabled())
+
+    def test_ah_q6_the_rename_field_shows_only_after_rename(self) -> None:
+        store = self.db()
+        evim = store.create_project("Evim")
+        store.create_project("Tez")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge.showProject(evim.id); bridge.setPage("projects"); pump(400)
+        self.assertEqual([], self.visible(root, "projectRenameField"))
+        self.press(root, self.item(root, "projectRename"))
+        field = self.visible(root, "projectRenameField")[0]
+        self.assertEqual(("Evim", True), (field.property("text"), field.hasActiveFocus()))
+        self.assertEqual([], self.visible(root, "projectRename"))
+        field.setProperty("text", "Evim 2"); QTest.keyClick(root, Qt.Key_Return); pump(200)
+        self.assertEqual("Evim 2", store.load_project(evim.id).name)
+        self.assertEqual([], self.visible(root, "projectRenameField"))
+        self.assertTrue(self.item(root, "projectRename").hasActiveFocus())
+        # Esc: put away, nothing renamed.
+        self.press(root, self.item(root, "projectRename"))
+        QTest.keyClick(root, Qt.Key_Escape); pump(100)
+        self.assertEqual(([], "Evim 2"), (self.visible(root, "projectRenameField"), store.load_project(evim.id).name))
+        # A refusal keeps the field and shows the store's notice; Cancel puts it away.
+        self.press(root, self.item(root, "projectRename"))
+        self.visible(root, "projectRenameField")[0].setProperty("text", "tez")
+        self.press(root, self.visible(root, "projectRenameSave")[0])
+        self.assertIn("already exists", bridge.projectNotice)
+        self.assertEqual(1, len(self.visible(root, "projectRenameField")))
+        self.press(root, self.visible(root, "projectRenameCancel")[0])
+        self.assertEqual(([], "Evim 2"), (self.visible(root, "projectRenameField"), store.load_project(evim.id).name))
+        # Another project, or an archived one, never shows a field left open.
+        self.press(root, self.item(root, "projectRename"))
+        bridge.archiveProject(evim.id); pump(300)
+        self.assertEqual(([], []), (self.visible(root, "projectRenameField"), self.visible(root, "projectRename")))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_ai_no_konusma_on_either_page_in_turkish(self) -> None:
+        store, bridge, root = self.lists()
+        self.sessions(bridge)
+        self.tr(bridge)
+        bridge.setPage("history"); pump(400)
+        shown = self.shown_texts(self.item(root, "historyPage"))
+        for section in ("conversations", "instruction", "files"):
+            self.projects(bridge, root, self.project.id, section)
+            shown += self.shown_texts(self.item(root, "projectsPage"))
+        self.projects(bridge, root, self.thesis.id)
+        shown += self.shown_texts(self.item(root, "projectsPage"))
+        self.assertTrue(shown)
+        self.assertEqual([], [t for t in shown if re.search("konuşma", t, re.I)])
+
+    def test_ak_a_project_switch_fades_the_detail_in_and_not_with_ambient_off(self) -> None:
+        store, bridge, root = self.lists()
+        self.projects(bridge, root, self.project.id)
+        detail = self.item(root, "projectDetail")
+        samples = self.motion(root, detail)
+        mark, called = len(samples), time.monotonic()
+        bridge.showProject(self.thesis.id)
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 180)    # Theme.panelIn
+        bridge.setAmbientEffects(False); pump(100)
+        bridge.showProject(self.project.id)
+        self.assertEqual(1.0, detail.opacity())
+
+
+class RenameDialogTests(ListCase):
+    def test_aj_the_rename_dialog_on_the_shell(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.sessions(bridge)
+        self.tr(bridge)
+        bridge.setPage("history"); pump(400)
+        row = self.visible(root, "historySessionRow")[0]
+        row.forceActiveFocus(); pump(100)
+        QTest.keyClick(root, Qt.Key_Menu); pump(300)                     # the keyboard path to the menu
+        menu = root.findChild(QObject, "renameMenu")
+        self.assertTrue(menu.property("visible"))
+        QMetaObject.invokeMethod(menu.findChild(QObject, "renameAction"), "triggered")
+        QMetaObject.invokeMethod(menu, "close")
+        dialog = root.findChild(QObject, "renameDialog")
+        settle(lambda: dialog.property("opened"))
+        self.assertEqual("YENİDEN ADLANDIR", self.under(self.frame(dialog), "jarvisDialogLabel")[0].property("text"))
+        scrim = self.scrims(root)
+        self.assertEqual(1, len(scrim))
+        settle(lambda: scrim[0].opacity() == 1.0)
+        self.assertAlmostEqual(0.56, scrim[0].property("color").alphaF(), places=2)
+        field = self.visible(root, "renameField")[0]
+        self.assertTrue(field.hasActiveFocus())
+        self.assertEqual(("Oturum 0", "Oturum 0"), (field.property("text"), field.property("selectedText")))
+        for _ in range(4):
+            QTest.keyClick(root, Qt.Key_Tab); pump(30)
+            self.assertTrue(self.inside(root.activeFocusItem(), self.frame(dialog)), root.activeFocusItem())
+        QTest.keyClick(root, Qt.Key_Escape)
+        settle(lambda: not dialog.property("visible"))
+        self.assertTrue(row.hasActiveFocus())                            # back to the row it was opened from
+        self.assertEqual("Oturum 0", bridge.sessions[0]["title"])
+        # Motion on its tokens; Save only while fully open; none with ambient effects off.
+        save = dialog.findChild(QObject, "renameSave")
+        samples = self.motion(root, dialog)
+        mark, called = len(samples), time.monotonic()
+        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", "s1"), Q_ARG("QVariant", "Oturum 1"))
+        self.assertFalse(save.isEnabled())
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 220)    # Theme.pageMs
+        settle(lambda: dialog.property("opened"))
+        self.assertTrue(save.isEnabled())
+        mark, called = len(samples), time.monotonic()
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(save.isEnabled())
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
+        bridge.setAmbientEffects(False); pump(100)
+        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", "s1"), Q_ARG("QVariant", "Oturum 1"))
+        self.assertTrue(dialog.property("opened"))
+        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(dialog.property("visible"))
+        self.assertEqual(0, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

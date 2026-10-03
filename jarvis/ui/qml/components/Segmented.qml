@@ -9,6 +9,7 @@ Rectangle {
     property var options: []
     property string value: ""
     property color accent: Theme.accent
+    property string segmentPrefix: ""         // segment objectNames: prefix + value (a caller's own names)
     signal picked(string value)
     implicitHeight: 34
     implicitWidth: row.width + 6
@@ -24,6 +25,7 @@ Rectangle {
         Repeater {
             model: seg.options
             Rectangle {
+                objectName: seg.segmentPrefix !== "" ? seg.segmentPrefix + modelData.value : ""
                 readonly property bool on: modelData.value === seg.value
                 readonly property bool hovered: m.containsMouse && seg.enabled
                 width: t.width + 24; height: 28; radius: Theme.radiusSmall - 3
@@ -39,6 +41,13 @@ Rectangle {
     opacity: enabled ? 1 : 0.38
     // Keyboard focus (Gate 6E): the ActionButton ring - crisp, 2 px, outside the well.
     activeFocusOnTab: true
+    // Left / Right pick the neighbouring segment.
+    function step(by) {
+        for (var i = 0; i < options.length; ++i)
+            if (options[i].value === value && options[i + by]) { picked(options[i + by].value); return }
+    }
+    Keys.onLeftPressed: step(-1)
+    Keys.onRightPressed: step(1)
     Rectangle { objectName: "segmentedFocusRing"; visible: seg.activeFocus; anchors.fill: parent; anchors.margins: -4
                 radius: parent.radius + 4; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
 }

@@ -1504,6 +1504,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>ARŞİVLENMİŞ SOHBETLER</translation>
     </message>
     <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİV</translation>
+    </message>
+    <message>
         <source>archived %1</source>
         <translation>arşivlendi %1</translation>
     </message>
@@ -1518,6 +1522,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>DURABLE SESSIONS (most recent %1)</source>
         <translation>KALICI OTURUMLAR (son %1)</translation>
+    </message>
+    <message>
+        <source>No durable session yet.</source>
+        <translation>Henüz kalıcı oturum yok.</translation>
     </message>
     <message>
         <source>Untitled session</source>
@@ -3004,6 +3012,18 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Save</source>
         <translation>Kaydet</translation>
+    </message>
+    <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİV</translation>
+    </message>
+    <message>
+        <source>No project yet. Type a name in the field on the left and press Create.</source>
+        <translation>Henüz proje yok. Soldaki alana bir ad yazıp Oluştur&apos;a basın.</translation>
+    </message>
+    <message>
+        <source>+ New conversation</source>
+        <translation>+ Yeni sohbet</translation>
     </message>
     <message>
         <source>Archived project: the instruction is read-only.</source>

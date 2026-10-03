@@ -49,6 +49,7 @@ SecondaryPage {
                                 border.color: parent.activeFocus ? Theme.commandEdge : Theme.border }
     }
     component Choice: Rectangle {
+        id: chip
         property string value: ""
         property bool selected: false
         signal picked()
@@ -56,26 +57,52 @@ SecondaryPage {
         width: choiceText.implicitWidth + 20; height: 28; radius: 14
         opacity: enabled ? 1 : 0.45
         color: selected ? Theme.alpha(Theme.accent, 0.16) : choiceArea.containsMouse ? Theme.alpha(Theme.text, 0.06) : "transparent"
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         border.width: 1; border.color: selected ? Theme.alpha(Theme.accent, 0.7) : Theme.border
+        activeFocusOnTab: enabled
         Accessible.role: Accessible.RadioButton; Accessible.name: choiceText.text; Accessible.checked: selected
+        Keys.onReturnPressed: chip.picked()
+        Keys.onSpacePressed: chip.picked()
         Text { id: choiceText; anchors.centerIn: parent; text: parent.value.toUpperCase(); color: parent.selected ? Theme.accent : Theme.text; font: Theme.caption }
         MouseArea { id: choiceArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: parent.picked() }
+        Rectangle { objectName: "classChoiceFocusRing"; visible: chip.activeFocus; anchors.fill: parent; anchors.margins: -4; radius: parent.radius + 4
+                    color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
     }
-    component ProjectRow: Rectangle {
+    // A disabled control takes no hover, so its reason tip sits beside it, in
+    // this wrapper (the control is the wrapper's last child).
+    component Reasoned: Item {
+        id: reasoned
+        property string reason: ""
+        readonly property Item control: children[children.length - 1]
+        implicitWidth: control ? control.width : 0; implicitHeight: control ? control.height : 0
+        HoverTip { target: reasoned.control; text: reasoned.reason; active: !!reasoned.control && !reasoned.control.enabled }
+    }
+    component ProjectRow: ListRow {
+        id: projectRow
         property var project: ({})
         objectName: "projectRow"
-        width: parent ? parent.width : 0; height: 44; radius: Theme.radiusSmall
-        readonly property bool current: page.current.id === project.id
-        color: current ? Theme.alpha(Theme.accent, 0.10) : "transparent"
-        border.width: 1; border.color: current ? Theme.alpha(Theme.accent, 0.6) : Theme.border
-        Text { objectName: "projectRowName"; anchors { left: parent.left; leftMargin: 12; right: unarchive.left; rightMargin: 8; verticalCenter: parent.verticalCenter }
-               text: parent.project.name || ""; textFormat: Text.PlainText; elide: Text.ElideRight
-               color: parent.project.active ? Theme.text : Theme.textMuted; font: Theme.pageRowStrong }
-        MouseArea { anchors.fill: parent; onClicked: bridge.showProject(parent.project.id) }
-        ActionButton { id: unarchive; objectName: "projectUnarchive"; compact: true; visible: !parent.project.active
-                       anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
-                       width: visible ? implicitWidth : 0; label: qsTr("Unarchive")
-                       onClicked: bridge.unarchiveProject(parent.project.id) }
+        titleName: "projectRowName"
+        title: project.name || ""; current: page.current.id === project.id; muted: !project.active
+        badge: project.active ? "" : qsTr("ARCHIVED"); badgeTint: Theme.warning
+        onActivated: bridge.showProject(projectRow.project.id)
+        ActionButton { objectName: "projectUnarchive"; compact: true; visible: !projectRow.project.active; label: qsTr("Unarchive")
+                       onClicked: bridge.unarchiveProject(projectRow.project.id) }
+    }
+    // Gate 6E: the open project's detail fades in when another project opens;
+    // Q6: the rename field shows only after "Rename" (Enter saves, Esc or
+    // Cancel puts it away; the same bridge call as before).
+    property bool renaming: false
+    readonly property string shownId: current.id || ""
+    onShownIdChanged: { renaming = false; if (Theme.ambient) detailFade.restart() }
+    function startRename() {
+        renaming = true
+        renameField.text = current.name || ""
+        renameField.selectAll(); renameField.forceActiveFocus()
+    }
+    function stopRename() { renaming = false; renameButton.forceActiveFocus() }
+    function saveRename() {
+        bridge.renameProject(current.id, renameField.text)
+        if (bridge.projectNotice === "") stopRename()
     }
 
     Row {
@@ -95,13 +122,14 @@ SecondaryPage {
             Text { objectName: "projectNotice"; visible: bridge.projectNotice !== ""; width: parent.width; wrapMode: Text.Wrap
                    textFormat: Text.PlainText; text: bridge.projectNotice; color: Theme.warning; font: Theme.pageRow }
             Flickable {
+                id: listColumn
                 width: parent.width; height: parent.height - y; clip: true
                 contentHeight: lists.height; boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar {}
+                ScrollBar.vertical: ScrollBar { policy: listColumn.contentHeight > listColumn.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
                 Column {
-                    id: lists; width: parent.width; spacing: 6
+                    id: lists; width: parent.width - (listColumn.contentHeight > listColumn.height ? 12 : 0); spacing: 6
                     Text { text: qsTr("ACTIVE"); color: Theme.textLabel; font: Theme.pageSection }
-                    Text { visible: page.active.length === 0; text: qsTr("No active project yet."); color: Theme.textMuted; font: Theme.pageMeta }
+                    Text { visible: page.active.length === 0; text: qsTr("No active project yet."); color: Theme.textLabel; font: Theme.pageMeta }
                     Repeater { model: page.active; ProjectRow { project: modelData } }
                     Item { width: 1; height: 8; visible: page.archived.length > 0 }
                     Text { objectName: "projectsArchivedHeading"; visible: page.archived.length > 0; text: qsTr("ARCHIVED PROJECTS"); color: Theme.textLabel; font: Theme.pageSection }
@@ -113,15 +141,51 @@ SecondaryPage {
         // -- the detail of the open project ---------------------------------------
         Item {
             width: parent.width * 0.62 - Theme.gap / 2; height: parent.height
-            Text { visible: !page.current.id; anchors.centerIn: parent; text: qsTr("Choose a project to see its conversations.")
-                   color: Theme.textMuted; font: Theme.pageRow }
+            // Gate 6E (D23): compact lines at the top, never floating mid-void.
+            Text { objectName: "projectsEmpty"; visible: !page.current.id; width: parent.width; wrapMode: Text.Wrap
+                   text: bridge.projectRecords.length === 0 ? qsTr("No project yet. Type a name in the field on the left and press Create.")
+                                                           : qsTr("Choose a project to see its conversations.")
+                   color: Theme.textLabel; font: Theme.pageRow }
             Column {
                 id: detail
                 objectName: "projectDetail"
                 visible: !!page.current.id
                 anchors.fill: parent; spacing: 10
-                Text { objectName: "projectDetailName"; width: parent.width; text: page.current.name || ""; textFormat: Text.PlainText
-                       elide: Text.ElideRight; color: Theme.text; font: Theme.title }
+                NumberAnimation { id: detailFade; target: detail; property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
+                // The name (elided; its tip has it whole), its state pill, the actions.
+                Item {
+                    width: parent.width; height: 36
+                    Text { id: detailName; objectName: "projectDetailName"; anchors.verticalCenter: parent.verticalCenter
+                           width: Math.max(0, Math.min(implicitWidth, parent.width - statePill.width - 12 - detailActions.width - 16))
+                           text: page.current.name || ""; textFormat: Text.PlainText
+                           elide: Text.ElideRight; color: Theme.text; font: Theme.titleLarge }
+                    HoverTip { objectName: "projectDetailNameTip"; target: detailName; text: detailName.text; active: detailName.truncated }
+                    Pill { id: statePill; objectName: "projectStatePill"; x: detailName.width + 12; anchors.verticalCenter: parent.verticalCenter
+                           font: Theme.pageSection; implicitHeight: 24
+                           text: page.current.active === false ? qsTr("archived") : qsTr("active")
+                           tint: page.current.active === false ? Theme.warning : Theme.success }
+                    Row {
+                        id: detailActions
+                        anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 6
+                        ActionButton { id: renameButton; objectName: "projectRename"; compact: true; label: qsTr("Rename")
+                                       visible: page.current.active === true && !page.renaming; onClicked: page.startRename() }
+                        ActionButton { objectName: "projectArchive"; compact: true; visible: page.current.active === true; label: qsTr("Archive"); danger: true
+                                       onClicked: bridge.archiveProject(page.current.id) }
+                        ActionButton { objectName: "projectDetailUnarchive"; compact: true; visible: page.current.active === false; label: qsTr("Unarchive")
+                                       onClicked: bridge.unarchiveProject(page.current.id) }
+                    }
+                }
+                Row {
+                    objectName: "projectRenameRow"
+                    visible: page.renaming && page.current.active === true; spacing: 8
+                    Field { id: renameField; objectName: "projectRenameField"; width: Math.min(320, detail.width - 240); height: 36
+                            placeholderText: qsTr("New name"); onAccepted: page.saveRename()
+                            // Esc here puts the field away; it must not reach the window's Escape (leave the page).
+                            Keys.onShortcutOverride: function (event) { event.accepted = event.key === Qt.Key_Escape }
+                            Keys.onEscapePressed: page.stopRename() }
+                    ActionButton { objectName: "projectRenameSave"; label: qsTr("Save"); primary: true; height: 36; onClicked: page.saveRename() }
+                    ActionButton { objectName: "projectRenameCancel"; label: qsTr("Cancel"); height: 36; onClicked: page.stopRename() }
+                }
                 Rectangle {
                     objectName: "projectArchivedBanner"
                     visible: page.current.active === false
@@ -130,125 +194,125 @@ SecondaryPage {
                     Text { id: archivedText; x: 12; y: 10; width: parent.width - 24; wrapMode: Text.Wrap; color: Theme.warning; font: Theme.pageRow
                            text: qsTr("Archived: this project is read-only. Its conversations are kept and can be read, but nothing new runs in it until you unarchive it.") }
                 }
-                Row {
-                    spacing: 8
-                    Field { id: renameField; objectName: "projectRenameField"; width: 260; height: 36; enabled: page.current.active === true
-                            placeholderText: qsTr("New name") }
-                    ActionButton { objectName: "projectRename"; label: qsTr("Rename"); height: 36; enabled: page.current.active === true
-                                   onClicked: { bridge.renameProject(page.current.id, renameField.text); if (bridge.projectNotice === "") renameField.text = "" } }
-                    ActionButton { objectName: "projectArchive"; visible: page.current.active === true; label: qsTr("Archive"); danger: true; height: 36
-                                   onClicked: bridge.archiveProject(page.current.id) }
-                    ActionButton { objectName: "projectDetailUnarchive"; visible: page.current.active === false; label: qsTr("Unarchive"); height: 36
-                                   onClicked: bridge.unarchiveProject(page.current.id) }
-                }
-                // Gate 6B: the project's conversations, its instruction and its files.
-                Row {
-                    spacing: 6
-                    Repeater {
-                        model: [{ id: "conversations", label: qsTr("Conversations") },
-                                { id: "instruction", label: qsTr("Instruction") },
-                                { id: "files", label: qsTr("Files") }]
-                        delegate: ActionButton { objectName: "projectTab_" + modelData.id; compact: true; label: modelData.label
-                                                 primary: page.section === modelData.id; onClicked: page.section = modelData.id }
-                    }
+                // Gate 6B: the project's conversations, its instruction and its files
+                // (Gate 6E: a segmented well, not three filled action buttons).
+                Segmented {
+                    objectName: "projectTabs"
+                    segmentPrefix: "projectTab_"
+                    options: [{ value: "conversations", label: qsTr("Conversations") },
+                              { value: "instruction", label: qsTr("Instruction") },
+                              { value: "files", label: qsTr("Files") }]
+                    value: page.section
+                    onPicked: function (value) { page.section = value }
                 }
                 Item {
                     width: parent.width; height: parent.height - y
 
-                    // -- conversations and jobs (Gate 6A) --
-                    Column {
+                    // -- conversations and jobs (Gate 6A); Gate 6E: one scroll (G7) --
+                    Flickable {
+                        id: conversationsColumn
+                        objectName: "projectConversationsColumn"
                         visible: page.section === "conversations"
-                        anchors.fill: parent; spacing: 10
-                        Item { width: parent.width; height: 36
-                            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
-                            ActionButton { objectName: "projectNewConversation"; anchors.right: parent.right; compact: true
-                                           enabled: page.current.active === true
-                                           label: qsTr("New conversation in %1").arg(page.current.name || "")
-                                           onClicked: { var b = bridge; if (b.newProjectConversation(page.current.id)) b.setPage("home") } } }
-                        ListView {
-                            id: conversationList
-                            objectName: "projectConversationList"
-                            width: parent.width; height: Math.min(Math.max(contentHeight, 40), parent.height * (archivedConversationList.count > 0 ? 0.3 : 0.5))
-                            clip: true; spacing: 4
-                            model: bridge.projectConversations
-                            ScrollBar.vertical: ScrollBar {}
-                            delegate: Rectangle {
-                                objectName: "projectConversationRow"
-                                property var row: modelData
-                                width: ListView.view.width; height: 40; radius: Theme.radiusSmall
-                                color: row.active ? Theme.alpha(Theme.accent, 0.10) : "transparent"
-                                border.width: 1; border.color: row.active ? Theme.alpha(Theme.accent, 0.6) : Theme.border
-                                Text { anchors { left: parent.left; leftMargin: 10; right: rowDelete.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                                       text: row.title + "  ·  " + (row.active ? qsTr("open") : page.when(row.updated_at))
-                                       textFormat: Text.PlainText; color: row.active ? Theme.accent : Theme.text; font: Theme.pageRowStrong; elide: Text.ElideRight }
-                                MouseArea { anchors.fill: parent; onClicked: { var b = bridge, id = row.id; b.openConversation(id); b.setPage("home") } }
-                                // Gate 6D-b: under an archived project the project's archive is
-                                // the reversible first step, so the delete is offered at once.
-                                ActionButton { id: rowDelete; objectName: "projectConversationDelete"; compact: true; danger: true
-                                               visible: row.deletable === true; width: visible ? implicitWidth : 0
-                                               anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
-                                               label: qsTr("Delete permanently…"); enabled: !bridge.busy
-                                               onClicked: deleteDialog.openFor(row.id) }
+                        anchors.fill: parent; clip: true
+                        contentHeight: conversations.height; boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: conversationsColumn.contentHeight > conversationsColumn.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
+                        Column {
+                            id: conversations
+                            width: conversationsColumn.width - (conversationsColumn.contentHeight > conversationsColumn.height ? 12 : 0); spacing: 10
+                            // The heading and its action share the line and never meet (D19):
+                            // the action is short; the project's name is in its tip.
+                            Item { width: parent.width; height: 36
+                                Text { objectName: "projectConversationsHeading"; anchors.verticalCenter: parent.verticalCenter
+                                       width: Math.min(implicitWidth, parent.width - newConversation.width - 12); elide: Text.ElideRight
+                                       text: qsTr("CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
+                                ActionButton { id: newConversation; objectName: "projectNewConversation"; anchors.right: parent.right; compact: true
+                                               enabled: page.current.active === true
+                                               label: qsTr("+ New conversation")
+                                               onClicked: { var b = bridge; if (b.newProjectConversation(page.current.id)) b.setPage("home") } }
+                                HoverTip { objectName: "projectNewConversationTip"; target: newConversation
+                                           text: page.current.active === true ? qsTr("New conversation in %1").arg(page.current.name || "")
+                                                                             : qsTr("Unarchive the project first") } }
+                            Column {
+                                width: parent.width; spacing: 4
+                                Repeater {
+                                    model: bridge.projectConversations
+                                    ListRow {
+                                        id: conversationRow
+                                        objectName: "projectConversationRow"
+                                        property var row: modelData
+                                        title: row.title; current: row.active
+                                        badge: row.active ? qsTr("open") : ""
+                                        meta: page.when(row.updated_at)
+                                        // Locals: opening rebuilds the model, and this delegate's context with it.
+                                        onActivated: { var b = bridge, id = conversationRow.row.id; b.openConversation(id); b.setPage("home") }
+                                        // Gate 6D-b: under an archived project the project's archive is
+                                        // the reversible first step, so the delete is offered at once.
+                                        ActionButton { objectName: "projectConversationDelete"; compact: true; danger: true
+                                                       visible: conversationRow.row.deletable === true
+                                                       label: qsTr("Delete permanently…"); enabled: !bridge.busy
+                                                       onClicked: deleteDialog.openFor(conversationRow.row.id) }
+                                    }
+                                }
+                                Text { objectName: "projectConversationsEmpty"; visible: bridge.projectConversations.length === 0
+                                       text: qsTr("No conversation in this project yet."); color: Theme.textLabel; font: Theme.pageMeta }
                             }
-                            Text { visible: conversationList.count === 0; anchors.centerIn: parent; text: qsTr("No conversation in this project yet.")
-                                   color: Theme.textMuted; font: Theme.pageMeta }
-                        }
-                        // Gate 6D-b: the project's archived conversations. A row opens
-                        // read-only; unarchiving waits for the project's own unarchive.
-                        Text { objectName: "projectArchivedConversationsHeading"; visible: archivedConversationList.count > 0
-                               text: qsTr("ARCHIVED CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
-                        Text { objectName: "projectConversationNotice"; visible: text !== "" && !deleteDialog.visible; width: parent.width
-                               wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.pageMeta }
-                        ListView {
-                            id: archivedConversationList
-                            objectName: "projectArchivedConversationList"
-                            visible: count > 0
-                            width: parent.width; height: count > 0 ? Math.min(contentHeight, parent.height * 0.25) : 0; clip: true; spacing: 4
-                            model: bridge.projectArchivedConversations
-                            ScrollBar.vertical: ScrollBar {}
-                            delegate: Rectangle {
-                                objectName: "projectArchivedConversationRow"
-                                property var row: modelData
-                                width: ListView.view.width; height: 40; radius: Theme.radiusSmall
-                                color: row.active ? Theme.alpha(Theme.accent, 0.10) : "transparent"
-                                border.width: 1; border.color: row.active ? Theme.alpha(Theme.accent, 0.6) : Theme.border
-                                Text { anchors { left: parent.left; leftMargin: 10; right: archivedButtons.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                                       text: row.title + "  ·  " + qsTr("archived %1").arg(page.when(row.archived_at))
-                                       textFormat: Text.PlainText; color: Theme.textMuted; font: Theme.pageRowStrong; elide: Text.ElideRight }
-                                MouseArea { anchors.fill: parent; onClicked: { var b = bridge, id = row.id; b.openConversation(id); b.setPage("home") } }
-                                Row {
-                                    id: archivedButtons
-                                    anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
-                                    spacing: 6
-                                    ActionButton { objectName: "projectConversationUnarchive"; compact: true; label: qsTr("Unarchive")
-                                                   enabled: page.current.active === true && !bridge.busy
-                                                   onClicked: { var b = bridge, id = row.id; b.unarchiveConversation(id) } }
+                            // Gate 6D-b: the project's archived conversations. A row opens
+                            // read-only; unarchiving waits for the project's own unarchive.
+                            Text { objectName: "projectArchivedConversationsHeading"; visible: archivedConversationList.count > 0
+                                   text: qsTr("ARCHIVED CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
+                            Text { objectName: "projectConversationUnarchiveReason"; visible: archivedConversationList.count > 0 && page.current.active === false
+                                   width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageMeta
+                                   text: qsTr("Unarchive the project first") }
+                            Text { objectName: "projectConversationNotice"; visible: text !== "" && !deleteDialog.visible; width: parent.width
+                                   wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.pageMeta }
+                            ListView {
+                                id: archivedConversationList
+                                objectName: "projectArchivedConversationList"
+                                visible: count > 0
+                                // Whole rows, at most five before its own scroll (as History).
+                                width: parent.width; height: count <= 5 ? contentHeight : 5 * (contentHeight + spacing) / count - spacing
+                                clip: true; spacing: 4; interactive: count > 5; snapMode: ListView.SnapToItem; boundsBehavior: Flickable.StopAtBounds
+                                model: bridge.projectArchivedConversations
+                                ScrollBar.vertical: ScrollBar { policy: archivedConversationList.count > 5 ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
+                                delegate: ListRow {
+                                    id: archivedRow
+                                    objectName: "projectArchivedConversationRow"
+                                    property var row: modelData
+                                    width: ListView.view.width - (ListView.view.count > 5 ? 12 : 0)
+                                    title: row.title; current: row.active; muted: true
+                                    badge: qsTr("ARCHIVED"); badgeTint: Theme.warning
+                                    meta: qsTr("archived %1").arg(page.when(row.archived_at))
+                                    onActivated: { var b = bridge, id = archivedRow.row.id; b.openConversation(id); b.setPage("home") }
+                                    Reasoned {
+                                        reason: page.current.active === true ? "" : qsTr("Unarchive the project first")
+                                        ActionButton { objectName: "projectConversationUnarchive"; compact: true; label: qsTr("Unarchive")
+                                                       enabled: page.current.active === true && !bridge.busy
+                                                       onClicked: { var b = bridge, id = archivedRow.row.id; b.unarchiveConversation(id) } }
+                                    }
                                     ActionButton { objectName: "projectArchivedConversationDelete"; compact: true; danger: true
-                                                   label: qsTr("Delete permanently…"); enabled: !bridge.busy; onClicked: deleteDialog.openFor(row.id) }
+                                                   label: qsTr("Delete permanently…"); enabled: !bridge.busy; onClicked: deleteDialog.openFor(archivedRow.row.id) }
                                 }
                             }
-                        }
-                        Text { objectName: "projectConversationUnarchiveReason"; visible: archivedConversationList.count > 0 && page.current.active === false
-                               width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.pageMeta
-                               text: qsTr("Unarchive the project first") }
-                        Text { objectName: "projectJobsHeading"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageSection
-                               text: bridge.projectJobsBounded
-                                     ? qsTr("SCHEDULED JOBS · among the first %1 jobs created; this project may have more").arg(bridge.projectJobsLimit)
-                                     : qsTr("SCHEDULED JOBS") }
-                        ListView {
-                            id: jobList
-                            objectName: "projectJobList"
-                            width: parent.width; height: parent.height - y; clip: true; spacing: 4
-                            model: bridge.projectJobs
-                            ScrollBar.vertical: ScrollBar {}
-                            delegate: Rectangle {
-                                width: ListView.view.width; height: 36; radius: Theme.radiusSmall; color: "transparent"; border.width: 1; border.color: Theme.border
-                                Text { anchors { left: parent.left; leftMargin: 10; right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                                       textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.text; font: Theme.pageRow
-                                       text: (modelData.readable ? modelData.label : qsTr("(unreadable definition)")) + "  ·  "
-                                             + (modelData.archived ? qsTr("archived") : modelData.enabled ? qsTr("enabled") : qsTr("disabled")) }
+                            Text { objectName: "projectJobsHeading"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageSection
+                                   text: bridge.projectJobsBounded
+                                         ? qsTr("SCHEDULED JOBS · among the first %1 jobs created; this project may have more").arg(bridge.projectJobsLimit)
+                                         : qsTr("SCHEDULED JOBS") }
+                            Column {
+                                objectName: "projectJobList"
+                                width: parent.width; spacing: 4
+                                Repeater {
+                                    model: bridge.projectJobs
+                                    Rectangle {
+                                        width: parent.width; height: 36; radius: Theme.radiusSmall; color: "transparent"; border.width: 1; border.color: Theme.border
+                                        Text { anchors { left: parent.left; leftMargin: 10; right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                                               textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.text; font: Theme.pageRow
+                                               text: (modelData.readable ? modelData.label : qsTr("(unreadable definition)")) + "  ·  "
+                                                     + (modelData.archived ? qsTr("archived") : modelData.enabled ? qsTr("enabled") : qsTr("disabled")) }
+                                    }
+                                }
+                                Text { objectName: "projectJobsEmpty"; visible: bridge.projectJobs.length === 0; text: qsTr("No scheduled job for this project.")
+                                       color: Theme.textLabel; font: Theme.pageMeta }
                             }
-                            Text { visible: jobList.count === 0; anchors.centerIn: parent; text: qsTr("No scheduled job for this project."); color: Theme.textMuted; font: Theme.pageMeta }
                         }
                     }
 
@@ -294,14 +358,20 @@ SecondaryPage {
                                     delegate: Choice { objectName: "instructionClass_" + modelData; value: modelData; enabled: page.current.active === true
                                                        selected: page.instructionClass === modelData; onPicked: page.instructionClass = modelData }
                                 }
-                                ActionButton { objectName: "instructionClear"; compact: true; label: qsTr("Clear")
-                                               enabled: page.current.active === true && page.instructionClass !== ""
-                                               onClicked: bridge.saveProjectInstruction(page.current.id, "", page.instructionClass) }
-                                ActionButton { objectName: "instructionSave"; compact: true; primary: true; label: qsTr("Save")
-                                               enabled: page.current.active === true && page.instructionClass !== ""
-                                               onClicked: bridge.saveProjectInstruction(page.current.id, instructionEditor.text, page.instructionClass) }
+                                Reasoned {
+                                    reason: instructionReason.text
+                                    ActionButton { objectName: "instructionClear"; compact: true; label: qsTr("Clear")
+                                                   enabled: page.current.active === true && page.instructionClass !== ""
+                                                   onClicked: bridge.saveProjectInstruction(page.current.id, "", page.instructionClass) }
+                                }
+                                Reasoned {
+                                    reason: instructionReason.text
+                                    ActionButton { objectName: "instructionSave"; compact: true; primary: true; label: qsTr("Save")
+                                                   enabled: page.current.active === true && page.instructionClass !== ""
+                                                   onClicked: bridge.saveProjectInstruction(page.current.id, instructionEditor.text, page.instructionClass) }
+                                }
                             }
-                            Text { objectName: "instructionReason"; width: parent.width; wrapMode: Text.Wrap; font: Theme.pageMeta
+                            Text { id: instructionReason; objectName: "instructionReason"; width: parent.width; wrapMode: Text.Wrap; font: Theme.pageMeta
                                    visible: text !== ""; color: page.current.active === true ? Theme.textMuted : Theme.warning
                                    text: page.current.active !== true ? qsTr("Archived project: the instruction is read-only.")
                                          : page.instructionClass === "" ? qsTr("Choose PUBLIC or INTERNAL before saving.") : "" }
@@ -335,11 +405,14 @@ SecondaryPage {
                                 delegate: Choice { objectName: "fileClass_" + modelData; value: modelData; enabled: page.current.active === true
                                                    selected: page.fileClass === modelData; onPicked: page.fileClass = modelData }
                             }
-                            ActionButton { objectName: "fileAdd"; compact: true; primary: true; label: qsTr("Add file…")
-                                           enabled: page.current.active === true && page.fileClass !== ""
-                                           onClicked: filePicker.open() }
+                            Reasoned {
+                                reason: fileReason.text
+                                ActionButton { objectName: "fileAdd"; compact: true; primary: true; label: qsTr("Add file…")
+                                               enabled: page.current.active === true && page.fileClass !== ""
+                                               onClicked: filePicker.open() }
+                            }
                         }
-                        Text { objectName: "fileReason"; width: parent.width; wrapMode: Text.Wrap; font: Theme.pageMeta
+                        Text { id: fileReason; objectName: "fileReason"; width: parent.width; wrapMode: Text.Wrap; font: Theme.pageMeta
                                visible: text !== ""; color: page.current.active === true ? Theme.textMuted : Theme.warning
                                text: page.current.active !== true ? qsTr("Archived project: files cannot be added, retired or restored. Purge stays available.")
                                      : page.fileClass === "" ? qsTr("Choose a classification before adding a file. SECRET files are stored but never retrieved.") : "" }
