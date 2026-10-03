@@ -24,7 +24,9 @@ ContextPanel {
     heading: qsTr("MODEL & PROVIDER")
     surfaceName: "modelSurface"
     surfaceFill: Theme.glassOverlay
-    panelWidth: 460; panelHeight: 720
+    panelWidth: 460
+    // Gate 6E: never taller than the room below the anchor (the surface also keeps its own 16 px margin).
+    panelHeight: Math.max(240, Math.min(720, modelPanel.height - modelPanel.anchorPoint.y - 16))
     onOpenChanged: if (open) { claudeDraft.model = bridge.config.claude_model || ""; claudeDraft.effort = bridge.config.claude_effort || ""
                                providerField.open = false; claudeField.open = false; codexField.open = false
                                bridge.refreshProviders() }
@@ -72,6 +74,9 @@ ContextPanel {
     function codexEntry(id) { return codexModels.filter(function(m) { return m.id === id })[0] || null }
     // The short display name; the canonical id never changes with it.
     function shortName(id, fallback) { return bridge.modelLabel(id || "", fallback || "") }
+    // Q8: the effort levels JARVIS knows read in the window's language; every other
+    // level (xhigh, max, ultra) is shown as it is. Display only: the value is never translated.
+    function effortLabel(e) { return e === "low" ? qsTr("low") : e === "medium" ? qsTr("medium") : e === "high" ? qsTr("high") : e }
     // Claude's choice: drafted here, persisted the moment it is made.
     QtObject { id: claudeDraft; property string model: ""; property string effort: "" }
     // ``row``: the catalog row it was chosen from; the bridge keeps it as the model's lane when it is an alias.
@@ -117,32 +122,51 @@ ContextPanel {
                anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                text: on ? onText : offText; tint: on ? Theme.success : Theme.textMuted }
     }
-    // "Eski modelleri göster": window-only, off at every launch.
-    component OldModelsToggle: Item {
+    // "Eski modelleri göster": window-only, off at every launch. Hover is a tonal
+    // lift, keyboard focus the crisp ring (the Choice pattern); Space toggles.
+    component OldModelsToggle: Rectangle {
+        id: toggle
         objectName: "showOldModelsToggle"
-        width: parent ? parent.width : 0; height: 28
+        width: parent ? parent.width : 0; height: 28; radius: Theme.radiusSmall
+        color: toggleArea.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+        activeFocusOnTab: true
         Accessible.role: Accessible.CheckBox; Accessible.name: label.text; Accessible.checked: bridge.showOldModels
-        Rectangle { id: box; x: 2; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
+        Accessible.onToggleAction: bridge.setShowOldModels(!bridge.showOldModels)
+        Keys.onSpacePressed: bridge.setShowOldModels(!bridge.showOldModels)
+        Rectangle { id: box; x: 8; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
                     color: bridge.showOldModels ? Theme.alpha(Theme.commandEdge, 0.25) : "transparent"
                     border.width: 1; border.color: bridge.showOldModels ? Theme.commandEdge : Theme.borderStrong
                     Text { anchors.centerIn: parent; visible: bridge.showOldModels; text: "✓"; color: Theme.commandEdge; font: Theme.caption } }
         Text { id: label; x: box.x + box.width + 8; anchors.verticalCenter: parent.verticalCenter
                text: qsTr("Show older models"); color: Theme.textLabel; font: Theme.caption }
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setShowOldModels(!bridge.showOldModels) }
+        MouseArea { id: toggleArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: bridge.setShowOldModels(!bridge.showOldModels) }
+        Rectangle { objectName: "modelRowFocusRing"; anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"
+                    border.width: 2; border.color: Theme.materialGlint; visible: toggle.activeFocus }
     }
-    // A selected model that has a newer version: offered, never applied on its own.
+    // A selected model that has a newer version: an action row (accent text, no input
+    // look) - offered, never applied on its own. Return / Space / a click choose it.
     component NewerHint: Rectangle {
+        id: hint
         property string keeperTitle: ""
         signal chosen()
         objectName: "modelNewerHint"
         width: parent ? parent.width : 0; height: 30; radius: Theme.radiusSmall
-        color: hintArea.containsMouse ? Theme.alpha(Theme.commandEdge, 0.12) : Theme.alpha(Theme.commandEdge, 0.05)
-        border.width: 1; border.color: Theme.alpha(Theme.commandEdge, 0.4)
+        color: hintArea.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+        activeFocusOnTab: true
         Accessible.role: Accessible.Button; Accessible.name: hintText.text
+        Accessible.onPressAction: chosen()
+        Keys.onPressed: function (event) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { event.accepted = true; chosen() }
+        }
         Text { id: hintText; objectName: "modelNewerHintText"; x: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 24
-               elide: Text.ElideRight; textFormat: Text.PlainText; color: Theme.text; font: Theme.caption
-               text: qsTr("New version: %1").arg(parent.keeperTitle) }
-        MouseArea { id: hintArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: parent.chosen() }
+               elide: Text.ElideRight; textFormat: Text.PlainText; color: Theme.accent; font: Theme.captionStrong
+               text: "↑ " + qsTr("New version: %1").arg(hint.keeperTitle) }
+        MouseArea { id: hintArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: hint.chosen() }
+        Rectangle { objectName: "modelRowFocusRing"; anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"
+                    border.width: 2; border.color: Theme.materialGlint; visible: hint.activeFocus }
     }
     component Choice: Rectangle {
         id: choice
@@ -181,6 +205,8 @@ ContextPanel {
     }
 
     Flickable {
+        id: flick
+        objectName: "modelPanelScroll"
         anchors.fill: parent
         contentHeight: col.height + 8
         clip: true
@@ -268,13 +294,13 @@ ContextPanel {
                        text: qsTr("The CLI did not list its models.") }
                 Caption { text: qsTr("Effort") }
                 Segmented {
-                    objectName: "claudeEffort"
+                    objectName: "claudeEffort"; segmentPrefix: "claudeEffort_"
                     readonly property var entry: modelPanel.claudeEntry(claudeDraft.model)
                     readonly property var levels: entry ? entry.efforts : bridge.effortChoices
                     enabled: levels.length > 0
                     value: claudeDraft.effort
                     onPicked: function(v) { modelPanel.applyClaude(claudeDraft.model, v) }
-                    options: [{ value: "", label: qsTr("Default") }].concat(levels.map(function(e) { return { value: e, label: e } }))
+                    options: [{ value: "", label: qsTr("Default") }].concat(levels.map(function(e) { return { value: e, label: modelPanel.effortLabel(e) } }))
                 }
                 Line { visible: !!modelPanel.claudeEntry(claudeDraft.model) && modelPanel.claudeEntry(claudeDraft.model).efforts.length === 0
                        text: qsTr("This model does not support an effort setting.") }
@@ -378,11 +404,11 @@ ContextPanel {
                        text: qsTr("The saved model %1 is not offered now; calls are refused until you choose one.").arg(bridge.codexModel) }
                 Caption { text: qsTr("Effort") }
                 Segmented {
-                    objectName: "codexEffort"
+                    objectName: "codexEffort"; segmentPrefix: "codexEffort_"
                     enabled: !!codexBlock.current
                     value: bridge.codexEffort
                     onPicked: function(v) { bridge.setCodexModel(bridge.codexModel, v) }
-                    options: (codexBlock.current ? codexBlock.current.efforts : []).map(function(e) { return { value: e, label: e } })
+                    options: (codexBlock.current ? codexBlock.current.efforts : []).map(function(e) { return { value: e, label: modelPanel.effortLabel(e) } })
                 }
                 Rectangle { width: parent.width; height: 1; color: Theme.border }
                 Caption { text: qsTr("Usage") }
@@ -428,6 +454,19 @@ ContextPanel {
                                      .arg(modelPanel.tokens(modelPanel.reported.output_tokens)).arg(modelPanel.tokens(modelPanel.reported.reasoning_output_tokens)) }
                 }
             }
+        }
+    }
+    // More content below: a 24 px fade into the surface colour (never over the last row).
+    Rectangle {
+        objectName: "modelPanelFade"
+        readonly property bool more: flick.contentHeight > flick.height + 1 && flick.contentY + flick.height < flick.contentHeight - 1
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        height: 24
+        opacity: more ? 1 : 0; visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+        gradient: Gradient {
+            GradientStop { position: 0; color: Theme.alpha(Theme.glassOverlay, 0) }
+            GradientStop { position: 1; color: Theme.glassOverlay }
         }
     }
 }

@@ -14,6 +14,7 @@ No test calls a CLI, a model or the network, or opens the live DB.
 
 from __future__ import annotations
 
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from PySide6.QtCore import QPointF
 
 from jarvis.model_retirement import codex_retirement, newest_per_name
 from tests.test_projects_ui import ProjectsUiCase
+from tests.test_projects_ui_6e import WindowCase as SixEWindowCase, settle
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.test_ui import UiTestCase, _APP, pump
 
@@ -285,3 +287,199 @@ class CatalogTests(UiTestCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Eski modelleri göster", tx("ModelPanel", "Show older models"))
         self.assertEqual("Yeni sürüm: %1", tx("ModelPanel", "New version: %1"))
+
+    def test_e_the_effort_labels_are_turkish_and_nothing_else_moved(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        self.assertEqual(["düşük", "orta", "yüksek"], [tx("ModelPanel", w) for w in ("low", "medium", "high")])
+        self.assertEqual("Yeni sürüm: %1", tx("ModelPanel", "New version: %1"))      # the hint's own source is unchanged
+
+
+# -- Gate 6E, slice C6: the model panel (D27, Salih Q8 2026-10-03) --
+
+ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CLAUDE_FIVE = [{"id": "default", "name": "Default", "resolved": "claude-opus-5-5", "efforts": ALL_EFFORTS},
+               {"id": "opus", "name": "Opus", "resolved": "claude-opus-5-5", "efforts": ALL_EFFORTS}]
+
+
+class PolishTests(WindowCase):
+    def stage(self, provider="claude", old=False, lines=None, size=None):
+        bridge = self.bridge()
+        if old:
+            bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7"); pump(100)
+        self.fake_providers(bridge, lines or self.lines())
+        bridge.setChatProvider(provider)
+        if provider == "codex":
+            bridge.setCodexModel("gpt-6.1-sol", "medium")
+        root = self.window(bridge)
+        if size:
+            root.resize(*size); pump(300)
+        self.click(root, "modelTrigger"); pump(400)
+        self.root = root
+        return bridge, root
+
+    def under(self, item, name) -> list:
+        found, stack = [], [item]
+        while stack:
+            node = stack.pop()
+            if str(node.objectName()) == name and node.isVisible():
+                found.append(node)
+            stack.extend(node.childItems())
+        return found
+
+    def center(self, item):
+        return item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+
+    def hover(self, item) -> None:
+        from PySide6.QtTest import QTest
+        QTest.mouseMove(self.root, self.center(item)); pump(20)
+
+    def press(self, item) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        QTest.mouseClick(self.root, Qt.LeftButton, Qt.NoModifier, self.center(item)); pump(260)
+
+    def key(self, key) -> None:
+        from PySide6.QtTest import QTest
+        QTest.keyClick(self.root, key); pump(200)
+
+    def tr(self, bridge) -> None:
+        from jarvis.ui.i18n import localization
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        bridge.setLanguage("tr-TR"); pump(300)
+
+    def label_of(self, segment) -> str:
+        return next(c.property("text") for c in segment.childItems() if isinstance(c.property("text"), str))
+
+    def test_f_the_hint_is_an_action_row_with_hover_focus_and_keys(self) -> None:
+        from PySide6.QtCore import Qt
+        bridge, root = self.stage(old=True)
+        hint = self.shown(root, "modelNewerHint")
+        text = self.shown(root, "modelNewerHintText")
+        self.assertEqual("↑ New version: Opus 5.5", text.property("text"))
+        self.assertTrue(hint.property("activeFocusOnTab"))
+        # At rest it is text, not a box: nothing is filled. Hover lifts it (eased in).
+        self.assertEqual(0.0, hint.property("color").alphaF())
+        self.hover(hint)
+        settle(lambda: abs(hint.property("color").alphaF() - 0.05) < 0.003)
+        self.assertAlmostEqual(0.05, hint.property("color").alphaF(), places=2)
+        # Focus: the ring (only then).
+        self.assertFalse(self.under(hint, "modelRowFocusRing"))
+        hint.forceActiveFocus(); pump(60)
+        self.assertTrue(self.under(hint, "modelRowFocusRing"))
+        # Return does what a click does: the keeper, and nothing before.
+        self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)
+        self.key(Qt.Key_Return)
+        self.assertEqual("claude-opus-5-5", self.store.load().settings.claude_model)
+        # Space does the same, again from a fresh old selection.
+        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7"); pump(100)
+        self.click(root, "modelTrigger"); pump(300)                   # close and reopen: the panel re-reads the selection
+        self.click(root, "modelTrigger"); pump(400)
+        hint = self.shown(root, "modelNewerHint")
+        hint.forceActiveFocus(); pump(60)
+        self.key(Qt.Key_Space)
+        self.assertEqual("claude-opus-5-5", self.store.load().settings.claude_model)
+
+    def test_g_the_toggle_has_hover_focus_and_space(self) -> None:
+        from PySide6.QtCore import Qt
+        bridge, root = self.stage()
+        toggle = self.shown(root, "showOldModelsToggle")
+        self.assertTrue(toggle.property("activeFocusOnTab"))
+        self.assertEqual(0.0, toggle.property("color").alphaF())
+        self.hover(toggle)
+        settle(lambda: abs(toggle.property("color").alphaF() - 0.05) < 0.003)
+        self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)
+        self.assertFalse(self.under(toggle, "modelRowFocusRing"))
+        toggle.forceActiveFocus(); pump(60)
+        self.assertTrue(self.under(toggle, "modelRowFocusRing"))
+        self.assertFalse(bridge.showOldModels)
+        self.key(Qt.Key_Space)
+        self.assertTrue(bridge.showOldModels)
+        self.key(Qt.Key_Space)
+        self.assertFalse(bridge.showOldModels)
+        self.key(Qt.Key_Return)                                   # Space only, like a check box
+        self.assertFalse(bridge.showOldModels)
+
+    def test_h_effort_labels_are_turkish_for_the_three_levels_and_the_values_never_change(self) -> None:
+        lines = self.lines(claude=CLAUDE_FIVE)
+        bridge, root = self.stage(lines=lines)
+        labels = lambda prefix, values: [self.label_of(self.shown(root, prefix + v)) for v in values]  # noqa: E731
+        self.assertEqual(["low", "medium", "high", "xhigh", "max"], labels("claudeEffort_", ALL_EFFORTS))     # English as today
+        self.assertEqual("Default", self.label_of(self.shown(root, "claudeEffort_")))
+        self.tr(bridge)
+        self.assertEqual(["düşük", "orta", "yüksek", "xhigh", "max"], labels("claudeEffort_", ALL_EFFORTS))
+        self.assertEqual("Varsayılan", self.label_of(self.shown(root, "claudeEffort_")))
+        # The picked value is the stored one, in every language.
+        for value in ("high", "low", "xhigh"):
+            self.press(self.shown(root, "claudeEffort_" + value))
+            self.assertEqual(value, self.store.load().settings.claude_effort)
+            self.assertEqual(value, bridge.config["claude_effort"])
+
+    def test_h_codex_effort_labels_and_values(self) -> None:
+        bridge, root = self.stage("codex")
+        self.tr(bridge)
+        self.assertEqual(["düşük", "orta", "yüksek"], [self.label_of(self.shown(root, "codexEffort_" + v)) for v in EFFORTS])
+        self.press(self.shown(root, "codexEffort_high"))
+        self.assertEqual("high", bridge.codexEffort)
+        self.press(self.shown(root, "codexEffort_low"))
+        self.assertEqual("low", bridge.codexEffort)
+
+    def test_i_the_panel_stays_inside_the_window_at_every_size(self) -> None:
+        for size in ((1100, 700), (1280, 760), (1920, 1080)):
+            with self.subTest(size=size):
+                bridge, root = self.stage(size=size)
+                surface = self.shown(root, "modelSurface")
+                self.assertEqual(min(720, size[1] - surface.y() - 16), surface.height())
+                self.assertLessEqual(surface.y() + surface.height(), size[1] - 16)
+                self.assertLessEqual(surface.height(), 720)
+                scroll = self.shown(root, "modelPanelScroll")
+                self.assertLessEqual(scroll.mapToScene(QPointF(0, scroll.height())).y(), surface.y() + surface.height())
+
+    def test_j_the_fade_shows_only_while_content_is_below(self) -> None:
+        bridge, root = self.stage(size=(1100, 700))
+        scroll = self.shown(root, "modelPanelScroll")
+        fade = lambda: [f for f in self.under(root.contentItem(), "modelPanelFade") if f.property("opacity") > 0]  # noqa: E731
+        self.assertEqual(24, self.under(root.contentItem(), "modelPanelFade")[0].height())
+        self.assertGreater(scroll.property("contentHeight"), scroll.height())
+        self.assertTrue(fade())                                                       # at the top, more below
+        end = scroll.property("contentHeight") - scroll.height()
+        scroll.setProperty("contentY", end)
+        settle(lambda: not fade())
+        self.assertFalse(fade())                                                      # at the end, nothing below
+        scroll.setProperty("contentY", end / 2)
+        settle(lambda: bool(fade()))
+        self.assertTrue(fade())
+        scroll.setProperty("contentHeight", scroll.height() - 10)                     # content that fits: no fade at all
+        scroll.setProperty("contentY", 0)
+        settle(lambda: not fade())
+        self.assertFalse(fade())
+
+    def test_k_motion_follows_the_tokens_and_ambient_off_is_instant(self) -> None:
+        bridge, root = self.stage(old=True, size=(1100, 700))
+        scroll = self.shown(root, "modelPanelScroll")
+        fade = self.under(root.contentItem(), "modelPanelFade")[0]
+        end = scroll.property("contentHeight") - scroll.height()
+        scroll.setProperty("contentY", end)
+        settle(lambda: not fade.property("visible"))
+        samples = SixEWindowCase.motion(self, root, fade)
+        mark, called = len(samples), time.monotonic()
+        scroll.setProperty("contentY", 0)                                             # more below again: fades in over hoverMs
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, True, 110)
+        mark, called = len(samples), time.monotonic()
+        scroll.setProperty("contentY", end)
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, False, 110)
+        # Hover lifts follow hoverMs too: the end state is held once reached.
+        hint = self.shown(root, "modelNewerHint")
+        self.hover(hint)
+        settle(lambda: abs(hint.property("color").alphaF() - 0.05) < 0.003)
+        # Ambient effects off: every one of them at once.
+        bridge.setAmbientEffects(False); pump(100)
+        toggle = self.shown(root, "showOldModelsToggle")
+        self.assertEqual(0.0, toggle.property("color").alphaF())
+        self.hover(toggle)
+        self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)    # one pump, no animation
+        scroll.setProperty("contentY", 0); pump(10)
+        self.assertEqual(1.0, fade.property("opacity"))
+        scroll.setProperty("contentY", end); pump(10)
+        self.assertEqual((0.0, False), (fade.property("opacity"), fade.property("visible")))

@@ -2002,6 +2002,18 @@ yok</translation>
         <translation>Sağlayıcı</translation>
     </message>
     <message>
+        <source>low</source>
+        <translation>düşük</translation>
+    </message>
+    <message>
+        <source>medium</source>
+        <translation>orta</translation>
+    </message>
+    <message>
+        <source>high</source>
+        <translation>yüksek</translation>
+    </message>
+    <message>
         <source>Show older models</source>
         <translation>Eski modelleri göster</translation>
     </message>
