@@ -37,4 +37,8 @@ Rectangle {
         }
     }
     opacity: enabled ? 1 : 0.38
+    // Keyboard focus (Gate 6E): the ActionButton ring - crisp, 2 px, outside the well.
+    activeFocusOnTab: true
+    Rectangle { objectName: "segmentedFocusRing"; visible: seg.activeFocus; anchors.fill: parent; anchors.margins: -4
+                radius: parent.radius + 4; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
 }

@@ -241,6 +241,15 @@ QtObject {
     readonly property int gap: 15
     readonly property int pad: 18
     readonly property int margin: 30
+    // Gate 6E shared sizes: the TopBar scope pills (selector, switcher, new),
+    // the menu rows (selector, switcher, context menu), the History / Projects
+    // list rows; the dialog scrim (attach, delete, purge: the approval
+    // overlay's strength) and the hover tip delay (as PowerControl's).
+    readonly property int pillHeight: 30
+    readonly property int rowHeight: 40
+    readonly property int menuRowHeight: 36
+    readonly property real scrimOpacity: 0.56
+    readonly property int tipDelay: 500
 
     // -- stage 1: glow (0-120 ms) --------------------------------------
     property color glow: space ? "#3d8bff" : "#2a5fb0"

@@ -9,16 +9,28 @@ C. One word: no "konuşma" in any Turkish string of the 6A-6D surfaces, the
    Composer, the command palette or the Bridge; the headings read SOHBETLER,
    ARŞİVLENMİŞ SOHBETLER and ARŞİVLENMİŞ PROJELER.
 
-Strings only: no behaviour, signal or layout is under test here.
-No test performs a live model, auth or network call or opens the live DB.
+Slice C2 - the shared parts the surfaces adopt in C3-C5 (exercised on their
+own in a harness built in the real window's engine):
+K. Theme tokens: pillHeight, rowHeight, menuRowHeight, scrimOpacity, tipDelay.
+L-M. HoverTip: waits for tipDelay; the whole name, wrapped, never elided, at
+   most 480 px; full opacity under a disabled, dimmed owner.
+N-Q. JarvisDialog: black scrim at .56; inside the window at every size with an
+   oversized body, footer visible; Esc / Tab / initial focus / focus return /
+   Enter rules; confirm only while fully open; motion on its tokens (judged on
+   animation frames), none at all with ambient effects off.
+R. Segmented: the focus ring on Tab focus.
+
+C1 tests are strings only. No test performs a live model, auth or network call or opens the live DB.
 """
 
 from __future__ import annotations
 
 import re
+import time
 import unittest
+from pathlib import Path
 
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import Q_ARG, QMetaObject, QObject, QPoint, QPointF, QRectF, Qt
 from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
@@ -215,6 +227,298 @@ class CatalogTests(UiTestCase):
             self.assertEqual(expected, tx("AttachDialog", source))
         self.assertEqual("1 görev", tx("HistoryPage", "1 task"))
         self.assertEqual("%1 görev", tx("HistoryPage", "%1 tasks"))
+
+
+# -- slice C2: the shared parts (Theme tokens, HoverTip, JarvisDialog, Segmented) --
+
+COMPONENTS = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components"
+LONG_NAME = ("Kat malikleri toplantısı için hazırlanacak belgeler, aidat hesapları, tadilat izinleri ve "
+             "yönetim planı değişikliği özeti")                                  # 120 characters
+SIZES = ((1100, 700), (1280, 760), (1920, 1080))
+# Built in the real window's engine (its Theme, i18n and imports); no surface
+# adopts these parts before C3-C5, so they are exercised here on their own.
+HARNESS = """
+import QtQuick
+import QtQuick.Controls.Basic
+import "../theme"
+Item {
+    anchors.fill: parent; z: 10000                  // above the window's own full-size layers
+    property int confirmed: 0
+    property int lines: 2
+    ActionButton { id: before; objectName: "h6eBefore"; label: "Before"; x: 40; y: 300
+                   onClicked: dialog.openFrom(before) }
+    Segmented { objectName: "h6eSegmented"; x: 160; y: 300; value: "a"
+                options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }
+    Rectangle { id: owner; objectName: "h6eOwner"; x: 40; y: 360; width: 160; height: 30
+                enabled: false; opacity: 0.45; color: "#334455" }
+    HoverTip { objectName: "h6eSiblingTip"; target: owner; text: "Wait for the current run to finish." }
+    Rectangle { objectName: "h6eNamed"; x: 40; y: 420; width: 160; height: 30; color: "#334455"
+                MouseArea { objectName: "h6eNamedArea"; anchors.fill: parent; hoverEnabled: true }
+                HoverTip { objectName: "h6eChildTip"; text: "%s" } }
+    JarvisDialog {
+        id: dialog
+        objectName: "h6eDialog"
+        label: "Delete permanently"; title: "Delete this conversation permanently?"; danger: true
+        initialFocus: cancel; confirmItem: confirm; enterGuard: [guarded]
+        Repeater { model: parent ? lines : 0
+                   Text { objectName: "h6eLine"; text: "Line " + index; height: 30; color: Theme.text; font: Theme.body } }
+        TextField { id: field; objectName: "h6eField"; width: 220 }
+        TextField { id: guarded; objectName: "h6eGuarded"; width: 220 }
+        buttons: [
+            ActionButton { id: cancel; objectName: "h6eCancel"; label: "Cancel"; onClicked: dialog.close() },
+            ActionButton { id: confirm; objectName: "h6eConfirm"; label: "Delete permanently"; danger: true; primary: true
+                           onClicked: { confirmed += 1; dialog.close() } }
+        ]
+    }
+}
+""" % LONG_NAME
+
+
+def settle(condition, timeout: float = 5.0) -> None:
+    """Turn the loop until the asserted condition holds (bounded), not for a fixed time."""
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        pump(10)
+
+
+class SharedPartsCase(WindowCase):
+    def harness(self, bridge, size=(1920, 1080)):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlComponent
+        root = self.window(bridge)
+        root.resize(*size); pump(300)
+        component = QQmlComponent(self.engine)
+        component.setData(HARNESS.encode("utf-8"), QUrl.fromLocalFile(str(COMPONENTS / "Harness6e.qml")))
+        self.assertFalse(component.isError(), component.errorString())
+        harness = component.beginCreate(self.engine.rootContext())
+        harness.setParentItem(root.contentItem())
+        harness.setParent(root.contentItem())                     # owned by the window, deleted with it
+        component.completeCreate()
+        pump(100)
+        self.root, self.harness_item = root, harness
+        return root, harness
+
+    def obj(self, name):
+        found = self.harness_item.findChild(QObject, name)
+        self.assertIsNotNone(found, name)
+        return found
+
+    def scene_rect(self, item) -> QRectF:
+        return self.rect(item)
+
+    def hover(self, item) -> None:
+        QTest.mouseMove(self.root, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
+        pump(20)
+
+    def focus(self):
+        return self.root.activeFocusItem()
+
+    def inside(self, item, ancestor) -> bool:
+        while item is not None:
+            if item == ancestor:
+                return True
+            item = item.parentItem()
+        return False
+
+    def scrims(self) -> list:
+        return [i for i in self.all_items(self.root, "jarvisDialogScrim") if i.isVisible()]
+
+
+class TokenTests(UiTestCase):
+    def test_k_the_shared_tokens(self) -> None:
+        bridge = self.bridge()
+        root = self.load(bridge)
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlComponent
+        component = QQmlComponent(self.engine)
+        component.setData(b'import QtQuick\nimport "../theme"\nQtObject { readonly property var t: '
+                          b'[Theme.pillHeight, Theme.rowHeight, Theme.menuRowHeight, Theme.scrimOpacity, Theme.tipDelay] }',
+                          QUrl.fromLocalFile(str(COMPONENTS / "Tokens6e.qml")))
+        probe = component.create(self.engine.rootContext())
+        probe.setParent(root)                                      # owned by the window, deleted with it
+        self.assertEqual([30, 40, 36, 0.56, 500], [round(v, 2) for v in probe.property("t").toVariant()])
+
+
+class HoverTipTests(SharedPartsCase):
+    def test_l_the_tip_waits_for_its_delay_then_shows_the_whole_name(self) -> None:
+        root, _ = self.harness(self.bridge(), (1100, 700))
+        tip = self.obj("h6eChildTip")
+        started = time.monotonic()
+        self.hover(self.obj("h6eNamed"))
+        pump(150)
+        if time.monotonic() - started < 0.45:                  # still inside the 500 ms delay
+            self.assertFalse(tip.property("shown"))
+        settle(lambda: tip.property("shown"))
+        self.assertTrue(tip.property("shown"))
+        self.assertGreaterEqual(time.monotonic() - started, 0.5 - 0.02)
+        self.assertTrue(self.obj("h6eNamedArea").property("containsMouse"))     # the owner's own hover is shared
+        text = self.visible(root, "hoverTipText")[0]
+        popup = text.parentItem()
+        self.assertEqual(LONG_NAME, text.property("text"))
+        self.assertFalse(text.property("truncated"))           # nothing elided or cut
+        self.assertIn(text.property("lineCount"), (2, 3))      # wraps, within 3 lines
+        self.assertLessEqual(popup.width(), 480)
+        self.assertGreater(popup.width(), 400)                 # a long name uses the room before wrapping
+        box = self.rect(popup)
+        self.assertTrue(QRectF(0, 0, root.width(), root.height()).contains(box), box)
+
+    def test_m_a_disabled_owners_tip_is_at_full_opacity(self) -> None:
+        root, _ = self.harness(self.bridge())
+        owner, tip = self.obj("h6eOwner"), self.obj("h6eSiblingTip")
+        self.assertFalse(owner.isEnabled())
+        self.hover(owner)
+        settle(lambda: tip.property("shown"))
+        self.assertTrue(tip.property("shown"))
+        text = self.visible(root, "hoverTipText")[0]
+        opacity, item = 1.0, text
+        while item is not None:                                # what the eye gets: every ancestor's opacity
+            opacity *= item.opacity()
+            item = item.parentItem()
+        self.assertEqual(1.0, opacity)
+        self.assertEqual(1, text.property("lineCount"))        # a short reason: one line, its own width
+        self.assertLess(text.parentItem().width(), 480)
+        QTest.mouseMove(root, QPoint(5, root.height() - 5)); pump(100)
+        self.assertFalse(tip.property("shown"))
+
+
+class DialogShellTests(SharedPartsCase):
+    def open(self, dialog) -> None:
+        QMetaObject.invokeMethod(self.obj("h6eBefore"), "forceActiveFocus")
+        QMetaObject.invokeMethod(dialog, "openFrom", Q_ARG("QVariant", self.obj("h6eBefore")))
+
+    def test_n_scrim_size_and_footer_at_every_size(self) -> None:
+        bridge = self.bridge()
+        root, harness = self.harness(bridge)
+        dialog = self.obj("h6eDialog")
+        harness.setProperty("lines", 60)                      # a body far taller than any window
+        for width, height in SIZES:
+            with self.subTest(size=(width, height)):
+                root.resize(width, height); pump(300)
+                self.open(dialog)
+                settle(lambda: dialog.property("opened"))
+                scrim = self.scrims()
+                self.assertEqual(1, len(scrim))
+                settle(lambda: scrim[0].opacity() == 1.0)
+                self.assertAlmostEqual(0.56, scrim[0].property("color").alphaF(), places=2)
+                self.assertEqual((0.0, 0.0, 0.0), scrim[0].property("color").getRgbF()[:3])
+                self.assertEqual(1.0, scrim[0].opacity())
+                window = QRectF(16, 16, width - 32, height - 32)
+                panel = self.rect(self.obj("jarvisDialogBody").parentItem())
+                self.assertTrue(window.contains(panel), (panel, width, height))
+                for name in ("h6eCancel", "h6eConfirm"):
+                    button = self.rect(self.obj(name))
+                    self.assertTrue(panel.contains(button), (name, button, panel))
+                body = self.obj("jarvisDialogBody")
+                self.assertGreater(body.property("contentHeight"), body.height())      # the body scrolls
+                QMetaObject.invokeMethod(dialog, "close")
+                settle(lambda: not dialog.property("visible"))
+
+    def test_o_keys_focus_and_enter(self) -> None:
+        bridge = self.bridge()
+        root, harness = self.harness(bridge)
+        bridge.setPage("history"); pump(500)
+        dialog = self.obj("h6eDialog")
+        cancel, confirm, field, guarded = (self.obj(n) for n in ("h6eCancel", "h6eConfirm", "h6eField", "h6eGuarded"))
+        self.open(dialog)
+        settle(lambda: dialog.property("opened"))
+        self.assertTrue(cancel.hasActiveFocus())                                    # the SAFE control
+        frame = self.obj("jarvisDialogBody").parentItem()
+        for _ in range(8):                                                         # Tab never leaves the dialog
+            QTest.keyClick(root, Qt.Key_Tab); pump(30)
+            self.assertTrue(self.inside(self.focus(), frame), self.focus())
+        # Enter in a field confirms nothing (the dialog did not opt in) ...
+        field.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(60)
+        self.assertEqual((0, True), (harness.property("confirmed"), dialog.property("visible")))
+        # ... and a guarded field never does, even when the dialog opts in.
+        dialog.setProperty("enterConfirms", True)
+        guarded.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(60)
+        self.assertEqual((0, True), (harness.property("confirmed"), dialog.property("visible")))
+        # Enter on the focused Cancel cancels.
+        cancel.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return)
+        settle(lambda: not dialog.property("visible"))
+        self.assertEqual(0, harness.property("confirmed"))
+        self.assertTrue(self.obj("h6eBefore").hasActiveFocus())                    # focus returns to the opener
+        # Esc cancels: the dialog closes, the page under it stays.
+        self.open(dialog)
+        settle(lambda: dialog.property("opened"))
+        QTest.keyClick(root, Qt.Key_Escape)
+        settle(lambda: not dialog.property("visible"))
+        self.assertEqual((0, "history"), (harness.property("confirmed"), bridge.page))
+        self.assertTrue(self.obj("h6eBefore").hasActiveFocus())
+        # Enter on the focused confirm button confirms; with opt-in an unguarded field does too.
+        self.open(dialog)
+        settle(lambda: dialog.property("opened"))
+        confirm.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return)
+        settle(lambda: not dialog.property("visible"))
+        self.open(dialog)
+        settle(lambda: dialog.property("opened"))
+        field.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return)
+        settle(lambda: not dialog.property("visible"))
+        self.assertEqual(2, harness.property("confirmed"))
+
+    def test_p_confirm_waits_for_the_motion_and_the_motion_keeps_its_tokens(self) -> None:
+        from PySide6.QtCore import SIGNAL
+        bridge = self.bridge()
+        root, _ = self.harness(bridge)
+        dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
+        ticks, events = [], {}
+        root.afterAnimating.connect(lambda: ticks.append(time.monotonic()))
+        QObject.connect(dialog, SIGNAL("opened()"), lambda: events.setdefault("opened", (time.monotonic(), len(ticks))))
+        QObject.connect(dialog, SIGNAL("closed()"), lambda: events.setdefault("closed", (time.monotonic(), len(ticks))))
+
+        def within_token_plus_one_frame(event: str, started_at: int, token_ms: int) -> None:
+            # Judged on the window's own animation frames, not on a wall-clock
+            # budget: the end state is reached no later than the frame after the
+            # first frame at or past the token (a starved loop just makes fewer,
+            # longer frames).
+            at, seen = events[event]
+            start = ticks[started_at] if len(ticks) > started_at else at
+            late = [t for t in ticks[started_at:seen] if t >= start + token_ms / 1000]
+            self.assertLessEqual(len(late), 1, (event, len(late)))
+            self.assertGreaterEqual(at - start, token_ms / 1000 - 0.03, event)      # it really moved
+
+        mark = len(ticks)
+        self.open(dialog)
+        self.assertFalse(confirm.isEnabled())                 # not while it is still opening
+        self.assertLess(dialog.property("opacity"), 1.0)
+        settle(lambda: "opened" in events)
+        self.assertTrue(confirm.isEnabled())
+        within_token_plus_one_frame("opened", mark, 220)      # Theme.pageMs
+        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
+        mark = len(ticks)
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(confirm.isEnabled())                 # nor while it is closing
+        settle(lambda: "closed" in events)
+        within_token_plus_one_frame("closed", mark, 150)      # Theme.panelOut
+
+    def test_q_ambient_off_means_no_motion_and_end_states_at_once(self) -> None:
+        bridge = self.bridge()
+        bridge.setAmbientEffects(False)
+        root, _ = self.harness(bridge)
+        dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
+        self.open(dialog)                                     # no pumping between the call and the checks
+        self.assertTrue(dialog.property("opened"))
+        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
+        self.assertTrue(confirm.isEnabled())
+        self.assertEqual([1.0], [s.opacity() for s in self.scrims()])
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(dialog.property("visible"))
+        self.assertTrue(self.obj("h6eBefore").hasActiveFocus())
+
+
+class SegmentedFocusTests(SharedPartsCase):
+    def test_r_the_segmented_well_shows_the_ring_on_tab_focus(self) -> None:
+        root, _ = self.harness(self.bridge())
+        segmented = self.obj("h6eSegmented")
+        ring = segmented.findChild(QObject, "segmentedFocusRing")
+        self.assertFalse(ring.isVisible())
+        QMetaObject.invokeMethod(self.obj("h6eBefore"), "forceActiveFocus"); pump(30)
+        QTest.keyClick(root, Qt.Key_Tab); pump(60)
+        self.assertTrue(segmented.hasActiveFocus())
+        self.assertTrue(ring.isVisible())
+        from PySide6.QtQml import QQmlProperty
+        self.assertEqual(2, QQmlProperty.read(ring, "border.width"))
+        self.assertEqual("a", segmented.property("value"))      # focus alone picks nothing
 
 
 if __name__ == "__main__":  # pragma: no cover
