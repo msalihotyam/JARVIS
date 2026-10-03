@@ -20,6 +20,7 @@ Popup {
     id: dialog
     property string label: ""                 // the small UPPERCASE line beside the dot
     property string title: ""
+    property string titleName: "jarvisDialogTitle"      // the title Text's objectName (a caller's own name)
     property bool danger: false
     property int preferredWidth: 600
     property Item initialFocus: null
@@ -104,7 +105,7 @@ Popup {
                 Text { objectName: "jarvisDialogLabel"; anchors.verticalCenter: parent.verticalCenter
                        text: i18n.upper(dialog.label); color: dialog.tone; font: Theme.label }
             }
-            Text { objectName: "jarvisDialogTitle"; visible: text !== ""; width: parent.width
+            Text { objectName: dialog.titleName; visible: text !== ""; width: parent.width
                    wrapMode: Text.Wrap; textFormat: Text.PlainText; text: dialog.title; color: Theme.text; font: Theme.subtitle }
         }
 

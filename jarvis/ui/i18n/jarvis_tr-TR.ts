@@ -183,6 +183,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yeni proje adı</translation>
     </message>
     <message>
+        <source>Choose a project to preview.</source>
+        <translation>Önizlemek için bir proje seçin.</translation>
+    </message>
+    <message>
         <source>&quot;%1&quot; · %2 · created %3</source>
         <translation>&quot;%1&quot; · %2 · oluşturuldu %3</translation>
     </message>
@@ -229,6 +233,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>• The model will see this conversation&apos;s earlier messages together with %1&apos;s context.</source>
         <translation>• Model bu sohbetin önceki mesajlarını %1 projesinin bağlamıyla birlikte görür.</translation>
+    </message>
+    <message>
+        <source>• The owner becomes the new project, permanently.</source>
+        <translation>• Sahip kalıcı olarak yeni proje olur.</translation>
+    </message>
+    <message>
+        <source>• It leaves History and appears in the new project&apos;s list.</source>
+        <translation>• Geçmiş&apos;ten çıkar ve yeni projenin listesinde görünür.</translation>
+    </message>
+    <message>
+        <source>• From the next message, the new project&apos;s instruction, file excerpts and memory may be used.</source>
+        <translation>• Bir sonraki mesajdan itibaren yeni projenin talimatı, dosya alıntıları ve hafızası kullanılabilir.</translation>
+    </message>
+    <message>
+        <source>• The model will see this conversation&apos;s earlier messages together with the new project&apos;s context.</source>
+        <translation>• Model bu sohbetin önceki mesajlarını yeni projenin bağlamıyla birlikte görür.</translation>
     </message>
     <message>
         <source>WHAT DOES NOT CHANGE</source>

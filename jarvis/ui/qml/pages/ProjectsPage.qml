@@ -398,37 +398,43 @@ SecondaryPage {
     // Purge: the permanent second step. The dialog names the exact row (names
     // are not unique), says honestly what purge does not reach (ARCHITECTURE
     // 4.24) and acts only when that row's file name is typed exactly.
-    Popup {
+    // Gate 6E: on the shared dialog shell (danger tone; focus starts in the
+    // name field, where Enter confirms nothing).
+    JarvisDialog {
         id: purgeDialog
         objectName: "purgeDialog"
         property var file: ({})
-        parent: Overlay.overlay
-        anchors.centerIn: parent
-        width: 560; padding: 18
-        modal: true; focus: true
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        function openFor(row) { file = row; confirmName.text = ""; open(); confirmName.forceActiveFocus() }
-        background: Rectangle { radius: 12; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
-        contentItem: Column {
-            spacing: 12
-            Text { text: qsTr("Purge this file permanently?"); color: Theme.text; font: Theme.uiValue }
-            Text { objectName: "purgeIdentity"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
-                   color: Theme.text; font: Theme.pageRowStrong; text: purgeDialog.file.display_name || "" }
-            Text { objectName: "purgeIdentityMeta"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
-                   color: Theme.textMuted; font: Theme.pageMeta; text: page.fileMeta(purgeDialog.file) }
-            Text { objectName: "purgeResidue"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageMeta
-                   text: qsTr("Purge deletes this file's text from the project store for good and frees its quota; a tombstone (id, fingerprint, time) remains. It does NOT reach: copies already sent to a provider, approval previews and audit records that showed excerpts, task results and conversation history, database backups (such as jarvis.pre-v2.db), or leftover data in database free pages, the WAL, the file system or the disk.") }
-            Text { width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText; color: Theme.text; font: Theme.pageMeta
-                   text: qsTr("Type the file name to confirm: %1").arg(purgeDialog.file.display_name || "") }
-            Field { id: confirmName; objectName: "purgeConfirmName"; width: parent.width; height: 36; maximumLength: 1024 }
-            Row {
-                anchors.right: parent.right
-                spacing: 8
-                ActionButton { objectName: "purgeCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: purgeDialog.close() }
-                ActionButton { objectName: "purgeConfirm"; label: qsTr("Purge"); danger: true; primary: true; height: 36; width: 110
-                               enabled: confirmName.text === (purgeDialog.file.display_name || null)
-                               onClicked: { if (bridge.purgeProjectFile(page.current.id, purgeDialog.file.id, confirmName.text)) purgeDialog.close() } }
+        danger: true
+        preferredWidth: 560
+        label: qsTr("Purge")
+        title: qsTr("Purge this file permanently?")
+        initialFocus: confirmName
+        confirmItem: purgeConfirm
+        confirmEnabled: confirmName.text === (purgeDialog.file.display_name || null)
+        enterGuard: [confirmName]
+        function openFor(row) { file = row; confirmName.text = ""; open() }
+        Rectangle {
+            objectName: "purgeIdentityCard"
+            width: parent ? parent.width : 0; height: purgeIdentityColumn.height + 20; radius: Theme.radiusSmall
+            color: Theme.glassNested; border.width: 1; border.color: Theme.alpha(Theme.text, 0.10)
+            Column {
+                id: purgeIdentityColumn
+                x: 12; y: 10; width: parent.width - 24; spacing: 4
+                Text { objectName: "purgeIdentity"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                       color: Theme.text; font: Theme.pageRowStrong; text: purgeDialog.file.display_name || "" }
+                Text { objectName: "purgeIdentityMeta"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                       color: Theme.textMuted; font: Theme.pageMeta; text: page.fileMeta(purgeDialog.file) }
             }
         }
+        Text { objectName: "purgeResidue"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageMeta
+               text: qsTr("Purge deletes this file's text from the project store for good and frees its quota; a tombstone (id, fingerprint, time) remains. It does NOT reach: copies already sent to a provider, approval previews and audit records that showed excerpts, task results and conversation history, database backups (such as jarvis.pre-v2.db), or leftover data in database free pages, the WAL, the file system or the disk.") }
+        Text { width: parent ? parent.width : 0; wrapMode: Text.Wrap; textFormat: Text.PlainText; color: Theme.text; font: Theme.pageMeta
+               text: qsTr("Type the file name to confirm: %1").arg(purgeDialog.file.display_name || "") }
+        Field { id: confirmName; objectName: "purgeConfirmName"; width: parent ? parent.width : 0; height: 36; maximumLength: 1024 }
+        buttons: [
+            ActionButton { objectName: "purgeCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: purgeDialog.close() },
+            ActionButton { id: purgeConfirm; objectName: "purgeConfirm"; label: qsTr("Purge"); danger: true; primary: true; height: 36; width: 110
+                           onClicked: { if (bridge.purgeProjectFile(page.current.id, purgeDialog.file.id, confirmName.text)) purgeDialog.close() } }
+        ]
     }
 }

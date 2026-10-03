@@ -61,6 +61,31 @@ class WindowCase(ProjectsUiCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         bridge.setLanguage("tr-TR"); pump(300)
 
+    def motion(self, root, popup) -> list:
+        """(time, visible, opacity) of ``popup`` at every animation frame of the window."""
+        samples = []
+        root.afterAnimating.connect(lambda: samples.append(
+            (time.monotonic(), popup.property("visible"), popup.property("opacity"))))
+        return samples
+
+    def assert_motion_within_token_plus_one_frame(self, samples, called_at, mark, opening, token_ms) -> None:
+        """The end state (opening: shown at full opacity; closing: hidden or
+        transparent) is on screen within the token plus one frame of the
+        animation itself: from the first frame that shows motion to the first
+        frame that shows the end state takes at most the token plus the longest
+        gap between two frames that moved. Judged on the animation's own frames,
+        not a wall-clock budget - a starved loop only makes fewer, longer
+        frames - and never before the token has run since the call."""
+        done = (lambda s: s[1] and s[2] == 1.0) if opening else (lambda s: not s[1] or s[2] == 0.0)
+        settle(lambda: any(done(sample) for sample in samples[mark:]))
+        window = samples[mark:]
+        first = next(i for i, sample in enumerate(window) if done(sample))
+        moved = [i for i in range(1, first + 1) if window[i][1:] != window[i - 1][1:]]
+        self.assertTrue(moved, "no frame showed the motion")
+        gap = max([window[b][0] - window[a][0] for a, b in zip(moved, moved[1:])] or [1 / 60])
+        self.assertLessEqual(window[first][0] - window[moved[0]][0], token_ms / 1000 + gap, (token_ms, gap))
+        self.assertGreaterEqual(window[first][0] - called_at, token_ms / 1000 - 0.03)
+
 
 class CountTests(WindowCase):
     def test_a_delete_dialog_counts_messages_in_english(self) -> None:
@@ -457,39 +482,22 @@ class DialogShellTests(SharedPartsCase):
         self.assertEqual(2, harness.property("confirmed"))
 
     def test_p_confirm_waits_for_the_motion_and_the_motion_keeps_its_tokens(self) -> None:
-        from PySide6.QtCore import SIGNAL
         bridge = self.bridge()
         root, _ = self.harness(bridge)
         dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
-        ticks, events = [], {}
-        root.afterAnimating.connect(lambda: ticks.append(time.monotonic()))
-        QObject.connect(dialog, SIGNAL("opened()"), lambda: events.setdefault("opened", (time.monotonic(), len(ticks))))
-        QObject.connect(dialog, SIGNAL("closed()"), lambda: events.setdefault("closed", (time.monotonic(), len(ticks))))
-
-        def within_token_plus_one_frame(event: str, started_at: int, token_ms: int) -> None:
-            # Judged on the window's own animation frames, not on a wall-clock
-            # budget: the end state is reached no later than the frame after the
-            # first frame at or past the token (a starved loop just makes fewer,
-            # longer frames).
-            at, seen = events[event]
-            start = ticks[started_at] if len(ticks) > started_at else at
-            late = [t for t in ticks[started_at:seen] if t >= start + token_ms / 1000]
-            self.assertLessEqual(len(late), 1, (event, len(late)))
-            self.assertGreaterEqual(at - start, token_ms / 1000 - 0.03, event)      # it really moved
-
-        mark = len(ticks)
+        samples = self.motion(root, dialog)
+        mark, called = len(samples), time.monotonic()
         self.open(dialog)
         self.assertFalse(confirm.isEnabled())                 # not while it is still opening
         self.assertLess(dialog.property("opacity"), 1.0)
-        settle(lambda: "opened" in events)
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 220)    # Theme.pageMs
+        settle(lambda: dialog.property("opened"))
         self.assertTrue(confirm.isEnabled())
-        within_token_plus_one_frame("opened", mark, 220)      # Theme.pageMs
         self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        mark = len(ticks)
+        mark, called = len(samples), time.monotonic()
         QMetaObject.invokeMethod(dialog, "close")
         self.assertFalse(confirm.isEnabled())                 # nor while it is closing
-        settle(lambda: "closed" in events)
-        within_token_plus_one_frame("closed", mark, 150)      # Theme.panelOut
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
 
     def test_q_ambient_off_means_no_motion_and_end_states_at_once(self) -> None:
         bridge = self.bridge()
@@ -550,17 +558,6 @@ class ScopeGroupCase(WindowCase):
         text = text_item.property("text")
         shown = QFontMetricsF(text_item.property("font")).elidedText(text, Qt.TextElideMode.ElideRight, text_item.width())
         return len(text) if shown == text else len(shown.rstrip("…"))
-
-    def frames(self, root):
-        ticks = []
-        root.afterAnimating.connect(lambda: ticks.append(time.monotonic()))
-        return ticks
-
-    def within_token_plus_one_frame(self, ticks, started_at, at, seen, token_ms) -> None:
-        # The window's own animation frames, not a wall-clock budget (see C2).
-        start = ticks[started_at] if len(ticks) > started_at else at
-        late = [t for t in ticks[started_at:seen] if t >= start + token_ms / 1000]
-        self.assertLessEqual(len(late), 1)
 
 
 class ScopeLayoutTests(ScopeGroupCase):
@@ -709,26 +706,22 @@ class ScopeStateTests(ScopeGroupCase):
             self.assertEqual(0, shape.rotation())
 
     def test_x_menu_motion_follows_its_tokens_and_stops_with_ambient_off(self) -> None:
-        from PySide6.QtCore import SIGNAL
         self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
         self.home(bridge, "global")
         menu = root.findChild(QObject, "projectSelectorMenu")
-        ticks, events = self.frames(root), {}
-        QObject.connect(menu, SIGNAL("opened()"), lambda: events.__setitem__("opened", (time.monotonic(), len(ticks))))
-        QObject.connect(menu, SIGNAL("closed()"), lambda: events.__setitem__("closed", (time.monotonic(), len(ticks))))
-        mark = len(ticks)
+        samples = self.motion(root, menu)
+        mark, called = len(samples), time.monotonic()
         QMetaObject.invokeMethod(menu, "open")
         self.assertLess(menu.property("opacity"), 1.0)
-        settle(lambda: "opened" in events)
-        self.within_token_plus_one_frame(ticks, mark, *events["opened"], 180)     # Theme.panelIn
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 180)    # Theme.panelIn
+        settle(lambda: menu.property("y") == menu.property("restY"))
         self.assertEqual(1.0, menu.property("opacity"))
         self.assertEqual(menu.property("restY"), menu.property("y"))
-        mark = len(ticks)
+        mark, called = len(samples), time.monotonic()
         QMetaObject.invokeMethod(menu, "close")
-        settle(lambda: "closed" in events)
-        self.within_token_plus_one_frame(ticks, mark, *events["closed"], 150)     # Theme.panelOut
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
         # Ambient effects off: no motion at all - the end state at once.
         bridge.setAmbientEffects(False); pump(100)
         for name in ("projectSelectorMenu", "conversationSwitcherMenu", "conversationSwitcherContext"):
@@ -738,6 +731,210 @@ class ScopeStateTests(ScopeGroupCase):
             self.assertEqual((1.0, popup.property("restY")), (popup.property("opacity"), popup.property("y")))
             QMetaObject.invokeMethod(popup, "close")
             self.assertFalse(popup.property("visible"), name)
+
+
+# -- slice C4: the attach, delete and purge dialogs on the shell --
+
+LONG_NEW = "Yazlık evin çatı onarımı, sigorta başvurusu, usta teklifleri ve belediye izinlerinin karşılaştırması"
+
+
+class DialogAdoptionCase(ScopeGroupCase):
+    def stage(self):
+        """Global conversation (attach), an archived one (delete), a retired file (purge)."""
+        store = self.db()
+        self.home_project = store.create_project("Evim")
+        doomed = store.create_conversation(title="Eski vergi notları")
+        say(store, doomed.id, "bir")
+        store.archive_conversation(doomed.id)
+        self.doomed = doomed.id
+        bridge = self.bridge()
+        root = self.window(bridge)
+        path = self.root / "fixture-files" / "rapor.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("gizli veri " * 30, encoding="utf-8")
+        bridge.backend.project_file("add", self.home_project.id, path=str(path), classification="sensitive")
+        file_id = store.list_project_files(self.home_project.id)[0]["id"]
+        bridge.backend.project_file("retire", self.home_project.id, file_id=file_id)
+        return store, bridge, root
+
+    def dialog(self, root, name):
+        shown = [d for d in root.findChildren(QObject, name) if d.property("visible")]
+        return shown[0] if shown else root.findChildren(QObject, name)[0]
+
+    def open_attach(self, bridge, root):
+        bridge.setPage("home"); pump(300)
+        self.click(root, "projectSelector"); pump(200)
+        self.click(root, "projectSelectorAttach"); pump(100)
+        return self.dialog(root, "attachDialog")
+
+    def open_delete(self, bridge, root):
+        bridge.setPage("history"); pump(400)
+        self.press(root, self.visible(root, "historyDelete")[0])
+        return self.dialog(root, "conversationDeleteDialog")
+
+    def open_purge(self, bridge, root):
+        bridge.showProject(self.home_project.id); pump(400)
+        self.item(root, "projectsPage").setProperty("section", "files"); pump(200)
+        self.press(root, self.visible(root, "filePurge")[0])
+        return self.dialog(root, "purgeDialog")
+
+    def frame(self, dialog):
+        return dialog.findChild(QObject, "jarvisDialogBody").parentItem()
+
+    def inside(self, item, ancestor) -> bool:
+        while item is not None:
+            if item == ancestor:
+                return True
+            item = item.parentItem()
+        return False
+
+    def scrims(self, root) -> list:
+        return [i for i in self.all_items(root, "jarvisDialogScrim") if i.isVisible()]
+
+    def close(self, dialog) -> None:
+        QMetaObject.invokeMethod(dialog, "close")
+        settle(lambda: not dialog.property("visible"))
+
+
+class DialogLayoutTests(DialogAdoptionCase):
+    def test_y_every_dialog_stays_inside_the_window_with_its_footer_and_scrim(self) -> None:
+        store, bridge, root = self.stage()
+        cases = (("attach", self.open_attach, ("attachCancel", "attachConfirm")),
+                 ("delete", self.open_delete, ("deleteCancel", "deleteConfirm")),
+                 ("purge", self.open_purge, ("purgeCancel", "purgeConfirm")))
+        for width, height in SIZES:
+            for name, opener, buttons in cases:
+                with self.subTest(dialog=name, size=(width, height)):
+                    root.resize(width, height); pump(300)
+                    dialog = opener(bridge, root)
+                    if name == "attach":                                # the long new name of D24
+                        self.visible(root, "attachNewName")[0].setProperty("text", LONG_NEW)
+                        dialog.setProperty("useNew", True)
+                        bridge.previewAttach("", LONG_NEW); pump(100)
+                    settle(lambda: dialog.property("opened"))
+                    panel = self.rect(self.frame(dialog))
+                    self.assertTrue(QRectF(16, 16, width - 32, height - 32).contains(panel), (panel, width, height))
+                    for button in buttons:
+                        box = self.rect(self.visible(root, button)[0])
+                        self.assertTrue(panel.contains(box), (button, box, panel))
+                    scrim = self.scrims(root)
+                    self.assertEqual(1, len(scrim))
+                    settle(lambda: scrim[0].opacity() == 1.0)
+                    self.assertAlmostEqual(0.56, scrim[0].property("color").alphaF(), places=2)
+                    self.close(dialog)
+
+    def test_z_the_identity_cards_and_the_attach_placeholder(self) -> None:
+        store, bridge, root = self.stage()
+        dialog = self.open_attach(bridge, root)
+        settle(lambda: dialog.property("opened"))
+        placeholder = self.visible(root, "attachPlaceholder")
+        self.assertEqual(["Choose a project to preview."], [p.property("text") for p in placeholder])
+        self.press(root, self.visible(root, "attachProject")[0])
+        self.assertEqual([], self.visible(root, "attachPlaceholder"))
+        card = self.visible(root, "attachIdentityCard")[0]
+        self.assertTrue(self.inside(self.visible(root, "attachIdentity")[0], card))
+        # A new project is named once (Target); the lines below refer to it.
+        self.visible(root, "attachNewName")[0].setProperty("text", LONG_NEW)
+        dialog.setProperty("useNew", True)
+        bridge.previewAttach("", LONG_NEW); pump(100)
+        self.assertEqual(f"Target: new project: {LONG_NEW}", self.visible(root, "attachTarget")[0].property("text"))
+        changes = self.visible(root, "attachChanges")[0].property("text")
+        self.assertNotIn(LONG_NEW, changes)
+        self.assertIn("The owner becomes the new project, permanently.", changes)
+        self.close(dialog)
+        dialog = self.open_delete(bridge, root)
+        card = self.visible(root, "deleteIdentityCard")[0]
+        self.assertTrue(self.inside(self.visible(root, "deleteIdentity")[0], card))
+        self.assertEqual("Delete this conversation permanently?", self.visible(root, "deleteTitle")[0].property("text"))
+        self.assertEqual("DELETE PERMANENTLY", self.visible(root, "jarvisDialogLabel")[0].property("text"))
+
+
+class DialogKeyboardTests(DialogAdoptionCase):
+    def test_aa_initial_focus_tab_escape_focus_return_and_enter(self) -> None:
+        store, bridge, root = self.stage()
+        # Delete, opened from the keyboard: focus on Vazgeç, Tab stays in, Esc returns to the opener.
+        bridge.setPage("history"); pump(400)
+        opener = self.visible(root, "historyDelete")[0]
+        opener.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return)
+        dialog = self.dialog(root, "conversationDeleteDialog")
+        settle(lambda: dialog.property("opened"))
+        self.assertTrue(self.visible(root, "deleteCancel")[0].hasActiveFocus())
+        for _ in range(6):
+            QTest.keyClick(root, Qt.Key_Tab); pump(30)
+            self.assertTrue(self.inside(root.activeFocusItem(), self.frame(dialog)), root.activeFocusItem())
+        QTest.keyClick(root, Qt.Key_Escape)
+        settle(lambda: not dialog.property("visible"))
+        self.assertEqual("history", bridge.page)
+        self.assertTrue(opener.hasActiveFocus())
+        self.assertFalse(store.is_conversation_deleted(self.doomed))
+        # Purge: focus in the name field; Enter there (even with the right name) purges nothing.
+        bridge.showProject(self.home_project.id); pump(400)
+        self.item(root, "projectsPage").setProperty("section", "files"); pump(200)
+        opener = self.visible(root, "filePurge")[0]
+        opener.forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return)
+        dialog = self.dialog(root, "purgeDialog")
+        settle(lambda: dialog.property("opened"))
+        name = self.visible(root, "purgeConfirmName")[0]
+        self.assertTrue(name.hasActiveFocus())
+        name.setProperty("text", "rapor.txt"); pump(60)
+        QTest.keyClick(root, Qt.Key_Return); pump(100)
+        self.assertTrue(dialog.property("visible"))
+        self.assertEqual("retired", store.list_project_files(self.home_project.id)[0]["lifecycle"])
+        QTest.keyClick(root, Qt.Key_Escape)
+        settle(lambda: not dialog.property("visible"))
+        self.assertTrue(opener.hasActiveFocus())
+        # Attach: focus on the first project; Enter in the new-name field only previews.
+        dialog = self.open_attach(bridge, root)
+        settle(lambda: dialog.property("opened"))
+        self.assertTrue(self.visible(root, "attachProject")[0].hasActiveFocus())
+        field = self.visible(root, "attachNewName")[0]
+        field.forceActiveFocus()
+        for ch in "Mutfak":
+            QTest.keyClick(root, ch)
+        pump(100)
+        self.assertEqual("Target: new project: Mutfak", self.visible(root, "attachTarget")[0].property("text"))
+        QTest.keyClick(root, Qt.Key_Return); pump(200)
+        self.assertTrue(dialog.property("visible"))
+        self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)       # still Global
+        self.assertEqual([], [p for p in store.list_projects() if p.name == "Mutfak"])
+        self.close(dialog)
+        self.assertEqual(0, self.execute_calls())
+
+
+class DialogMotionTests(DialogAdoptionCase):
+    def test_ab_confirm_waits_for_the_motion_and_ambient_off_is_instant(self) -> None:
+        store, bridge, root = self.stage()
+        bridge.setPage("history"); pump(400)
+        dialog = root.findChildren(QObject, "conversationDeleteDialog")[0]
+        confirm = dialog.findChild(QObject, "deleteConfirm")
+        samples = self.motion(root, dialog)
+        mark, called = len(samples), time.monotonic()
+        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
+        self.assertTrue(dialog.property("shown"))
+        self.assertFalse(confirm.isEnabled())                            # not while opening
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 220)    # Theme.pageMs
+        settle(lambda: dialog.property("opened"))
+        self.assertTrue(confirm.isEnabled())
+        mark, called = len(samples), time.monotonic()
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(confirm.isEnabled())                            # nor while closing
+        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
+        # Ambient effects off: every dialog at once.
+        bridge.setAmbientEffects(False); pump(100)
+        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
+        self.assertTrue(dialog.property("opened"))
+        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
+        self.assertTrue(confirm.isEnabled())
+        QMetaObject.invokeMethod(dialog, "close")
+        self.assertFalse(dialog.property("visible"))
+        for name in ("attachDialog", "purgeDialog"):
+            if name == "purgeDialog":
+                bridge.showProject(self.home_project.id); pump(400)
+            other = root.findChildren(QObject, name)[0]
+            QMetaObject.invokeMethod(other, "open")
+            self.assertTrue(other.property("opened"), name)
+            QMetaObject.invokeMethod(other, "close")
+            self.assertFalse(other.property("visible"), name)
 
 
 if __name__ == "__main__":  # pragma: no cover
