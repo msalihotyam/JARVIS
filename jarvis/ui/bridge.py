@@ -801,13 +801,15 @@ class Bridge(QObject):
         project each one is deletable at once: the project's archive is the
         reversible first step (Gate 6D-b, Salih decision 2026-09-30)."""
         archived = self.openProject.get("active") is False
-        return [{**row, "active": row["id"] == self._conversation_store.id, "deletable": archived}
+        return [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                 "active": row["id"] == self._conversation_store.id, "deletable": archived}
                 for row in self._project_conversations]
 
     @Property("QVariantList", notify=projectsChanged)
     def projectArchivedConversations(self) -> list:
         """The open project's archived conversations (its ARCHIVED section)."""
-        return [{**row, "active": row["id"] == self._conversation_store.id} for row in self._project_archived_conversations]
+        return [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                 "active": row["id"] == self._conversation_store.id} for row in self._project_archived_conversations]
 
     @Property("QVariantList", notify=projectsChanged)
     def projectJobs(self) -> list:
@@ -852,7 +854,7 @@ class Bridge(QObject):
             records = []
         rows_of = [
             {"id": r.id, "updated_at": r.updated_at, "archived_at": r.archived_at,
-             "title": r.title or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"))}
+             "title": r.title or ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"), ())}
             for r in records
         ]
         self._project_conversations = [row for row in rows_of if row["archived_at"] is None]
@@ -3286,11 +3288,16 @@ class Bridge(QObject):
     @Slot()
     def retranslated(self) -> None:
         """The running language changed: every projected text re-renders.
-        State itself is untouched - only its presentation is read again."""
+        State itself is untouched - only its presentation is read again: the
+        labels the Bridge projects (the owner "Global", the untitled name, the
+        open project's rows) are rendered in the property getters, so
+        re-emitting their signals is all it takes. No store read, no write."""
         self.feedChanged.emit()
         self.dataChanged.emit()
         self.stateChanged.emit()
         self.approvalChanged.emit()
+        self.conversationChanged.emit()
+        self.projectsChanged.emit()
 
     @Property(str, notify=prefsChanged)
     def profile(self) -> str:

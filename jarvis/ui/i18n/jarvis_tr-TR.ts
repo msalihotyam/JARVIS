@@ -3196,7 +3196,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>Nothing new can start, and paused work stays where it stopped. JARVIS stays open: your conversation, results and history are here, and you can still reject a pending approval.</source>
-        <translation>Yeni hiçbir iş başlayamaz ve duraklatılan işler kaldıkları yerde bekler. JARVIS açık kalır: konuşmanız, sonuçlar ve geçmiş burada; bekleyen bir onayı yine de reddedebilirsiniz.</translation>
+        <translation>Yeni hiçbir iş başlayamaz ve duraklatılan işler kaldıkları yerde bekler. JARVIS açık kalır: sohbetiniz, sonuçlar ve geçmiş burada; bekleyen bir onayı yine de reddedebilirsiniz.</translation>
     </message>
     <message>
         <source>Freezing does not undo anything already sent to its destination. Resume JARVIS from the red control or the tray.</source>
@@ -3981,6 +3981,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>UNREADABLE</source>
         <translation>OKUNAMADI</translation>
+    </message>
+    <message>
+        <source>1 task</source>
+        <translation>1 görev</translation>
     </message>
     <message>
         <source>TASKS</source>

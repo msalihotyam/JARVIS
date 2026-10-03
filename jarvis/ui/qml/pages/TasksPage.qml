@@ -39,7 +39,7 @@ SecondaryPage {
                     Column { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 4
                         Text { text: modelData.title || qsTr("Untitled session"); color: modelData.title ? Theme.text : Theme.textMuted
                                font: Theme.pageRowStrong; width: parent.parent.width - 20; elide: Text.ElideRight }
-                        Text { text: page.when(modelData.updated_at) + "  ·  " + qsTr("%1 tasks").arg(modelData.task_count || 0) + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : ""); color: Theme.textMuted; font: Theme.pageMetaFigures
+                        Text { objectName: "tasksSessionMeta"; text: page.when(modelData.updated_at) + "  ·  " + (modelData.task_count === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(modelData.task_count || 0)) + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : ""); color: Theme.textMuted; font: Theme.pageMetaFigures
                                width: parent.parent.width - 20; elide: Text.ElideRight }
                     }
                     MouseArea { anchors.fill: parent; onClicked: { page.selectedSession = modelData.session_id; page.selectedTask = ""; page.selectedTaskRow = null; bridge.loadTasks(modelData.session_id) } }

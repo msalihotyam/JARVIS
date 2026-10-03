@@ -1297,5 +1297,89 @@ class RenameDialogTests(ListCase):
         self.assertEqual(0, self.execute_calls())
 
 
+# -- slice C7: a live language switch (Q2, D26) and the copy residue --
+# AL the Bridge-projected labels follow a live switch with no refresh; AM
+# "retranslated" re-reads only (no store write, no state change); AN TasksPage
+# counts tasks; AO no "konuşma" is left in the Turkish catalog.
+
+def dump(database) -> dict:
+    import contextlib
+    import sqlite3
+    with contextlib.closing(sqlite3.connect(database)) as connection:
+        tables = [r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        return {t: connection.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in tables}
+
+
+class LiveLanguageTests(ListCase):
+    def untitled_global(self, store, bridge) -> None:
+        bridge.openConversation(store.create_conversation().id); bridge.setPage("home"); pump(350)
+
+    def test_al_a_live_switch_rewrites_the_projected_labels_without_a_refresh(self) -> None:
+        store, bridge, root = self.lists()
+        self.untitled_global(store, bridge)
+        owner = lambda: self.item(root, "projectSelectorName").property("text")  # noqa: E731
+        switcher = lambda: self.item(root, "conversationSwitcherText").property("text")  # noqa: E731
+        self.assertEqual(("Global", "New Chat"), (owner(), switcher()))
+        self.tr(bridge)                                                       # no refresh of any kind after the switch
+        self.assertEqual(("Genel", "Yeni Sohbet"), (owner(), switcher()))
+        self.assertEqual("Genel", bridge.conversationProject["name"])
+        # The open project's detail: the untitled row and the archived section rewrite as well.
+        bridge.showProject(self.project.id); pump(400)
+        untitled = lambda: [r["title"] for r in bridge.projectConversations if r["title"] in ("New Chat", "Yeni Sohbet")]  # noqa: E731
+        self.assertEqual(["Yeni Sohbet"], untitled())
+        self.assertIn("Yeni Sohbet", self.shown_texts(self.item(root, "projectsPage")))
+        bridge.setLanguage("en-US"); pump(300)
+        self.assertEqual(["New Chat"], untitled())
+        self.assertIn("New Chat", self.shown_texts(self.item(root, "projectsPage")))
+        self.assertNotIn("Yeni Sohbet", self.shown_texts(self.item(root, "projectsPage")))
+        bridge.setPage("home"); pump(350)
+        self.assertEqual(("Global", "New Chat"), (owner(), switcher()))
+        bridge.setLanguage("tr-TR"); pump(300)                                # and again, the other way
+        self.assertEqual(("Genel", "Yeni Sohbet"), (owner(), switcher()))
+
+    def test_am_retranslated_reads_again_and_changes_nothing(self) -> None:
+        store, bridge, root = self.lists()
+        self.untitled_global(store, bridge)
+        bridge.showProject(self.project.id); pump(300)
+        seen = []
+        bridge.conversationChanged.connect(lambda: seen.append("conversation"))
+        bridge.projectsChanged.connect(lambda: seen.append("projects"))
+
+        def state() -> tuple:
+            return (bridge.conversationId, bridge.page, bridge.openProject, bridge.config, bridge.busy, bridge.conversations,
+                    bridge.projectConversations, bridge.projectArchivedConversations, bridge.activity, bridge.chatProvider)
+        before, rows = state(), dump(self.database)
+        prefs = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
+        settings = self.store.load().settings
+        bridge.retranslated(); pump(200)
+        self.assertEqual(before, state())
+        self.assertEqual(rows, dump(self.database))                             # no store write, no new row anywhere
+        self.assertEqual(prefs, self.prefs_path.read_bytes() if self.prefs_path.exists() else None)
+        self.assertEqual(settings, self.store.load().settings)
+        self.assertTrue({"conversation", "projects"} <= set(seen))               # the presentation is read again
+        self.assertEqual(0, self.execute_calls())
+
+    def test_an_the_tasks_page_counts_tasks(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.sessions(bridge)
+        bridge.setPage("tasks"); pump(400)
+        metas = lambda: sorted(t.split("  ·  ")[1] for t in self.texts(root, "tasksSessionMeta"))  # noqa: E731
+        self.assertEqual(["0 tasks", "1 task", "2 tasks"], metas())
+        self.tr(bridge)
+        self.assertEqual(["0 görev", "1 görev", "2 görev"], metas())
+
+    def test_ao_no_konusma_is_left_in_the_turkish_catalog(self) -> None:
+        table = load_catalog(CATALOG_DIR / "jarvis_tr-TR.ts")
+        self.assertEqual({}, {k: v for k, v in table.items() if re.search("konuşma|KONUŞMA", v, re.I)})
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        self.assertIn("sohbetiniz", tx("SafetyCards", "Nothing new can start, and paused work stays where it stopped. "
+                                       "JARVIS stays open: your conversation, results and history are here, and you can still "
+                                       "reject a pending approval."))
+        self.assertEqual("1 görev", tx("TasksPage", "1 task"))
+        self.assertEqual("%1 görev", tx("TasksPage", "%1 tasks"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
