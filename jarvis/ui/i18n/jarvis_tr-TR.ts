@@ -4057,6 +4057,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>İptal</translation>
     </message>
     <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİV</translation>
+    </message>
+    <message>
         <source>PROJECTS</source>
         <translation>PROJELER</translation>
     </message>

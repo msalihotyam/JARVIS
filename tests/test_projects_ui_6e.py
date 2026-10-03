@@ -233,7 +233,7 @@ class CatalogTests(UiTestCase):
 
 COMPONENTS = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components"
 LONG_NAME = ("Kat malikleri toplantısı için hazırlanacak belgeler, aidat hesapları, tadilat izinleri ve "
-             "yönetim planı değişikliği özeti")                                  # 120 characters
+             "yönetim planı özeti")                                              # 109 characters
 SIZES = ((1100, 700), (1280, 760), (1920, 1080))
 # Built in the real window's engine (its Theme, i18n and imports); no surface
 # adopts these parts before C3-C5, so they are exercised here on their own.
@@ -519,6 +519,225 @@ class SegmentedFocusTests(SharedPartsCase):
         from PySide6.QtQml import QQmlProperty
         self.assertEqual(2, QQmlProperty.read(ring, "border.width"))
         self.assertEqual("a", segmented.property("value"))      # focus alone picks nothing
+
+
+# -- slice C3: the TopBar scope group, its menus and the rename editor --
+
+LONG_PROJECT = "İstanbul Beşiktaş daire tadilatı, taşınma planlaması ve kira sözleşmesi takibi 2026"
+OTHERS = ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip", "leftContextCard",
+          "coreStatusGroup", "editLayoutTrigger")
+
+
+class ScopeGroupCase(WindowCase):
+    def seed(self):
+        store = self.db()
+        longp = store.create_project(LONG_PROJECT)
+        thesis = store.create_project("Tez 2025 okuma ve yazım çalışması")
+        self.ids = {
+            "long": store.create_conversation(longp.id, title=LONG_NAME).id,
+            "thesis": store.create_conversation(thesis.id, title="Okuma listesi taslağı ve kaynakça").id,
+            "global": store.create_conversation(title="Kısa").id,
+        }
+        store.set_project_active(thesis.id, False)
+        return store
+
+    def home(self, bridge, key) -> None:
+        bridge.openConversation(self.ids[key]); bridge.setPage("home"); pump(350)
+
+    def painted(self, text_item) -> int:
+        """Characters a Text really shows: its text elided to its own width."""
+        from PySide6.QtGui import QFontMetricsF
+        text = text_item.property("text")
+        shown = QFontMetricsF(text_item.property("font")).elidedText(text, Qt.TextElideMode.ElideRight, text_item.width())
+        return len(text) if shown == text else len(shown.rstrip("…"))
+
+    def frames(self, root):
+        ticks = []
+        root.afterAnimating.connect(lambda: ticks.append(time.monotonic()))
+        return ticks
+
+    def within_token_plus_one_frame(self, ticks, started_at, at, seen, token_ms) -> None:
+        # The window's own animation frames, not a wall-clock budget (see C2).
+        start = ticks[started_at] if len(ticks) > started_at else at
+        late = [t for t in ticks[started_at:seen] if t >= start + token_ms / 1000]
+        self.assertLessEqual(len(late), 1)
+
+
+class ScopeLayoutTests(ScopeGroupCase):
+    def test_s_names_are_never_a_bare_ellipsis_and_the_tip_has_them_whole(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for language in ("en-US", "tr-TR"):
+            if language == "tr-TR":
+                self.tr(bridge)
+            for key in ("long", "thesis", "global"):
+                self.home(bridge, key)
+                for width, height in SIZES:
+                    with self.subTest(language=language, owner=key, size=(width, height)):
+                        root.resize(width, height); pump(400)
+                        name, title = self.item(root, "projectSelectorName"), self.item(root, "conversationSwitcherText")
+                        for text_item in (name, title):
+                            self.assertGreaterEqual(self.painted(text_item), min(6, len(text_item.property("text"))),
+                                                    text_item.property("text"))
+                        badge = self.item(root, "projectSelectorArchived")
+                        self.assertEqual(key == "thesis", badge.isVisible())
+                        if key == "thesis":
+                            self.assertEqual({"en-US": "ARCHIVED", "tr-TR": "ARŞİV"}[language],
+                                             badge.childItems()[0].property("text"))
+                            self.assertEqual(name.property("text") + " · " + ("archived" if language == "en-US" else "arşivlendi"),
+                                             self.item(root, "projectSelectorTip").property("text"))
+                        else:
+                            self.assertEqual(name.property("text"), self.item(root, "projectSelectorTip").property("text"))
+                            # The room the spec promises before any floor is used.
+                            selector, switcher = self.item(root, "projectSelector"), self.item(root, "conversationSwitcher")
+                            group = self.item(root, "projectScope")
+                            self.assertGreaterEqual(selector.width(), min(group.property("selNat"), 110))
+                            self.assertGreaterEqual(switcher.width(), min(group.property("swNat"), 140))
+                        tip = self.item(root, "conversationSwitcherTipText")
+                        self.assertEqual(bridge.conversationTitle, tip.property("text"))           # the whole title
+
+    def test_t_the_scope_group_never_overlaps_the_bar(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for theme in ("space", "command"):
+            bridge.setTheme(theme); pump(400)
+            for key in ("long", "thesis"):
+                self.home(bridge, key)
+                for width, height in SIZES:
+                    with self.subTest(theme=theme, owner=key, size=(width, height)):
+                        root.resize(width, height); pump(500)
+                        group = self.item(root, "projectScope")
+                        rects = [self.rect(self.item(root, n)) for n in
+                                 ("projectSelector", "conversationSwitcher", "newConversationButton")]
+                        for left, right in zip(rects, rects[1:]):
+                            self.assertLessEqual(left.right(), right.left())
+                        self.assertTrue(QRectF(0, 0, width, height).contains(self.rect(group)))
+                        for mine in rects:
+                            for name in OTHERS:
+                                for other in self.all_items(root, name):
+                                    if other.isVisible() and other.width() > 0:
+                                        self.assertFalse(mine.intersects(self.rect(other)), name)
+                        # The header progress (shown only during a run) starts after
+                        # the scope row or is below its own 240 px threshold.
+                        hud = self.item(root, "hudProgress")
+                        band = QRectF(hud.mapToScene(QPointF(0, 0)), hud.size())
+                        if hud.width() >= 240:
+                            self.assertFalse(band.intersects(self.rect(group)))
+
+
+class ScopeKeyboardTests(ScopeGroupCase):
+    def test_u_tab_reaches_the_pills_and_the_keys_open_the_menus(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.home(bridge, "long")
+        names = ("projectSelector", "conversationSwitcher", "newConversationButton")
+        reached = set()
+        # The window's Tab chain (unchanged): ... window controls, the scope
+        # pills, the orb, the rail ... (the composer keeps Tab for itself).
+        self.item(root, "windowCloseControl").forceActiveFocus(); pump(30)
+        for _ in range(6):
+            QTest.keyClick(root, Qt.Key_Tab); pump(20)
+            focused = root.activeFocusItem()
+            if focused is not None and focused.objectName() in names:
+                reached.add(focused.objectName())
+                ring = [c for c in focused.childItems() if c.objectName() == "scopePillFocusRing"][0]
+                self.assertTrue(ring.isVisible(), focused.objectName())
+        self.assertEqual(set(names), reached)
+        menu = lambda name: root.findChild(QObject, name)  # noqa: E731
+        selector, switcher = self.item(root, "projectSelector"), self.item(root, "conversationSwitcher")
+        for key in (Qt.Key_Return, Qt.Key_Space, Qt.Key_Down):
+            selector.forceActiveFocus(); QTest.keyClick(root, key); pump(300)
+            self.assertTrue(menu("projectSelectorMenu").property("visible"), key)
+            QTest.keyClick(root, Qt.Key_Escape); pump(300)
+            self.assertFalse(menu("projectSelectorMenu").property("visible"))
+            switcher.forceActiveFocus(); QTest.keyClick(root, key); pump(300)
+            self.assertTrue(menu("conversationSwitcherMenu").property("visible"), key)
+            QTest.keyClick(root, Qt.Key_Escape); pump(300)
+        for key, modifier in ((Qt.Key_Menu, Qt.NoModifier), (Qt.Key_F10, Qt.ShiftModifier)):
+            switcher.forceActiveFocus(); QTest.keyClick(root, key, modifier); pump(300)
+            self.assertTrue(menu("conversationSwitcherContext").property("visible"), key)
+            self.assertEqual(LONG_NAME, self.item(root, "conversationContextHeader").property("text"))
+            QTest.keyClick(root, Qt.Key_Escape); pump(300)
+            self.assertFalse(menu("conversationSwitcherContext").property("visible"))
+        # Return on "+" does what its click does: a new conversation in this scope.
+        before = bridge.conversationId
+        self.item(root, "newConversationButton").forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(400)
+        self.assertNotEqual(before, bridge.conversationId)
+        self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"])
+        self.assertEqual(0, self.execute_calls())
+
+
+class ScopeStateTests(ScopeGroupCase):
+    def test_v_the_disabled_new_button_tip_is_at_full_opacity(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.home(bridge, "thesis")
+        button = self.item(root, "newConversationButton")
+        self.assertLess(button.opacity(), 1.0)                                    # dimmed: not allowed here
+        QTest.mouseMove(root, button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint())
+        tip = self.item(root, "newConversationTip")
+        settle(lambda: tip.property("shown"))
+        text = [t for t in self.visible(root, "hoverTipText")
+                if t.property("text").startswith("The project is archived")][0]
+        opacity, item = 1.0, text
+        while item is not None:
+            opacity *= item.opacity()
+            item = item.parentItem()
+        self.assertEqual(1.0, opacity)
+        before = bridge.conversationId
+        self.press(root, button)
+        self.assertEqual(before, bridge.conversationId)                           # still refused, as before
+
+    def test_w_the_chevron_turns_while_its_menu_is_open(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.home(bridge, "global")
+        for pill, chevron, menu in (("projectSelector", "projectSelectorChevron", "projectSelectorMenu"),
+                                    ("conversationSwitcher", "conversationSwitcherChevron", "conversationSwitcherMenu")):
+            shape = self.item(root, chevron)
+            self.assertEqual(0, shape.rotation())
+            self.press(root, self.item(root, pill))
+            settle(lambda: shape.rotation() == 180)
+            self.assertEqual(180, shape.rotation())
+            QMetaObject.invokeMethod(root.findChild(QObject, menu), "close")
+            settle(lambda: shape.rotation() == 0)
+            self.assertEqual(0, shape.rotation())
+
+    def test_x_menu_motion_follows_its_tokens_and_stops_with_ambient_off(self) -> None:
+        from PySide6.QtCore import SIGNAL
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.home(bridge, "global")
+        menu = root.findChild(QObject, "projectSelectorMenu")
+        ticks, events = self.frames(root), {}
+        QObject.connect(menu, SIGNAL("opened()"), lambda: events.__setitem__("opened", (time.monotonic(), len(ticks))))
+        QObject.connect(menu, SIGNAL("closed()"), lambda: events.__setitem__("closed", (time.monotonic(), len(ticks))))
+        mark = len(ticks)
+        QMetaObject.invokeMethod(menu, "open")
+        self.assertLess(menu.property("opacity"), 1.0)
+        settle(lambda: "opened" in events)
+        self.within_token_plus_one_frame(ticks, mark, *events["opened"], 180)     # Theme.panelIn
+        self.assertEqual(1.0, menu.property("opacity"))
+        self.assertEqual(menu.property("restY"), menu.property("y"))
+        mark = len(ticks)
+        QMetaObject.invokeMethod(menu, "close")
+        settle(lambda: "closed" in events)
+        self.within_token_plus_one_frame(ticks, mark, *events["closed"], 150)     # Theme.panelOut
+        # Ambient effects off: no motion at all - the end state at once.
+        bridge.setAmbientEffects(False); pump(100)
+        for name in ("projectSelectorMenu", "conversationSwitcherMenu", "conversationSwitcherContext"):
+            popup = root.findChild(QObject, name)
+            QMetaObject.invokeMethod(popup, "open")
+            self.assertTrue(popup.property("opened"), name)
+            self.assertEqual((1.0, popup.property("restY")), (popup.property("opacity"), popup.property("y")))
+            QMetaObject.invokeMethod(popup, "close")
+            self.assertFalse(popup.property("visible"), name)
 
 
 if __name__ == "__main__":  # pragma: no cover

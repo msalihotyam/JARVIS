@@ -32,20 +32,122 @@ Item {
     property bool modelOpen: false
     property Item controlLayer: null
 
-    // One row of the project selector's menu.
+    // -- the scope group's parts (Gate 6E) --------------------------------------
+    // One row of the scope menus: menuRowHeight; a hover lift; the current row
+    // carries the 2 px accent mark; an action row reads in accent, an enabled
+    // destructive row in danger, an untitled one in textLabel. An elided label
+    // has its tip.
     component ScopeChoice: Rectangle {
+        id: choice
         property string label: ""
         property bool current: false
         property bool available: true
+        property bool action: false
+        property bool danger: false
+        property bool muted: false
         signal chosen()
-        width: 264; height: 32; radius: 6
+        height: Theme.menuRowHeight; radius: 6
         enabled: !bridge.busy && available
         opacity: enabled ? 1 : 0.45
         color: current ? Theme.alpha(Theme.accent, 0.14) : choiceArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
-        Text { x: 10; width: parent.width - 20; anchors.verticalCenter: parent.verticalCenter; text: parent.label
-               textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.text; font: Theme.body }
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+        Rectangle { visible: choice.current; x: 0; y: 8; width: 2; height: parent.height - 16; radius: 1; color: Theme.accent }
+        Text { id: choiceText; x: 12; width: parent.width - 24; anchors.verticalCenter: parent.verticalCenter; text: choice.label
+               textFormat: Text.PlainText; elide: Text.ElideRight; font: Theme.body
+               color: choice.danger && choice.enabled ? Theme.danger : choice.action ? Theme.accent
+                      : choice.muted ? Theme.textLabel : Theme.text }
         MouseArea { id: choiceArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: parent.chosen() }
+                    onClicked: choice.chosen() }
+        HoverTip { text: choice.label; active: choiceText.truncated }
+    }
+    // A disabled item's reason, under it; and a menu's section divider.
+    component Reason: Text {
+        leftPadding: 12; rightPadding: 12; bottomPadding: 4
+        wrapMode: Text.Wrap; textFormat: Text.PlainText; color: Theme.textDim; font: Theme.caption
+    }
+    component Divider: Item {
+        height: 9
+        Rectangle { y: 4; x: 8; width: parent.width - 16; height: 1; color: Theme.border }
+    }
+    // A drawn chevron (no font glyph): it turns over while its menu is open.
+    component Chevron: Shape {
+        id: chevron
+        property bool open: false
+        width: 10; height: 6
+        rotation: open ? 180 : 0
+        Behavior on rotation { enabled: Theme.ambient; NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+            strokeColor: Theme.textLabel; strokeWidth: 1.5; fillColor: "transparent"
+            capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            startX: 1; startY: 1
+            PathLine { x: 5; y: 5 }
+            PathLine { x: 9; y: 1 }
+        }
+    }
+    // A scope pill: pillHeight, hover fill over hoverMs, press .97, the focus
+    // ring. Click / Return / Space (and Down on a menu pill) activate it; a
+    // right click, Menu or Shift+F10 ask for its context menu.
+    component ScopePill: Rectangle {
+        id: pill
+        property color idleFill: Theme.alpha(Theme.text, 0.04)
+        property color hotFill: Theme.alpha(Theme.text, 0.10)
+        property bool open: false
+        property bool menuKeys: true
+        readonly property bool hovered: pillArea.containsMouse
+        signal activated()
+        signal contextRequested()
+        signal dismissRequested()
+        height: Theme.pillHeight; radius: height / 2
+        color: hovered || open ? hotFill : idleFill
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+        border.width: 1
+        scale: pillArea.pressed ? 0.97 : 1
+        Behavior on scale { enabled: Theme.ambient; NumberAnimation { duration: 90 } }
+        activeFocusOnTab: true
+        // Escape closes this pill's own open menu (the menus do not take focus),
+        // before the window's Escape chain sees it.
+        Keys.onShortcutOverride: function (event) { if (event.key === Qt.Key_Escape && pill.open) event.accepted = true }
+        Keys.onPressed: function (event) {
+            var key = event.key
+            if (key === Qt.Key_Escape && pill.open) {
+                event.accepted = true; pill.dismissRequested()
+            } else if (key === Qt.Key_Return || key === Qt.Key_Enter || key === Qt.Key_Space || (pill.menuKeys && key === Qt.Key_Down)) {
+                event.accepted = true; pill.activated()
+            } else if (key === Qt.Key_Menu || (key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+                event.accepted = true; pill.contextRequested()
+            }
+        }
+        Rectangle { objectName: "scopePillFocusRing"; visible: pill.activeFocus; anchors.fill: parent; anchors.margins: -3
+                    radius: pill.radius + 3; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+        MouseArea {
+            id: pillArea
+            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            onClicked: function (mouse) { if (mouse.button === Qt.RightButton) pill.contextRequested(); else pill.activated() }
+        }
+    }
+    // The scope menus: glass, and the popover motion - opacity and panelTravel
+    // over panelIn in, panelOut out; no motion at all with ambient effects off.
+    component ScopeMenu: Popup {
+        id: menu
+        property real restY: 0
+        y: restY
+        padding: 8
+        background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
+                                WheelHandler { } }
+        enter: Theme.ambient ? menuIn : null
+        exit: Theme.ambient ? menuOut : null
+        readonly property Transition menuIn: Transition {
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
+                NumberAnimation { property: "y"; from: menu.restY - Theme.panelTravel; to: menu.restY; duration: Theme.panelIn; easing.type: Theme.ease }
+            }
+        }
+        readonly property Transition menuOut: Transition {
+            NumberAnimation { property: "opacity"; to: 0; duration: Theme.panelOut; easing.type: Theme.ease }
+        }
+        onClosed: { opacity = 1; y = restY }
     }
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
     readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
@@ -272,7 +374,7 @@ Item {
     }
     Text { id: wordmark; objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
            lineHeightMode: Text.FixedHeight; lineHeight: 34 }
-    Text { objectName: "brandTagline"; x: 122; y: 55; text: qsTr("THINKS AHEAD FOR YOU"); color: Theme.textLabel; font: Theme.hudLabel
+    Text { id: tagline; objectName: "brandTagline"; x: 122; y: 55; text: qsTr("THINKS AHEAD FOR YOU"); color: Theme.textLabel; font: Theme.hudLabel
            lineHeightMode: Text.FixedHeight; lineHeight: 16 }
 
     // The project selector and "+ New conversation" (V2.0 Gate 6B, Salih
@@ -281,7 +383,13 @@ Item {
     // Global, All projects. Choosing one only OPENS a conversation (its newest
     // non-archived one, or a new one) - it never changes a conversation's
     // owner, and it grants, approves or selects nothing: Core binds a session
-    // to its conversation's owner. Mouse first; no shortcut is needed.
+    // to its conversation's owner. Mouse first; the keyboard reaches it too
+    // (Gate 6E, Q7): Tab, Return / Space / Down, Menu or Shift+F10.
+    //
+    // Layout (Gate 6E): inline after the wordmark while it fits; on a narrow
+    // window it takes its own row under the tagline, beside the rail card. The
+    // switcher gives way first, then the selector; neither name is ever cut to
+    // a bare ellipsis, and an elided name has its tip.
     Item {
         id: scopeGroup
         objectName: "projectScope"
@@ -289,49 +397,98 @@ Item {
         visible: bridge.page === "home"
         readonly property var owner: bridge.conversationProject || ({})
         readonly property color tone: owner.archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
-        // Both controls stay within the room before the core, whatever the name.
-        readonly property real room: core.x - x - 16
-        readonly property bool compactNew: room < 60 + 8 + 90 + 8 + newFull.implicitWidth + 24
-        // What the selector and the conversation switcher share, after "+ New".
-        readonly property real shared: room - newChatButton.width - 16
         // An edit of a name is bound to the conversation it STARTED on.
         property string editId: ""
-        x: wordmark.x + wordmark.width + 16
-        y: wordmark.y + 4
-        height: 26
-        width: projectSelector.width + 8 + switcher.width + 8 + newChatButton.width
 
-        Rectangle {
+        // Geometry. A pill is: padding, its lead (the selector's dot or, when
+        // archived, the ARŞİV badge in its place), the name, the chevron.
+        readonly property real gap: twoRow ? 6 : 8
+        readonly property real pad: twoRow ? 10 : 12
+        readonly property real chevronRoom: 6 + 10 + pad
+        readonly property real lead: (owner.archived ? archivedBadge.width : 6) + 6
+        readonly property real selFixed: pad + lead + chevronRoom
+        readonly property real swFixed: pad + chevronRoom
+        readonly property real selNat: Math.min(280, selFixed + selectorName.implicitWidth)
+        readonly property real swNat: Math.min(320, swFixed + switcherText.implicitWidth)
+        // Floors: never under six characters of a name (then the ellipsis).
+        TextMetrics { id: selSix; font: Theme.caption; text: (scopeGroup.owner.name || "").slice(0, 6) + "…" }
+        TextMetrics { id: swSix; font: Theme.caption; text: switcher.shown.slice(0, 6) + "…" }
+        readonly property real selFloor: Math.min(selNat, selFixed + Math.ceil(selSix.advanceWidth) + 2)
+        readonly property real swFloor: Math.min(swNat, swFixed + Math.ceil(swSix.advanceWidth) + 2)
+        readonly property real selMin: Math.max(selFloor, Math.min(selNat, 110))
+        readonly property real swMin: Math.max(swFloor, Math.min(swNat, 140))
+        readonly property real newFullW: newFull.implicitWidth + 24
+        // Inline after the wordmark while both names keep their room; else a
+        // row of its own under the tagline (the rail card's right edge + 12;
+        // the Command preset has no rail card: under the orb).
+        readonly property real inlineX: wordmark.x + wordmark.width + 16
+        readonly property bool twoRow: bar.narrow || core.x - inlineX - 6
+                                       < 110 + 140 + Theme.pillHeight + 16 + (owner.archived ? archivedBadge.width : 0)
+        x: twoRow ? (Theme.command ? orb.x : bar.railWidth + 2) : inlineX
+        y: twoRow ? tagline.y + 24 : wordmark.y + 2
+        readonly property real room: core.x - x - 6
+        readonly property bool newIcon: twoRow || room < selMin + swMin + newFullW + 2 * gap
+        readonly property real newW: newIcon ? Theme.pillHeight : newFullW
+        readonly property real avail: room - newW - 2 * gap
+        // The switcher gives way first (to 140), then the selector (to 110),
+        // then both to their six-character floors.
+        readonly property real swFit: Math.max(swMin, Math.min(swNat, avail - selNat))
+        readonly property real selFit: Math.max(selMin, Math.min(selNat, avail - swFit))
+        readonly property real swW: Math.max(swFloor, Math.min(swFit, avail - selFit))
+        readonly property real selW: Math.max(selFloor, Math.min(selFit, avail - swW))
+        height: Theme.pillHeight
+        width: selW + gap + swW + gap + newW
+
+        ScopePill {
             id: projectSelector
             objectName: "projectSelector"
-            height: 26; radius: 13
-            width: Math.max(Math.min(60, scopeGroup.shared / 2),
-                            Math.min(selectorText.implicitWidth + 13 + 24 + 16, 280, scopeGroup.shared - Math.min(90, scopeGroup.shared / 2)))
-            color: selectorArea.containsMouse || selectorMenu.visible ? Theme.alpha(scopeGroup.tone, 0.14) : Theme.alpha(scopeGroup.tone, 0.07)
-            border.width: 1; border.color: Theme.alpha(scopeGroup.tone, 0.55)
+            width: scopeGroup.selW
+            idleFill: Theme.alpha(scopeGroup.tone, 0.07); hotFill: Theme.alpha(scopeGroup.tone, 0.14)
+            border.color: Theme.alpha(scopeGroup.tone, 0.55)
+            open: selectorMenu.visible
             Accessible.role: Accessible.ButtonMenu; Accessible.name: selectorText.text
-            Row {
-                x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 7
-                Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: scopeGroup.tone }
+            onActivated: selectorMenu.visible ? selectorMenu.close() : selectorMenu.open()
+            onDismissRequested: selectorMenu.close()
+            Rectangle { visible: !scopeGroup.owner.archived; x: scopeGroup.pad; anchors.verticalCenter: parent.verticalCenter
+                        width: 6; height: 6; radius: 3; color: scopeGroup.tone }
+            Rectangle {
+                id: archivedBadge
+                objectName: "projectSelectorArchived"
+                visible: !!scopeGroup.owner.archived
+                x: scopeGroup.pad - 2; anchors.verticalCenter: parent.verticalCenter
+                width: badgeText.implicitWidth + 10; height: 18; radius: 9
+                color: Theme.alpha(Theme.warning, 0.12); border.width: 1; border.color: Theme.alpha(Theme.warning, 0.45)
+                Text { id: badgeText; anchors.centerIn: parent; text: qsTr("ARCHIVED"); color: Theme.warning; font: Theme.label }
+            }
+            Item {
+                id: selectorText
+                objectName: "projectSelectorText"
+                // The owner's whole label ("name · archived"): what the pill says
+                // and what assistive technology reads. It is drawn as the name
+                // and, when archived, the ARŞİV badge - never colour alone.
+                readonly property string text: (scopeGroup.owner.name || "")
+                                               + (scopeGroup.owner.archived ? " · " + qsTr("archived") : "")
+                x: scopeGroup.pad + scopeGroup.lead - (scopeGroup.owner.archived ? 2 : 0); height: parent.height
+                width: Math.max(0, projectSelector.width - x - scopeGroup.chevronRoom)
                 Text {
-                    id: selectorText
-                    objectName: "projectSelectorText"
-                    width: Math.max(0, Math.min(implicitWidth, projectSelector.width - 24 - 13 - 16))
+                    id: selectorName
+                    objectName: "projectSelectorName"
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.min(implicitWidth, parent.width)
                     textFormat: Text.PlainText; elide: Text.ElideRight
-                    text: (scopeGroup.owner.name || "") + (scopeGroup.owner.archived ? " · " + qsTr("archived") : "")
+                    text: scopeGroup.owner.name || ""
                     color: scopeGroup.owner.global ? Theme.textLabel : Theme.text; font: Theme.caption
                 }
             }
-            Text { anchors { right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                   text: "▾"; color: Theme.textLabel; font: Theme.caption }
-            MouseArea { id: selectorArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                        onClicked: selectorMenu.visible ? selectorMenu.close() : selectorMenu.open() }
+            Chevron { objectName: "projectSelectorChevron"; open: selectorMenu.visible
+                      anchors { right: parent.right; rightMargin: scopeGroup.pad; verticalCenter: parent.verticalCenter } }
+            HoverTip { objectName: "projectSelectorTip"; text: selectorText.text; active: selectorName.truncated && !selectorMenu.visible }
         }
 
         // Gate 6D-a (Salih decision 2026-09-30): the open conversation's name.
         // Click: the current scope's conversations, to switch. Right-click:
         // rename. A label only - it selects, grants and approves nothing.
-        Rectangle {
+        ScopePill {
             id: switcher
             objectName: "conversationSwitcher"
             readonly property string shown: bridge.conversationTitle || qsTr("New Chat")
@@ -352,46 +509,30 @@ Item {
             readonly property string deleteReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
                 : bridge.busy ? qsTr("Wait for the current run to finish.")
                 : !deleteAllowed ? qsTr("Archive it first") : ""
-            x: projectSelector.width + 8
-            height: 26; radius: 13
-            width: Math.max(Math.min(60, scopeGroup.shared / 2),
-                            Math.min(switcherText.implicitWidth + 13 + 24 + 16, 260, scopeGroup.shared - projectSelector.width))
-            color: switcherArea.containsMouse || switcherMenu.visible ? Theme.alpha(Theme.text, 0.10) : Theme.alpha(Theme.text, 0.04)
-            border.width: 1; border.color: Theme.borderStrong
+            x: projectSelector.width + scopeGroup.gap
+            width: scopeGroup.swW
+            border.color: Theme.borderStrong
+            open: switcherMenu.visible || switcherContext.visible
             Accessible.role: Accessible.ButtonMenu; Accessible.name: switcherText.text
+            onActivated: { switcherContext.close(); switcherMenu.visible ? switcherMenu.close() : switcherMenu.open() }
+            onContextRequested: { switcherMenu.close(); switcherContext.open() }
+            onDismissRequested: { switcherMenu.close(); switcherContext.close() }
             Text {
                 id: switcherText
                 objectName: "conversationSwitcherText"
-                x: 12; anchors.verticalCenter: parent.verticalCenter
-                width: Math.max(0, Math.min(implicitWidth, switcher.width - 12 - 22))
+                x: scopeGroup.pad; anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(0, Math.min(implicitWidth, switcher.width - scopeGroup.swFixed))
                 textFormat: Text.PlainText; elide: Text.ElideRight
                 text: switcher.shown
                 color: bridge.conversationTitle ? Theme.text : Theme.textLabel; font: Theme.caption
             }
-            Text { anchors { right: parent.right; rightMargin: 10; verticalCenter: parent.verticalCenter }
-                   text: "▾"; color: Theme.textLabel; font: Theme.caption }
-            MouseArea {
-                id: switcherArea
-                anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                onClicked: function (mouse) {
-                    if (mouse.button === Qt.RightButton) { switcherMenu.close(); switcherContext.open() }
-                    else { switcherContext.close(); switcherMenu.visible ? switcherMenu.close() : switcherMenu.open() }
-                }
-            }
-            Rectangle {
-                objectName: "conversationSwitcherTip"
-                visible: switcherArea.containsMouse && bridge.conversationTitle !== "" && !switcherMenu.visible && !switcherContext.visible
-                anchors.top: parent.bottom; anchors.topMargin: 8; x: 0
-                width: Math.min(switcherTip.implicitWidth, 404) + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised
-                border.width: 1; border.color: Theme.borderStrong; z: 50
-                Text { id: switcherTip; objectName: "conversationSwitcherTipText"; anchors.centerIn: parent
-                       width: Math.min(implicitWidth, 404); elide: Text.ElideRight
-                       textFormat: Text.PlainText; text: bridge.conversationTitle; color: Theme.text; font: Theme.caption }
-            }
+            Chevron { objectName: "conversationSwitcherChevron"; open: switcherMenu.visible
+                      anchors { right: parent.right; rightMargin: scopeGroup.pad; verticalCenter: parent.verticalCenter } }
+            HoverTip { objectName: "conversationSwitcherTipText"; text: bridge.conversationTitle
+                       active: bridge.conversationTitle !== "" && !switcherMenu.visible && !switcherContext.visible }
         }
 
-        Rectangle {
+        ScopePill {
             id: newChatButton
             objectName: "newConversationButton"
             // Disabled with its reason while the open conversation's project
@@ -401,48 +542,50 @@ Item {
             readonly property string reason: scopeGroup.owner.archived
                 ? qsTr("The project is archived: unarchive it to start a new conversation.")
                 : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-            x: projectSelector.width + 8 + switcher.width + 8
-            height: 26; radius: 13
-            width: (scopeGroup.compactNew ? newPlus.implicitWidth : newFull.implicitWidth) + 24
+            x: switcher.x + switcher.width + scopeGroup.gap
+            width: scopeGroup.newW
+            menuKeys: false
             opacity: allowed ? 1 : 0.45
-            color: newArea.containsMouse && allowed ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
-            border.width: 1; border.color: Theme.borderStrong
+            hotFill: allowed ? Theme.alpha(Theme.accent, 0.14) : idleFill
+            border.color: Theme.borderStrong
             Accessible.role: Accessible.Button; Accessible.name: newFull.text; Accessible.description: reason
-            Text { id: newFull; visible: !scopeGroup.compactNew; anchors.centerIn: parent; text: qsTr("+ New conversation")
+            onActivated: if (newChatButton.allowed) bridge.newConversationInScope()
+            Text { id: newFull; visible: !scopeGroup.newIcon; anchors.centerIn: parent; text: qsTr("+ New conversation")
                    color: Theme.text; font: Theme.caption }
-            Text { id: newPlus; visible: scopeGroup.compactNew; anchors.centerIn: parent; text: "+"; color: Theme.text; font: Theme.captionStrong }
-            MouseArea { id: newArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                        onClicked: if (newChatButton.allowed) bridge.newConversationInScope() }
-            Rectangle {
-                objectName: "newConversationTip"
-                visible: newArea.containsMouse && (newChatButton.reason !== "" || scopeGroup.compactNew)
-                anchors.top: parent.bottom; anchors.topMargin: 8; x: 0
-                width: tip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised
-                border.width: 1; border.color: Theme.borderStrong; z: 50
-                Text { id: tip; anchors.centerIn: parent; color: Theme.text; font: Theme.caption
-                       text: newChatButton.reason || newFull.text }
+            // The icon form: a drawn plus, no font glyph.
+            Item {
+                objectName: "newConversationIcon"
+                visible: scopeGroup.newIcon; anchors.centerIn: parent; width: 10; height: 10
+                Rectangle { anchors.centerIn: parent; width: 10; height: 1.6; radius: 0.8; color: Theme.text }
+                Rectangle { anchors.centerIn: parent; width: 1.6; height: 10; radius: 0.8; color: Theme.text }
             }
+            // The reason (or the full label of the icon form), at full opacity
+            // even while the button itself is dimmed.
+            HoverTip { objectName: "newConversationTip"; text: newChatButton.reason || newFull.text
+                       active: newChatButton.reason !== "" || scopeGroup.newIcon }
         }
 
         AttachDialog { id: attachDialog }
         ConversationDeleteDialog { id: deleteDialog }
 
         // The current scope's conversations, newest first; the open one marked.
-        Popup {
+        ScopeMenu {
             id: switcherMenu
             objectName: "conversationSwitcherMenu"
-            y: switcher.height + 8; x: switcher.x
-            width: 280; padding: 8
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
+            restY: switcher.height + 8; x: switcher.x
+            width: 320
             contentItem: Column {
                 spacing: 2
-                Text { text: qsTr("CONVERSATIONS"); color: Theme.textMuted; font: Theme.label; leftPadding: 10 }
+                Text { text: qsTr("CONVERSATIONS"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; bottomPadding: 4 }
                 ListView {
-                    width: 264; height: Math.min(contentHeight, 320); clip: true; spacing: 2
+                    objectName: "conversationSwitcherList"
+                    width: switcherMenu.availableWidth; height: Math.min(contentHeight, 8 * (Theme.menuRowHeight + 2) - 2)
+                    clip: true; spacing: 2
                     boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { }
                     model: bridge.scopeConversations
-                    delegate: ScopeChoice { objectName: "conversationSwitcherItem"
-                                            label: modelData.title || qsTr("New Chat"); current: modelData.active
+                    delegate: ScopeChoice { objectName: "conversationSwitcherItem"; width: ListView.view.width
+                                            label: modelData.title || qsTr("New Chat"); muted: !modelData.title; current: modelData.active
                                             onChosen: { switcherMenu.close(); bridge.openConversation(modelData.id) } }
                 }
             }
@@ -452,44 +595,48 @@ Item {
         // Each is disabled with its reason (archived project or conversation,
         // not archived yet, a busy run); the store still refuses. Each acts on
         // the conversation open when it was chosen.
-        Popup {
+        ScopeMenu {
             id: switcherContext
             objectName: "conversationSwitcherContext"
-            y: switcher.height + 8; x: switcher.x
-            width: 280; padding: 8
+            restY: switcher.height + 8; x: switcher.x
+            width: 300
             onAboutToShow: bridge.previewDeleteConversation("")
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
             contentItem: Column {
-                spacing: 4
-                ScopeChoice { objectName: "conversationRenameItem"; label: qsTr("Rename"); available: switcher.renameAllowed
+                spacing: 2
+                // Which conversation these act on.
+                Text { objectName: "conversationContextHeader"; width: switcherContext.availableWidth; leftPadding: 12; rightPadding: 12
+                       bottomPadding: 4; elide: Text.ElideRight; textFormat: Text.PlainText
+                       text: switcher.shown; color: Theme.textMuted; font: Theme.caption }
+                ScopeChoice { objectName: "conversationRenameItem"; width: switcherContext.availableWidth
+                              label: qsTr("Rename"); available: switcher.renameAllowed
                               onChosen: { switcherContext.close(); scopeGroup.editId = bridge.conversationId
                                           bridge.clearRenameNotice(); switcherEditor.open() } }
-                Text { objectName: "conversationRenameReason"; visible: !switcher.renameAllowed; width: 264; wrapMode: Text.Wrap
-                       textFormat: Text.PlainText; text: switcher.renameReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
-                ScopeChoice { objectName: "conversationArchiveItem"; label: qsTr("Archive"); available: switcher.archiveAllowed
+                Reason { width: switcherContext.availableWidth; objectName: "conversationRenameReason"; visible: !switcher.renameAllowed; text: switcher.renameReason }
+                ScopeChoice { objectName: "conversationArchiveItem"; width: switcherContext.availableWidth
+                              label: qsTr("Archive"); available: switcher.archiveAllowed
                               onChosen: { var id = bridge.conversationId; if (bridge.archiveConversation(id)) switcherContext.close() } }
-                Text { objectName: "conversationArchiveReason"; visible: !switcher.archiveAllowed; width: 264; wrapMode: Text.Wrap
-                       textFormat: Text.PlainText; text: switcher.archiveReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
-                ScopeChoice { objectName: "conversationDeleteItem"; label: qsTr("Delete permanently…"); available: switcher.deleteAllowed
+                Reason { width: switcherContext.availableWidth; objectName: "conversationArchiveReason"; visible: !switcher.archiveAllowed; text: switcher.archiveReason }
+                Divider { width: switcherContext.availableWidth }
+                ScopeChoice { objectName: "conversationDeleteItem"; width: switcherContext.availableWidth; danger: true
+                              label: qsTr("Delete permanently…"); available: switcher.deleteAllowed
                               onChosen: { var id = bridge.conversationId; switcherContext.close(); deleteDialog.openFor(id) } }
-                Text { objectName: "conversationDeleteReason"; visible: !switcher.deleteAllowed; width: 264; wrapMode: Text.Wrap
-                       textFormat: Text.PlainText; text: switcher.deleteReason; color: Theme.textMuted; font: Theme.caption; leftPadding: 10 }
-                Text { objectName: "conversationLifecycleNotice"; visible: bridge.conversationNotice !== ""; width: 264; wrapMode: Text.Wrap
-                       textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.caption; leftPadding: 10 }
+                Reason { width: switcherContext.availableWidth; objectName: "conversationDeleteReason"; visible: !switcher.deleteAllowed; text: switcher.deleteReason }
+                Text { objectName: "conversationLifecycleNotice"; visible: bridge.conversationNotice !== ""
+                       width: switcherContext.availableWidth; leftPadding: 12; rightPadding: 12; wrapMode: Text.Wrap
+                       textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.caption }
             }
         }
 
         // The edit. Enter / Save commits the normalized name to the conversation
         // the edit STARTED on; Escape / Cancel / a change of conversation reverts.
-        Popup {
+        ScopeMenu {
             id: switcherEditor
             objectName: "conversationRenameEditor"
-            y: switcher.height + 8; x: switcher.x
-            width: 320; padding: 10
+            restY: switcher.height + 8; x: switcher.x
+            width: 320; padding: 12
             closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
             onAboutToShow: { renameField.text = bridge.conversationTitle }
             onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge }
             function commit() {
                 if (!bridge.busy && bridge.renameConversation(scopeGroup.editId, renameField.text)) switcherEditor.close()
             }
@@ -500,55 +647,62 @@ Item {
                 }
             }
             contentItem: Column {
-                spacing: 8
+                spacing: 10
+                Text { objectName: "conversationRenameTitle"; text: i18n.upper(qsTr("Rename")); color: Theme.textMuted; font: Theme.label }
                 TextField {
                     id: renameField
                     objectName: "conversationRenameField"
-                    width: 300; height: 34; selectByMouse: true; color: Theme.text; font: Theme.body
+                    width: switcherEditor.availableWidth; height: 36; selectByMouse: true; color: Theme.text; font: Theme.body
                     placeholderText: qsTr("Conversation name")
                     background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                             border.color: renameField.activeFocus ? Theme.commandEdge : Theme.border }
                     onAccepted: switcherEditor.commit()
                 }
-                Text { objectName: "conversationRenameNotice"; visible: bridge.conversationRenameNotice !== ""; width: 300
-                       wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationRenameNotice
-                       color: Theme.warning; font: Theme.caption }
-                Row {
-                    spacing: 8
-                    ActionButton { objectName: "conversationRenameSave"; label: qsTr("Save"); primary: true; height: 32
-                                   enabled: !bridge.busy; onClicked: switcherEditor.commit() }
-                    ActionButton { objectName: "conversationRenameCancel"; label: qsTr("Cancel"); height: 32
-                                   onClicked: switcherEditor.close() }
+                Text { objectName: "conversationRenameNotice"; visible: bridge.conversationRenameNotice !== ""
+                       width: switcherEditor.availableWidth; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                       text: bridge.conversationRenameNotice; color: Theme.warning; font: Theme.caption }
+                Item {
+                    width: switcherEditor.availableWidth; height: 32
+                    Row {
+                        anchors.right: parent.right
+                        spacing: 8
+                        ActionButton { objectName: "conversationRenameCancel"; label: qsTr("Cancel"); height: 32
+                                       onClicked: switcherEditor.close() }
+                        ActionButton { objectName: "conversationRenameSave"; label: qsTr("Save"); primary: true; height: 32
+                                       enabled: !bridge.busy; onClicked: switcherEditor.commit() }
+                    }
                 }
             }
         }
 
-        Popup {
+        // Projects first, then Global, then the two actions (in accent).
+        ScopeMenu {
             id: selectorMenu
             objectName: "projectSelectorMenu"
             property var choices: []
-            y: projectSelector.height + 8; x: 0
-            width: 280; padding: 8
+            restY: projectSelector.height + 8; x: 0
+            width: 300
             onAboutToShow: choices = bridge.projectChoices()
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
-                WheelHandler { } }
             contentItem: Column {
                 spacing: 2
-                Text { text: qsTr("PROJECTS"); color: Theme.textMuted; font: Theme.label; leftPadding: 10 }
+                Text { text: qsTr("PROJECTS"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; bottomPadding: 4 }
                 Repeater {
                     model: selectorMenu.choices
-                    delegate: ScopeChoice { objectName: "projectSelectorItem"; label: modelData.name
-                                       current: modelData.id === scopeGroup.owner.id
-                                       onChosen: { selectorMenu.close(); bridge.openProjectScope(modelData.id) } }
+                    delegate: ScopeChoice { objectName: "projectSelectorItem"; width: selectorMenu.availableWidth; label: modelData.name
+                                            current: modelData.id === scopeGroup.owner.id
+                                            onChosen: { selectorMenu.close(); bridge.openProjectScope(modelData.id) } }
                 }
-                ScopeChoice { objectName: "projectSelectorGlobal"; label: qsTr("Global"); current: !!scopeGroup.owner.global
-                         onChosen: { selectorMenu.close(); bridge.openProjectScope("") } }
+                Divider { width: selectorMenu.availableWidth }
+                ScopeChoice { objectName: "projectSelectorGlobal"; width: selectorMenu.availableWidth
+                              label: qsTr("Global"); current: !!scopeGroup.owner.global
+                              onChosen: { selectorMenu.close(); bridge.openProjectScope("") } }
+                Divider { width: selectorMenu.availableWidth }
                 // Gate 6C: only while the open conversation is a writable Global one.
-                ScopeChoice { objectName: "projectSelectorAttach"; visible: bridge.canAttach
-                              label: qsTr("Attach to a project…")
+                ScopeChoice { objectName: "projectSelectorAttach"; visible: bridge.canAttach; width: selectorMenu.availableWidth
+                              label: qsTr("Attach to a project…"); action: true
                               onChosen: { selectorMenu.close(); attachDialog.openDialog() } }
-                Rectangle { width: 264; height: 1; color: Theme.border }
-                ScopeChoice { objectName: "projectSelectorAll"; label: qsTr("All projects"); onChosen: { selectorMenu.close(); bridge.showProject("") } }
+                ScopeChoice { objectName: "projectSelectorAll"; width: selectorMenu.availableWidth; action: true
+                              label: qsTr("All projects"); onChosen: { selectorMenu.close(); bridge.showProject("") } }
             }
         }
     }
@@ -620,8 +774,13 @@ Item {
         readonly property var stages: bridge.progress.stages || []
         // Ends just short of the core; reaches toward the rail, at most 360 px.
         readonly property real endX: bar.coreCx - bar.coreDiameter * 0.5 - bar.width * 0.02
+        // Gate 6E: on a narrow window the scope controls share this band, and
+        // controls outrank secondary metadata (the degradation order above):
+        // the indicator starts after them, or yields when that leaves too little.
+        readonly property real startX: scopeGroup.visible && scopeGroup.twoRow ? scopeGroup.x + scopeGroup.width + 16
+                                                                               : bar.railWidth + 24
         visible: bridge.progress.active === true && stages.length === 4 && width >= 240
-        width: Math.max(0, Math.min(360, endX - bar.railWidth - 24)); height: 50
+        width: Math.max(0, Math.min(360, endX - startX)); height: 50
         x: endX - width
         y: bar.coreCy + Math.round(bar.viewportHeight * 0.03) - 6
         readonly property real pitch: width / 4
