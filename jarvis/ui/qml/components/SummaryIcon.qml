@@ -2,7 +2,8 @@ import QtQuick
 import QtQuick.Shapes
 
 // The summary line icons (tasks / updates / focus / plan / memory), drawn at
-// 18 px so the rail cards and their peek panels share one set.
+// 18 px so the rail cards and their peek panels share one set; and the
+// sidebar's scope icons (global, project - Gate 6F).
 Shape {
     id: glyph
     property string icon: "tasks"
@@ -56,5 +57,21 @@ Shape {
         PathMove { x: 15.5; y: 4 } PathLine { x: 15.5; y: 14 }
         PathAngleArc { centerX: 9; centerY: 9; radiusX: 6.5; radiusY: 2.5; startAngle: 0; sweepAngle: 180; moveToStart: true }
         PathAngleArc { centerX: 9; centerY: 14; radiusX: 6.5; radiusY: 2.5; startAngle: 0; sweepAngle: 180; moveToStart: true }
+    }
+    // Global: a globe - the outline, the equator and one meridian.
+    ShapePath {
+        strokeColor: glyph.icon === "global" ? glyph.tint : "transparent"; strokeWidth: 1.6; fillColor: "transparent"
+        capStyle: ShapePath.RoundCap
+        PathAngleArc { centerX: 9; centerY: 9; radiusX: 7; radiusY: 7; startAngle: 0; sweepAngle: 360; moveToStart: true }
+        PathMove { x: 2; y: 9 } PathLine { x: 16; y: 9 }
+        PathAngleArc { centerX: 9; centerY: 9; radiusX: 3; radiusY: 7; startAngle: 0; sweepAngle: 360; moveToStart: true }
+    }
+    // Project: a folder.
+    ShapePath {
+        strokeColor: glyph.icon === "project" ? glyph.tint : "transparent"; strokeWidth: 1.6; fillColor: "transparent"
+        joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
+        startX: 2; startY: 4
+        PathLine { x: 7; y: 4 } PathLine { x: 9; y: 6 } PathLine { x: 16; y: 6 } PathLine { x: 16; y: 15 }
+        PathLine { x: 2; y: 15 } PathLine { x: 2; y: 4 }
     }
 }

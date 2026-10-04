@@ -280,7 +280,7 @@ class RaceTests(SwitcherCase):
         def during(*args, **kwargs):
             # Runs inside the submit: the conversation is busy right now.
             seen["busy"] = bridge.busy
-            seen["allowed"] = self.item(root, "conversationSwitcher").property("renameAllowed")
+            seen["allowed"] = self.item(root, "conversationMenu").property("renameAllowed")
             seen["commit"] = bridge.renameConversation(conversation.id, "Çok erken")
             seen["notice"] = bridge.conversationRenameNotice
             seen["title_during"] = store.load_conversation(conversation.id).title
@@ -292,7 +292,7 @@ class RaceTests(SwitcherCase):
         self.assertIn("Wait", seen["notice"])
         self.assertEqual(task_title(message), seen["title_during"])                  # the automatic name came first
         self.assertFalse(bridge.busy)
-        self.assertTrue(self.item(root, "conversationSwitcher").property("renameAllowed"))
+        self.assertTrue(self.item(root, "conversationMenu").property("renameAllowed"))
         # After it clears, a manual rename wins and is never overwritten.
         self.assertTrue(bridge.renameConversation(conversation.id, "Elle verilen ad"))
         self.assertEqual("Elle verilen ad", store.load_conversation(conversation.id).title)
@@ -319,7 +319,7 @@ class RaceTests(SwitcherCase):
         # And the QML commit path uses the captured id, not the open one.
         self.start_edit(root)
         self.item(root, "conversationRenameField").setProperty("text", "B yeni"); pump(60)
-        self.assertEqual(b.id, self.item(root, "projectScope").property("editId"))
+        self.assertEqual(b.id, self.item(root, "conversationMenu").property("editId"))
         self.press(root, self.item(root, "conversationRenameSave"))
         self.assertEqual(("A yeni", "B yeni"), (store.load_conversation(a.id).title, store.load_conversation(b.id).title))
 
@@ -413,6 +413,6 @@ class CatalogTests(UiTestCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Yeni Sohbet", tx("TopBar", "New Chat"))
-        self.assertEqual("Yeniden adlandır", tx("TopBar", "Rename"))
+        self.assertEqual("Yeniden adlandır", tx("ConversationMenu", "Rename"))
         self.assertEqual("SOHBETLER", tx("TopBar", "CONVERSATIONS"))
         self.assertEqual("Bir ad yazın; eski ad korunur.", tx("Bridge", "Type a name; the old name is kept."))

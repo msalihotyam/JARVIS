@@ -71,6 +71,7 @@ QtObject {
     readonly property font label: face(12, true, 0.7)          // UPPERCASE section / column labels
     readonly property font caption: face(13, false)            // metadata, timestamps, helper, row sub-lines, actions
     readonly property font captionStrong: face(13, true)       // a caption that names something (a chip, a counter's label)
+    readonly property font captionFigures: face(13, false, 0, true)   // a caption count or time (tabular)
     readonly property font body: face(14, false)               // interface text, values, descriptions
     readonly property font bodyStrong: face(14, true)          // row titles, buttons, emphasised values
     readonly property font lead: face(15, false)               // an explanatory sentence on a card

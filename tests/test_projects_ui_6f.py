@@ -27,6 +27,15 @@ the next scheduled job; Memory the status and this scope's records. Two
 read-only Bridge keys: B3 on the newest ``sessions`` item (its latest task)
 and B4 on ``conversationProject`` (instruction, files, memory records).
 
+Slice F3 - the sidebar navigation (L2 a-e, L4, Q8-Q10): Genel, the active
+projects and the selected scope's conversations grouped Bugün / Dün / Daha
+eski, in whole rows with no clipping and no overlap with the tiles; a scope
+pick is the 6B rule, a row pick the switcher pick, the round "+" a new
+conversation in the selected scope; the counts follow every change; a
+right-click on a row opens the ONE conversation menu (ConversationMenu.qml,
+which the TopBar switcher also opens) for THAT row without opening it; the
+links go where Q9 / Q10 say; every action has a mouse path.
+
 No test performs a live model, auth or network call or opens the live DB.
 """
 
@@ -35,10 +44,11 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import unittest
+from datetime import timezone
 from unittest import mock
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QMetaObject, QObject, QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QFontMetricsF
 from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
@@ -537,6 +547,459 @@ class TileContentTests(TileContentCase):
                                 ("No scheduled job", "Zamanlanmış iş yok"), ("%1 records", "%1 kayıt"),
                                 ("last record %1", "son kayıt %1")):
             self.assertEqual(turkish, tx("SummaryRail", source))
+
+
+LONG_PROJECT = "İstanbul Beşiktaş daire tadilatı, taşınma planlaması ve kira sözleşmesi takibi 2026"
+LONG_TITLE = "Kat malikleri toplantısı için hazırlanacak belgeler, aidat hesapları ve tadilat izinleri"
+
+
+class SidebarNavCase(SidebarShellCase, SidebarDataCase):
+    def shown(self, root, name) -> list:
+        return [i for i in self.all_items(root, name) if i.isVisible()]
+
+    def tap(self, root, item, button=Qt.LeftButton) -> None:
+        QTest.mouseClick(root, button, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
+        pump(350)
+
+    def row(self, root, name, title):
+        found = [i for i in self.shown(root, name) if i.property("title") == title]
+        self.assertEqual(1, len(found), (name, title, [i.property("title") for i in self.shown(root, name)]))
+        return found[0]
+
+    def titles(self, root) -> list:
+        return [i.property("title") for i in self.shown(root, "sidebarConversation")]
+
+    def child(self, item, name):
+        found = [c for c in item.childItems() if c.objectName() == name]
+        return found[0] if found else None
+
+    def link(self, root, name) -> str:
+        return str(self.item(root, name).property("count"))
+
+    def editing(self, root) -> bool:
+        return any(i.isVisible() for i in self.all_items(root, "conversationRenameField"))
+
+    def stamp(self, conversation_id: str, when) -> None:
+        with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("UPDATE conversations SET updated_at = ? WHERE id = ?",
+                               (when.astimezone(timezone.utc).isoformat(), conversation_id))
+
+
+class SidebarNavTests(SidebarNavCase):
+    def test_t_whole_rows_no_clip_no_overlap_and_long_names_elide_with_a_tip(self) -> None:
+        store = self.seed()
+        extra = [store.create_project(f"Proje {n}") for n in range(3)]
+        longp = store.create_project(LONG_PROJECT)
+        for n in range(4):
+            store.create_conversation(longp.id, title=f"Kısa {n}")
+        owned = store.create_conversation(longp.id, title=LONG_TITLE)
+        bridge = self.bridge()
+        bridge.openConversation(owned.id)
+        root = self.window(bridge)
+        active = 3 + len(extra) + 1
+        for theme in ("space", "dark"):
+            bridge.setTheme(theme)
+            for width, height in SIZES:
+                root.resize(width, height); pump(700)
+                with self.subTest(theme=theme, size=(width, height)):
+                    side, nav = self.box(root, "sidebar"), self.box(root, "sidebarNav")
+                    self.inside(side, nav, "nav")
+                    tiles = [self.box(root, "rail" + key) for key in TILES]
+                    plist, clist = self.box(root, "sidebarProjectList"), self.box(root, "sidebarConversationList")
+                    for name in ("sidebarGlobal", "sidebarProjectsLink", "sidebarNewProject", "sidebarScopeChip",
+                                 "sidebarNewConversation"):
+                        box = self.box(root, name)
+                        self.inside(nav, box, name)
+                        for tile in tiles:
+                            self.apart(box, tile, name)
+                    for box, what in ((plist, "projects"), (clist, "conversations")):
+                        self.inside(nav, box, what)
+                        for tile in tiles:
+                            self.apart(box, tile, what)
+                    # Whole rows: a row the list shows is wholly inside it.
+                    shown = {}
+                    for name, box in (("sidebarProject", plist), ("sidebarConversation", clist)):
+                        inside = 0
+                        for item in self.shown(root, name):
+                            r = self.rect(item)
+                            cut = r.intersected(box)
+                            if cut.height() > 0.5:
+                                self.assertAlmostEqual(r.height(), cut.height(), delta=0.5, msg=name)
+                                inside += 1
+                        shown[name] = inside
+                    # 5 at the 1920 class, 3 below; fewer only while the conversations would keep
+                    # less than two whole rows (1100x700 until the scope group leaves the bar, F4).
+                    if (width, height) == (1100, 700):
+                        self.assertIn(shown["sidebarProject"], (2, 3))
+                    else:
+                        self.assertEqual(min(5 if width >= 1600 else 3, active), shown["sidebarProject"])
+                    self.assertGreaterEqual(shown["sidebarConversation"], 2)
+                    # Names elide (never under 6 characters) and the tip has them whole; counts and times never elide.
+                    for name, title_name, meta_name in (("sidebarGlobal", "sidebarGlobalName", "sidebarGlobalCount"),
+                                                        ("sidebarProject", "sidebarProjectName", "sidebarProjectCount"),
+                                                        ("sidebarConversation", "sidebarConversationTitle", "sidebarConversationTime")):
+                        for row in self.shown(root, name):
+                            title, meta = self.child(row, title_name), self.child(row, meta_name)
+                            for text in (title, meta):
+                                pos = text.mapToItem(row, QPointF(0, 0))
+                                self.assertGreaterEqual(pos.x(), 0, name)
+                                self.assertLessEqual(pos.x() + text.property("contentWidth"), row.width() + 0.5, name)
+                                self.assertEqual(1, text.property("lineCount"), name)
+                            self.assertFalse(meta.property("truncated"), name)
+                            self.assertLessEqual(title.mapToItem(row, QPointF(title.width(), 0)).x(),
+                                                 meta.mapToItem(row, QPointF(0, 0)).x(), name)
+                            tip = self.child(row, "sidebarRowTip")
+                            self.assertEqual(row.property("title"), tip.property("text"))
+                            if title.property("truncated"):
+                                six = QFontMetricsF(title.property("font")).horizontalAdvance(row.property("title")[:6] + "…")
+                                self.assertGreaterEqual(title.width() + 0.5, six, name)
+                                self.assertTrue(tip.property("active"), name)
+                    self.assertTrue(self.row(root, "sidebarProject", LONG_PROJECT).property("current"))
+                    self.assertTrue(self.child(self.row(root, "sidebarProject", LONG_PROJECT), "sidebarProjectName").property("truncated"))
+                    self.assertTrue(self.child(self.row(root, "sidebarConversation", LONG_TITLE), "sidebarConversationTitle").property("truncated"))
+                    chip, chip_name = self.box(root, "sidebarScopeChip"), self.item(root, "sidebarScopeName")
+                    self.inside(chip, self.rect(chip_name), "chip name")
+                    self.assertEqual(LONG_PROJECT, self.item(root, "sidebarScopeTip").property("text"))
+                    self.apart(chip, self.box(root, "sidebarNewConversation"), "chip / +")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_u_grouping_by_the_local_day_of_the_last_change(self) -> None:
+        from datetime import datetime, timedelta
+        store = self.db()
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        cases = (("Bugün ilk", midnight + timedelta(seconds=30)),                # just after midnight: today
+                 ("Dün son", midnight - timedelta(seconds=30)),                  # just before it: yesterday
+                 ("Dün ilk", midnight - timedelta(days=1) + timedelta(seconds=30)),
+                 ("Daha eski", midnight - timedelta(days=1, seconds=30)))        # the day before: earlier
+        for title, when in cases:
+            self.stamp(store.create_conversation(title=title).id, when)
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge._refresh_conversations(); pump(300)
+        groups = {}
+        for row in self.shown(root, "sidebarConversation"):
+            groups.setdefault(row.parentItem().property("key"), []).append(row.property("title"))
+        self.assertEqual({"today": ["Bugün ilk"], "yesterday": ["Dün son", "Dün ilk"], "earlier": ["Daha eski"]}, groups)
+        self.assertEqual(["Today", "Yesterday", "Earlier"], self.texts(root, "sidebarGroupLabel"))
+        times = {row.property("title"): row.property("meta") for row in self.shown(root, "sidebarConversation")}
+        self.assertEqual(("00:00", "23:59", "00:00"), (times["Bugün ilk"], times["Dün son"], times["Dün ilk"]))
+        older = cases[3][1]
+        self.assertEqual(f"{older.day} {older.strftime('%b')}", times["Daha eski"])
+        # Empty groups are not shown.
+        store.archive_conversation(next(r.id for r in store.list_conversations(project_id=None) if r.title == "Daha eski"))
+        bridge._refresh_conversations(); pump(300)
+        self.assertEqual(["Today", "Yesterday"], self.texts(root, "sidebarGroupLabel"))
+
+    def test_v_a_scope_pick_is_the_6b_rule_and_a_row_pick_is_the_switcher_pick(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        # A project: its newest non-archived conversation.
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        newest = store.list_conversations(project_id=self.many.id)[0]
+        self.assertEqual((newest.id, self.many.id), (bridge.conversationId, bridge.conversationProject["id"]))
+        self.assertTrue(self.row(root, "sidebarProject", "Çok").property("current"))
+        self.assertEqual(sorted(r.title for r in self.live), sorted(self.titles(root)))
+        # An empty project: a new conversation in it.
+        before = len(store.list_conversations(project_id=self.empty.id))
+        self.tap(root, self.row(root, "sidebarProject", "Boş"))
+        self.assertEqual((before + 1, self.empty.id), (len(store.list_conversations(project_id=self.empty.id)),
+                                                       bridge.conversationProject["id"]))
+        self.assertEqual(["New Chat"], self.titles(root))
+        # Genel: the newest Global one.
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        self.assertEqual(store.list_conversations(project_id=None)[0].id, bridge.conversationId)
+        self.assertTrue(self.item(root, "sidebarGlobal").property("current"))
+        # The archived project is not a row; openProjectScope refuses it anyway.
+        self.assertNotIn("Eski", [i.property("title") for i in self.shown(root, "sidebarProject")])
+        self.assertFalse(bridge.openProjectScope(self.old.id))
+        # A row pick: that conversation opens and is marked (edge + fill); the switcher names it.
+        other = self.row(root, "sidebarConversation", "Genel 0")
+        self.assertFalse(other.property("current"))
+        self.tap(root, other)
+        picked = self.row(root, "sidebarConversation", "Genel 0")
+        self.assertEqual(self.global_live[0].id, bridge.conversationId)
+        self.assertTrue(picked.property("current"))
+        self.assertEqual(1.0, self.child(picked, "sidebarRowEdge").property("opacity"))
+        self.assertEqual(1, sum(1 for r in self.shown(root, "sidebarConversation") if r.property("current")))
+        self.assertEqual("Genel 0", self.item(root, "conversationSwitcherText").property("text"))
+        # The busy guard: no pick while a run is busy.
+        bridge._busy = True
+        try:
+            self.tap(root, self.row(root, "sidebarConversation", "Genel 1"))
+            self.tap(root, self.row(root, "sidebarProject", "Tek"))
+            self.assertEqual(self.global_live[0].id, bridge.conversationId)
+        finally:
+            bridge._busy = False
+        self.assertEqual(0, self.execute_calls())
+
+    def test_w_the_round_plus_opens_a_new_conversation_in_the_selected_scope(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        plus = self.item(root, "sidebarNewConversation")
+        self.assertEqual("New conversation in Global", plus.property("tip"))
+        count = len(store.list_conversations(project_id=None))
+        self.tap(root, plus)
+        self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
+        self.assertTrue(bridge.conversationProject["global"])
+        self.assertTrue(self.row(root, "sidebarConversation", "New Chat").property("current"))
+        self.tap(root, self.row(root, "sidebarProject", "Tek"))
+        self.assertEqual("New conversation in Tek", plus.property("tip"))
+        self.tap(root, plus)
+        self.assertEqual((self.one.id, 2), (bridge.conversationProject["id"], len(store.list_conversations(project_id=self.one.id))))
+        # Under an archived project: dimmed, the reason in its tip, and a click does nothing.
+        bridge.openConversation(store.list_conversations(project_id=self.old.id)[0].id); pump(300)
+        self.assertFalse(plus.property("allowed"))
+        self.assertAlmostEqual(0.38, plus.property("opacity"), places=2)
+        self.assertEqual("The project is archived: unarchive it to start a new conversation.", plus.property("tip"))
+        self.tap(root, plus)
+        self.assertEqual(1, len(store.list_conversations(project_id=self.old.id)))
+        self.assertTrue(self.item(root, "sidebarScopeChip").property("archived"))
+        self.assertEqual("Eski · archived", self.item(root, "sidebarScopeTip").property("text"))
+        # While busy: the same.
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        bridge._busy = True
+        try:
+            bridge.stateChanged.emit(); pump(100)
+            self.assertEqual("Wait for the current run to finish.", plus.property("tip"))
+            self.tap(root, plus)
+            self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
+        finally:
+            bridge._busy = False
+        self.assertEqual(0, self.execute_calls())
+
+    def test_x_the_counts_follow_archive_unarchive_attach_and_delete(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        count = lambda title: self.child(self.row(root, "sidebarProject", title), "sidebarProjectCount").property("text")  # noqa: E731
+        genel = lambda: self.item(root, "sidebarGlobalCount").property("text")  # noqa: E731
+        self.assertEqual(("–", "1", "3"), (count("Boş"), count("Tek"), count("Çok")))
+        self.assertEqual(str(len(bridge.conversations)), genel())
+        self.assertEqual("1", self.link(root, "sidebarArchivedProjects"))
+        self.assertEqual("1", self.link(root, "sidebarArchive"))                       # Genel: History's archived
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        self.assertEqual("2", self.link(root, "sidebarArchive"))
+        # archive / unarchive
+        victim = next(r for r in self.live if r.id != bridge.conversationId)
+        self.assertTrue(bridge.archiveConversation(victim.id)); pump(300)
+        self.assertEqual(("2", "3"), (count("Çok"), self.link(root, "sidebarArchive")))
+        self.assertNotIn(victim.title, self.titles(root))
+        self.assertTrue(bridge.unarchiveConversation(victim.id)); pump(300)
+        self.assertEqual(("3", "2"), (count("Çok"), self.link(root, "sidebarArchive")))
+        # permanent delete of an archived one
+        gone = next(r.id for r in store.list_conversations(project_id=self.many.id, include_archived=True) if r.archived_at)
+        bridge.previewDeleteConversation(gone); pump(60)
+        self.assertTrue(bridge.confirmDeleteConversation(gone)); pump(300)
+        bridge.setPage("home"); pump(400)
+        self.assertEqual("1", self.link(root, "sidebarArchive"))
+        # attach: a Global conversation moves to Boş
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        before = genel()
+        say(store, bridge.conversationId, "tezgah ölçüleri")
+        bridge.previewAttach(self.empty.id, ""); pump(60)
+        self.assertTrue(bridge.confirmAttach(self.empty.id, ""), bridge.attachNotice); pump(300)
+        bridge.setPage("home"); pump(400)
+        self.assertEqual((str(int(before) - 1), "1"), (genel(), count("Boş")))
+        # a project archived: one more in the archived link, its row gone
+        bridge.archiveProject(self.one.id); pump(400)
+        bridge.setPage("home"); pump(400)
+        self.assertEqual("2", self.link(root, "sidebarArchivedProjects"))
+        self.assertNotIn("Tek", [i.property("title") for i in self.shown(root, "sidebarProject")])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_y_a_right_click_acts_on_that_row_and_does_not_open_it(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        opened = bridge.conversationId
+        target = next(r for r in self.live if r.id != opened)
+        calls = []
+        real = bridge.backend.conversation_rename
+        bridge.backend.conversation_rename = lambda cid, title: (calls.append((cid, title)), real(cid, title))[1]
+        self.tap(root, self.row(root, "sidebarConversation", target.title), Qt.RightButton)
+        menu = self.item(root, "conversationMenu")
+        self.assertTrue(menu.property("open"))
+        self.assertEqual((target.id, opened), (menu.property("targetId"), bridge.conversationId))       # not opened
+        self.assertEqual(target.title, self.item(root, "conversationContextHeader").property("text"))
+        self.assertTrue(self.item(root, "conversationRenameItem").isEnabled())
+        self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
+        self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))
+        # Rename: prefilled with THAT row's title; the commit renames that row only.
+        self.tap(root, self.item(root, "conversationRenameItem"))
+        self.assertTrue(self.editing(root))
+        self.assertEqual(target.title, self.item(root, "conversationRenameField").property("text"))
+        self.item(root, "conversationRenameField").setProperty("text", "Satırdan yeni ad"); pump(60)
+        self.tap(root, self.item(root, "conversationRenameSave"))
+        self.assertEqual([(target.id, "Satırdan yeni ad")], calls)
+        self.assertFalse(self.editing(root))
+        self.assertEqual(opened, bridge.conversationId)
+        self.assertIn("Satırdan yeni ad", self.titles(root))
+        # Archive from the row: that one leaves the list; the open one stays open.
+        self.tap(root, self.row(root, "sidebarConversation", "Satırdan yeni ad"), Qt.RightButton)
+        self.tap(root, self.item(root, "conversationArchiveItem"))
+        self.assertIsNotNone(store.load_conversation(target.id).archived_at)
+        self.assertEqual(opened, bridge.conversationId)
+        self.assertNotIn("Satırdan yeni ad", self.titles(root))
+        self.assertFalse(menu.property("open"))
+        # Under an archived project: rename / archive disabled with their reasons; delete
+        # offered for that row, and the dialog is for that row.
+        store.set_project_active(self.old.id, True)                    # a second one, made before the archive
+        second = store.create_conversation(self.old.id, title="Eski ikinci")
+        store.set_project_active(self.old.id, False)
+        bridge.refreshProjects()
+        bridge.openConversation(store.list_conversations(project_id=self.old.id)[-1].id); pump(300)
+        self.assertNotEqual(second.id, bridge.conversationId)
+        self.tap(root, self.row(root, "sidebarConversation", "Eski ikinci"), Qt.RightButton)
+        self.assertFalse(self.item(root, "conversationRenameItem").isEnabled())
+        self.assertIn("archived", self.item(root, "conversationRenameReason").property("text"))
+        self.assertFalse(self.item(root, "conversationArchiveItem").isEnabled())
+        self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())
+        self.tap(root, self.item(root, "conversationDeleteItem"))
+        dialog = root.findChild(QObject, "conversationDeleteDialog")
+        self.assertTrue(dialog.property("visible"))
+        self.assertEqual(second.id, dialog.property("targetId"))
+        self.assertNotEqual(second.id, bridge.conversationId)
+        QMetaObject.invokeMethod(dialog, "close"); pump(400)
+        self.assertIsNotNone(store.load_conversation(second.id))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_z_the_top_bar_menu_still_works_through_conversation_menu(self) -> None:
+        from pathlib import Path
+        qml = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components"
+        self.assertNotIn("conversationSwitcherContext", (qml / "TopBar.qml").read_text(encoding="utf-8"))
+        self.assertIn("conversationSwitcherContext", (qml / "ConversationMenu.qml").read_text(encoding="utf-8"))
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(1, len(self.all_items(root, "conversationMenu")))                # one menu, two openers
+        self.tap(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        menu = self.item(root, "conversationMenu")
+        self.assertEqual(("", True), (menu.property("rowId"), menu.property("open")))
+        self.assertTrue(self.item(root, "conversationSwitcher").property("open"))
+        self.assertEqual(self.item(root, "conversationSwitcherText").property("text"),
+                         self.item(root, "conversationContextHeader").property("text"))
+        # Under the switcher, as before.
+        switcher, header = self.box(root, "conversationSwitcher"), self.box(root, "conversationContextHeader")
+        self.assertGreater(header.top(), switcher.bottom())
+        self.tap(root, self.item(root, "conversationRenameItem"))
+        self.item(root, "conversationRenameField").setProperty("text", "Üstten ad"); pump(60)
+        self.tap(root, self.item(root, "conversationRenameSave"))
+        self.assertEqual("Üstten ad", store.load_conversation(bridge.conversationId).title)
+        self.assertEqual("Üstten ad", self.item(root, "conversationSwitcherText").property("text"))
+        self.assertIn("Üstten ad", self.titles(root))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_aa_the_links_and_the_new_project_plus(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
+        for name in ("sidebarProjectsLink", "sidebarArchivedProjects"):
+            self.tap(root, self.item(root, name))
+            self.assertEqual(("projects", {}), (bridge.page, bridge.openProject), name)
+            bridge.setPage("home"); pump(400)
+        # Q9: the Projects page with its create field focused.
+        self.tap(root, self.item(root, "sidebarNewProject"))
+        self.assertEqual("projects", bridge.page)
+        self.assertTrue(self.item(root, "projectNewName").property("activeFocus"))
+        bridge.setPage("home"); pump(400)
+        # Arşiv (n): Genel -> History; a project -> its detail.
+        self.tap(root, self.item(root, "sidebarArchive"))
+        self.assertEqual("history", bridge.page)
+        bridge.setPage("home"); pump(400)
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        self.tap(root, self.item(root, "sidebarArchive"))
+        self.assertEqual(("projects", self.many.id), (bridge.page, bridge.openProject.get("id")))
+        bridge.setPage("home"); pump(400)
+        # No archived conversation: no link.
+        self.tap(root, self.row(root, "sidebarProject", "Tek"))
+        self.assertFalse(self.item(root, "sidebarArchive").isVisible())
+        # Below 760 px of height the archived-projects link folds into the heading as "(n)".
+        root.resize(1100, 700); pump(600)
+        self.assertFalse(self.item(root, "sidebarArchivedProjects").isVisible())
+        folded = self.item(root, "sidebarArchivedProjectsCount")
+        self.assertEqual(("(1)", "Archived projects"), (folded.property("count"), folded.property("tip")))
+        self.inside(self.box(root, "sidebarNav"), self.rect(folded), "folded link")
+        self.apart(self.rect(folded), self.box(root, "sidebarNewProject"), "folded / +")
+        self.tap(root, folded)
+        self.assertEqual("projects", bridge.page)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_bb_every_navigation_action_has_a_mouse_path(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        keys = []
+        real = QTest.keyClick
+        with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
+            self.tap(root, self.row(root, "sidebarProject", "Çok"))                                      # scope pick
+            self.assertEqual(self.many.id, bridge.conversationProject["id"])
+            other = next(t for t in self.titles(root) if not self.row(root, "sidebarConversation", t).property("current"))
+            self.tap(root, self.row(root, "sidebarConversation", other))                                 # conversation pick
+            self.assertEqual(other, bridge.conversationTitle)
+            self.tap(root, self.item(root, "sidebarNewConversation"))                                    # new conversation
+            self.assertEqual(("", self.many.id), (bridge.conversationTitle, bridge.conversationProject["id"]))
+            self.tap(root, self.row(root, "sidebarConversation", other), Qt.RightButton)                 # rename
+            self.tap(root, self.item(root, "conversationRenameItem"))
+            self.item(root, "conversationRenameField").setProperty("text", other + " 2"); pump(60)
+            self.tap(root, self.item(root, "conversationRenameSave"))
+            self.tap(root, self.row(root, "sidebarConversation", other + " 2"), Qt.RightButton)          # archive
+            self.tap(root, self.item(root, "conversationArchiveItem"))
+            self.assertNotIn(other + " 2", self.titles(root))
+            self.tap(root, self.item(root, "sidebarGlobal"))                                             # Genel
+            self.assertTrue(bridge.conversationProject["global"])
+            self.tap(root, self.item(root, "railTasks"))                                                 # tiles / peek
+            self.assertTrue(root.property("peekOpen"))
+            self.tap(root, self.item(root, "railTasks"))
+            self.tap(root, self.item(root, "sidebarArchive"))                                            # Arşiv
+            self.assertEqual("history", bridge.page)
+            bridge.setPage("home"); pump(400)
+            self.tap(root, self.item(root, "sidebarNewProject"))                                         # new project
+            self.assertEqual("projects", bridge.page)
+        self.assertEqual([], keys)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_cc_the_keyboard_reaches_the_rows_with_a_ring(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        genel = self.item(root, "sidebarGlobal")
+        genel.forceActiveFocus(); pump(200)
+        self.assertTrue(self.child(genel, "sidebarRowFocusRing").isVisible())
+        QTest.keyClick(root, Qt.Key_Tab); pump(200)
+        self.assertTrue(self.item(root, "sidebarProjectsLink").property("activeFocus"))
+        row = self.row(root, "sidebarProject", "Çok")
+        row.forceActiveFocus(); pump(200)
+        QTest.keyClick(root, Qt.Key_Return); pump(400)
+        self.assertEqual(self.many.id, bridge.conversationProject["id"])
+        target = next(r for r in self.shown(root, "sidebarConversation") if not r.property("current"))
+        target.forceActiveFocus(); pump(200)
+        QTest.keyClick(root, Qt.Key_Menu); pump(400)
+        menu = self.item(root, "conversationMenu")
+        self.assertEqual((True, target.property("itemId")), (menu.property("open"), menu.property("targetId")))
+        QTest.keyClick(root, Qt.Key_Escape); pump(400)
+        self.assertFalse(menu.property("open"))
+
+    def test_dd_the_new_navigation_strings_are_turkish(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        for source, turkish in (("Global", "Genel"), ("PROJECTS", "PROJELER"), ("CONVERSATIONS", "SOHBETLER"),
+                                ("All projects", "Tüm projeler"), ("New project", "Yeni proje"),
+                                ("Archived projects", "Arşivlenmiş projeler"), ("Today", "Bugün"), ("Yesterday", "Dün"),
+                                ("Earlier", "Daha eski"), ("New Chat", "Yeni Sohbet"),
+                                ("No conversation in this scope yet. Press + to start one.",
+                                 "Bu kapsamda henüz sohbet yok. Başlatmak için + düğmesine basın.")):
+            self.assertEqual(turkish, tx("Sidebar", source))
+        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        self.assertEqual("Arşiv", _APP.translate("Sidebar", "Archive", "sidebar link"))     # the noun
+        self.assertEqual("Arşivle", tx("ConversationMenu", "Archive"))                      # the verb, unchanged
+        for source, turkish in (("Rename", "Yeniden adlandır"), ("Delete permanently…", "Kalıcı sil…"),
+                                ("Archive it first", "Önce arşivleyin")):
+            self.assertEqual(turkish, tx("ConversationMenu", source))
 
 
 if __name__ == "__main__":  # pragma: no cover

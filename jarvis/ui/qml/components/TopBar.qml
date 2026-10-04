@@ -33,44 +33,11 @@ Item {
     property bool settingsOpen: false
     property bool modelOpen: false
     property Item controlLayer: null
+    // Gate 6F: the one conversation menu (Main.qml); the switcher opens it.
+    property Item conversationMenu: null
 
-    // -- the scope group's parts (Gate 6E) --------------------------------------
-    // One row of the scope menus: menuRowHeight; a hover lift; the current row
-    // carries the 2 px accent mark; an action row reads in accent, an enabled
-    // destructive row in danger, an untitled one in textLabel. An elided label
-    // has its tip.
-    component ScopeChoice: Rectangle {
-        id: choice
-        property string label: ""
-        property bool current: false
-        property bool available: true
-        property bool action: false
-        property bool danger: false
-        property bool muted: false
-        signal chosen()
-        height: Theme.menuRowHeight; radius: 6
-        enabled: !bridge.busy && available
-        opacity: enabled ? 1 : 0.45
-        color: current ? Theme.alpha(Theme.accent, 0.14) : choiceArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-        Rectangle { visible: choice.current; x: 0; y: 8; width: 2; height: parent.height - 16; radius: 1; color: Theme.accent }
-        Text { id: choiceText; x: 12; width: parent.width - 24; anchors.verticalCenter: parent.verticalCenter; text: choice.label
-               textFormat: Text.PlainText; elide: Text.ElideRight; font: Theme.body
-               color: choice.danger && choice.enabled ? Theme.danger : choice.action ? Theme.accent
-                      : choice.muted ? Theme.textLabel : Theme.text }
-        MouseArea { id: choiceArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: choice.chosen() }
-        HoverTip { text: choice.label; active: choiceText.truncated }
-    }
-    // A disabled item's reason, under it; and a menu's section divider.
-    component Reason: Text {
-        leftPadding: 12; rightPadding: 12; bottomPadding: 4
-        wrapMode: Text.Wrap; textFormat: Text.PlainText; color: Theme.textDim; font: Theme.caption
-    }
-    component Divider: Item {
-        height: 9
-        Rectangle { y: 4; x: 8; width: parent.width - 16; height: 1; color: Theme.border }
-    }
+    // -- the scope group's parts (Gate 6E; the menus' shared parts live in
+    // ConversationMenu.qml) ----------------------------------------------------
     // A drawn chevron (no font glyph): it turns over while its menu is open.
     component Chevron: Shape {
         id: chevron
@@ -128,28 +95,6 @@ Item {
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             onClicked: function (mouse) { if (mouse.button === Qt.RightButton) pill.contextRequested(); else pill.activated() }
         }
-    }
-    // The scope menus: glass, and the popover motion - opacity and panelTravel
-    // over panelIn in, panelOut out; no motion at all with ambient effects off.
-    component ScopeMenu: Popup {
-        id: menu
-        property real restY: 0
-        y: restY
-        padding: 8
-        background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
-                                WheelHandler { } }
-        enter: Theme.ambient ? menuIn : null
-        exit: Theme.ambient ? menuOut : null
-        readonly property Transition menuIn: Transition {
-            ParallelAnimation {
-                NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
-                NumberAnimation { property: "y"; from: menu.restY - Theme.panelTravel; to: menu.restY; duration: Theme.panelIn; easing.type: Theme.ease }
-            }
-        }
-        readonly property Transition menuOut: Transition {
-            NumberAnimation { property: "opacity"; to: 0; duration: Theme.panelOut; easing.type: Theme.ease }
-        }
-        onClosed: { opacity = 1; y = restY }
     }
     // Until the scope group leaves the bar (Gate 6F F4): the bottom of its
     // own row on a narrow window, so the home sidebar starts below it.
@@ -402,8 +347,6 @@ Item {
         visible: bridge.page === "home"
         readonly property var owner: bridge.conversationProject || ({})
         readonly property color tone: owner.archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
-        // An edit of a name is bound to the conversation it STARTED on.
-        property string editId: ""
 
         // Geometry. A pill is: padding, its lead (the selector's dot or, when
         // archived, the ARŞİV badge in its place), the name, the chevron.
@@ -497,31 +440,16 @@ Item {
             id: switcher
             objectName: "conversationSwitcher"
             readonly property string shown: bridge.conversationTitle || qsTr("New Chat")
-            readonly property bool renameAllowed: bridge.conversationId !== "" && !bridge.conversationReadOnly && !bridge.busy
-            readonly property string renameReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
-                : bridge.conversationArchived ? qsTr("This conversation is archived: unarchive it to rename it.")
-                : bridge.conversationReadOnly ? qsTr("The project is archived: unarchive it to rename this conversation.")
-                : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-            // Gate 6D-b: archive (reversible), then the permanent delete - offered
-            // only on an archived conversation or under an archived project.
-            readonly property bool archiveAllowed: renameAllowed
-            readonly property string archiveReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
-                : bridge.conversationArchived ? qsTr("This conversation is already archived.")
-                : bridge.conversationReadOnly ? qsTr("The project is archived: its conversations are already read-only.")
-                : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-            readonly property bool deleteAllowed: bridge.conversationId !== "" && !bridge.busy
-                                                  && (bridge.conversationArchived || !!scopeGroup.owner.archived)
-            readonly property string deleteReason: bridge.conversationId === "" ? qsTr("This conversation is not saved yet.")
-                : bridge.busy ? qsTr("Wait for the current run to finish.")
-                : !deleteAllowed ? qsTr("Archive it first") : ""
             x: projectSelector.width + scopeGroup.gap
             width: scopeGroup.swW
             border.color: Theme.borderStrong
-            open: switcherMenu.visible || switcherContext.visible
+            // Its right-click menu: the shared conversation menu, on the open conversation.
+            readonly property bool contextOpen: !!bar.conversationMenu && bar.conversationMenu.open && bar.conversationMenu.rowId === ""
+            open: switcherMenu.visible || contextOpen
             Accessible.role: Accessible.ButtonMenu; Accessible.name: switcherText.text
-            onActivated: { switcherContext.close(); switcherMenu.visible ? switcherMenu.close() : switcherMenu.open() }
-            onContextRequested: { switcherMenu.close(); switcherContext.open() }
-            onDismissRequested: { switcherMenu.close(); switcherContext.close() }
+            onActivated: { bar.conversationMenu.dismiss(); switcherMenu.visible ? switcherMenu.close() : switcherMenu.open() }
+            onContextRequested: { switcherMenu.close(); bar.conversationMenu.openFor("", "", switcher, Qt.point(0, switcher.height + 8)) }
+            onDismissRequested: { switcherMenu.close(); bar.conversationMenu.dismiss() }
             Text {
                 id: switcherText
                 objectName: "conversationSwitcherText"
@@ -534,7 +462,7 @@ Item {
             Chevron { objectName: "conversationSwitcherChevron"; open: switcherMenu.visible
                       anchors { right: parent.right; rightMargin: scopeGroup.pad; verticalCenter: parent.verticalCenter } }
             HoverTip { objectName: "conversationSwitcherTipText"; text: bridge.conversationTitle
-                       active: bridge.conversationTitle !== "" && !switcherMenu.visible && !switcherContext.visible }
+                       active: bridge.conversationTitle !== "" && !switcherMenu.visible && !switcher.contextOpen }
         }
 
         ScopePill {
@@ -571,10 +499,9 @@ Item {
         }
 
         AttachDialog { id: attachDialog }
-        ConversationDeleteDialog { id: deleteDialog }
 
         // The current scope's conversations, newest first; the open one marked.
-        ScopeMenu {
+        ConversationMenu.ScopeMenu {
             id: switcherMenu
             objectName: "conversationSwitcherMenu"
             restY: switcher.height + 8; x: switcher.x
@@ -589,99 +516,15 @@ Item {
                     boundsBehavior: Flickable.StopAtBounds
                     ScrollBar.vertical: ScrollBar { }
                     model: bridge.scopeConversations
-                    delegate: ScopeChoice { objectName: "conversationSwitcherItem"; width: ListView.view.width
+                    delegate: ConversationMenu.ScopeChoice { objectName: "conversationSwitcherItem"; width: ListView.view.width
                                             label: modelData.title || qsTr("New Chat"); muted: !modelData.title; current: modelData.active
                                             onChosen: { switcherMenu.close(); bridge.openConversation(modelData.id) } }
                 }
             }
         }
 
-        // Right-click: rename (6D-a), archive and the permanent delete (6D-b).
-        // Each is disabled with its reason (archived project or conversation,
-        // not archived yet, a busy run); the store still refuses. Each acts on
-        // the conversation open when it was chosen.
-        ScopeMenu {
-            id: switcherContext
-            objectName: "conversationSwitcherContext"
-            restY: switcher.height + 8; x: switcher.x
-            width: 300
-            onAboutToShow: bridge.previewDeleteConversation("")
-            contentItem: Column {
-                spacing: 2
-                // Which conversation these act on.
-                Text { objectName: "conversationContextHeader"; width: switcherContext.availableWidth; leftPadding: 12; rightPadding: 12
-                       bottomPadding: 4; elide: Text.ElideRight; textFormat: Text.PlainText
-                       text: switcher.shown; color: Theme.textMuted; font: Theme.caption }
-                ScopeChoice { objectName: "conversationRenameItem"; width: switcherContext.availableWidth
-                              label: qsTr("Rename"); available: switcher.renameAllowed
-                              onChosen: { switcherContext.close(); scopeGroup.editId = bridge.conversationId
-                                          bridge.clearRenameNotice(); switcherEditor.open() } }
-                Reason { width: switcherContext.availableWidth; objectName: "conversationRenameReason"; visible: !switcher.renameAllowed; text: switcher.renameReason }
-                ScopeChoice { objectName: "conversationArchiveItem"; width: switcherContext.availableWidth
-                              label: qsTr("Archive"); available: switcher.archiveAllowed
-                              onChosen: { var id = bridge.conversationId; if (bridge.archiveConversation(id)) switcherContext.close() } }
-                Reason { width: switcherContext.availableWidth; objectName: "conversationArchiveReason"; visible: !switcher.archiveAllowed; text: switcher.archiveReason }
-                Divider { width: switcherContext.availableWidth }
-                ScopeChoice { objectName: "conversationDeleteItem"; width: switcherContext.availableWidth; danger: true
-                              label: qsTr("Delete permanently…"); available: switcher.deleteAllowed
-                              onChosen: { var id = bridge.conversationId; switcherContext.close(); deleteDialog.openFor(id) } }
-                Reason { width: switcherContext.availableWidth; objectName: "conversationDeleteReason"; visible: !switcher.deleteAllowed; text: switcher.deleteReason }
-                Text { objectName: "conversationLifecycleNotice"; visible: bridge.conversationNotice !== ""
-                       width: switcherContext.availableWidth; leftPadding: 12; rightPadding: 12; wrapMode: Text.Wrap
-                       textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.caption }
-            }
-        }
-
-        // The edit. Enter / Save commits the normalized name to the conversation
-        // the edit STARTED on; Escape / Cancel / a change of conversation reverts.
-        ScopeMenu {
-            id: switcherEditor
-            objectName: "conversationRenameEditor"
-            restY: switcher.height + 8; x: switcher.x
-            width: 320; padding: 12
-            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-            onAboutToShow: { renameField.text = bridge.conversationTitle }
-            onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
-            function commit() {
-                if (!bridge.busy && bridge.renameConversation(scopeGroup.editId, renameField.text)) switcherEditor.close()
-            }
-            Connections {
-                target: bridge
-                function onConversationChanged() {
-                    if (switcherEditor.visible && bridge.conversationId !== scopeGroup.editId) switcherEditor.close()
-                }
-            }
-            contentItem: Column {
-                spacing: 10
-                Text { objectName: "conversationRenameTitle"; text: i18n.upper(qsTr("Rename")); color: Theme.textMuted; font: Theme.label }
-                TextField {
-                    id: renameField
-                    objectName: "conversationRenameField"
-                    width: switcherEditor.availableWidth; height: 36; selectByMouse: true; color: Theme.text; font: Theme.body
-                    placeholderText: qsTr("Conversation name")
-                    background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
-                                            border.color: renameField.activeFocus ? Theme.commandEdge : Theme.border }
-                    onAccepted: switcherEditor.commit()
-                }
-                Text { objectName: "conversationRenameNotice"; visible: bridge.conversationRenameNotice !== ""
-                       width: switcherEditor.availableWidth; wrapMode: Text.Wrap; textFormat: Text.PlainText
-                       text: bridge.conversationRenameNotice; color: Theme.warning; font: Theme.caption }
-                Item {
-                    width: switcherEditor.availableWidth; height: 32
-                    Row {
-                        anchors.right: parent.right
-                        spacing: 8
-                        ActionButton { objectName: "conversationRenameCancel"; label: qsTr("Cancel"); height: 32
-                                       onClicked: switcherEditor.close() }
-                        ActionButton { objectName: "conversationRenameSave"; label: qsTr("Save"); primary: true; height: 32
-                                       enabled: !bridge.busy; onClicked: switcherEditor.commit() }
-                    }
-                }
-            }
-        }
-
         // Projects first, then Global, then the two actions (in accent).
-        ScopeMenu {
+        ConversationMenu.ScopeMenu {
             id: selectorMenu
             objectName: "projectSelectorMenu"
             property var choices: []
@@ -693,20 +536,20 @@ Item {
                 Text { text: qsTr("PROJECTS"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; bottomPadding: 4 }
                 Repeater {
                     model: selectorMenu.choices
-                    delegate: ScopeChoice { objectName: "projectSelectorItem"; width: selectorMenu.availableWidth; label: modelData.name
+                    delegate: ConversationMenu.ScopeChoice { objectName: "projectSelectorItem"; width: selectorMenu.availableWidth; label: modelData.name
                                             current: modelData.id === scopeGroup.owner.id
                                             onChosen: { selectorMenu.close(); bridge.openProjectScope(modelData.id) } }
                 }
-                Divider { width: selectorMenu.availableWidth }
-                ScopeChoice { objectName: "projectSelectorGlobal"; width: selectorMenu.availableWidth
+                ConversationMenu.Divider { width: selectorMenu.availableWidth }
+                ConversationMenu.ScopeChoice { objectName: "projectSelectorGlobal"; width: selectorMenu.availableWidth
                               label: qsTr("Global"); current: !!scopeGroup.owner.global
                               onChosen: { selectorMenu.close(); bridge.openProjectScope("") } }
-                Divider { width: selectorMenu.availableWidth }
+                ConversationMenu.Divider { width: selectorMenu.availableWidth }
                 // Gate 6C: only while the open conversation is a writable Global one.
-                ScopeChoice { objectName: "projectSelectorAttach"; visible: bridge.canAttach; width: selectorMenu.availableWidth
+                ConversationMenu.ScopeChoice { objectName: "projectSelectorAttach"; visible: bridge.canAttach; width: selectorMenu.availableWidth
                               label: qsTr("Attach to a project…"); action: true
                               onChosen: { selectorMenu.close(); attachDialog.openDialog() } }
-                ScopeChoice { objectName: "projectSelectorAll"; width: selectorMenu.availableWidth; action: true
+                ConversationMenu.ScopeChoice { objectName: "projectSelectorAll"; width: selectorMenu.availableWidth; action: true
                               label: qsTr("All projects"); onChosen: { selectorMenu.close(); bridge.showProject("") } }
             }
         }

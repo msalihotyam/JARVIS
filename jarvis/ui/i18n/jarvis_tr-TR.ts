@@ -1333,6 +1333,65 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
 </context>
 <context>
+    <name>ConversationMenu</name>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>This conversation is not saved yet.</source>
+        <translation>Bu sohbet henüz kaydedilmedi.</translation>
+    </message>
+    <message>
+        <source>This conversation is archived: unarchive it to rename it.</source>
+        <translation>Bu sohbet arşivlendi: yeniden adlandırmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>The project is archived: unarchive it to rename this conversation.</source>
+        <translation>Proje arşivlendi: bu sohbeti yeniden adlandırmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>Wait for the current run to finish.</source>
+        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>This conversation is already archived.</source>
+        <translation>Bu sohbet zaten arşivlendi.</translation>
+    </message>
+    <message>
+        <source>The project is archived: its conversations are already read-only.</source>
+        <translation>Proje arşivlendi: sohbetleri zaten salt okunur.</translation>
+    </message>
+    <message>
+        <source>Archive it first</source>
+        <translation>Önce arşivleyin</translation>
+    </message>
+    <message>
+        <source>Rename</source>
+        <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Archive</source>
+        <translation>Arşivle</translation>
+    </message>
+    <message>
+        <source>Delete permanently…</source>
+        <translation>Kalıcı sil…</translation>
+    </message>
+    <message>
+        <source>Conversation name</source>
+        <translation>Sohbet adı</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>İptal</translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Kaydet</translation>
+    </message>
+</context>
+<context>
     <name>EditMenu</name>
     <message>
         <source>Undo</source>
@@ -3533,6 +3592,79 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>Sidebar</name>
+    <message>
+        <source>Today</source>
+        <translation>Bugün</translation>
+    </message>
+    <message>
+        <source>Yesterday</source>
+        <translation>Dün</translation>
+    </message>
+    <message>
+        <source>Earlier</source>
+        <translation>Daha eski</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>PROJECTS</source>
+        <translation>PROJELER</translation>
+    </message>
+    <message>
+        <source>All projects</source>
+        <translation>Tüm projeler</translation>
+    </message>
+    <message>
+        <source>Archived projects</source>
+        <translation>Arşivlenmiş projeler</translation>
+    </message>
+    <message>
+        <source>New project</source>
+        <translation>Yeni proje</translation>
+    </message>
+    <message>
+        <source>The project is archived: unarchive it to start a new conversation.</source>
+        <translation>Proje arşivlendi: yeni sohbet başlatmak için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>Wait for the current run to finish.</source>
+        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>CONVERSATIONS</source>
+        <translation>SOHBETLER</translation>
+    </message>
+    <message>
+        <source>archived</source>
+        <translation>arşivlendi</translation>
+    </message>
+    <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİV</translation>
+    </message>
+    <message>
+        <source>New conversation in %1</source>
+        <translation>%1 içinde yeni sohbet</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>No conversation in this scope yet. Press + to start one.</source>
+        <translation>Bu kapsamda henüz sohbet yok. Başlatmak için + düğmesine basın.</translation>
+    </message>
+    <message>
+        <source>Archive</source>
+        <comment>sidebar link</comment>
+        <extracomment>the noun - the archived conversations (a link), not the verb &quot;Archive&quot;</extracomment>
+        <translation>Arşiv</translation>
+    </message>
+</context>
+<context>
     <name>SummaryPeek</name>
     <message>
         <source>Current request</source>
@@ -3963,60 +4095,12 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Yeni Sohbet</translation>
     </message>
     <message>
-        <source>This conversation is not saved yet.</source>
-        <translation>Bu sohbet henüz kaydedilmedi.</translation>
-    </message>
-    <message>
-        <source>This conversation is archived: unarchive it to rename it.</source>
-        <translation>Bu sohbet arşivlendi: yeniden adlandırmak için arşivden çıkarın.</translation>
-    </message>
-    <message>
-        <source>The project is archived: unarchive it to rename this conversation.</source>
-        <translation>Proje arşivlendi: bu sohbeti yeniden adlandırmak için arşivden çıkarın.</translation>
-    </message>
-    <message>
-        <source>This conversation is already archived.</source>
-        <translation>Bu sohbet zaten arşivlendi.</translation>
-    </message>
-    <message>
-        <source>The project is archived: its conversations are already read-only.</source>
-        <translation>Proje arşivlendi: sohbetleri zaten salt okunur.</translation>
-    </message>
-    <message>
-        <source>Archive it first</source>
-        <translation>Önce arşivleyin</translation>
-    </message>
-    <message>
         <source>+ New conversation</source>
         <translation>+ Yeni sohbet</translation>
     </message>
     <message>
         <source>CONVERSATIONS</source>
         <translation>SOHBETLER</translation>
-    </message>
-    <message>
-        <source>Rename</source>
-        <translation>Yeniden adlandır</translation>
-    </message>
-    <message>
-        <source>Archive</source>
-        <translation>Arşivle</translation>
-    </message>
-    <message>
-        <source>Delete permanently…</source>
-        <translation>Kalıcı sil…</translation>
-    </message>
-    <message>
-        <source>Conversation name</source>
-        <translation>Sohbet adı</translation>
-    </message>
-    <message>
-        <source>Save</source>
-        <translation>Kaydet</translation>
-    </message>
-    <message>
-        <source>Cancel</source>
-        <translation>İptal</translation>
     </message>
     <message>
         <source>ARCHIVED</source>

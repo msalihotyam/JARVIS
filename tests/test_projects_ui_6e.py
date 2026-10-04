@@ -40,7 +40,7 @@ from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F40
 from tests.test_ui import _APP, UiTestCase, pump
 
 SURFACES = ("TopBar", "HistoryPage", "ProjectsPage", "AttachDialog", "ConversationDeleteDialog", "Composer",
-            "CommandPalette", "Bridge")
+            "CommandPalette", "Bridge", "Sidebar", "ConversationMenu")
 
 
 def say(memory, conversation_id: str, text: str) -> None:

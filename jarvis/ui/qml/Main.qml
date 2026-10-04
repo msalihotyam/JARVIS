@@ -132,6 +132,7 @@ Window {
     TopBar {
         id: topBar
         controlLayer: topControls
+        conversationMenu: conversationMenu
         anchors { left: parent.left; right: parent.right; top: parent.top }
         // The identity / core zone owns a proportional share of the height;
         // the Command preset keeps its own compact strip.
@@ -350,7 +351,13 @@ Window {
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
         onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
         onApprovalRequested: { root.closeContexts(); root.approvalRevealRequested() }
+        conversationMenu: conversationMenu
+        // Q9: the Projects page, its create field focused.
+        onNewProjectRequested: { bridge.showProject(""); if (pageLoader.item && pageLoader.item.focusCreate) pageLoader.item.focusCreate() }
     }
+    // The one conversation menu (rename / archive / delete): the TopBar
+    // switcher opens it on the open conversation, a sidebar row on that row.
+    ConversationMenu { id: conversationMenu }
     // Edit Mode's popovers for both regions: over the rail, under approvals.
     LayoutMenus { id: layoutMenus; z: 445; railShown: sidebar.visible; commandMode: root.presentation === "command" }
     CommandPalette { id: palette; onLifecycleRequested: root.toggleLifecycle(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
@@ -411,6 +418,7 @@ Window {
     Shortcut { sequence: "Escape"; onActivated: {
         if (attachmentPreview.open) attachmentPreview.close()
         else if (palette.open) palette.hide()
+        else if (conversationMenu.open) conversationMenu.dismiss()
         else if (confirm.open) confirm.open = false
         else if (resumeConfirm.open) resumeConfirm.open = false
         else if (settings.open) settings.open = false

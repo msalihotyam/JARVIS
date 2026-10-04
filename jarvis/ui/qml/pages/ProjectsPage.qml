@@ -100,6 +100,8 @@ SecondaryPage {
         renameField.selectAll(); renameField.forceActiveFocus()
     }
     function stopRename() { renaming = false; renameButton.forceActiveFocus() }
+    // Gate 6F (Q9): the sidebar's PROJELER "+" lands here, on the create field.
+    function focusCreate() { newName.forceActiveFocus() }
     function saveRename() {
         bridge.renameProject(current.id, renameField.text)
         if (bridge.projectNotice === "") stopRename()
