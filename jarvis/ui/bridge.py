@@ -277,6 +277,7 @@ class Bridge(QObject):
         # one whose detail is open, its conversations and its jobs, and the
         # last answer Core gave to a lifecycle request (shown as returned).
         self._project_records: list[dict] = []
+        self._project_counts: dict[str, tuple[int, int]] = {}      # project id -> (conversations, archived); presentation only
         self._open_project = ""
         self._project_conversations: list[dict] = []
         self._project_jobs: list[dict] = []
@@ -583,10 +584,13 @@ class Bridge(QObject):
 
     def _refresh_conversations(self) -> None:
         store = self._conversation_db()
+        # ONE store read per refresh, every owner: Global's lists, the open scope's list and the
+        # per-project counts are all cut from it (never a query per project).
         try:
-            records = store.list_conversations(project_id=None, include_archived=True) if store is not None else []
+            everything = store.list_conversations(include_archived=True) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
-            records = []
+            everything = []
+        records = [r for r in everything if r.project_id is None]
         self._conversation_list = [
             {"id": r.id, "origin": r.origin, "updated_at": r.updated_at, "title": self._listed_title(r)}
             for r in records if r.archived_at is None
@@ -606,16 +610,24 @@ class Bridge(QObject):
         self._open_title = "" if open_record is None else (open_record.title or (
             ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
         self._conversation_owner = self._owner_of(store, open_id)
-        try:
-            scope = store.list_conversations(project_id=self._conversation_owner.get("id") or None) if store is not None else []
-        except Exception:  # noqa: BLE001 - storage boundary
-            scope = []
+        scope_owner = self._conversation_owner.get("id") or None
+        scope = [r for r in everything if r.project_id == scope_owner and r.archived_at is None]
         self._scope_conversations = [
-            {"id": r.id, "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
-                                              if r.origin == "legacy-import" else "")}
+            {"id": r.id, "updated_at": r.updated_at,
+             "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                  if r.origin == "legacy-import" else "")}
             for r in scope
         ]
+        counts: dict[str, list[int]] = {}
+        for r in everything:
+            if r.project_id is not None:
+                counts.setdefault(r.project_id, [0, 0])[0 if r.archived_at is None else 1] += 1
+        counts_now = {pid: (live, archived) for pid, (live, archived) in counts.items()}
+        counts_changed = counts_now != self._project_counts
+        self._project_counts = counts_now
         self.conversationChanged.emit()
+        if counts_changed:                       # the project list's badges follow, with no manual refresh
+            self.projectsChanged.emit()
 
     @staticmethod
     def _owner_of(store: Any, conversation_id: str | None) -> dict[str, Any]:
@@ -659,7 +671,8 @@ class Bridge(QObject):
         """Non-archived conversations of the open conversation's scope; an
         untitled one has title "" (the window says "New Chat")."""
         return [{"id": row["id"], "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
-                 "active": row["id"] == self._conversation_store.id} for row in self._scope_conversations]
+                 "updated_at": row["updated_at"], "active": row["id"] == self._conversation_store.id}
+                for row in self._scope_conversations]
 
     @Property(str, notify=conversationChanged)
     def conversationTitle(self) -> str:
@@ -789,7 +802,9 @@ class Bridge(QObject):
 
     @Property("QVariantList", notify=projectsChanged)
     def projectRecords(self) -> list:
-        return [dict(record) for record in self._project_records]
+        """Every project with its conversation counts (live, archived) - read-only presentation keys."""
+        return [{**record, "conversation_count": self._project_counts.get(record["id"], (0, 0))[0],
+                 "archived_count": self._project_counts.get(record["id"], (0, 0))[1]} for record in self._project_records]
 
     @Property(dict, notify=projectsChanged)
     def openProject(self) -> dict:
