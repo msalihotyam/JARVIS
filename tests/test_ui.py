@@ -823,6 +823,13 @@ class PresentationTests(UiTestCase):
 
     def test_context_and_protected_composer_bounds_at_all_required_sizes(self):
         from PySide6.QtCore import QPointF
+
+        def settle(condition, timeout=5.0):
+            """Turn the loop until the asserted condition holds (bounded), not for a fixed time."""
+            deadline = time.monotonic() + timeout
+            while not condition() and time.monotonic() < deadline:
+                pump(20)
+
         bridge = self.bridge()
         root = self.window(bridge)
         for theme in ("space", "dark", "command"):
@@ -830,19 +837,19 @@ class PresentationTests(UiTestCase):
             for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
                 with self.subTest(theme=theme, size=(width, height)):
                     root.resize(width, height)
-                    pump(500)
+                    pump(100)
                     composer = self.item(root, "commandComposer" if theme == "command" else "canonicalComposer")
-                    corner = composer.mapToScene(QPointF(composer.width(), composer.height()))
-                    self.assertLessEqual(corner.x(), width)
-                    self.assertLessEqual(corner.y(), height)
+                    corner = lambda: composer.mapToScene(QPointF(composer.width(), composer.height()))  # noqa: E731
+                    # The layout has settled once the composer is inside the window: wait for exactly the asserted conditions.
+                    settle(lambda: corner().x() <= width and corner().y() <= height and composer.width() > 360)
+                    self.assertLessEqual(corner().x(), width)
+                    self.assertLessEqual(corner().y(), height)
                     self.assertGreater(composer.width(), 360)
                     for trigger, surface in (("settingsOrb", "settingsSurface"), ("modelTrigger", "modelSurface"), ("navigationTrigger", "navSurface")):
                         self.click(root, trigger)
                         panel = self.item(root, surface)
-                        self.assertGreaterEqual(panel.x(), 0)
-                        self.assertGreaterEqual(panel.y(), 80)
-                        self.assertLessEqual(panel.x() + panel.width(), width)
-                        self.assertLessEqual(panel.y() + panel.height(), height)
+                        settle(lambda: panel.x() >= 0 and panel.y() >= 80 and panel.x() + panel.width() <= width
+                               and panel.y() + panel.height() <= height)
                         QTest.keyClick(root, Qt.Key_Escape)
                         pump(220)
 
@@ -4209,14 +4216,22 @@ class ConversationUxTests(UiTestCase):
         bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
         root = self.window(bridge); feed = self.feed(root)
         self.fill(bridge)
-        bridge._say("jarvis", "yeni", chat=True); pump(120)
+        bridge._say("jarvis", "yeni", chat=True)
+        # The glide runs 260 ms: poll at frame rate for it to START (a slow runner starts it late), then act at once.
+        deadline = time.monotonic() + 5.0
+        while not feed.property("gliding") and time.monotonic() < deadline:
+            pump(1)
         self.assertTrue(feed.property("gliding"))
         QTest.mouseMove(root); feed_item = feed
         from PySide6.QtCore import QPoint, QPointF
         center = feed_item.mapToScene(QPointF(feed_item.width() / 2, feed_item.height() / 2)).toPoint()
         from PySide6.QtGui import QWheelEvent
         wheel = QWheelEvent(QPointF(center), QPointF(center), QPoint(0, 0), QPoint(0, 240), Qt.NoButton, Qt.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
-        QGuiApplication.sendEvent(root, wheel); pump(400)
+        QGuiApplication.sendEvent(root, wheel)
+        deadline = time.monotonic() + 5.0
+        while feed.property("gliding") and time.monotonic() < deadline:
+            pump(10)
+        pump(100)
         self.assertFalse(feed.property("gliding"))
         self.assertGreater(self.end_gap(feed), 6)                                        # the reader took over
         bridge.submitText("Tamam mı?"); pump(900)
