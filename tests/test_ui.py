@@ -850,6 +850,10 @@ class PresentationTests(UiTestCase):
                         panel = self.item(root, surface)
                         settle(lambda: panel.x() >= 0 and panel.y() >= 80 and panel.x() + panel.width() <= width
                                and panel.y() + panel.height() <= height)
+                        self.assertGreaterEqual(panel.x(), 0)
+                        self.assertGreaterEqual(panel.y(), 80)
+                        self.assertLessEqual(panel.x() + panel.width(), width)
+                        self.assertLessEqual(panel.y() + panel.height(), height)
                         QTest.keyClick(root, Qt.Key_Escape)
                         pump(220)
 
