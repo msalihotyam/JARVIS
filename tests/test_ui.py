@@ -1104,8 +1104,11 @@ class MacroGeometryTests(UiTestCase):
     """
     item = PresentationTests.item
 
+    # Gate 6F: "central left" (12.81) and "central width" (64.11) were the
+    # rail's line; the home work surface now starts after the sidebar
+    # (Theme.sidebarWidth), checked per size below instead of as a ratio.
     REFERENCE = {
-        "central left": 12.81, "central width": 64.11, "central right": 76.93,
+        "central right": 76.93,
         "column gap": 1.04, "stack left": 77.97, "stack width": 20.10, "stack right": 98.07,
         "shell top Y": 15.56, "panel start Y": 18.98, "central bottom Y": 95.14, "stack bottom Y": 92.13,
         "core centre X": 48.96, "core centre Y": 7.99,
@@ -1127,9 +1130,13 @@ class MacroGeometryTests(UiTestCase):
                 return a.x(), a.y(), b.x(), b.y()
 
             work = box("canonicalWorkspace"); stack = box("panelColumn"); core = box("jarvisCore")
+            side = box("sidebar")
+            with self.subTest(size=(width, height), boundary="sidebar"):
+                # 10 px in, Theme.sidebarWidth wide, then the same gap as the column's.
+                self.assertAlmostEqual(10, side[0], delta=0.5)
+                self.assertAlmostEqual(max(256, min(340, round(width * 0.1771))), side[2] - side[0], delta=0.5)
+                self.assertAlmostEqual(stack[0] - work[2], work[0] - side[2], delta=1.0)
             measured = {
-                "central left": 100 * work[0] / width,
-                "central width": 100 * (work[2] - work[0]) / width,
                 "central right": 100 * work[2] / width,
                 "column gap": 100 * (stack[0] - work[2]) / width,
                 "stack left": 100 * stack[0] / width,
@@ -1341,20 +1348,27 @@ class LeftContextTests(UiTestCase):
         native_fonts = bool(QFontDatabase.families())
         root = self.window(self.bridge())
         context = self.item(root, "leftContextCard")
-        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+        sidebar = self.item(root, "sidebar")
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760), (1100, 700)):
             root.resize(width, height); pump(500)
             task = self.item(root, "railTasks")
             a = context.mapToScene(QPointF(0, 0))
             b = task.mapToScene(QPointF(0, 0))
+            s = sidebar.mapToScene(QPointF(0, 0))
             with self.subTest(size=(width, height)):
+                # Gate 6F (L2 g): the thin strip at the sidebar's foot, under the
+                # tiles and aligned with them, inside the sidebar.
                 self.assertTrue(context.isVisible())
                 self.assertEqual(a.x(), b.x())
-                self.assertEqual(context.width(), task.width())
-                self.assertAlmostEqual(12, b.y() - a.y() - context.height(), delta=1)
-                self.assertGreaterEqual(a.y(), 84)
-                self.assertGreaterEqual(context.height(), 130)
+                self.assertGreaterEqual(a.y(), b.y() + task.height())
+                self.assertGreaterEqual(a.x(), s.x()); self.assertLessEqual(a.x() + context.width(), s.x() + sidebar.width())
+                self.assertLessEqual(a.y() + context.height(), s.y() + sidebar.height())
+                self.assertGreaterEqual(s.y(), 84)
+                self.assertAlmostEqual(30, context.height(), delta=0.5)
                 for name in ("contextClock", "contextDate", "contextTimeZone", "contextTemperature", "contextWeatherCondition"):
                     text = self.item(root, name)
+                    if not text.isVisible():
+                        continue                 # given way on a short line; the strip's tip has it
                     pos = text.mapToItem(context, QPointF(0, 0))
                     self.assertGreaterEqual(pos.x(), 0); self.assertGreaterEqual(pos.y(), 0)
                     ink_width = text.property("contentWidth") if native_fonts else text.width()
@@ -1362,14 +1376,16 @@ class LeftContextTests(UiTestCase):
                     self.assertLessEqual(pos.y() + text.property("contentHeight"), context.height(), name)
                 clock = self.item(root, "contextClock")
                 weather = self.item(root, "contextWeather")
-                end = clock.mapToItem(context, QPointF(clock.property("contentWidth") if native_fonts else clock.width(), 0)).x()
+                end = self.item(root, "contextDate").mapToItem(context, QPointF(self.item(root, "contextDate").width(), 0)).x()
+                self.assertLess(clock.mapToItem(context, QPointF(0, 0)).x(), end)
                 self.assertLessEqual(end, weather.x())
         self.assertEqual(0, self.execute_calls())
 
     def test_weather_remains_explicitly_unavailable_without_a_key_or_reading(self) -> None:
         root = self.window(self.bridge())
         self.assertFalse(self.item(root, "contextTemperature").isVisible())      # no "--°", no 0°
-        self.assertEqual("Weather\nunavailable", self.item(root, "contextWeatherCondition").property("text"))
+        # Gate 6F: one strip line - the short phrase, on one line.
+        self.assertEqual("No weather", self.item(root, "contextWeatherCondition").property("text"))
         self.assertEqual("Local time", self.item(root, "contextPlace").property("text"))
         context = self.item(root, "leftContextCard")
         self.assertTrue(context.property("zoneText").startswith("UTC"))
@@ -1586,8 +1602,9 @@ class WeatherCardTests(UiTestCase):
         clock = self.item(root, "contextClock").property("font").pixelSize()
         temp = self.item(root, "contextTemperature").property("font").pixelSize()
         self.assertGreater(clock, temp)
-        self.assertLess(self.item(root, "contextClock").mapToScene(QPointF(0, 0)).y(),
-                        self.item(root, "contextPlace").mapToScene(QPointF(0, 0)).y())
+        # Gate 6F: one strip line - the time first, the weather after it.
+        self.assertLess(self.item(root, "contextClock").mapToScene(QPointF(0, 0)).x(),
+                        self.item(root, "contextTemperature").mapToScene(QPointF(0, 0)).x())
         self.assertIn("Beşiktaş", self.item(root, "leftContextCard").property("Accessible.name") or "Beşiktaş")
         self.assertEqual(0, self.execute_calls())
 
@@ -1709,7 +1726,7 @@ class WeatherCardTests(UiTestCase):
         self.assertEqual("Gök gürültülü sağanak", self.item(root, "contextWeatherCondition").property("text"))
         self.assertTrue(self.item(root, "contextTimeZone").property("text").endswith(" itibarıyla"))
         bridge._weather_reading = None; bridge._publish_weather(); pump(200)
-        self.assertEqual("Hava durumu\nyok", self.item(root, "contextWeatherCondition").property("text"))
+        self.assertEqual("Hava yok", self.item(root, "contextWeatherCondition").property("text"))
 
 
 def w_geo():
@@ -1857,45 +1874,48 @@ class ConversationSurfaceTests(UiTestCase):
             root.resize(width, height)
             pump(700)
             work = self.box(root, "canonicalWorkspace"); rail = self.box(root, "summaryRail")
-            composer = self.box(root, "canonicalComposer")
+            composer = self.box(root, "canonicalComposer"); side = self.box(root, "sidebar")
+            clock = self.box(root, "leftContextCard")
             with self.subTest(size=(width, height)):
-                previous_bottom = rail[1]
                 shown = self.shown_rail(bridge)
-                self.assertEqual(self.SUMMARY + ("Memory",), shown)      # the default rail: four cards (Updates waits in Cards)
-                # The cards share the rail height evenly: n cards, n - 1 gaps of 10-14 px.
-                share = (rail[3] - rail[1] - 12 * (len(shown) - 1)) / len(shown)
-                for key in shown:
+                self.assertEqual(self.SUMMARY + ("Memory",), shown)      # the default: four tiles (Updates has none, Q4)
+                # Gate 6F (L2 f): a 2x2 grid of small tiles at the sidebar's foot,
+                # 86 px at the 1920 class (>= 1600) and 74 px below, 8 / 6 px apart (title, value, line).
+                tile, gap = (86, 8) if width >= 1600 else (74, 6)
+                for i, key in enumerate(shown):
                     card = self.box(root, "rail" + key)
-                    # Phase 3.3b: substantial modules within the frozen rail,
-                    # not the former 76 px navigation-sized cards.
-                    self.assertGreaterEqual(card[3] - card[1], 84)
-                    self.assertAlmostEqual(card[3] - card[1], max(84, share), delta=3)
-                    if width == 1920:
-                        self.assertGreaterEqual(card[2] - card[0], work[0] * 0.90)
-                        self.assertGreaterEqual(card[3] - card[1], 120)
-                        self.assertLessEqual(card[3] - card[1], 190)
-                    if key != "Tasks":
-                        self.assertGreaterEqual(card[1] - previous_bottom, 10)
-                        self.assertLessEqual(card[1] - previous_bottom, 14)
-                    # In order, inside the Phase 1 rail, never over the work surface.
-                    self.assertGreaterEqual(card[1], previous_bottom - 1)
+                    self.assertAlmostEqual(tile, card[3] - card[1], delta=0.5)
+                    self.assertAlmostEqual(rail[0] + (i % 2) * ((rail[2] - rail[0] + gap) / 2), card[0], delta=1)
+                    self.assertAlmostEqual(rail[1] + (i // 2) * (tile + gap), card[1], delta=1)
+                    self.assertAlmostEqual((rail[2] - rail[0] - gap) / 2, card[2] - card[0], delta=1)
+                    # Inside the sidebar, never over the work surface, on screen.
+                    self.assertGreaterEqual(card[0], side[0]); self.assertLessEqual(card[2], side[2])
                     self.assertLessEqual(card[2], work[0])
-                    self.assertGreaterEqual(card[0], 0)
                     self.assertLessEqual(card[3], height)
-                    previous_bottom = card[3]
-                # Phase 3.4b: the shown cards share the available height, so the
-                # LAST shown card reaches the rail's end; the rail itself still
-                # reserves the existing lower HUD area.
-                self.assertAlmostEqual(previous_bottom, rail[3], delta=1)
-                self.assertGreaterEqual(height - previous_bottom, 60)
+                # The grid ends above the clock strip; the sidebar keeps the lower HUD area.
+                self.assertAlmostEqual(2 * tile + gap, rail[3] - rail[1], delta=1)
+                self.assertLessEqual(rail[3], clock[1])
+                self.assertGreaterEqual(height - side[3], 60)
                 # The composer stays inside the work surface and on screen.
                 self.assertGreaterEqual(composer[0], work[0]); self.assertLessEqual(composer[2], work[2])
                 self.assertLessEqual(composer[3], work[3]); self.assertLessEqual(work[3], height)
-        # Ambient, not navigation: the rail belongs to the Command Center only.
+        # The sidebar is the home page's only (Q11).
         bridge.setPage("tasks"); pump(400)
         self.assertFalse(self.item(root, "summaryRail").isVisible())
         bridge.setPage("home"); pump(400)
         self.assertTrue(self.item(root, "summaryRail").isVisible())
+        # A hidden tile reflows the grid: 3 -> two, then one across; 1 -> one across (Q3).
+        root.resize(1920, 1080); pump(600)
+        bridge.setCardVisible("rail", "plan", False); pump(300)
+        rail = self.box(root, "summaryRail"); memory = self.box(root, "railMemory")
+        self.assertAlmostEqual(rail[2] - rail[0], memory[2] - memory[0], delta=1)
+        self.assertAlmostEqual(2 * 86 + 8, rail[3] - rail[1], delta=1)
+        for key in ("tasks", "focus"):
+            bridge.setCardVisible("rail", key, False)
+        pump(300)
+        rail = self.box(root, "summaryRail")
+        self.assertAlmostEqual(86, rail[3] - rail[1], delta=1)
+        self.assertAlmostEqual(rail[2] - rail[0], self.box(root, "railMemory")[2] - self.box(root, "railMemory")[0], delta=1)
         self.assertEqual(0, self.execute_calls())
 
     def test_conversation_surface_is_conversation_first(self) -> None:
@@ -1935,14 +1955,15 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertAlmostEqual(32, avatar[2] - avatar[0], delta=0.6)
         self.assertGreaterEqual(avatar[0] - 2, feed[0]); self.assertGreaterEqual(avatar[1] - 2, card[1] - 2)
         self.assertLess(avatar[2], card[0])
-        # The rail socket: 36 px, flush inside the card, centred; the card's
-        # size and hit area are what they were.
+        # Gate 6F (L2 f): the tile's icon well - 20 px, inside the tile at its
+        # top left, level with the title; the tile is the 86 px 1920 tile.
         for key in self.shown_rail(bridge):
             sock = self.box(root, "railSocket" + key); rail_card = self.box(root, "rail" + key)
-            self.assertAlmostEqual(36, sock[2] - sock[0], delta=0.6)
-            self.assertAlmostEqual((sock[1] + sock[3]) / 2, (rail_card[1] + rail_card[3]) / 2, delta=1.0)
-            # Five cards at 1920: each keeps a substantial height (~136 px), not the 4-card 172.
-            self.assertGreater(sock[0], rail_card[0]); self.assertGreaterEqual(rail_card[3] - rail_card[1], 120)
+            title = self.box(root, "railTitle" + key)
+            self.assertAlmostEqual(20, sock[2] - sock[0], delta=0.6)
+            self.assertAlmostEqual((sock[1] + sock[3]) / 2, (title[1] + title[3]) / 2, delta=1.0)
+            self.assertGreater(sock[0], rail_card[0]); self.assertGreater(sock[1], rail_card[1])
+            self.assertAlmostEqual(86, rail_card[3] - rail_card[1], delta=0.5)
         self.assertEqual(0, self.execute_calls())
 
     def test_empty_state_welcome_gives_way_to_the_first_accepted_turn(self) -> None:
@@ -2031,7 +2052,6 @@ class ConversationSurfaceTests(UiTestCase):
     def test_peek_opens_anchored_switches_and_closes_every_way(self) -> None:
         from PySide6.QtCore import QPoint
         bridge = self.bridge()
-        bridge.setCardVisible("rail", "updates", True)      # hidden by default; this test uses it
         root = self.window(bridge)
         pump(700)   # the work surface width animates in; read it settled
         work = self.box(root, "canonicalWorkspace")
@@ -2042,16 +2062,18 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertTrue(self.item(root, "railTasks").property("active"))
         peek = self.box(root, "summaryPeek"); rail = self.box(root, "summaryRail")
         self.assertGreaterEqual(peek[0], rail[2], "the peek opens to the right of the rail")
+        # Gate 6F (Q5): beside the sidebar, never over it.
+        self.assertGreaterEqual(peek[0], self.box(root, "sidebar")[2])
         # Quick look, not a reflow: the conversation does not move.
         self.assertEqual(work, self.box(root, "canonicalWorkspace"))
         self.assertEqual(composer, self.box(root, "canonicalComposer"))
 
         # Another card switches in place; exactly one card is active.
-        self.click(root, "railUpdates"); pump(300)
-        self.assertTrue(root.property("peekOpen")); self.assertEqual("Updates", root.property("peekKey"))
-        self.assertEqual(["Updates"], [k for k in self.SUMMARY + ("Updates",) if self.item(root, "rail" + k).property("active")])
+        self.click(root, "railPlan"); pump(300)
+        self.assertTrue(root.property("peekOpen")); self.assertEqual("Plan", root.property("peekKey"))
+        self.assertEqual(["Plan"], [k for k in self.SUMMARY if self.item(root, "rail" + k).property("active")])
         # The same card again closes it.
-        self.click(root, "railUpdates"); pump(300)
+        self.click(root, "railPlan"); pump(300)
         self.assertFalse(root.property("peekOpen"))
         # X, Escape and an outside click close it too.
         self.click(root, "railFocus"); pump(300)
@@ -2075,9 +2097,8 @@ class ConversationSurfaceTests(UiTestCase):
 
     def test_peek_stays_inside_the_viewport_and_shows_only_real_state(self) -> None:
         bridge = self.bridge()
-        bridge.setCardVisible("rail", "updates", True)      # hidden by default; this test uses it
         root = self.window(bridge)
-        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760), (1100, 700)):
             root.resize(width, height)
             pump(600)
             for key in self.SUMMARY:
@@ -2087,6 +2108,10 @@ class ConversationSurfaceTests(UiTestCase):
                     self.assertGreaterEqual(peek[0], 0); self.assertGreaterEqual(peek[1], 0)
                     self.assertLessEqual(peek[2], width); self.assertLessEqual(peek[3], height)
                     self.assertLessEqual(close[2], width); self.assertGreaterEqual(close[1], 0)
+                    # Gate 6F (Q5): beside the sidebar, level with its tile where the window allows.
+                    tile = self.box(root, "rail" + key)
+                    self.assertGreaterEqual(peek[0], self.box(root, "sidebar")[2])
+                    self.assertLessEqual(peek[1], tile[1])
                     self.click(root, "rail" + key); pump(300)
                     self.assertFalse(root.property("peekOpen"))
         # An empty installation: no tasks, projects or jobs exist, so those
@@ -2096,10 +2121,6 @@ class ConversationSurfaceTests(UiTestCase):
             self.click(root, "rail" + key); pump(300)
             self.assertTrue(self.item(root, "summaryPeekEmpty").isVisible(), f"{key} should be empty")
             self.click(root, "rail" + key); pump(300)
-        # Updates is real too: this session's own activity note is listed.
-        self.click(root, "railUpdates"); pump(300)
-        self.assertFalse(self.item(root, "summaryPeekEmpty").isVisible())
-        self.assertIn("JARVIS interface started", self.texts(self.item(root, "summaryPeek"), []))
         self.assertEqual(0, self.execute_calls())
 
 class ReactorStateTests(UiTestCase):
@@ -2251,7 +2272,7 @@ class GlassMaterialTests(UiTestCase):
         # Primary shell ~54 %, secondary shell ~66 %; the composer (interactive) ~89 %.
         self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
         self.assertAlmostEqual(0.66, self.alpha(self.item(root, "railTasks")), delta=0.03)
-        self.assertAlmostEqual(0.66, self.alpha(self.item(root, "leftContextCard")), delta=0.03)
+        self.assertAlmostEqual(0.66, self.alpha(self.item(root, "sidebar")), delta=0.03)      # Gate 6F: the strip lives on it
         # Reading islands stay dark: the assistant surface and a user bubble are ~88 %.
         bridge._say("user", "a request"); bridge._say("jarvis", "an answer"); pump(300)
         self.assertGreaterEqual(self.alpha(self.item(root, "feedCard_user"), "color"), 0.0)   # gradient-backed; the stops are tokens
@@ -2442,8 +2463,9 @@ class TypographyTests(UiTestCase):
         self.assertEqual((quiet, 20), (font("welcomeSupport").family(), font("welcomeSupport").pixelSize()))
         self.assertEqual((strong, 18, sw), (font("selectorModelText").family(), font("selectorModelText").pixelSize(), font("selectorModelText").weight()))
         self.assertEqual((strong, 16), (font("workflowCounter").family(), font("workflowCounter").pixelSize()))   # a small numeral sits in the interface face
-        self.assertEqual(("Space Grotesk", 22), (font("railCountTasks").family(), font("railCountTasks").pixelSize()))
-        self.assertEqual((strong, 18, sw), (font("railTitleTasks").family(), font("railTitleTasks").pixelSize(), font("railTitleTasks").weight()))
+        # Gate 6F (L2 f): the small tile - a 26 px figure, a 13 px semibold title.
+        self.assertEqual(("Space Grotesk", 26), (font("railCountTasks").family(), font("railCountTasks").pixelSize()))
+        self.assertEqual((strong, 13, sw), (font("railTitleTasks").family(), font("railTitleTasks").pixelSize(), font("railTitleTasks").weight()))
         self.assertEqual("Space Grotesk", font("contextClock").family())
         bridge._say("user", "Bu projeyi incele."); bridge._say("jarvis", "Hangi projeyi inceleyeyim?\nIkinci paragraf."); pump(400)
         body = font("feedMessage_jarvis")
@@ -2455,7 +2477,7 @@ class TypographyTests(UiTestCase):
         # Typography moved no region.
         work = self.item(root, "canonicalWorkspace"); stack = self.item(root, "panelColumn")
         a = work.mapToScene(QPointF(0, 0)); b = stack.mapToScene(QPointF(0, 0))
-        self.assertEqual((246.0, 168.0, 1231.0), (round(a.x(), 1), round(a.y(), 1), round(work.width(), 1)))
+        self.assertEqual((370.0, 168.0, 1107.0), (round(a.x(), 1), round(a.y(), 1), round(work.width(), 1)))   # Gate 6F: after the sidebar
         self.assertEqual((1497.0, 205.0, 386.0), (round(b.x(), 1), round(b.y(), 1), round(stack.width(), 1)))
         self.assertEqual(0, self.execute_calls())
 
@@ -2477,13 +2499,13 @@ class LocalFitTests(UiTestCase):
             self.click(root, "settingsOrb")
             panel = self.item(root, "settingsSurface")
             self.assertTrue(self.item(root, "summaryRail").isVisible())
-            self.assertGreater(panel.parentItem().z(), self.item(root, "summaryRail").z())
+            self.assertGreater(panel.parentItem().z(), self.item(root, "sidebar").z())
             self.assertEqual("#36aaff", panel.parentItem().property("surfaceEdge").name())
-            # Use a point inside BOTH a rail card and the Dark package choice,
-            # not its centre (which lies safely to the right of the rail).
+            # Use a point inside BOTH the sidebar (Gate 6F: the rail's place)
+            # and the Dark package choice.
             choice = self.item(root, "package_dark")
-            for key in ("Tasks", "Focus", "Plan"):
-                card = self.item(root, "rail" + key)
+            for key in ("sidebar",):
+                card = self.item(root, key)
                 p = card.mapToScene(QPointF(0, 0))
                 q = choice.mapToScene(QPointF(0, 0))
                 left = max(p.x(), q.x()); right = min(p.x() + card.width(), q.x() + choice.width())
@@ -2492,7 +2514,7 @@ class LocalFitTests(UiTestCase):
                     QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPointF((left + right) / 2, (top + bottom) / 2).toPoint())
                     break
             else:
-                self.fail("Regression point must overlap a visible rail card")
+                self.fail("Regression point must overlap the visible sidebar")
             pump(500)
             self.assertEqual("dark", bridge.theme)
             self.assertTrue(root.property("settingsOpen"))
@@ -2692,7 +2714,7 @@ class LayoutEditorTests(UiTestCase):
                 self.assertFalse(bridge.railCards[-1]["visible"])
                 self.click(root, "layoutCards")
                 popover = self.item(root, "layoutPopover")
-                self.assertEqual("6 visible · 3 hidden", self.item(root, "inventoryCount").property("text"))
+                self.assertEqual("6 visible · 2 hidden", self.item(root, "inventoryCount").property("text"))   # Gate 6F Q4: no Updates tile
                 top_left = popover.mapToScene(popover.boundingRect().topLeft())
                 self.assertGreaterEqual(top_left.x(), 0); self.assertGreaterEqual(top_left.y(), 0)
                 self.assertLessEqual(top_left.x() + popover.width(), width)
@@ -5387,7 +5409,7 @@ class FinalPolishTests(SurfaceCase):
         pump(700)                                                                # the resize reflow has settled
         work = self.item(root, "canonicalWorkspace"); stack = self.item(root, "panelColumn")
         before = (work.x(), work.y(), work.width(), work.height(), stack.x(), stack.width())
-        self.assertEqual((1231.0, 386.0), (work.width(), stack.width()))
+        self.assertEqual((1107.0, 386.0), (work.width(), stack.width()))      # Gate 6F: after the sidebar; the stack unchanged
         self.click(root, "modelTrigger"); pump(300)
         model = self.item(root, "modelSurface")
         self.assertGreaterEqual(self.alpha(model), 0.94)                        # nothing behind reads through
@@ -6590,7 +6612,7 @@ class PresentationTypographyTests(SurfaceCase):
             with self.subTest(surface=name):
                 self.assertEqual(1, self.render_type(item))
                 self.assertEqual(family, item.property("font").family())
-        for name in ("railNoteTasks", "railTitleTasks", "contextPlace",
+        for name in ("railLineTasks", "railTitleTasks", "contextPlace",
                      "statValue_Model", "workflowValue_Status"):
             item = self.item(root, name)
             with self.subTest(surface=name):
@@ -6680,7 +6702,7 @@ class PresentationTypographyTests(SurfaceCase):
         pump(400)
         title = self.item(root, "feedTitle").property("font")
         source = self.item(root, "feedSource").property("font")
-        note = self.item(root, "railNoteTasks").property("font")
+        note = self.item(root, "railLineTasks").property("font")
         rail_title = self.item(root, "railTitleTasks").property("font")
         # The title: the interface semibold at 14.
         self.assertEqual(self.strong(), (title.family(), title.weight()))
@@ -6699,10 +6721,12 @@ class PresentationTypographyTests(SurfaceCase):
                 self.assertEqual(QColor(tokens(root, "inkTokens")["secondary"]).name(), QColor(line.property("color")).name())
         self.assertLess(source.pixelSize(), title.pixelSize())
         self.assertLess(source.weight(), title.weight())
-        # The rail's second line: the 13 px caption, never smaller.
+        # The tile's line: the 13 px caption, never smaller; beneath the title
+        # by weight (Gate 6F: the small tile's title is the 13 px semibold).
         self.assertEqual((self.quiet(), 13, 400), (note.family(), note.pixelSize(), note.weight()))
-        self.assertLess(note.pixelSize(), rail_title.pixelSize())
-        self.assertFalse(self.item(root, "railNoteTasks").property("truncated"))
+        self.assertLessEqual(note.pixelSize(), rail_title.pixelSize())
+        self.assertLess(note.weight(), rail_title.weight())
+        self.assertFalse(self.item(root, "railLineTasks").property("truncated"))
 
     def test_the_composer_writes_in_the_conversation_face(self) -> None:
         """Typed text is the interface face. The placeholder - and nothing else
@@ -6751,7 +6775,7 @@ class PresentationTypographyTests(SurfaceCase):
         pump(400)
         reply = self.item(root, "feedMessage_jarvis").property("font")
         wrote = self.item(root, "feedMessage_user").property("font")
-        note = self.item(root, "railNoteTasks").property("font")
+        note = self.item(root, "railLineTasks").property("font")
         ramp = tokens(root, "typeTokens")
         self.assertEqual(ramp["reading"], reply)
         self.assertEqual((self.chat(), 16, 500), (wrote.family(), wrote.pixelSize(), wrote.weight()))
@@ -6778,12 +6802,12 @@ class PresentationTypographyTests(SurfaceCase):
         bridge = self.bridge()
         root = self.window(bridge)
         native_fonts = bool(QFontDatabase.families())
-        for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
+        for width, height in ((1920, 1080), (1536, 864), (1280, 760), (1100, 700)):
             root.resize(width, height)
             pump(600)
             with self.subTest(size=(width, height)):
                 for key in ("Tasks", "Focus", "Plan", "Memory"):
-                    note = self.item(root, "railNote" + key)
+                    note = self.item(root, "railLine" + key)
                     if not note.isVisible() or not native_fonts:
                         continue
                     self.assertFalse(note.property("truncated"), key)
@@ -6889,10 +6913,12 @@ class PrePolishTests(SurfaceCase):
         root = self.window(bridge)
         self.assertEqual(False, [c for c in bridge.railCards if c["id"] == "updates"][0]["visible"])
         self.assertNotIn("railUpdates", [str(i.objectName()) for i in self.all_items(root)])
-        # Same data source as the live feed: this session's activity notes.
+        # Same data source as the live feed: this session's activity notes. Gate 6F
+        # (Q4): Updates has no tile - a layout that shows it keeps it, unshown.
         bridge.setCardVisible("rail", "updates", True); pump(300)
-        self.assertTrue(self.item(root, "railUpdates").isVisible())
-        self.assertGreaterEqual(len(bridge.activity), 1)                 # what the card would count
+        self.assertTrue([c for c in bridge.railCards if c["id"] == "updates"][0]["visible"])
+        self.assertNotIn("railUpdates", [str(i.objectName()) for i in self.all_items(root)])
+        self.assertGreaterEqual(len(bridge.activity), 1)                 # what the live feed lists
 
     def test_attachments_preview_from_the_snapshot_in_the_draft_the_groups_and_the_sent_message(self) -> None:
         bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
@@ -7217,45 +7243,43 @@ class RailSwitchTests(SurfaceCase):
             pump(10)
 
     def active(self, root):
-        return [k for k in ("Tasks", "Updates", "Focus", "Plan") if self.item(root, "rail" + k).property("active")]
+        return [k for k in ("Tasks", "Focus", "Plan") if self.item(root, "rail" + k).property("active")]
 
     def test_switching_cards_closes_a_then_opens_b(self) -> None:
         bridge = self.bridge()
-        bridge.setCardVisible("rail", "updates", True)
         root = self.window(bridge)
         pump(700)
         self.press(root, "railTasks")
         pump(400)
         self.assertEqual((True, "Tasks"), (root.property("peekOpen"), root.property("peekKey")))
         frames, stop = self.watch(root)
-        self.press(root, "railUpdates")
-        self.assertEqual(["Updates"], self.active(root))                          # the pick shows at once
-        self.settle(frames, (True, "Updates", 1.0))
+        self.press(root, "railFocus")
+        self.assertEqual(["Focus"], self.active(root))                            # the pick shows at once
+        self.settle(frames, (True, "Focus", 1.0))
         stop()
         # A leaves first: its own content fades out, still A's.
         closing = [f for f in frames if f[1] == "Tasks"]
         self.assertTrue(closing and min(f[2] for f in closing) < 0.2, frames[:12])
         self.assertFalse(any(f[0] for f in closing))
         # Then B arrives from transparent, and only then.
-        opening = [f for f in frames if f[1] == "Updates"]
+        opening = [f for f in frames if f[1] == "Focus"]
         self.assertTrue(opening and opening[0][2] < 0.5, opening[:5])
         self.assertEqual(sorted(f[2] for f in opening), [f[2] for f in opening])  # rising, never a jump back
-        self.assertEqual((True, "Updates", 1.0), frames[-1])
-        self.assertEqual(["Updates"], self.active(root))
+        self.assertEqual((True, "Focus", 1.0), frames[-1])
+        self.assertEqual(["Focus"], self.active(root))
 
     def test_rapid_picks_settle_on_the_last_card_and_the_same_card_closes(self) -> None:
         bridge = self.bridge()
-        bridge.setCardVisible("rail", "updates", True)
         root = self.window(bridge)
         pump(700)
         self.press(root, "railTasks")
         pump(400)
-        for name in ("railUpdates", "railFocus", "railPlan", "railUpdates"):
+        for name in ("railPlan", "railFocus", "railTasks", "railPlan"):
             self.press(root, name)
             pump(20)
         pump(600)
-        self.assertEqual((True, "Updates"), (root.property("peekOpen"), root.property("peekKey")))
-        self.assertEqual(["Updates"], self.active(root))
+        self.assertEqual((True, "Plan"), (root.property("peekOpen"), root.property("peekKey")))
+        self.assertEqual(["Plan"], self.active(root))
         # Mid-switch, the card being opened picked again: nothing opens.
         self.press(root, "railFocus")
         pump(20)
@@ -7581,7 +7605,7 @@ class TypographySystemTests(SurfaceCase):
         bridge._say("result", "Görev sonucu.", task_id="t-1", run_status="completed", capability="code_analysis")
         pump(500)
         seen += [("home",) + t for t in self.shown_texts(root)]
-        for key in ("Tasks", "Updates", "Focus", "Plan"):
+        for key in ("Tasks", "Focus", "Plan"):
             self.click(root, "rail" + key)
             pump(400)
             seen += [("peek " + key,) + t for t in self.shown_texts(root)]
@@ -7661,7 +7685,6 @@ class TypographySystemTests(SurfaceCase):
     def test_every_visible_interface_text_is_on_the_system(self) -> None:
         from PySide6.QtGui import QFontInfo
         bridge = self.bridge()
-        bridge.setCardVisible("rail", "updates", True)
         root = self.window(bridge)
         pump(700)
         faces = self.fonts()

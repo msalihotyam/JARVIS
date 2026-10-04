@@ -1,31 +1,25 @@
 import QtQuick
-import QtQuick.Shapes
-import QtQuick.Effects
 import "../theme"
 
-// The left ambient rail's summary stack: Tasks, Updates, Focus, Plan, Memory.
-// It is contextual information, not navigation chrome. Each card is one glance
-// at real state and never expands in the rail; a click opens a quick-look peek
-// anchored to its right (SummaryPeek), and the full page stays one step
-// further for deeper work. Memory is informational only: no peek, no route.
+// The sidebar's summary tiles (Gate 6F, L2 f): Tasks, Focus, Plan, Memory as
+// a 2x2 grid at the foot of the sidebar. A hidden tile reflows the grid to
+// 3 / 2 / 1 (Q3); Updates has no tile (Q4: the right column's live feed
+// carries it). Each tile is one glance at real state: an icon well, a big
+// number or status and ONE short line that never clips - it takes the
+// longest of its variants that fits, and elides (with its tip) only as the
+// last resort. A click opens the quick-look peek beside the sidebar (Q5);
+// the full page stays one step further. Memory is read, not pressed.
 //
-// Every figure comes from a bridge listing; nothing is invented to fill the
-// approved layout:
-//   Tasks   -> the live task and the durable sessions      (Tasks page)
-//   Updates -> this interface session's activity notes     (History page,
-//              whose "this interface session" list is exactly these notes)
-//   Focus   -> the active memory projects                  (Memory page)
-//   Plan    -> the scheduled automation jobs               (Automations page)
-//   Memory  -> the backend's reported memory status        (no page)
-//
-// Order and visibility are the persisted layout (bridge.railCards). In Edit
-// Mode the card bodies stop navigating and each card offers its layout menu.
+// Every figure comes from a bridge listing; nothing is invented. Order and
+// visibility are the persisted layout (bridge.railCards); in Edit Mode the
+// tiles stop navigating and each offers its layout menu.
 //
 // The shaping helpers live here so the peek reads the same derived state.
 Item {
     id: rail
     objectName: "summaryRail"
     property string activeKey: ""
+    property bool big: true                  // the 1920-class tile (84 px), else the compact one (62 px)
     signal picked(string key, real cardY, real cardHeight)
     signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
 
@@ -50,11 +44,6 @@ Item {
         return ({ running: qsTr("Running"), awaiting_approval: qsTr("Awaiting you"), awaiting_clarification: qsTr("Needs a detail"),
                   completed: qsTr("Completed"), failed: qsTr("Failed"), rejected: qsTr("Denied"), cancelled: qsTr("Cancelled") })[s] || (s || "")
     }
-    function kindWord(k) {
-        return ({ system: qsTr("System"), scheduled: qsTr("Scheduled"), approval: qsTr("Approval"), error: qsTr("Error"),
-                  unknown: qsTr("Outcome unknown"), data: qsTr("Data") })[k] || qsTr("Update")
-    }
-    function isAlert(k) { return k === "error" || k === "unknown" || k === "approval" }
 
     // -- real state, shaped once ------------------------------------------
     readonly property var liveJobs: bridge.jobs.filter(function(j) { return !j.archived && j.readable !== false })
@@ -67,232 +56,177 @@ Item {
         }
         return best
     }
-    readonly property int attention: (bridge.approvalPending ? 1 : 0)
-                                     + bridge.activity.filter(function(a) { return rail.isAlert(a.kind) }).length
     readonly property int taskTotal: bridge.sessions.reduce(function(n, s) { return n + (s.task_count || 0) }, 0)
-
-    readonly property bool roomy: width >= 200
-    readonly property bool tight: width < 150
-    readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
     readonly property string sessionsWord: bridge.sessions.length === 1 ? qsTr("1 session") : qsTr("%1 sessions").arg(bridge.sessions.length)
-    readonly property var modules: [
-        // `key` is the stable id (object names, the peek); `title` is what is shown.
-        // A count line always begins with its number (translations keep it first).
-        { id: "tasks", key: "Tasks", title: qsTr("Tasks"), page: "tasks", icon: "tasks",
-          line: qsTr("%1 active").arg(bridge.taskLive ? 1 : 0),
-          note: rail.roomy ? rail.sessionsWord + " · " + (rail.taskTotal === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(rail.taskTotal)) : rail.sessionsWord },
-        { id: "updates", key: "Updates", title: qsTr("Updates"), page: "history", icon: "updates",
-          line: qsTr("%1 recent").arg(bridge.activity.length),
-          note: rail.attention > 0 ? (rail.roomy ? (rail.attention === 1 ? qsTr("1 needs attention") : qsTr("%1 need attention").arg(rail.attention)) : qsTr("%1 to review").arg(rail.attention)) : qsTr("All clear") },
-        { id: "focus", key: "Focus", title: qsTr("Focus"), page: "memory", icon: "focus",
-          line: bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length),
-          note: bridge.projects.length ? (rail.roomy ? qsTr("Active in memory") : qsTr("In memory"))
-                                       : (rail.roomy ? qsTr("No focus context yet") : rail.width < 180 ? qsTr("No context") : qsTr("No context yet")),
-          // The long form is a whole sentence; at this size it is the one note
-          // that can outgrow the rail, so it keeps a short form to fall back to.
-          shortNote: bridge.projects.length ? qsTr("In memory") : qsTr("No context yet") },
-        { id: "plan", key: "Plan", title: qsTr("Plan"), page: "automations", icon: "plan",
-          line: rail.tight ? (rail.enabledJobs.length === 1 ? qsTr("1 job") : qsTr("%1 jobs").arg(rail.enabledJobs.length)) : qsTr("%1 scheduled").arg(rail.enabledJobs.length),
-          note: rail.nextJob ? qsTr("Next %1").arg(rail.dueShort(rail.nextJob.next_due_at_utc))
-                             : (rail.liveJobs.length ? (rail.roomy ? qsTr("Nothing enabled") : qsTr("None enabled")) : (rail.roomy ? qsTr("Nothing scheduled") : qsTr("None yet"))) },
-        // A status, not a count: the whole line is the status word.
-        { id: "memory", key: "Memory", title: qsTr("Memory"), page: "", icon: "memory", status: true,
-          line: ({ "Available": qsTr("Available"), "Unavailable": qsTr("Unavailable"), "Status unavailable": qsTr("Status unavailable") })[bridge.memoryStatus] || bridge.memoryStatus,
-          note: qsTr("Persistent across sessions"), shortNote: qsTr("Persistent") }
-    ]
+    readonly property string tasksWord: rail.taskTotal === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(rail.taskTotal)
+
+    // A tile: its title, then `value` - a big number, or with `word` a word
+    // after its `dot` - then `lines`, its one short line, longest variant
+    // first; `tip` is the whole sentence (its tip and accessible name).
+    // `quiet`: read, not pressed. `key` is the stable id (object names, the
+    // peek); `title` is what is shown.
+    readonly property var modules: {
+        var tasks = bridge.taskLive ? 1 : 0
+        var memoryWord = ({ "Available": qsTr("Available"), "Unavailable": qsTr("Unavailable"),
+                            "Status unavailable": qsTr("Status unavailable") })[bridge.memoryStatus] || bridge.memoryStatus
+        var next = rail.nextJob ? qsTr("Next %1").arg(rail.dueShort(rail.nextJob.next_due_at_utc)) : ""
+        return [
+            { id: "tasks", key: "Tasks", title: qsTr("Tasks"), icon: "tasks", tone: "#4fd8ff", value: String(tasks),
+              lines: [qsTr("%1 active").arg(tasks).substring(String(tasks).length + 1) + " · " + rail.sessionsWord,
+                      qsTr("%1 active").arg(tasks).substring(String(tasks).length + 1)],
+              tip: qsTr("%1 active").arg(tasks) + " · " + rail.sessionsWord + " · " + rail.tasksWord },
+            { id: "focus", key: "Focus", title: qsTr("Focus"), icon: "focus", tone: Theme.warning, value: String(bridge.projects.length),
+              lines: [(bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length))
+                          .substring(String(bridge.projects.length).length + 1) + " · " + (bridge.projects.length ? qsTr("In memory") : qsTr("No context yet")),
+                      (bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length))
+                          .substring(String(bridge.projects.length).length + 1)],
+              tip: bridge.projects.length ? qsTr("Active in memory") : qsTr("No focus context yet") },
+            { id: "plan", key: "Plan", title: qsTr("Plan"), icon: "plan", tone: "#9b7bff", value: String(rail.enabledJobs.length),
+              lines: [qsTr("%1 scheduled").arg(rail.enabledJobs.length).substring(String(rail.enabledJobs.length).length + 1)
+                          + (next ? " · " + next : ""),
+                      qsTr("%1 scheduled").arg(rail.enabledJobs.length).substring(String(rail.enabledJobs.length).length + 1)],
+              tip: next || (rail.liveJobs.length ? qsTr("Nothing enabled") : qsTr("Nothing scheduled")) },
+            { id: "memory", key: "Memory", title: qsTr("Memory"), icon: "memory", tone: Theme.success, quiet: true, word: true,
+              dot: bridge.memoryStatus === "Available" ? Theme.success : Theme.warning, value: memoryWord,
+              lines: [qsTr("Persistent across sessions"), qsTr("Persistent")], tip: qsTr("Persistent across sessions") }
+        ]
+    }
     readonly property var shownModules: {
         var byId = {}
         rail.modules.forEach(function(m) { byId[m.id] = m })
-        return bridge.railCards.filter(function(c) { return c.visible }).map(function(c) { return byId[c.id] })
+        return bridge.railCards.filter(function(c) { return c.visible && byId[c.id] !== undefined }).map(function(c) { return byId[c.id] })
     }
-    readonly property int count: Math.max(1, shownModules.length)
+    readonly property int count: shownModules.length
 
-    // Share the available height, which already excludes the lower HUD, among
-    // the cards shown. Extra space is breathing room for real content, never
-    // invented rows; a fifth card takes blank space, not text size.
-    readonly property real cardFull: Math.max(84, (height - 12 * (count - 1)) / count)
-    readonly property real cardCompact: 50
-    readonly property bool showNote: count * cardFull + 10 * (count - 1) <= height
-    readonly property real cardHeight: showNote ? cardFull : cardCompact
-    readonly property real gap: count * cardHeight + 12 * (count - 1) <= height ? 12 : 6
+    // The grid: two per row; an odd last tile takes the whole row (3 / 2 / 1).
+    // A tile has three rows: the title, the value, the line.
+    readonly property int gap: big ? 8 : 6
+    readonly property real cardHeight: big ? 86 : 74
+    readonly property int rows: Math.ceil(count / 2)
+    readonly property real cell: (width - gap) / 2
+    implicitHeight: rows > 0 ? rows * cardHeight + (rows - 1) * gap : 0
+    height: implicitHeight
+    readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
 
-    Column {
-        width: rail.width
-        spacing: rail.gap
-        Repeater {
-            model: rail.shownModules
+    Repeater {
+        model: rail.shownModules
+        Rectangle {
+            id: card
+            objectName: "rail" + modelData.key
+            readonly property bool editing: bridge.editMode
+            // Memory has no peek or page: outside editing it is read, not pressed.
+            readonly property bool navigable: !editing && !modelData.quiet
+            readonly property bool active: rail.activeKey === modelData.key
+            readonly property bool hovered: hit.containsMouse
+            readonly property bool alert: !!modelData.alert
+            readonly property bool whole: index === rail.count - 1 && rail.count % 2 === 1
+            x: whole ? 0 : (index % 2) * (rail.cell + rail.gap)
+            y: Math.floor(index / 2) * (rail.cardHeight + rail.gap)
+            width: whole ? rail.width : rail.cell
+            height: rail.cardHeight
+            radius: 10
+            color: alert ? Theme.alpha(Theme.warning, hovered ? 0.20 : 0.13) : active ? rail.activeFill
+                 : hovered && navigable ? Theme.glassControlHover : Theme.glassSecondaryShell
+            border.width: 1
+            border.color: alert ? Theme.alpha(Theme.warning, 0.75) : active ? Theme.alpha(Theme.accent, 0.7)
+                        : hovered && navigable ? Theme.glassEdgeStrong : Theme.glassEdge
+            Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+            Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
+            activeFocusOnTab: card.navigable
+            Accessible.role: card.navigable ? Accessible.Button : Accessible.StaticText
+            Accessible.name: modelData.title + ": " + modelData.tip
+            function activate() {
+                if (card.navigable) rail.picked(modelData.key, card.y, card.height)
+            }
+            Keys.onReturnPressed: card.activate()
+            Keys.onSpacePressed: card.activate()
+
+            readonly property int inset: rail.big ? 12 : 10
+            readonly property int pad: rail.big ? 9 : 7
+            // Row 1: the icon well and the title.
             Rectangle {
-                id: card
-                objectName: "rail" + modelData.key
-                readonly property bool editing: bridge.editMode
-                // Memory has no peek or page: outside editing it is read, not pressed.
-                readonly property bool navigable: !editing && !modelData.status
-                readonly property bool active: rail.activeKey === modelData.key
-                readonly property bool hovered: hit.containsMouse
-                width: rail.width
-                height: rail.cardHeight
-                radius: 14
-                // Closed: controlled glass. Active: a restrained cyan
-                // treatment - brighter edge and a slight lift, no glow bloom.
-                color: active ? rail.activeFill : hovered ? "#b6051a30" : Theme.glassSecondaryShell
-                border.width: 0
-                Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-                activeFocusOnTab: card.navigable
-                Accessible.role: card.navigable ? Accessible.Button : Accessible.StaticText
-                Accessible.name: modelData.title + ": " + modelData.line
-                Keys.onReturnPressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
-                Keys.onSpacePressed: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
+                id: well
+                objectName: "railSocket" + modelData.key
+                x: card.inset; y: card.pad
+                width: rail.big ? 20 : 18; height: width; radius: 5
+                color: Theme.alpha(modelData.tone, card.alert ? 0.24 : 0.14)
+                SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#d8f0ff"; scale: (well.width - 7) / 18 }
+            }
+            Text {
+                objectName: "railTitle" + modelData.key
+                x: well.x + well.width + 7; anchors.verticalCenter: well.verticalCenter
+                width: card.width - x - card.inset
+                elide: Text.ElideRight; textFormat: Text.PlainText
+                text: modelData.title; color: Theme.textLabel; font: Theme.captionStrong; renderType: Theme.textRender
+            }
+            // Row 2: the big number, or a word after its dot. A word takes the
+            // display face while it fits, else the caption's strong face, and
+            // elides (its tip has it) only when even that is too wide.
+            readonly property font wordFace: Qt.font({ family: Theme.display, pixelSize: rail.big ? 19 : 16, weight: Font.Medium })
+            FontMetrics { id: wordMetrics; font: card.wordFace }
+            readonly property real end: card.width - (menuButton.visible ? menuButton.width + 8 : card.inset)
+            Rectangle {
+                id: statusDot
+                visible: !!modelData.dot && modelData.value !== ""
+                x: card.inset; anchors.verticalCenter: count.verticalCenter
+                width: 8; height: 8; radius: 4; color: modelData.dot || Theme.success
+            }
+            Text {
+                id: count
+                objectName: "railCount" + modelData.key
+                x: statusDot.visible ? statusDot.x + statusDot.width + 7 : card.inset
+                y: Math.round((well.y + well.height + line.y - height) / 2)
+                width: Math.min(implicitWidth, Math.max(0, card.end - x)); elide: Text.ElideRight
+                textFormat: Text.PlainText; text: modelData.value; color: card.alert ? Theme.warning : Theme.text
+                font: !modelData.word ? Theme.figure(rail.big ? 26 : 20)
+                      : wordMetrics.advanceWidth(modelData.value) <= card.end - x ? card.wordFace : Theme.captionStrong
+                renderType: Theme.textRender
+            }
+            // Row 3: the one short line - the longest variant that fits; the
+            // last one elides (its tip has it) only if even it does not.
+            FontMetrics { id: lineMetrics; font: Theme.caption }
+            Text {
+                id: line
+                objectName: "railLine" + modelData.key
+                readonly property real room: card.width - 2 * card.inset
+                readonly property string fitted: {
+                    var v = modelData.lines
+                    for (var i = 0; i < v.length; i++)
+                        if (lineMetrics.advanceWidth(v[i]) <= room) return v[i]
+                    return v[v.length - 1]
+                }
+                x: card.inset; y: card.height - card.pad - height
+                width: Math.max(0, room)
+                elide: Text.ElideRight; textFormat: Text.PlainText
+                text: fitted; color: card.alert ? Theme.warning : Theme.textMuted; font: Theme.caption; renderType: Theme.textRender
+            }
+            MouseArea {
+                id: hit
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: card.navigable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: card.activate()
+            }
+            HoverTip { objectName: "railTip" + modelData.key; text: modelData.tip; active: !card.editing }
+            Rectangle { objectName: "railFocusRing" + modelData.key; visible: card.activeFocus; anchors.fill: parent; anchors.margins: 1
+                        radius: card.radius - 1; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
 
-                // The shell: a static nine-slice of light - soft outer glow, a
-                // cyan rim brightest where light catches the upper left, and a
-                // faint secondary inner rim. The active shell fades in over it.
-                BorderImage {
-                    anchors.fill: parent; anchors.margins: -12
-                    source: "../assets/rail-card-shell.png"
-                    layer.enabled: true
-                    layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
-                    border { left: 34; top: 34; right: 34; bottom: 34 }
-                    opacity: card.active ? 0 : card.hovered ? 1 : 0.9
-                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
-                }
-                BorderImage {
-                    anchors.fill: parent; anchors.margins: -12
-                    source: "../assets/rail-card-shell-active.png"
-                    layer.enabled: true
-                    layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
-                    border { left: 34; top: 34; right: 34; bottom: 34 }
-                    opacity: card.active ? 1 : card.hovered ? 0.35 : 0
-                    visible: opacity > 0
-                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
-                }
-                // Inner light from the upper left, fading down and across.
-                Rectangle {
-                    anchors.fill: parent; anchors.margins: 1; radius: 13
-                    gradient: Gradient {
-                        GradientStop { position: 0; color: card.active ? "#363692ff" : Theme.glassMicro }
-                        GradientStop { position: 0.55; color: "transparent" }
-                    }
-                }
-                Rectangle {
-                    anchors.fill: parent; anchors.margins: -3; radius: 14
-                    color: "transparent"; border.color: Theme.alpha(Theme.accent, 0.7)
-                    visible: card.activeFocus
-                }
-                // The pointer into the open peek: a filled tab leaving the
-                // active card's edge, stroked on its outer sides only.
-                Shape {
-                    visible: card.active
-                    x: parent.width - 2; y: parent.height / 2 - 11
-                    width: 13; height: 22
-                    preferredRendererType: Shape.CurveRenderer
-                    ShapePath {
-                        strokeWidth: -1; fillColor: rail.activeFill
-                        startX: 0; startY: 0
-                        PathLine { x: 1.6; y: 0 } PathLine { x: 12; y: 11 } PathLine { x: 1.6; y: 22 } PathLine { x: 0; y: 22 } PathLine { x: 0; y: 0 }
-                    }
-                    ShapePath {
-                        strokeColor: Theme.materialGlint; strokeWidth: 1.2; fillColor: "transparent"
-                        joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.FlatCap
-                        startX: 1.6; startY: 0.5
-                        PathLine { x: 11.5; y: 11 } PathLine { x: 1.6; y: 21.5 }
-                    }
-                }
-
-                // Icon socket: a compact recessed optical socket, nearly flush
-                // with the card - deep navy, restrained cool-blue edge accents,
-                // one blue-white line glyph. One family for every module; the
-                // card, its labels and its whole hit area are unchanged.
-                Rectangle {
-                    id: tile
-                    objectName: "railSocket" + modelData.key
-                    x: rail.tight ? 9 : 13; anchors.verticalCenter: parent.verticalCenter
-                    width: rail.tight ? 32 : 36; height: width; radius: rail.tight ? 8 : 9
-                    color: "#0a1f36"
-                    border.width: 1; border.color: Theme.alpha("#299ddf", card.active || card.hovered ? 0.7 : 0.42)
-                    Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-                    // The recess: a darker upper half, a faint light along the lower edge.
-                    Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: parent.height * 0.5; radius: parent.radius - 1
-                        gradient: Gradient { GradientStop { position: 0; color: "#3a000a14" } GradientStop { position: 1; color: "transparent" } } }
-                    Rectangle { x: 7; y: parent.height - 2; width: parent.width - 14; height: 1; color: Theme.alpha("#49bdfa", 0.3) }
-                    SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#b8e7ff"; scale: (rail.tight ? 20 : 22) / 18 }
-                }
-
-                // Darker protection beneath the labels; the space stays visible
-                // around them.
-                Rectangle {
-                    x: tile.x - 5; width: parent.width - x - 8; radius: 9
-                    anchors.verticalCenter: parent.verticalCenter; height: Math.max(tile.height, labels.height) + 16
-                    color: Theme.glassSecondaryReading
-                }
-                Column {
-                    id: labels
-                    x: tile.x + tile.width + (rail.tight ? 8 : 13)
-                    anchors.verticalCenter: parent.verticalCenter
-                    // The right reserve is the chevron's; Memory has none.
-                    width: parent.width - x - (modelData.status ? 12 : rail.tight ? 17 : 24)
-                    spacing: rail.showNote ? 2 : 0
-                    readonly property int tier: Theme.tier(card.Window.width)
-                    // Title, then the count numeral with its unit on one baseline, then the detail.
-                    Text { objectName: "railTitle" + modelData.key; width: parent.width; elide: Text.ElideRight; text: modelData.title; color: Theme.text
-                           renderType: Theme.textRender
-                           font: Theme.railTitle(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railTitleLine(labels.tier) }
-                    Row {
-                        width: parent.width; spacing: count === "" ? 0 : 5
-                        readonly property string count: modelData.status ? "" : modelData.line.split(" ")[0]
-                        // A status card keeps the count's line box (1 px wide: a Row skips zero-width items) so its rhythm matches.
-                        Text { id: countText; objectName: "railCount" + modelData.key; text: parent.count === "" ? " " : parent.count; width: parent.count === "" ? 1 : implicitWidth; color: "#37c4f0"
-                               renderType: Theme.textRender
-                               font: Theme.railCount(labels.tier); lineHeightMode: Text.FixedHeight; lineHeight: Theme.railCountLine(labels.tier) }
-                        Text { objectName: "railLine" + modelData.key; anchors.baseline: countText.baseline; width: parent.width - countText.width - parent.spacing; elide: Text.ElideRight
-                               renderType: Theme.textRender
-                               text: parent.count === "" ? modelData.line : modelData.line.substring(parent.count.length + 1); color: "#37c4f0"; font: Theme.uiLabel }
-                    }
-                    Text { objectName: "railNote" + modelData.key; visible: rail.showNote; width: parent.width; elide: Text.ElideRight; color: Theme.textLabel
-                           renderType: Theme.textRender
-                           text: modelData.shortNote && noteMetrics.advanceWidth > width ? modelData.shortNote : modelData.note
-                           font: Theme.metadataStrong; lineHeightMode: Text.FixedHeight; lineHeight: 18
-                           TextMetrics { id: noteMetrics; text: modelData.note; font: Theme.metadataStrong } }
-                }
-                Shape {
-                    visible: !card.active && card.navigable
-                    x: parent.width - (rail.tight ? 14 : 19); y: labels.y + (rail.showNote ? 4 : 2)
-                    width: 7; height: 12; scale: rail.tight ? 1 : 1.15
-                    preferredRendererType: Shape.CurveRenderer
-                    ShapePath {
-                        strokeColor: card.hovered ? "#91ceff" : "#36b1ff"
-                        strokeWidth: 1.6; fillColor: "transparent"
-                        capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
-                        startX: 1; startY: 1
-                        PathLine { x: 6; y: 6 }
-                        PathLine { x: 1; y: 11 }
-                    }
-                }
-
-                MouseArea {
-                    id: hit
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: card.navigable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                    onClicked: if (card.navigable) rail.picked(modelData.key, card.y, card.height)
-                }
-
-                // Edit Mode: a restrained blue outline and the card's layout menu.
-                Rectangle {
-                    anchors.fill: parent; radius: parent.radius
-                    color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.55)
-                    opacity: card.editing ? 1 : 0; visible: opacity > 0
-                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
-                }
-                IconButton {
-                    id: menuButton
-                    objectName: "railMenu" + modelData.key
-                    visible: card.editing
-                    // Narrow rails keep the title clear with a slimmer target.
-                    anchors { right: parent.right; top: parent.top; rightMargin: rail.width < 180 ? 2 : 4; topMargin: rail.showNote ? 4 : Math.max(0, (parent.height - height) / 2) }
-                    width: rail.width < 180 ? 26 : 36; height: rail.showNote ? 32 : 36
-                    glyph: "•••"; tip: qsTr("%1 layout options").arg(modelData.title)
-                    onClicked: rail.menuRequested(modelData.id, menuButton, index > 0, index < rail.shownModules.length - 1)
-                }
+            // Edit Mode: a restrained blue outline and the tile's layout menu.
+            Rectangle {
+                anchors.fill: parent; radius: parent.radius
+                color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.55)
+                opacity: card.editing ? 1 : 0; visible: opacity > 0
+                Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+            }
+            IconButton {
+                id: menuButton
+                objectName: "railMenu" + modelData.key
+                visible: card.editing
+                // On the value's row, so the title and the line keep their room.
+                anchors { right: parent.right; rightMargin: 4; verticalCenter: count.verticalCenter }
+                width: 26; height: 26
+                glyph: "•••"; tip: qsTr("%1 layout options").arg(modelData.title)
+                onClicked: rail.menuRequested(modelData.id, menuButton, index > 0, index < rail.shownModules.length - 1)
             }
         }
     }

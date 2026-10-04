@@ -15,6 +15,9 @@ Item {
     // Height, rail width and the viewport height come from the macro
     // layout (Main.qml); the rail's own rhythm is proportional to it.
     property real railWidth: 246
+    // Gate 6F: the home sidebar's right edge (0 when there is none); the
+    // lifecycle indicator starts after it.
+    property real sideRight: 0
     property real viewportHeight: 1080
     // The rail's own left inset, proportional like the rail itself.
     readonly property real railInset: Theme.px(bar.width * 0.0163, 20, 34)
@@ -26,7 +29,6 @@ Item {
     signal closeRequested()
     signal openSettings()
     signal openModel()
-    property date now: new Date()
     property bool fullscreen: true
     property bool settingsOpen: false
     property bool modelOpen: false
@@ -149,6 +151,9 @@ Item {
         }
         onClosed: { opacity = 1; y = restY }
     }
+    // Until the scope group leaves the bar (Gate 6F F4): the bottom of its
+    // own row on a narrow window, so the home sidebar starts below it.
+    readonly property real scopeBottom: scopeGroup.visible && scopeGroup.twoRow ? scopeGroup.y + scopeGroup.height : 0
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
     readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
     readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
@@ -707,16 +712,6 @@ Item {
         }
     }
 
-    LeftContextCard {
-        visible: !Theme.command
-        x: 10
-        width: bar.railWidth - 20
-        // The accepted summary rail stays fixed; leave a deliberate 12 px gap.
-        height: Math.min(144, Math.round(bar.viewportHeight * 0.1980) + 76 - 12 - 84)
-        y: Math.round(bar.viewportHeight * 0.1980) + 76 - 12 - height
-        now: bar.now
-    }
-
     // -- core + core-side status ----------------------------------------------
     JarvisCore {
         id: core
@@ -778,7 +773,7 @@ Item {
         // controls outrank secondary metadata (the degradation order above):
         // the indicator starts after them, or yields when that leaves too little.
         readonly property real startX: scopeGroup.visible && scopeGroup.twoRow ? scopeGroup.x + scopeGroup.width + 16
-                                                                               : bar.railWidth + 24
+                                                                               : Math.max(bar.railWidth, bar.sideRight) + 24
         visible: bridge.progress.active === true && stages.length === 4 && width >= 240
         width: Math.max(0, Math.min(360, endX - startX)); height: 50
         x: endX - width

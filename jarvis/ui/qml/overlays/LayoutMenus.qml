@@ -22,13 +22,15 @@ Item {
     readonly property bool open: mode !== ""
     visible: open
 
-    readonly property var railNames: ({ tasks: qsTr("Tasks"), updates: qsTr("Updates"), focus: qsTr("Focus"), plan: qsTr("Plan"), memory: qsTr("Memory") })
+    // The sidebar's four tiles (Gate 6F); Updates has no tile (Q4), so it is not offered.
+    readonly property var railNames: ({ tasks: qsTr("Tasks"), focus: qsTr("Focus"), plan: qsTr("Plan"), memory: qsTr("Memory") })
     readonly property var stackNames: commandMode
         ? ({ system: qsTr("Model & execution"), workflow: qsTr("Active task"), activity: qsTr("Recent actions"), automations: qsTr("Memory context") })
         : ({ system: qsTr("System status"), workflow: qsTr("Active workflow"), activity: qsTr("Live intelligence feed"), automations: qsTr("Automations") })
     // Layout cards only: these counts are never memories, tasks or events.
-    readonly property var railHidden: railShown ? bridge.railCards.filter(function(c) { return !c.visible }) : []
-    readonly property int railVisible: railShown ? bridge.railCards.length - railHidden.length : 0
+    readonly property var railTiles: bridge.railCards.filter(function(c) { return c.id in menus.railNames })
+    readonly property var railHidden: railShown ? railTiles.filter(function(c) { return !c.visible }) : []
+    readonly property int railVisible: railShown ? railTiles.length - railHidden.length : 0
     readonly property var stackHidden: bridge.panels.filter(function(p) { return !p.visible })
     readonly property int stackVisible: bridge.panels.length - stackHidden.length
 

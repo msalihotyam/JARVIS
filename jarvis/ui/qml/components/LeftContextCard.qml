@@ -1,22 +1,21 @@
 import QtQuick
-import QtQuick.Shapes
-import QtQuick.Effects
 import "../theme"
 
-// The same blue glass as the accepted summary rail. Weather is the operator's
-// fixed place as the bridge projects it (fresh, stale or unavailable); QML only
-// shows it and never fetches anything. Without a reading the card claims no city.
+// The sidebar's clock strip (Gate 6F, L2 g): one thin line at its foot - the
+// time, the date, then the weather (or the time zone without a reading).
+// Weather is the operator's fixed place as the bridge projects it (fresh,
+// stale or unavailable); QML only shows it and never fetches anything.
+// Without a reading the strip claims no city. The right part gives way
+// piece by piece when the line is short; the whole sentence is the strip's
+// tip and its accessible name, so nothing is lost.
 Rectangle {
     id: context
     objectName: "leftContextCard"
     property date now: new Date()
-    readonly property bool compact: width < 190
-    readonly property bool tight: width < 155
-    readonly property int inset: tight ? 9 : 13
-    readonly property real weatherWidth: tight ? 49 : compact ? 57 : 68
+    property bool big: true
     // Formatted in the interface language's locale; the time itself is never reinterpreted.
     readonly property string timeText: now.toLocaleTimeString(Qt.locale(i18n.qtLocale), "HH:mm")
-    readonly property string dateText: now.toLocaleDateString(Qt.locale(i18n.qtLocale), tight ? "d MMM yyyy" : "ddd, d MMM")
+    readonly property string dateText: now.toLocaleDateString(Qt.locale(i18n.qtLocale), "ddd, d MMM")
     readonly property string zoneText: {
         var minutes = -now.getTimezoneOffset()
         var sign = minutes < 0 ? "-" : "+"
@@ -66,139 +65,98 @@ Rectangle {
         if (c.indexOf("cloud") >= 0 || c.indexOf("fog") >= 0) return "cloud"
         return c ? "fall" : ""
     }
-    radius: 14
-    color: Theme.glassSecondaryShell
+    color: "transparent"
     Accessible.role: Accessible.Pane
     Accessible.name: hasWeather
         ? qsTr("%1, %2. %3, %4 %5, reading at %6.").arg(timeText).arg(dateText).arg(wx.district)
               .arg(temperatureText).arg(conditionLabel).arg(readingText)
         : qsTr("%1, %2, Local time, %3. Weather unavailable.").arg(timeText).arg(dateText).arg(zoneText)
+    // The strip's top rule: it belongs to the sidebar, not a card of its own.
+    Rectangle { width: parent.width; height: 1; color: Theme.glassSeparator }
 
-    BorderImage {
-        anchors.fill: parent; anchors.margins: -12
-        source: "../assets/rail-card-shell.png"
-        border { left: 34; top: 34; right: 34; bottom: 34 }
-        layer.enabled: true
-        layer.effect: MultiEffect { colorization: 0.85; colorizationColor: "#55b7ff"; brightness: 0.12 }
+    readonly property int lineY: Math.round(height / 2) + 1
+    Text {
+        id: clockText
+        objectName: "contextClock"
+        x: 4; anchors.verticalCenter: parent.top; anchors.verticalCenterOffset: context.lineY
+        text: context.timeText; color: Theme.text
+        font: Theme.clock(context.big ? 17 : 16)
     }
-    Rectangle {
-        anchors.fill: parent; anchors.margins: 1; radius: 13
-        gradient: Gradient {
-            GradientStop { position: 0; color: Theme.glassMicro }
-            GradientStop { position: 0.65; color: "transparent" }
-        }
+    Text {
+        id: dateLabel
+        objectName: "contextDate"
+        x: clockText.x + clockText.width + 10; anchors.baseline: clockText.baseline
+        text: context.dateText; color: Theme.textLabel; font: Theme.dateText; renderType: Theme.textRender
     }
-    Column {
-        id: timeGroup
-        x: context.inset; y: context.compact ? 10 : 12
-        width: parent.width - x - context.weatherWidth - context.inset
-        spacing: context.compact ? 2 : 4
-        // Clock: Space Grotesk Medium with tabular figures, at the role size for
-        // the viewport - capped to the clock column the card really has, so a
-        // narrow rail never pushes the time into the weather instrument.
-        readonly property int tier: Theme.tier(context.Window.width)
-        TextMetrics { id: clockMetrics; text: "00:00"; font: Theme.clock(Theme.clockSize(timeGroup.tier)) }
-        // The room the clock really has: its own column, which ends before the
-        // weather column (the card's accepted rule - the time never crosses it).
-        readonly property real clockRoom: width
-        // The role size, capped to the room the column has. Until the column
-        // and the metrics have a real width (the first bindings run before
-        // layout, when the column is 0 or negative) the role size stands, so
-        // the size is never 0 or negative.
-        readonly property int clockPx: {
-            var role = Theme.clockSize(tier)
-            if (clockRoom <= 0 || clockMetrics.advanceWidth <= 0) return role
-            return Math.max(1, Math.min(role, Math.floor(role * clockRoom / clockMetrics.advanceWidth)))
-        }
-        Text {
-            objectName: "contextClock"
-            width: timeGroup.clockRoom
-            text: context.timeText; color: Theme.text
-            font: Theme.clock(timeGroup.clockPx)
-            lineHeightMode: Text.FixedHeight; lineHeight: Theme.clockLine(timeGroup.tier)
-        }
-        Text {
-            objectName: "contextDate"
-            width: parent.width; text: context.dateText; color: Theme.textLabel; elide: Text.ElideRight
-            font: Theme.dateText; lineHeightMode: Text.FixedHeight; lineHeight: 18
-        }
-    }
-    Item {
-        id: local
-        objectName: "contextLocation"
-        x: context.inset; y: parent.height - height - (context.compact ? 12 : 14)
-        width: timeGroup.width; height: 35
-        Shape {
-            id: pin
-            visible: !context.tight
-            width: 15; height: 20; y: 1
-            preferredRendererType: Shape.CurveRenderer
-            ShapePath {
-                strokeColor: Theme.materialBlue; strokeWidth: 1.7; fillColor: "transparent"
-                startX: 7.5; startY: 19
-                PathCubic { x: 1; y: 7; control1X: 5; control1Y: 15; control2X: 1; control2Y: 11 }
-                PathCubic { x: 14; y: 7; control1X: 1; control1Y: -1; control2X: 14; control2Y: -1 }
-                PathCubic { x: 7.5; y: 19; control1X: 14; control1Y: 11; control2X: 10; control2Y: 15 }
-            }
-            Rectangle { x: 5; y: 4; width: 5; height: 5; radius: 2.5; color: "transparent"; border.color: Theme.materialGlint }
-        }
-        Column {
-            x: pin.visible ? 21 : 0; width: parent.width - x; spacing: 2
-            Text { objectName: "contextPlace"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight
-                   text: context.hasWeather ? context.wx.district : context.compact ? qsTr("Local") : qsTr("Local time")
-                   color: Theme.text; font: context.compact ? Theme.caption : Theme.body }
+    // The right part, in the order it gives way: with a reading the
+    // temperature stays, then the condition, then the place; without one the
+    // zone stays, then "no weather". What is not shown is in the tip.
+    readonly property real room: width - 4 - (dateLabel.x + dateLabel.width + 12)
+    FontMetrics { id: rightMetrics; font: Theme.caption }
+    readonly property real tempW: hasWeather ? markItem.width + 6 + temperatureLabel.implicitWidth : 0
+    readonly property bool showCondition: (hasWeather ? tempW + 8 : zoneLabel.implicitWidth + 8)
+                                          + rightMetrics.advanceWidth(conditionLabelText.text) <= room
+    readonly property bool showPlace: hasWeather && showCondition
+                                      && tempW + 8 + rightMetrics.advanceWidth(conditionLabelText.text) + 8 + rightMetrics.advanceWidth(placeLabel.text) <= room
+    Row {
+        id: right
+        objectName: "contextWeather"
+        anchors { right: parent.right; rightMargin: 4; verticalCenter: parent.top; verticalCenterOffset: context.lineY }
+        spacing: 8
+        Item {
+            id: local
+            objectName: "contextLocation"
+            visible: !context.hasWeather || context.showPlace
+            width: context.hasWeather ? placeLabel.width : zoneLabel.width
+            height: zoneLabel.height
+            Text { id: placeLabel; objectName: "contextPlace"; renderType: Theme.textRender
+                   visible: context.hasWeather
+                   text: context.hasWeather ? context.wx.district : qsTr("Local time")
+                   color: Theme.textLabel; font: Theme.caption }
             // With a reading: when the provider says it applies ("last reading" once it is no longer current).
-            Text { objectName: "contextTimeZone"; renderType: Theme.textRender; width: parent.width; elide: Text.ElideRight
+            Text { id: zoneLabel; objectName: "contextTimeZone"; renderType: Theme.textRender
+                   visible: !context.hasWeather
                    text: !context.hasWeather ? context.zoneText
                          : context.stale ? qsTr("Last reading %1").arg(context.readingText) : qsTr("As of %1").arg(context.readingText)
-                   color: Theme.textLabel; font: Theme.caption }
+                   color: Theme.textMuted; font: Theme.caption }
         }
-    }
-    Column {
-        id: weather
-        objectName: "contextWeather"
-        x: parent.width - width - context.inset
-        y: 12
-        width: context.weatherWidth
-        spacing: context.compact ? 3 : 5
         Item {
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: context.compact ? 29 : 38; height: width
-            id: mark
+            id: markItem
             objectName: "contextWeatherMark"
+            visible: context.hasWeather
             property string family: context.family
+            anchors.verticalCenter: parent.verticalCenter
+            width: 16; height: 16
             opacity: context.stale ? 0.55 : 1
             Rectangle { anchors.fill: parent; radius: width / 2; color: "#2036aaff"; border.color: "#596d9ebe" }
-            Rectangle { anchors.fill: parent; anchors.margins: 5; radius: width / 2; color: "transparent"; border.color: "#7197b2"; opacity: 0.7 }
-            // Unavailable: the neutral slashed instrument, never a fabricated sun.
-            Rectangle { visible: mark.family === ""; anchors.centerIn: parent; width: parent.width * 0.7; height: 1.8; rotation: -45; color: "#c2dff4" }
-            Rectangle { visible: mark.family === "sun"; anchors.centerIn: parent; width: parent.width * 0.34; height: width; radius: width / 2; color: "#d8ecfa" }
+            Rectangle { visible: markItem.family === "sun"; anchors.centerIn: parent; width: 6; height: 6; radius: 3; color: "#d8ecfa" }
             Column {
-                visible: mark.family === "cloud"; anchors.centerIn: parent; spacing: mark.width * 0.09
-                Repeater { model: [0.5, 0.36, 0.5]
-                    Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: mark.width * modelData; height: 1.8; radius: 1; color: "#c2dff4" } }
+                visible: markItem.family === "cloud"; anchors.centerIn: parent; spacing: 2
+                Repeater { model: [8, 6, 8]
+                    Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: modelData; height: 1.4; radius: 0.7; color: "#c2dff4" } }
             }
             Row {
-                visible: mark.family === "fall"; anchors.centerIn: parent; spacing: mark.width * 0.1
+                visible: markItem.family === "fall"; anchors.centerIn: parent; spacing: 2
                 Repeater { model: 3
-                    Rectangle { width: 1.8; height: mark.width * 0.3; radius: 1; rotation: 18; color: "#c2dff4" } }
+                    Rectangle { width: 1.4; height: 5; radius: 0.7; rotation: 18; color: "#c2dff4" } }
             }
         }
         Text {
+            id: temperatureLabel
             objectName: "contextTemperature"
-            width: parent.width; horizontalAlignment: Text.AlignHCenter
             visible: context.hasWeather
             text: context.temperatureText; color: context.stale ? Theme.textMuted : Theme.text
-            font { family: Theme.display; pixelSize: context.compact ? 25 : 31; weight: Font.Medium }
+            font: Theme.captionStrong; renderType: Theme.textRender
         }
         Text {
+            id: conditionLabelText
             objectName: "contextWeatherCondition"
             renderType: Theme.textRender
-            width: parent.width; horizontalAlignment: Text.AlignHCenter
-            // Unavailable: said whole - the narrowest rail takes the shorter phrase rather than an ellipsis.
-            text: context.hasWeather ? context.conditionLabel : context.tight ? qsTr("No\nweather") : qsTr("Weather\nunavailable")
-            wrapMode: Text.WordWrap; maximumLineCount: context.hasWeather ? 2 : 3; elide: Text.ElideRight
+            visible: context.showCondition
+            // Unavailable: said whole, on one line.
+            text: context.hasWeather ? context.conditionLabel : qsTr("No\nweather").replace("\n", " ")
             color: context.stale ? Theme.textMuted : Theme.textLabel; font: Theme.caption
         }
     }
+    HoverTip { objectName: "contextTip"; text: context.Accessible.name }
 }

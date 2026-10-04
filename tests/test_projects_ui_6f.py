@@ -1,4 +1,6 @@
-"""V2 Projects Gate 6F, slice F1: read-only Bridge additions for the sidebar.
+"""V2 Projects Gate 6F: the left sidebar.
+
+Slice F1 - read-only Bridge additions for the sidebar:
 
 B1. Every item of ``scopeConversations`` carries ``updated_at`` - the store's
     own timestamp, unchanged in format - so the sidebar can group Bugün / Dün /
@@ -9,8 +11,16 @@ B2. Every item of ``projectRecords`` carries ``conversation_count`` and
     are: create, archive, unarchive, attach and permanent delete.
 
 Presentation only: extra keys on existing properties; the store is read, never
-written, and no property, slot or signal is new. No test performs a live model,
-auth or network call or opens the live DB.
+written, and no property, slot or signal is new.
+
+Slice F2a - the sidebar shell (L2, Q3-Q5, Q7, Q11; L5): one panel on the home
+page only, from the clock card's line to above the lower HUD; the 2x2 tiles
+and the clock strip at its foot, inside the window with no clipping and no
+overlap at 1100x700, 1280x760 and 1920x1080 in both themes; a hidden tile
+reflows the grid; the peek opens beside the sidebar level with its tile; the
+right column keeps its place.
+
+No test performs a live model, auth or network call or opens the live DB.
 """
 
 from __future__ import annotations
@@ -19,6 +29,9 @@ import contextlib
 import sqlite3
 import unittest
 from unittest import mock
+
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
 from jarvis.memory import SQLiteMemoryStore
@@ -161,6 +174,182 @@ class CountTests(SidebarDataCase):
         self.assertEqual(before, dump(self.database))
         from jarvis.memory import SCHEMA_VERSION
         self.assertEqual(10, SCHEMA_VERSION)
+
+
+
+SIZES = ((1100, 700), (1280, 760), (1920, 1080))
+TILES = ("Tasks", "Focus", "Plan", "Memory")
+
+
+class SidebarShellCase(ProjectsUiCase):
+    def box(self, root, name) -> QRectF:
+        return self.rect(self.item(root, name))
+
+    def inside(self, outer: QRectF, inner: QRectF, what: str) -> None:
+        self.assertGreaterEqual(inner.left(), outer.left() - 0.5, what)
+        self.assertGreaterEqual(inner.top(), outer.top() - 0.5, what)
+        self.assertLessEqual(inner.right(), outer.right() + 0.5, what)
+        self.assertLessEqual(inner.bottom(), outer.bottom() + 0.5, what)
+
+    def apart(self, a: QRectF, b: QRectF, what: str) -> None:
+        overlap = a.intersected(b)
+        self.assertFalse(overlap.width() > 0.5 and overlap.height() > 0.5, what)
+
+    def press(self, root, name) -> None:
+        item = self.item(root, name)
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
+        pump(350)
+
+
+class SidebarShellTests(SidebarShellCase):
+    def test_h_sidebar_tiles_and_strip_fit_at_every_size_in_both_themes(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for theme in ("space", "dark"):
+            bridge.setTheme(theme)
+            for width, height in SIZES:
+                root.resize(width, height); pump(700)
+                with self.subTest(theme=theme, size=(width, height)):
+                    window = QRectF(0, 0, width, height)
+                    side = self.box(root, "sidebar")
+                    self.inside(window, side, "sidebar")
+                    # Theme.sidebarWidth: 340 at 1920, 256 below.
+                    self.assertAlmostEqual(max(256, min(340, round(width * 0.1771))), side.width(), delta=0.5)
+                    for other in ("canonicalWorkspace", "canonicalComposer", "panelColumn"):
+                        self.apart(side, self.box(root, other), other)
+                    strip = self.box(root, "leftContextCard")
+                    self.inside(side, strip, "clock strip")
+                    tiles = [self.box(root, "rail" + key) for key in TILES]
+                    for key, tile in zip(TILES, tiles):
+                        self.inside(side, tile, key)
+                        self.assertLessEqual(tile.bottom(), strip.top(), key)
+                        # One line that never clips: each text inside its tile, the line not elided.
+                        for part in ("railTitle", "railCount", "railLine"):
+                            text = self.item(root, part + key)
+                            if not text.isVisible():
+                                continue
+                            pos = text.mapToItem(self.item(root, "rail" + key), QPointF(0, 0))
+                            self.assertGreaterEqual(pos.x(), 0, part + key)
+                            self.assertLessEqual(pos.x() + text.property("contentWidth"), tile.width() + 0.5, part + key)
+                            self.assertLessEqual(pos.y() + text.property("contentHeight"), tile.height() + 0.5, part + key)
+                            self.assertEqual(1, text.property("lineCount"), part + key)
+                        line = self.item(root, "railLine" + key)
+                        self.assertFalse(line.isVisible() and line.property("truncated"), key)   # a status tile's line gives way
+                        self.assertFalse(self.item(root, "railTitle" + key).property("truncated"), key)
+                    for i, a in enumerate(tiles):
+                        for b in tiles[i + 1:]:
+                            self.apart(a, b, "tiles")
+                    for part in ("contextClock", "contextDate", "contextTimeZone", "contextTemperature",
+                                 "contextWeatherCondition", "contextPlace"):
+                        text = self.item(root, part)
+                        if text.isVisible():
+                            ink = self.rect(text)
+                            ink.setWidth(text.property("contentWidth"))
+                            self.inside(strip, ink, part)
+                            self.assertEqual(1, text.property("lineCount"), part)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_i_home_only_from_the_clock_line_and_the_right_column_keeps_its_place(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        # The right column at c49e856 (L5): (x, y, width) per size.
+        column = {(1100, 700): (858, 150, 221), (1280, 760): (998, 150, 257), (1920, 1080): (1497, 205, 386)}
+        for width, height in SIZES:
+            root.resize(width, height); pump(700)
+            with self.subTest(size=(width, height)):
+                stack = self.box(root, "panelColumn")
+                self.assertEqual(column[(width, height)], (round(stack.x()), round(stack.y()), round(stack.width())))
+                side = self.box(root, "sidebar")
+                # Where the clock card started (Q7: the TopBar keeps its height); while the
+                # scope group takes its own row on a narrow window (until F4), below that row.
+                scope = self.box(root, "projectScope")
+                clock_line = max(84, round(height * 0.1980) + 76 - 12 - 144)
+                self.assertGreaterEqual(side.top(), clock_line - 0.5)
+                for name in ("brandWordmark", "brandTagline", "settingsOrb", "projectScope", "jarvisCore", "commandStrip"):
+                    self.apart(side, self.box(root, name), name)
+                if scope.top() < 40:                      # inline beside the wordmark: nothing below it
+                    self.assertAlmostEqual(clock_line, side.top(), delta=0.5)
+                self.assertAlmostEqual(height - 64, side.bottom(), delta=0.5)
+        # Home only (Q11): every other page keeps its own width.
+        for page in ("history", "projects", "tasks"):
+            bridge.setPage(page); pump(500)
+            self.assertFalse(self.item(root, "sidebar").isVisible(), page)
+        bridge.setPage("home"); pump(500)
+        self.assertTrue(self.item(root, "sidebar").isVisible())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_j_a_hidden_tile_reflows_the_grid_at_every_size(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in SIZES:
+            root.resize(width, height); pump(600)
+            tile, gap = (86, 8) if width >= 1600 else (74, 6)
+            with self.subTest(size=(width, height)):
+                nav_full = self.box(root, "sidebarNav").height()
+                self.assertAlmostEqual(2 * tile + gap, self.box(root, "summaryRail").height(), delta=0.5)
+                bridge.setCardVisible("rail", "plan", False); pump(300)      # 3: two, then one across
+                grid = self.box(root, "summaryRail")
+                self.assertAlmostEqual(grid.width(), self.box(root, "railMemory").width(), delta=0.5)
+                self.assertAlmostEqual(2 * tile + gap, grid.height(), delta=0.5)
+                bridge.setCardVisible("rail", "focus", False); pump(300)     # 2: one row
+                self.assertAlmostEqual(tile, self.box(root, "summaryRail").height(), delta=0.5)
+                self.assertAlmostEqual(self.box(root, "railTasks").top(), self.box(root, "railMemory").top(), delta=0.5)
+                self.assertGreater(self.box(root, "sidebarNav").height(), nav_full)   # the navigation takes the room
+                bridge.setCardVisible("rail", "tasks", False); pump(300)     # 1: across
+                self.assertAlmostEqual(self.box(root, "summaryRail").width(), self.box(root, "railMemory").width(), delta=0.5)
+                bridge.setCardVisible("rail", "memory", False); pump(300)    # none: no grid
+                self.assertFalse(self.item(root, "summaryRail").isVisible())
+                for key in ("tasks", "focus", "plan", "memory"):
+                    bridge.setCardVisible("rail", key, True)
+                pump(300)
+                self.assertEqual(TILES, tuple(c["id"].capitalize() for c in bridge.railCards if c["visible"] and c["id"] != "updates"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_k_the_peek_opens_beside_its_tile_inside_the_window(self) -> None:
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for width, height in SIZES:
+            root.resize(width, height); pump(600)
+            for key in ("Tasks", "Focus", "Plan"):
+                with self.subTest(size=(width, height), tile=key):
+                    self.press(root, "rail" + key)
+                    self.assertEqual((True, key), (root.property("peekOpen"), root.property("peekKey")))
+                    peek, side, tile = self.box(root, "summaryPeek"), self.box(root, "sidebar"), self.box(root, "rail" + key)
+                    self.inside(QRectF(0, 0, width, height), peek, "peek")
+                    self.assertAlmostEqual(side.right() + 12, peek.left(), delta=0.5)
+                    self.assertLessEqual(peek.top(), tile.center().y())
+                    self.assertGreaterEqual(peek.bottom(), tile.center().y())
+                    self.press(root, "rail" + key)
+                    self.assertFalse(root.property("peekOpen"))
+            # Memory is read, not pressed: no peek.
+            self.press(root, "railMemory")
+            self.assertFalse(root.property("peekOpen"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_l_edit_mode_keeps_a_left_section_for_the_four_tiles(self) -> None:
+        bridge = self.bridge()
+        bridge.setCardVisible("rail", "updates", True)        # a saved layout that shows Updates: still no tile (Q4)
+        root = self.window(bridge)
+        pump(500)
+        self.assertEqual([], self.all_items(root, "railUpdates"))
+        bridge.setEditMode(True); pump(300)
+        for key in TILES:
+            self.assertTrue(self.item(root, "railMenu" + key).isVisible(), key)
+            # The menu sits on the number's line: the title keeps its room.
+            self.assertFalse(self.item(root, "railTitle" + key).property("truncated"), key)
+        self.press(root, "railMenuFocus")
+        menus = self.item(root, "layoutMenus")
+        self.assertEqual(("card", "rail", "focus"), tuple(menus.property(k) for k in ("mode", "region", "card")))
+        self.press(root, "menuHide")
+        self.assertEqual([], [i for i in self.all_items(root, "railFocus") if i.isVisible()])
+        self.press(root, "layoutCards")
+        # Only the tiles are offered on the left; Updates is not one.
+        self.assertTrue(self.item(root, "addToLayout_focus").isVisible())
+        self.assertEqual([], self.all_items(root, "addToLayout_updates"))
+        self.press(root, "addToLayout_focus")
+        self.assertTrue(self.item(root, "railFocus").isVisible())
+        bridge.setEditMode(False); pump(300)
+        self.assertEqual(0, self.execute_calls())
 
 
 if __name__ == "__main__":  # pragma: no cover

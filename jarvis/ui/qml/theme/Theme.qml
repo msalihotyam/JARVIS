@@ -205,6 +205,8 @@ QtObject {
     // The rail shrinks before the work surface does, and never disappears.
     function px(v, lo, hi) { return Math.round(Math.max(lo, Math.min(hi, v))) }
     function railWidth(w) { return px(w * macroRail, 132, 300) }
+    // Gate 6F: the home sidebar (mockup: 340 at 1920, 256 below 1600).
+    function sidebarWidth(w) { return px(w * 0.1771, 256, 340) }
     function outerRight(w) { return px(w * (1 - macroStackRight), 18, 48) }
     function topZone(h) { return px(h * macroTopZone, 150, 240) }
     function centralBottom(h) { return px(h * (1 - macroCentralBottom), 30, 70) }

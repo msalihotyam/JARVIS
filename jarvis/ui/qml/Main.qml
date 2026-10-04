@@ -135,8 +135,8 @@ Window {
         // the Command preset keeps its own compact strip.
         height: root.presentation === "command" ? 110 : Theme.topZone(root.height)
         railWidth: Theme.railWidth(root.width)
+        sideRight: sidebar.visible ? sidebar.x + sidebar.width : 0
         viewportHeight: root.height
-        now: clock.now
         fullscreen: root.fullscreen
         settingsOpen: settings.open
         modelOpen: modelPanel.open
@@ -174,6 +174,9 @@ Window {
         Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
         readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
+        // Gate 6F: on home the work surface starts after the sidebar; the right
+        // column and every other page keep the rail line (L5, Q11).
+        readonly property real homeInset: command || !root.homePage ? 0 : sidebar.x + Theme.sidebarWidth(root.width) + columnGap - Theme.railWidth(root.width)
         readonly property int columnGap: command ? 16 : Theme.columnGap(root.width)
         // The conversation shell alone rises into the header environment;
         // the right stack and every other page keep the panel line.
@@ -182,8 +185,8 @@ Window {
         // Workspace: the page, with a restrained crossfade + slide on change.
         Item {
             id: workspace
-            anchors { left: parent.left; top: parent.top; bottom: parent.bottom; topMargin: -content.lift }
-            width: content.width - (content.showColumn ? content.columnWidth + content.columnGap : 0)
+            anchors { left: parent.left; top: parent.top; bottom: parent.bottom; topMargin: -content.lift; leftMargin: content.homeInset }
+            width: content.width - content.homeInset - (content.showColumn ? content.columnWidth + content.columnGap : 0)
             Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Loader {
                 id: pageLoader
@@ -219,7 +222,7 @@ Window {
         // Column width grip (Edit Mode): direct while dragging, snapped on release.
         Rectangle {
             visible: bridge.editMode && content.showColumn
-            x: workspace.width + content.columnGap / 2 - 3; width: 6; height: 60
+            x: workspace.x + workspace.width + content.columnGap / 2 - 3; width: 6; height: 60
             anchors.verticalCenter: parent.verticalCenter
             radius: 3; color: Theme.accent; opacity: widthGrip.pressed ? 1 : 0.6
             MouseArea {
@@ -320,29 +323,33 @@ Window {
     AttachmentPreview { id: attachmentPreview }
     Connections { target: bridge; function onPreviewRequested(file) { attachmentPreview.show(file) } }
 
-    // -- the left ambient rail's summary stack and its quick-look peek ------
-    // The rail sits under the date / time / context block, inside the Phase 1
-    // rail width, and above the peek's outside-click scrim so its cards can
-    // toggle and switch the peek; approval and confirmation still cover it.
+    // -- the home sidebar (Gate 6F) and its tiles' quick-look peek ------------
+    // One panel where the clock card and the summary rail were: it starts
+    // where the clock card started (the TopBar keeps its height) and ends
+    // above the lower HUD. It sits above the peek's outside-click scrim so its
+    // tiles can toggle and switch the peek; approval and confirmation still
+    // cover it. The peek opens beside the sidebar, level with its tile.
     SummaryPeek {
         id: peek
-        rail: summaryRail
-        anchorPoint: Qt.point(summaryRail.x + summaryRail.width + 12, summaryRail.y + peek.cardY - 8)
+        rail: sidebar.rail
+        anchorPoint: Qt.point(sidebar.x + sidebar.width + 12, sidebar.y + peek.cardY - 8)
     }
-    SummaryRail {
-        id: summaryRail
+    Sidebar {
+        id: sidebar
         z: 420
         visible: root.presentation !== "command" && root.homePage
         x: 10
-        y: Math.round(root.height * 0.1980) + 76
-        width: Theme.railWidth(root.width) - x - 10
+        // While the scope group still takes its own row (until F4), below it.
+        y: Math.max(84, Math.round(root.height * 0.1980) + 76 - 12 - 144, topBar.scopeBottom + 8)
+        width: Theme.sidebarWidth(root.width)
         height: root.height - y - 64
+        now: clock.now
         activeKey: peekSwitch.running ? peekSwitch.key : peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
         onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
     }
     // Edit Mode's popovers for both regions: over the rail, under approvals.
-    LayoutMenus { id: layoutMenus; z: 445; railShown: summaryRail.visible; commandMode: root.presentation === "command" }
+    LayoutMenus { id: layoutMenus; z: 445; railShown: sidebar.visible; commandMode: root.presentation === "command" }
     CommandPalette { id: palette; onLifecycleRequested: root.toggleLifecycle(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
     ConfirmDialog { id: confirm }
 

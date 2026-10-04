@@ -1555,10 +1555,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Görevler</translation>
     </message>
     <message>
-        <source>Updates</source>
-        <translation>Yenilikler</translation>
-    </message>
-    <message>
         <source>Focus</source>
         <translation>Odak</translation>
     </message>
@@ -1771,10 +1767,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>%1, %2, Yerel saat, %3. Hava durumu yok.</translation>
     </message>
     <message>
-        <source>Local</source>
-        <translation>Yerel</translation>
-    </message>
-    <message>
         <source>Local time</source>
         <translation>Yerel saat</translation>
     </message>
@@ -1785,12 +1777,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>As of %1</source>
         <translation>%1 itibarıyla</translation>
-    </message>
-    <message>
-        <source>Weather
-unavailable</source>
-        <translation>Hava durumu
-yok</translation>
     </message>
     <message>
         <source>No
@@ -3613,42 +3599,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Tam görevler sayfasına git</translation>
     </message>
     <message>
-        <source>Updates</source>
-        <translation>Yenilikler</translation>
-    </message>
-    <message>
-        <source>This interface session</source>
-        <translation>Bu arayüz oturumu</translation>
-    </message>
-    <message>
-        <source>Recent updates</source>
-        <translation>Son güncellemeler</translation>
-    </message>
-    <message>
-        <source>Need attention</source>
-        <translation>Dikkat bekleyen</translation>
-    </message>
-    <message>
-        <source>Attention</source>
-        <translation>Dikkat</translation>
-    </message>
-    <message>
-        <source>No updates in this session yet.</source>
-        <translation>Bu oturumda henüz güncelleme yok.</translation>
-    </message>
-    <message>
-        <source>Notes from JARVIS and the scheduler appear here.</source>
-        <translation>JARVIS&apos;ten ve zamanlayıcıdan notlar burada görünür.</translation>
-    </message>
-    <message>
-        <source>Open History</source>
-        <translation>Geçmişi aç</translation>
-    </message>
-    <message>
-        <source>This session&apos;s updates and durable sessions</source>
-        <translation>Bu oturumun güncellemeleri ve kalıcı oturumlar</translation>
-    </message>
-    <message>
         <source>Focus</source>
         <translation>Odak</translation>
     </message>
@@ -3776,34 +3726,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>İptal edildi</translation>
     </message>
     <message>
-        <source>System</source>
-        <translation>Sistem</translation>
-    </message>
-    <message>
-        <source>Scheduled</source>
-        <translation>Planlı</translation>
-    </message>
-    <message>
-        <source>Approval</source>
-        <translation>Onay</translation>
-    </message>
-    <message>
-        <source>Error</source>
-        <translation>Hata</translation>
-    </message>
-    <message>
-        <source>Outcome unknown</source>
-        <translation>Sonuç bilinmiyor</translation>
-    </message>
-    <message>
-        <source>Data</source>
-        <translation>Veri</translation>
-    </message>
-    <message>
-        <source>Update</source>
-        <translation>Güncelleme</translation>
-    </message>
-    <message>
         <source>1 session</source>
         <translation>1 oturum</translation>
     </message>
@@ -3826,30 +3748,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>%1 tasks</source>
         <translation>%1 görev</translation>
-    </message>
-    <message>
-        <source>Updates</source>
-        <translation>Yenilikler</translation>
-    </message>
-    <message>
-        <source>%1 recent</source>
-        <translation>%1 yeni</translation>
-    </message>
-    <message>
-        <source>1 needs attention</source>
-        <translation>1 dikkat bekliyor</translation>
-    </message>
-    <message>
-        <source>%1 need attention</source>
-        <translation>%1 dikkat bekliyor</translation>
-    </message>
-    <message>
-        <source>%1 to review</source>
-        <translation>%1 incelenecek</translation>
-    </message>
-    <message>
-        <source>All clear</source>
-        <translation>Her şey yolunda</translation>
     </message>
     <message>
         <source>Focus</source>
@@ -3876,24 +3774,12 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Henüz odak bağlamı yok</translation>
     </message>
     <message>
-        <source>No context</source>
-        <translation>Bağlam yok</translation>
-    </message>
-    <message>
         <source>No context yet</source>
         <translation>Henüz bağlam yok</translation>
     </message>
     <message>
         <source>Plan</source>
         <translation>Plan</translation>
-    </message>
-    <message>
-        <source>1 job</source>
-        <translation>1 iş</translation>
-    </message>
-    <message>
-        <source>%1 jobs</source>
-        <translation>%1 iş</translation>
     </message>
     <message>
         <source>%1 scheduled</source>
@@ -3908,16 +3794,8 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Etkin iş yok</translation>
     </message>
     <message>
-        <source>None enabled</source>
-        <translation>Etkin yok</translation>
-    </message>
-    <message>
         <source>Nothing scheduled</source>
         <translation>Planlanmış iş yok</translation>
-    </message>
-    <message>
-        <source>None yet</source>
-        <translation>Henüz yok</translation>
     </message>
     <message>
         <source>Memory</source>

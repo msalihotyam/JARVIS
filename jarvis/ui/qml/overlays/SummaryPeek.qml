@@ -3,7 +3,7 @@ import QtQuick.Shapes
 import "../theme"
 import "../components"
 
-// The quick-look panel a summary card opens, anchored to its right. It
+// The quick-look panel a summary tile opens, beside the sidebar. It
 // overlays the workspace without reflowing it, closes on X / Escape / an
 // outside click / the same card again, and switches in place when another
 // card is picked.
@@ -68,16 +68,6 @@ ContextPanel {
                      rows: rows, empty: qsTr("No tasks recorded yet."), emptyNote: qsTr("Ask JARVIS from the composer; tasks appear here."),
                      action: { label: qsTr("Open Tasks"), note: qsTr("Go to the full tasks page"), page: "tasks" } }
         }
-        case "Updates":
-            return { title: qsTr("Updates"), subtitle: qsTr("This interface session"), icon: "updates", tone: "#0f9e7e",
-                     metrics: [{ value: bridge.activity.length, label: qsTr("Recent updates"), tone: "#37c4f0" },
-                               { value: r.attention, label: qsTr("Need attention"), tone: r.attention > 0 ? Theme.danger : Theme.textLabel }],
-                     rows: bridge.activity.map(function(a) {
-                         return { title: a.text, sub: r.kindWord(a.kind) + " · " + a.time,
-                                  pill: r.isAlert(a.kind) ? qsTr("Attention") : "", meta: r.ago(a.ts),
-                                  dot: r.isAlert(a.kind) ? "alert" : a.kind === "scheduled" ? "live" : "quiet" } }),
-                     empty: qsTr("No updates in this session yet."), emptyNote: qsTr("Notes from JARVIS and the scheduler appear here."),
-                     action: { label: qsTr("Open History"), note: qsTr("This session's updates and durable sessions"), page: "history" } }
         case "Focus":
             return { title: qsTr("Focus"), subtitle: qsTr("Active projects in memory"), icon: "focus", tone: "#b7801e",
                      metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
