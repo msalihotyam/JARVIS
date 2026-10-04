@@ -27,15 +27,31 @@ Item {
 
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: Theme.alpha(Theme.glassEdge, 0.25) }
 
+    // The names' floor (G2: never under six painted characters), MEASURED as
+    // each name is laid out - a hidden Text in its own font and renderer (a
+    // TextMetrics gives design advances, narrower than the native rasterizer
+    // paints at caption size): seven characters and the ellipsis - one measured
+    // character of headroom, so a slightly wider face or rasterizer still
+    // paints six (and 1 px past it: an elide at exactly a string's advance
+    // keeps one character fewer). The chip's 32 % gives way to its floor first (the title has
+    // the room); only if the title would then go under its own floor does the
+    // ARCHIVED pill step down to a warning dot.
+    Text { id: nameSeven; visible: false; font: scopeName.font; textFormat: Text.PlainText; text: (header.owner.name || "").slice(0, 7) + "…" }
+    Text { id: titleSeven; visible: false; font: title.font; textFormat: Text.PlainText; text: title.text.slice(0, 7) + "…" }
+    readonly property real nameFloor: Math.min(scopeName.implicitWidth, Math.ceil(nameSeven.implicitWidth) + 1)
+    readonly property real titleFloor: Math.min(title.implicitWidth, Math.ceil(titleSeven.implicitWidth) + 1)
+    readonly property real chipMax: actions.x - 12 - titleFloor - 26
+
     // -- the scope chip -------------------------------------------------------
     Rectangle {
         id: chip
         objectName: "chatHeaderScope"
         readonly property string fullName: (header.owner.name || "") + (header.archived ? " · " + qsTr("archived") : "")
-        readonly property real lead: 10 + 18 + 6 + (header.archived ? archivedPill.width + 6 : 0)
+        readonly property bool pillFits: !header.archived || 34 + archivedPill.width + 6 + header.nameFloor + 12 <= header.chipMax
+        readonly property real lead: 10 + 18 + 6 + (header.archived ? (pillFits ? archivedPill.width + 6 : 12) : 0)
         readonly property real natural: lead + scopeName.implicitWidth + 12
         x: 0; anchors.verticalCenter: parent.verticalCenter
-        width: Math.min(natural, Math.round(header.width * 0.32))
+        width: Math.min(natural, Math.max(Math.round(header.width * 0.32), lead + header.nameFloor + 12))
         height: Theme.pillHeight; radius: height / 2
         color: Theme.alpha(header.tint, header.scopeMenu && (chipArea.containsMouse || scopeList.visible) ? 0.16 : 0.08)
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
@@ -50,8 +66,10 @@ Item {
             }
         }
         SummaryIcon { x: 10; anchors.verticalCenter: parent.verticalCenter; icon: header.owner.global ? "global" : "project"; tint: header.tint }
-        Pill { id: archivedPill; objectName: "chatHeaderScopeArchived"; visible: header.archived; dot: false; implicitHeight: 18
+        Pill { id: archivedPill; objectName: "chatHeaderScopeArchived"; visible: header.archived && chip.pillFits; dot: false; implicitHeight: 18
                x: 34; anchors.verticalCenter: parent.verticalCenter; text: qsTr("ARCHIVED"); tint: Theme.warning }
+        Rectangle { visible: header.archived && !chip.pillFits; x: 34; anchors.verticalCenter: parent.verticalCenter
+                    width: 6; height: 6; radius: 3; color: Theme.warning }
         Text {
             id: scopeName
             objectName: "chatHeaderScopeName"

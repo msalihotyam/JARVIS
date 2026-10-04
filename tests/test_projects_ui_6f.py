@@ -1656,5 +1656,49 @@ class SweepDefectTests(SweepCase):
         self.assertEqual(0, self.execute_calls())
 
 
+class NameFloorVarianceTests(SidebarNavCase):
+    """G2 under metric variance (CI run 37212140938 painted 5): the six-character floor of
+    the header's scope name and title and the sidebar's scope chip is measured as each
+    name is laid out, so it holds with other interface faces too - here the bundled
+    Inter, Manrope and Space Grotesk stand in for the wider metrics of another machine."""
+
+    def painted(self, text_item) -> int:
+        text = text_item.property("text")
+        shown = QFontMetricsF(text_item.property("font")).elidedText(text, Qt.TextElideMode.ElideRight, text_item.width())
+        return len(text) if shown == text else len(shown.rstrip("…"))
+
+    def test_ll_the_six_character_floor_holds_with_other_interface_faces(self) -> None:
+        from jarvis.ui import typography
+        base = typography.load_fonts()
+        for family in (base["chat"], base["placeholder"], base["display"]):            # Manrope, Inter, Space Grotesk
+            faces = {**base, "ui": family, "uiStrong": family, "uiStrongWeight": 600, "reading": family, "sans": family}
+            with self.subTest(face=family), mock.patch.object(typography, "_families", faces):
+                store = self.db()
+                thesis = store.create_project(f"Tez 2025 okuma ve yazım çalışması {family}")
+                archived = store.create_conversation(thesis.id, title="Okuma listesi taslağı ve kaynakça")
+                store.set_project_active(thesis.id, False)
+                longp = store.create_project(f"{LONG_PROJECT} {family}")
+                live = store.create_conversation(longp.id, title=LONG_TITLE)
+                bridge = self.bridge()
+                root = self.window(bridge)
+                self.assertEqual(family, self.item(root, "chatHeaderScopeName").property("font").family())
+                for language in ("en-US", "tr-TR"):
+                    if language == "tr-TR":
+                        bridge.setLanguage("tr-TR"); pump(300)
+                    for conversation in (archived, live):
+                        bridge.openConversation(conversation.id); bridge.setPage("home"); pump(300)
+                        for width, height in SIZES:
+                            root.resize(width, height); pump(400)
+                            self.steady(root, "chatHeader")
+                            for name in ("chatHeaderScopeName", "chatHeaderTitle", "sidebarScopeName"):
+                                text = self.item(root, name)
+                                self.assertGreaterEqual(self.painted(text), min(6, len(text.property("text"))),
+                                                        (family, language, name, (width, height), text.property("text")))
+                            # The pill stays (the chip's 32 % gave way to the floor, not the badge).
+                            self.assertEqual(conversation is archived, self.item(root, "chatHeaderScopeArchived").isVisible())
+                bridge.setLanguage("en-US"); pump(200)
+        self.assertEqual(0, self.execute_calls())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

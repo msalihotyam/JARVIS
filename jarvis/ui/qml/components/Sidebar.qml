@@ -380,18 +380,24 @@ Rectangle {
                 Text { id: conversationsLabel; x: 10; anchors.verticalCenter: parent.verticalCenter
                        width: Math.max(0, Math.min(implicitWidth, newConversation.x - 8 - 8 - x - scopeChip.floor))
                        elide: Text.ElideRight
-                       text: i18n.upper(qsTr("CONVERSATIONS")); color: Theme.textMuted; font: Theme.label }
+                       text: i18n.upper(qsTr("CONVERSATIONS")); color: Theme.textMuted; font: Theme.label
+                       HoverTip { objectName: "sidebarConversationsTip"; text: conversationsLabel.text; active: conversationsLabel.truncated } }
                 Rectangle {
                     id: scopeChip
                     objectName: "sidebarScopeChip"
                     readonly property bool archived: !!sidebar.owner.archived
                     readonly property color tint: archived ? Theme.warning : Theme.accent
-                    readonly property real floor: 16 + (archived ? 12 : 0) + Math.min(chipName.implicitWidth, Math.ceil(chipSix.advanceWidth) + 2)
+                    // G2, measured as the name is laid out (a hidden Text in its own
+                    // font and renderer, not TextMetrics' design advances): seven characters and the
+                    // ellipsis - one measured character of headroom, so a slightly
+                    // wider face or rasterizer still paints six (1 px past it: an
+                    // elide at exactly a string's advance keeps one character fewer).
+                    readonly property real floor: 16 + (archived ? 12 : 0) + Math.min(chipName.implicitWidth, Math.ceil(chipSeven.implicitWidth) + 1)
                     readonly property real room: Math.min(Math.max(parent.width * 0.55, floor), newConversation.x - 8 - x)
-                    // The ARŞİV pill when it fits beside six characters of the
+                    // The ARŞİV pill when it fits beside the floor of the
                     // name; else a warning dot (the tip and name say archived).
-                    TextMetrics { id: chipSix; font: Theme.caption; text: (sidebar.owner.name || "").slice(0, 6) + "…" }
-                    readonly property bool pillFits: archived && room >= archivedPill.width + 6 + chipSix.advanceWidth + 20
+                    Text { id: chipSeven; visible: false; font: chipName.font; textFormat: Text.PlainText; text: (sidebar.owner.name || "").slice(0, 7) + "…" }
+                    readonly property bool pillFits: archived && room >= archivedPill.width + 6 + Math.ceil(chipSeven.implicitWidth) + 17
                     readonly property real lead: archived ? (pillFits ? archivedPill.width + 6 : 12) : 0
                     readonly property string fullName: (sidebar.owner.name || "") + (archived ? " · " + qsTr("archived") : "")
                     x: conversationsLabel.x + conversationsLabel.width + 8; anchors.verticalCenter: parent.verticalCenter
