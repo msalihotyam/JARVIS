@@ -967,6 +967,15 @@ JARVIS deterministic Core authority/security modelinin yerine Hermes yaklaşım�
 - **Q1–Q4 ve Q7–Q9:** preflight'ın önerdiği gibi kabul edildi (Q1 başlıksız sohbet adı için ayrı "New Chat" kaynağı; Q2 canlı dil değişiminde Bridge etiketlerinin yenilenmesi, ayrı commit C7; Q3 etkinlik notlarında çoğul düzeltmesi ve tr "mesaj"; Q4 6A–6D yüzeylerinde "sohbet"; Q7 klavye yolu; Q8 tr efor etiketleri; Q9 History arşiv bölümü kapalı başlamaz).
 - **Dilimler:** C1 metin/çoğul/katalog, C2 token ve ortak parçalar, C3 üst çubuk kapsam grubu, C4 diyaloglar, C5 History + Projects listeleri, C6 model paneli, C7 canlı dil yenileme. Plan: `build/6e/PREFLIGHT.txt` (COMMIT SLICING).
 
+### Salih kararları — V2.0 Gate 6F sol kenar çubuğu (2026-10-04)
+- **L1:** üst çubuktaki kapsam grubu (proje seçici, sohbet değiştirici, "+ Yeni sohbet") kaldırılır. Üst çubukta logo + wordmark + slogan, çekirdek, model seçici, güç/dondur ve pencere düğmeleri kalır.
+- **L2:** sol sütun (SummaryRail kartları + saat kartı) tek bir kenar çubuğu olur, yukarıdan aşağı: "Genel" satırı (sohbet sayısı); PROJELER başlığı + küçük "+" (yeni proje), etkin projeler satır olarak (ad kısaltılır + ipucu, sayı rozeti; 1920'de ~5, 1100'de 3 satır, sonra kaydırma) ve "Arşivlenmiş projeler (n)"; ayraç; SOHBETLER başlığı + seçili kapsamın adı + küçük yuvarlak "+" (seçili kapsamda yeni sohbet; tam genişlikte satır yok); seçili kapsamın sohbetleri Bugün / Dün / Daha eski gruplarında, açık olan kenar işareti + dolguyla, başlıksız olan "Yeni Sohbet" sönük, ve "Arşiv (n)"; 2x2 küçük kart (Görevler, Odak, Plan, Hafıza; bugünkü kartlarla aynı veri ve tıklama hedefi, satır asla kesilmez); en altta ince saat şeridi (saat, tarih, saat dilimi/hava).
+- **L3:** sohbet alanına başlık satırı: kapsam çipi > sohbet adı; "Projeye bağla" düğmesi (yalnız Genel sohbetlerde); "…" menüsü = Yeniden adlandır / Arşivle / Kalıcı sil… (bugünkü değiştirici bağlam menüsüyle aynı eylemler ve diyaloglar). Kenar çubuğundaki sohbet satırına sağ tık aynı menüyü açar.
+- **L4:** davranış değişmez: proje seçmek 6B kuralını korur (en son arşivlenmemiş sohbeti, yoksa yeni sohbet); sohbet seçmek bugünkü değiştirici seçimidir; aynı bridge çağrıları ve diyaloglar; tek otorite Core; fare öncelikli (hiçbir özellik kısayola bağlı değil).
+- **L5:** değişmeyen yüzeyler: sağ sütun, History sayfası, Projects sayfası, diyaloglar, model paneli.
+- **Yerine geçtiği kararlar:** 6B/6D'nin üst çubuk yerleşimi (proje seçici + "+ Yeni sohbet" çekirdeğin solunda, 6D-a sohbet değiştirici) ve 6C'nin "giriş noktası yalnız üst çubuk seçici menüsü" kuralı; "Projeye bağla" girişi sohbet başlık satırına taşınır. 6B/6C/6D'nin davranış kuralları (seçimin sahibi değiştirmemesi, tek yönlü taşıma, önizleme + açık onay, arşiv/sil koşulları) aynen geçerlidir.
+- **Plan:** `build/6f/PREFLIGHT.txt` (açık sorular Salih'te; dilimler COMMIT SLICING).
+
 ---
 
 # 4. MASTER DESIGN PRINCIPLES — DEĞİŞMEMESİ GEREKENLER

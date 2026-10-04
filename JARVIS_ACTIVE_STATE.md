@@ -60,10 +60,11 @@ complete on main; nothing in flight. Installed: `1.0.0-8fbbaef` (predates
 
 ## Next action (in order)
 
-1. Gate 6E visual polish (6A–6D + model panel). 2. Full suite once on the
-release HEAD (`-Parallel` ok). 3. Back up `releases\1.0.0-4f5a93d` outside
-Apps, re-install (Salih's go). 4. Dogfood (D-2/D-3). 5. Rollback (D-4). 6.
-V2.0 close.
+1. Gate 6E visual polish (6A–6D + model panel). 2. Gate 6F left sidebar
+navigation (Salih 2026-10-04; plan `build/6f/PREFLIGHT.txt`). 3. Full suite
+once on the release HEAD (`-Parallel` ok). 4. Back up
+`releases\1.0.0-4f5a93d` outside Apps, re-install (Salih's go). 5. Dogfood
+(D-2/D-3). 6. Rollback (D-4). 7. V2.0 close.
 
 ## Rollback / safety anchors
 
