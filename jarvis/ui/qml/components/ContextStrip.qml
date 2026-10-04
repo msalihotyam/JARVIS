@@ -138,7 +138,7 @@ Item {
                                 onAboutToShow: attachable = bridge.clipboardAttachable()
                                 padding: 6
                                 // The same foreground material and row grammar as the edit menu.
-                                background: Rectangle { implicitWidth: 220; radius: 8; color: Theme.glassOverlay
+                                background: Rectangle { implicitWidth: 220; radius: 8; color: Theme.menuSurface
                                                         border.width: 1; border.color: Theme.glassOverlayEdge
                                                         Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 3; anchors.leftMargin: 1; anchors.rightMargin: -1
                                                                     anchors.bottomMargin: -3; radius: parent.radius + 1; color: "#000000"; opacity: 0.3 } }

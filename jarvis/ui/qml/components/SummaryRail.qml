@@ -231,6 +231,7 @@ Item {
                 SummaryIcon { anchors.centerIn: parent; icon: modelData.icon; tint: "#d8f0ff"; scale: (well.width - 7) / 18 }
             }
             Text {
+                id: titleText
                 objectName: "railTitle" + modelData.key
                 x: well.x + well.width + 7; anchors.verticalCenter: well.verticalCenter
                 width: card.width - x - card.inset
@@ -285,7 +286,14 @@ Item {
                 cursorShape: card.navigable ? Qt.PointingHandCursor : Qt.ArrowCursor
                 onClicked: card.activate()
             }
-            HoverTip { objectName: "railTip" + modelData.key; text: modelData.tip; active: !card.editing }
+            // G3: a tip only for text that is elided, and never while its peek is open. It sits beside
+            // the sidebar, level with its tile, so it never covers a neighbouring tile's title.
+            HoverTip {
+                objectName: "railTip" + modelData.key; text: modelData.tip
+                active: !card.editing && !card.active && (titleText.truncated || count.truncated || line.truncated)
+                offsetX: rail.width - card.x + (rail.parent && rail.parent.pad !== undefined ? rail.parent.pad : 10) + 6
+                offsetY: 0
+            }
             Rectangle { objectName: "railFocusRing" + modelData.key; visible: card.activeFocus; anchors.fill: parent; anchors.margins: 1
                         radius: card.radius - 1; color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
 

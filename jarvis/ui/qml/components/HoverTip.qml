@@ -17,6 +17,9 @@ Item {
     property Item target: parent
     property string text: ""
     property bool active: true
+    // Where the tip sits, from the target's top-left: by default just below it.
+    property real offsetX: 0
+    property real offsetY: height + 8
     readonly property bool shown: popup.visible
     anchors.fill: target
 
@@ -26,7 +29,7 @@ Item {
     ToolTip {
         id: popup
         objectName: "hoverTipPopup"
-        x: 0; y: tip.height + 8
+        x: tip.offsetX; y: tip.offsetY
         delay: Theme.tipDelay
         visible: hover.hovered && tip.active && tip.text !== ""
         leftPadding: 8; rightPadding: 8; topPadding: 4; bottomPadding: 4

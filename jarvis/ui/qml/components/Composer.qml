@@ -157,7 +157,7 @@ Item {
             objectName: "permissionModeMenu"
             y: -height - 8; x: 0
             width: 360; padding: 10
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
+            background: Rectangle { radius: 10; color: Theme.menuSurface; border.width: 1; border.color: Theme.glassOverlayEdge
                 // An open menu OWNS the wheel: the conversation behind it stays put.
                 WheelHandler { } }
             contentItem: Column {
@@ -212,7 +212,7 @@ Item {
             objectName: "attachMenu"
             y: -height - 8; x: 0
             width: 240; padding: 8
-            background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
+            background: Rectangle { radius: 10; color: Theme.menuSurface; border.width: 1; border.color: Theme.glassOverlayEdge
                 WheelHandler { } }
             contentItem: Column {
                 spacing: 2

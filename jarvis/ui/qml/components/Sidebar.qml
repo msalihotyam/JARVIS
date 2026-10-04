@@ -313,6 +313,21 @@ Rectangle {
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                 // Whole rows at rest.
                 onMovementEnded: contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height))
+                // The selected project's row stays in view (P3): on open, on a scope change, when the
+                // list or its room changes. Only those events move it - never the reader's own scrolling.
+                function keepSelected() {
+                    var at = -1
+                    for (var i = 0; i < sidebar.projects.length; ++i) if (sidebar.projects[i].id === sidebar.owner.id) at = i
+                    if (at < 0 || height <= 0) return
+                    var top = at * sidebar.step, bottom = top + sidebar.step - 2
+                    if (top < contentY) contentY = top
+                    else if (bottom > contentY + height) contentY = Math.min(Math.max(0, contentHeight - height), Math.max(0, (at + 1 - Math.round((height + 2) / sidebar.step)) * sidebar.step))
+                }
+                readonly property string selected: sidebar.owner.id || ""
+                onSelectedChanged: Qt.callLater(keepSelected)
+                onHeightChanged: Qt.callLater(keepSelected)
+                onContentHeightChanged: Qt.callLater(keepSelected)
+                Component.onCompleted: Qt.callLater(keepSelected)
                 Column {
                     id: projectColumn
                     width: projectList.width - (projectList.contentHeight > projectList.height ? 10 : 0); spacing: 2

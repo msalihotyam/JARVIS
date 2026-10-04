@@ -347,6 +347,9 @@ QtObject {
     // small dark shadow - so nothing behind it stays readable through it.
     readonly property color glassOverlay: ambient ? "#f2061424" : "#fa061424"
     readonly property color glassOverlayEdge: "#993d9be0"
+    // A MENU over content (Gate 6F F5, P2): the same navy, fully opaque - a
+    // 95 % body let the tile text behind it show through.
+    readonly property color menuSurface: Qt.rgba(0x06 / 255, 0x14 / 255, 0x24 / 255, 1)
     // A nested control inside a card: a small tonal step from its parent,
     // never another framed sheet.
     readonly property color glassNested: "#0aeaf4ff"

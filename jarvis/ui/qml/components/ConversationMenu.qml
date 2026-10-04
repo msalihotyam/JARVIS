@@ -58,7 +58,7 @@ Item {
         property real restY: 0
         y: restY
         padding: 8
-        background: Rectangle { radius: 10; color: Theme.glassOverlay; border.width: 1; border.color: Theme.glassOverlayEdge
+        background: Rectangle { radius: 10; color: Theme.menuSurface; border.width: 1; border.color: Theme.glassOverlayEdge
                                 WheelHandler { } }
         enter: Theme.ambient ? menuIn : null
         exit: Theme.ambient ? menuOut : null
@@ -136,7 +136,8 @@ Item {
             // Which conversation these act on.
             Text { objectName: "conversationContextHeader"; width: context.availableWidth; leftPadding: 12; rightPadding: 12
                    bottomPadding: 4; elide: Text.ElideRight; textFormat: Text.PlainText
-                   text: menu.shown; color: Theme.textMuted; font: Theme.caption }
+                   text: menu.shown; color: Theme.textMuted; font: Theme.caption
+                   HoverTip { objectName: "conversationContextHeaderTip"; text: parent.text; active: parent.truncated } }
             ScopeChoice { objectName: "conversationRenameItem"; width: context.availableWidth
                           label: qsTr("Rename"); available: menu.renameAllowed
                           onChosen: { menu.editId = menu.targetId; menu.editTitle = menu.rowId ? menu.rowTitle : bridge.conversationTitle

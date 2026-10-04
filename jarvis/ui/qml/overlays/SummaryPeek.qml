@@ -37,6 +37,11 @@ ContextPanel {
     readonly property var rows: spec ? spec.rows.slice(0, maxRows) : []
     readonly property int listHeight: rows.length ? rows.length * rowHeight : emptyHeight
 
+    // A memory project is listed by id; the window shows its name (ids stay internal).
+    function projectName(id) {
+        var hit = bridge.projectRecords.filter(function(p) { return p.id === id })[0]
+        return hit ? hit.name : id
+    }
     function shortDate(v) {
         if (!v) return ""
         var d = new Date(v)
@@ -72,9 +77,9 @@ ContextPanel {
             return { title: qsTr("Focus"), subtitle: qsTr("Active projects in memory"), icon: "focus", tone: "#b7801e",
                      metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
                                { value: bridge.memoryItems.length,
-                                 label: bridge.projects.length ? qsTr("Items in %1").arg(bridge.projects[0]) : qsTr("Memory items"), tone: Theme.textLabel }],
+                                 label: bridge.projects.length ? qsTr("Items in %1").arg(peek.projectName(bridge.projects[0])) : qsTr("Memory items"), tone: Theme.textLabel }],
                      rows: bridge.projects.map(function(p, i) {
-                         return { title: p, sub: i === 0 ? qsTr("%1 memory items").arg(bridge.memoryItems.length) : qsTr("Active project"),
+                         return { title: peek.projectName(p), sub: i === 0 ? qsTr("%1 memory items").arg(bridge.memoryItems.length) : qsTr("Active project"),
                                   pill: "", meta: "", dot: "live" } }),
                      empty: qsTr("No active focus context yet."), emptyNote: qsTr("Projects appear here once memory holds one."),
                      action: { label: qsTr("Open Memory"), note: qsTr("Projects and reference data"), page: "memory" } }
@@ -138,7 +143,8 @@ ContextPanel {
                         Row {
                             spacing: 7
                             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 7; height: 7; radius: 3.5; color: modelData.tone; opacity: 0.9 }
-                            Text { width: tile.width - 46; elide: Text.ElideRight; text: modelData.label; color: "#b3c7e0"; font: Theme.caption }
+                            Text { width: tile.width - 46; elide: Text.ElideRight; text: modelData.label; color: "#b3c7e0"; font: Theme.caption
+                                   HoverTip { text: parent.text; active: parent.truncated } }
                         }
                     }
                 }
@@ -173,8 +179,10 @@ ContextPanel {
                             x: 22; anchors.verticalCenter: parent.verticalCenter
                             width: parent.width - x - (pill.visible ? pill.width + 10 : 0) - (meta.visible ? meta.width + 12 : 0)
                             spacing: 2
-                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: "#eef6fc"; font: Theme.lead }
-                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.sub; color: Theme.textMuted; font: Theme.caption }
+                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.title; color: "#eef6fc"; font: Theme.lead
+                                   HoverTip { text: parent.text; active: parent.truncated } }
+                            Text { width: parent.width; elide: Text.ElideRight; text: modelData.sub; color: Theme.textMuted; font: Theme.caption
+                                   HoverTip { text: parent.text; active: parent.truncated } }
                         }
                         Rectangle {
                             id: pill
@@ -255,7 +263,8 @@ ContextPanel {
                 x: 48; anchors.verticalCenter: parent.verticalCenter; spacing: 1
                 width: parent.width - 48 - 36
                 Text { text: peek.spec ? peek.spec.action.label : ""; color: "#fafeff"; font: Theme.subtitle }
-                Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font: Theme.caption }
+                Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font: Theme.caption
+                       HoverTip { text: parent.text; active: parent.truncated } }
             }
             Text { anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
                    text: "›"; color: Theme.accent; font.pixelSize: 22 }
