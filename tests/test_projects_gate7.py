@@ -193,10 +193,8 @@ class ArchiveControlsTests(ProjectsUiCase):
         pump(300)
 
     def selector_labels(self, root) -> list[str]:
-        self.click(root, "projectSelector"); pump(200)
-        labels = sorted(i.property("label") for i in self.visible(root, "projectSelectorItem"))
-        self.click(root, "projectSelector"); pump(200)
-        return labels
+        """The projects a scope pick offers (Gate 6F: the sidebar's rows)."""
+        return sorted(i.property("title") for i in self.visible(root, "sidebarProject"))
 
     def test_a2_archive_and_unarchive_by_clicking(self) -> None:
         store = self.db()
@@ -225,7 +223,7 @@ class ArchiveControlsTests(ProjectsUiCase):
         self.assertTrue(bridge.conversationReadOnly)
         self.assertTrue(self.item(root, "readOnlyBanner").isVisible())
         self.assertFalse(self.item(root, "composerInput").isEnabled())
-        self.assertEqual("Evim · archived", self.item(root, "projectSelectorText").property("text"))
+        self.assertEqual("Evim · archived", self.item(root, "chatHeaderScope").property("fullName"))
         self.assertEqual([], self.selector_labels(root))
         bridge.submitText("zorla gönder"); pump(200)
         self.assertEqual([], self.model.calls)
@@ -272,11 +270,8 @@ class RestartTests(ProjectsUiCase):
         root = self.window(second)
         self.assertTrue(second.openProjectScope(project.id)); pump(300)
         self.assertEqual(conversation_id, second.conversationId)                          # the moved conversation
-        self.assertEqual("Evim", self.item(root, "projectSelectorText").property("text"))
-        self.click(root, "projectSelector"); pump(200)
-        self.assertEqual(["Evim"], [i.property("label") for i in self.all_items(root, "projectSelectorItem")
-                                     if i.isVisible()])
-        self.click(root, "projectSelector"); pump(200)
+        self.assertEqual("Evim", self.item(root, "chatHeaderScope").property("fullName"))
+        self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()])
         self.assertFalse(second.canAttach)                                                  # never moves again
         # The next run is P-scoped.
         second.submitText("Bu projeyi incele."); pump(100)

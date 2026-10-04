@@ -331,8 +331,8 @@ class MovedArchivedConversationTests(IntentTestCase):
 
 class AttachWindowTests(ProjectsUiCase):
     def open_dialog(self, root) -> None:
-        self.click(root, "projectSelector"); pump(200)
-        self.click(root, "projectSelectorAttach"); pump(300)
+        self.steady(root, "chatHeaderAttach")
+        self.click(root, "chatHeaderAttach"); pump(300)
 
     def choose(self, root, name: str) -> None:
         item = [i for i in self.all_items(root, "attachProject") if i.property("label") == name][0]
@@ -352,18 +352,15 @@ class AttachWindowTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertTrue(bridge.canAttach)
-        self.click(root, "projectSelector"); pump(200)
-        self.assertTrue(self.item(root, "projectSelectorAttach").isVisible())
-        self.click(root, "projectSelector"); pump(200)
+        self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())             # Global only (L3)
         bridge.openConversation(owned.id); pump(200)
         self.assertFalse(bridge.canAttach)
-        self.click(root, "projectSelector"); pump(200)
-        self.assertFalse(self.item(root, "projectSelectorAttach").isVisible())
-        self.click(root, "projectSelector"); pump(200)
+        self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
         bridge.openProjectScope(""); pump(200)
         store.archive_conversation(bridge.conversationId)
         bridge.refreshProjects(); pump(100)
         self.assertFalse(bridge.canAttach)
+        self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
 
     def test_e_preview_changed_refresh_and_confirm(self) -> None:
         store = self.db()
@@ -401,7 +398,7 @@ class AttachWindowTests(ProjectsUiCase):
         self.click(root, "attachConfirm")
         self.assertEqual(project.id, store.load_conversation(conversation_id).project_id)
         self.assertEqual((conversation_id, ""), (bridge.conversationId, bridge._session_id))   # fresh session next
-        self.assertEqual("Evim", self.item(root, "projectSelectorText").property("text"))
+        self.assertEqual("Evim", self.item(root, "chatHeaderScope").property("fullName"))
         self.assertNotIn(conversation_id, [row["id"] for row in bridge.conversations])      # left History
         self.assertFalse(bridge.canAttach)
         self.assertEqual(0, self.execute_calls())
@@ -471,7 +468,7 @@ class AttachCatalogTests(UiTestCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Projeye bağla", tx("AttachDialog", "Attach to project"))
-        self.assertEqual("Projeye bağla…", tx("TopBar", "Attach to a project…"))
+        self.assertEqual("Projeye bağla…", tx("ChatHeader", "Attach to a project…"))
 
 
 class PreviewResultTests(StoreCase):

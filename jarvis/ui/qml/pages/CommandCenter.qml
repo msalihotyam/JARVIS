@@ -16,6 +16,8 @@ Item {
     objectName: "canonicalWorkspace"
     property int lift: 37       // the material band: fully present at the panel line
     property int fade: 48       // where the text begins, below the band
+    property Item conversationMenu: null
+    property var attachDialog: null
     readonly property bool roomy: width >= 700
     readonly property bool empty: bridge.feed.length === 0 && !bridge.safety.cards
     // Primary content glass: the shell lets the space through in its unused
@@ -58,11 +60,17 @@ Item {
             color: "transparent"; border.width: 1; border.color: page.edge }
     }
 
-    // -- the stream, below the fade --------------------------------------------
+    // -- the chat header (Gate 6F, L3), then the stream, below the fade ---------
+    ChatHeader {
+        id: chatHeader
+        x: page.inset + (page.roomy ? 8 : 4); y: page.fade
+        width: page.width - 2 * x
+        conversationMenu: page.conversationMenu; attachDialog: page.attachDialog
+    }
     Item {
         id: flowArea
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: attention.top
-                  topMargin: page.fade; leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
+                  topMargin: page.fade + chatHeader.height + 8; leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
         FeedView {
             id: conversation
             objectName: "conversationFeed"

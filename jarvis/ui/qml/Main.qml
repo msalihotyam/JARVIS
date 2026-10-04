@@ -132,7 +132,6 @@ Window {
     TopBar {
         id: topBar
         controlLayer: topControls
-        conversationMenu: conversationMenu
         anchors { left: parent.left; right: parent.right; top: parent.top }
         // The identity / core zone owns a proportional share of the height;
         // the Command preset keeps its own compact strip.
@@ -211,8 +210,10 @@ Window {
             }
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
-        Component { id: canonicalPackage; CommandCenter { lift: content.lift; fade: Theme.shellFade(root.height) } }
+        Component { id: canonicalPackage; CommandCenter { lift: content.lift; fade: Theme.shellFade(root.height)
+                                                          conversationMenu: sharedConversationMenu; attachDialog: sharedAttachDialog } }
         Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false
+            conversationMenu: sharedConversationMenu; attachDialog: sharedAttachDialog
             onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("stack", card, anchor, canUp, canDown) }
             onCardsRequested: function(anchor) { layoutMenus.toggle("cards", anchor) }
             onResetRequested: function(anchor) { layoutMenus.toggle("reset", anchor) } } }
@@ -342,8 +343,7 @@ Window {
         z: 420
         visible: root.presentation !== "command" && root.homePage
         x: 10
-        // While the scope group still takes its own row (until F4), below it.
-        y: Math.max(84, Math.round(root.height * 0.1980) + 76 - 12 - 144, topBar.scopeBottom + 8)
+        y: Math.max(84, Math.round(root.height * 0.1980) + 76 - 12 - 144)
         width: Theme.sidebarWidth(root.width)
         height: root.height - y - 64
         now: clock.now
@@ -351,13 +351,15 @@ Window {
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
         onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
         onApprovalRequested: { root.closeContexts(); root.approvalRevealRequested() }
-        conversationMenu: conversationMenu
+        conversationMenu: sharedConversationMenu
         // Q9: the Projects page, its create field focused.
         onNewProjectRequested: { bridge.showProject(""); if (pageLoader.item && pageLoader.item.focusCreate) pageLoader.item.focusCreate() }
     }
-    // The one conversation menu (rename / archive / delete): the TopBar
-    // switcher opens it on the open conversation, a sidebar row on that row.
-    ConversationMenu { id: conversationMenu }
+    // The one conversation menu (rename / archive / delete): the chat
+    // header's "…" opens it on the open conversation, a sidebar row on that
+    // row. And the one "Projeye bağla" dialog (the chat header opens it).
+    ConversationMenu { id: sharedConversationMenu }
+    AttachDialog { id: sharedAttachDialog }
     // Edit Mode's popovers for both regions: over the rail, under approvals.
     LayoutMenus { id: layoutMenus; z: 445; railShown: sidebar.visible; commandMode: root.presentation === "command" }
     CommandPalette { id: palette; onLifecycleRequested: root.toggleLifecycle(); onSettingsRequested: root.toggleSettings(); onFocusComposer: {} }
@@ -418,7 +420,7 @@ Window {
     Shortcut { sequence: "Escape"; onActivated: {
         if (attachmentPreview.open) attachmentPreview.close()
         else if (palette.open) palette.hide()
-        else if (conversationMenu.open) conversationMenu.dismiss()
+        else if (sharedConversationMenu.open) sharedConversationMenu.dismiss()
         else if (confirm.open) confirm.open = false
         else if (resumeConfirm.open) resumeConfirm.open = false
         else if (settings.open) settings.open = false

@@ -4,13 +4,13 @@ import "../theme"
 
 // Gate 6F (F3, Q8): the conversation menu - rename (6D-a), archive and the
 // permanent delete (6D-b) - with its rename editor and the delete dialog,
-// moved unchanged out of the TopBar switcher. One menu, two openers: the open
-// conversation (the switcher until F4, then the chat header), or a sidebar
-// row, which it acts on WITHOUT opening it. Every item is disabled with its
+// moved unchanged out of the former TopBar switcher. One menu, two openers:
+// the chat header's "…" (the open conversation), or a sidebar row, which it
+// acts on WITHOUT opening it. Every item is disabled with its
 // reason (archived project or conversation, not archived yet, a busy run);
 // the store still refuses. Each acts on the conversation it was opened for.
 // It holds the scope menus' shared parts (a row, a reason, a divider, the
-// glass popup), which the TopBar's own menus use too.
+// glass popup), which the Command preset's scope menu uses too.
 Item {
     id: menu
     objectName: "conversationMenu"
@@ -106,13 +106,15 @@ Item {
     property string editOn: ""
 
     // Open the menu for `id` ("" or the open one's id = the open conversation),
-    // at `point` of `anchor`, kept inside the window (8 px clear of its edges).
-    function openFor(id, title, anchor, point) {
+    // at `point` of `anchor`, kept inside the window (8 px clear of its edges);
+    // its rename editor at `editPoint` of `editAnchor` when given, else there too.
+    function openFor(id, title, anchor, point, editAnchor, editPoint) {
         editor.close()
         rowId = id === bridge.conversationId ? "" : (id || "")
         rowTitle = title || ""
         var p = anchor.mapToItem(menu, point.x, point.y)
-        place(context, p); place(editor, p)
+        place(context, p)
+        place(editor, editAnchor ? editAnchor.mapToItem(menu, editPoint.x, editPoint.y) : p)
         context.open()
     }
     function place(popup, p) {

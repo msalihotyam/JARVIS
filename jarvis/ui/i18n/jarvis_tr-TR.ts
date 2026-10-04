@@ -829,6 +829,45 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
 </context>
 <context>
+    <name>ChatHeader</name>
+    <message>
+        <source>archived</source>
+        <translation>arşivlendi</translation>
+    </message>
+    <message>
+        <source>ARCHIVED</source>
+        <translation>ARŞİV</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Attach to a project…</source>
+        <translation>Projeye bağla…</translation>
+    </message>
+    <message>
+        <source>Conversation actions</source>
+        <translation>Sohbet işlemleri</translation>
+    </message>
+    <message>
+        <source>PROJECTS</source>
+        <translation>PROJELER</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>All projects</source>
+        <translation>Tüm projeler</translation>
+    </message>
+    <message>
+        <source>CONVERSATIONS</source>
+        <translation>SOHBETLER</translation>
+    </message>
+</context>
+<context>
     <name>CommandCenter</name>
     <message>
         <source>Good morning, %1.</source>
@@ -4077,50 +4116,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>THINKS AHEAD FOR YOU</source>
         <translation>SİZİN İÇİN ÖNCEDEN DÜŞÜNÜR</translation>
-    </message>
-    <message>
-        <source>archived</source>
-        <translation>arşivlendi</translation>
-    </message>
-    <message>
-        <source>The project is archived: unarchive it to start a new conversation.</source>
-        <translation>Proje arşivlendi: yeni sohbet başlatmak için arşivden çıkarın.</translation>
-    </message>
-    <message>
-        <source>Wait for the current run to finish.</source>
-        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
-    </message>
-    <message>
-        <source>New Chat</source>
-        <translation>Yeni Sohbet</translation>
-    </message>
-    <message>
-        <source>+ New conversation</source>
-        <translation>+ Yeni sohbet</translation>
-    </message>
-    <message>
-        <source>CONVERSATIONS</source>
-        <translation>SOHBETLER</translation>
-    </message>
-    <message>
-        <source>ARCHIVED</source>
-        <translation>ARŞİV</translation>
-    </message>
-    <message>
-        <source>PROJECTS</source>
-        <translation>PROJELER</translation>
-    </message>
-    <message>
-        <source>Global</source>
-        <translation>Genel</translation>
-    </message>
-    <message>
-        <source>Attach to a project…</source>
-        <translation>Projeye bağla…</translation>
-    </message>
-    <message>
-        <source>All projects</source>
-        <translation>Tüm projeler</translation>
     </message>
     <message>
         <source>Pending</source>

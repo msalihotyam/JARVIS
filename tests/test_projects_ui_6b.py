@@ -242,8 +242,15 @@ class FileTests(ProjectsUiCase):
 
 
 class SelectorTests(ProjectsUiCase):
+    # Gate 6F: the selector's picks are the sidebar's rows (L4: the same calls).
     def menu_labels(self, root) -> list[str]:
-        return [item.property("label") for item in self.all_items(root, "projectSelectorItem") if item.isVisible()]
+        return [item.property("title") for item in self.all_items(root, "sidebarProject") if item.isVisible()]
+
+    def row(self, root, title):
+        return [i for i in self.all_items(root, "sidebarProject") if i.isVisible() and i.property("title") == title][0]
+
+    def owner(self, root) -> str:
+        return self.item(root, "chatHeaderScope").property("fullName")
 
     def test_c_selector_names_the_owner_and_lists_active_projects(self) -> None:
         store = self.db()
@@ -252,14 +259,14 @@ class SelectorTests(ProjectsUiCase):
         owned = store.create_conversation(home.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual("Global", self.item(root, "projectSelectorText").property("text"))
+        self.assertEqual("Global", self.owner(root))
         bridge.openConversation(owned.id); pump(300)
-        self.assertEqual("Evim", self.item(root, "projectSelectorText").property("text"))
-        self.click(root, "projectSelector"); pump(200)
+        self.assertEqual("Evim", self.owner(root))
         self.assertEqual(["Evim", "Tez"], sorted(self.menu_labels(root)))       # no archived project
-        self.assertTrue(self.item(root, "projectSelectorGlobal").isVisible())
-        self.assertTrue(self.item(root, "projectSelectorAll").isVisible())
-        self.click(root, "projectSelectorAll"); pump(300)
+        self.assertTrue(self.item(root, "sidebarGlobal").isVisible())
+        self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())     # "All projects" (Q10)
+        self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
+        self.click(root, "sidebarProjectsLink"); pump(300)
         self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
         self.assertIsNotNone(thesis)
 
@@ -272,17 +279,14 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         global_open = bridge.conversationId
-        self.click(root, "projectSelector"); pump(200)
-        target = [i for i in self.all_items(root, "projectSelectorItem") if i.property("label") == "Evim"][0]
-        self.click_item(root, target)
+        self.click_item(root, self.row(root, "Evim"))
         self.assertEqual(older.id, bridge.conversationId)                   # archived newest skipped
         self.assertEqual("home", bridge.page)
         before = len(store.list_conversations(project_id=thesis.id))
         self.assertTrue(bridge.openProjectScope(thesis.id)); pump(200)
         self.assertEqual(before + 1, len(store.list_conversations(project_id=thesis.id)))
         self.assertEqual(thesis.id, store.load_conversation(bridge.conversationId).project_id)
-        self.click(root, "projectSelector"); pump(200)
-        self.click(root, "projectSelectorGlobal"); pump(200)
+        self.click(root, "sidebarGlobal"); pump(200)
         self.assertEqual(global_open, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # An archived or unknown project is never opened through the selector.
@@ -309,52 +313,26 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.openConversation(owned.id); pump(200)
-        self.click(root, "newConversationButton")
+        self.click(root, "sidebarNewConversation")
         self.assertNotEqual(owned.id, bridge.conversationId)
         self.assertEqual(home.id, store.load_conversation(bridge.conversationId).project_id)
         self.assertTrue(bridge.openProjectScope("")); pump(200)
         before = bridge.conversationId
-        self.click(root, "newConversationButton")
+        self.click(root, "sidebarNewConversation")
         self.assertNotEqual(before, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # Archived owner: disabled with its reason; nothing is created.
         bridge.openConversation(owned.id); pump(200)
         store.set_project_active(home.id, False)
         bridge.refreshProjects(); pump(200)
-        button = self.item(root, "newConversationButton")
+        button = self.item(root, "sidebarNewConversation")
         self.assertFalse(button.property("allowed"))
-        self.assertIn("archived", button.property("reason"))
+        self.assertIn("archived", button.property("tip"))                      # its reason
         count = len(store.list_conversations(include_archived=True))
-        self.click(root, "newConversationButton")
+        self.click(root, "sidebarNewConversation")
         self.assertFalse(bridge.newConversationInScope())
         self.assertEqual((owned.id, count), (bridge.conversationId, len(store.list_conversations(include_archived=True))))
-        self.assertEqual("Evim · archived", self.item(root, "projectSelectorText").property("text"))
-
-    def test_c_selector_and_button_never_overlap_the_top_bar(self) -> None:
-        store = self.db()
-        project = store.create_project("A rather long project name that has to elide somewhere")
-        owned = store.create_conversation(project.id)
-        bridge = self.bridge()
-        root = self.window(bridge)
-        bridge.openConversation(owned.id)
-        others = ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip",
-                  "leftContextCard", "coreStatusGroup")
-        for theme in ("space", "command"):
-            bridge.setTheme(theme); pump(400)
-            for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
-                with self.subTest(theme=theme, size=(width, height)):
-                    root.resize(width, height); pump(500)
-                    selector = self.rect(self.item(root, "projectSelector"))
-                    button = self.rect(self.item(root, "newConversationButton"))
-                    self.assertTrue(self.item(root, "projectSelector").isVisible())
-                    self.assertTrue(self.item(root, "newConversationButton").isVisible())
-                    self.assertFalse(selector.intersects(button))
-                    for mine in (selector, button):
-                        for name in others:
-                            for other in self.all_items(root, name):
-                                if other.isVisible() and other.width() > 0:
-                                    self.assertFalse(mine.intersects(self.rect(other)), name)
-
+        self.assertEqual("Evim · archived", self.owner(root))
 
 class AuthorityTests(ProjectsUiCase):
     def test_d_the_selected_project_changes_no_approval_decision(self) -> None:
@@ -380,6 +358,6 @@ class CatalogTests(UiTestCase):
         from jarvis.ui.i18n import localization, tx
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual("Tüm projeler", tx("TopBar", "All projects"))
-        self.assertEqual("+ Yeni sohbet", tx("TopBar", "+ New conversation"))
+        self.assertEqual("Tüm projeler", tx("Sidebar", "All projects"))
+        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
         self.assertEqual("Kalıcı sil", tx("ProjectsPage", "Purge"))

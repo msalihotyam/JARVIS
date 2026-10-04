@@ -483,9 +483,9 @@ class WindowCase(ProjectsUiCase):
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
     def context(self, root) -> None:
-        """Right-click the switcher (it lives on the home page)."""
+        """The open conversation's menu: the chat header's "…" (on the home page)."""
         self.home.setPage("home"); pump(300)
-        self.press(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        self.press(root, self.item(root, "chatHeaderMenu"))
 
     def window(self, bridge):
         self.home = bridge
@@ -606,7 +606,7 @@ class ArchivedSectionTests(WindowCase):
                                                     bridge.conversationTitle))
         bridge.setPage("home"); pump(300)
         self.assertIn("this conversation is archived", self.item(root, "readOnlyReason").property("text"))
-        self.assertTrue(self.item(root, "newConversationButton").property("allowed"))    # a Global one may still start
+        self.assertTrue(self.item(root, "sidebarNewConversation").property("allowed"))   # a Global one may still start
         # Unarchive from History: back in the lists, writable again.
         bridge.setPage("history"); pump(300)
         self.press(root, self.visible(root, "historyUnarchive")[0])

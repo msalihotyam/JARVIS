@@ -40,7 +40,7 @@ from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F40
 from tests.test_ui import _APP, UiTestCase, pump
 
 SURFACES = ("TopBar", "HistoryPage", "ProjectsPage", "AttachDialog", "ConversationDeleteDialog", "Composer",
-            "CommandPalette", "Bridge", "Sidebar", "ConversationMenu")
+            "CommandPalette", "Bridge", "Sidebar", "ConversationMenu", "ChatHeader")
 
 
 def say(memory, conversation_id: str, text: str) -> None:
@@ -123,8 +123,9 @@ class CountTests(WindowCase):
         self.attach_identity_is(root, '"Yeni Sohbet" · 3 mesaj · oluşturuldu ')
 
     def attach_identity_is(self, root, prefix: str) -> None:
-        self.click(root, "projectSelector"); pump(200)
-        self.click(root, "projectSelectorAttach"); pump(300)
+        pump(200)                                       # the previous dialog's exit motion ends first
+        self.steady(root, "chatHeaderAttach")
+        self.click(root, "chatHeaderAttach"); pump(300)
         item = [i for i in self.all_items(root, "attachProject") if i.property("label") == "Evim"][0]
         self.press(root, item)
         identity = self.item(root, "attachIdentity").property("text")
@@ -191,19 +192,25 @@ class UntitledNameTests(WindowCase):
             return [r["title"] for r in (*bridge.archivedConversations, *bridge.projectConversations,
                                          *bridge.projectArchivedConversations)]
         self.assertEqual(["New Chat"] * 3, names())
-        self.assertEqual("New Chat", self.item(root, "conversationSwitcherText").property("text"))
+        bridge.setPage("home"); pump(300)                                      # the header and sidebar live on home
+        self.assertEqual("New Chat", self.item(root, "chatHeaderTitle").property("text"))
+        self.assertEqual("New Chat", self.open_row(root).property("title"))
         self.tr(bridge)
         self.assertEqual(["Yeni Sohbet"] * 3, names())
         bridge.setPage("home"); pump(300)
-        self.assertEqual("Yeni Sohbet", self.item(root, "conversationSwitcherText").property("text"))
+        self.assertEqual("Yeni Sohbet", self.item(root, "chatHeaderTitle").property("text"))
+        self.assertEqual("Yeni Sohbet", self.open_row(root).property("title"))
         self.assertEqual(inside.id, bridge.projectConversations[0]["id"])
         self.assertEqual("Yeni Sohbet", tx("AttachDialog", "New Chat"))
         self.assertEqual("Yeni Sohbet", tx("ConversationDeleteDialog", "New Chat"))
 
+    def open_row(self, root):
+        return [i for i in self.all_items(root, "sidebarConversation") if i.isVisible() and i.property("current")][0]
+
     def test_g_the_actions_stay_sentence_case(self) -> None:
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual("+ Yeni sohbet", tx("TopBar", "+ New conversation"))
+        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
         self.assertEqual("Yeni sohbet", tx("HistoryPage", "New conversation"))
         self.assertEqual("Yeni sohbet", tx("CommandPalette", "New conversation"))
         self.assertEqual("Evim içinde yeni sohbet", tx("ProjectsPage", "New conversation in %1").replace("%1", "Evim"))
@@ -237,7 +244,7 @@ class CatalogTests(UiTestCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("SOHBETLER", tx("HistoryPage", "CONVERSATIONS"))
         self.assertEqual("SOHBETLER", tx("ProjectsPage", "CONVERSATIONS"))
-        self.assertEqual("SOHBETLER", tx("TopBar", "CONVERSATIONS"))
+        self.assertEqual("SOHBETLER", tx("Sidebar", "CONVERSATIONS"))
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", tx("ProjectsPage", "ARCHIVED CONVERSATIONS"))
         self.assertEqual("ARŞİVLENMİŞ PROJELER", tx("ProjectsPage", "ARCHIVED PROJECTS"))
         self.assertEqual("Bu projede henüz sohbet yok.", tx("ProjectsPage", "No conversation in this project yet."))
@@ -260,6 +267,14 @@ COMPONENTS = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "co
 LONG_NAME = ("Kat malikleri toplantısı için hazırlanacak belgeler, aidat hesapları, tadilat izinleri ve "
              "yönetim planı özeti")                                              # 109 characters
 SIZES = ((1100, 700), (1280, 760), (1920, 1080))
+
+
+def attach_dialog(root):
+    """The "Projeye bağla" dialog, by its type: the composer's file picker has
+    the objectName "attachDialog" too (Gate 6F: the lookup is unambiguous)."""
+    found = [d for d in root.findChildren(QObject, "attachDialog") if d.metaObject().className().startswith("AttachDialog")]
+    assert len(found) == 1, [d.metaObject().className() for d in root.findChildren(QObject, "attachDialog")]
+    return found[0]
 # Built in the real window's engine (its Theme, i18n and imports); no surface
 # adopts these parts before C3-C5, so they are exercised here on their own.
 HARNESS = """
@@ -573,55 +588,23 @@ class ScopeLayoutTests(ScopeGroupCase):
                 for width, height in SIZES:
                     with self.subTest(language=language, owner=key, size=(width, height)):
                         root.resize(width, height); pump(400)
-                        name, title = self.item(root, "projectSelectorName"), self.item(root, "conversationSwitcherText")
-                        for text_item in (name, title):
+                        name, title = self.item(root, "chatHeaderScopeName"), self.item(root, "chatHeaderTitle")
+                        side = self.item(root, "sidebarScopeName")
+                        for text_item in (name, title, side):
                             self.assertGreaterEqual(self.painted(text_item), min(6, len(text_item.property("text"))),
                                                     text_item.property("text"))
-                        badge = self.item(root, "projectSelectorArchived")
+                        badge = self.item(root, "chatHeaderScopeArchived")
                         self.assertEqual(key == "thesis", badge.isVisible())
+                        suffix = " · " + ("archived" if language == "en-US" else "arşivlendi")
                         if key == "thesis":
-                            self.assertEqual({"en-US": "ARCHIVED", "tr-TR": "ARŞİV"}[language],
-                                             badge.childItems()[0].property("text"))
-                            self.assertEqual(name.property("text") + " · " + ("archived" if language == "en-US" else "arşivlendi"),
-                                             self.item(root, "projectSelectorTip").property("text"))
+                            self.assertEqual({"en-US": "ARCHIVED", "tr-TR": "ARŞİV"}[language], badge.property("text"))
+                            self.assertEqual(name.property("text") + suffix, self.item(root, "chatHeaderScopeTip").property("text"))
+                            self.assertEqual(side.property("text") + suffix, self.item(root, "sidebarScopeTip").property("text"))
                         else:
-                            self.assertEqual(name.property("text"), self.item(root, "projectSelectorTip").property("text"))
-                            # The room the spec promises before any floor is used.
-                            selector, switcher = self.item(root, "projectSelector"), self.item(root, "conversationSwitcher")
-                            group = self.item(root, "projectScope")
-                            self.assertGreaterEqual(selector.width(), min(group.property("selNat"), 110))
-                            self.assertGreaterEqual(switcher.width(), min(group.property("swNat"), 140))
-                        tip = self.item(root, "conversationSwitcherTipText")
+                            self.assertEqual(name.property("text"), self.item(root, "chatHeaderScopeTip").property("text"))
+                            self.assertEqual(side.property("text"), self.item(root, "sidebarScopeTip").property("text"))
+                        tip = self.item(root, "chatHeaderTitleTip")
                         self.assertEqual(bridge.conversationTitle, tip.property("text"))           # the whole title
-
-    def test_t_the_scope_group_never_overlaps_the_bar(self) -> None:
-        self.seed()
-        bridge = self.bridge()
-        root = self.window(bridge)
-        for theme in ("space", "command"):
-            bridge.setTheme(theme); pump(400)
-            for key in ("long", "thesis"):
-                self.home(bridge, key)
-                for width, height in SIZES:
-                    with self.subTest(theme=theme, owner=key, size=(width, height)):
-                        root.resize(width, height); pump(500)
-                        group = self.item(root, "projectScope")
-                        rects = [self.rect(self.item(root, n)) for n in
-                                 ("projectSelector", "conversationSwitcher", "newConversationButton")]
-                        for left, right in zip(rects, rects[1:]):
-                            self.assertLessEqual(left.right(), right.left())
-                        self.assertTrue(QRectF(0, 0, width, height).contains(self.rect(group)))
-                        for mine in rects:
-                            for name in OTHERS:
-                                for other in self.all_items(root, name):
-                                    if other.isVisible() and other.width() > 0:
-                                        self.assertFalse(mine.intersects(self.rect(other)), name)
-                        # The header progress (shown only during a run) starts after
-                        # the scope row or is below its own 240 px threshold.
-                        hud = self.item(root, "hudProgress")
-                        band = QRectF(hud.mapToScene(QPointF(0, 0)), hud.size())
-                        if hud.width() >= 240:
-                            self.assertFalse(band.intersects(self.rect(group)))
 
 
 class ScopeKeyboardTests(ScopeGroupCase):
@@ -630,38 +613,46 @@ class ScopeKeyboardTests(ScopeGroupCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.home(bridge, "long")
-        names = ("projectSelector", "conversationSwitcher", "newConversationButton")
+        # Gate 6F: the scope picks are the sidebar's rows and its "+" (the pills left the bar).
+        rings = {"sidebarGlobal": "sidebarRowFocusRing", "sidebarProject": "sidebarRowFocusRing",
+                 "sidebarNewConversation": "sidebarPlusFocusRing", "sidebarConversation": "sidebarRowFocusRing",
+                 "chatHeaderMenu": None}
         reached = set()
-        # The window's Tab chain (unchanged): ... window controls, the scope
-        # pills, the orb, the rail ... (the composer keeps Tab for itself).
-        self.item(root, "windowCloseControl").forceActiveFocus(); pump(30)
-        for _ in range(6):
-            QTest.keyClick(root, Qt.Key_Tab); pump(20)
+        self.item(root, "sidebarGlobal").forceActiveFocus(); pump(30)
+        for _ in range(16):
             focused = root.activeFocusItem()
-            if focused is not None and focused.objectName() in names:
+            if focused is not None and focused.objectName() in rings:
                 reached.add(focused.objectName())
-                ring = [c for c in focused.childItems() if c.objectName() == "scopePillFocusRing"][0]
-                self.assertTrue(ring.isVisible(), focused.objectName())
-        self.assertEqual(set(names), reached)
+                if rings[focused.objectName()]:
+                    ring = [c for c in focused.childItems() if c.objectName() == rings[focused.objectName()]][0]
+                    self.assertTrue(ring.isVisible(), focused.objectName())
+            QTest.keyClick(root, Qt.Key_Tab); pump(20)
+        self.assertLessEqual({"sidebarGlobal", "sidebarProject", "sidebarNewConversation", "sidebarConversation"}, reached)
         menu = lambda name: root.findChild(QObject, name)  # noqa: E731
-        selector, switcher = self.item(root, "projectSelector"), self.item(root, "conversationSwitcher")
-        for key in (Qt.Key_Return, Qt.Key_Space, Qt.Key_Down):
-            selector.forceActiveFocus(); QTest.keyClick(root, key); pump(300)
-            self.assertTrue(menu("projectSelectorMenu").property("visible"), key)
-            QTest.keyClick(root, Qt.Key_Escape); pump(300)
-            self.assertFalse(menu("projectSelectorMenu").property("visible"))
-            switcher.forceActiveFocus(); QTest.keyClick(root, key); pump(300)
-            self.assertTrue(menu("conversationSwitcherMenu").property("visible"), key)
-            QTest.keyClick(root, Qt.Key_Escape); pump(300)
+        # Return / Space on a scope row: the 6B pick.
+        for key in (Qt.Key_Return, Qt.Key_Space):
+            self.item(root, "sidebarGlobal").forceActiveFocus(); QTest.keyClick(root, key); pump(300)
+            self.assertTrue(bridge.conversationProject["global"], key)
+            row = [i for i in self.visible(root, "sidebarProject") if i.property("title") == LONG_PROJECT][0]
+            row.forceActiveFocus(); QTest.keyClick(root, key); pump(300)
+            self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"], key)
+        # Menu / Shift+F10 on a row, and Return / Space on "…": the conversation menu.
         for key, modifier in ((Qt.Key_Menu, Qt.NoModifier), (Qt.Key_F10, Qt.ShiftModifier)):
-            switcher.forceActiveFocus(); QTest.keyClick(root, key, modifier); pump(300)
+            row = [i for i in self.visible(root, "sidebarConversation") if i.property("current")][0]
+            row.forceActiveFocus(); QTest.keyClick(root, key, modifier); pump(300)
+            self.assertTrue(menu("conversationSwitcherContext").property("visible"), key)
+            self.assertEqual(LONG_NAME, self.item(root, "conversationContextHeader").property("text"))
+            QTest.keyClick(root, Qt.Key_Escape); pump(300)
+            self.assertFalse(menu("conversationSwitcherContext").property("visible"))
+        for key in (Qt.Key_Return, Qt.Key_Space):
+            self.item(root, "chatHeaderMenu").forceActiveFocus(); QTest.keyClick(root, key); pump(300)
             self.assertTrue(menu("conversationSwitcherContext").property("visible"), key)
             self.assertEqual(LONG_NAME, self.item(root, "conversationContextHeader").property("text"))
             QTest.keyClick(root, Qt.Key_Escape); pump(300)
             self.assertFalse(menu("conversationSwitcherContext").property("visible"))
         # Return on "+" does what its click does: a new conversation in this scope.
         before = bridge.conversationId
-        self.item(root, "newConversationButton").forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(400)
+        self.item(root, "sidebarNewConversation").forceActiveFocus(); QTest.keyClick(root, Qt.Key_Return); pump(400)
         self.assertNotEqual(before, bridge.conversationId)
         self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"])
         self.assertEqual(0, self.execute_calls())
@@ -673,10 +664,10 @@ class ScopeStateTests(ScopeGroupCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.home(bridge, "thesis")
-        button = self.item(root, "newConversationButton")
+        button = self.item(root, "sidebarNewConversation")
         self.assertLess(button.opacity(), 1.0)                                    # dimmed: not allowed here
         QTest.mouseMove(root, button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint())
-        tip = self.item(root, "newConversationTip")
+        tip = [c for c in button.childItems() if c.objectName() == "sidebarPlusTip"][0]
         settle(lambda: tip.property("shown"))
         text = [t for t in self.visible(root, "hoverTipText")
                 if t.property("text").startswith("The project is archived")][0]
@@ -689,28 +680,12 @@ class ScopeStateTests(ScopeGroupCase):
         self.press(root, button)
         self.assertEqual(before, bridge.conversationId)                           # still refused, as before
 
-    def test_w_the_chevron_turns_while_its_menu_is_open(self) -> None:
-        self.seed()
-        bridge = self.bridge()
-        root = self.window(bridge)
-        self.home(bridge, "global")
-        for pill, chevron, menu in (("projectSelector", "projectSelectorChevron", "projectSelectorMenu"),
-                                    ("conversationSwitcher", "conversationSwitcherChevron", "conversationSwitcherMenu")):
-            shape = self.item(root, chevron)
-            self.assertEqual(0, shape.rotation())
-            self.press(root, self.item(root, pill))
-            settle(lambda: shape.rotation() == 180)
-            self.assertEqual(180, shape.rotation())
-            QMetaObject.invokeMethod(root.findChild(QObject, menu), "close")
-            settle(lambda: shape.rotation() == 0)
-            self.assertEqual(0, shape.rotation())
-
     def test_x_menu_motion_follows_its_tokens_and_stops_with_ambient_off(self) -> None:
         self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
         self.home(bridge, "global")
-        menu = root.findChild(QObject, "projectSelectorMenu")
+        menu = root.findChild(QObject, "conversationSwitcherContext")           # the header's "…" menu
         samples = self.motion(root, menu)
         mark, called = len(samples), time.monotonic()
         QMetaObject.invokeMethod(menu, "open")
@@ -724,7 +699,7 @@ class ScopeStateTests(ScopeGroupCase):
         self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
         # Ambient effects off: no motion at all - the end state at once.
         bridge.setAmbientEffects(False); pump(100)
-        for name in ("projectSelectorMenu", "conversationSwitcherMenu", "conversationSwitcherContext"):
+        for name in ("conversationSwitcherContext", "conversationRenameEditor"):
             popup = root.findChild(QObject, name)
             QMetaObject.invokeMethod(popup, "open")
             self.assertTrue(popup.property("opened"), name)
@@ -758,14 +733,16 @@ class DialogAdoptionCase(ScopeGroupCase):
         return store, bridge, root
 
     def dialog(self, root, name):
+        if name == "attachDialog":
+            return attach_dialog(root)
         shown = [d for d in root.findChildren(QObject, name) if d.property("visible")]
         return shown[0] if shown else root.findChildren(QObject, name)[0]
 
     def open_attach(self, bridge, root):
         bridge.setPage("home"); pump(300)
-        self.click(root, "projectSelector"); pump(200)
-        self.click(root, "projectSelectorAttach"); pump(100)
-        return self.dialog(root, "attachDialog")
+        self.steady(root, "chatHeaderAttach")
+        self.click(root, "chatHeaderAttach"); pump(100)
+        return attach_dialog(root)
 
     def open_delete(self, bridge, root):
         bridge.setPage("history"); pump(400)
@@ -898,6 +875,7 @@ class DialogKeyboardTests(DialogAdoptionCase):
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)       # still Global
         self.assertEqual([], [p for p in store.list_projects() if p.name == "Mutfak"])
         self.close(dialog)
+        self.assertTrue(self.item(root, "chatHeaderAttach").hasActiveFocus())          # back to its opener
         self.assertEqual(0, self.execute_calls())
 
 
@@ -930,7 +908,7 @@ class DialogMotionTests(DialogAdoptionCase):
         for name in ("attachDialog", "purgeDialog"):
             if name == "purgeDialog":
                 bridge.showProject(self.home_project.id); pump(400)
-            other = root.findChildren(QObject, name)[0]
+            other = attach_dialog(root) if name == "attachDialog" else root.findChildren(QObject, name)[0]
             QMetaObject.invokeMethod(other, "open")
             self.assertTrue(other.property("opened"), name)
             QMetaObject.invokeMethod(other, "close")
@@ -1317,11 +1295,12 @@ class LiveLanguageTests(ListCase):
     def test_al_a_live_switch_rewrites_the_projected_labels_without_a_refresh(self) -> None:
         store, bridge, root = self.lists()
         self.untitled_global(store, bridge)
-        owner = lambda: self.item(root, "projectSelectorName").property("text")  # noqa: E731
-        switcher = lambda: self.item(root, "conversationSwitcherText").property("text")  # noqa: E731
-        self.assertEqual(("Global", "New Chat"), (owner(), switcher()))
+        owner = lambda: self.item(root, "chatHeaderScopeName").property("text")  # noqa: E731
+        switcher = lambda: self.item(root, "chatHeaderTitle").property("text")  # noqa: E731
+        side = lambda: self.item(root, "sidebarGlobal").property("title")  # noqa: E731
+        self.assertEqual(("Global", "New Chat", "Global"), (owner(), switcher(), side()))
         self.tr(bridge)                                                       # no refresh of any kind after the switch
-        self.assertEqual(("Genel", "Yeni Sohbet"), (owner(), switcher()))
+        self.assertEqual(("Genel", "Yeni Sohbet", "Genel"), (owner(), switcher(), side()))
         self.assertEqual("Genel", bridge.conversationProject["name"])
         # The open project's detail: the untitled row and the archived section rewrite as well.
         bridge.showProject(self.project.id); pump(400)

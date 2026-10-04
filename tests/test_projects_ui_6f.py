@@ -36,6 +36,13 @@ right-click on a row opens the ONE conversation menu (ConversationMenu.qml,
 which the TopBar switcher also opens) for THAT row without opening it; the
 links go where Q9 / Q10 say; every action has a mouse path.
 
+Slice F4 - the chat header and the slimmed TopBar (L1, L3, Q2): the header
+(scope chip > title; "Projeye bağla" for a Global conversation only; "…" =
+the conversation menu on the open conversation) fits at every size in both
+themes with long names eliding to their tips; the TopBar has no scope group
+and nothing overlaps there; the Command preset's chip opens the scope and
+conversation menu; the "Projeye bağla" dialog is found by its type.
+
 No test performs a live model, auth or network call or opens the live DB.
 """
 
@@ -278,15 +285,13 @@ class SidebarShellTests(SidebarShellCase):
                 stack = self.box(root, "panelColumn")
                 self.assertEqual(column[(width, height)], (round(stack.x()), round(stack.y()), round(stack.width())))
                 side = self.box(root, "sidebar")
-                # Where the clock card started (Q7: the TopBar keeps its height); while the
-                # scope group takes its own row on a narrow window (until F4), below that row.
-                scope = self.box(root, "projectScope")
+                # Where the clock card started (Q7: the TopBar keeps its height): 84 / 84 / 134
+                # (F4: the scope group left the bar, so nothing pushes it lower).
                 clock_line = max(84, round(height * 0.1980) + 76 - 12 - 144)
-                self.assertGreaterEqual(side.top(), clock_line - 0.5)
-                for name in ("brandWordmark", "brandTagline", "settingsOrb", "projectScope", "jarvisCore", "commandStrip"):
+                self.assertEqual({(1100, 700): 84, (1280, 760): 84, (1920, 1080): 134}[(width, height)], clock_line)
+                self.assertAlmostEqual(clock_line, side.top(), delta=0.5)
+                for name in ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip"):
                     self.apart(side, self.box(root, name), name)
-                if scope.top() < 40:                      # inline beside the wordmark: nothing below it
-                    self.assertAlmostEqual(clock_line, side.top(), delta=0.5)
                 self.assertAlmostEqual(height - 64, side.bottom(), delta=0.5)
         # Home only (Q11): every other page keeps its own width.
         for page in ("history", "projects", "tasks"):
@@ -558,6 +563,13 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
     def tap(self, root, item, button=Qt.LeftButton) -> None:
+        last = None
+        for _ in range(60):                         # the work surface may still be reflowing (it animates its width)
+            now = self.rect(item)
+            if now == last:
+                break
+            last = now
+            pump(40)
         QTest.mouseClick(root, button, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
         pump(350)
 
@@ -627,12 +639,8 @@ class SidebarNavTests(SidebarNavCase):
                                 self.assertAlmostEqual(r.height(), cut.height(), delta=0.5, msg=name)
                                 inside += 1
                         shown[name] = inside
-                    # 5 at the 1920 class, 3 below; fewer only while the conversations would keep
-                    # less than two whole rows (1100x700 until the scope group leaves the bar, F4).
-                    if (width, height) == (1100, 700):
-                        self.assertIn(shown["sidebarProject"], (2, 3))
-                    else:
-                        self.assertEqual(min(5 if width >= 1600 else 3, active), shown["sidebarProject"])
+                    # 5 at the 1920 class, 3 below.
+                    self.assertEqual(min(5 if width >= 1600 else 3, active), shown["sidebarProject"])
                     self.assertGreaterEqual(shown["sidebarConversation"], 2)
                     # Names elide (never under 6 characters) and the tip has them whole; counts and times never elide.
                     for name, title_name, meta_name in (("sidebarGlobal", "sidebarGlobalName", "sidebarGlobalCount"),
@@ -722,7 +730,7 @@ class SidebarNavTests(SidebarNavCase):
         self.assertTrue(picked.property("current"))
         self.assertEqual(1.0, self.child(picked, "sidebarRowEdge").property("opacity"))
         self.assertEqual(1, sum(1 for r in self.shown(root, "sidebarConversation") if r.property("current")))
-        self.assertEqual("Genel 0", self.item(root, "conversationSwitcherText").property("text"))
+        self.assertEqual("Genel 0", self.item(root, "chatHeaderTitle").property("text"))
         # The busy guard: no pick while a run is busy.
         bridge._busy = True
         try:
@@ -866,7 +874,7 @@ class SidebarNavTests(SidebarNavCase):
         self.assertIsNotNone(store.load_conversation(second.id))
         self.assertEqual(0, self.execute_calls())
 
-    def test_z_the_top_bar_menu_still_works_through_conversation_menu(self) -> None:
+    def test_z_the_header_menu_works_through_conversation_menu(self) -> None:
         from pathlib import Path
         qml = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components"
         self.assertNotIn("conversationSwitcherContext", (qml / "TopBar.qml").read_text(encoding="utf-8"))
@@ -875,20 +883,20 @@ class SidebarNavTests(SidebarNavCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertEqual(1, len(self.all_items(root, "conversationMenu")))                # one menu, two openers
-        self.tap(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        self.tap(root, self.item(root, "chatHeaderMenu"))
         menu = self.item(root, "conversationMenu")
         self.assertEqual(("", True), (menu.property("rowId"), menu.property("open")))
-        self.assertTrue(self.item(root, "conversationSwitcher").property("open"))
-        self.assertEqual(self.item(root, "conversationSwitcherText").property("text"),
+        self.assertTrue(self.item(root, "chatHeaderMenu").property("open"))
+        self.assertEqual(self.item(root, "chatHeaderTitle").property("text"),
                          self.item(root, "conversationContextHeader").property("text"))
-        # Under the switcher, as before.
-        switcher, header = self.box(root, "conversationSwitcher"), self.box(root, "conversationContextHeader")
-        self.assertGreater(header.top(), switcher.bottom())
+        # Under "…".
+        button, header = self.box(root, "chatHeaderMenu"), self.box(root, "conversationContextHeader")
+        self.assertGreater(header.top(), button.bottom())
         self.tap(root, self.item(root, "conversationRenameItem"))
         self.item(root, "conversationRenameField").setProperty("text", "Üstten ad"); pump(60)
         self.tap(root, self.item(root, "conversationRenameSave"))
         self.assertEqual("Üstten ad", store.load_conversation(bridge.conversationId).title)
-        self.assertEqual("Üstten ad", self.item(root, "conversationSwitcherText").property("text"))
+        self.assertEqual("Üstten ad", self.item(root, "chatHeaderTitle").property("text"))
         self.assertIn("Üstten ad", self.titles(root))
         self.assertEqual(0, self.execute_calls())
 
@@ -1000,6 +1008,240 @@ class SidebarNavTests(SidebarNavCase):
         for source, turkish in (("Rename", "Yeniden adlandır"), ("Delete permanently…", "Kalıcı sil…"),
                                 ("Archive it first", "Önce arşivleyin")):
             self.assertEqual(turkish, tx("ConversationMenu", source))
+
+
+BAR = ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip", "coreStatusGroup", "editLayoutTrigger")
+
+
+def attach_dialog(root):
+    """The "Projeye bağla" dialog by its type (the composer's file picker shares its objectName)."""
+    found = [d for d in root.findChildren(QObject, "attachDialog") if d.metaObject().className().startswith("AttachDialog")]
+    assert len(found) == 1, [d.metaObject().className() for d in root.findChildren(QObject, "attachDialog")]
+    return found[0]
+
+
+class ChatHeaderTests(SidebarNavCase):
+    def clear(self, root, box, name, item) -> None:
+        """``box`` is clear of ``item``; the core is its machine - the outer ring, 0.74 D
+        (JarvisCore L5) - not its square box, whose corners the shell's fade band enters."""
+        if name != "jarvisCore":
+            self.apart(box, self.rect(item), name)
+            return
+        r = self.rect(item)
+        cx, cy, radius = r.center().x(), r.center().y(), r.width() * 0.37
+        nx, ny = min(max(cx, box.left()), box.right()), min(max(cy, box.top()), box.bottom())
+        self.assertGreaterEqual(((nx - cx) ** 2 + (ny - cy) ** 2) ** 0.5, radius - 0.5, name)
+
+    def test_ee_the_header_fits_at_every_size_in_both_themes_and_long_names_elide(self) -> None:
+        store = self.seed()
+        longp = store.create_project(LONG_PROJECT)
+        longest = (LONG_TITLE + ", " + LONG_TITLE.lower())[:120]                  # the store's limit; elides even at 1920
+        owned = store.create_conversation(longp.id, title=longest)
+        global_long = store.create_conversation(title=longest[:-8] + " (Genel)")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for theme in ("space", "dark"):
+            bridge.setTheme(theme)
+            for key, conversation in (("project", owned), ("global", global_long)):
+                bridge.openConversation(conversation.id); pump(300)
+                for width, height in SIZES:
+                    root.resize(width, height); pump(600)
+                    with self.subTest(theme=theme, owner=key, size=(width, height)):
+                        header = self.box(root, "chatHeader")
+                        self.inside(self.box(root, "canonicalWorkspace"), header, "header")
+                        for other in ("canonicalComposer", "sidebar", "panelColumn"):
+                            self.apart(header, self.box(root, other), other)
+                        for name in BAR:
+                            for item in self.shown(root, name):
+                                if item.width() > 0:
+                                    self.clear(root, header, name, item)
+                        parts = ["chatHeaderScope", "chatHeaderTitle", "chatHeaderMenu"]
+                        self.assertEqual(key == "global", self.item(root, "chatHeaderAttach").isVisible())
+                        if key == "global":
+                            parts.insert(2, "chatHeaderAttach")
+                        boxes = [self.box(root, name) for name in parts]
+                        for name, box in zip(parts, boxes):
+                            self.inside(header, box, name)
+                        for left, right in zip(boxes, boxes[1:]):
+                            self.assertLessEqual(left.right(), right.left() + 0.5, (parts, left, right))
+                        self.assertLessEqual(boxes[0].width(), round(header.width() * 0.32) + 0.5)
+                        # Long names elide (never under 6 characters) and their tips have them whole.
+                        name, title = self.item(root, "chatHeaderScopeName"), self.item(root, "chatHeaderTitle")
+                        for text in (name, title):
+                            self.assertEqual(1, text.property("lineCount"))
+                            if text.property("truncated"):
+                                six = QFontMetricsF(text.property("font")).horizontalAdvance(text.property("text")[:6] + "…")
+                                self.assertGreaterEqual(text.width() + 0.5, six)
+                        self.assertTrue(title.property("truncated"))
+                        self.assertEqual(bridge.conversationTitle, self.item(root, "chatHeaderTitleTip").property("text"))
+                        self.assertEqual(bridge.conversationProject["name"], self.item(root, "chatHeaderScopeTip").property("text"))
+                        if key == "project":
+                            self.assertTrue(name.property("truncated"))
+                        # The stream starts below the header.
+                        self.assertGreaterEqual(self.box(root, "conversationFeed").top(), header.bottom())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_ff_attach_only_for_global_and_the_same_flow(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        button = self.item(root, "chatHeaderAttach")
+        self.assertTrue((bridge.canAttach, True) == (True, button.isVisible()))
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        self.assertFalse(button.isVisible())                                            # a project's: no entry
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        archived = next(r.id for r in store.list_conversations(project_id=None, include_archived=True) if r.archived_at)
+        bridge.openConversation(archived); pump(300)
+        self.assertFalse(button.isVisible())                                            # archived: no entry
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        say(store, bridge.conversationId, "tezgah ölçüleri")
+        moving = bridge.conversationId
+        self.assertTrue(button.isVisible())
+        self.tap(root, button)
+        dialog = attach_dialog(root)
+        self.assertTrue(dialog.property("visible"))
+        item = [i for i in self.all_items(root, "attachProject") if i.property("label") == "Boş"][0]
+        self.tap(root, item)
+        self.assertEqual("Target: Boş", self.item(root, "attachTarget").property("text"))
+        self.tap(root, self.item(root, "attachConfirm"))
+        self.assertEqual(self.empty.id, store.load_conversation(moving).project_id)
+        self.assertEqual("Boş", self.item(root, "chatHeaderScope").property("fullName"))
+        self.assertFalse(button.isVisible())
+        self.assertEqual(0, self.execute_calls())
+
+    def test_gg_the_header_menu_acts_on_the_open_one_and_a_row_menu_on_its_row(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        menu = self.item(root, "conversationMenu")
+        self.assertEqual(1, len(self.all_items(root, "conversationMenu")))              # one menu, two openers
+        opened = bridge.conversationId
+        self.tap(root, self.item(root, "chatHeaderMenu"))
+        self.assertEqual(("", opened, True), (menu.property("rowId"), menu.property("targetId"), menu.property("open")))
+        self.assertEqual(self.item(root, "chatHeaderTitle").property("text"),
+                         self.item(root, "conversationContextHeader").property("text"))
+        self.tap(root, self.item(root, "conversationRenameItem"))
+        field = self.item(root, "conversationRenameField")
+        self.assertEqual(bridge.conversationTitle, field.property("text"))
+        # The editor sits under the title.
+        title, editor = self.box(root, "chatHeaderTitle"), self.box(root, "conversationRenameTitle")
+        self.assertGreater(editor.top(), title.bottom())
+        self.assertLess(abs(editor.left() - title.left()), 40)
+        field.setProperty("text", "Başlıktan ad"); pump(60)
+        self.tap(root, self.item(root, "conversationRenameSave"))
+        self.assertEqual("Başlıktan ad", store.load_conversation(opened).title)
+        self.assertEqual("Başlıktan ad", self.item(root, "chatHeaderTitle").property("text"))
+        # A row's menu: that row, not the open one; the header's "…" is not marked open.
+        other = next(r for r in self.shown(root, "sidebarConversation") if not r.property("current"))
+        other_id = other.property("itemId")
+        self.tap(root, other, Qt.RightButton)
+        self.assertEqual(other_id, menu.property("targetId"))
+        self.assertFalse(self.item(root, "chatHeaderMenu").property("open"))
+        self.tap(root, self.item(root, "conversationArchiveItem"))
+        self.assertIsNotNone(store.load_conversation(other_id).archived_at)
+        self.assertEqual(opened, bridge.conversationId)
+        # The header's "…" archives the OPEN one: it leaves for the scope's newest live one.
+        self.tap(root, self.item(root, "chatHeaderMenu"))
+        self.tap(root, self.item(root, "conversationArchiveItem"))
+        self.assertIsNotNone(store.load_conversation(opened).archived_at)
+        self.assertNotEqual(opened, bridge.conversationId)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_hh_the_top_bar_has_no_scope_group_and_nothing_overlaps_there(self) -> None:
+        from pathlib import Path
+        qml = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components" / "TopBar.qml"
+        source = qml.read_text(encoding="utf-8")
+        for gone in ("scopeGroup", "projectSelector", "conversationSwitcher", "newConversationButton", "ScopePill",
+                     "Chevron", "scopeBottom", "AttachDialog"):
+            self.assertNotIn(gone, source)
+        store = self.seed()
+        longp = store.create_project(LONG_PROJECT)
+        owned = store.create_conversation(longp.id, title=LONG_TITLE)
+        bridge = self.bridge()
+        bridge.openConversation(owned.id)
+        root = self.window(bridge)
+        for gone in ("projectScope", "projectSelector", "conversationSwitcher", "newConversationButton"):
+            self.assertEqual([], self.all_items(root, gone))
+        for theme in ("space", "command"):
+            bridge.setTheme(theme); pump(400)
+            for width, height in SIZES:
+                root.resize(width, height); pump(600)
+                with self.subTest(theme=theme, size=(width, height)):
+                    window = QRectF(0, 0, width, height)
+                    mine = [self.box(root, "chatHeader")] + ([self.box(root, "sidebar")] if theme != "command" else [])
+                    for box in mine:
+                        self.inside(window, box, "inside")
+                        for name in BAR:
+                            for item in self.shown(root, name):
+                                if item.width() > 0:
+                                    self.clear(root, box, name, item)
+                    # The header progress (shown only during a run) starts after the
+                    # sidebar or is below its own 240 px threshold (from 6E test_t).
+                    hud = self.item(root, "hudProgress")
+                    band = QRectF(hud.mapToScene(QPointF(0, 0)), hud.size())
+                    if theme != "command" and hud.width() >= 240:
+                        self.apart(band, self.box(root, "sidebar"), "progress")
+        self.assertEqual(0, self.execute_calls())
+
+    def test_ii_the_command_preset_chip_opens_the_scope_and_conversation_menu(self) -> None:
+        store = self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        bridge.setTheme("command"); pump(500)
+        self.assertFalse(self.item(root, "sidebar").isVisible())
+        chip = self.item(root, "chatHeaderScope")
+        # The canonical page's header may linger until its deferred deletion: the preset's menu is the shown one.
+        scope_menu = lambda: next((m for m in root.findChildren(QObject, "chatHeaderScopeMenu") if m.property("visible")),  # noqa: E731
+                                  root.findChildren(QObject, "chatHeaderScopeMenu")[-1])
+        self.tap(root, chip)
+        self.assertTrue(scope_menu().property("visible"))
+        self.assertEqual(["Boş", "Tek", "Çok"], [i.property("label") for i in self.shown(root, "scopeMenuProject")])
+        self.tap(root, [i for i in self.shown(root, "scopeMenuProject") if i.property("label") == "Çok"][0])
+        self.assertFalse(scope_menu().property("visible"))
+        self.assertEqual((store.list_conversations(project_id=self.many.id)[0].id, self.many.id),
+                         (bridge.conversationId, bridge.conversationProject["id"]))           # the 6B rule
+        self.tap(root, chip)
+        rows = self.shown(root, "scopeMenuConversation")
+        self.assertEqual(sorted(r.title for r in self.live), sorted(i.property("label") for i in rows))
+        target = next(i for i in rows if not i.property("current"))
+        label = target.property("label")
+        self.tap(root, target)
+        self.assertEqual(label, bridge.conversationTitle)                                     # the switcher pick
+        self.tap(root, chip)
+        self.tap(root, self.item(root, "scopeMenuGlobal"))
+        self.assertTrue(bridge.conversationProject["global"])
+        self.tap(root, chip)
+        self.tap(root, self.item(root, "scopeMenuAll"))
+        self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
+        bridge.setPage("home"); pump(400)
+        # "…" is the same conversation menu here.
+        self.tap(root, self.item(root, "chatHeaderMenu"))
+        self.assertTrue(self.item(root, "conversationMenu").property("open"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_jj_the_attach_dialog_lookup_is_unambiguous(self) -> None:
+        self.seed()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        named = root.findChildren(QObject, "attachDialog")
+        kinds = sorted(d.metaObject().className().split("_")[0] for d in named)
+        self.assertEqual(2, len(named), kinds)                                          # the picker and the dialog
+        dialog = attach_dialog(root)
+        self.assertIsNotNone(dialog.property("preferredWidth"))
+        self.tap(root, self.item(root, "chatHeaderAttach"))
+        self.assertEqual([dialog], [d for d in named if d.property("visible")])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_kk_the_header_strings_are_turkish(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        for source, turkish in (("Attach to a project…", "Projeye bağla…"), ("Conversation actions", "Sohbet işlemleri"),
+                                ("New Chat", "Yeni Sohbet"), ("ARCHIVED", "ARŞİV"), ("archived", "arşivlendi"),
+                                ("PROJECTS", "PROJELER"), ("Global", "Genel"), ("All projects", "Tüm projeler"),
+                                ("CONVERSATIONS", "SOHBETLER")):
+            self.assertEqual(turkish, tx("ChatHeader", source))
 
 
 if __name__ == "__main__":  # pragma: no cover

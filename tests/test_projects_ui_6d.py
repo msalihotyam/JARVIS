@@ -12,7 +12,8 @@ C. Race safety: a manual name is never overwritten by the automatic one; an
    rename; an edit is bound to the conversation it started on.
 D. Authority: one new production caller of set_conversation_title; a rename
    changes no approval decision and nothing else the person was shown.
-E. Layout: project selector | switcher | + New conversation, no overlap.
+E. Layout: retired with the TopBar scope group (Gate 6F L1); the header and
+   sidebar layout is tests/test_projects_ui_6f.py.
 F. Turkish catalog.
 
 No test performs a live model, auth or network call or opens the live DB.
@@ -52,15 +53,18 @@ class SwitcherCase(ProjectsUiCase):
         return self.item(root, name).property("text")
 
     def menu(self, root) -> list[tuple]:
-        """(label, open?) of the open switcher menu, in order."""
-        self.press(root, self.item(root, "conversationSwitcher"))
-        return [(i.property("label"), i.property("current")) for i in self.visible(root, "conversationSwitcherItem")]
+        """(label, open?) of the scope's conversation list (Gate 6F: the sidebar rows), in order."""
+        return [(i.property("title"), i.property("current")) for i in self.visible(root, "sidebarConversation")]
 
     def close_menu(self, root) -> None:
-        self.press(root, self.item(root, "conversationSwitcher"))
+        pass                                  # the sidebar list is always shown: nothing to close
+
+    def open_actions(self, root) -> None:
+        """The conversation menu of the OPEN conversation (Gate 6F: the chat header's "…")."""
+        self.press(root, self.item(root, "chatHeaderMenu"))
 
     def start_edit(self, root) -> None:
-        self.press(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        self.open_actions(root)
         self.press(root, self.item(root, "conversationRenameItem"))
 
     def commit(self, root, text: str) -> None:
@@ -90,20 +94,20 @@ class SwitcherTests(SwitcherCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.openConversation(second.id); pump(200)
-        self.assertEqual("New Chat", self.text(root, "conversationSwitcherText"))
+        self.assertEqual("New Chat", self.text(root, "chatHeaderTitle"))
         bridge.openConversation(first.id); pump(200)
-        self.assertEqual("Birinci", self.text(root, "conversationSwitcherText"))
+        self.assertEqual("Birinci", self.text(root, "chatHeaderTitle"))
         # Global scope: exactly its non-archived conversations, newest first, the open one marked.
         expected = [c.id for c in store.list_conversations(project_id=None)]
         self.assertEqual({first.id, second.id, third.id}, set(expected))                 # no archived, no project one
         titles = {c.id: (c.title or "New Chat") for c in store.list_conversations(project_id=None)}
         self.assertEqual([(titles[i], i == first.id) for i in expected], self.menu(root))
         self.assertEqual([i for i in expected], [row["id"] for row in bridge.scopeConversations])
-        items = self.visible(root, "conversationSwitcherItem")
-        target = [i for i in items if i.property("label") == "Üçüncü"][0]
+        items = self.visible(root, "sidebarConversation")
+        target = [i for i in items if i.property("title") == "Üçüncü"][0]
         self.press(root, target)
         self.assertEqual(third.id, bridge.conversationId)
-        self.assertEqual("Üçüncü", self.text(root, "conversationSwitcherText"))
+        self.assertEqual("Üçüncü", self.text(root, "chatHeaderTitle"))
         self.assertFalse([l for l, _ in self.menu(root) if l in ("Arşiv", "Proje sohbeti")])
         self.close_menu(root)
         # Project scope: only that project's conversations.
@@ -115,9 +119,8 @@ class SwitcherTests(SwitcherCase):
         bridge.openProjectScope(""); pump(200)
         bridge._busy = True
         bridge.stateChanged.emit(); pump(60)
-        self.press(root, self.item(root, "conversationSwitcher"))
-        self.assertTrue(self.visible(root, "conversationSwitcherItem"))
-        self.assertFalse(any(i.isEnabled() for i in self.visible(root, "conversationSwitcherItem")))
+        self.assertTrue(self.visible(root, "sidebarConversation"))
+        self.assertFalse(any(i.property("available") for i in self.visible(root, "sidebarConversation")))
         before = bridge.conversationId
         self.assertFalse(bridge.openConversation(first.id if before != first.id else second.id))
         self.assertEqual(before, bridge.conversationId)
@@ -131,10 +134,16 @@ class SwitcherTests(SwitcherCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.openConversation(conversation.id); pump(300)
-        self.assertEqual(long_title.strip(), self.text(root, "conversationSwitcherTipText"))
-        switcher, label = self.item(root, "conversationSwitcher"), self.item(root, "conversationSwitcherText")
-        self.assertLessEqual(label.width(), switcher.width())
-        self.assertLess(label.width(), label.property("implicitWidth"))
+        for size in ((1280, 760), (1100, 700)):
+            root.resize(*size); pump(500)
+            with self.subTest(size=size):
+                self.assertEqual(long_title.strip(), self.text(root, "chatHeaderTitleTip"))
+                header, label = self.item(root, "chatHeader"), self.item(root, "chatHeaderTitle")
+                self.assertLessEqual(label.mapToItem(header, label.width(), 0).x(), header.width())
+                self.assertLess(label.width(), label.property("implicitWidth"))
+                row = [i for i in self.visible(root, "sidebarConversation") if i.property("current")][0]
+                self.assertTrue([c for c in row.childItems() if c.objectName() == "sidebarConversationTitle"][0].property("truncated"))
+                self.assertEqual(long_title.strip(), [c for c in row.childItems() if c.objectName() == "sidebarRowTip"][0].property("text"))
 
 
 class RenameTests(SwitcherCase):
@@ -147,8 +156,8 @@ class RenameTests(SwitcherCase):
         calls = self.spy(bridge)
         conversation = store.create_conversation(title="Global ad")
         bridge.openConversation(conversation.id); pump(200)
-        # Right-click: the one item, enabled, with no reason.
-        self.press(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        # The conversation menu (the header's "…"): the one item, enabled, with no reason.
+        self.open_actions(root)
         self.assertTrue(self.item(root, "conversationRenameItem").isEnabled())
         self.assertFalse(self.item(root, "conversationRenameReason").isVisible())
         self.assertEqual(1, len(self.visible(root, "conversationRenameItem")))
@@ -160,7 +169,8 @@ class RenameTests(SwitcherCase):
         self.assertEqual([(conversation.id, "Tatil planı 2025")], calls)
         self.assertEqual("Tatil planı 2025", store.load_conversation(conversation.id).title)
         self.assertFalse(self.editing(root))
-        self.assertEqual("Tatil planı 2025", self.text(root, "conversationSwitcherText"))
+        self.assertEqual("Tatil planı 2025", self.text(root, "chatHeaderTitle"))
+        self.assertIn("Tatil planı 2025", [i.property("title") for i in self.visible(root, "sidebarConversation")])
         self.assertIn("Tatil planı 2025", [row["title"] for row in bridge.conversations])       # History
         # The project's conversation list shows a project conversation's new name.
         bridge.openConversation(owned.id); pump(200)
@@ -225,7 +235,7 @@ class RenameTests(SwitcherCase):
         root = self.window(bridge)
         bridge.openConversation(owned.id); pump(300)
         self.assertTrue(bridge.conversationReadOnly)
-        self.press(root, self.item(root, "conversationSwitcher"), Qt.RightButton)
+        self.open_actions(root)
         self.assertFalse(self.item(root, "conversationRenameItem").isEnabled())
         self.assertIn("archived", self.text(root, "conversationRenameReason"))
         self.assertTrue(self.item(root, "conversationRenameReason").isVisible())
@@ -315,7 +325,7 @@ class RaceTests(SwitcherCase):
         self.assertTrue(bridge.renameConversation(a.id, "A yeni"))
         self.assertEqual(("A yeni", "B adı"), (store.load_conversation(a.id).title, store.load_conversation(b.id).title))
         self.assertEqual(b.id, bridge.conversationId)
-        self.assertEqual("B adı", self.text(root, "conversationSwitcherText"))
+        self.assertEqual("B adı", self.text(root, "chatHeaderTitle"))
         # And the QML commit path uses the captured id, not the open one.
         self.start_edit(root)
         self.item(root, "conversationRenameField").setProperty("text", "B yeni"); pump(60)
@@ -368,51 +378,12 @@ class AuthorityTests(SwitcherCase):
         self.assertEqual(0, self.execute_calls())
 
 
-class LayoutTests(SwitcherCase):
-    def test_e_selector_switcher_and_button_never_overlap_the_top_bar(self) -> None:
-        store = self.db()
-        project = store.create_project("A rather long project name that has to elide somewhere")
-        owned = store.create_conversation(project.id, title="A rather long conversation name that has to elide too")
-        bridge = self.bridge()
-        root = self.window(bridge)
-        bridge.openConversation(owned.id)
-        others = ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip",
-                  "leftContextCard", "coreStatusGroup")
-        for theme in ("space", "command"):
-            bridge.setTheme(theme); pump(400)
-            for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
-                with self.subTest(theme=theme, size=(width, height)):
-                    root.resize(width, height); pump(500)
-                    names = ("projectSelector", "conversationSwitcher", "newConversationButton")
-                    rects = [self.rect(self.item(root, name)) for name in names]
-                    for name in names:
-                        self.assertTrue(self.item(root, name).isVisible(), name)
-                    # Left to right, in this order, never touching.
-                    for left, right in zip(rects, rects[1:]):
-                        self.assertLessEqual(left.right(), right.left())
-                    for mine in rects:
-                        for name in others:
-                            for other in self.all_items(root, name):
-                                if other.isVisible() and other.width() > 0:
-                                    self.assertFalse(mine.intersects(self.rect(other)), name)
-
-    def test_e_each_control_keeps_its_own_room_with_short_names(self) -> None:
-        store = self.db()
-        conversation = store.create_conversation(title="Kısa")
-        bridge = self.bridge()
-        root = self.window(bridge)
-        bridge.openConversation(conversation.id); pump(300)
-        rects = [self.rect(self.item(root, n)) for n in ("projectSelector", "conversationSwitcher", "newConversationButton")]
-        for left, right in zip(rects, rects[1:]):
-            self.assertLess(left.right(), right.left())
-
-
 class CatalogTests(UiTestCase):
     def test_f_new_strings_are_turkish(self) -> None:
         from jarvis.ui.i18n import localization, tx
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual("Yeni Sohbet", tx("TopBar", "New Chat"))
+        self.assertEqual("Yeni Sohbet", tx("ChatHeader", "New Chat"))
         self.assertEqual("Yeniden adlandır", tx("ConversationMenu", "Rename"))
-        self.assertEqual("SOHBETLER", tx("TopBar", "CONVERSATIONS"))
+        self.assertEqual("SOHBETLER", tx("Sidebar", "CONVERSATIONS"))
         self.assertEqual("Bir ad yazın; eski ad korunur.", tx("Bridge", "Type a name; the old name is kept."))

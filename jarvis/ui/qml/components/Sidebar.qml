@@ -40,7 +40,8 @@ Rectangle {
     // is a tonal lift, open / selected the accent fill with the 2 px edge
     // mark, keyboard focus the ring. The name elides with its tip; the count
     // or time never elides. Return / Space activate; Menu / Shift+F10 (and a
-    // right-click) ask for its menu.
+    // right-click) ask for its menu. While a run is busy a pick is not
+    // `available`: dimmed, its click does nothing and its tip says why.
     component NavRow: Rectangle {
         id: row
         property string title: ""
@@ -51,17 +52,20 @@ Rectangle {
         property string itemId: ""
         property bool current: false
         property bool muted: false
+        readonly property bool available: !bridge.busy
         signal activated()
         signal contextRequested(point position)
         width: parent ? parent.width : 0
         height: sidebar.rowH
+        opacity: available ? 1 : 0.38
         radius: Theme.radiusSmall
         color: current ? Theme.alpha(Theme.accent, 0.10) : area.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
         Accessible.name: meta !== "" ? title + ", " + meta : title
-        Accessible.onPressAction: activated()
+        Accessible.onPressAction: if (available) activated()
+        Accessible.description: available ? "" : busyReason.text
         Keys.onShortcutOverride: function (event) {
             if (event.key === Qt.Key_Escape && sidebar.conversationMenu && sidebar.conversationMenu.open) event.accepted = true
         }
@@ -69,7 +73,7 @@ Rectangle {
             if (event.key === Qt.Key_Escape && sidebar.conversationMenu && sidebar.conversationMenu.open) {
                 event.accepted = true; sidebar.conversationMenu.dismiss()
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                event.accepted = true; row.activated()
+                event.accepted = true; if (row.available) row.activated()
             } else if (event.key === Qt.Key_Menu || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
                 event.accepted = true; row.contextRequested(Qt.point(row.width / 2, row.height / 2))
             }
@@ -118,10 +122,10 @@ Rectangle {
             cursorShape: Qt.PointingHandCursor
             onClicked: function (mouse) {
                 if (mouse.button === Qt.RightButton) row.contextRequested(Qt.point(mouse.x, mouse.y))
-                else row.activated()
+                else if (row.available) row.activated()
             }
         }
-        HoverTip { objectName: "sidebarRowTip"; text: row.title; active: nameText.truncated }
+        HoverTip { objectName: "sidebarRowTip"; text: row.available ? row.title : busyReason.text; active: nameText.truncated || !row.available }
     }
     // A small text link (PROJELER, archived projects, Arşiv): hover lifts its
     // ink; a tip when it says less than its whole meaning.
@@ -154,7 +158,7 @@ Rectangle {
                    anchors.verticalCenter: parent.verticalCenter }
         }
         Rectangle { visible: link.current; x: 0; y: 6; width: 2; height: link.height - 12; radius: 1; color: Theme.accent }
-        Rectangle { visible: link.activeFocus; anchors.fill: parent; anchors.margins: 1; radius: link.radius - 1
+        Rectangle { objectName: "sidebarLinkFocusRing"; visible: link.activeFocus; anchors.fill: parent; anchors.margins: 1; radius: link.radius - 1
                     color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
         MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: link.activated() }
         HoverTip { text: link.tip; active: link.tip !== "" }
@@ -183,14 +187,15 @@ Rectangle {
         Keys.onSpacePressed: if (allowed) activated()
         Rectangle { anchors.centerIn: parent; width: plus.accent ? 13 : 12; height: 1.8; radius: 0.9; color: plus.accent ? Theme.text : Theme.textLabel }
         Rectangle { anchors.centerIn: parent; width: 1.8; height: plus.accent ? 13 : 12; radius: 0.9; color: plus.accent ? Theme.text : Theme.textLabel }
-        Rectangle { visible: plus.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: plus.radius + 3
+        Rectangle { objectName: "sidebarPlusFocusRing"; visible: plus.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: plus.radius + 3
                     color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
         MouseArea { id: plusArea; anchors.fill: parent; hoverEnabled: true
                     cursorShape: plus.allowed ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: if (plus.allowed) plus.activated() }
-        HoverTip { text: plus.tip }
+        HoverTip { objectName: "sidebarPlusTip"; text: plus.tip }
     }
 
     // -- the navigation's data and metrics ------------------------------------
+    Text { id: busyReason; visible: false; text: qsTr("Wait for the current run to finish.") }
     readonly property var owner: bridge.conversationProject || ({})
     readonly property var projects: bridge.projectRecords.filter(function (p) { return p.active })
     readonly property int archivedProjects: bridge.projectRecords.length - projects.length
@@ -355,14 +360,19 @@ Rectangle {
                 readonly property string reason: sidebar.owner.archived
                     ? qsTr("The project is archived: unarchive it to start a new conversation.")
                     : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+                // The heading gives way (elides) before the chip goes under six
+                // characters of the scope's name.
                 Text { id: conversationsLabel; x: 10; anchors.verticalCenter: parent.verticalCenter
+                       width: Math.max(0, Math.min(implicitWidth, newConversation.x - 8 - 8 - x - scopeChip.floor))
+                       elide: Text.ElideRight
                        text: i18n.upper(qsTr("CONVERSATIONS")); color: Theme.textMuted; font: Theme.label }
                 Rectangle {
                     id: scopeChip
                     objectName: "sidebarScopeChip"
                     readonly property bool archived: !!sidebar.owner.archived
                     readonly property color tint: archived ? Theme.warning : Theme.accent
-                    readonly property real room: Math.min(parent.width * 0.55, newConversation.x - 8 - x)
+                    readonly property real floor: 16 + (archived ? 12 : 0) + Math.min(chipName.implicitWidth, Math.ceil(chipSix.advanceWidth) + 2)
+                    readonly property real room: Math.min(Math.max(parent.width * 0.55, floor), newConversation.x - 8 - x)
                     // The ARŞİV pill when it fits beside six characters of the
                     // name; else a warning dot (the tip and name say archived).
                     TextMetrics { id: chipSix; font: Theme.caption; text: (sidebar.owner.name || "").slice(0, 6) + "…" }

@@ -9,6 +9,8 @@ Item {
     id: cockpit
     objectName: "commandPreset"
     property bool fixtureApproval: false
+    property Item conversationMenu: null
+    property var attachDialog: null
     signal dismissFixture()
     signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
     signal cardsRequested(Item anchor)
@@ -45,8 +47,11 @@ Item {
             id: conversation
             anchors { left: parent.left; top: greeting.bottom; bottom: parent.bottom; topMargin: 25 }
             width: cockpit.showBay ? parent.width * 0.53 - 20 : parent.width
-            Text { visible: bridge.feed.length === 0; width: parent.width; wrapMode: Text.Wrap; text: qsTr("Waiting for your request. The model proposes; you remain in control of each authorized action."); color: Theme.textLabel; font: Theme.lead }
-            FeedView { anchors.fill: parent; visible: bridge.feed.length > 0 }
+            // Gate 6F (Q2): the chat header; here its chip opens the scope menu.
+            ChatHeader { id: chatHeader; width: parent.width; scopeMenu: true
+                         conversationMenu: cockpit.conversationMenu; attachDialog: cockpit.attachDialog }
+            Text { y: chatHeader.height + 10; visible: bridge.feed.length === 0; width: parent.width; wrapMode: Text.Wrap; text: qsTr("Waiting for your request. The model proposes; you remain in control of each authorized action."); color: Theme.textLabel; font: Theme.lead }
+            FeedView { anchors.fill: parent; anchors.topMargin: chatHeader.height + 10; visible: bridge.feed.length > 0 }
             Flow { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } spacing: 8
                 Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
             }

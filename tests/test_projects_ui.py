@@ -65,6 +65,17 @@ class ProjectsUiCase(UiTestCase):
         top_left = item.mapToScene(QPointF(0, 0))
         return QRectF(top_left.x(), top_left.y(), item.width(), item.height())
 
+    def steady(self, root, name) -> None:
+        """Wait until ``name`` stops moving: the home work surface reflows (animates its
+        width) after the window opens, and the chat header moves with it (Gate 6F)."""
+        last = None
+        for _ in range(60):
+            now = self.rect(self.item(root, name))
+            if now == last:
+                return
+            last = now
+            pump(40)
+
     def texts(self, root, name) -> list[str]:
         return [item.property("text") for item in self.all_items(root, name) if item.isVisible()]
 
@@ -162,43 +173,28 @@ class DetailTests(ProjectsUiCase):
 
 class BadgeTests(ProjectsUiCase):
     # Gate 6B (Salih decision 2026-09-30): the 6A badge became the project
-    # selector in the same slot; it names the owner and opens a menu (the
-    # selector itself is covered in tests/test_projects_ui_6b.py).
+    # selector in the same slot; Gate 6F: the owner is named by the chat
+    # header's scope chip and the sidebar marks it; the sidebar lists the
+    # projects directly (the selector rules are in tests/test_projects_ui_6b.py).
     def test_d_selector_names_the_owner_and_opens_its_menu(self) -> None:
         store = self.db()
         project = store.create_project("Evim")
         owned = store.create_conversation(project.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual("Global", self.item(root, "projectSelectorText").property("text"))
+        owner = lambda: self.item(root, "chatHeaderScope").property("fullName")  # noqa: E731
+        selected = lambda: [i.property("title") for i in self.all_items(root, "sidebarProject") if i.property("current")]  # noqa: E731
+        self.assertEqual("Global", owner())
+        self.assertTrue(self.item(root, "sidebarGlobal").property("current"))
         bridge.openConversation(owned.id); pump(300)
-        self.assertEqual("Evim", self.item(root, "projectSelectorText").property("text"))
-        self.click(root, "projectSelector"); pump(300)
-        self.assertTrue(self.item(root, "projectSelectorAll").isVisible())
+        self.assertEqual("Evim", owner())
+        self.assertEqual(["Evim"], selected())
+        self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())            # "All projects" (Q10)
+        self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()])
         self.assertEqual("home", bridge.page)
         bridge.newConversation(); pump(300)
-        self.assertEqual("Global", self.item(root, "projectSelectorText").property("text"))
-
-    def test_d_selector_never_overlaps_the_top_bar(self) -> None:
-        store = self.db()
-        project = store.create_project("A rather long project name that has to elide somewhere")
-        owned = store.create_conversation(project.id)
-        bridge = self.bridge()
-        root = self.window(bridge)
-        bridge.openConversation(owned.id)
-        others = ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip",
-                  "leftContextCard", "coreStatusGroup")
-        for theme in ("space", "command"):
-            bridge.setTheme(theme); pump(400)
-            for width, height in ((1920, 1080), (1280, 760), (1100, 700)):
-                with self.subTest(theme=theme, size=(width, height)):
-                    root.resize(width, height); pump(500)
-                    badge = self.rect(self.item(root, "projectSelector"))
-                    self.assertTrue(self.item(root, "projectSelector").isVisible())
-                    for name in others:
-                        for other in self.all_items(root, name):
-                            if other.isVisible() and other.width() > 0:
-                                self.assertFalse(badge.intersects(self.rect(other)), name)
+        self.assertEqual("Global", owner())
+        self.assertEqual([], selected())
 
 
 class ArchivedTests(ProjectsUiCase):
@@ -227,7 +223,7 @@ class ArchivedTests(ProjectsUiCase):
         self.assertTrue(self.item(root, "readOnlyBanner").isVisible())
         self.assertIn("Tez", self.item(root, "readOnlyReason").property("text"))
         self.assertFalse(self.item(root, "composerInput").isEnabled())
-        self.assertEqual("Tez · archived", self.item(root, "projectSelectorText").property("text"))
+        self.assertEqual("Tez · archived", self.item(root, "chatHeaderScope").property("fullName"))
         # A submit forced through the bridge still meets Core's refusal.
         bridge.submitText("zorla gönder"); pump(200)
         self.assertEqual([], self.model.calls)
