@@ -3726,76 +3726,16 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>İptal edildi</translation>
     </message>
     <message>
-        <source>1 session</source>
-        <translation>1 oturum</translation>
-    </message>
-    <message>
-        <source>%1 sessions</source>
-        <translation>%1 oturum</translation>
-    </message>
-    <message>
         <source>Tasks</source>
         <translation>Görevler</translation>
-    </message>
-    <message>
-        <source>%1 active</source>
-        <translation>%1 aktif</translation>
-    </message>
-    <message>
-        <source>1 task</source>
-        <translation>1 görev</translation>
-    </message>
-    <message>
-        <source>%1 tasks</source>
-        <translation>%1 görev</translation>
     </message>
     <message>
         <source>Focus</source>
         <translation>Odak</translation>
     </message>
     <message>
-        <source>1 project</source>
-        <translation>1 proje</translation>
-    </message>
-    <message>
-        <source>%1 projects</source>
-        <translation>%1 proje</translation>
-    </message>
-    <message>
-        <source>Active in memory</source>
-        <translation>Hafızada aktif</translation>
-    </message>
-    <message>
-        <source>In memory</source>
-        <translation>Hafızada</translation>
-    </message>
-    <message>
-        <source>No focus context yet</source>
-        <translation>Henüz odak bağlamı yok</translation>
-    </message>
-    <message>
-        <source>No context yet</source>
-        <translation>Henüz bağlam yok</translation>
-    </message>
-    <message>
         <source>Plan</source>
         <translation>Plan</translation>
-    </message>
-    <message>
-        <source>%1 scheduled</source>
-        <translation>%1 planlı</translation>
-    </message>
-    <message>
-        <source>Next %1</source>
-        <translation>Sonraki: %1</translation>
-    </message>
-    <message>
-        <source>Nothing enabled</source>
-        <translation>Etkin iş yok</translation>
-    </message>
-    <message>
-        <source>Nothing scheduled</source>
-        <translation>Planlanmış iş yok</translation>
     </message>
     <message>
         <source>Memory</source>
@@ -3806,6 +3746,78 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Kullanılabilir</translation>
     </message>
     <message>
+        <source>Current request</source>
+        <translation>Geçerli istek</translation>
+    </message>
+    <message>
+        <source>%1 · running for %2</source>
+        <translation>%1 · %2 süredir çalışıyor</translation>
+    </message>
+    <message>
+        <source>1 approval waiting</source>
+        <translation>1 onay bekliyor</translation>
+    </message>
+    <message>
+        <source>Open the waiting approval</source>
+        <translation>Bekleyen onayı aç</translation>
+    </message>
+    <message>
+        <source>No task yet</source>
+        <translation>Henüz görev yok</translation>
+    </message>
+    <message>
+        <source>No task</source>
+        <translation>Görev yok</translation>
+    </message>
+    <message>
+        <source>no project context</source>
+        <translation>proje bağlamı yok</translation>
+    </message>
+    <message>
+        <source>no context</source>
+        <translation>bağlam yok</translation>
+    </message>
+    <message>
+        <source>instruction ✓</source>
+        <translation>talimat ✓</translation>
+    </message>
+    <message>
+        <source>no instruction</source>
+        <translation>talimat yok</translation>
+    </message>
+    <message>
+        <source>1 file</source>
+        <translation>1 dosya</translation>
+    </message>
+    <message>
+        <source>%1 files</source>
+        <translation>%1 dosya</translation>
+    </message>
+    <message>
+        <source>1 conversation</source>
+        <translation>1 sohbet</translation>
+    </message>
+    <message>
+        <source>%1 conversations</source>
+        <translation>%1 sohbet</translation>
+    </message>
+    <message>
+        <source>today</source>
+        <translation>bugün</translation>
+    </message>
+    <message>
+        <source>tomorrow</source>
+        <translation>yarın</translation>
+    </message>
+    <message>
+        <source>No scheduled job</source>
+        <translation>Zamanlanmış iş yok</translation>
+    </message>
+    <message>
+        <source>No job</source>
+        <translation>İş yok</translation>
+    </message>
+    <message>
         <source>Unavailable</source>
         <translation>Kullanılamıyor</translation>
     </message>
@@ -3814,12 +3826,28 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Durum alınamıyor</translation>
     </message>
     <message>
-        <source>Persistent across sessions</source>
-        <translation>Oturumlar arasında kalıcı</translation>
+        <source>last record %1</source>
+        <translation>son kayıt %1</translation>
     </message>
     <message>
-        <source>Persistent</source>
-        <translation>Kalıcı</translation>
+        <source>last %1</source>
+        <translation>son %1</translation>
+    </message>
+    <message>
+        <source>no records yet</source>
+        <translation>henüz kayıt yok</translation>
+    </message>
+    <message>
+        <source>no records</source>
+        <translation>kayıt yok</translation>
+    </message>
+    <message>
+        <source>1 record</source>
+        <translation>1 kayıt</translation>
+    </message>
+    <message>
+        <source>%1 records</source>
+        <translation>%1 kayıt</translation>
     </message>
     <message>
         <source>%1 layout options</source>

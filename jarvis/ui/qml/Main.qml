@@ -43,6 +43,8 @@ Window {
                                          title: Theme.title, titleLarge: Theme.titleLarge, reading: Theme.conversationBody,
                                          composer: Theme.composerText })
     readonly property var inkTokens: ({ primary: Theme.text, secondary: Theme.textLabel, muted: Theme.textMuted, dim: Theme.textDim })
+    // Gate 6F (T1): the waiting approval is brought into view in the conversation.
+    signal approvalRevealRequested()
     readonly property bool inlineApproval: presentation === "command" && root.homePage && root.width >= 1500 && !bridge.focusMode
     property bool devApprovalVisible: false
     // The last non-minimized, non-hidden state (full screen / maximized /
@@ -347,6 +349,7 @@ Window {
         activeKey: peekSwitch.running ? peekSwitch.key : peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
         onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("rail", card, anchor, canUp, canDown) }
+        onApprovalRequested: { root.closeContexts(); root.approvalRevealRequested() }
     }
     // Edit Mode's popovers for both regions: over the rail, under approvals.
     LayoutMenus { id: layoutMenus; z: 445; railShown: sidebar.visible; commandMode: root.presentation === "command" }

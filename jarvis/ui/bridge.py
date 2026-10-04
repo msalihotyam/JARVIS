@@ -273,6 +273,7 @@ class Bridge(QObject):
         # Gate 6A: the open conversation's owner, as the store reports it
         # ({} = Global). Context only: nothing here is authority.
         self._conversation_owner: dict[str, Any] = {}
+        self._scope_facts: dict[str, Any] = {}                       # the sidebar's Focus / Memory tiles; presentation only
         # The Projects page: every project (names shown, ids internal), the
         # one whose detail is open, its conversations and its jobs, and the
         # last answer Core gave to a lifecycle request (shown as returned).
@@ -610,6 +611,7 @@ class Bridge(QObject):
         self._open_title = "" if open_record is None else (open_record.title or (
             ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
         self._conversation_owner = self._owner_of(store, open_id)
+        self._scope_facts = self._read_scope_facts(store, self._conversation_owner.get("id") or None)
         scope_owner = self._conversation_owner.get("id") or None
         scope = [r for r in everything if r.project_id == scope_owner and r.archived_at is None]
         self._scope_conversations = [
@@ -645,6 +647,30 @@ class Bridge(QObject):
         if project is None:
             return {"id": record.project_id, "name": record.project_id, "active": False}
         return {"id": project.id, "name": project.name, "active": bool(project.active)}
+
+    @staticmethod
+    def _read_scope_facts(store: Any, project_id: str | None) -> dict[str, Any]:
+        """Gate 6F (tiles T2, T4), read only: what the model sees in the scope -
+        its current instruction and active files (a project) - and the scope's
+        active memory records: their count and the newest write. Genel has no
+        records of its own, so its newest write is across every active project."""
+        facts: dict[str, Any] = {"instruction": False, "file_count": 0, "memory_count": 0, "memory_at": ""}
+        if store is None:
+            return facts
+        try:
+            if project_id:
+                current = store.load_project_instruction(project_id)
+                facts["instruction"] = current is not None and bool(current.text.strip())
+                facts["file_count"] = sum(1 for f in store.list_project_files(project_id) if f.get("lifecycle") == "active")
+                items = store.list_memory_items(project_id)
+            else:
+                # ponytail: one listing per active project; a store-wide "newest item" query if projects grow many
+                items = [i for p in store.list_projects() if p.active for i in store.list_memory_items(p.id)]
+        except Exception:  # noqa: BLE001 - a label only
+            return facts
+        facts["memory_count"] = len(items)
+        facts["memory_at"] = max((i.updated_at or i.created_at for i in items), default="")
+        return facts
 
     @Property("QVariantList", notify=conversationChanged)
     def conversations(self) -> list:
@@ -781,11 +807,14 @@ class Bridge(QObject):
 
     @Property(dict, notify=conversationChanged)
     def conversationProject(self) -> dict:
-        """The open conversation's owner: name and state, or Global."""
+        """The open conversation's owner: name and state, or Global; with the
+        sidebar's read-only scope facts (instruction, file_count, memory_count,
+        memory_at - Gate 6F tiles T2, T4)."""
         owner = self._conversation_owner
         if not owner:
-            return {"id": "", "name": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Global")), "global": True, "archived": False}
-        return {"id": owner["id"], "name": owner["name"], "global": False, "archived": not owner["active"]}
+            return {"id": "", "name": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Global")), "global": True, "archived": False,
+                    **self._scope_facts}
+        return {"id": owner["id"], "name": owner["name"], "global": False, "archived": not owner["active"], **self._scope_facts}
 
     @Property(bool, notify=conversationChanged)
     def conversationReadOnly(self) -> bool:
@@ -851,6 +880,7 @@ class Bridge(QObject):
             self._open_project = ""
         self._load_project_detail()
         self._conversation_owner = self._owner_of(self._conversation_db(), self._conversation_store.id)
+        self._scope_facts = self._read_scope_facts(self._conversation_db(), self._conversation_owner.get("id") or None)
         self.conversationChanged.emit()
         self.projectsChanged.emit()
 
@@ -2163,7 +2193,7 @@ class Bridge(QObject):
         # their tasks and results stay on the Tasks page.
         listing = [row for row in rows(payload, "sessions", "session_id")
                    if not self._of_deleted_conversation(str(row.get("session_id") or ""))]
-        self._sessions = self._titled(listing, "session_id")
+        self._sessions = self._with_latest_task(self._titled(listing, "session_id"))
         if isinstance(payload, dict) and payload.get("error") is not None:
             self._last_error = str(payload["error"].get("message"))
         self.dataChanged.emit()
@@ -2188,6 +2218,21 @@ class Bridge(QObject):
             except Exception:  # noqa: BLE001 - a label only: unreadable reads as untitled
                 cache[owner] = PersistedConversation(None, None)
         return cache[owner]
+
+    def _with_latest_task(self, sessions: list) -> list:
+        """Gate 6F (tile T1), read only: the newest readable session also carries
+        its latest task's status, time and name - one task listing, never one
+        per session."""
+        newest = next((s for s in sessions if s.get("readable") and s.get("latest_task_id")), None)
+        if newest is None:
+            return sessions
+        sid, tid = str(newest["session_id"]), str(newest["latest_task_id"])
+        latest = next((t for t in rows(self.backend.tasks(sid), "tasks", "task_id") if t.get("task_id") == tid), None)
+        if latest is None:
+            return sessions
+        newest.update(latest_status=str(latest.get("status") or ""), latest_updated_at=str(latest.get("updated_at") or ""),
+                      latest_title=self._owner_store(sid, {}).title(tid))
+        return sessions
 
     def _titled(self, listing: list, key: str) -> list:
         """Each row with its display name ("" when it has none); the id stays."""

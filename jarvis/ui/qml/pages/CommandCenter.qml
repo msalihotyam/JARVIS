@@ -71,6 +71,10 @@ Item {
             visible: !page.empty
             referenceLayout: page.roomy
             layoutScale: Math.max(0.75, Math.min(1, page.width / 1231))
+            // The sidebar's amber Tasks tile (Gate 6F T1): the waiting approval
+            // sits at the end of the stream - bring it into view.
+            Connections { target: page.Window.window; ignoreUnknownSignals: true
+                          function onApprovalRevealRequested() { conversation.jumpToLatest() } }
         }
         // The welcome: the greeting and one real question. It carries the
         // truthful execution state instead when that state needs attention.

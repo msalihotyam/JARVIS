@@ -20,6 +20,13 @@ overlap at 1100x700, 1280x760 and 1920x1080 in both themes; a hidden tile
 reflows the grid; the peek opens beside the sidebar level with its tile; the
 right column keeps its place.
 
+Slice F2b - tile content (Salih, T1-T4): Tasks shows the running task, else
+a waiting approval (amber; its click goes to the approval), else the last
+task, else nothing; Focus what the model sees in the selected scope; Plan
+the next scheduled job; Memory the status and this scope's records. Two
+read-only Bridge keys: B3 on the newest ``sessions`` item (its latest task)
+and B4 on ``conversationProject`` (instruction, files, memory records).
+
 No test performs a live model, auth or network call or opens the live DB.
 """
 
@@ -31,13 +38,14 @@ import unittest
 from unittest import mock
 
 from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
 from jarvis.memory import SQLiteMemoryStore
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
-from tests.test_ui import pump
+from tests.test_ui import _APP, pump
 
 
 def say(memory, conversation_id: str, text: str) -> None:
@@ -350,6 +358,185 @@ class SidebarShellTests(SidebarShellCase):
         self.assertTrue(self.item(root, "railFocus").isVisible())
         bridge.setEditMode(False); pump(300)
         self.assertEqual(0, self.execute_calls())
+
+
+class TileContentCase(SidebarShellCase):
+    def text(self, root, name) -> str:
+        return str(self.item(root, name).property("text"))
+
+    def tile(self, root, key) -> tuple:
+        """(value, line, tip) as the tile shows them."""
+        return (self.text(root, "railCount" + key), self.text(root, "railLine" + key),
+                str(self.item(root, "railTip" + key).property("text")))
+
+    def scoped(self):
+        """A project with an instruction, two active files (one more retired), three
+        conversations and two memory records; Global with one conversation."""
+        from jarvis.contracts import DataClassification, ProjectMemoryItem, ProjectMemoryKind
+        store = self.db()
+        project = store.create_project("Ev tadilatı")
+        store.save_explicit_user_project_instruction(project.id, "Yanıtları Türkçe ver.", "internal")
+        conversations = [store.create_conversation(project.id, title=f"Sohbet {n}") for n in range(3)]
+        for n in range(2):
+            store.save_memory_item(ProjectMemoryItem(project_id=project.id, kind=ProjectMemoryKind.FACT, text=f"Kayıt {n}",
+                                                     classification=DataClassification.INTERNAL))
+        global_one = store.create_conversation(title="Genel sohbet")
+        return store, project, conversations, global_one
+
+    def files(self, bridge, project_id, names) -> None:
+        import tempfile
+        from pathlib import Path
+        folder = Path(tempfile.mkdtemp(prefix="jarvis-6f-files-"))
+        for name in names:
+            (folder / name).write_text(f"{name}\n" + "satır\n" * 20, encoding="utf-8")      # distinct: one active copy per content
+            bridge.backend.project_file("add", project_id, path=str(folder / name), classification="internal")
+
+
+class TileContentTests(TileContentCase):
+    def test_m_tasks_shows_the_running_task_a_waiting_approval_the_last_task_or_nothing(self) -> None:
+        import time
+        from tests.test_ui import task_proposal
+        bridge = self.bridge(task_proposal("code_analysis"))
+        root = self.window(bridge)
+        pump(400)
+        # Nothing yet.
+        self.assertEqual(("—", "No task yet"), self.tile(root, "Tasks")[:2])
+        # A waiting approval: amber, and the click goes to the approval (no peek).
+        bridge.submitText("Bu projeyi incele."); pump(400)
+        self.assertTrue(bridge.approvalPending)
+        value, line, tip = self.tile(root, "Tasks")
+        self.assertEqual(("1", "approval waiting"), (value, line))
+        self.assertEqual(QColor("#ffb347").name(), QColor(self.item(root, "railCountTasks").property("color")).name())   # amber
+        self.assertEqual(QColor("#ffb347").name(), QColor(self.item(root, "railLineTasks").property("color")).name())
+        feed = self.item(root, "conversationFeed")
+        feed.setProperty("followEnd", False)
+        self.press(root, "railTasks")
+        self.assertFalse(root.property("peekOpen"))
+        self.assertTrue(feed.property("followEnd"))                     # brought to the end, where the approval is
+        self.assertTrue(self.item(root, "safetyCard_approval").isVisible())
+        # Approved and finished: the last task, its result, name and time.
+        bridge.approve(); pump(500)
+        self.assertFalse(bridge.approvalPending)
+        value, line, tip = self.tile(root, "Tasks")
+        status = bridge.task["status"]
+        self.assertIn(status, ("completed", "failed", "rejected", "cancelled"))
+        self.assertTrue(line.startswith(bridge.task["title"]), line)
+        self.assertRegex(tip, r" · \d\d:\d\d$")
+        # Running: its running time and its name.
+        bridge._session_id = bridge._session_id or "s-1"
+        bridge._busy = True
+        bridge._task = {**bridge._task, "status": "running", "title": "Rapor özeti"}
+        bridge._work_started_at = time.time() - 75
+        bridge.stateChanged.emit(); pump(1300)
+        value, line, tip = self.tile(root, "Tasks")
+        self.assertRegex(value, r"^1:1\d$")
+        self.assertEqual("Rapor özeti", line)
+        bridge._busy = False
+
+    def test_n_tasks_after_a_restart_reads_the_newest_sessions_latest_task_once(self) -> None:
+        bridge = self.bridge()
+        calls = []
+        bridge.backend.sessions = lambda: {"sessions": [
+            {"session_id": "s-new", "updated_at": "2026-10-04T08:00:00+00:00", "readable": True, "latest_task_id": "t-9",
+             "task_count": 2, "active_task_id": ""},
+            {"session_id": "s-old", "updated_at": "2026-10-01T08:00:00+00:00", "readable": True, "latest_task_id": "t-1",
+             "task_count": 1, "active_task_id": ""}]}
+
+        def tasks(session_id):
+            calls.append(session_id)
+            return {"tasks": [{"task_id": "t-9", "session_id": session_id, "status": "failed",
+                               "updated_at": "2026-10-04T08:00:00+00:00", "readable": True}]}
+        bridge.backend.tasks = tasks
+        bridge.refreshHistory()
+        self.assertEqual(["s-new"], calls)                              # one listing, the newest session's
+        newest = bridge.sessions[0]
+        self.assertEqual(("failed", "2026-10-04T08:00:00+00:00"), (newest["latest_status"], newest["latest_updated_at"]))
+        self.assertNotIn("latest_status", bridge.sessions[1])
+        root = self.window(bridge)
+        pump(400)
+        value, line, tip = self.tile(root, "Tasks")
+        self.assertEqual("Failed", value)
+        self.assertTrue(tip.startswith("Failed · "), tip)
+
+    def test_o_focus_says_what_the_model_sees_in_genel_and_in_a_project(self) -> None:
+        store, project, conversations, global_one = self.scoped()
+        bridge = self.bridge()
+        self.files(bridge, project.id, ("a.md", "b.md", "c.md"))
+        retired = store.list_project_files(project.id)[-1]["id"]
+        bridge.backend.project_file("retire", project.id, file_id=retired)
+        bridge.refreshProjects()
+        root = self.window(bridge)
+        bridge.openConversation(global_one.id); pump(400)
+        self.assertEqual(("Global", "no project context"), self.tile(root, "Focus")[:2])
+        bridge.openConversation(conversations[0].id); pump(400)
+        facts = bridge.conversationProject
+        self.assertEqual((True, 2), (facts["instruction"], facts["file_count"]))
+        value, line, tip = self.tile(root, "Focus")
+        self.assertEqual("Ev tadilatı", value)
+        self.assertEqual("Ev tadilatı · instruction ✓ · 2 files · 3 conversations", tip)
+        self.assertIn(line, ("instruction ✓ · 2 files · 3 conversations", "2 files · 3 conversations", "3 conversations"))
+        for width, height in SIZES:
+            root.resize(width, height); pump(500)
+            with self.subTest(size=(width, height)):
+                self.assertFalse(self.item(root, "railLineFocus").property("truncated"))
+
+    def test_p_plan_shows_the_next_job_in_genel_and_in_a_project(self) -> None:
+        from datetime import datetime, timedelta
+        store, project, conversations, global_one = self.scoped()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).astimezone()
+        later = tomorrow + timedelta(days=3)
+        for owner in (global_one.id, conversations[0].id):
+            bridge.openConversation(owner); pump(300)
+            with self.subTest(scope=owner):
+                bridge._jobs = []; bridge.dataChanged.emit(); pump(200)
+                self.assertEqual(("—", "No scheduled job"), self.tile(root, "Plan")[:2])
+                bridge._jobs = [{"id": "j-2", "label": "Yedek", "enabled": True, "next_due_at_utc": later.isoformat()},
+                                {"id": "j-1", "label": "Haftalık rapor", "enabled": True, "next_due_at_utc": tomorrow.isoformat()},
+                                {"id": "j-3", "label": "Kapalı", "enabled": False, "next_due_at_utc": tomorrow.isoformat()}]
+                bridge.dataChanged.emit(); pump(200)
+                value, line, tip = self.tile(root, "Plan")
+                self.assertEqual("09:00", value)
+                self.assertIn(line, ("Haftalık rapor · tomorrow", "Haftalık rapor"))
+                self.assertEqual("Haftalık rapor · tomorrow 09:00", tip)
+
+    def test_q_memory_shows_the_status_and_this_scopes_records(self) -> None:
+        store, project, conversations, global_one = self.scoped()
+        bridge = self.bridge()
+        bridge.refreshConfig()
+        root = self.window(bridge)
+        bridge.openConversation(conversations[0].id); pump(400)
+        self.assertEqual(2, bridge.conversationProject["memory_count"])
+        value, line, tip = self.tile(root, "Memory")
+        self.assertEqual(("Available", "2 records"), (value, line))
+        bridge.openConversation(global_one.id); pump(400)
+        value, line, tip = self.tile(root, "Memory")
+        self.assertEqual("Available", value)
+        self.assertRegex(line, r"^last record \d\d:\d\d$")
+        self.assertFalse(self.item(root, "railMemory").property("activeFocusOnTab"))      # read, not pressed
+
+    def test_r_reading_the_scope_facts_writes_nothing(self) -> None:
+        store, project, conversations, global_one = self.scoped()
+        bridge = self.bridge()
+        bridge.openConversation(conversations[0].id)
+        before = dump(self.database)
+        for _ in range(2):
+            bridge._refresh_conversations()
+            bridge.conversationProject, bridge.sessions
+        bridge.refreshHistory()
+        self.assertEqual(before, dump(self.database))
+
+    def test_s_the_new_tile_strings_are_turkish(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        for source, turkish in (("1 approval waiting", "1 onay bekliyor"), ("No task yet", "Henüz görev yok"),
+                                ("no project context", "proje bağlamı yok"), ("instruction ✓", "talimat ✓"),
+                                ("%1 files", "%1 dosya"), ("%1 conversations", "%1 sohbet"), ("tomorrow", "yarın"),
+                                ("No scheduled job", "Zamanlanmış iş yok"), ("%1 records", "%1 kayıt"),
+                                ("last record %1", "son kayıt %1")):
+            self.assertEqual(turkish, tx("SummaryRail", source))
 
 
 if __name__ == "__main__":  # pragma: no cover

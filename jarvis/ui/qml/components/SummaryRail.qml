@@ -10,6 +10,16 @@ import "../theme"
 // last resort. A click opens the quick-look peek beside the sidebar (Q5);
 // the full page stays one step further. Memory is read, not pressed.
 //
+// What each tile says (Salih, T1-T4), from existing bridge data only:
+//   Tasks  - the running task: its running time and name; else a waiting
+//            approval: the tile turns amber and its click goes to the
+//            approval; else the last task: its result, name and time.
+//   Focus  - what the model sees in the selected scope: the project with
+//            its instruction, files and conversations; Genel has none.
+//   Plan   - the next scheduled job: when, then its name and day.
+//   Memory - the store's status, then this scope's records (a project) or
+//            the last record written (Genel).
+//
 // Every figure comes from a bridge listing; nothing is invented. Order and
 // visibility are the persisted layout (bridge.railCards); in Edit Mode the
 // tiles stop navigating and each offers its layout menu.
@@ -22,6 +32,7 @@ Item {
     property bool big: true                  // the 1920-class tile (84 px), else the compact one (62 px)
     signal picked(string key, real cardY, real cardHeight)
     signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
+    signal approvalRequested()               // the Tasks tile while an approval waits (T1)
 
     // A slow clock so relative ages stay honest without per-second redraws.
     property real now: Date.now()
@@ -57,40 +68,105 @@ Item {
         return best
     }
     readonly property int taskTotal: bridge.sessions.reduce(function(n, s) { return n + (s.task_count || 0) }, 0)
-    readonly property string sessionsWord: bridge.sessions.length === 1 ? qsTr("1 session") : qsTr("%1 sessions").arg(bridge.sessions.length)
-    readonly property string tasksWord: rail.taskTotal === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(rail.taskTotal)
+
+    // -- T1: the running task, a waiting approval, else the last task ------
+    readonly property bool running: bridge.taskLive && !bridge.approvalPending
+    // A 1 s clock only while a task runs: its running time.
+    property real tick: Date.now()
+    Timer { interval: 1000; running: rail.visible && rail.running && bridge.workStartedAt > 0; repeat: true; onTriggered: rail.tick = Date.now() }
+    function clockOf(ms) {
+        var s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), r = s % 60
+        return (h > 0 ? h + ":" + (m < 10 ? "0" : "") : "") + m + ":" + (r < 10 ? "0" : "") + r
+    }
+    // This interface session's finished task (its time: its result's entry),
+    // else the newest durable session's latest task as the store lists it.
+    readonly property var lastTask: {
+        var t = bridge.task || ({})
+        if (t.task_id && ["completed", "failed", "rejected", "cancelled"].indexOf(t.status) >= 0) {
+            var at = ""
+            for (var i = bridge.feed.length - 1; i >= 0; i--)
+                if (bridge.feed[i].task_id === t.task_id && bridge.feed[i].ts) { at = new Date(bridge.feed[i].ts * 1000).toISOString(); break }
+            return { name: t.title || t.capability || qsTr("Current request"), status: t.status, at: at }
+        }
+        var s = bridge.sessions.filter(function(r) { return !!r.latest_status })[0]
+        return s ? { name: s.latest_title || s.title || qsTr("Current request"), status: s.latest_status, at: s.latest_updated_at || "" } : null
+    }
+    readonly property var tasksTile: {
+        var tile = { id: "tasks", key: "Tasks", title: qsTr("Tasks"), icon: "tasks", tone: "#4fd8ff" }
+        if (rail.running) {
+            var name = bridge.task.title || bridge.task.capability || qsTr("Current request")
+            var time = bridge.workStartedAt > 0 ? rail.clockOf(rail.tick - bridge.workStartedAt) : ""
+            return Object.assign(tile, { value: time || rail.statusWord(bridge.task.status), word: !time, dot: Theme.accent,
+                                         lines: [name], tip: time ? qsTr("%1 · running for %2").arg(name).arg(time) : name })
+        }
+        if (bridge.approvalPending) {
+            var waiting = qsTr("1 approval waiting")
+            return Object.assign(tile, { tone: Theme.warning, alert: true, action: "approval", value: "1",
+                                         lines: [waiting.substring(2)], tip: qsTr("Open the waiting approval") })
+        }
+        var last = rail.lastTask
+        if (last) {
+            var when = rail.dueShort(last.at), result = rail.statusWord(last.status)
+            return Object.assign(tile, { value: result, word: true,
+                                         dot: last.status === "completed" ? Theme.success : last.status === "failed" ? Theme.danger : Theme.textMuted,
+                                         lines: when ? [last.name + " · " + when, last.name] : [last.name],
+                                         tip: result + " · " + last.name + (when ? " · " + when : "") })
+        }
+        return Object.assign(tile, { value: "—", lines: [qsTr("No task yet"), qsTr("No task")], tip: qsTr("No task yet") })
+    }
+
+    // -- T2: what the model sees in the selected scope ----------------------
+    readonly property var scope: bridge.conversationProject || ({})
+    readonly property bool global: !!rail.scope.global || !rail.scope.id
+    readonly property var scopeRecord: rail.global ? null : bridge.projectRecords.filter(function(p) { return p.id === rail.scope.id })[0] || null
+    readonly property var focusTile: {
+        var tile = { id: "focus", key: "Focus", title: qsTr("Focus"), icon: "focus", tone: Theme.warning, word: true, value: rail.scope.name || "" }
+        if (rail.global)
+            return Object.assign(tile, { lines: [qsTr("no project context"), qsTr("no context")],
+                                         tip: (rail.scope.name || "") + " · " + qsTr("no project context") })
+        var files = rail.scope.file_count || 0, talks = rail.scopeRecord ? rail.scopeRecord.conversation_count : 0
+        var a = rail.scope.instruction ? qsTr("instruction ✓") : qsTr("no instruction")
+        var b = files === 1 ? qsTr("1 file") : qsTr("%1 files").arg(files)
+        var c = talks === 1 ? qsTr("1 conversation") : qsTr("%1 conversations").arg(talks)
+        return Object.assign(tile, { lines: [a + " · " + b + " · " + c, b + " · " + c, c], tip: rail.scope.name + " · " + a + " · " + b + " · " + c })
+    }
+
+    // -- T3: the next scheduled job ----------------------------------------
+    function dayOf(iso) {
+        var d = new Date(iso), today = new Date(rail.now)
+        var tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1)
+        if (d.toDateString() === today.toDateString()) return qsTr("today")
+        if (d.toDateString() === tomorrow.toDateString()) return qsTr("tomorrow")
+        return d.toLocaleDateString(Qt.locale(i18n.qtLocale), "ddd d MMM")
+    }
+    readonly property var planTile: {
+        var tile = { id: "plan", key: "Plan", title: qsTr("Plan"), icon: "plan", tone: "#9b7bff" }
+        var job = rail.nextJob
+        if (!job)
+            return Object.assign(tile, { value: "—", lines: [qsTr("No scheduled job"), qsTr("No job")], tip: qsTr("No scheduled job") })
+        var name = job.label || job.id, day = rail.dayOf(job.next_due_at_utc)
+        var time = new Date(job.next_due_at_utc).toLocaleTimeString(Qt.locale(i18n.qtLocale), "HH:mm")
+        return Object.assign(tile, { value: time, lines: [name + " · " + day, name], tip: name + " · " + day + " " + time })
+    }
+
+    // -- T4: the memory store and this scope's records ---------------------
+    readonly property var memoryTile: {
+        var word = ({ "Available": qsTr("Available"), "Unavailable": qsTr("Unavailable"),
+                      "Status unavailable": qsTr("Status unavailable") })[bridge.memoryStatus] || bridge.memoryStatus
+        var count = rail.scope.memory_count || 0, at = rail.scope.memory_at || ""
+        var lines = rail.global ? (at ? [qsTr("last record %1").arg(rail.dueShort(at)), qsTr("last %1").arg(rail.dueShort(at))]
+                                      : [qsTr("no records yet"), qsTr("no records")])
+                                : count ? [count === 1 ? qsTr("1 record") : qsTr("%1 records").arg(count)] : [qsTr("no records yet"), qsTr("no records")]
+        return { id: "memory", key: "Memory", title: qsTr("Memory"), icon: "memory", tone: Theme.success, quiet: true, word: true,
+                 dot: bridge.memoryStatus === "Available" ? Theme.success : Theme.warning, value: word, lines: lines, tip: word + " · " + lines[0] }
+    }
 
     // A tile: its title, then `value` - a big number, or with `word` a word
     // after its `dot` - then `lines`, its one short line, longest variant
     // first; `tip` is the whole sentence (its tip and accessible name).
-    // `quiet`: read, not pressed. `key` is the stable id (object names, the
-    // peek); `title` is what is shown.
-    readonly property var modules: {
-        var tasks = bridge.taskLive ? 1 : 0
-        var memoryWord = ({ "Available": qsTr("Available"), "Unavailable": qsTr("Unavailable"),
-                            "Status unavailable": qsTr("Status unavailable") })[bridge.memoryStatus] || bridge.memoryStatus
-        var next = rail.nextJob ? qsTr("Next %1").arg(rail.dueShort(rail.nextJob.next_due_at_utc)) : ""
-        return [
-            { id: "tasks", key: "Tasks", title: qsTr("Tasks"), icon: "tasks", tone: "#4fd8ff", value: String(tasks),
-              lines: [qsTr("%1 active").arg(tasks).substring(String(tasks).length + 1) + " · " + rail.sessionsWord,
-                      qsTr("%1 active").arg(tasks).substring(String(tasks).length + 1)],
-              tip: qsTr("%1 active").arg(tasks) + " · " + rail.sessionsWord + " · " + rail.tasksWord },
-            { id: "focus", key: "Focus", title: qsTr("Focus"), icon: "focus", tone: Theme.warning, value: String(bridge.projects.length),
-              lines: [(bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length))
-                          .substring(String(bridge.projects.length).length + 1) + " · " + (bridge.projects.length ? qsTr("In memory") : qsTr("No context yet")),
-                      (bridge.projects.length === 1 ? qsTr("1 project") : qsTr("%1 projects").arg(bridge.projects.length))
-                          .substring(String(bridge.projects.length).length + 1)],
-              tip: bridge.projects.length ? qsTr("Active in memory") : qsTr("No focus context yet") },
-            { id: "plan", key: "Plan", title: qsTr("Plan"), icon: "plan", tone: "#9b7bff", value: String(rail.enabledJobs.length),
-              lines: [qsTr("%1 scheduled").arg(rail.enabledJobs.length).substring(String(rail.enabledJobs.length).length + 1)
-                          + (next ? " · " + next : ""),
-                      qsTr("%1 scheduled").arg(rail.enabledJobs.length).substring(String(rail.enabledJobs.length).length + 1)],
-              tip: next || (rail.liveJobs.length ? qsTr("Nothing enabled") : qsTr("Nothing scheduled")) },
-            { id: "memory", key: "Memory", title: qsTr("Memory"), icon: "memory", tone: Theme.success, quiet: true, word: true,
-              dot: bridge.memoryStatus === "Available" ? Theme.success : Theme.warning, value: memoryWord,
-              lines: [qsTr("Persistent across sessions"), qsTr("Persistent")], tip: qsTr("Persistent across sessions") }
-        ]
-    }
+    // `quiet`: read, not pressed; `alert` + `action`: the amber approval tile.
+    // `key` is the stable id (object names, the peek); `title` is what is shown.
+    readonly property var modules: [rail.tasksTile, rail.focusTile, rail.planTile, rail.memoryTile]
     readonly property var shownModules: {
         var byId = {}
         rail.modules.forEach(function(m) { byId[m.id] = m })
@@ -136,7 +212,9 @@ Item {
             Accessible.role: card.navigable ? Accessible.Button : Accessible.StaticText
             Accessible.name: modelData.title + ": " + modelData.tip
             function activate() {
-                if (card.navigable) rail.picked(modelData.key, card.y, card.height)
+                if (!card.navigable) return
+                if (modelData.action === "approval") rail.approvalRequested()
+                else rail.picked(modelData.key, card.y, card.height)
             }
             Keys.onReturnPressed: card.activate()
             Keys.onSpacePressed: card.activate()

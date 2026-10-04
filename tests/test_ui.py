@@ -7348,6 +7348,9 @@ class TaskTitleUiTests(SurfaceCase):
         root = self.window(bridge)
         pump(700)
         session_id = bridge.sessions[0]["session_id"]
+        # Gate 6F (T1): while an approval waits the Tasks tile goes to it, so
+        # the approval is answered first; then the tile opens the peek.
+        bridge.cancelTask(); pump(300)
         self.click(root, "railTasks")
         pump(400)
         shown = self.texts(self.item(root, "summaryPeek"))
@@ -7381,6 +7384,7 @@ class TaskTitleUiTests(SurfaceCase):
         bridge = self.started()
         root = self.window(bridge)
         pump(700)
+        bridge.cancelTask(); pump(300)            # Gate 6F (T1): the waiting approval first; then the tile opens the peek
         self.click(root, "railTasks")
         pump(400)
         rows = [r for r in self.all_items(root) if r.objectName() == "summaryPeekRow" and r.isVisible()]

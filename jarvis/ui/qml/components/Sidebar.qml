@@ -17,6 +17,7 @@ Rectangle {
     readonly property alias nav: navigation
     signal picked(string key, real cardY, real cardHeight)
     signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
+    signal approvalRequested()
 
     radius: 12
     color: Theme.glassSecondaryShell
@@ -44,6 +45,7 @@ Rectangle {
         activeKey: sidebar.activeKey
         onPicked: function(key, cardY, cardHeight) { sidebar.picked(key, summaryRail.y + cardY, cardHeight) }
         onMenuRequested: function(card, anchor, canUp, canDown) { sidebar.menuRequested(card, anchor, canUp, canDown) }
+        onApprovalRequested: sidebar.approvalRequested()
     }
     LeftContextCard {
         id: clock
