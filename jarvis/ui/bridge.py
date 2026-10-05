@@ -19,7 +19,7 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -57,8 +57,10 @@ from jarvis.ui.telemetry import Sampler
 from jarvis.ui.preferences import (
     CHAT_PROVIDERS,
     CONTEXTUAL_PANELS,
+    GLOBAL_SCOPE,
     PAGES,
     PANEL_IDS,
+    PIN_LIMIT,
     PROFILES,
     THEMES,
     UiPreferences,
@@ -259,6 +261,9 @@ class Bridge(QObject):
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
         self._conversation_list: list[dict] = []
         self._scope_conversations: list[dict] = []
+        # Gate 6F F6: the pinned conversations' records (any scope) and their owners' names.
+        self._pin_records: dict[str, Any] = {}
+        self._pin_projects: dict[str, dict] = {}
         self._show_old_models = False
         self._rename_notice = ""
         # Gate 6D-b: History's archived Global conversations, whether the open
@@ -332,6 +337,9 @@ class Bridge(QObject):
         # state, so any of the three refreshes it.
         for signal in (self.stateChanged, self.prefsChanged):
             signal.connect(self.providersChanged)
+        # The sidebar's pins and groups follow the lists and the project names.
+        for signal in (self.conversationChanged, self.projectsChanged):
+            signal.connect(self.sidebarChanged)
 
     # -- worker --------------------------------------------------------------
 
@@ -587,10 +595,11 @@ class Bridge(QObject):
         store = self._conversation_db()
         # ONE store read per refresh, every owner: Global's lists, the open scope's list and the
         # per-project counts are all cut from it (never a query per project).
+        listed = store is not None
         try:
             everything = store.list_conversations(include_archived=True) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
-            everything = []
+            everything, listed = [], False
         records = [r for r in everything if r.project_id is None]
         self._conversation_list = [
             {"id": r.id, "origin": r.origin, "updated_at": r.updated_at, "title": self._listed_title(r)}
@@ -620,6 +629,17 @@ class Bridge(QObject):
                                   if r.origin == "legacy-import" else "")}
             for r in scope
         ]
+        # Gate 6F F6: pins of conversations no longer listed (archived, deleted, unknown) are
+        # pruned on this read - never on a failed one, which lists nothing.
+        if listed:
+            self.prefs.prune_sidebar({r.id for r in everything if r.archived_at is None},
+                                     {r.project_id for r in everything if r.project_id})
+        self._pin_records = {r.id: r for r in everything if r.archived_at is None and r.id in self.prefs.sidebar["pins"]}
+        if any(r.project_id for r in self._pin_records.values()):
+            try:
+                self._pin_projects = {p.id: {"id": p.id, "name": p.name, "active": bool(p.active)} for p in store.list_projects()}
+            except Exception:  # noqa: BLE001 - a label only
+                self._pin_projects = {}
         counts: dict[str, list[int]] = {}
         for r in everything:
             if r.project_id is not None:
@@ -778,8 +798,11 @@ class Bridge(QObject):
 
     @Slot(str, result=bool)
     def openConversation(self, conversation_id: str) -> bool:
-        """Open a saved conversation; its history returns to the screen."""
-        conversation_id = str(conversation_id)
+        """Open a saved conversation; its history returns to the screen and its
+        sidebar date group opens (F6)."""
+        return self._open_conversation(str(conversation_id), expand=True)
+
+    def _open_conversation(self, conversation_id: str, expand: bool) -> bool:
         if self._busy:
             return False
         if conversation_id == self._conversation_store.id:
@@ -791,6 +814,8 @@ class Bridge(QObject):
         if opened is None:
             return False
         self._activate(opened)
+        if expand:
+            self._expand_group_of(conversation_id)
         count = len(opened.state.turns)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (1 turn)") if count == 1
                     else QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"), (count,)), "system")
@@ -1120,7 +1145,8 @@ class Bridge(QObject):
         except Exception:  # noqa: BLE001 - storage boundary: create instead
             records = []
         if records:
-            opened = self.openConversation(records[0].id)
+            # A scope pick is not a pick of that conversation: the scope's groups stay as they were left.
+            opened = self._open_conversation(records[0].id, expand=False)
         else:
             opened = self.newProjectConversation(project_id) if project_id else self.newConversation()
         if opened:
@@ -1137,6 +1163,106 @@ class Bridge(QObject):
         if not owner.get("active"):
             return False
         return self.newProjectConversation(owner["id"])
+
+    # -- Gate 6F F6: pinned conversations and collapsible date groups ---------
+    #
+    # Window preferences only (UiPreferences' sidebar file): a pin is an id in
+    # an ordered list, a group's open state a flag per scope. Nothing here
+    # writes the conversation store or changes a conversation, its owner or its
+    # archive state; opening a pinned conversation is openConversation.
+
+    sidebarChanged = Signal()
+
+    @Property(int, constant=True)
+    def pinLimit(self) -> int:
+        return PIN_LIMIT
+
+    @Property("QVariantList", notify=sidebarChanged)
+    def pinnedConversations(self) -> list:
+        """The pinned conversations of every scope, in their manual order: the
+        scopeConversations keys, plus the owner (project_id "" = Global, its
+        name and whether it is archived)."""
+        projects = {**self._pin_projects, **{r["id"]: r for r in self._project_records}}
+        out = []
+        for pin in self.prefs.sidebar["pins"]:
+            record = self._pin_records.get(pin)
+            if record is None:
+                continue
+            owner = projects.get(record.project_id or "", {})
+            title = record.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                     if record.origin == "legacy-import" else "")
+            out.append({"id": record.id, "title": render(title) if isinstance(title, tuple) else title,
+                        "updated_at": record.updated_at, "active": record.id == self._conversation_store.id,
+                        "project_id": record.project_id or "",
+                        "project_name": str(owner.get("name") or record.project_id or ""),
+                        "project_archived": bool(record.project_id) and not owner.get("active", False)})
+        return out
+
+    @Property("QVariantMap", notify=sidebarChanged)
+    def sidebarGroups(self) -> dict:
+        """Which sidebar sections are open: SABİTLENDİ ("pinned", every
+        scope) and the open scope's today / yesterday / earlier."""
+        return {"pinned": self.prefs.sidebar["pins_open"], **self.prefs.groups_open(self._sidebar_scope())}
+
+    def _sidebar_scope(self) -> str:
+        return self._conversation_owner.get("id") or GLOBAL_SCOPE
+
+    def _sidebar_saved(self, changed: bool) -> bool:
+        if changed:
+            self.prefs.save_sidebar()
+            self.sidebarChanged.emit()
+        return changed
+
+    @Slot(str, result=bool)
+    def pinConversation(self, conversation_id: str) -> bool:
+        """Pin a listed, non-archived conversation (to the top); refused at the limit."""
+        conversation_id = str(conversation_id)
+        store = self._conversation_db()
+        try:
+            record = store.load_conversation(conversation_id) if store is not None and conversation_id else None
+        except Exception:  # noqa: BLE001 - storage boundary: not pinned
+            record = None
+        if record is None or record.archived_at is not None:
+            return False
+        changed = self.prefs.pin(conversation_id)
+        if changed:
+            self._pin_records[conversation_id] = record
+            if record.project_id and record.project_id not in self._pin_projects:
+                self._refresh_conversations()
+        return self._sidebar_saved(changed)
+
+    @Slot(str, result=bool)
+    def unpinConversation(self, conversation_id: str) -> bool:
+        return self._sidebar_saved(self.prefs.unpin(str(conversation_id)))
+
+    @Slot(str, int, result=bool)
+    def movePin(self, conversation_id: str, index: int) -> bool:
+        """Put a pin at ``index`` of SABİTLENDİ (drag and drop, Yukarı / Aşağı taşı)."""
+        return self._sidebar_saved(self.prefs.move_pin(str(conversation_id), int(index)))
+
+    @staticmethod
+    def _date_group(updated_at: str) -> str:
+        """The sidebar's date group of a stored timestamp, by the local calendar
+        day as the sidebar groups it (unreadable: earlier)."""
+        try:
+            day = datetime.fromisoformat(str(updated_at)).astimezone().date()
+        except ValueError:
+            return "earlier"
+        today = datetime.now().astimezone().date()
+        return "today" if day >= today else "yesterday" if day == today - timedelta(days=1) else "earlier"
+
+    def _expand_group_of(self, conversation_id: str) -> None:
+        """Switching to a conversation opens its date group (a pinned one has none)."""
+        if conversation_id in self.prefs.sidebar["pins"]:
+            return
+        row = next((r for r in self._scope_conversations if r["id"] == conversation_id), None)
+        if row is not None:
+            self.setGroupOpen(self._date_group(row["updated_at"]), True)
+
+    @Slot(str, bool)
+    def setGroupOpen(self, key: str, open_: bool) -> None:
+        """Open or collapse SABİTLENDİ ("pinned") or one of the open scope's date groups."""
+        self._sidebar_saved(self.prefs.set_group_open(self._sidebar_scope(), str(key), bool(open_)))
 
     # -- Gate 6C "Projeye bağla": attach the open Global conversation --------
     #
@@ -1290,6 +1416,8 @@ class Bridge(QObject):
                         scope: tuple[str | None, bool]) -> bool:
         self._lifecycle_notice = self._error_message(payload)
         if not self._lifecycle_notice:
+            if leaves and self.prefs.unpin(conversation_id):      # archived or deleted: its pin goes (F6)
+                self.prefs.save_sidebar()
             if leaves and conversation_id == self._conversation_store.id:
                 self._leave_open_conversation(*scope)
             else:

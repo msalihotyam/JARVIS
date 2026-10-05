@@ -303,6 +303,36 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     }
 
 
+#: Gate 6F F6. At most this many pinned conversations.
+PIN_LIMIT = 10
+SIDEBAR_VERSION = 1
+#: Genel's key among the per-scope groups (project ids start with "p-").
+GLOBAL_SCOPE = "global"
+#: The date groups' default: Bugün and Dün open, Daha eski collapsed.
+DEFAULT_GROUPS = {"today": True, "yesterday": True, "earlier": False}
+
+
+def canonical_sidebar() -> dict[str, Any]:
+    return {"version": SIDEBAR_VERSION, "pins": [], "pins_open": True, "groups": {}}
+
+
+def validate_sidebar(candidate: Any) -> dict[str, Any]:
+    """The sidebar document, or the canonical one when ANY part is malformed."""
+    defaults = canonical_sidebar()
+    if not isinstance(candidate, dict) or set(candidate) != set(defaults) or candidate["version"] != SIDEBAR_VERSION:
+        return defaults
+    pins, groups = candidate["pins"], candidate["groups"]
+    if (not isinstance(pins, list) or len(pins) > PIN_LIMIT or len(set(map(str, pins))) != len(pins)
+            or any(type(pin) is not str or not pin for pin in pins) or type(candidate["pins_open"]) is not bool):
+        return defaults
+    if not isinstance(groups, dict) or any(
+            type(scope) is not str or not isinstance(state, dict) or set(state) != set(DEFAULT_GROUPS)
+            or any(type(flag) is not bool for flag in state.values()) for scope, state in groups.items()):
+        return defaults
+    return {"version": SIDEBAR_VERSION, "pins": list(pins), "pins_open": candidate["pins_open"],
+            "groups": {scope: dict(state) for scope, state in groups.items()}}
+
+
 def default_preferences_path() -> Path:
     return Path.home() / ".jarvis" / "ui-preferences.json"
 
@@ -407,3 +437,87 @@ class UiPreferences:
 
     def reset_all_layouts(self) -> None:
         self.package()["profiles"] = package_profiles(self.data["theme"])
+
+    # -- Gate 6F F6: the sidebar's pins and collapsed groups -------------------
+    #
+    # Kept in a SIBLING file (``<prefs>.sidebar.json``), never in the main
+    # document: validate_preferences is all-or-nothing on its key set, so an
+    # added key would make every earlier release (8fbbaef included) read the
+    # whole document as defaults - theme, language, layout lost on a rollback.
+    # A release that does not know this file never opens it. Local to this PC,
+    # never a conversation's data: pinning changes no conversation.
+
+    @property
+    def sidebar_path(self) -> Path:
+        return self.path.with_suffix(".sidebar.json")
+
+    @property
+    def sidebar(self) -> dict[str, Any]:
+        if not hasattr(self, "_sidebar"):
+            self._sidebar = self._load_sidebar()
+        return self._sidebar
+
+    def _load_sidebar(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.sidebar_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return canonical_sidebar()
+        return validate_sidebar(raw)
+
+    def save_sidebar(self) -> bool:
+        self._sidebar = validate_sidebar(self.sidebar)
+        try:
+            self.sidebar_path.parent.mkdir(parents=True, exist_ok=True)
+            self.sidebar_path.write_text(json.dumps(self._sidebar, indent=2), encoding="utf-8")
+        except OSError:
+            return False
+        return True
+
+    def prune_sidebar(self, conversation_ids: set[str], scopes: set[str]) -> None:
+        """Forget pins of conversations no longer listed (archived, deleted,
+        unknown) and the groups of scopes no longer known. In memory: the
+        next sidebar write persists it."""
+        self.sidebar["pins"] = [pin for pin in self.sidebar["pins"] if pin in conversation_ids]
+        self.sidebar["groups"] = {key: value for key, value in self.sidebar["groups"].items() if key in scopes | {GLOBAL_SCOPE}}
+
+    def pin(self, conversation_id: str) -> bool:
+        """A new pin goes to the top; refused at the limit."""
+        pins = self.sidebar["pins"]
+        if not conversation_id or conversation_id in pins or len(pins) >= PIN_LIMIT:
+            return False
+        pins.insert(0, conversation_id)
+        return True
+
+    def unpin(self, conversation_id: str) -> bool:
+        if conversation_id not in self.sidebar["pins"]:
+            return False
+        self.sidebar["pins"].remove(conversation_id)
+        return True
+
+    def move_pin(self, conversation_id: str, index: int) -> bool:
+        """Put a pin at ``index`` (clamped to the list)."""
+        pins = self.sidebar["pins"]
+        if conversation_id not in pins:
+            return False
+        at = pins.index(conversation_id)
+        target = int(clamp(int(index), 0, len(pins) - 1))
+        if target == at:
+            return False
+        pins.insert(target, pins.pop(at))
+        return True
+
+    def groups_open(self, scope: str) -> dict[str, bool]:
+        return {**DEFAULT_GROUPS, **self.sidebar["groups"].get(scope or GLOBAL_SCOPE, {})}
+
+    def set_group_open(self, scope: str, key: str, open_: bool) -> bool:
+        if key == "pinned":
+            changed = self.sidebar["pins_open"] != bool(open_)
+            self.sidebar["pins_open"] = bool(open_)
+            return changed
+        if key not in DEFAULT_GROUPS:
+            return False
+        groups = self.groups_open(scope)
+        changed = groups[key] != bool(open_)
+        groups[key] = bool(open_)
+        self.sidebar["groups"][scope or GLOBAL_SCOPE] = groups
+        return changed

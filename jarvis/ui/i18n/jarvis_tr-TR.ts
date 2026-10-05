@@ -1406,6 +1406,30 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Önce arşivleyin</translation>
     </message>
     <message>
+        <source>This conversation is archived: unarchive it to pin it.</source>
+        <translation>Bu sohbet arşivlendi: sabitlemek için arşivden çıkarın.</translation>
+    </message>
+    <message>
+        <source>At most %1 conversations can be pinned: unpin one first.</source>
+        <translation>En fazla %1 sohbet sabitlenebilir: önce birinin sabitlemesini kaldırın.</translation>
+    </message>
+    <message>
+        <source>Unpin</source>
+        <translation>Sabitlemeyi kaldır</translation>
+    </message>
+    <message>
+        <source>Pin</source>
+        <translation>Sabitle</translation>
+    </message>
+    <message>
+        <source>Move up</source>
+        <translation>Yukarı taşı</translation>
+    </message>
+    <message>
+        <source>Move down</source>
+        <translation>Aşağı taşı</translation>
+    </message>
+    <message>
         <source>Rename</source>
         <translation>Yeniden adlandır</translation>
     </message>
@@ -3673,6 +3697,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Süren çalışmanın bitmesini bekleyin.</translation>
     </message>
     <message>
+        <source>Expanded</source>
+        <translation>Açık</translation>
+    </message>
+    <message>
+        <source>Collapsed</source>
+        <translation>Kapalı</translation>
+    </message>
+    <message>
         <source>CONVERSATIONS</source>
         <translation>SOHBETLER</translation>
     </message>
@@ -3689,8 +3721,16 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>%1 içinde yeni sohbet</translation>
     </message>
     <message>
+        <source>PINNED</source>
+        <translation>SABİTLENDİ</translation>
+    </message>
+    <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>In the %1 project</source>
+        <translation>%1 projesinde</translation>
     </message>
     <message>
         <source>No conversation in this scope yet. Press + to start one.</source>

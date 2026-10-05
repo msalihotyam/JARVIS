@@ -43,12 +43,23 @@ themes with long names eliding to their tips; the TopBar has no scope group
 and nothing overlaps there; the Command preset's chip opens the scope and
 conversation menu; the "Projeye bağla" dialog is found by its type.
 
+Slice F6 - collapsible date groups, pins and their order (F6 A-C): a group
+heading collapses its group (its count shown; Bugün + Dün open, Daha eski
+collapsed; the open conversation stays in view; a switch opens its group;
+per scope, across a reopen); SABİTLENDİ gathers the pins of every scope
+above the date groups (not repeated there; pin, faint project, tip), at most
+ten, in a manual order (a drag by the grip, Yukarı / Aşağı taşı; a new pin on
+top); archive and delete unpin. Window preferences only, in UiPreferences'
+sidebar file beside the main document: the store and the main document stay
+byte-identical, unknown ids are pruned on read, older files load.
+
 No test performs a live model, auth or network call or opens the live DB.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import unittest
 from datetime import timezone
@@ -684,6 +695,8 @@ class SidebarNavTests(SidebarNavCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge._refresh_conversations(); pump(300)
+        # F6: Daha eski starts collapsed; its heading opens it.
+        self.tap(root, next(h for h in self.shown(root, "sidebarGroupHead") if h.property("key") == "earlier"))
         groups = {}
         for row in self.shown(root, "sidebarConversation"):
             groups.setdefault(row.parentItem().property("key"), []).append(row.property("title"))
@@ -1698,6 +1711,604 @@ class NameFloorVarianceTests(SidebarNavCase):
                             self.assertEqual(conversation is archived, self.item(root, "chatHeaderScopeArchived").isVisible())
                 bridge.setLanguage("en-US"); pump(200)
         self.assertEqual(0, self.execute_calls())
+
+
+
+class F6Case(SweepCase):
+    """Gate 6F F6: collapsible date groups, pins and their manual order (window preferences only)."""
+
+    def into_view(self, root, item) -> None:
+        """Scroll the sidebar's conversation list so ``item`` (one of its rows or headings) is wholly in view."""
+        flick = self.item(root, "sidebarConversationList")
+        content, node = flick.property("contentItem"), item
+        while node is not None and node != content:
+            node = node.parentItem()
+        if node is None:
+            return
+        top = item.mapToItem(content, QPointF(0, 0)).y()
+        y = flick.property("contentY")
+        if top < y:
+            flick.setProperty("contentY", top)
+        elif top + item.height() > y + flick.height():
+            flick.setProperty("contentY", top + item.height() - flick.height())
+        pump(150)
+
+    def tap(self, root, item, button=Qt.LeftButton) -> None:
+        self.into_view(root, item)
+        super().tap(root, item, button)
+
+    def sidebar_file(self):
+        return self.prefs_path.with_suffix(".sidebar.json")
+
+    def head(self, root, key):
+        if key == "pinned":
+            return self.item(root, "sidebarPinnedHead")
+        found = [h for h in self.shown(root, "sidebarGroupHead") if h.property("key") == key]
+        self.assertEqual(1, len(found), key)
+        return found[0]
+
+    def chevron(self, head) -> float:
+        return next(i for i in self.descendants(head) if i.objectName() == "sidebarGroupChevron").property("rotation")
+
+    def pinned(self, root) -> list:
+        return [i.property("title") for i in self.shown(root, "sidebarPinnedConversation")]
+
+    def pin_row(self, root, title):
+        return self.row(root, "sidebarPinnedConversation", title)
+
+    def menu(self, root, opener, button=Qt.RightButton):
+        self.tap(root, opener, button)
+        menu = self.popup_named(root, "conversationSwitcherContext")
+        self.assertTrue(settle(lambda: bool(menu.property("opened")) and menu.property("opacity") == 1.0))
+        return menu
+
+    def choose(self, root, opener, item, button=Qt.RightButton, label=None) -> None:
+        """Open the conversation menu on ``opener`` and click ``item`` (its label first, when given)."""
+        self.menu(root, opener, button)
+        if label is not None:
+            self.assertEqual(label, self.item(root, item).property("label"))
+        self.tap(root, self.item(root, item))
+
+    def close_menu(self, root) -> None:
+        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close"); pump(400)
+
+    def drag(self, root, row, target_y: float, probe=None) -> None:
+        """A real drag by the row's grip: press, move in steps, release at the scene y ``target_y``."""
+        self.into_view(root, row)
+        grip = self.child(row, "sidebarPinGripArea")
+        start = grip.mapToScene(QPointF(grip.width() / 2, grip.height() / 2)).toPoint()
+        self.hover(root, grip); pump(100)
+        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start); pump(50)
+        steps = 6
+        for n in range(1, steps + 1):
+            QTest.mouseMove(root, QPoint(start.x(), round(start.y() + (target_y - start.y()) * n / steps))); pump(40)
+        if probe is not None:
+            probe()
+        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(target_y))); pump(350)
+
+    def gap_y(self, root, index: int) -> float:
+        """The scene y of the gap above pinned row ``index`` (the one below the last row for len)."""
+        rows = self.shown(root, "sidebarPinnedConversation")
+        if index < len(rows):
+            return rows[index].mapToScene(QPointF(0, 1)).y()
+        return rows[-1].mapToScene(QPointF(0, rows[-1].height() - 1)).y()
+
+    def painted(self, text_item) -> int:
+        text = text_item.property("text")
+        shown = QFontMetricsF(text_item.property("font")).elidedText(text, Qt.TextElideMode.ElideRight, text_item.width())
+        return len(text) if shown == text else len(shown.rstrip("…"))
+
+
+class CollapsibleGroupTests(F6Case):
+    def dated(self):
+        from datetime import datetime, timedelta
+        store = self.db()
+        now = datetime.now().astimezone()
+        today = [store.create_conversation(title=f"Bugün {n}") for n in range(2)]
+        yesterday = store.create_conversation(title="Dün 0")
+        self.stamp(yesterday.id, now - timedelta(days=1))
+        older = [store.create_conversation(title=f"Eski {n}") for n in range(3)]
+        for n, c in enumerate(older):
+            self.stamp(c.id, now - timedelta(days=5, minutes=n))
+        return store, today, yesterday, older
+
+    def test_ss_defaults_a_click_toggles_and_a_collapsed_heading_counts(self) -> None:
+        store, today, yesterday, older = self.dated()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(today[1].id, bridge.conversationId)
+        # Bugün + Dün open, Daha eski collapsed; SABİTLENDİ open (and hidden: nothing pinned).
+        self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.assertFalse(self.item(root, "sidebarPinned").isVisible())
+        self.assertEqual(["Today", "Yesterday", "Earlier"], self.texts(root, "sidebarGroupLabel"))
+        self.assertEqual(["· 3"], self.texts(root, "sidebarGroupCount"))
+        self.assertEqual(["Bugün 1", "Bugün 0", "Dün 0"], self.titles(root))
+        self.assertEqual((90, 90, 0), tuple(self.chevron(self.head(root, k)) for k in ("today", "yesterday", "earlier")))
+        # A click opens it, another collapses it again.
+        self.tap(root, self.head(root, "earlier"))
+        self.assertTrue(bridge.sidebarGroups["earlier"])
+        self.assertEqual(["Bugün 1", "Bugün 0", "Dün 0", "Eski 0", "Eski 1", "Eski 2"], self.titles(root))
+        self.assertEqual([], self.texts(root, "sidebarGroupCount"))
+        self.assertEqual(90, self.chevron(self.head(root, "earlier")))
+        self.tap(root, self.head(root, "earlier"))
+        self.assertEqual(["Bugün 1", "Bugün 0", "Dün 0"], self.titles(root))
+        # The open conversation stays in view inside its collapsed group, marked; the heading counts all.
+        self.tap(root, self.head(root, "today"))
+        self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.assertEqual(["Bugün 1", "Dün 0"], self.titles(root))
+        self.assertTrue(self.row(root, "sidebarConversation", "Bugün 1").property("current"))
+        self.assertEqual(["· 2", "· 3"], self.texts(root, "sidebarGroupCount"))
+        # The keyboard toggles it too (Return on the focused heading).
+        head = self.head(root, "today")
+        head.forceActiveFocus(); pump(100)
+        QTest.keyClick(root, Qt.Key_Return); pump(300)
+        self.assertTrue(bridge.sidebarGroups["today"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_tt_a_switch_opens_its_group_and_the_state_is_per_scope_across_a_reopen(self) -> None:
+        from datetime import datetime, timedelta
+        store = self.db()
+        now = datetime.now().astimezone()
+        tez = store.create_project("Tez")
+        g_old = store.create_conversation(title="Genel eski")
+        self.stamp(g_old.id, now - timedelta(days=5))
+        store.create_conversation(title="Genel yeni")
+        t_old = store.create_conversation(tez.id, title="Tez eski")
+        self.stamp(t_old.id, now - timedelta(days=5))
+        store.create_conversation(tez.id, title="Tez yeni")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.tap(root, self.head(root, "today"))                                # Genel: Bugün collapsed
+        self.tap(root, self.row(root, "sidebarProject", "Tez"))                 # Tez: its own defaults
+        self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.tap(root, self.head(root, "earlier"))                              # Tez: Daha eski open
+        self.assertIn("Tez eski", self.titles(root))
+        self.tap(root, self.item(root, "sidebarGlobal"))                        # back to Genel: as it was left
+        self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.assertNotIn("Genel eski", self.titles(root))
+        # Switching to a conversation of a collapsed group opens that group.
+        self.assertTrue(bridge.openConversation(g_old.id)); pump(300)
+        self.assertTrue(bridge.sidebarGroups["earlier"])
+        self.assertTrue(self.row(root, "sidebarConversation", "Genel eski").property("current"))
+        self.assertFalse(bridge.sidebarGroups["today"])                          # the others keep their state
+        # A reopened window has every scope's state.
+        root.hide()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertTrue(bridge.conversationProject["global"])
+        self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": True}, bridge.sidebarGroups)
+        self.assertEqual(["Genel yeni", "Genel eski"], self.titles(root))             # the open one stays in view
+        self.assertEqual(["· 1"], self.texts(root, "sidebarGroupCount"))
+        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+        self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": True}, bridge.sidebarGroups)
+        self.assertEqual(["Tez yeni", "Tez eski"], self.titles(root))
+        saved = json.loads(self.sidebar_file().read_text(encoding="utf-8"))["groups"]
+        self.assertEqual({"global": {"today": False, "yesterday": True, "earlier": True},
+                          tez.id: {"today": True, "yesterday": True, "earlier": True}}, saved)
+        self.assertEqual(0, self.execute_calls())
+
+
+class PinTests(F6Case):
+    def scoped(self):
+        store = self.db()
+        self.tez = store.create_project("Tez")
+        self.genel = [store.create_conversation(title=f"Genel {n}") for n in range(3)]
+        self.tezc = [store.create_conversation(self.tez.id, title=f"Tez {n}") for n in range(3)]
+        return store
+
+    def test_uu_pin_and_unpin_from_both_menus_across_scopes(self) -> None:
+        self.scoped()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(self.genel[2].id, bridge.conversationId)
+        # A sidebar row's menu: Sabitle - into SABİTLENDİ, out of its date group, the conversation unchanged.
+        self.choose(root, self.row(root, "sidebarConversation", "Genel 0"), "conversationPinItem", label="Pin")
+        self.assertEqual(["Genel 0"], self.pinned(root))
+        self.assertTrue(self.item(root, "sidebarPinned").isVisible())
+        self.assertNotIn("Genel 0", self.titles(root))
+        self.assertEqual(["PINNED"], self.texts(root, "sidebarPinnedLabel"))
+        row = self.pin_row(root, "Genel 0")
+        self.assertFalse(self.child(row, "sidebarPinPlace").isVisible())               # Genel: no label
+        self.assertTrue(self.child(row, "sidebarPinIcon").isVisible())
+        tip = self.child(row, "sidebarRowTip")
+        self.assertEqual(("Genel 0\nGlobal", True), (tip.property("text"), tip.property("active")))
+        # The header "…": the open conversation; a new pin goes to the top.
+        self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton, label="Pin")
+        self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
+        self.assertTrue(self.pin_row(root, "Genel 2").property("current"))
+        # Another scope: its pin joins the same list, labelled with its project.
+        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+        self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))                      # every scope's pins
+        self.choose(root, self.row(root, "sidebarConversation", "Tez 1"), "conversationPinItem", label="Pin")
+        self.assertEqual(["Tez 1", "Genel 2", "Genel 0"], self.pinned(root))
+        self.assertNotIn("Tez 1", self.titles(root))
+        row = self.pin_row(root, "Tez 1")
+        self.assertTrue(self.child(row, "sidebarPinPlace").isVisible())
+        self.assertEqual(["Tez"], [t.property("text") for t in self.descendants(row) if t.objectName() == "sidebarPinPlaceName"])
+        self.assertEqual("Tez 1\nIn the Tez project", self.child(row, "sidebarRowTip").property("text"))
+        # A pin of another scope opens there: the scope pick and the conversation pick.
+        self.tap(root, self.pin_row(root, "Genel 0"))
+        self.assertEqual((self.genel[0].id, True), (bridge.conversationId, bridge.conversationProject["global"]))
+        self.assertTrue(self.item(root, "sidebarGlobal").property("current"))
+        self.assertTrue(self.pin_row(root, "Genel 0").property("current"))
+        self.tap(root, self.pin_row(root, "Tez 1"))
+        self.assertEqual((self.tezc[1].id, self.tez.id), (bridge.conversationId, bridge.conversationProject["id"]))
+        self.assertTrue(self.row(root, "sidebarProject", "Tez").property("current"))
+        self.assertEqual("Tez 1", self.item(root, "chatHeaderTitle").property("text"))
+        # Sabitlemeyi kaldır: from a pinned row of another scope, and from the header.
+        self.choose(root, self.pin_row(root, "Genel 2"), "conversationPinItem", label="Unpin")
+        self.assertEqual(["Tez 1", "Genel 0"], self.pinned(root))
+        self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton, label="Unpin")
+        self.assertEqual(["Genel 0"], self.pinned(root))
+        self.assertIn("Tez 1", self.titles(root))                                        # back in its date group
+        self.tap(root, self.item(root, "sidebarGlobal"))
+        self.assertIn("Genel 2", self.titles(root))
+        self.assertEqual([self.genel[0].id], json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_vv_ten_at_most_with_the_reason_and_archive_or_delete_unpins(self) -> None:
+        store = self.db()
+        convs = [store.create_conversation(title=f"Sohbet {n}") for n in range(11)]
+        tez = store.create_project("Tez")
+        owned = store.create_conversation(tez.id, title="Tez sohbeti")
+        bridge = self.bridge()
+        for c in convs[:9] + [owned]:
+            self.assertTrue(bridge.pinConversation(c.id))
+        root = self.window(bridge)
+        self.assertEqual(10, len(bridge.pinnedConversations))
+        # At the limit: Sabitle is disabled with its reason, and refused.
+        self.menu(root, self.row(root, "sidebarConversation", "Sohbet 10"))
+        pin = self.item(root, "conversationPinItem")
+        self.assertEqual(("Pin", False), (pin.property("label"), pin.property("enabled")))
+        reason = self.item(root, "conversationPinReason")
+        self.assertTrue(reason.isVisible())
+        self.assertEqual("At most 10 conversations can be pinned: unpin one first.", reason.property("text"))
+        self.tap(root, pin)
+        self.assertEqual(10, len(bridge.pinnedConversations))
+        self.close_menu(root)
+        self.assertFalse(bridge.pinConversation(convs[10].id))
+        # A pinned one's menu still unpins at the limit.
+        self.menu(root, self.pin_row(root, "Sohbet 3"))
+        self.assertEqual(("Unpin", True), (self.item(root, "conversationPinItem").property("label"),
+                                           self.item(root, "conversationPinItem").property("enabled")))
+        self.assertFalse(self.item(root, "conversationPinReason").isVisible())
+        # Archive (from its pinned row's menu): the pin goes; the conversation is archived, nothing else.
+        self.tap(root, self.item(root, "conversationArchiveItem"))
+        self.assertIsNotNone(store.load_conversation(convs[3].id).archived_at)
+        self.assertNotIn("Sohbet 3", self.pinned(root))
+        self.assertNotIn(convs[3].id, json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
+        # A pin under a project archived afterwards stays; its menu offers the delete (the project is archived).
+        store.set_project_active(tez.id, False)
+        bridge.refreshProjects(); pump(300)
+        self.assertIn("Tez sohbeti", self.pinned(root))
+        self.menu(root, self.pin_row(root, "Tez sohbeti"))
+        self.assertTrue(self.item(root, "conversationDeleteItem").property("enabled"))
+        self.assertFalse(self.item(root, "conversationArchiveItem").property("enabled"))
+        self.close_menu(root)
+        # The permanent delete (its existing preview + confirm): the pin goes.
+        bridge.previewDeleteConversation(owned.id); pump(60)
+        self.assertTrue(bridge.confirmDeleteConversation(owned.id)); pump(300)
+        self.assertIsNone(store.load_conversation(owned.id))
+        self.assertNotIn("Tez sohbeti", self.pinned(root))
+        self.assertNotIn(owned.id, json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
+        # Below the limit again: Sabitle is back.
+        self.menu(root, self.row(root, "sidebarConversation", "Sohbet 10"))
+        self.assertTrue(self.item(root, "conversationPinItem").property("enabled"))
+        self.assertFalse(self.item(root, "conversationPinReason").isVisible())
+        self.close_menu(root)
+        self.assertEqual(0, self.execute_calls())
+
+
+class PinOrderTests(F6Case):
+    def test_ww_drag_and_the_menu_reorder_a_new_pin_tops_and_the_order_persists(self) -> None:
+        store = self.db()
+        convs = {name: store.create_conversation(title=name) for name in ("A", "B", "C", "D")}
+        bridge = self.bridge()
+        root = self.window(bridge)
+        for name in ("A", "B", "C"):
+            self.choose(root, self.row(root, "sidebarConversation", name), "conversationPinItem")
+        self.assertEqual(["C", "B", "A"], self.pinned(root))                             # each new pin on top
+        self.choose(root, self.row(root, "sidebarConversation", "D"), "conversationPinItem")
+        self.assertEqual(["D", "C", "B", "A"], self.pinned(root))
+        # Hover shows the grip in place of the pin.
+        row = self.pin_row(root, "D")
+        self.hover(root, self.child(row, "sidebarPinGripArea")); pump(200)
+        self.assertTrue(self.child(row, "sidebarPinGrip").isVisible())
+        self.assertFalse(self.child(row, "sidebarPinIcon").isVisible())
+        # A real mouse drag: D into the gap above A; the drop line shows the gap while it moves.
+        seen = {}
+
+        def probe():
+            line = self.item(root, "sidebarPinDropLine")
+            seen.update(line=line.isVisible(), y=self.rect(line).center().y(), dragging=self.pin_row(root, "D").property("dragging"))
+        target = self.gap_y(root, 3)
+        self.drag(root, self.pin_row(root, "D"), target, probe)
+        self.assertEqual((True, True), (seen["line"], seen["dragging"]))
+        self.assertAlmostEqual(target, seen["y"], delta=4)
+        self.assertEqual(["C", "B", "D", "A"], self.pinned(root))
+        self.assertFalse(self.item(root, "sidebarPinDropLine").isVisible())
+        # Down to the end, and up to the top.
+        self.drag(root, self.pin_row(root, "C"), self.gap_y(root, 4))
+        self.assertEqual(["B", "D", "A", "C"], self.pinned(root))
+        self.drag(root, self.pin_row(root, "A"), self.gap_y(root, 0))
+        self.assertEqual(["A", "B", "D", "C"], self.pinned(root))
+        # A drop on its own place moves nothing; a press on the grip without a move is a click (it opens).
+        self.drag(root, self.pin_row(root, "B"), self.gap_y(root, 1) + 8)
+        self.assertEqual(["A", "B", "D", "C"], self.pinned(root))
+        self.tap(root, self.child(self.pin_row(root, "B"), "sidebarPinGripArea"))
+        self.assertEqual(convs["B"].id, bridge.conversationId)
+        # The menu: Yukarı / Aşağı taşı, only where it can move.
+        self.menu(root, self.pin_row(root, "A"))
+        self.assertEqual((False, True), (self.item(root, "conversationPinUpItem").isVisible(),
+                                         self.item(root, "conversationPinDownItem").isVisible()))
+        self.tap(root, self.item(root, "conversationPinDownItem"))
+        self.assertEqual(["B", "A", "D", "C"], self.pinned(root))
+        self.menu(root, self.pin_row(root, "C"))
+        self.assertEqual((True, False), (self.item(root, "conversationPinUpItem").isVisible(),
+                                         self.item(root, "conversationPinDownItem").isVisible()))
+        self.tap(root, self.item(root, "conversationPinUpItem"))
+        self.assertEqual(["B", "A", "C", "D"], self.pinned(root))
+        self.menu(root, self.pin_row(root, "A"))
+        self.assertEqual("Move up", self.item(root, "conversationPinUpItem").property("label"))
+        self.assertEqual("Move down", self.item(root, "conversationPinDownItem").property("label"))
+        self.close_menu(root)
+        # A new pin goes to the top of the manual order.
+        other = store.create_conversation(title="E")
+        bridge._refresh_conversations(); pump(300)
+        self.choose(root, self.row(root, "sidebarConversation", "E"), "conversationPinItem")
+        self.assertEqual(["E", "B", "A", "C", "D"], self.pinned(root))
+        # The order persists across a reopen.
+        root.hide()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(["E", "B", "A", "C", "D"], self.pinned(root))
+        self.assertEqual([other.id] + [convs[n].id for n in ("B", "A", "C", "D")],
+                         json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_xx_a_collapsed_pinned_section_keeps_the_open_pin_and_does_not_drag(self) -> None:
+        store = self.db()
+        for name in ("A", "B", "C"):
+            store.create_conversation(title=name)
+        bridge = self.bridge()
+        for c in store.list_conversations(project_id=None):
+            bridge.pinConversation(c.id)
+        root = self.window(bridge)
+        self.assertEqual(["A", "B", "C"], self.pinned(root))
+        self.tap(root, self.head(root, "pinned"))
+        self.assertFalse(bridge.sidebarGroups["pinned"])
+        self.assertEqual(["C"], self.pinned(root))                                       # the open one stays
+        self.assertEqual(["· 3"], self.texts(root, "sidebarGroupCount"))
+        self.drag(root, self.pin_row(root, "C"), self.gap_y(root, 0) - 40)
+        self.assertEqual(["A", "B", "C"], [p["title"] for p in bridge.pinnedConversations])
+        self.tap(root, self.head(root, "pinned"))
+        self.assertEqual(["A", "B", "C"], self.pinned(root))
+        self.assertEqual(0, self.execute_calls())
+
+
+    def test_ccc_a_drag_held_at_the_lists_edge_scrolls_it_to_every_gap(self) -> None:
+        store = self.db()
+        for n in range(6):
+            store.create_conversation(title=f"Sabit {n}")
+        bridge = self.bridge()
+        for c in reversed(store.list_conversations(project_id=None)):
+            bridge.pinConversation(c.id)
+        root = self.window(bridge)
+        root.resize(1100, 700); pump(900)
+        order = self.pinned(root)
+        listing = self.box(root, "sidebarConversationList")
+        flick = self.item(root, "sidebarConversationList")
+        self.assertLess(flick.height(), 6 * 38)                                          # not all six in view
+        row = self.pin_row(root, order[0])
+        grip = self.child(row, "sidebarPinGripArea")
+        start = grip.mapToScene(QPointF(grip.width() / 2, grip.height() / 2)).toPoint()
+        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start); pump(50)
+        edge = QPoint(start.x(), round(listing.bottom() - 6))
+        for y in range(start.y(), edge.y() + 1, 12):
+            QTest.mouseMove(root, QPoint(start.x(), y)); pump(30)
+        QTest.mouseMove(root, edge)
+        self.assertTrue(settle(lambda: flick.property("contentY") >= flick.property("contentHeight") - flick.height() - 0.5))
+        # Held at the bottom: the gap below the last pin is the drop target.
+        bottom = self.gap_y(root, 6)
+        QTest.mouseMove(root, QPoint(start.x(), round(min(bottom, listing.bottom() - 6)))); pump(100)
+        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(min(bottom, listing.bottom() - 6)))); pump(350)
+        self.assertEqual(order[1:] + order[:1], [p["title"] for p in bridge.pinnedConversations])
+        self.assertEqual(0, self.execute_calls())
+
+
+class SidebarPrefsStorageTests(F6Case):
+    def test_yy_only_the_sidebar_file_is_written_pruned_on_read_and_old_files_load(self) -> None:
+        from jarvis.ui.preferences import UiPreferences, canonical_preferences, validate_preferences
+        store = self.db()
+        tez = store.create_project("Tez")
+        keep = [store.create_conversation(title=f"Genel {n}") for n in range(3)]
+        owned = store.create_conversation(tez.id, title="Tez 0")
+        bridge = self.bridge()
+        bridge.setTheme("dark"); bridge.setLanguage("en-US")                              # a main document on disk
+        root = self.window(bridge)
+        main_before = self.prefs_path.read_bytes()
+        db_before = dump(self.database)
+        # Pin, reorder, collapse - all by mouse.
+        self.choose(root, self.row(root, "sidebarConversation", "Genel 0"), "conversationPinItem")
+        self.choose(root, self.row(root, "sidebarConversation", "Genel 1"), "conversationPinItem")
+        self.choose(root, self.pin_row(root, "Genel 1"), "conversationPinDownItem")
+        self.tap(root, self.head(root, "today"))
+        self.tap(root, self.head(root, "pinned"))
+        self.tap(root, self.head(root, "pinned"))
+        bridge.pinConversation(owned.id); pump(200)
+        # The conversation store and the main preferences document are byte-identical.
+        self.assertEqual(db_before, dump(self.database))
+        self.assertEqual(main_before, self.prefs_path.read_bytes())
+        doc = json.loads(self.prefs_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(canonical_preferences()), set(doc))                         # the release's exact keys
+        self.assertEqual(doc, validate_preferences(doc))                                 # accepted whole, never defaults
+        self.assertEqual("dark", UiPreferences(self.prefs_path).data["theme"])
+        # The sidebar file: its keys and shape.
+        side = json.loads(self.sidebar_file().read_text(encoding="utf-8"))
+        self.assertEqual({"version": 1, "pins": [owned.id, keep[0].id, keep[1].id], "pins_open": True,
+                          "groups": {"global": {"today": False, "yesterday": True, "earlier": False}}}, side)
+        # Unknown, archived and deleted ids (and an unknown scope) are pruned on read.
+        archived = store.create_conversation(title="Arşivlenecek")
+        store.archive_conversation(archived.id)
+        side["pins"] = ["c-unknown", keep[2].id, archived.id] + side["pins"]
+        side["groups"]["p-" + "0" * 32] = {"today": False, "yesterday": False, "earlier": True}
+        self.sidebar_file().write_text(json.dumps(side), encoding="utf-8")
+        root.hide()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual([keep[2].id, owned.id, keep[0].id, keep[1].id], [p["id"] for p in bridge.pinnedConversations])
+        self.assertEqual(["Genel 2", "Tez 0", "Genel 0", "Genel 1"], self.pinned(root))
+        self.assertEqual({"global"}, set(bridge.prefs.sidebar["groups"]))
+        self.assertNotIn("c-unknown", bridge.prefs.sidebar["pins"])
+        # A malformed sidebar file loads as the defaults, never an error.
+        root.hide()
+        self.sidebar_file().write_text('{"version": 1, "pins": "nope"}', encoding="utf-8")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(([], {"pinned": True, "today": True, "yesterday": True, "earlier": False}),
+                         (bridge.pinnedConversations, bridge.sidebarGroups))
+        self.assertEqual("dark", bridge.theme)
+        # A preferences file from before F6 (no sidebar file at all) loads with every choice kept.
+        root.hide()
+        self.sidebar_file().unlink()
+        old = canonical_preferences()
+        old.update(theme="dark", language="tr-TR")
+        self.prefs_path.write_text(json.dumps(old, indent=2), encoding="utf-8")
+        bridge = self.bridge()
+        self.assertEqual(("dark", "tr-TR", []), (bridge.theme, bridge.language, bridge.pinnedConversations))
+        self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.assertFalse(self.sidebar_file().exists())                                   # nothing written by reading
+        bridge.setLanguage("en-US")
+        self.assertEqual(0, self.execute_calls())
+
+
+class PinFitTests(F6Case):
+    def test_zz_ten_long_pins_fit_at_every_size_in_both_themes(self) -> None:
+        store = self.db()
+        longp = store.create_project(LONG_PROJECT)
+        short = store.create_project("Ev")
+        pins = [store.create_conversation(longp.id, title=f"{LONG_TITLE} {n}") for n in range(4)]
+        pins += [store.create_conversation(short.id, title=f"Ev sohbeti {n}") for n in range(3)]
+        pins += [store.create_conversation(title=f"{LONG_TITLE} genel {n}") for n in range(3)]
+        for n in range(4):
+            store.create_conversation(title=f"Liste {n}")
+        bridge = self.bridge()
+        for c in pins:
+            self.assertTrue(bridge.pinConversation(c.id))
+        root = self.window(bridge)
+        for theme in ("space", "dark"):
+            bridge.setTheme(theme)
+            for width, height in SIZES:
+                root.resize(width, height); pump(900)
+                what = f"{theme} {width}x{height}"
+                window = QRectF(0, 0, width, height)
+                with self.subTest(at=what):
+                    self.frame(root, what)
+                    listing = self.box(root, "sidebarConversationList")
+                    for tile in TILES:
+                        self.apart(listing, self.box(root, "rail" + tile), what)
+                    self.inside(self.box(root, "sidebarNav"), listing, what)
+                    # Whole rows inside the list at rest; scrolled to its end, the last row is reachable whole.
+                    flick = self.item(root, "sidebarConversationList")
+                    end = max(0, flick.property("contentHeight") - flick.height())
+                    flick.setProperty("contentY", end); pump(200)
+                    last = self.shown(root, "sidebarConversation")[-1]
+                    self.inside(listing, self.rect(last), what + " last row")
+                    self.no_clipped_text(root, last, what + " last row")
+                    for contentY in (0,):
+                        flick.setProperty("contentY", contentY); pump(200)
+                        whole = 0
+                        for name in ("sidebarPinnedConversation", "sidebarConversation", "sidebarPinnedHead", "sidebarGroupHead"):
+                            for item in self.shown(root, name):
+                                r = self.rect(item)
+                                cut = r.intersected(listing)
+                                if cut.height() > 0.5:
+                                    self.assertAlmostEqual(r.height(), cut.height(), delta=0.5, msg=(what, name, contentY))
+                                    self.no_clipped_text(root, item, f"{what} {name}")
+                                    whole += 1
+                        self.assertGreaterEqual(whole, 2, what)
+                    flick.setProperty("contentY", 0); pump(200)
+                    self.assertEqual(10, len(self.shown(root, "sidebarPinnedConversation")))
+                    # A pinned row: the title keeps six characters, the project label too, and they never touch.
+                    for row in self.shown(root, "sidebarPinnedConversation"):
+                        title = self.child(row, "sidebarPinnedTitle")
+                        self.assertGreaterEqual(self.painted(title), 6, (what, row.property("title")))
+                        place = self.child(row, "sidebarPinPlace")
+                        if place.isVisible():
+                            name = next(t for t in self.descendants(place) if t.objectName() == "sidebarPinPlaceName")
+                            self.assertGreaterEqual(self.painted(name), min(6, len(name.property("text"))), what)
+                            self.assertLessEqual(title.mapToScene(QPointF(title.width(), 0)).x(),
+                                                 self.rect(place).left() - 4, what)
+                            self.inside(self.rect(row), self.rect(place), what)
+                        self.assertTrue(self.child(row, "sidebarRowTip").property("active"))
+                    # The menu with its pin items, on a pinned row, inside the window and unclipped.
+                    menu = self.menu(root, self.shown(root, "sidebarPinnedConversation")[1])
+                    for name in ("conversationPinItem", "conversationPinUpItem", "conversationPinDownItem"):
+                        self.assertTrue(self.item(root, name).isVisible(), name)
+                    body = self.rect(menu.property("background"))
+                    self.inside(window.adjusted(7.5, 7.5, -7.5, -7.5), body, what + " menu")
+                    self.no_clipped_text(root, menu.property("contentItem"), what + " pin menu")
+                    self.close_menu(root)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_aaa_every_f6_action_has_a_mouse_path_at_every_size_in_both_themes(self) -> None:
+        from datetime import datetime, timedelta
+        store = self.db()
+        tez = store.create_project("Tez")
+        old = store.create_conversation(title="Eski")
+        self.stamp(old.id, datetime.now().astimezone() - timedelta(days=5))
+        for n in range(3):
+            store.create_conversation(title=f"Genel {n}")
+        store.create_conversation(tez.id, title="Tez 0")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        keys = []
+        real = QTest.keyClick
+        with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
+            for theme in ("space", "dark"):
+                bridge.setTheme(theme)
+                for width, height in SIZES:
+                    root.resize(width, height); pump(900)
+                    with self.subTest(theme=theme, size=(width, height)):
+                        self.tap(root, self.item(root, "sidebarGlobal"))
+                        self.tap(root, self.head(root, "earlier"))                                   # expand
+                        self.assertIn("Eski", self.titles(root))
+                        self.tap(root, self.head(root, "earlier"))                                   # collapse
+                        self.assertNotIn("Eski", self.titles(root))
+                        self.choose(root, self.row(root, "sidebarConversation", "Genel 0"), "conversationPinItem")
+                        self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton)
+                        self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
+                        self.choose(root, self.pin_row(root, "Genel 2"), "conversationPinDownItem")      # menu move
+                        self.assertEqual(["Genel 0", "Genel 2"], self.pinned(root))
+                        self.drag(root, self.pin_row(root, "Genel 2"), self.gap_y(root, 0))               # drag
+                        self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
+                        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+                        self.tap(root, self.head(root, "today"))                                     # a project's group
+                        self.tap(root, self.head(root, "today"))
+                        self.tap(root, self.pin_row(root, "Genel 0"))                                # another scope's pin
+                        self.assertEqual(bridge.conversationTitle, "Genel 0")
+                        self.tap(root, self.head(root, "pinned"))
+                        self.tap(root, self.head(root, "pinned"))
+                        for title in ("Genel 2", "Genel 0"):                                         # unpin
+                            self.choose(root, self.pin_row(root, title), "conversationPinItem")
+                        self.assertEqual([], self.pinned(root))
+        self.assertEqual([], keys)                                                                    # no shortcut anywhere
+        self.assertEqual(0, self.execute_calls())
+
+    def test_bbb_the_f6_strings_are_turkish(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        for source, turkish in (("Pin", "Sabitle"), ("Unpin", "Sabitlemeyi kaldır"), ("Move up", "Yukarı taşı"),
+                                ("Move down", "Aşağı taşı"),
+                                ("This conversation is archived: unarchive it to pin it.",
+                                 "Bu sohbet arşivlendi: sabitlemek için arşivden çıkarın."),
+                                ("At most %1 conversations can be pinned: unpin one first.",
+                                 "En fazla %1 sohbet sabitlenebilir: önce birinin sabitlemesini kaldırın.")):
+            self.assertEqual(turkish, tx("ConversationMenu", source))
+        for source, turkish in (("PINNED", "SABİTLENDİ"), ("In the %1 project", "%1 projesinde"),
+                                ("Expanded", "Açık"), ("Collapsed", "Kapalı")):
+            self.assertEqual(turkish, tx("Sidebar", source))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Shapes
 import "../theme"
 
 // Gate 6F (L2): the one left panel of the home page. Top to bottom: the
@@ -11,6 +12,10 @@ import "../theme"
 // row pick opens that conversation, "+" starts one in the selected scope; a
 // right-click on a row opens the conversation menu for THAT row (Q8). It
 // selects, grants and approves nothing.
+// F6: SABİTLENDİ (the pins of every scope, in their manual order - drag by
+// the grip or Yukarı / Aşağı taşı in the menu) above the date groups; every
+// group collapses on its heading (the open conversation stays in view). Both
+// are window preferences (bridge.sidebarGroups, bridge.pinnedConversations).
 Rectangle {
     id: sidebar
     objectName: "sidebar"
@@ -52,18 +57,28 @@ Rectangle {
         property string itemId: ""
         property bool current: false
         property bool muted: false
+        // F6, a pinned row: the pin (the grip on hover - drag it to reorder),
+        // its project faint on the right ("" = Genel: none), a tip saying where.
+        property bool pinned: false
+        property string place: ""
+        property string tip: ""
+        property bool dragging: false
         readonly property bool available: !bridge.busy
+        readonly property bool hovered: area.containsMouse || gripArea.containsMouse
         signal activated()
         signal contextRequested(point position)
+        signal dragStarted()
+        signal dragMoved(real sceneY)
+        signal dragEnded()
         width: parent ? parent.width : 0
         height: sidebar.rowH
-        opacity: available ? 1 : 0.38
+        opacity: dragging ? 0.5 : available ? 1 : 0.38
         radius: Theme.radiusSmall
-        color: current ? Theme.alpha(Theme.accent, 0.10) : area.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
+        color: current ? Theme.alpha(Theme.accent, 0.10) : hovered ? Theme.alpha(Theme.text, 0.05) : "transparent"
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
-        Accessible.name: meta !== "" ? title + ", " + meta : title
+        Accessible.name: meta !== "" ? title + ", " + meta : place !== "" ? title + ", " + place : title
         Accessible.onPressAction: if (available) activated()
         Accessible.description: available ? "" : busyReason.text
         Keys.onShortcutOverride: function (event) {
@@ -100,9 +115,9 @@ Rectangle {
         Text {
             id: nameText
             objectName: row.titleName
-            x: row.icon !== "" ? well.x + well.width + 8 : 10
+            x: row.icon !== "" ? well.x + well.width + 8 : row.pinned ? 28 : 10
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, Math.min(implicitWidth, metaText.x - 8 - x))
+            width: Math.max(0, Math.min(implicitWidth, (placeRow.visible ? placeRow.x : metaText.x) - 8 - x))
             text: row.title; textFormat: Text.PlainText; elide: Text.ElideRight
             color: row.current ? Theme.accent : row.muted ? Theme.textLabel : Theme.text
             font: sidebar.big ? Theme.pageRow : Theme.body
@@ -111,6 +126,27 @@ Rectangle {
         Text { id: metaText; objectName: row.metaName; text: row.meta; textFormat: Text.PlainText
                x: row.width - 10 - implicitWidth; anchors.verticalCenter: parent.verticalCenter
                color: Theme.textMuted; font: Theme.captionFigures }
+        // The pin, or on hover the grip (two columns of three dots).
+        SummaryIcon { objectName: "sidebarPinIcon"; visible: row.pinned && !row.hovered && !row.dragging
+                      x: 5; anchors.verticalCenter: parent.verticalCenter; scale: 0.78
+                      icon: "pin"; tint: row.current ? Theme.accent : Theme.textLabel }
+        Grid {
+            objectName: "sidebarPinGrip"
+            visible: row.pinned && (row.hovered || row.dragging)
+            x: 9; anchors.verticalCenter: parent.verticalCenter; columns: 2; spacing: 3
+            Repeater { model: 6; Rectangle { width: 3; height: 3; radius: 1.5; color: gripArea.containsMouse || row.dragging ? Theme.text : Theme.textLabel } }
+        }
+        Row {
+            id: placeRow
+            objectName: "sidebarPinPlace"
+            visible: row.place !== ""
+            x: row.width - 10 - width; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+            Item { width: 12; height: 12; anchors.verticalCenter: parent.verticalCenter
+                   SummaryIcon { anchors.centerIn: parent; scale: 0.67; icon: "project"; tint: Theme.textDim } }
+            Text { objectName: "sidebarPinPlaceName"; anchors.verticalCenter: parent.verticalCenter
+                   width: Math.min(implicitWidth, Math.max(row.width * 0.34, 56)); text: row.place
+                   textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.textDim; font: Theme.caption }
+        }
         Rectangle { objectName: "sidebarRowEdge"; x: 0; y: 8; width: 2; height: row.height - 16; radius: 1; color: Theme.accent
                     opacity: row.current ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
@@ -125,7 +161,70 @@ Rectangle {
                 else if (row.available) row.activated()
             }
         }
-        HoverTip { objectName: "sidebarRowTip"; text: row.available ? row.title : busyReason.text; active: nameText.truncated || !row.available }
+        // The grip: a press and a move past 4 px drags (the sidebar shows where it
+        // drops); a press without a move is a click.
+        MouseArea {
+            id: gripArea
+            objectName: "sidebarPinGripArea"
+            visible: row.pinned
+            width: 26; height: parent.height
+            hoverEnabled: true; preventStealing: true
+            cursorShape: row.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+            property real startY: 0
+            onPressed: function (mouse) { startY = mouse.y }
+            onPositionChanged: function (mouse) {
+                if (!pressed) return
+                if (!row.dragging && Math.abs(mouse.y - startY) > 4) row.dragStarted()
+                if (row.dragging) row.dragMoved(mapToItem(null, mouse.x, mouse.y).y)
+            }
+            onReleased: if (row.dragging) row.dragEnded(); else if (row.available) row.activated()
+            onCanceled: if (row.dragging) row.dragEnded()
+        }
+        HoverTip { objectName: "sidebarRowTip"; text: !row.available ? busyReason.text : row.tip || row.title
+                   active: !row.dragging && (row.tip !== "" || nameText.truncated || !row.available) }
+    }
+    // A collapsible heading (SABİTLENDİ, Bugün / Dün / Daha eski): a click,
+    // Return or Space toggles it; collapsed it shows its count; the chevron
+    // turns (instant with ambient effects off).
+    component GroupHead: Item {
+        id: head
+        property string key: ""
+        property string text: ""
+        property string labelName: ""
+        property int count: 0
+        property bool open: true
+        property font face: Theme.caption
+        function toggle() { bridge.setGroupOpen(head.key, !head.open) }
+        width: parent ? parent.width : 0; height: sidebar.labelH
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: head.text + ", " + head.count
+        Accessible.description: head.open ? qsTr("Expanded") : qsTr("Collapsed")
+        Accessible.onPressAction: toggle()
+        Keys.onReturnPressed: toggle()
+        Keys.onSpacePressed: toggle()
+        Row {
+            x: 10; height: parent.height; spacing: 6
+            Text { objectName: head.labelName; height: parent.height; verticalAlignment: Text.AlignBottom; bottomPadding: 3
+                   text: head.text; textFormat: Text.PlainText; font: head.face
+                   color: headArea.containsMouse ? Theme.textMuted : Theme.textDim
+                   Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
+            Text { objectName: "sidebarGroupCount"; visible: !head.open; height: parent.height; verticalAlignment: Text.AlignBottom; bottomPadding: 3
+                   text: "· " + head.count; font: Theme.captionFigures; color: Theme.textDim }
+            Shape {
+                objectName: "sidebarGroupChevron"
+                width: 10; height: 10; y: parent.height - 3 - 12
+                rotation: head.open ? 90 : 0
+                Behavior on rotation { NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath { strokeColor: headArea.containsMouse ? Theme.textMuted : Theme.textDim; strokeWidth: 1.5; fillColor: "transparent"
+                            capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+                            startX: 3.5; startY: 2; PathLine { x: 7; y: 5 } PathLine { x: 3.5; y: 8 } }
+            }
+        }
+        Rectangle { objectName: "sidebarGroupFocusRing"; visible: head.activeFocus; anchors.fill: parent; radius: Theme.radiusTiny
+                    color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+        MouseArea { id: headArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: head.toggle() }
     }
     // A small text link (PROJELER, archived projects, Arşiv): hover lifts its
     // ink; a tip when it says less than its whole meaning.
@@ -213,10 +312,17 @@ Rectangle {
     // The conversations by the local calendar day of their last change.
     function stamp(v) { return new Date(String(v || "").replace(/(\.\d{3})\d+/, "$1")).getTime() }
     readonly property real today: new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+    // F6: the pins (every scope) and which sections are open; a pinned row is
+    // not repeated in its date group.
+    readonly property var pins: bridge.pinnedConversations
+    readonly property var openGroups: bridge.sidebarGroups
+    function shownRows(items, open) { return open ? items : items.filter(function (c) { return !!c.active }) }
     readonly property var groups: {
         var start = new Date(today), yesterday = new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1).getTime()
         var out = [[], [], []]
-        var list = bridge.scopeConversations
+        var pinned = {}
+        for (var p = 0; p < pins.length; ++p) pinned[pins[p].id] = true
+        var list = bridge.scopeConversations.filter(function (c) { return !pinned[c.id] })
         for (var i = 0; i < list.length; ++i) {
             var t = stamp(list[i].updated_at)
             out[isNaN(t) || t < yesterday ? 2 : t < today ? 1 : 0].push(list[i])
@@ -239,11 +345,15 @@ Rectangle {
     // The tallest run of whole items, from the top, that fits the room.
     readonly property real conversationH: {
         var sizes = []
+        if (pins.length > 0) {
+            sizes.push(labelH)
+            for (var p = 0; p < shownRows(pins, openGroups.pinned).length; ++p) sizes.push(rowH)
+        }
         for (var g = 0; g < groups.length; ++g) {
             sizes.push(labelH)
-            for (var i = 0; i < groups[g].items.length; ++i) sizes.push(rowH)
+            for (var i = 0; i < shownRows(groups[g].items, openGroups[groups[g].key]).length; ++i) sizes.push(rowH)
         }
-        if (groups.length === 0) sizes.push(emptyLine.implicitHeight)
+        if (emptyLine.visible) sizes.push(emptyLine.implicitHeight)
         if (scopeArchived > 0) sizes.push(linkH + 4)
         var h = 0
         for (var k = 0; k < sizes.length; ++k) {
@@ -437,6 +547,8 @@ Rectangle {
                 objectName: "sidebarConversationList"
                 width: parent.width; height: sidebar.conversationH
                 clip: true; contentHeight: conversationColumn.height
+                // The drawn pins and chevrons stay inside the clip with every scene-graph backend.
+                layer.enabled: true
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                 // A scope change fades the list in (as the 6E project switch).
@@ -447,16 +559,96 @@ Rectangle {
                 Column {
                     id: conversationColumn
                     width: conversationList.width - (conversationList.contentHeight > conversationList.height ? 10 : 0); spacing: 2
+                    // SABİTLENDİ: hidden when nothing is pinned. A pin of another scope
+                    // opens there (the sidebar follows the open conversation's scope).
+                    Column {
+                        id: pinSection
+                        objectName: "sidebarPinned"
+                        visible: sidebar.pins.length > 0
+                        width: parent.width; spacing: 2
+                        // The drag: which pin, from where, the pointer (scene y), the gap it
+                        // would drop into, and whether it holds at the list's top / bottom edge
+                        // (-1 / 1: the list scrolls under it, so every gap is reachable).
+                        property string dragId: ""
+                        property int from: -1
+                        property int dropAt: -1
+                        property real pointer: 0
+                        property int edge: 0
+                        function dropIndex(sceneY) {
+                            var y = pinColumn.mapFromItem(null, 0, sceneY).y
+                            return Math.max(0, Math.min(sidebar.pins.length, Math.round(y / sidebar.step)))
+                        }
+                        function track() {
+                            var y = conversationList.mapFromItem(null, 0, pointer).y
+                            edge = y > conversationList.height - 18 ? 1 : y < 18 ? -1 : 0
+                            dropAt = dropIndex(pointer)
+                        }
+                        Timer {
+                            interval: 40; repeat: true; running: pinSection.dragId !== "" && pinSection.edge !== 0
+                            onTriggered: {
+                                conversationList.contentY = Math.max(0, Math.min(conversationList.contentHeight - conversationList.height,
+                                                                                 conversationList.contentY + pinSection.edge * 6))
+                                pinSection.track()
+                            }
+                        }
+                        function drop() {
+                            var id = dragId, start = from, to = dropAt
+                            dragId = ""; from = -1; dropAt = -1; edge = 0
+                            if (id !== "" && to >= 0 && to !== start && to !== start + 1) bridge.movePin(id, to > start ? to - 1 : to)
+                        }
+                        GroupHead {
+                            objectName: "sidebarPinnedHead"; labelName: "sidebarPinnedLabel"; key: "pinned"
+                            text: i18n.upper(qsTr("PINNED")); face: Theme.label
+                            count: sidebar.pins.length; open: !!sidebar.openGroups.pinned
+                        }
+                        Item {
+                            width: parent.width; height: pinColumn.height
+                            Column {
+                                id: pinColumn
+                                width: parent.width; spacing: 2
+                                Repeater {
+                                    model: sidebar.shownRows(sidebar.pins, sidebar.openGroups.pinned)
+                                    NavRow {
+                                        id: pinRow
+                                        objectName: "sidebarPinnedConversation"
+                                        titleName: "sidebarPinnedTitle"
+                                        itemId: modelData.id; pinned: true
+                                        title: modelData.title || qsTr("New Chat"); muted: !modelData.title
+                                        place: modelData.project_id !== "" ? modelData.project_name : ""
+                                        tip: title + "\n" + (modelData.project_id !== "" ? qsTr("In the %1 project").arg(modelData.project_name) : qsTr("Global"))
+                                        current: !!modelData.active
+                                        dragging: pinSection.dragId === modelData.id
+                                        onActivated: bridge.openConversation(modelData.id)
+                                        onContextRequested: function (position) {
+                                            if (sidebar.conversationMenu) sidebar.conversationMenu.openFor(modelData.id, modelData.title, pinRow, position,
+                                                                                                           null, null, modelData.project_archived)
+                                        }
+                                        onDragStarted: if (sidebar.openGroups.pinned) { pinSection.dragId = modelData.id; pinSection.from = index }
+                                        onDragMoved: function (sceneY) { pinSection.pointer = sceneY; pinSection.track() }
+                                        onDragEnded: pinSection.drop()
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                objectName: "sidebarPinDropLine"
+                                visible: pinSection.dragId !== "" && pinSection.dropAt >= 0
+                                x: 6; width: parent.width - 12; height: 2; radius: 1; color: Theme.accent
+                                y: Math.max(0, Math.min(parent.height - height, pinSection.dropAt * sidebar.step - 2))
+                            }
+                        }
+                    }
                     Repeater {
                         model: sidebar.groups
                         Column {
                             id: group
                             readonly property string key: modelData.key
                             width: parent.width; spacing: 2
-                            Text { objectName: "sidebarGroupLabel"; x: 10; height: sidebar.labelH; verticalAlignment: Text.AlignBottom
-                                   bottomPadding: 3; text: modelData.label; color: Theme.textDim; font: Theme.caption }
+                            GroupHead {
+                                objectName: "sidebarGroupHead"; labelName: "sidebarGroupLabel"; key: group.key
+                                text: modelData.label; count: modelData.items.length; open: !!sidebar.openGroups[group.key]
+                            }
                             Repeater {
-                                model: modelData.items
+                                model: sidebar.shownRows(modelData.items, sidebar.openGroups[group.key])
                                 NavRow {
                                     id: conversationRow
                                     objectName: "sidebarConversation"
@@ -476,7 +668,7 @@ Rectangle {
                     Text {
                         id: emptyLine
                         objectName: "sidebarConversationEmpty"
-                        visible: sidebar.groups.length === 0
+                        visible: bridge.scopeConversations.length === 0
                         x: 10; width: parent.width - 20; topPadding: 4; bottomPadding: 4
                         wrapMode: Text.Wrap; textFormat: Text.PlainText
                         text: qsTr("No conversation in this scope yet. Press + to start one.")

@@ -3,7 +3,7 @@ import QtQuick.Shapes
 
 // The summary line icons (tasks / updates / focus / plan / memory), drawn at
 // 18 px so the rail cards and their peek panels share one set; and the
-// sidebar's scope icons (global, project - Gate 6F).
+// sidebar's scope icons (global, project - Gate 6F) and its pin (F6).
 Shape {
     id: glyph
     property string icon: "tasks"
@@ -73,5 +73,15 @@ Shape {
         startX: 2; startY: 4
         PathLine { x: 7; y: 4 } PathLine { x: 9; y: 6 } PathLine { x: 16; y: 6 } PathLine { x: 16; y: 15 }
         PathLine { x: 2; y: 15 } PathLine { x: 2; y: 4 }
+    }
+    // Pin: a pushpin - the cap, the body flaring to its rim, the needle.
+    ShapePath {
+        strokeColor: glyph.icon === "pin" ? glyph.tint : "transparent"; strokeWidth: 1.6; fillColor: "transparent"
+        joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
+        startX: 5.5; startY: 2
+        PathLine { x: 12.5; y: 2 }
+        PathMove { x: 7; y: 2 } PathLine { x: 6.5; y: 7.5 } PathLine { x: 4; y: 10.5 } PathLine { x: 14; y: 10.5 }
+        PathLine { x: 11.5; y: 7.5 } PathLine { x: 11; y: 2 }
+        PathMove { x: 9; y: 10.5 } PathLine { x: 9; y: 16.5 }
     }
 }

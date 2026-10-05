@@ -9,6 +9,9 @@ import "../theme"
 // acts on WITHOUT opening it. Every item is disabled with its
 // reason (archived project or conversation, not archived yet, a busy run);
 // the store still refuses. Each acts on the conversation it was opened for.
+// F6: Sabitle / Sabitlemeyi kaldır (at most bridge.pinLimit, disabled with
+// its reason at the limit) and, on a pinned one, Yukarı / Aşağı taşı - window
+// preferences only, the conversation itself never changes.
 // It holds the scope menus' shared parts (a row, a reason, a divider, the
 // glass popup), which the Command preset's scope menu uses too.
 Item {
@@ -78,10 +81,14 @@ Item {
     // the open one's scope (never archived, the same owner: the same reasons).
     property string rowId: ""
     property string rowTitle: ""
+    // A pinned row of ANOTHER scope says whether its own project is archived;
+    // undefined = the open conversation's owner (a row of the open scope).
+    property var rowOwnerArchived: undefined
     readonly property string targetId: rowId || bridge.conversationId
     readonly property string shown: (rowId ? rowTitle : bridge.conversationTitle) || qsTr("New Chat")
     readonly property bool archived: !rowId && bridge.conversationArchived
-    readonly property bool ownerArchived: !!(bridge.conversationProject || {}).archived
+    readonly property bool ownerArchived: rowId && rowOwnerArchived !== undefined ? !!rowOwnerArchived
+                                                                              : !!(bridge.conversationProject || {}).archived
     readonly property bool open: context.visible
     readonly property bool renameAllowed: targetId !== "" && !archived && !ownerArchived && !bridge.busy
     readonly property string renameReason: targetId === "" ? qsTr("This conversation is not saved yet.")
@@ -99,6 +106,16 @@ Item {
     readonly property string deleteReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : bridge.busy ? qsTr("Wait for the current run to finish.")
         : !deleteAllowed ? qsTr("Archive it first") : ""
+    // Pinning (F6): the target's place in SABİTLENDİ (-1 = not pinned).
+    readonly property int pinIndex: { var pins = bridge.pinnedConversations
+                                      for (var i = 0; i < pins.length; ++i) if (pins[i].id === targetId) return i
+                                      return -1 }
+    readonly property bool pinned: pinIndex >= 0
+    readonly property bool pinAllowed: targetId !== "" && !bridge.busy && (pinned || (!archived && bridge.pinnedConversations.length < bridge.pinLimit))
+    readonly property string pinReason: targetId === "" ? qsTr("This conversation is not saved yet.")
+        : bridge.busy ? qsTr("Wait for the current run to finish.")
+        : archived ? qsTr("This conversation is archived: unarchive it to pin it.")
+        : !pinAllowed ? qsTr("At most %1 conversations can be pinned: unpin one first.").arg(bridge.pinLimit) : ""
     // An edit is bound to the conversation it STARTED on, and is reverted
     // when the open conversation changes under it.
     property string editId: ""
@@ -108,10 +125,11 @@ Item {
     // Open the menu for `id` ("" or the open one's id = the open conversation),
     // at `point` of `anchor`, kept inside the window (8 px clear of its edges);
     // its rename editor at `editPoint` of `editAnchor` when given, else there too.
-    function openFor(id, title, anchor, point, editAnchor, editPoint) {
+    function openFor(id, title, anchor, point, editAnchor, editPoint, ownerArchived) {
         editor.close()
         rowId = id === bridge.conversationId ? "" : (id || "")
         rowTitle = title || ""
+        rowOwnerArchived = ownerArchived
         var p = anchor.mapToItem(menu, point.x, point.y)
         place(context, p)
         place(editor, editAnchor ? editAnchor.mapToItem(menu, editPoint.x, editPoint.y) : p)
@@ -138,6 +156,16 @@ Item {
                    bottomPadding: 4; elide: Text.ElideRight; textFormat: Text.PlainText
                    text: menu.shown; color: Theme.textMuted; font: Theme.caption
                    HoverTip { objectName: "conversationContextHeaderTip"; text: parent.text; active: parent.truncated } }
+            ScopeChoice { objectName: "conversationPinItem"; width: context.availableWidth
+                          label: menu.pinned ? qsTr("Unpin") : qsTr("Pin"); available: menu.pinAllowed
+                          onChosen: { var id = menu.targetId; context.close()
+                                      if (menu.pinned) bridge.unpinConversation(id); else bridge.pinConversation(id) } }
+            Reason { width: context.availableWidth; objectName: "conversationPinReason"; visible: !menu.pinAllowed; text: menu.pinReason }
+            ScopeChoice { objectName: "conversationPinUpItem"; width: context.availableWidth; visible: menu.pinIndex > 0
+                          label: qsTr("Move up"); onChosen: { var id = menu.targetId, to = menu.pinIndex - 1; context.close(); bridge.movePin(id, to) } }
+            ScopeChoice { objectName: "conversationPinDownItem"; width: context.availableWidth
+                          visible: menu.pinned && menu.pinIndex < bridge.pinnedConversations.length - 1
+                          label: qsTr("Move down"); onChosen: { var id = menu.targetId, to = menu.pinIndex + 1; context.close(); bridge.movePin(id, to) } }
             ScopeChoice { objectName: "conversationRenameItem"; width: context.availableWidth
                           label: qsTr("Rename"); available: menu.renameAllowed
                           onChosen: { menu.editId = menu.targetId; menu.editTitle = menu.rowId ? menu.rowTitle : bridge.conversationTitle
