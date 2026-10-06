@@ -71,6 +71,7 @@ from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
 from jarvis.memory import SQLiteMemoryStore
+from tests.helpers import wait_still, wait_until
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.test_ui import _APP, pump
@@ -231,10 +232,30 @@ class SidebarShellCase(ProjectsUiCase):
         overlap = a.intersected(b)
         self.assertFalse(overlap.width() > 0.5 and overlap.height() > 0.5, what)
 
-    def press(self, root, name) -> None:
+    def press(self, root, name, until=None) -> None:
         item = self.item(root, name)
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
-        pump(350)
+        if until is None:
+            pump(350)
+        else:                                       # S0b: the state the caller asserts next; the old wait is the ceiling
+            wait_until(until, 350)
+
+    def resize_still(self, root, width: int, height: int, ceiling_ms: int) -> None:
+        """Resize, then wait until the home frame (sidebar, header, composer, column) stops
+        moving - its width animates; the old fixed wait is the ceiling."""
+        root.resize(width, height)
+        names = ("sidebar", "chatHeader", "canonicalComposer", "panelColumn")
+        wait_still(lambda: (root.width(), root.height(),
+                            tuple(self.rect(i) for n in names for i in self.all_items(root, n))), ceiling_ms)
+
+    def closed(self, popup, ceiling_ms: int) -> None:
+        """Close a popup; wait until it is gone (its exit transition ended); the old wait is the ceiling."""
+        QMetaObject.invokeMethod(popup, "close")
+        wait_until(lambda: not popup.property("visible"), ceiling_ms)
+
+    def home(self, root, bridge, ceiling_ms: int) -> None:
+        bridge.setPage("home")
+        wait_until(lambda: root.property("loadedPage") == "home", ceiling_ms)
 
 
 class SidebarShellTests(SidebarShellCase):
@@ -244,7 +265,7 @@ class SidebarShellTests(SidebarShellCase):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for width, height in SIZES:
-                root.resize(width, height); pump(700)
+                self.resize_still(root, width, height, 700)
                 with self.subTest(theme=theme, size=(width, height)):
                     window = QRectF(0, 0, width, height)
                     side = self.box(root, "sidebar")
@@ -291,7 +312,7 @@ class SidebarShellTests(SidebarShellCase):
         # The right column at c49e856 (L5): (x, y, width) per size.
         column = {(1100, 700): (858, 150, 221), (1280, 760): (998, 150, 257), (1920, 1080): (1497, 205, 386)}
         for width, height in SIZES:
-            root.resize(width, height); pump(700)
+            self.resize_still(root, width, height, 700)
             with self.subTest(size=(width, height)):
                 stack = self.box(root, "panelColumn")
                 self.assertEqual(column[(width, height)], (round(stack.x()), round(stack.y()), round(stack.width())))
@@ -316,7 +337,7 @@ class SidebarShellTests(SidebarShellCase):
         bridge = self.bridge()
         root = self.window(bridge)
         for width, height in SIZES:
-            root.resize(width, height); pump(600)
+            self.resize_still(root, width, height, 600)
             tile, gap = (86, 8) if width >= 1600 else (74, 6)
             with self.subTest(size=(width, height)):
                 nav_full = self.box(root, "sidebarNav").height()
@@ -343,7 +364,7 @@ class SidebarShellTests(SidebarShellCase):
         bridge = self.bridge()
         root = self.window(bridge)
         for width, height in SIZES:
-            root.resize(width, height); pump(600)
+            self.resize_still(root, width, height, 600)
             for key in ("Tasks", "Focus", "Plan"):
                 with self.subTest(size=(width, height), tile=key):
                     self.press(root, "rail" + key)
@@ -502,7 +523,7 @@ class TileContentTests(TileContentCase):
         self.assertEqual("Ev tadilatı · instruction ✓ · 2 files · 3 conversations", tip)
         self.assertIn(line, ("instruction ✓ · 2 files · 3 conversations", "2 files · 3 conversations", "3 conversations"))
         for width, height in SIZES:
-            root.resize(width, height); pump(500)
+            self.resize_still(root, width, height, 500)
             with self.subTest(size=(width, height)):
                 self.assertFalse(self.item(root, "railLineFocus").property("truncated"))
 
@@ -573,7 +594,7 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
     def shown(self, root, name) -> list:
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
-    def tap(self, root, item, button=Qt.LeftButton) -> None:
+    def tap(self, root, item, button=Qt.LeftButton, until=None) -> None:
         last = None
         for _ in range(60):                         # the work surface may still be reflowing (it animates its width)
             now = self.rect(item)
@@ -582,7 +603,10 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
             last = now
             pump(40)
         QTest.mouseClick(root, button, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
-        pump(350)
+        if until is None:
+            pump(350)
+        else:                                       # S0b: the state the caller asserts next; the old wait is the ceiling
+            wait_until(until, 350)
 
     def row(self, root, name, title):
         found = [i for i in self.shown(root, name) if i.property("title") == title]
@@ -623,7 +647,7 @@ class SidebarNavTests(SidebarNavCase):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for width, height in SIZES:
-                root.resize(width, height); pump(700)
+                self.resize_still(root, width, height, 700)
                 with self.subTest(theme=theme, size=(width, height)):
                     side, nav = self.box(root, "sidebar"), self.box(root, "sidebarNav")
                     self.inside(side, nav, "nav")
@@ -939,7 +963,7 @@ class SidebarNavTests(SidebarNavCase):
         self.tap(root, self.row(root, "sidebarProject", "Tek"))
         self.assertFalse(self.item(root, "sidebarArchive").isVisible())
         # Below 760 px of height the archived-projects link folds into the heading as "(n)".
-        root.resize(1100, 700); pump(600)
+        self.resize_still(root, 1100, 700, 600)
         self.assertFalse(self.item(root, "sidebarArchivedProjects").isVisible())
         folded = self.item(root, "sidebarArchivedProjectsCount")
         self.assertEqual(("(1)", "Archived projects"), (folded.property("count"), folded.property("tip")))
@@ -1058,7 +1082,7 @@ class ChatHeaderTests(SidebarNavCase):
             for key, conversation in (("project", owned), ("global", global_long)):
                 bridge.openConversation(conversation.id); pump(300)
                 for width, height in SIZES:
-                    root.resize(width, height); pump(600)
+                    self.resize_still(root, width, height, 600)
                     with self.subTest(theme=theme, owner=key, size=(width, height)):
                         header = self.box(root, "chatHeader")
                         self.inside(self.box(root, "canonicalWorkspace"), header, "header")
@@ -1179,7 +1203,7 @@ class ChatHeaderTests(SidebarNavCase):
         for theme in ("space", "command"):
             bridge.setTheme(theme); pump(400)
             for width, height in SIZES:
-                root.resize(width, height); pump(600)
+                self.resize_still(root, width, height, 600)
                 with self.subTest(theme=theme, size=(width, height)):
                     window = QRectF(0, 0, width, height)
                     mine = [self.box(root, "chatHeader")] + ([self.box(root, "sidebar")] if theme != "command" else [])
@@ -1408,21 +1432,24 @@ class MenuOpacityTests(PunchListCase):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for width, height in SIZES[:2] + SIZES[2:]:
-                root.resize(width, height); pump(700)
+                self.resize_still(root, width, height, 700)
                 bridge.openProjectScope(self.many.id); pump(400)
                 with self.subTest(theme=theme, size=(width, height)):
-                    self.tap(root, self.shown(root, "sidebarConversation")[1], Qt.RightButton)
+                    self.tap(root, self.shown(root, "sidebarConversation")[1], Qt.RightButton,
+                             until=lambda: self.is_open(self.popup(root, "conversationSwitcherContext")))
                     self.opaque(root, "conversationSwitcherContext", "the sidebar row menu")
-                    self.tap(root, self.item(root, "conversationRenameItem"))
+                    self.tap(root, self.item(root, "conversationRenameItem"),
+                             until=lambda: self.is_open(self.popup(root, "conversationRenameEditor")))
                     self.opaque(root, "conversationRenameEditor", "the rename editor")
-                    QMetaObject.invokeMethod(self.popup(root, "conversationRenameEditor"), "close"); pump(400)
-                    self.tap(root, self.item(root, "chatHeaderMenu"))
+                    self.closed(self.popup(root, "conversationRenameEditor"), 400)
+                    self.tap(root, self.item(root, "chatHeaderMenu"),
+                             until=lambda: self.is_open(self.popup(root, "conversationSwitcherContext")))
                     self.opaque(root, "conversationSwitcherContext", "the header menu")
-                    QMetaObject.invokeMethod(self.popup(root, "conversationSwitcherContext"), "close"); pump(400)
+                    self.closed(self.popup(root, "conversationSwitcherContext"), 400)
                     for chip, menu in (("permissionModeControl", "permissionModeMenu"), ("attachControl", "attachMenu")):
-                        self.tap(root, self.item(root, chip))
+                        self.tap(root, self.item(root, chip), until=lambda: self.is_open(self.popup(root, menu)))
                         self.opaque(root, menu, "the composer")
-                        QMetaObject.invokeMethod(self.popup(root, menu), "close"); pump(400)
+                        self.closed(self.popup(root, menu), 400)
         # The Command preset's scope menu is the same material.
         bridge.setTheme("command"); pump(500)
         bridge.openProjectScope(self.many.id); pump(400)
@@ -1520,7 +1547,7 @@ class SweepTests(SweepCase):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for width, height in SIZES:
-                root.resize(width, height); pump(900)
+                self.resize_still(root, width, height, 900)
                 window = QRectF(0, 0, width, height)
                 what = f"{theme} {width}x{height}"
                 with self.subTest(state="rest", at=what):
@@ -1528,7 +1555,9 @@ class SweepTests(SweepCase):
                     self.no_clipped_text(root, self.item(root, "sidebar"), what + " sidebar")
                     self.no_clipped_text(root, self.item(root, "chatHeader"), what + " header")
                 with self.subTest(state="row menu", at=what):
-                    self.tap(root, self.shown(root, "sidebarConversation")[0], Qt.RightButton)
+                    context = self.popup_named(root, "conversationSwitcherContext")
+                    self.tap(root, self.shown(root, "sidebarConversation")[0], Qt.RightButton,
+                             until=lambda: bool(context.property("opened")) and context.property("opacity") == 1.0)
                     menu = self.opened_menu(root, "conversationSwitcherContext")
                     body = self.rect(menu.property("background"))
                     self.inside(window, body, "row menu in the window")
@@ -1536,36 +1565,42 @@ class SweepTests(SweepCase):
                     self.assertLessEqual(body.right(), width - 7.5)
                     self.assertLessEqual(body.bottom(), height - 7.5)
                     self.no_clipped_text(root, menu.property("contentItem"), what + " row menu")
-                    QMetaObject.invokeMethod(menu, "close"); pump(400)
+                    self.closed(menu, 400)
                 with self.subTest(state="header menu", at=what):
-                    self.tap(root, self.item(root, "chatHeaderMenu"))
+                    self.tap(root, self.item(root, "chatHeaderMenu"),
+                             until=lambda: bool(context.property("opened")) and context.property("opacity") == 1.0)
                     menu = self.opened_menu(root, "conversationSwitcherContext")
                     self.inside(window, self.rect(menu.property("background")), "header menu in the window")
                     self.no_clipped_text(root, menu.property("contentItem"), what + " header menu")
-                    QMetaObject.invokeMethod(menu, "close"); pump(400)
+                    self.closed(menu, 400)
                 with self.subTest(state="rename editor", at=what):
-                    self.tap(root, self.item(root, "chatHeaderMenu"))
-                    self.tap(root, self.item(root, "conversationRenameItem"))
+                    self.tap(root, self.item(root, "chatHeaderMenu"),
+                             until=lambda: bool(context.property("opened")) and context.property("opacity") == 1.0)
+                    named = self.popup_named(root, "conversationRenameEditor")
+                    self.tap(root, self.item(root, "conversationRenameItem"),
+                             until=lambda: bool(named.property("opened")) and named.property("opacity") == 1.0)
                     editor = self.opened_menu(root, "conversationRenameEditor")
                     self.inside(window, self.rect(editor.property("background")), "rename editor in the window")
                     self.no_clipped_text(root, editor.property("contentItem"), what + " rename editor")
-                    QMetaObject.invokeMethod(editor, "close"); pump(400)
+                    self.closed(editor, 400)
                 for key in ("Tasks", "Focus", "Plan"):
                     with self.subTest(state="peek " + key, at=what):
-                        self.press(root, "rail" + key)
+                        self.press(root, "rail" + key, until=lambda: root.property("peekOpen"))
                         self.assertTrue(root.property("peekOpen"))
                         peek = self.item(root, "summaryPeek")
                         self.inside(window, self.rect(peek), "peek in the window")
                         self.apart(self.rect(peek), self.box(root, "sidebar"), "peek over the sidebar")
                         self.no_clipped_text(root, peek, what + " peek " + key)
-                        self.press(root, "rail" + key)
+                        self.press(root, "rail" + key, until=lambda: not root.property("peekOpen"))
                 for chip, menu_name in (("permissionModeControl", "permissionModeMenu"), ("attachControl", "attachMenu")):
                     with self.subTest(state=menu_name, at=what):
-                        self.tap(root, self.item(root, chip))
+                        chip_menu = self.popup_named(root, menu_name)
+                        self.tap(root, self.item(root, chip),
+                                 until=lambda: bool(chip_menu.property("opened")) and chip_menu.property("opacity") == 1.0)
                         menu = self.opened_menu(root, menu_name)
                         self.inside(window, self.rect(menu.property("background")), menu_name + " in the window")
                         self.no_clipped_text(root, menu.property("contentItem"), what + " " + menu_name)
-                        QMetaObject.invokeMethod(menu, "close"); pump(400)
+                        self.closed(menu, 400)
         self.assertEqual(0, self.execute_calls())
 
 
@@ -1580,51 +1615,55 @@ class SweepPathTests(SweepCase):
             for theme in ("space", "dark"):
                 bridge.setTheme(theme)
                 for width, height in SIZES:
-                    root.resize(width, height); pump(900)
+                    self.resize_still(root, width, height, 900)
                     with self.subTest(theme=theme, size=(width, height)):
-                        bridge.setPage("home"); bridge.openProjectScope(""); pump(400)
-                        self.tap(root, self.item(root, "sidebarGlobal"))                                     # Genel
+                        bridge.setPage("home"); bridge.openProjectScope("")
+                        wait_until(lambda: root.property("loadedPage") == "home" and bridge.conversationProject["global"], 400)
+                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])  # Genel
                         self.assertTrue(bridge.conversationProject["global"])
-                        self.tap(root, self.row(root, "sidebarProject", "Çok"))                              # a project
+                        self.tap(root, self.row(root, "sidebarProject", "Çok"),
+                                 until=lambda: bridge.conversationProject["id"] == self.many.id)               # a project
                         self.assertEqual(self.many.id, bridge.conversationProject["id"])
                         other = next(t for t in self.titles(root) if t.startswith("Çok ") and not self.row(root, "sidebarConversation", t).property("current"))
-                        self.tap(root, self.scrolled_row(root, other))                                       # a conversation
+                        self.tap(root, self.scrolled_row(root, other), until=lambda: bridge.conversationTitle == other)  # a conversation
                         self.assertEqual(other, bridge.conversationTitle)
                         before = bridge.conversationId
-                        self.tap(root, self.item(root, "sidebarNewConversation"))                            # the round +
+                        self.tap(root, self.item(root, "sidebarNewConversation"), until=lambda: bridge.conversationId != before)  # the round +
                         self.assertNotEqual(before, bridge.conversationId)
                         self.tap(root, self.scrolled_row(root, other), Qt.RightButton)                       # its row menu
                         self.assertTrue(self.opened_menu_named(root, "conversationSwitcherContext"))
                         for item in ("conversationRenameItem", "conversationArchiveItem", "conversationDeleteItem"):
                             self.assertTrue(self.item(root, item).isVisible(), item)
-                        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close"); pump(400)
+                        self.closed(self.popup_named(root, "conversationSwitcherContext"), 400)
                         self.tap(root, self.item(root, "chatHeaderMenu"))                                    # the header "…"
                         self.assertTrue(self.opened_menu_named(root, "conversationSwitcherContext"))
-                        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close"); pump(400)
-                        self.tap(root, self.item(root, "sidebarGlobal"))
+                        self.closed(self.popup_named(root, "conversationSwitcherContext"), 400)
+                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])
                         self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())                     # Projeye bağla
                         self.tap(root, self.item(root, "chatHeaderAttach"))
                         dialog = attach_dialog(root)
                         self.assertTrue(settle(lambda: bool(dialog.property("visible"))))
-                        QMetaObject.invokeMethod(dialog, "close"); pump(400)
+                        self.closed(dialog, 400)
                         for key in ("Tasks", "Focus", "Plan"):                                               # the tiles' peeks
-                            self.tap(root, self.item(root, "rail" + key))
+                            self.tap(root, self.item(root, "rail" + key),
+                                     until=lambda: (root.property("peekOpen"), root.property("peekKey")) == (True, key))
                             self.assertEqual((True, key), (root.property("peekOpen"), root.property("peekKey")))
-                            self.tap(root, self.item(root, "rail" + key))
+                            self.tap(root, self.item(root, "rail" + key), until=lambda: not root.property("peekOpen"))
                             self.assertFalse(root.property("peekOpen"))
                         listing = self.item(root, "sidebarConversationList")                                 # the link is the list's last
                         listing.setProperty("contentY", max(0, listing.property("contentHeight") - listing.height())); pump(200)
-                        self.tap(root, self.item(root, "sidebarArchive"))                                    # Arşiv
+                        self.tap(root, self.item(root, "sidebarArchive"), until=lambda: bridge.page == "history")  # Arşiv
                         self.assertEqual("history", bridge.page)
-                        bridge.setPage("home"); pump(400)
-                        self.tap(root, self.item(root, "sidebarProjectsLink"))                               # PROJELER
+                        self.home(root, bridge, 400)
+                        self.tap(root, self.item(root, "sidebarProjectsLink"), until=lambda: bridge.page == "projects")  # PROJELER
                         self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
-                        bridge.setPage("home"); pump(400)
-                        self.tap(root, self.item(root, "sidebarNewProject"))                                 # new project
+                        self.home(root, bridge, 400)
+                        self.tap(root, self.item(root, "sidebarNewProject"), until=lambda: bridge.page == "projects")  # new project
                         self.assertEqual("projects", bridge.page)
-                        bridge.setPage("home"); pump(400)
+                        self.home(root, bridge, 400)
                         self.tap(root, self.item(root, "sidebarArchivedProjects") if self.shown(root, "sidebarArchivedProjects")
-                                 else self.item(root, "sidebarArchivedProjectsCount"))                       # archived projects
+                                 else self.item(root, "sidebarArchivedProjectsCount"),
+                                 until=lambda: bridge.page == "projects")                                    # archived projects
                         self.assertEqual("projects", bridge.page)
         self.assertEqual([], keys)                                                                           # no shortcut anywhere
         self.assertEqual(0, self.execute_calls())
@@ -1648,7 +1687,7 @@ class SweepDefectTests(SweepCase):
         bridge = self.bridge()
         bridge.openConversation(long_conv.id)
         root = self.window(bridge)
-        root.resize(1100, 700); pump(900)
+        self.resize_still(root, 1100, 700, 900)
         # The conversation menu's header names the conversation it acts on: elided, it has its tip.
         self.tap(root, self.item(root, "chatHeaderMenu"))
         header = self.item(root, "conversationContextHeader")
@@ -1699,9 +1738,10 @@ class NameFloorVarianceTests(SidebarNavCase):
                     if language == "tr-TR":
                         bridge.setLanguage("tr-TR"); pump(300)
                     for conversation in (archived, live):
-                        bridge.openConversation(conversation.id); bridge.setPage("home"); pump(300)
+                        bridge.openConversation(conversation.id); bridge.setPage("home")
+                        wait_until(lambda: bridge.conversationId == conversation.id and root.property("loadedPage") == "home", 300)
                         for width, height in SIZES:
-                            root.resize(width, height); pump(400)
+                            self.resize_still(root, width, height, 400)
                             self.steady(root, "chatHeader")
                             for name in ("chatHeaderScopeName", "chatHeaderTitle", "sidebarScopeName"):
                                 text = self.item(root, name)
@@ -1726,16 +1766,17 @@ class F6Case(SweepCase):
         if node is None:
             return
         top = item.mapToItem(content, QPointF(0, 0)).y()
-        y = flick.property("contentY")
+        y = target = flick.property("contentY")
         if top < y:
-            flick.setProperty("contentY", top)
+            target = top
         elif top + item.height() > y + flick.height():
-            flick.setProperty("contentY", top + item.height() - flick.height())
-        pump(150)
+            target = top + item.height() - flick.height()
+        flick.setProperty("contentY", target)
+        wait_until(lambda: abs(flick.property("contentY") - target) < 0.5, 150)       # S0b: at once when no scroll
 
-    def tap(self, root, item, button=Qt.LeftButton) -> None:
+    def tap(self, root, item, button=Qt.LeftButton, until=None) -> None:
         self.into_view(root, item)
-        super().tap(root, item, button)
+        super().tap(root, item, button, until)
 
     def sidebar_file(self):
         return self.prefs_path.with_suffix(".sidebar.json")
@@ -1757,20 +1798,21 @@ class F6Case(SweepCase):
         return self.row(root, "sidebarPinnedConversation", title)
 
     def menu(self, root, opener, button=Qt.RightButton):
-        self.tap(root, opener, button)
         menu = self.popup_named(root, "conversationSwitcherContext")
+        opened = lambda: bool(menu.property("opened")) and menu.property("opacity") == 1.0  # noqa: E731
+        self.tap(root, opener, button, until=opened)
         self.assertTrue(settle(lambda: bool(menu.property("opened")) and menu.property("opacity") == 1.0))
         return menu
 
     def choose(self, root, opener, item, button=Qt.RightButton, label=None) -> None:
         """Open the conversation menu on ``opener`` and click ``item`` (its label first, when given)."""
-        self.menu(root, opener, button)
+        menu = self.menu(root, opener, button)
         if label is not None:
             self.assertEqual(label, self.item(root, item).property("label"))
-        self.tap(root, self.item(root, item))
+        self.tap(root, self.item(root, item), until=lambda: not menu.property("visible"))   # a chosen item closes it
 
     def close_menu(self, root) -> None:
-        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close"); pump(400)
+        self.closed(self.popup_named(root, "conversationSwitcherContext"), 400)
 
     def drag(self, root, row, target_y: float, probe=None) -> None:
         """A real drag by the row's grip: press, move in steps, release at the scene y ``target_y``."""
@@ -2094,7 +2136,7 @@ class PinOrderTests(F6Case):
         for c in reversed(store.list_conversations(project_id=None)):
             bridge.pinConversation(c.id)
         root = self.window(bridge)
-        root.resize(1100, 700); pump(900)
+        self.resize_still(root, 1100, 700, 900)
         order = self.pinned(root)
         listing = self.box(root, "sidebarConversationList")
         flick = self.item(root, "sidebarConversationList")
@@ -2199,7 +2241,7 @@ class PinFitTests(F6Case):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for width, height in SIZES:
-                root.resize(width, height); pump(900)
+                self.resize_still(root, width, height, 900)
                 what = f"{theme} {width}x{height}"
                 window = QRectF(0, 0, width, height)
                 with self.subTest(at=what):
@@ -2268,12 +2310,12 @@ class PinFitTests(F6Case):
             for theme in ("space", "dark"):
                 bridge.setTheme(theme)
                 for width, height in SIZES:
-                    root.resize(width, height); pump(900)
+                    self.resize_still(root, width, height, 900)
                     with self.subTest(theme=theme, size=(width, height)):
-                        self.tap(root, self.item(root, "sidebarGlobal"))
-                        self.tap(root, self.head(root, "earlier"))                                   # expand
+                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])
+                        self.tap(root, self.head(root, "earlier"), until=lambda: "Eski" in self.titles(root))   # expand
                         self.assertIn("Eski", self.titles(root))
-                        self.tap(root, self.head(root, "earlier"))                                   # collapse
+                        self.tap(root, self.head(root, "earlier"), until=lambda: "Eski" not in self.titles(root))  # collapse
                         self.assertNotIn("Eski", self.titles(root))
                         self.choose(root, self.row(root, "sidebarConversation", "Genel 0"), "conversationPinItem")
                         self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton)
@@ -2282,13 +2324,13 @@ class PinFitTests(F6Case):
                         self.assertEqual(["Genel 0", "Genel 2"], self.pinned(root))
                         self.drag(root, self.pin_row(root, "Genel 2"), self.gap_y(root, 0))               # drag
                         self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
-                        self.tap(root, self.row(root, "sidebarProject", "Tez"))
-                        self.tap(root, self.head(root, "today"))                                     # a project's group
-                        self.tap(root, self.head(root, "today"))
-                        self.tap(root, self.pin_row(root, "Genel 0"))                                # another scope's pin
+                        self.tap(root, self.row(root, "sidebarProject", "Tez"), until=lambda: bridge.conversationProject["name"] == "Tez")
+                        self.tap(root, self.head(root, "today"), until=lambda: not bridge.sidebarGroups["today"])  # a project's group
+                        self.tap(root, self.head(root, "today"), until=lambda: bridge.sidebarGroups["today"])
+                        self.tap(root, self.pin_row(root, "Genel 0"), until=lambda: bridge.conversationTitle == "Genel 0")  # another scope's pin
                         self.assertEqual(bridge.conversationTitle, "Genel 0")
-                        self.tap(root, self.head(root, "pinned"))
-                        self.tap(root, self.head(root, "pinned"))
+                        self.tap(root, self.head(root, "pinned"), until=lambda: not bridge.sidebarGroups["pinned"])
+                        self.tap(root, self.head(root, "pinned"), until=lambda: bridge.sidebarGroups["pinned"])
                         for title in ("Genel 2", "Genel 0"):                                         # unpin
                             self.choose(root, self.pin_row(root, title), "conversationPinItem")
                         self.assertEqual([], self.pinned(root))
@@ -2440,7 +2482,7 @@ class RowMenuButtonTests(F6Case):
         root = self.window(bridge)
         self.assertEqual(b.id, bridge.conversationId)
         for width, height in SIZES:
-            root.resize(width, height); pump(700)
+            self.resize_still(root, width, height, 700)
             with self.subTest(size=(width, height)):
                 self.away(root)
                 row = self.row(root, "sidebarConversation", a.title)

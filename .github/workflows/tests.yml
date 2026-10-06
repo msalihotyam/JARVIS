@@ -7,6 +7,13 @@
 #
 # No secrets, no tokens (read-only), no network calls from the tests. Every
 # third-party action is pinned to a full commit SHA.
+#
+# S0b: the suite runs as SHARDS duration-balanced shards (a deterministic plan
+# from scripts/test_durations.json; tests without a record go to the
+# least-loaded shard), then one aggregate job checks every shard's report
+# against a fresh discovery - the total count and the exact test-id set - and
+# gives the one result. The shard count is the matrix below and --shards in
+# the aggregate step: change both together.
 name: tests
 
 on:
@@ -22,9 +29,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  suite:
+  shard:
+    name: shard ${{ matrix.shard }}/4
     runs-on: windows-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       PYTHONUTF8: "1"
     steps:
@@ -35,28 +47,94 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # v7.0.0
+      # v7.0.0; its own pip cache, keyed on this file (it names the one dependency).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml
 
       # The suite needs exactly PySide6 (same version as the local system Python).
       - name: Install PySide6
         shell: pwsh
         run: python -m pip install "PySide6==6.11.2"
 
-      # The parallel runner: UI modules serially in ONE worker, the rest over N
-      # workers; it applies the load-sensitive rerun rule (RUNBOOK rule D).
-      - name: Run the full suite
+      # This shard of the plan: UI units over K processes, the rest over N
+      # workers; it applies the load-sensitive rerun rule (RUNBOOK rule D) and
+      # checks that it ran exactly the tests it dispatched.
+      - name: Run this shard
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --durations 30 *> ci-summary.txt
+          python scripts/test_parallel.py --shard ${{ matrix.shard }}/4 --durations 30 --report shard-report.json *> shard-summary.txt
           $code = $LASTEXITCODE
+          Get-Content shard-summary.txt
+          exit $code
+
+      # v7.0.1
+      - name: Upload this shard's summary and report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ci-shard-${{ matrix.shard }}
+          path: |
+            shard-summary.txt
+            shard-report.json
+          if-no-files-found: warn
+
+  aggregate:
+    name: aggregate
+    needs: shard
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml
+
+      # Discovery imports every test module.
+      - name: Install PySide6
+        shell: pwsh
+        run: python -m pip install "PySide6==6.11.2"
+
+      # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: ci-shard-*
+          path: shards
+
+      # Every shard's report against a fresh discovery and the same plan: the
+      # count, the exact id set, each shard green; one result.
+      - name: Check and combine the shards
+        shell: pwsh
+        run: |
+          python scripts/test_parallel.py --aggregate shards --shards 4 --durations 30 *> ci-summary.txt
+          $code = $LASTEXITCODE
+          # Per shard: its workers and totals when green, its whole summary (the traces) when not.
+          foreach ($file in Get-ChildItem shards -Recurse -Filter shard-summary.txt | Sort-Object FullName) {
+            $text = @(Get-Content $file.FullName)
+            Add-Content ci-summary.txt "`n===== $($file.Directory.Name) =====" -Encoding utf8
+            if (($text | Select-Object -Last 1) -eq "OK") {
+              $text = $text | Where-Object { $_ -match '^(\d+ modules|\d+ units|worker |Ran |rule D|  \S+: (PASS|FAIL) alone)' }
+            }
+            $text | Add-Content ci-summary.txt -Encoding utf8
+          }
           Get-Content ci-summary.txt
           exit $code
 
       # v7.0.1
-      - name: Upload the runner summary and failing traces
+      - name: Upload the combined summary
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

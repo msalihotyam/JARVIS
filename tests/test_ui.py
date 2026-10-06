@@ -51,7 +51,7 @@ from jarvis.ui.preferences import (  # noqa: E402
     canonical_preferences,
     validate_preferences,
 )
-from tests.helpers import safe_cleanup  # noqa: E402
+from tests.helpers import safe_cleanup, wait_still, wait_until  # noqa: E402
 from tests.test_intent import (  # noqa: E402
     ACCOUNT,
     OTHER_ACCOUNT,
@@ -770,12 +770,15 @@ class PresentationTests(UiTestCase):
         self.assertIsNotNone(item, name)
         return item
 
-    def click(self, root, name):
+    def click(self, root, name, until=None):
         from PySide6.QtCore import QPointF
         item = self.item(root, name)
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
-        pump(260)
+        if until is None:
+            pump(260)
+        else:                       # S0b: the state the caller asserts next; the old wait is the ceiling
+            wait_until(until, 260)
 
     def window(self, bridge):
         root = self.load(bridge)
@@ -972,17 +975,17 @@ class SecondaryPageTests(UiTestCase):
             for page in ("tasks", "automations", "memory", "history"):
                 for action in ("x", "escape"):
                     with self.subTest(theme=theme, page=page, action=action):
-                        self.click(root, "navigationTrigger")
-                        self.click(root, "navigate_" + page)
+                        self.click(root, "navigationTrigger", until=lambda: root.property("navOpen"))
+                        self.click(root, "navigate_" + page, until=lambda: root.property("loadedPage") == page)
                         self.assertEqual(page, bridge.page)
                         close = self.item(root, "secondaryPageClose")
                         self.assertTrue(close.isVisible())
                         self.assertTrue(close.isEnabled())
                         if action == "x":
-                            self.click(root, "secondaryPageClose")
+                            self.click(root, "secondaryPageClose", until=lambda: bridge.page == "home")
                         else:
                             QTest.keyClick(root, Qt.Key_Escape)
-                            pump(300)
+                            wait_until(lambda: bridge.page == "home", 300)
                         self.assertEqual("home", bridge.page)
                         self.assertTrue(root.isVisible())
                         self.assertEqual(theme, bridge.theme)
@@ -2100,10 +2103,12 @@ class ConversationSurfaceTests(UiTestCase):
         root = self.window(bridge)
         for width, height in ((1920, 1080), (1536, 864), (1280, 760), (1100, 700)):
             root.resize(width, height)
-            pump(600)
+            wait_still(lambda: (root.width(), self.box(root, "sidebar"), self.box(root, "panelColumn")), 600)
             for key in self.SUMMARY:
                 with self.subTest(size=(width, height), module=key):
-                    self.click(root, "rail" + key); pump(300)
+                    # S0b: open, then the peek at rest (it moves in); the old waits are the ceilings.
+                    self.click(root, "rail" + key, until=lambda: root.property("peekOpen"))
+                    wait_still(lambda: self.box(root, "summaryPeek"), 300)
                     peek = self.box(root, "summaryPeek"); close = self.box(root, "summaryPeekClose")
                     self.assertGreaterEqual(peek[0], 0); self.assertGreaterEqual(peek[1], 0)
                     self.assertLessEqual(peek[2], width); self.assertLessEqual(peek[3], height)
@@ -2112,7 +2117,8 @@ class ConversationSurfaceTests(UiTestCase):
                     tile = self.box(root, "rail" + key)
                     self.assertGreaterEqual(peek[0], self.box(root, "sidebar")[2])
                     self.assertLessEqual(peek[1], tile[1])
-                    self.click(root, "rail" + key); pump(300)
+                    self.click(root, "rail" + key, until=lambda: not root.property("peekOpen"))
+                    wait_until(lambda: not root.property("peekOpen"), 300)
                     self.assertFalse(root.property("peekOpen"))
         # An empty installation: no tasks, projects or jobs exist, so those
         # peeks show their truthful empty state rather than invented rows.
@@ -5130,6 +5136,9 @@ class EditMenuPasteTests(SurfaceCase):
         reads) and behind the bridge's seam (what the attachment decision reads)."""
         from PySide6.QtGui import QGuiApplication
         QGuiApplication.clipboard().setMimeData(self.mime(kind, folder))
+        # S0b (orchestrator-approved hygiene): never leave image / URL MIME data on the process
+        # clipboard - a process that exits holding it crashes in Qt's teardown (0xC0000005).
+        self.addCleanup(QGuiApplication.clipboard().clear)
         data = self.mime(kind, folder)
         bridge.clipboard_data = lambda: data
 

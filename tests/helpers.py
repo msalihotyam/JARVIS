@@ -318,3 +318,36 @@ def installed_cli(case, stem: str = "claude"):
     resolved = resolve_trusted_executable(stem, configured=str(binary))
     assert resolved is not None, "the stand-in CLI did not resolve"
     return resolved
+
+
+def wait_until(condition, ceiling_ms: int, poll_ms: int = 10) -> bool:
+    """Turn the Qt event loop (``tests.test_ui.pump``) until ``condition()`` holds; at most
+    ``ceiling_ms``. S0b: it replaces a fixed wait, whose length it keeps as the ceiling, so a
+    run is never shorter than the condition and never longer than before. Returns
+    ``condition()`` - the caller's own assertion follows. Not for absence checks ("nothing
+    happened"): those keep their fixed waits."""
+    import time
+
+    from tests.test_ui import pump
+
+    deadline = time.monotonic() + ceiling_ms / 1000
+    while True:
+        pump(0)
+        if condition():
+            return True
+        if time.monotonic() >= deadline:
+            return bool(condition())
+        pump(poll_ms)
+
+
+def wait_still(sample, ceiling_ms: int, poll_ms: int = 50, quiet: int = 3) -> bool:
+    """``wait_until`` for motion: until ``sample()`` (e.g. some items' scene rectangles) is the
+    same ``quiet`` times in a row, ``poll_ms`` apart - an animated reflow has ended; at most
+    ``ceiling_ms``."""
+    seen: list = []
+
+    def still() -> bool:
+        seen.append(sample())
+        return len(seen) >= quiet and all(s == seen[-1] for s in seen[-quiet:])
+
+    return wait_until(still, ceiling_ms, poll_ms)
