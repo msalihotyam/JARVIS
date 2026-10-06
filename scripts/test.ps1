@@ -15,21 +15,18 @@ $Candidates = @()
 if ($PythonPath) {
     $Candidates += $PythonPath
 }
-$Candidates += Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 $Candidates += "python"
 $Candidates += "py"
+$Candidates += Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 
-$JarvisPython = $null
-foreach ($Candidate in $Candidates) {
-    $DetectedVersion = Get-JarvisPythonVersion -Candidate $Candidate
-    if ($DetectedVersion -and (Test-JarvisPythonVersion -VersionText $DetectedVersion)) {
-        $JarvisPython = $Candidate
-        break
-    }
-}
-
-if (-not $JarvisPython) {
+$Selected = Select-JarvisPython -Candidates $Candidates -Explicit $PythonPath
+if (-not $Selected) {
     throw "Python 3.11+ bulunamadı. -PythonPath ile python.exe yolunu verin."
+}
+$JarvisPython = $Selected.Path
+Write-Host "Python: $JarvisPython"
+if (-not $Selected.HasPySide6) {
+    Write-Warning "$JarvisPython cannot import PySide6; UI test modules will fail. Pass -PythonPath with a Python that has PySide6."
 }
 
 Push-Location $ProjectRoot

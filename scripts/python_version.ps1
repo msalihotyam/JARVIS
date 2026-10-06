@@ -30,3 +30,44 @@ function Get-JarvisPythonVersion {
         return $null
     }
 }
+
+function Test-JarvisPythonHasPySide6 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Candidate
+    )
+
+    try {
+        & $Candidate -c "import PySide6" 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+# Rule: an explicit -PythonPath (first in the list) wins when it is 3.11+.
+# Otherwise the first 3.11+ candidate that can import PySide6; if none can,
+# the first 3.11+ one (UI modules will fail - the caller warns).
+function Select-JarvisPython {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Candidates,
+        [string]$Explicit = ""
+    )
+
+    $Fallback = $null
+    foreach ($Candidate in $Candidates) {
+        $Version = Get-JarvisPythonVersion -Candidate $Candidate
+        if (-not ($Version -and (Test-JarvisPythonVersion -VersionText $Version))) {
+            continue
+        }
+        $HasUi = Test-JarvisPythonHasPySide6 -Candidate $Candidate
+        if ($HasUi -or ($Explicit -and $Candidate -eq $Explicit)) {
+            return [pscustomobject]@{ Path = $Candidate; HasPySide6 = $HasUi }
+        }
+        if (-not $Fallback) {
+            $Fallback = [pscustomobject]@{ Path = $Candidate; HasPySide6 = $false }
+        }
+    }
+    return $Fallback
+}
