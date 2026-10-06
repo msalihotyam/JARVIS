@@ -47,7 +47,6 @@ canonical main) and **S0c** (`scripts/test.ps1` Python selection, worktree
   (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
 - Old dashboard retired (Salih 2026-10-06). The orchestrator's board is the
   artifact "JARVIS Pano" (https://claude.ai/artifact/LboCEVPnvVb9QapsNbD8GZ).
-- Open for Salih: the freeze-key skin default (skin 1 or 2) is not recorded.
 - Gate 7 still to do: D-3 one approved live Claude call after Salih's own CLI
   re-login; D-4 packaged `-Rollback` and back (approvals cleared,
   `conversation.json` backed up and restored). Codex review queue (one commit

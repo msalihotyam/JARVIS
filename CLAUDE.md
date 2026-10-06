@@ -20,12 +20,6 @@ Anında gereken, runbook'ta ayrıntılanan kısa alt küme:
 - Dilim (slice) başlatırken `jarvis-slice`, kuyruk çalıştırırken `jarvis-queue`
   skill'ini kullan (`.claude/skills/`).
 
-## Development Dashboard
-
-Pano (`dev/dashboard/`) yalnızca geliştirme aracıdır. Ne zaman ve nasıl
-güncelleneceği: `JARVIS_RUNBOOK.md` → "Dashboard" ve tam sözleşme
-`dev/dashboard/UPDATE.md`.
-
 ## Kod Erişimi
 
 - JARVIS kod yapısı sorularında önce Serena sembolik erişimini kullan
