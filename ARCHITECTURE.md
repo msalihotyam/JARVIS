@@ -3228,17 +3228,21 @@ kullanılmadan önce doğrulanır; doğrulanmayan satır onarılmaz, kullanılma
   sonrası P kapsamındadır. Kabul edilen risk: bağlamadan önce başlamış bir
   istek bağlamadan sonra taşınan konuşmada Global kapsamlı bir görev olarak
   kaydolabilir (daha az bağlam, asla daha fazla değil).
-- **Konuşma arşivi ve kalıcı silme (Gate 6D-b, Salih kararları 2026-09-30):**
-  iki adım, proje dosyasının retire -> purge'ü gibi. (1) `archive_conversation`
+- **Konuşma arşivi ve kalıcı silme (Gate 6D-b, Salih kararları 2026-09-30;
+  Gate 6F F7, Salih kararı 2026-10-05):** etkin bir projenin konuşması için
+  iki adım, proje dosyasının retire -> purge'ü gibi; Global konuşma tek adımda
+  silinir. (1) `archive_conversation`
   geri alınabilir: yalnız `archived_at` yazılır; arşivlenmiş projede ve bağlı
   bir oturumda açık iş varken (bitmemiş görev, bekleyen onay, bitmemiş zincir;
   okunamayan bağlı oturum kapalı başarısız - 6C'nin aynı denetimi) reddedilir.
   `unarchive_conversation` arşivi birebir geri alır (durum, başlık, zamanlar
   değişmez); silinmiş konuşmada, arşivsiz konuşmada ve arşivlenmiş projede
   ("önce projeyi arşivden çıkarın") reddedilir. (2) `delete_conversation`
-  kalıcıdır ve yalnız arşivlenmiş bir konuşmaya ya da sahibi arşivlenmiş
-  projenin konuşmasına uygulanır (projenin arşivi geri alınabilir ilk adımdır;
-  gizlilik silmesi §4.24'teki gibi engellenmez). TEK `BEGIN IMMEDIATE` işlemi:
+  kalıcıdır; Global konuşmaya arşivsiz de uygulanır (F7), proje konuşmasına
+  ise yalnız arşivlendikten ya da sahibi proje arşivlendikten sonra
+  (`memory._delete_check`: ret yalnız etkin projenin arşivlenmemiş
+  konuşmasında; projenin arşivi geri alınabilir ilk adımdır; gizlilik silmesi
+  §4.24'teki gibi engellenmez). TEK `BEGIN IMMEDIATE` işlemi:
   paylaşılan denetim (açık iş yok), önizleme bağı (`next_seq` VE başlık
   önizlenenle aynı, değilse "önizlemeyi yenile"), onay = konuşma kimliği; sonra
   MEZAR TAŞI: başlık boşaltılır, durum doğrulanmış boş durumla değiştirilir,
@@ -3510,8 +3514,9 @@ kendisi karar vermez.
   gerekçesiyle kapalıdır (zorlama deponun reddidir).
 - **Arşivle / Arşivden çıkar / Kalıcı sil (6D-b, Salih kararları 2026-09-30,
   §4.22):** değiştiricinin sağ tık menüsü: "Yeniden adlandır", "Arşivle",
-  "Kalıcı sil…". "Kalıcı sil…" arşivlenmemiş konuşmada "Önce arşivleyin"
-  gerekçesiyle kapalıdır; arşivlenmiş konuşmada ve arşivlenmiş projenin
+  "Kalıcı sil…". "Kalıcı sil…" yalnız etkin projenin arşivlenmemiş
+  konuşmasında "Önce arşivleyin" gerekçesiyle kapalıdır; Global konuşmada
+  (arşivsiz de, F7 2026-10-05), arşivlenmiş konuşmada ve arşivlenmiş projenin
   konuşmasında açıktır. Her öğe `_busy` iken kapalıdır ve seçildiği andaki
   konuşma kimliğine bağlıdır; retler olduğu gibi gösterilir. Açık konuşma
   arşivlenir ya da silinirse pencere onda KALMAZ: kapsamı yazılabilirse

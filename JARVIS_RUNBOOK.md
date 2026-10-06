@@ -23,6 +23,9 @@ Salih decision (2026-10-06; replaces "One line at a time"):
 - Integration is one lane at a time via `dev.ps1 finish`, in the
   orchestrator's order. A cherry-pick conflict stops the integration and is
   reported.
+- **Clean main first (G0, 2026-10-06):** `dev.ps1 new` / `finish` /
+  `cleanup` require a clean canonical main, so a docs/state lane on main
+  commits its work before any lane is opened or integrated.
 - **Gate close:** one full suite on the integrated main HEAD (CI on the same
   SHA allowed) covers the combined result.
 - Chats: one chat per lane, and at most one chat on canonical main at a time
@@ -230,17 +233,33 @@ Tests run with `python -m unittest discover -s tests` (as
 
 - Serial, the REFERENCE when a result is disputed: `scripts\test.ps1`
   (`python -m unittest discover -s tests`).
-- Parallel, same tests in several processes: `scripts\test.ps1 -Parallel
-  [-Workers N]` (or `python scripts\test_parallel.py [modules]`). UI modules
-  (anything importing PySide6 / `jarvis.ui`) run serially in ONE worker; the
-  rest are spread over N workers (default `min(cpu_count - 1, 6)`), each with
-  its own TEMP. One combined summary; non-zero exit on any failure. Measured:
-  full suite 1577 s serial vs 916 s parallel, identical counts.
+- Parallel, same tests in several processes (S0b, 7bb272b): `scripts\test.ps1
+  -Parallel [-Workers N] [-UiWorkers K]` (or `python scripts\test_parallel.py
+  [modules]`). Discovery runs first in its own process. A module whose
+  recorded duration is large is split at TestCase level into
+  duration-balanced chunks. UI units (anything importing PySide6 /
+  `jarvis.ui`) run over K processes (default `min(4, cpu_count // 3)`, so
+  K=4 at 12 CPUs), the rest over N workers (default `min(cpu_count - 1, 6)`).
+  Every process has its own TEMP and QApplication.
+- Completeness check: exit 0 only when every unit passed AND the dispatched
+  test ids equal the serial `discover -s tests` id set exactly AND every
+  process ran exactly what it was given (its `Ran` count and every id in its
+  `-v` output). One combined summary.
+- Durations: `scripts/test_durations.json` (per test class) drives the splits
+  and the CI shards; regenerate it now and then with `--write-durations
+  scripts/test_durations.json`. Unrecorded units still run (least-loaded
+  slot).
+- Measured (S0b, 4746 tests, same set as the serial discover): local full
+  suite 1398 s -> 445 s wall; `test_ui` ~530 s -> 176 s.
 - Slowest tests: add `-Durations N` (either mode; serial prints them natively).
 
-**CI (Salih 2026-10-02):** a required FULL suite may be satisfied by a green
-GitHub Actions run (`scripts\ci.ps1`) on the EXACT commit (same SHA), reported
-with the run URL. The local serial runner stays the reference when results
+**CI (Salih 2026-10-02; S0b 2026-10-06):** a required FULL suite may be
+satisfied by a green GitHub Actions run (`scripts\ci.ps1`) on the EXACT
+commit (same SHA), reported with the run URL. The workflow runs 4
+duration-balanced shards (`--shard I/4`) plus one aggregate job that checks
+the count and the exact id set against a fresh discovery and gives the one
+result. Measured: 56.7 min -> 11.3 min wall, 35.7 job-minutes (run
+37452034169). The local serial runner stays the reference when results
 disagree.
 
 **Load-sensitive rerun rule D (Salih 2026-10-02; replaces the idle-machine
@@ -279,6 +298,10 @@ take the higher one.
   acceptance criteria and returns PASS or findings - then commits without
   waiting. The orchestrator checks T0 in batch at gate end and T1 briefly
   before integration.
+- **Docs / state-only slices** need no review subagent (G0, 2026-10-06).
+- **T1 QML changes:** the review subagent also runs
+  `qt-development-skills:qt-qml-review` (read-only) on the changed QML; its
+  findings are filtered by this runbook and the Theme conventions.
 - **T2: the full flow** ("Standard gate order & exits"), unchanged.
 - A slice that discovers it must touch T2 code stops and reports (fail
   closed).
@@ -307,8 +330,8 @@ Salih decision** - cloud sessions are not used until it is recorded here.
 ## V2.0 scope freeze
 
 Salih decision (2026-10-06): V2.0 scope is frozen. New ideas go to the
-"Next release inbox" in the roadmap (created in the G0 slice), never into a
-V2.0 slice. The mechanical lamp (third status-indicator skin) and the
+"Next release inbox" in the roadmap (V2.0 section), never into a V2.0
+slice; V2.0 takes only bugs and blockers. The mechanical lamp (third status-indicator skin) and the
 freeze-key skins 3-4 move to V2.1.
 
 ## Standard gate order & exits
@@ -398,6 +421,11 @@ unmodified, as long as such a release is a rollback target. Deleting it, or
 that release, is a separate explicit decision.
 
 ## Dashboard
+
+**Retired (Salih 2026-10-06):** the old dashboard is unused; its WIP is
+parked in git stash "Salih dashboard WIP (2026-09-12), parked 2026-10-06".
+Do not update or stage `dev/dashboard/*`. The rules below describe the
+retired tool and stay only for reference.
 
 Update `dev/dashboard/status.json` only after the accepted work is canonical
 on main. See `dev/dashboard/UPDATE.md` for the full contract (percentages are
