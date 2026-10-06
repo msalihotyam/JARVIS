@@ -17,6 +17,8 @@ Anında gereken, runbook'ta ayrıntılanan kısa alt küme:
 - `uv.lock`'a asla dokunma (izlenmez, stage/commit edilmez).
 - Açık yetki olmadan asla push yapma; yetki bir sonraki push'a taşınmaz.
 - GREEN MEANS STOP: gerekli test yeşilse commit et ve dur.
+- Dilim (slice) başlatırken `jarvis-slice`, kuyruk çalıştırırken `jarvis-queue`
+  skill'ini kullan (`.claude/skills/`).
 
 ## Development Dashboard
 

@@ -9,7 +9,8 @@ description: JARVIS development lifecycle rules — how to identify the current 
 themselves — model policy, prompt shape, chat rotation, test budget, the full
 worktree lifecycle HARD RULE. This skill only says how to apply them without
 being told again, and never restates or overrides them. Where this file and
-the runbook disagree, the runbook wins.
+the runbook disagree, the runbook wins. Slices and queues: `jarvis-slice`,
+`jarvis-queue`.
 
 ## 1. Identify where you actually are
 

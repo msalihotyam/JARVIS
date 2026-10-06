@@ -9,12 +9,24 @@ contract.
 text in this runbook. When that happens, this file must be updated to reflect
 it — the runbook must never be left stating a superseded rule.
 
-## One line at a time
+## Parallel lanes
 
-Only one main development line is active at a time: one accepted
-implementation in flight, one worktree, one thread of review. Do not start a
-second line of work before the current one reaches an accepted, committed,
-clean state.
+Salih decision (2026-10-06; replaces "One line at a time"):
+
+- At most **3 lanes** run at once. Each code lane works in its own helper
+  worktree (`dev.ps1 new`); at most one docs/state lane works on canonical
+  main.
+- Every prompt lists the lane's **owned files**. A file belongs to one lane at
+  a time. Central single-owner surfaces (core, contracts, memory/store,
+  schema/migrations, authority/approval/attestation) are owned by one lane at
+  a time.
+- Integration is one lane at a time via `dev.ps1 finish`, in the
+  orchestrator's order. A cherry-pick conflict stops the integration and is
+  reported.
+- **Gate close:** one full suite on the integrated main HEAD (CI on the same
+  SHA allowed) covers the combined result.
+- Chats: one chat per lane, and at most one chat on canonical main at a time
+  (see "Claude chat rotation").
 
 ## Every worker instruction includes
 
@@ -39,9 +51,9 @@ integrates and verifies. It is not forbidden from writing code.
 - **The chief writes** central single-owner surfaces (core, contracts,
   schema, migrations), cross-module glue and integration fixes, and small
   work where delegation costs more than doing it.
-- **Sequential by default.** Parallel or worktree fan-out is opt-in and only
-  when ownership is genuinely disjoint. A central shared surface has exactly
-  one owner at a time.
+- **Parallel lanes** follow "Parallel lanes" (Salih 2026-10-06): at most 3,
+  each with its owned files; a central shared surface has exactly one owner
+  at a time.
 - **Brief:** objective, owned surface, forbidden scope, invariants,
   acceptance proof — nothing else.
 - **Return:** concise, target <= 15 lines. Raw logs stay with the subagent;
@@ -85,11 +97,11 @@ a chat's scrollback.
 - Rotate at **milestone boundaries**, when Messages/context is roughly
   400–500k+ or the chat is noticeably slow.
 - Do **not** rotate mid-implementation unless the session is unusable.
-- Salih decision (2026-09-30): keep one Opus chat and one Sonnet chat. Each
-  prompt goes to the chat matching its `MODEL:` line, so the model is never
-  switched inside a chat (a switch forces a full re-read of the session). The
-  two chats share canonical main and must never run at the same time.
-  Rotation rules above are unchanged, per chat.
+- Salih decision (2026-09-30, adapted 2026-10-06): each prompt goes to the
+  chat matching its `MODEL:` line, so the model is never switched inside a
+  chat (a switch forces a full re-read of the session). One chat per lane; at
+  most one chat on canonical main at a time. Rotation rules above are
+  unchanged, per chat.
 - Before retiring a chat: the accepted work must be canonical, and the chat
   must be rebound to `C:\Users\realk\Masaüstü\JARVIS`.
 - Archive old chats; do not delete them.
@@ -248,6 +260,56 @@ If a new concrete blocker or uncovered acceptance criterion appears after the
 final green run, report it instead of silently expanding the task.
 
 **Canonical stop rule: GREEN MEANS STOP.**
+
+## Verification tiers (risk)
+
+Salih decision (2026-10-06): a second axis next to the TEST BUDGET tiers
+(which say WHAT to run, above). The prompt names the risk tier; when unsure,
+take the higher one.
+
+| Tier | Change |
+|---|---|
+| T0 | Text, layout, style; no logic |
+| T1 | Window-layer behaviour (QML, bridge, pure helpers); no authority code |
+| T2 | Core / contracts / memory / store / schema / authority / security / approval / attestation, connectors, network, release, `dev.ps1` |
+
+- **T0 / T1: the worker self-verifies** - the test tier the TEST BUDGET
+  requires, screenshots for visible changes (`scripts/ui_visual.py`), and one
+  independent review subagent with fresh context that reads the diff and the
+  acceptance criteria and returns PASS or findings - then commits without
+  waiting. The orchestrator checks T0 in batch at gate end and T1 briefly
+  before integration.
+- **T2: the full flow** ("Standard gate order & exits"), unchanged.
+- A slice that discovers it must touch T2 code stops and reports (fail
+  closed).
+
+## Slice queue and unattended runs
+
+Salih decision (2026-10-06):
+
+- The queue lives in `build\queue\` (gitignored): `NN-<slug>.md`, each a
+  complete slice prompt written by the orchestrator and approved by Salih. One
+  queue runs in one lane, in order, via the `jarvis-queue` skill.
+- **Unattended** means: no questions; no waiting for approval to test or
+  commit; commits only on the lane's worktree branch (never on canonical
+  main); never push `main` (the `ci/*` exception is unchanged); no `finish`,
+  cleanup or worktree removal.
+- After each slice the worker writes `NN-<slug>.report.md`. On BLOCKED or a
+  red result it writes the report and stops the whole queue.
+
+## Cloud sessions
+
+Salih decision (2026-10-06): docs slices, and core/logic slices whose required
+tier runs on Linux, may run in Claude Code cloud sessions while the PC is off.
+Slices that need Windows UI evidence may not. Pushing a cloud branch: **pending
+Salih decision** - cloud sessions are not used until it is recorded here.
+
+## V2.0 scope freeze
+
+Salih decision (2026-10-06): V2.0 scope is frozen. New ideas go to the
+"Next release inbox" in the roadmap (created in the G0 slice), never into a
+V2.0 slice. The mechanical lamp (third status-indicator skin) and the
+freeze-key skins 3-4 move to V2.1.
 
 ## Standard gate order & exits
 
