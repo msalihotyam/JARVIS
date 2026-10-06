@@ -3697,6 +3697,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Süren çalışmanın bitmesini bekleyin.</translation>
     </message>
     <message>
+        <source>Conversation actions</source>
+        <translation>Sohbet işlemleri</translation>
+    </message>
+    <message>
         <source>Expanded</source>
         <translation>Açık</translation>
     </message>

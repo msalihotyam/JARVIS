@@ -163,9 +163,10 @@ class ArchiveStoreTests(StoreCase):
 
 class DeleteStoreTests(StoreCase):
     def test_a_every_delete_refusal_writes_nothing(self) -> None:
-        # Not archived (Global, and an ACTIVE project's): archive first.
+        # Not archived, of an ACTIVE project: archive first. (Gate 6F F7: a Global one needs no archive -
+        # test_a_f7_a_global_conversation_is_deleted_without_an_archive.)
         owned = self.memory.create_conversation(self.p.id, title="Proje")
-        for conversation_id in (self.conversation.id, owned.id):
+        for conversation_id in (owned.id,):
             with self.subTest(conversation=conversation_id):
                 self.assertIn("Archive this conversation first",
                               self.memory.conversation_delete_preview(conversation_id)["blocked"])
@@ -287,9 +288,41 @@ class DeleteStoreTests(StoreCase):
                 attempt()
         self.assertEqual(before, snapshot(self.database))
 
+    def test_a_f7_a_global_conversation_is_deleted_without_an_archive(self) -> None:
+        """Gate 6F F7 (Salih 2026-10-05): a Global conversation is deleted in one step; the open-work
+        refusal, the preview binding and the tombstone are unchanged; a project's still needs its archive."""
+        cid = self.conversation.id
+        preview = self.memory.conversation_delete_preview(cid)
+        self.assertEqual(("", None, 2, None), (preview["blocked"], preview["archived_at"], preview["turns"], preview["owner"]))
+        session = self.linked_session()
+        task = make_task()
+        self.memory.save_task(session.id, task)
+        self.assertIn("task in this conversation", self.memory.conversation_delete_preview(cid)["blocked"])
+        self.assertRefusedNothingWritten(lambda: self.delete(), "task in this conversation")
+        task.status = TaskStatus.CANCELLED
+        self.memory.save_task(session.id, task)
+        held = self.memory.conversation_delete_preview(cid)
+        say(self.memory, cid, "üçüncü mesaj")
+        self.assertRefusedNothingWritten(lambda: self.memory.delete_conversation(
+            cid, confirm=cid, expected_next_seq=held["expected_next_seq"], expected_title=held["title"]),
+            "changed after the preview; preview again")
+        self.assertRefusedNothingWritten(lambda: self.delete(cid, confirm="Tatil"), "confirmation equal")
+        deleted = self.delete()
+        self.assertTrue(self.memory.is_conversation_deleted(cid))
+        self.assertEqual(deleted["deleted_at"], row(self.database, cid)[8])            # archived_at set by the delete
+        self.assertEqual([(cid, deleted["deleted_at"])], snapshot(self.database)["conversation_deletions"])
+        self.assertEqual(cid, self.memory.conversation_for_session(session.id))         # the link is kept
+        owned = self.memory.create_conversation(self.p.id, title="Proje")
+        self.assertIn("Archive this conversation first", self.memory.conversation_delete_preview(owned.id)["blocked"])
+        self.assertRefusedNothingWritten(lambda: self.delete(owned.id), "Archive this conversation first")
+
     def test_a_the_app_results_report_refusals(self) -> None:
         settings = Settings(memory_database=self.database)
-        refused = conversation_delete_result(self.memory, settings, self.conversation.id, confirm=self.conversation.id,
+        # Gate 6F F7: an ACTIVE project's conversation (a Global one needs no archive any more).
+        owned = self.memory.create_conversation(self.p.id, title="Tatil")
+        say(self.memory, owned.id, "ilk mesaj")
+        say(self.memory, owned.id, "ikinci mesaj")
+        refused = conversation_delete_result(self.memory, settings, owned.id, confirm=owned.id,
                                              expected_next_seq=3, expected_title="Tatil")
         self.assertEqual("invalid_task", refused.payload["error"]["code"])
         self.assertIn("Archive this conversation first", refused.payload["error"]["message"])
@@ -718,8 +751,10 @@ class DialogTests(WindowCase):
 
     def test_g_busy_disables_every_item_and_delete_needs_an_archive_first(self) -> None:
         store = self.db()
+        owned = store.create_conversation(store.create_project("Ev").id, title="Ev sohbeti")
         bridge = self.bridge()
         root = self.window(bridge)
+        bridge.openConversation(owned.id); pump(200)                                 # F7: a project's (Global: one step)
         self.context(root)
         self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
         self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))

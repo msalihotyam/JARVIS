@@ -12,6 +12,8 @@ import "../theme"
 // F6: Sabitle / Sabitlemeyi kaldır (at most bridge.pinLimit, disabled with
 // its reason at the limit) and, on a pinned one, Yukarı / Aşağı taşı - window
 // preferences only, the conversation itself never changes.
+// F7: a Global conversation is deleted permanently in one step (the same
+// confirm dialog); a project's still needs its archive (or the project's).
 // It holds the scope menus' shared parts (a row, a reason, a divider, the
 // glass popup), which the Command preset's scope menu uses too.
 Item {
@@ -84,11 +86,17 @@ Item {
     // A pinned row of ANOTHER scope says whether its own project is archived;
     // undefined = the open conversation's owner (a row of the open scope).
     property var rowOwnerArchived: undefined
+    // ...and whether it is Global (undefined = the open conversation's owner).
+    property var rowOwnerGlobal: undefined
+    // The item the menu was opened from (a row's "⋯" shows while its menu is open).
+    property Item opener: null
     readonly property string targetId: rowId || bridge.conversationId
     readonly property string shown: (rowId ? rowTitle : bridge.conversationTitle) || qsTr("New Chat")
     readonly property bool archived: !rowId && bridge.conversationArchived
     readonly property bool ownerArchived: rowId && rowOwnerArchived !== undefined ? !!rowOwnerArchived
                                                                               : !!(bridge.conversationProject || {}).archived
+    readonly property bool ownerGlobal: rowId && rowOwnerGlobal !== undefined ? !!rowOwnerGlobal
+                                                                          : !!(bridge.conversationProject || {}).global
     readonly property bool open: context.visible
     readonly property bool renameAllowed: targetId !== "" && !archived && !ownerArchived && !bridge.busy
     readonly property string renameReason: targetId === "" ? qsTr("This conversation is not saved yet.")
@@ -96,13 +104,13 @@ Item {
         : ownerArchived ? qsTr("The project is archived: unarchive it to rename this conversation.")
         : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
     // Archive (reversible), then the permanent delete - offered only on an
-    // archived conversation or under an archived project.
+    // archived conversation, under an archived project or (F7) on a Global one.
     readonly property bool archiveAllowed: renameAllowed
     readonly property string archiveReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : archived ? qsTr("This conversation is already archived.")
         : ownerArchived ? qsTr("The project is archived: its conversations are already read-only.")
         : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-    readonly property bool deleteAllowed: targetId !== "" && !bridge.busy && (archived || ownerArchived)
+    readonly property bool deleteAllowed: targetId !== "" && !bridge.busy && (archived || ownerArchived || ownerGlobal)
     readonly property string deleteReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : bridge.busy ? qsTr("Wait for the current run to finish.")
         : !deleteAllowed ? qsTr("Archive it first") : ""
@@ -125,11 +133,13 @@ Item {
     // Open the menu for `id` ("" or the open one's id = the open conversation),
     // at `point` of `anchor`, kept inside the window (8 px clear of its edges);
     // its rename editor at `editPoint` of `editAnchor` when given, else there too.
-    function openFor(id, title, anchor, point, editAnchor, editPoint, ownerArchived) {
+    function openFor(id, title, anchor, point, editAnchor, editPoint, ownerArchived, ownerGlobal) {
         editor.close()
         rowId = id === bridge.conversationId ? "" : (id || "")
         rowTitle = title || ""
         rowOwnerArchived = ownerArchived
+        rowOwnerGlobal = ownerGlobal
+        opener = anchor
         var p = anchor.mapToItem(menu, point.x, point.y)
         place(context, p)
         place(editor, editAnchor ? editAnchor.mapToItem(menu, editPoint.x, editPoint.y) : p)

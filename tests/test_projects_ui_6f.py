@@ -2311,5 +2311,193 @@ class PinFitTests(F6Case):
             self.assertEqual(turkish, tx("Sidebar", source))
 
 
+class ProjectListOffsetTests(F6Case):
+    """F7-3 (P-F6-1): after a resize across the 1600 px breakpoint the list was clamped with its
+    old content height (compact rows) against its new height and kept that off-grid offset while
+    no listed project was selected (Genel, an archived project): half a row at 1280 and 1100."""
+
+    def offset(self, root) -> tuple:
+        listing = self.item(root, "sidebarProjectList")
+        step = self.shown(root, "sidebarProject")[0].height() + 2
+        return listing.property("contentY"), step, max(0.0, listing.property("contentHeight") - listing.height())
+
+    def test_ddd_the_project_list_opens_at_zero_and_stays_on_whole_rows_across_sizes(self) -> None:
+        store = self.db()
+        projects = [store.create_project(f"Proje {n:02d}") for n in range(10)]
+        for project in projects:
+            store.create_conversation(project.id, title=f"Sohbet {project.name}")
+        old = store.create_project("Arşivli")
+        store.create_conversation(old.id, title="Arşivli sohbet")
+        store.set_project_active(old.id, False)
+        bridge = self.bridge()
+        bridge.openProjectScope(""); pump(200)
+        root = self.window(bridge)
+        # Opened at every size: offset 0.
+        for width, height in SIZES:
+            root.resize(width, height); pump(700)
+            self.assertEqual(0, self.offset(root)[0], (width, height))
+        # Scrolled to the last project, then a scope that is not a row (Genel; an archived project),
+        # then across the breakpoint and back: whole rows, never past the end.
+        for leave in (lambda: self.tap(root, self.item(root, "sidebarGlobal")),
+                      lambda: (bridge.openConversation(store.list_conversations(project_id=old.id)[0].id), pump(400))):
+            root.resize(1100, 700); pump(700)
+            bridge.openProjectScope(projects[-1].id); pump(500)                  # the list scrolls to show it
+            self.assertGreater(self.offset(root)[0], 0)
+            leave()
+            for width, height in ((1920, 1080), (1280, 760), (1100, 700), (1920, 1080), (1100, 700)):
+                root.resize(width, height); pump(700)
+                y, step, end = self.offset(root)
+                with self.subTest(size=(width, height), y=y, step=step):
+                    self.assertAlmostEqual(0, y % step, delta=0.5)
+                    self.assertLessEqual(y, end + 0.5)
+                    top = self.box(root, "sidebarProjectList").top()
+                    first = min(self.rect(r).top() for r in self.shown(root, "sidebarProject") if self.rect(r).bottom() > top + 0.5)
+                    self.assertAlmostEqual(top, first, delta=0.5)             # the first row in view is whole
+        self.assertEqual(0, self.execute_calls())
+
+
+class OneStepDeleteTests(F6Case):
+    """F7-1 (Salih 2026-10-05): a Global conversation's menu offers "Kalıcı sil…" at once - the same
+    confirm dialog, the same Core path; a project's conversation still needs its archive."""
+
+    def dialog_open(self, root) -> bool:
+        return settle(lambda: any(i.isVisible() for i in self.all_items(root, "deleteConfirm")))
+
+    def test_eee_a_global_conversation_is_deleted_in_one_step_through_the_same_dialog(self) -> None:
+        store = self.db()
+        g0, g1 = (store.create_conversation(title=f"Genel {n}") for n in range(2))
+        tez = store.create_project("Tez")
+        t0 = store.create_conversation(tez.id, title="Tez sohbeti")
+        bridge = self.bridge()
+        root = self.window(bridge)
+        self.assertEqual(g1.id, bridge.conversationId)
+        calls, real = [], bridge.backend.conversation_delete
+        bridge.backend.conversation_delete = lambda *a, **k: calls.append((a, k)) or real(*a, **k)
+        # A row's menu: Kalıcı sil… is offered; it opens the existing dialog, nothing is deleted yet.
+        self.menu(root, self.row(root, "sidebarConversation", "Genel 0"))
+        item = self.item(root, "conversationDeleteItem")
+        self.assertEqual(("Delete permanently…", True), (item.property("label"), item.isEnabled()))
+        self.assertFalse(self.item(root, "conversationDeleteReason").isVisible())
+        self.tap(root, item)
+        self.assertTrue(self.dialog_open(root))
+        self.assertEqual((g0.id, "Genel 0", ""), (bridge.deletePreview["conversation_id"], bridge.deletePreview["title"],
+                                                  bridge.deletePreview["blocked"]))
+        self.assertFalse(store.is_conversation_deleted(g0.id))
+        self.assertIsNone(store.load_conversation(g0.id).archived_at)                     # never archived first
+        self.tap(root, next(i for i in self.all_items(root, "deleteConfirm") if i.isVisible()))
+        self.assertTrue(store.is_conversation_deleted(g0.id))
+        self.assertEqual(1, len(calls))
+        self.assertEqual({"confirm": g0.id, "expected_next_seq": 1, "expected_title": "Genel 0"}, calls[0][1])
+        self.assertEqual(g1.id, bridge.conversationId)                                    # the open one stays open
+        self.assertNotIn("Genel 0", self.titles(root))
+        # The header "…" on the open Global conversation: offered; Vazgeç writes nothing.
+        self.menu(root, self.item(root, "chatHeaderMenu"), Qt.LeftButton)
+        self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())
+        self.tap(root, self.item(root, "conversationDeleteItem"))
+        self.assertTrue(self.dialog_open(root))
+        before = dump(self.database)
+        self.tap(root, next(i for i in self.all_items(root, "deleteCancel") if i.isVisible()))
+        self.assertEqual(before, dump(self.database))
+        self.assertEqual(1, len(calls))
+        # A pinned Global conversation seen from a project scope: offered too.
+        bridge.pinConversation(g1.id)
+        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+        self.menu(root, self.pin_row(root, "Genel 1"))
+        self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())
+        self.close_menu(root)
+        # A project's conversation: unchanged - archive first, with its reason; Core refuses it too.
+        self.menu(root, self.row(root, "sidebarConversation", "Tez sohbeti"))
+        self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
+        self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))
+        self.close_menu(root)
+        bridge.previewDeleteConversation(t0.id); pump(60)
+        self.assertIn("Archive this conversation first", bridge.deletePreview["blocked"])
+        self.assertFalse(bridge.confirmDeleteConversation(t0.id))
+        self.assertFalse(store.is_conversation_deleted(t0.id))
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, self.execute_calls())
+
+
+class RowMenuButtonTests(F6Case):
+    """F7-2 (Salih 2026-10-05): a conversation row's "⋯" - on hover, keyboard focus or while its menu is
+    open, in place of the time (or the pin's project); the same menu as a right-click, next to the row;
+    the row is not opened. Conversation rows only."""
+
+    def button(self, row):
+        return self.child(row, "sidebarRowMenuButton")
+
+    def away(self, root) -> None:
+        QTest.mouseMove(root, QPoint(root.width() // 2, root.height() - 4)); pump(200)
+
+    def test_fff_the_row_button_shows_on_hover_and_opens_that_rows_menu_without_opening_it(self) -> None:
+        store = self.db()
+        tez = store.create_project("Tez")
+        pinned = store.create_conversation(tez.id, title="Tez sohbeti")
+        a = store.create_conversation(title="Kat malikleri toplantısı için hazırlanacak belgeler ve aidatlar")
+        b = store.create_conversation(title="Açık sohbet")
+        bridge = self.bridge()
+        bridge.pinConversation(pinned.id)
+        root = self.window(bridge)
+        self.assertEqual(b.id, bridge.conversationId)
+        for width, height in SIZES:
+            root.resize(width, height); pump(700)
+            with self.subTest(size=(width, height)):
+                self.away(root)
+                row = self.row(root, "sidebarConversation", a.title)
+                self.assertFalse(self.button(row).isVisible())
+                self.assertEqual(1.0, self.child(row, "sidebarConversationTime").property("opacity"))
+                # Hover: "⋯" in place of the time, inside the row, the title clear of it.
+                self.into_view(root, row)
+                self.hover(root, row); pump(200)
+                button = self.button(row)
+                self.assertTrue(button.isVisible())
+                self.assertEqual(0.0, self.child(row, "sidebarConversationTime").property("opacity"))
+                self.inside(self.rect(row), self.rect(button), "button in the row")
+                title = self.child(row, "sidebarConversationTitle")
+                self.assertLessEqual(self.rect(title).left() + title.width(), self.rect(button).left() - 4)
+                self.assertGreaterEqual(self.painted(title), 6)
+                self.assertEqual("Conversation actions", self.child(button, "sidebarRowMenuTip").property("text"))
+                # Its click: that row's menu, next to the row; the open conversation does not change.
+                self.tap(root, button)
+                menu = self.popup_named(root, "conversationSwitcherContext")
+                self.assertTrue(settle(lambda: bool(menu.property("opened"))))
+                self.assertEqual((a.id, b.id), (self.item(root, "conversationMenu").property("targetId"), bridge.conversationId))
+                self.assertEqual(a.title, self.item(root, "conversationContextHeader").property("text"))
+                body, box = self.rect(menu.property("background")), self.rect(row)
+                self.assertGreaterEqual(body.left(), box.right() - 0.5)
+                self.assertAlmostEqual(box.top(), body.top(), delta=1 if body.bottom() < height - 8.5 else height)
+                self.inside(QRectF(0, 0, width, height), body, "menu in the window")
+                self.assertFalse(self.child(self.button(row), "sidebarRowMenuTip").property("active"))   # never over the menu
+                self.away(root)
+                self.assertTrue(self.button(row).isVisible())                              # its menu is open
+                self.close_menu(root)
+                self.assertFalse(self.button(row).isVisible())
+                # Keyboard focus shows it too.
+                row.forceActiveFocus(); pump(200)
+                self.assertTrue(self.button(row).isVisible())
+                row.setProperty("focus", False); pump(100)
+                self.assertFalse(self.button(row).isVisible())
+                # A pinned row: in place of its project label.
+                pin = self.pin_row(root, "Tez sohbeti")
+                self.into_view(root, pin)
+                self.hover(root, pin); pump(200)
+                self.assertTrue(self.button(pin).isVisible())
+                self.assertEqual(0.0, self.child(pin, "sidebarPinPlace").property("opacity"))
+                self.tap(root, self.button(pin))
+                self.assertEqual((pinned.id, b.id), (self.item(root, "conversationMenu").property("targetId"), bridge.conversationId))
+                self.close_menu(root)
+                # Project rows have none.
+                self.hover(root, self.shown(root, "sidebarProject")[0]); pump(200)
+                self.assertEqual([], [i for i in self.descendants(self.shown(root, "sidebarProject")[0])
+                                      if i.objectName() == "sidebarRowMenuButton" and i.isVisible()])
+        self.assertEqual(0, self.execute_calls())
+
+    def test_ggg_the_row_button_string_is_turkish(self) -> None:
+        from jarvis.ui.i18n import localization, tx
+        localization(_APP).apply("tr-TR")
+        self.addCleanup(lambda: localization(_APP).apply("en-US"))
+        self.assertEqual("Sohbet işlemleri", tx("Sidebar", "Conversation actions"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -63,8 +63,13 @@ Rectangle {
         property string place: ""
         property string tip: ""
         property bool dragging: false
+        // F7, a conversation row: "⋯" in place of its time (or project) while the
+        // row is hovered or focused or its menu is open; it opens that row's menu.
+        property bool menuButton: false
+        readonly property bool menuHere: !!sidebar.conversationMenu && sidebar.conversationMenu.open && sidebar.conversationMenu.opener === row
+        readonly property bool showMenu: menuButton && !dragging && (hovered || activeFocus || menuHere)
         readonly property bool available: !bridge.busy
-        readonly property bool hovered: area.containsMouse || gripArea.containsMouse
+        readonly property bool hovered: area.containsMouse || gripArea.containsMouse || menuArea.containsMouse
         signal activated()
         signal contextRequested(point position)
         signal dragStarted()
@@ -117,7 +122,8 @@ Rectangle {
             objectName: row.titleName
             x: row.icon !== "" ? well.x + well.width + 8 : row.pinned ? 28 : 10
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, Math.min(implicitWidth, (placeRow.visible ? placeRow.x : metaText.x) - 8 - x))
+            width: Math.max(0, Math.min(implicitWidth, (placeRow.visible ? placeRow.x : metaText.x) - 8 - x,
+                                        row.showMenu ? rowMenu.x - 8 - x : implicitWidth))
             text: row.title; textFormat: Text.PlainText; elide: Text.ElideRight
             color: row.current ? Theme.accent : row.muted ? Theme.textLabel : Theme.text
             font: sidebar.big ? Theme.pageRow : Theme.body
@@ -125,6 +131,7 @@ Rectangle {
         }
         Text { id: metaText; objectName: row.metaName; text: row.meta; textFormat: Text.PlainText
                x: row.width - 10 - implicitWidth; anchors.verticalCenter: parent.verticalCenter
+               opacity: row.showMenu ? 0 : 1
                color: Theme.textMuted; font: Theme.captionFigures }
         // The pin, or on hover the grip (two columns of three dots).
         SummaryIcon { objectName: "sidebarPinIcon"; visible: row.pinned && !row.hovered && !row.dragging
@@ -140,6 +147,7 @@ Rectangle {
             id: placeRow
             objectName: "sidebarPinPlace"
             visible: row.place !== ""
+            opacity: row.showMenu ? 0 : 1
             x: row.width - 10 - width; anchors.verticalCenter: parent.verticalCenter; spacing: 3
             Item { width: 12; height: 12; anchors.verticalCenter: parent.verticalCenter
                    SummaryIcon { anchors.centerIn: parent; scale: 0.67; icon: "project"; tint: Theme.textDim } }
@@ -180,8 +188,25 @@ Rectangle {
             onReleased: if (row.dragging) row.dragEnded(); else if (row.available) row.activated()
             onCanceled: if (row.dragging) row.dragEnded()
         }
+        Rectangle {
+            id: rowMenu
+            objectName: "sidebarRowMenuButton"
+            visible: row.showMenu
+            x: row.width - 6 - width; anchors.verticalCenter: parent.verticalCenter
+            width: 24; height: 24; radius: Theme.radiusTiny
+            color: menuArea.containsMouse ? Theme.alpha(Theme.text, 0.10) : "transparent"
+            Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+            Row {
+                anchors.centerIn: parent; spacing: 3
+                Repeater { model: 3; Rectangle { width: 3; height: 3; radius: 1.5; color: menuArea.containsMouse ? Theme.text : Theme.textLabel } }
+            }
+            // Its own click: the row's menu next to the row; the row is not opened.
+            MouseArea { id: menuArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        onClicked: row.contextRequested(Qt.point(row.width + 4, 0)) }
+            HoverTip { objectName: "sidebarRowMenuTip"; text: qsTr("Conversation actions"); active: !row.menuHere }
+        }
         HoverTip { objectName: "sidebarRowTip"; text: !row.available ? busyReason.text : row.tip || row.title
-                   active: !row.dragging && (row.tip !== "" || nameText.truncated || !row.available) }
+                   active: !row.dragging && !menuArea.containsMouse && (row.tip !== "" || nameText.truncated || !row.available) }
     }
     // A collapsible heading (SABİTLENDİ, Bugün / Dün / Daha eski): a click,
     // Return or Space toggles it; collapsed it shows its count; the chevron
@@ -428,7 +453,11 @@ Rectangle {
                 function keepSelected() {
                     var at = -1
                     for (var i = 0; i < sidebar.projects.length; ++i) if (sidebar.projects[i].id === sidebar.owner.id) at = i
-                    if (at < 0 || height <= 0) return
+                    if (height <= 0) return
+                    // F7-3: no listed project selected (Genel, an archived one) - whole rows, in bounds. A
+                    // resize across the 1600 px breakpoint clamps the list while its content still has the
+                    // old row size, which left it half a row off when nothing re-aligned it.
+                    if (at < 0) { contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height)); return }
                     var top = at * sidebar.step, bottom = top + sidebar.step - 2
                     if (top < contentY) contentY = top
                     else if (bottom > contentY + height) contentY = Math.min(Math.max(0, contentHeight - height), Math.max(0, (at + 1 - Math.round((height + 2) / sidebar.step)) * sidebar.step))
@@ -612,7 +641,7 @@ Rectangle {
                                         id: pinRow
                                         objectName: "sidebarPinnedConversation"
                                         titleName: "sidebarPinnedTitle"
-                                        itemId: modelData.id; pinned: true
+                                        itemId: modelData.id; pinned: true; menuButton: true
                                         title: modelData.title || qsTr("New Chat"); muted: !modelData.title
                                         place: modelData.project_id !== "" ? modelData.project_name : ""
                                         tip: title + "\n" + (modelData.project_id !== "" ? qsTr("In the %1 project").arg(modelData.project_name) : qsTr("Global"))
@@ -621,7 +650,8 @@ Rectangle {
                                         onActivated: bridge.openConversation(modelData.id)
                                         onContextRequested: function (position) {
                                             if (sidebar.conversationMenu) sidebar.conversationMenu.openFor(modelData.id, modelData.title, pinRow, position,
-                                                                                                           null, null, modelData.project_archived)
+                                                                                                           null, null, modelData.project_archived,
+                                                                                                           modelData.project_id === "")
                                         }
                                         onDragStarted: if (sidebar.openGroups.pinned) { pinSection.dragId = modelData.id; pinSection.from = index }
                                         onDragMoved: function (sceneY) { pinSection.pointer = sceneY; pinSection.track() }
@@ -651,7 +681,7 @@ Rectangle {
                                 model: sidebar.shownRows(modelData.items, sidebar.openGroups[group.key])
                                 NavRow {
                                     id: conversationRow
-                                    objectName: "sidebarConversation"
+                                    objectName: "sidebarConversation"; menuButton: true
                                     titleName: "sidebarConversationTitle"; metaName: "sidebarConversationTime"
                                     itemId: modelData.id
                                     title: modelData.title || qsTr("New Chat"); muted: !modelData.title

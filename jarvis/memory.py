@@ -5363,7 +5363,9 @@ class SQLiteMemoryStore:
     # ------------------------------------------------------------------
     # Gate 6D-b permanent delete (Salih decision 2026-09-30): the SECOND step
     # after archive (or after the owner project's archive), confirmed from a
-    # preview. The row becomes a tombstone - never a hard DELETE: the links,
+    # preview. Gate 6F F7 (Salih 2026-10-05): a Global conversation (no
+    # project) needs no archive first; a project's still does. The row
+    # becomes a tombstone - never a hard DELETE: the links,
     # the move and the legacy digest reference it, and nothing tied to a
     # session (tasks, approvals, checkpoints, audit, billing) is touched.
     # ------------------------------------------------------------------
@@ -5405,8 +5407,8 @@ class SQLiteMemoryStore:
             "expected_next_seq": state.next_seq,
         }
         refusal: str | None = None
-        if record.archived_at is None and (owner is None or owner["active"]):
-            refusal = "Archive this conversation first; only an archived conversation can be deleted."
+        if record.archived_at is None and owner is not None and owner["active"]:
+            refusal = "Archive this conversation first; a project's conversation can be deleted only once archived."
         refusal = refusal or self._conversation_open_work(connection, record.id, "deleted")
         preview["blocked"] = refusal or ""
         return preview, refusal
@@ -5445,8 +5447,8 @@ class SQLiteMemoryStore:
         and the person's confirm.
 
         ``confirm`` must equal ``conversation_id`` (checked before anything
-        is touched). ONE transaction: the shared check (archived, or its
-        owner project archived; no open work in a linked session), the
+        is touched). ONE transaction: the shared check (Global, archived, or
+        its owner project archived; no open work in a linked session), the
         preview binding (``next_seq`` AND title unchanged), then the
         tombstone - title emptied, state replaced by the verified empty
         state, ``updated_at`` = the deletion time, ``archived_at`` kept or
