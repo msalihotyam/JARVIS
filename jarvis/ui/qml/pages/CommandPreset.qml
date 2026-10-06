@@ -24,9 +24,9 @@ Item {
         id: navigation; x: 0; y: 0; width: cockpit.navWidth; height: upper.height
         visible: width > 0; level: 1; padding: cockpit.wide ? 12 : 5; brackets: true
         Column { width: parent.width; spacing: 6
-            Repeater { model: [{label:qsTr("Home"),page:"home",glyph:"⌂"},{label:qsTr("Tasks"),page:"tasks",glyph:"◇"},{label:qsTr("Automations"),page:"automations",glyph:"⟳"},{label:qsTr("Memory"),page:"memory",glyph:"▤"},{label:qsTr("History"),page:"history",glyph:"◷"},{label:qsTr("Projects"),page:"projects",glyph:"▦"}]
+            Repeater { model: [{label:qsTr("Home"),page:"home",icon:"home"},{label:qsTr("Tasks"),page:"tasks",icon:"tasks"},{label:qsTr("Automations"),page:"automations",icon:"automations"},{label:qsTr("Memory"),page:"memory",icon:"memory"},{label:qsTr("History"),page:"history",icon:"history"},{label:qsTr("Projects"),page:"projects",icon:"project"}]
                 Rectangle { width: parent.width; height: 43; radius: 5; color: bridge.page === modelData.page ? Theme.alpha(Theme.accent, 0.10) : "transparent"
-                    Text { x: cockpit.wide ? 10 : 12; anchors.verticalCenter: parent.verticalCenter; text: modelData.glyph; color: Theme.accent; font.pixelSize: 21 }
+                    Icon { x: cockpit.wide ? 10 : 12; anchors.verticalCenter: parent.verticalCenter; name: modelData.icon; size: 20; tint: Theme.accent }
                     Text { visible: cockpit.wide; x: 43; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.textLabel; font: Theme.caption }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setPage(modelData.page) }
                 }
@@ -65,7 +65,7 @@ Item {
             ApprovalCard { anchors.fill: parent; visible: bridge.approvalPending || cockpit.fixtureApproval; fixture: cockpit.fixtureApproval && !bridge.approvalPending; onDismissFixture: cockpit.dismissFixture() }
             GlassPanel { anchors.fill: parent; visible: !bridge.approvalPending && !cockpit.fixtureApproval; title: qsTr("Authorization gate"); brackets: true; border.color: Theme.borderStrong
                 Column { anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter } spacing: 22
-                    IconBox { width: 58; height: 58; anchors.horizontalCenter: parent.horizontalCenter; glyph: "◇"; tint: Theme.accent }
+                    IconBox { width: 58; height: 58; anchors.horizontalCenter: parent.horizontalCenter; icon: "diamond"; tint: Theme.accent }
                     Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: qsTr("No action awaiting approval"); color: Theme.text; font: Theme.title }
                     Text { width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: qsTr("When an action needs permission, its exact scope, destination and outbound preview appear here. Nothing is pre-authorized by this panel."); color: Theme.textMuted; font: Theme.caption }
                     Pill { anchors.horizontalCenter: parent.horizontalCenter; text: qsTr("Standing by"); tint: Theme.accent }
@@ -121,7 +121,7 @@ Item {
             Column { width: parent.width; spacing: 12
                 Repeater { model: [qsTr("Coding agents"), qsTr("Research agents"), qsTr("Browser agents")]
                     Row { width: parent.width; spacing: 8
-                        IconBox { width: 25; height: 25; glyph: "◇"; tint: Theme.textMuted }
+                        IconBox { width: 25; height: 25; icon: "diamond"; tint: Theme.textMuted }
                         Column { spacing: 1
                             Text { text: modelData; color: Theme.textLabel; font: Theme.caption }
                             Text { text: qsTr("Unavailable in this build"); color: Theme.textDim; font: Theme.caption }

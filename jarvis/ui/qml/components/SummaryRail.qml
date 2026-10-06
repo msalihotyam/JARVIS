@@ -311,7 +311,7 @@ Item {
                 // On the value's row, so the title and the line keep their room.
                 anchors { right: parent.right; rightMargin: 4; verticalCenter: count.verticalCenter }
                 width: 26; height: 26
-                glyph: "•••"; tip: qsTr("%1 layout options").arg(modelData.title)
+                icon: "more"; tip: qsTr("%1 layout options").arg(modelData.title)
                 onClicked: rail.menuRequested(modelData.id, menuButton, index > 0, index < rail.shownModules.length - 1)
             }
         }

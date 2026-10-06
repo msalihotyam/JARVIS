@@ -11,12 +11,12 @@ ContextPanel {
         width: parent.width; spacing: 4
         Repeater {
             model: [
-                { page: "home", label: qsTr("Command Center"), key: "1", glyph: "⌂" },
-                { page: "tasks", label: qsTr("Tasks"), key: "2", glyph: "◇" },
-                { page: "automations", label: qsTr("Automations"), key: "3", glyph: "⟳" },
-                { page: "memory", label: qsTr("Memory"), key: "4", glyph: "▤" },
-                { page: "history", label: qsTr("History"), key: "5", glyph: "◷" },
-                { page: "projects", label: qsTr("Projects"), key: "6", glyph: "▦" }
+                { page: "home", label: qsTr("Command Center"), key: "1", icon: "home" },
+                { page: "tasks", label: qsTr("Tasks"), key: "2", icon: "tasks" },
+                { page: "automations", label: qsTr("Automations"), key: "3", icon: "automations" },
+                { page: "memory", label: qsTr("Memory"), key: "4", icon: "memory" },
+                { page: "history", label: qsTr("History"), key: "5", icon: "history" },
+                { page: "projects", label: qsTr("Projects"), key: "6", icon: "project" }
             ]
             Rectangle {
                 id: entry
@@ -28,7 +28,7 @@ ContextPanel {
                 activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: modelData.label
                 Keys.onReturnPressed: nav.go(modelData.page)
                 Keys.onSpacePressed: nav.go(modelData.page)
-                Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: modelData.glyph; color: Theme.accent; font.pixelSize: 18 }
+                Icon { x: 11; anchors.verticalCenter: parent.verticalCenter; name: modelData.icon; size: 18; tint: Theme.accent }
                 Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: entry.current ? Theme.text : Theme.textLabel; font: Theme.body }
                 Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+" + modelData.key; color: Theme.textDim; font: Theme.caption }
                 MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: nav.go(modelData.page) }

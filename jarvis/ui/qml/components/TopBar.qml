@@ -473,9 +473,9 @@ Item {
         Row {
             y: controls.mid - height / 2
             spacing: 2
-            IconButton { glyph: "–"; tip: qsTr("Minimize"); width: 34; height: 34; onClicked: bar.minimizeRequested() }
-            IconButton { glyph: bar.fullscreen ? "❐" : "▢"; tip: bar.fullscreen ? qsTr("Windowed") : qsTr("Full screen"); width: 34; height: 34; onClicked: bar.restoreRequested() }
-            IconButton { objectName: "windowCloseControl"; glyph: "✕"; tip: bridge.trayAvailable ? qsTr("Hide to tray - JARVIS keeps running") : qsTr("Close"); width: 34; height: 34; onClicked: bar.closeRequested() }
+            IconButton { icon: "minimize"; tip: qsTr("Minimize"); width: 34; height: 34; onClicked: bar.minimizeRequested() }
+            IconButton { icon: bar.fullscreen ? "restore" : "maximize"; tip: bar.fullscreen ? qsTr("Windowed") : qsTr("Full screen"); width: 34; height: 34; onClicked: bar.restoreRequested() }
+            IconButton { objectName: "windowCloseControl"; icon: "close"; tip: bridge.trayAvailable ? qsTr("Hide to tray - JARVIS keeps running") : qsTr("Close"); width: 34; height: 34; onClicked: bar.closeRequested() }
         }
     }
 

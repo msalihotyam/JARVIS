@@ -78,10 +78,10 @@ Item {
         }
     }
 
-    // -- one menu row: glyph, label; disabled at a boundary -------------------
+    // -- one menu row: icon, label; disabled at a boundary --------------------
     component MenuRow: Rectangle {
         id: row
-        property string glyph: ""
+        property string icon: ""
         property string label: ""
         signal triggered()
         width: parent ? parent.width : 0; height: 40; radius: 8
@@ -94,8 +94,7 @@ Item {
         Keys.onSpacePressed: if (enabled) triggered()
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         Rectangle { anchors.fill: parent; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: row.activeFocus }
-        Text { x: 12; width: 20; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignHCenter
-               text: row.glyph; color: Theme.accent; font: Theme.lead }
+        Icon { x: 14; anchors.verticalCenter: parent.verticalCenter; name: row.icon; size: 16; tint: Theme.accent }
         Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: row.label; color: Theme.text; font: Theme.uiLabel }
         MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; cursorShape: row.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: if (row.enabled) row.triggered() }
@@ -105,13 +104,13 @@ Item {
         id: cardMenu
         Column {
             objectName: "layoutCardMenu"
-            MenuRow { objectName: "menuMoveUp"; glyph: "↑"; label: qsTr("Move up"); enabled: menus.canUp
+            MenuRow { objectName: "menuMoveUp"; icon: "arrow-up"; label: qsTr("Move up"); enabled: menus.canUp
                 onTriggered: { bridge.moveCard(menus.region, menus.card, -1); menus.close() } }
-            MenuRow { objectName: "menuMoveDown"; glyph: "↓"; label: qsTr("Move down"); enabled: menus.canDown
+            MenuRow { objectName: "menuMoveDown"; icon: "arrow-down"; label: qsTr("Move down"); enabled: menus.canDown
                 onTriggered: { bridge.moveCard(menus.region, menus.card, 1); menus.close() } }
             Item { width: parent.width; height: 9
                 Rectangle { anchors.verticalCenter: parent.verticalCenter; x: 8; width: parent.width - 16; height: 1; color: Theme.glassSeparator } }
-            MenuRow { objectName: "menuHide"; glyph: "⊘"; label: qsTr("Hide from layout")
+            MenuRow { objectName: "menuHide"; icon: "hide"; label: qsTr("Hide from layout")
                 onTriggered: { bridge.setCardVisible(menus.region, menus.card, false); menus.close() } }
         }
     }

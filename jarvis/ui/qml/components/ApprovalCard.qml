@@ -54,7 +54,7 @@ GlassPanel {
     objectName: "approvalCard"
     Item {
         id: head; width: parent.width; height: 72
-        IconBox { x: 0; y: 2; width: 38; height: 40; glyph: "◇"; tint: Theme.warning }
+        IconBox { x: 0; y: 2; width: 38; height: 40; icon: "diamond"; tint: Theme.warning }
         Column { x: 53; width: parent.width - 60; spacing: 5
             Text { width: parent.width; wrapMode: Text.Wrap; text: qsTr("AUTHORIZATION REQUIRED"); color: Theme.warning; font: Theme.pageHeading }
             Text { width: parent.width; wrapMode: Text.Wrap; text: card.fixture ? qsTr("VISUAL FIXTURE · no authority") : qsTr("HUMAN GATE · one action, exactly as shown"); color: Theme.textMuted; font: Theme.caption }
@@ -134,6 +134,6 @@ GlassPanel {
             ActionButton { objectName: "approvalCancel"; label: qsTr("Cancel task"); enabled: card.actionable; onClicked: bridge.cancelTask() }
             ActionButton { objectName: "approvalApprove"; label: qsTr("Approve"); primary: true; enabled: card.actionable; onClicked: bridge.approve() }
         }
-        IconButton { visible: card.fixture; glyph: "✕"; tip: qsTr("Close visual fixture"); onClicked: card.dismissFixture() }
+        IconButton { visible: card.fixture; icon: "close"; tip: qsTr("Close visual fixture"); onClicked: card.dismissFixture() }
     }
 }

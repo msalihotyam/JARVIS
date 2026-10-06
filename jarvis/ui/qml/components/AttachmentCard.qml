@@ -4,7 +4,7 @@ import "../theme"
 // One attachment, the same way everywhere it appears: in the draft, inside a
 // reference group and under a sent message. An image shows its real thumbnail
 // (JARVIS's own snapshot, aspect kept); a file shows its type and size. A
-// click opens the internal preview; the ✕, when offered, removes it from the
+// click opens the internal preview; the close icon, when offered, removes it from the
 // draft. `nested` (inside a group or a sent message) is a small tonal step
 // from its parent rather than another framed card. Presentation only -
 // nothing here reads a path or grants anything.
@@ -104,12 +104,11 @@ Item {
         cursorShape: Qt.PointingHandCursor
         onClicked: card.opened()
     }
-    Text {
+    Icon {
         objectName: "attachmentRemove_" + card.file.id
         visible: card.removable
-        anchors.right: parent.right; anchors.rightMargin: 7; anchors.top: parent.top; anchors.topMargin: 5
-        text: "✕"; color: removeArea.containsMouse ? Theme.danger : Theme.textMuted
-        font: Theme.caption
+        anchors.right: parent.right; anchors.rightMargin: 6; anchors.top: parent.top; anchors.topMargin: 8
+        name: "close"; size: 12; tint: removeArea.containsMouse ? Theme.danger : Theme.textMuted
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Remove this attachment")
         MouseArea { id: removeArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true

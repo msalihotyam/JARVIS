@@ -137,7 +137,7 @@ ContextPanel {
         Rectangle { id: box; x: 8; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
                     color: bridge.showOldModels ? Theme.alpha(Theme.commandEdge, 0.25) : "transparent"
                     border.width: 1; border.color: bridge.showOldModels ? Theme.commandEdge : Theme.borderStrong
-                    Text { anchors.centerIn: parent; visible: bridge.showOldModels; text: "✓"; color: Theme.commandEdge; font: Theme.caption } }
+                    Icon { anchors.centerIn: parent; visible: bridge.showOldModels; name: "check"; size: 12; tint: Theme.commandEdge } }
         Text { id: label; x: box.x + box.width + 8; anchors.verticalCenter: parent.verticalCenter
                text: qsTr("Show older models"); color: Theme.textLabel; font: Theme.caption }
         MouseArea { id: toggleArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
@@ -200,8 +200,7 @@ ContextPanel {
                    color: choice.selected ? "#e6f8ff" : Theme.text
                    font: Theme.face(16, choice.selected) }
             Text { width: parent.width; elide: Text.ElideRight; text: choice.meta; color: Theme.textMuted; font: Theme.caption } }
-        Text { visible: choice.selected; anchors.verticalCenter: parent.verticalCenter; x: parent.width - 26; text: "✓"; color: Theme.commandEdge
-               font: Theme.subtitle }
+        Icon { visible: choice.selected; anchors.verticalCenter: parent.verticalCenter; x: parent.width - 28; name: "check"; size: 16; tint: Theme.commandEdge }
     }
 
     Flickable {

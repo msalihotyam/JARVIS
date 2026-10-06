@@ -5,7 +5,7 @@ import "../components"
 
 // The internal look at one attachment: an image large and in proportion, or a
 // text-like file's snapshotted text, read-only and scrollable. Dark
-// translucent backdrop; ✕, Escape and a click outside close it.
+// translucent backdrop; the close icon, Escape and a click outside close it.
 //
 // Display only. It shows exactly what JARVIS already holds for the attachment
 // - the snapshot copy and the text taken at attach time - and never opens the
@@ -70,7 +70,7 @@ Item {
                        font: Theme.caption }
             }
             IconButton { objectName: "attachmentPreviewClose"; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-                         glyph: "✕"; tip: qsTr("Close"); onClicked: preview.close() }
+                         icon: "close"; tip: qsTr("Close"); onClicked: preview.close() }
         }
         AttachmentCard { id: card; visible: false }    // for its size formatting only
 

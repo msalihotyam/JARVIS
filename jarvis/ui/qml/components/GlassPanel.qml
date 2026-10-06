@@ -141,7 +141,7 @@ Rectangle {
             objectName: panel.closable ? "secondaryPageClose" : ""
             visible: panel.closable
             anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-            width: 28; height: 28; glyph: "✕"; tip: qsTr("Back to Command Center")
+            width: 28; height: 28; icon: "close"; tip: qsTr("Back to Command Center")
             onClicked: panel.closeRequested()
         }
     }

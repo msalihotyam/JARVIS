@@ -66,7 +66,7 @@ Item {
             width: parent.width; spacing: 10
             Rectangle { width: parent.width; height: 44; radius: Theme.radiusSmall; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.6)
                 Rectangle { z: -1; anchors.fill: parent; anchors.margins: -3; radius: Theme.radiusSmall + 3; color: Theme.alpha(Theme.accent, 0.1) }
-                Text { x: 14; anchors.verticalCenter: parent.verticalCenter; text: "›"; color: Theme.accent; font.pixelSize: 18 }
+                Icon { x: 11; anchors.verticalCenter: parent.verticalCenter; name: "chevron-right"; size: 16; tint: Theme.accent }
                 TextField { id: search; anchors.fill: parent; anchors.margins: 4; anchors.leftMargin: 30; background: Item {}  color: Theme.text; placeholderText: qsTr("Type a command…"); placeholderTextColor: Theme.textDim; font: Theme.lead
                     onTextChanged: palette.cursor = 0
                     Keys.onDownPressed: palette.cursor = Math.min(palette.cursor + 1, palette.matches.length - 1)

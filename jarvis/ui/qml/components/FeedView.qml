@@ -699,8 +699,7 @@ Item {
         border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55)
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Jump to latest message")
-        Text { anchors.centerIn: parent; anchors.verticalCenterOffset: 1; text: "↓"; color: Theme.text
-               font: Theme.title }
+        Icon { anchors.centerIn: parent; name: "arrow-down"; size: 16; tint: Theme.text }
         MouseArea { id: jumpArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     enabled: feed.jumpVisible; onClicked: feed.jumpToLatest() }
     }

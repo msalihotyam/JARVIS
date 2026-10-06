@@ -49,13 +49,14 @@ Column {
         onVisibleChanged: if (visible) { opacity = 0; fade.restart() }
         NumberAnimation { id: fade; target: surface; property: "opacity"; from: 0; to: 1; duration: 160; easing.type: Easing.OutCubic }
     }
-    // A static state glyph in a ring: ? unknown, ✕ failed, ✓ completed, – blocked, ■ disabled, ◆ approval.
+    // A static state icon in a ring (Icon.qml): question unknown, close failed, check completed,
+    // minus blocked, pause frozen, filled diamond approval.
     component StateIcon: Rectangle {
         property color tone: Theme.accentSoft
-        property string glyph: ""
+        property string icon: ""
         width: 40; height: 40; radius: width / 2
         color: Theme.alpha(tone, 0.10); border.width: 2; border.color: Theme.alpha(tone, 0.85)
-        Text { anchors.centerIn: parent; text: parent.glyph; color: parent.tone; font: Theme.title }
+        Icon { anchors.centerIn: parent; name: parent.icon; tint: parent.tone; size: Math.round(parent.width * 0.4) }
     }
     // One label / value field. Values wrap; nothing approval-critical is elided.
     component Field: Item {
@@ -119,8 +120,8 @@ Column {
         visible: !cards.s.fixture && (st === "frozen" || st === "freeze_requested" || st === "refused" || st === "unconfirmed")
         tone: st === "freeze_requested" ? Theme.warning : Theme.danger
         height: visible ? executionBody.height + 32 : 0
-        // ❚❚ frozen / freezing (a pause, not a stop), ! unconfirmed or refused.
-        StateIcon { x: 20; y: 16; tone: executionCard.tone; glyph: executionCard.st === "frozen" || executionCard.st === "freeze_requested" ? "❚❚" : "!" }
+        // pause frozen / freezing (a pause, not a stop), exclamation unconfirmed or refused.
+        StateIcon { x: 20; y: 16; tone: executionCard.tone; icon: executionCard.st === "frozen" || executionCard.st === "freeze_requested" ? "pause" : "exclamation" }
         Column {
             id: executionBody
             x: 76; y: 16; width: parent.width - 96; spacing: 6
@@ -149,7 +150,7 @@ Column {
         tone: Theme.warning
         border.width: 1.5
         height: visible ? approvalBody.height + 36 : 0
-        StateIcon { x: 20; y: 18; tone: Theme.warning; glyph: "◆" }
+        StateIcon { x: 20; y: 18; tone: Theme.warning; icon: "diamond-filled" }
         Column {
             id: approvalBody
             x: 76; y: 18; width: parent.width - 96; spacing: 8
@@ -224,7 +225,7 @@ Column {
             : d.state === "submitting" ? Theme.accent : Theme.warning
         height: visible ? decisionBody.height + 28 : 0
         StateIcon { x: 20; y: 14; width: 32; height: 32; tone: decisionCard.tone
-                    glyph: decisionCard.d.state === "recorded" ? "✓" : decisionCard.d.state === "submitting" ? "…" : decisionCard.d.state === "rejected" ? "–" : "!" }
+                    icon: decisionCard.d.state === "recorded" ? "check" : decisionCard.d.state === "submitting" ? "more" : decisionCard.d.state === "rejected" ? "minus" : "exclamation" }
         Column {
             id: decisionBody
             x: 68; y: 14; width: parent.width - 88; spacing: 4
@@ -251,9 +252,9 @@ Column {
             : kind === "blocked" || kind === "unmet" ? Theme.warning : kind === "completed" ? Theme.success : Theme.accentSoft
         height: visible ? outcomeBody.height + 32 : 0
         StateIcon { x: 20; y: 16; tone: outcomeCard.tone
-                    glyph: outcomeCard.kind === "unknown" || outcomeCard.kind === "in_progress" ? "?" : outcomeCard.kind === "failed" ? "✕"
-                         : outcomeCard.kind === "completed" ? "✓" : outcomeCard.kind === "blocked" || outcomeCard.kind === "unmet" ? "—"
-                         : outcomeCard.kind === "paused" ? "❚❚" : "·" }
+                    icon: outcomeCard.kind === "unknown" || outcomeCard.kind === "in_progress" ? "question" : outcomeCard.kind === "failed" ? "close"
+                         : outcomeCard.kind === "completed" ? "check" : outcomeCard.kind === "blocked" || outcomeCard.kind === "unmet" ? "minus"
+                         : outcomeCard.kind === "paused" ? "pause" : "dot" }
         Column {
             id: outcomeBody
             x: 76; y: 16; width: parent.width - 96; spacing: 6

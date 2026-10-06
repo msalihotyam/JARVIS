@@ -36,8 +36,9 @@ Rectangle {
         id: marker
         x: 14; anchors.verticalCenter: parent.verticalCenter
         width: 22; height: 22; radius: 11; color: Theme.alpha(strip.tone, 0.12); border.width: 1.5; border.color: strip.tone
-        Text { anchors.centerIn: parent; color: strip.tone; font: Theme.captionStrong
-               text: ({ execution: "❚❚", approval: "◆", decision: "◆", outcome: strip.item.tone === "unknown" ? "?" : "!" })[strip.item.key] || "!" }
+        Icon { anchors.centerIn: parent; tint: strip.tone; size: 12
+               name: ({ execution: "pause", approval: "diamond-filled", decision: "diamond-filled",
+                        outcome: strip.item.tone === "unknown" ? "question" : "exclamation" })[strip.item.key] || "exclamation" }
     }
     Text {
         objectName: "attentionLabel"
@@ -50,10 +51,10 @@ Rectangle {
         spacing: 2
         visible: strip.items.length > 1
         width: visible ? implicitWidth : 0
-        IconButton { objectName: "attentionPrev"; glyph: "‹"; tip: qsTr("Previous item"); width: 30; height: 30; enabled: strip.current > 0; onClicked: strip.index = strip.current - 1 }
+        IconButton { objectName: "attentionPrev"; icon: "chevron-left"; tip: qsTr("Previous item"); width: 30; height: 30; enabled: strip.current > 0; onClicked: strip.index = strip.current - 1 }
         Text { objectName: "attentionCount"; anchors.verticalCenter: parent.verticalCenter; width: 48; horizontalAlignment: Text.AlignHCenter
                text: qsTr("%1 of %2").arg(strip.current + 1).arg(strip.items.length); color: Theme.textLabel; font: Theme.metadata }
-        IconButton { objectName: "attentionNext"; glyph: "›"; tip: qsTr("Next item"); width: 30; height: 30; enabled: strip.current < strip.items.length - 1; onClicked: strip.index = strip.current + 1 }
+        IconButton { objectName: "attentionNext"; icon: "chevron-right"; tip: qsTr("Next item"); width: 30; height: 30; enabled: strip.current < strip.items.length - 1; onClicked: strip.index = strip.current + 1 }
     }
     ActionButton {
         id: reviewButton

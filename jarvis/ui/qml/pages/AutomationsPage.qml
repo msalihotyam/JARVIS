@@ -48,7 +48,7 @@ SecondaryPage {
                 anchors.fill: parent; visible: bridge.jobs.length === 0
                 radius: Theme.radiusSmall; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.border
                 Row { anchors.centerIn: parent; spacing: 16
-                    IconBox { width: 38; height: 38; glyph: "⟳"; tint: Theme.accent }
+                    IconBox { width: 38; height: 38; icon: "automations"; tint: Theme.accent }
                     Column { anchors.verticalCenter: parent.verticalCenter; spacing: 6
                         Text { text: qsTr("No automations yet"); color: Theme.text; font: Theme.title }
                         Text { text: qsTr("Create a job below, or ask JARVIS from the Command Center."); color: Theme.textLabel; font: Theme.pageRow }

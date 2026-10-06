@@ -59,7 +59,7 @@ ContextPanel {
                             Text { text: modelData.name; color: Theme.text; font: Theme.bodyStrong }
                             Text { text: modelData.note; color: Theme.textMuted; font: Theme.caption }
                         }
-                        Text { anchors.right: parent.right; anchors.rightMargin: 14; anchors.verticalCenter: parent.verticalCenter; text: choice.selected ? "✓" : ""; color: Theme.materialBlue }
+                        Icon { anchors.right: parent.right; anchors.rightMargin: 14; anchors.verticalCenter: parent.verticalCenter; visible: choice.selected; name: "check"; size: 14; tint: Theme.materialBlue }
                         Rectangle { anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"; border.width: 2; border.color: Theme.materialGlint; visible: choice.activeFocus }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setTheme(modelData.key) }
                     }

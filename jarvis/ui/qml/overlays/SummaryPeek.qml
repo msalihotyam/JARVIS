@@ -266,8 +266,8 @@ ContextPanel {
                 Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.action.note : ""; color: Theme.textMuted; font: Theme.caption
                        HoverTip { text: parent.text; active: parent.truncated } }
             }
-            Text { anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
-                   text: "›"; color: Theme.accent; font.pixelSize: 22 }
+            Icon { anchors { right: parent.right; rightMargin: 14; verticalCenter: parent.verticalCenter }
+                   name: "chevron-right"; size: 18; tint: Theme.accent }
             MouseArea {
                 id: actionHit
                 anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor

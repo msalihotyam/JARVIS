@@ -159,10 +159,10 @@ Item {
                                             onTriggered: bridge.attachClipboardToGroup(card.groupId) }
                             }
                         }
-                        Text {
+                        Icon {
                             objectName: "contextGroupRemove_" + card.groupId
-                            text: "✕"; color: removeArea.containsMouse ? Theme.danger : Theme.textMuted
-                            font: Theme.caption
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: "close"; size: 12; tint: removeArea.containsMouse ? Theme.danger : Theme.textMuted
                             Accessible.role: Accessible.Button
                             Accessible.name: qsTr("Remove this group")
                             MouseArea { id: removeArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true

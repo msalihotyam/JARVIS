@@ -1,11 +1,13 @@
 import QtQuick
 import "../theme"
 
-// A small icon-only control. The glyph is a text glyph or a short label;
-// no icon pack. Frameless until hovered, like the reference window chrome.
+// A small icon-only control: one drawn icon (Icon.qml, by name; Gate 6G K1)
+// or drawn children of its own. Frameless until hovered, like the reference
+// window chrome.
 Rectangle {
     id: button
-    property string glyph: ""
+    property string icon: ""
+    property real iconSize: Math.round(Math.min(width, height) * 0.47)
     property string tip: ""
     property bool danger: false
     property bool active: false
@@ -13,7 +15,7 @@ Rectangle {
     signal clicked()
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
-    Accessible.name: tip || glyph
+    Accessible.name: tip || icon
     Accessible.onPressAction: if (enabled) clicked()
     Keys.onReturnPressed: if (enabled) clicked()
     Keys.onSpacePressed: if (enabled) clicked()
@@ -38,12 +40,12 @@ Rectangle {
     // Keyboard focus: a crisp 2 px outline just outside the control, distinct from hover and active.
     Rectangle { anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 2; color: "transparent"; border.width: 2; border.color: Theme.materialGlint; visible: button.activeFocus }
 
-    Text {
+    Icon {
         anchors.centerIn: parent
-        text: button.glyph
-        color: danger ? Theme.danger : (active ? tone : (hovered ? Theme.text : Theme.textLabel))
-        font: Theme.body
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+        visible: button.icon !== ""
+        name: button.icon; size: button.iconSize
+        tint: danger ? Theme.danger : (active ? tone : (hovered ? Theme.text : Theme.textLabel))
+        Behavior on tint { ColorAnimation { duration: Theme.hoverMs } }
     }
     MouseArea {
         id: area

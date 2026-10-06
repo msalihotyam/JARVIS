@@ -10,6 +10,7 @@ Rectangle {
     property bool danger: false
     property bool compact: false
     property color accent: Theme.accent
+    property string trailingIcon: ""          // a drawn icon after the label (Icon.qml name)
     signal clicked()
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
@@ -22,7 +23,7 @@ Rectangle {
     readonly property bool hovered: area.containsMouse && enabled
     readonly property bool pressed: area.pressed && enabled
 
-    implicitWidth: text.width + (compact ? 22 : 30); implicitHeight: compact ? 30 : 36
+    implicitWidth: text.width + (trailingIcon !== "" ? 16 : 0) + (compact ? 22 : 30); implicitHeight: compact ? 30 : 36
     radius: Theme.radiusSmall
     color: primary ? (pressed ? Qt.darker(tone, 1.25) : hovered ? Qt.lighter(tone, 1.08) : tone)
                    : (pressed ? Theme.alpha(tone, 0.20) : hovered ? Theme.alpha(tone, 0.12) : Theme.alpha(Theme.text, 0.035))
@@ -53,11 +54,14 @@ Rectangle {
     Text {
         id: text
         anchors.centerIn: parent
+        anchors.horizontalCenterOffset: button.trailingIcon !== "" ? -8 : 0
         text: button.label
         color: primary ? "#04101c" : (danger ? Theme.danger : (hovered ? Theme.text : Theme.textLabel))
         font: Theme.captionStrong
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     }
+    Icon { visible: button.trailingIcon !== ""; name: button.trailingIcon; size: 12; tint: text.color
+           anchors.left: text.right; anchors.leftMargin: 4; anchors.verticalCenter: text.verticalCenter }
     MouseArea {
         id: area
         anchors.fill: parent; hoverEnabled: true; cursorShape: button.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor

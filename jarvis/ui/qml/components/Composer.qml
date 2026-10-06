@@ -167,14 +167,19 @@ Item {
                 Repeater {
                     model: composer.permissionModes
                     delegate: Rectangle {
+                        id: modeOption
                         objectName: "permissionMode_" + modelData.id
+                        // The drawn check is not text: the selected state is told to assistive tech here.
+                        Accessible.role: Accessible.RadioButton; Accessible.name: modelData.name; Accessible.checked: selected
                         width: 340; height: modeText.height + 16; radius: 8
                         readonly property bool selected: bridge.permissionMode === modelData.id
                         color: selected ? Theme.alpha(Theme.accent, 0.16) : optionArea.containsMouse ? Theme.alpha(Theme.text, 0.06) : "transparent"
                         border.width: selected ? 1 : 0; border.color: Theme.alpha(Theme.accent, 0.5)
                         Column { id: modeText; x: 10; y: 8; width: parent.width - 20; spacing: 2
-                            Text { text: modelData.name + (parent.parent.selected ? "  ✓" : ""); color: Theme.text
-                                   font: Theme.captionStrong }
+                            Row { spacing: 8
+                                Text { text: modelData.name; color: Theme.text; font: Theme.captionStrong }
+                                Icon { visible: modeOption.selected; anchors.verticalCenter: parent.verticalCenter
+                                       name: "check"; size: 12; tint: Theme.text } }
                             Text { width: parent.width; wrapMode: Text.Wrap; text: modelData.detail; color: Theme.textMuted
                                    font: Theme.caption } }
                         MouseArea { id: optionArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
