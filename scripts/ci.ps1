@@ -6,7 +6,8 @@
 # for ci/* - Salih decision 2026-10-02; main and every other branch still need
 # his explicit authorization every time), waits for the .github/workflows/
 # tests.yml run for that exact commit and prints the result, the run URL and
-# the runner summary. Exit code: 0 green, 1 red, 2 setup problem.
+# the combined summary of all shards (the aggregate job's). Exit code: 0
+# green, 1 red, 2 setup problem.
 #
 # This script never logs in. If `gh` is missing or not authenticated it stops
 # and says what to run.
@@ -96,8 +97,8 @@ $Download = Join-Path ([IO.Path]::GetTempPath()) "jarvis-ci-$($Run.databaseId)"
 gh run download $Run.databaseId --name ci-summary --dir $Download 2>$null
 $Summary = Join-Path $Download "ci-summary.txt"
 if (Test-Path $Summary) {
-    Write-Output "--- runner summary ($Summary) ---"
-    Get-Content $Summary -Tail 60
+    Write-Output "--- combined summary of all shards ($Summary) ---"
+    Get-Content $Summary
 } else {
     Write-Output "(no ci-summary artifact was uploaded)"
 }
