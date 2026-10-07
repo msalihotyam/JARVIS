@@ -251,13 +251,19 @@ class SidebarShellCase(ProjectsUiCase):
         else:                                       # S0b: the state the caller asserts next; the old wait is the ceiling
             wait_until(until, 350)
 
-    def resize_still(self, root, width: int, height: int, ceiling_ms: int) -> None:
+    def resize_still(self, root, width: int, height: int, ceiling_ms: int, every=None) -> bool:
         """Resize, then wait until the home frame (sidebar, header, composer, column) stops
-        moving - its width animates; the old fixed wait is the ceiling."""
+        moving - its width animates; the old fixed wait is the ceiling. ``every`` (F-ee) runs
+        its assertions on each sampled frame of the reflow, not only on the still one. True
+        once still; a caller that measures the still frame asserts it (F-ee)."""
         root.resize(width, height)
         names = ("sidebar", "chatHeader", "canonicalComposer", "panelColumn")
-        wait_still(lambda: (root.width(), root.height(),
-                            tuple(self.rect(i) for n in names for i in self.all_items(root, n))), ceiling_ms)
+
+        def sample():
+            if every is not None:
+                every()
+            return (root.width(), root.height(), tuple(self.rect(i) for n in names for i in self.all_items(root, n)))
+        return wait_still(sample, ceiling_ms)
 
     def closed(self, popup, ceiling_ms: int) -> None:
         """Close a popup; wait until it is gone (its exit transition ended); the old wait is the ceiling."""
@@ -1138,14 +1144,25 @@ class ChatHeaderTests(SidebarNavCase):
         global_long = store.create_conversation(title=longest[:-8] + " (Genel)")
         bridge = self.bridge()
         root = self.window(bridge)
+
+        def clear_mid_reflow() -> None:             # F-ee: no frame of a reflow puts the header over a neighbour
+            header = self.box(root, "chatHeader")
+            self.inside(QRectF(0, 0, root.width(), root.height()), header, "header in the window mid-reflow")
+            for other in ("canonicalComposer", "sidebar", "panelColumn"):
+                self.apart(header, self.box(root, other), other + " mid-reflow")
+        # F-ee: the first step below is the largest shrink, a 4K window to the minimum.
+        self.assertTrue(self.resize_still(root, 3840, 2160, 3000, every=clear_mid_reflow), "4K did not settle")
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for key, conversation in (("project", owned), ("global", global_long)):
                 bridge.openConversation(conversation.id)
                 pump(300)
                 for width, height in SIZES:
-                    self.resize_still(root, width, height, 600)
                     with self.subTest(theme=theme, owner=key, size=(width, height)):
+                        # F-ee: the rail's reflow, then the column's, take ~1 s to go still offscreen
+                        # (the old 600 ms ran out unnoticed); what follows measures the still frame.
+                        self.assertTrue(self.resize_still(root, width, height, 3000, every=clear_mid_reflow),
+                                        "the reflow did not settle")
                         header = self.box(root, "chatHeader")
                         self.inside(self.box(root, "canonicalWorkspace"), header, "header")
                         for other in ("canonicalComposer", "sidebar", "panelColumn"):

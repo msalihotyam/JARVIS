@@ -177,9 +177,18 @@ Window {
         readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
         readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
         // Gate 6F: on home the work surface starts after the sidebar; the right
-        // column and every other page keep the rail line (L5, Q11).
-        readonly property real homeInset: command || !root.homePage ? 0 : sidebar.x + Theme.sidebarWidth(root.width) + columnGap - Theme.railWidth(root.width)
+        // column and every other page keep the rail line (L5, Q11). Measured
+        // from this item's live x, so the rail's reflow never slides it under the sidebar.
+        readonly property real homeInset: command || !root.homePage ? 0 : sidebar.x + Theme.sidebarWidth(root.width) + columnGap - x
         readonly property int columnGap: command ? 16 : Theme.columnGap(root.width)
+        // F-ee: the column and its gap, animated as ONE value that both the work
+        // surface and the column read, so no frame of a reflow (a window resize,
+        // focus mode, the grip) lets one overlap the other. While a large window
+        // shrinks, the span is held to the room after the sidebar: never a
+        // negative work surface, never the column under the sidebar.
+        property real columnSpan: showColumn ? columnWidth + columnGap : 0
+        Behavior on columnSpan { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
+        readonly property real liveSpan: Math.min(columnSpan, Math.max(0, width - homeInset))
         // The conversation shell alone rises into the header environment;
         // the right stack and every other page keep the panel line.
         readonly property int lift: command || !root.homePage ? 0 : Theme.shellLift(root.height)
@@ -188,8 +197,7 @@ Window {
         Item {
             id: workspace
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom; topMargin: -content.lift; leftMargin: content.homeInset }
-            width: content.width - content.homeInset - (content.showColumn ? content.columnWidth + content.columnGap : 0)
-            Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
+            width: content.width - content.homeInset - content.liveSpan
             Loader {
                 id: pageLoader
                 anchors.fill: parent
@@ -243,13 +251,12 @@ Window {
             objectName: "panelColumn"
             anchors { right: parent.right; top: parent.top; bottom: parent.bottom
                       bottomMargin: content.command ? 0 : Theme.stackInset(root.height) }
-            width: content.columnWidth
+            width: Math.max(0, content.liveSpan - content.columnGap)
             visible: content.showColumn
             opacity: content.showColumn ? 1 : 0
             onMenuRequested: function(card, anchor, canUp, canDown) { layoutMenus.openCard("stack", card, anchor, canUp, canDown) }
             onCardsRequested: function(anchor) { layoutMenus.toggle("cards", anchor) }
             onResetRequested: function(anchor) { layoutMenus.toggle("reset", anchor) }
-            Behavior on width { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
             Behavior on opacity { NumberAnimation { duration: Theme.focusMs; easing.type: Easing.InOutCubic } }
         }
     }
