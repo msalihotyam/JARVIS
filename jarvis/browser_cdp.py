@@ -183,9 +183,7 @@ class _WebSocket:
         if "101" not in lines[0]:
             raise BrowserCommandFailed("the browser did not accept the debugging handshake")
         expected = base64.b64encode(
-            hashlib.sha1(
-(key + _WEBSOCKET_GUID).encode("ascii"), usedforsecurity=False
-).digest()
+            hashlib.sha1((key + _WEBSOCKET_GUID).encode("ascii"), usedforsecurity=False).digest()
         ).decode("ascii")
         accepted = {
             name.strip().lower(): value.strip()
