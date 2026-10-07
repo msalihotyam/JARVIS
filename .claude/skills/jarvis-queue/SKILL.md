@@ -11,9 +11,10 @@ slice itself follows `jarvis-slice`.
 
 ## Before the first slice
 
-- Confirm the lane: a helper worktree on its own `claude/<task>` branch
-  (`jarvis-lifecycle` section 1), clean, not canonical main. Not on a
-  worktree branch: stop and report.
+- Confirm the lane: a native worktree `.claude/worktrees/<slice-id>` on its
+  own `worktree-<slice-id>` branch (`jarvis-lifecycle` section 1; a
+  `dev.ps1` helper worktree on `claude/<task>` is the fallback), clean, not
+  canonical main. Not on a worktree branch: stop and report.
 - List `build\queue\NN-*.md` in order. Skip slices that already have a
   `NN-<slug>.report.md` with `STATUS: PASS`.
 
@@ -33,11 +34,13 @@ slice itself follows `jarvis-slice`.
 - Ask nothing; do not wait for approval to test or commit.
 - Commit only on the lane's worktree branch, never on canonical main.
 - Never push `main` (the `ci/*` exception is as in the runbook); no
-  `finish`, no cleanup, no worktree removal, no REBOUND answer.
+  integration, no cleanup, no worktree removal, no `ExitWorktree` remove (keep
+  only), no REBOUND answer.
 - A slice that needs a decision, a higher tier than named, or a file outside
   its owned files is BLOCKED, not improvised.
 
 ## At the end
 
 Print one line per slice: number, slug, STATUS, commit hash. Integration
-(`dev.ps1 finish`) stays with the orchestrator.
+("Parallel lanes": ff-merge or cherry-pick, only on Salih's "entegre et")
+stays with the orchestrator.

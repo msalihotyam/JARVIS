@@ -28,3 +28,6 @@ htmlcov/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Claude Code native worktrees (code lanes)
+.claude/worktrees/

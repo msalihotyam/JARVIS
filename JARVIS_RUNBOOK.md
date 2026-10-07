@@ -11,25 +11,53 @@ it — the runbook must never be left stating a superseded rule.
 
 ## Parallel lanes
 
-Salih decision (2026-10-06; replaces "One line at a time"):
+Salih decision (2026-10-06; replaces "One line at a time"). Lane procedure
+changed 2026-10-07 (S0d): native worktrees, no chat rebinding.
 
-- At most **3 lanes** run at once. Each code lane works in its own helper
-  worktree (`dev.ps1 new`); at most one docs/state lane works on canonical
-  main.
+- At most **3 lanes** run at once. Each code lane works in its own **native
+  worktree** (below); at most one docs/state lane works on canonical main.
 - Every prompt lists the lane's **owned files**. A file belongs to one lane at
   a time. Central single-owner surfaces (core, contracts, memory/store,
   schema/migrations, authority/approval/attestation) are owned by one lane at
   a time.
-- Integration is one lane at a time via `dev.ps1 finish`, in the
-  orchestrator's order. A cherry-pick conflict stops the integration and is
-  reported.
-- **Clean main first (G0, 2026-10-06):** `dev.ps1 new` / `finish` /
-  `cleanup` require a clean canonical main, so a docs/state lane on main
-  commits its work before any lane is opened or integrated.
+- **Chats stay bound to the canonical folder
+  `C:\Users\realk\Masaüstü\JARVIS` and are never rebound.** Salih drives
+  everything by messaging chats (works from a phone); no folder rebinding is
+  ever required.
+- **Opening a code lane:** the lane's chat starts with `EnterWorktree`
+  `name=<slice-id>`. That creates `.claude/worktrees/<slice-id>` on branch
+  `worktree-<slice-id>` from local `HEAD` (`.claude/settings.json`:
+  `worktree.baseRef = "head"`; the default would branch from `origin/HEAD`,
+  and local main is far ahead of it). All edits, tests and commits happen
+  there.
+- **Isolation:** while inside the worktree, never run git against the
+  canonical checkout.
+- **Ending a lane:** commit in the worktree, report, then `ExitWorktree`
+  choosing **keep**. Never remove a worktree before it is integrated.
+- **Integrating** happens only when Salih says "entegre et", one lane at a
+  time, in the orchestrator's order, by a chat in canonical on a clean main:
+  1. If `main` is still the branch's base: `git merge --ff-only
+     worktree-<slice-id>`.
+  2. Otherwise: `git cherry-pick main..worktree-<slice-id>`.
+  3. On a conflict: abort and report. Never resolve silently.
+  4. Then verify the tree, run the suite the tier requires, and run
+     `scripts\ci.ps1`.
+- **Cleanup after a successful integration:**
+  - `git worktree remove .claude/worktrees/<slice-id>` (no `--force`).
+  - ff-merged: `git branch -d worktree-<slice-id>`.
+  - cherry-picked: `git cherry main worktree-<slice-id>` must show only `-`
+    lines; then `git branch -D worktree-<slice-id>`.
+  - If anything refuses, STOP and report.
+- **Clean main first:** a docs/state lane on main commits its work before any
+  lane is opened or integrated (and `dev.ps1 new` / `finish` / `cleanup`
+  require a clean canonical main).
+- **Fallback:** `dev.ps1 new` / `finish` / `cleanup` (sibling helper
+  worktrees) stays available. The REBOUND attestation and the "Worktree
+  lifecycle — HARD RULE" below apply only to those helper worktrees.
 - **Gate close:** one full suite on the integrated main HEAD (CI on the same
   SHA allowed) covers the combined result.
-- Chats: one chat per lane, and at most one chat on canonical main at a time
-  (see "Claude chat rotation").
+- Chats: one chat per lane, and at most one chat on canonical main outside a
+  worktree at a time (see "Claude chat rotation").
 
 ## Every worker instruction includes
 
@@ -437,6 +465,9 @@ computed by the renderer, never written by hand). Also:
   `status.json` change in a small dev-tooling commit so main is clean again.
 
 ## Worktree lifecycle — HARD RULE
+
+Applies to `dev.ps1` helper worktrees only (the fallback). Native worktrees
+follow "Parallel lanes".
 
 Before any `jfinish` / finish-current / worktree cleanup, ALL of the
 following must be true, in order:

@@ -29,12 +29,12 @@ Three distinct kinds of location, and they are not interchangeable:
 
 - **Canonical main** — `C:\Users\realk\Masaüstü\JARVIS`, branch `main`. Where
   integration lands and where dashboard/ACTIVE_STATE housekeeping happens.
-- **Helper-managed task worktree** — created by `dev.ps1`, a *sibling* of
-  canonical main named `JARVIS-<Worker>-<task>`, on a branch like
+- **Native worktree (the code-lane default)** — created by `EnterWorktree`
+  under `.claude/worktrees/<slice-id>` on branch `worktree-<slice-id>`, from
+  local `HEAD` (`baseRef head`). The chat stays bound to canonical.
+- **Helper-managed task worktree (fallback)** — created by `dev.ps1`, a
+  *sibling* of canonical main named `JARVIS-<Worker>-<task>`, on a branch like
   `claude/<task>`, with helper-owned state and an ownership marker.
-- **Claude-managed worktree** — created by Claude Code's own worktree
-  isolation, under `.claude/worktrees/`. The helper does not own it and does
-  not know about it.
 
 **Never guess the type.** If the path, the worktree list and the branch do not
 together make the type unambiguous, stop and ask. A wrong guess here is what
@@ -42,13 +42,18 @@ turns a cleanup into a boundary violation.
 
 ## 2. Route by worktree type
 
-- A **helper-managed** task goes through the helper lifecycle end to end:
-  `dev.ps1 new` → work → `dev.ps1 finish-current` → `dev.ps1 cleanup`. Do not
-  hand-roll `git worktree remove` or branch deletion for it.
-- A **Claude-managed** worktree under `.claude/worktrees/` must **never** be
-  sent through helper `finish` / `finish-current` / `cleanup`. The helper will
-  refuse or misfire on a worktree it does not own; ending one is Claude
-  Code's own concern.
+- A **native** worktree follows RUNBOOK "Parallel lanes": `EnterWorktree
+  name=<slice-id>` → work and commit there → report → `ExitWorktree` keep.
+  Integration only on Salih's "entegre et", from canonical on a clean main
+  (`git merge --ff-only worktree-<slice-id>`, else `git cherry-pick
+  main..worktree-<slice-id>`; a conflict is aborted and reported), then verify,
+  run the tier's suite and `scripts\ci.ps1`, then `git worktree remove` (no
+  `--force`) and the branch deletion the runbook names. It must **never** be
+  sent through helper `finish` / `finish-current` / `cleanup`. While inside
+  it, never run git against the canonical checkout.
+- A **helper-managed** task (fallback) goes through the helper lifecycle end
+  to end: `dev.ps1 new` → work → `dev.ps1 finish-current` → `dev.ps1
+  cleanup`. Do not hand-roll `git worktree remove` or branch deletion for it.
 - Canonical main is never "finished" or "cleaned up" at all.
 
 ## 3. Verify before integrating or cleaning up
@@ -61,11 +66,12 @@ Before either, re-verify live (not from memory): the worktree list, the
 branch, HEAD, and `git status --porcelain` empty. Before cleanup also confirm
 the work was accepted and already integrated.
 
-Per the runbook's HARD RULE, before any destructive cleanup the persistent
-development chat must already be **rebound to canonical**
+For a **helper-managed** worktree, per the runbook's HARD RULE, before any
+destructive cleanup the persistent development chat must already be **rebound
+to canonical**
 `C:\Users\realk\Masaüstü\JARVIS`. Answering the helper's `REBOUND` prompt
 before that is true is itself the violation. Rebind first, verify, then
-answer.
+answer. (Native worktrees need no rebinding and no REBOUND answer.)
 
 ## 4. Stop conditions
 

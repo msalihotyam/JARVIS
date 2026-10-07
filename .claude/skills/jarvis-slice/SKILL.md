@@ -16,7 +16,9 @@ overrides it. Where the two disagree, the runbook wins.
   `JARVIS_ACTIVE_STATE.md`, the active roadmap section, then the freshness
   check. Contradiction: stop and report.
 - Establish the facts live (`jarvis-lifecycle` section 1): toplevel, worktree
-  list, branch, HEAD, `git status --short`. Never from the prompt.
+  list, branch, HEAD, `git status --short`. Never from the prompt. A code
+  slice runs inside its native worktree (`EnterWorktree name=<slice-id>`);
+  when it ends, commit, report, `ExitWorktree` keep.
 - Read from the prompt: the tier (T0 / T1 / T2; unsure = higher), the
   MODEL / EFFORT lines and the **owned files**.
 
