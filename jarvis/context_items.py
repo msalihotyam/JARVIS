@@ -114,7 +114,7 @@ def safe_name(name: Any) -> str:
     override can never reach the interface or the provider through a name.
     """
     text = unicodedata.normalize("NFC", str(name or ""))
-    text = "".join(char for char in text if char.isprintable() and char not in "‪‫‬‭‮")
+    text = "".join(char for char in text if char.isprintable() and char not in "\u202a\u202b\u202c\u202d\u202e")
     text = re.split(r"[\\/]", text)[-1].strip()
     return text[:120] or "file"
 

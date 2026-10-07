@@ -183,7 +183,9 @@ class _WebSocket:
         if "101" not in lines[0]:
             raise BrowserCommandFailed("the browser did not accept the debugging handshake")
         expected = base64.b64encode(
-            hashlib.sha1((key + _WEBSOCKET_GUID).encode("ascii")).digest()
+            hashlib.sha1(
+(key + _WEBSOCKET_GUID).encode("ascii"), usedforsecurity=False
+).digest()
         ).decode("ascii")
         accepted = {
             name.strip().lower(): value.strip()
@@ -443,7 +445,7 @@ def _endpoint(port: int) -> str:
 def _debugging_socket(port: int) -> str | None:
     """The browser-level protocol socket, or ``None`` if nothing answers."""
     try:
-        with urlopen(f"{_endpoint(port)}/json/version", timeout=2) as answer:
+        with urlopen(f"{_endpoint(port)}/json/version", timeout=2) as answer:  # nosec B310 - fixed loopback http URL, int port
             payload = json.loads(answer.read(64 * 1024).decode("utf-8", "replace"))
     except (URLError, OSError, ValueError):
         return None

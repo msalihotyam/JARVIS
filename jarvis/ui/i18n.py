@@ -72,7 +72,7 @@ def QT_TRANSLATE_NOOP(context: str, source: str) -> str:  # noqa: N802 - the nam
 def load_catalog(path: Path) -> dict[tuple[str, str], str]:
     """(context, source) -> translation, finished entries only."""
     try:
-        root = ElementTree.parse(path).getroot()
+        root = ElementTree.parse(path).getroot()  # nosec B314 - app-shipped translation catalog
     except (OSError, ElementTree.ParseError):
         return {}
     table: dict[tuple[str, str], str] = {}

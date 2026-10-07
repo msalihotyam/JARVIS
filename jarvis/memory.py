@@ -4740,7 +4740,7 @@ class SQLiteMemoryStore:
                 (record.id, project_id),
             )
             connection.execute(
-                f"INSERT INTO project_instructions ({self._INSTRUCTION_COLUMNS}) "
+                f"INSERT INTO project_instructions ({self._INSTRUCTION_COLUMNS}) "  # nosec B608 - constant SQL fragments only; values are bound
                 "VALUES (?, ?, ?, ?, ?, NULL)",
                 (record.id, project_id, record.text, classification.value, record.created_at),
             )
@@ -4750,7 +4750,7 @@ class SQLiteMemoryStore:
         """The CURRENT version (possibly an empty clear), or ``None``."""
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "
+                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "  # nosec B608 - constant SQL fragments only; values are bound
                 "WHERE project_id = ? AND superseded_by IS NULL",
                 (project_id,),
             ).fetchone()
@@ -4761,7 +4761,7 @@ class SQLiteMemoryStore:
         validate_project_id(project_id)
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "
+                f"SELECT {self._INSTRUCTION_COLUMNS} FROM project_instructions "  # nosec B608 - constant SQL fragments only; values are bound
                 "WHERE project_id = ? ORDER BY created_at, rowid",
                 (project_id,),
             ).fetchall()
@@ -4804,7 +4804,7 @@ class SQLiteMemoryStore:
         if type(file_id) is not str or not PROJECT_FILE_ID.fullmatch(file_id):
             raise ValueError("file id must be 'pf-' followed by 32 lowercase hex digits")
         row = self._file_row(connection.execute(
-            f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE id = ? AND project_id = ?",
+            f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE id = ? AND project_id = ?",  # nosec B608 - constant SQL fragments only; values are bound
             (file_id, project_id),
         ).fetchone())
         if row is None or row["lifecycle"] not in project_files.LIFECYCLES:
@@ -4889,7 +4889,7 @@ class SQLiteMemoryStore:
                 connection, project_id, active_add=1, files_add=1, chars_add=record["char_count"]
             )
             connection.execute(
-                f"INSERT INTO project_files ({self._FILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO project_files ({self._FILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",  # nosec B608 - constant SQL fragments only; values are bound
                 tuple(record[key] for key in self._FILE_COLUMNS.split(", ")),
             )
             connection.executemany(
@@ -4910,7 +4910,7 @@ class SQLiteMemoryStore:
         where = "" if include_purged else " AND lifecycle != 'purged'"
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE project_id = ?{where} "
+                f"SELECT {self._FILE_COLUMNS} FROM project_files WHERE project_id = ?{where} "  # nosec B608 - constant SQL fragments only; values are bound
                 "ORDER BY added_at, id",
                 (project_id,),
             ).fetchall()
@@ -5201,7 +5201,7 @@ class SQLiteMemoryStore:
         self._require_conversation_id(conversation_id)
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone()
         return None if row is None else self._conversation_record(row)
@@ -5215,7 +5215,7 @@ class SQLiteMemoryStore:
         self._require_conversation_id(conversation_id)
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT state_json, integrity FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
+                f"SELECT state_json, integrity FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone()
         if row is None:
@@ -5242,7 +5242,7 @@ class SQLiteMemoryStore:
         where = f" WHERE {' AND '.join(clauses)}"
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations{where} "
+                f"SELECT {self._CONVERSATION_COLUMNS} FROM conversations{where} "  # nosec B608 - constant SQL fragments only; values are bound
                 "ORDER BY updated_at DESC, id",
                 params,
             ).fetchall()
@@ -5264,7 +5264,7 @@ class SQLiteMemoryStore:
         self._require_conversation_id(conversation_id)
         with self._connection(write=True) as connection:
             row = connection.execute(
-                f"SELECT state_json, integrity, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
+                f"SELECT state_json, integrity, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone()
             if row is None:
@@ -5295,7 +5295,7 @@ class SQLiteMemoryStore:
         with self._connection(write=True) as connection:
             self._require_writable_owner(connection, conversation_id)
             changed = connection.execute(
-                f"UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL AND {self._NOT_DELETED}",
+                f"UPDATE conversations SET title = ? WHERE id = ? AND archived_at IS NULL AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
                 (title, conversation_id),
             ).rowcount
         if changed != 1:
@@ -5304,7 +5304,7 @@ class SQLiteMemoryStore:
     def _live_conversation_row(self, connection: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
         """The row of a conversation that exists and is not deleted, else ``KeyError``."""
         row = connection.execute(
-            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "
+            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "  # nosec B608 - constant SQL fragments only; values are bound
             f"WHERE id = ? AND {self._NOT_DELETED}",
             (conversation_id,),
         ).fetchone()
@@ -5514,7 +5514,7 @@ class SQLiteMemoryStore:
             raise ValueError("session id must be a non-empty string")
         with self._connection(write=True) as connection:
             conversation = connection.execute(
-                f"SELECT project_id, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",
+                f"SELECT project_id, archived_at FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone()
             if conversation is None:
@@ -5588,7 +5588,7 @@ class SQLiteMemoryStore:
         if (project_id is None) == (new_project_name is None):
             raise ValueError("Name exactly one target: an existing project or a new project name.")
         row = connection.execute(
-            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "
+            f"SELECT {self._CONVERSATION_COLUMNS}, state_json, integrity FROM conversations "  # nosec B608 - constant SQL fragments only; values are bound
             f"WHERE id = ? AND {self._NOT_DELETED}",
             (conversation_id,),
         ).fetchone()
@@ -5656,7 +5656,7 @@ class SQLiteMemoryStore:
                 return "A chain in this conversation is not finished; finish or cancel it first."
         terminal = sorted(_TERMINAL_STATUS_VALUES)
         if connection.execute(
-            "SELECT 1 FROM tasks t JOIN conversation_sessions cs ON cs.session_id = t.session_id "
+            "SELECT 1 FROM tasks t JOIN conversation_sessions cs ON cs.session_id = t.session_id "  # nosec B608 - constant SQL fragments only; values are bound
             f"WHERE cs.conversation_id = ? AND t.status NOT IN ({', '.join('?' * len(terminal))}) LIMIT 1",
             (conversation_id, *terminal),
         ).fetchone() is not None:
@@ -5684,7 +5684,7 @@ class SQLiteMemoryStore:
             return None
         try:
             used = connection.execute(
-                f"SELECT 1 FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? LIMIT 1",
+                f"SELECT 1 FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? LIMIT 1",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone() is not None
         except sqlite3.Error:
@@ -7286,7 +7286,7 @@ class SQLiteMemoryStore:
         if type(expected_revision) is not int or expected_revision < 1:
             raise JobError("expected_revision is not an exact positive integer")
         row = connection.execute(
-            f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+            f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)  # nosec B608 - constant SQL fragments only; values are bound
         ).fetchone()
         record = self._job_from_row(row)
         if record is None:
@@ -7335,7 +7335,7 @@ class SQLiteMemoryStore:
         """
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)  # nosec B608 - constant SQL fragments only; values are bound
             ).fetchone()
         return self._job_from_row(row)
 
@@ -7459,7 +7459,7 @@ class SQLiteMemoryStore:
         moment = self._job_instant(nominal_due_at_utc, "nominal_due_at_utc")
         with self._connection(write=True) as connection:
             row = connection.execute(
-                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)  # nosec B608 - constant SQL fragments only; values are bound
             ).fetchone()
             record = self._job_from_row(row)
             if record is None:
@@ -8614,7 +8614,7 @@ class SQLiteMemoryStore:
         bound = self._visibility_rows(limit)
         if bound == 0:
             return []
-        sql = f"SELECT {self._JOB_COLUMNS} FROM jobs"
+        sql = f"SELECT {self._JOB_COLUMNS} FROM jobs"  # nosec B608 - constant SQL fragments only; values are bound
         if not include_archived:
             sql += " WHERE archived_at IS NULL"
         sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
@@ -8626,7 +8626,7 @@ class SQLiteMemoryStore:
         """ONE job as the same validated projection a listing returns."""
         with self._connection() as connection:
             row = connection.execute(
-                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)
+                f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)  # nosec B608 - constant SQL fragments only; values are bound
             ).fetchone()
         return None if row is None else self._job_summary(row)
 
@@ -8668,7 +8668,7 @@ class SQLiteMemoryStore:
                 "SELECT revision FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             rows = connection.execute(
-                f"SELECT {self._JOB_RUN_COLUMNS} FROM job_runs WHERE job_id = ? "
+                f"SELECT {self._JOB_RUN_COLUMNS} FROM job_runs WHERE job_id = ? "  # nosec B608 - constant SQL fragments only; values are bound
                 "ORDER BY generation DESC LIMIT ?",
                 (job_id, bound),
             ).fetchall()
