@@ -147,7 +147,8 @@ class WindowCase(ProjectsUiCase):
         self.fake_providers(bridge, self.lines())
         bridge.setChatProvider(provider)
         root = self.window(bridge)
-        self.click(root, "modelTrigger"); pump(400)
+        self.click(root, "modelTrigger")
+        pump(400)
         return root
 
     def every(self, root):
@@ -229,7 +230,8 @@ class WindowTests(WindowCase):
 
     def test_b_a_selected_old_claude_model_stays_and_the_hint_selects_the_keeper_only_on_click(self) -> None:
         bridge = self.bridge()
-        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7"); pump(100)
+        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
+        pump(100)
         root = self.open_panel(bridge)
         self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)
         self.assertIn("claude-opus-4-7", self.listed(root, "claudeModel_"))              # shown although older
@@ -253,7 +255,8 @@ class WindowTests(WindowCase):
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "high")
         root = self.window(bridge)
-        self.click(root, "modelTrigger"); pump(400)
+        self.click(root, "modelTrigger")
+        pump(400)
         self.assertIn("gpt-5.6-sol", self.listed(root, "codexModel_"))
         self.assertIn("6.1 Sol", self.shown(root, "modelNewerHintText").property("text"))
         self.assertIn("New version: ", self.shown(root, "modelNewerHintText").property("text"))
@@ -266,7 +269,8 @@ class WindowTests(WindowCase):
         bridge = self.bridge()
         root = self.open_panel(bridge)
         self.assertFalse([i for i in self.every(root) if str(i.objectName()) == "modelNewerHint" and i.isVisible()])
-        bridge.applyModel("claude-opus-5-5", "", "opus"); pump(100)
+        bridge.applyModel("claude-opus-5-5", "", "opus")
+        pump(100)
         self.assertFalse([i for i in self.every(root) if str(i.objectName()) == "modelNewerHint" and i.isVisible()])
 
 
@@ -307,15 +311,18 @@ class PolishTests(WindowCase):
     def stage(self, provider="claude", old=False, lines=None, size=None):
         bridge = self.bridge()
         if old:
-            bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7"); pump(100)
+            bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
+            pump(100)
         self.fake_providers(bridge, lines or self.lines())
         bridge.setChatProvider(provider)
         if provider == "codex":
             bridge.setCodexModel("gpt-6.1-sol", "medium")
         root = self.window(bridge)
         if size:
-            root.resize(*size); pump(300)
-        self.click(root, "modelTrigger"); pump(400)
+            root.resize(*size)
+            pump(300)
+        self.click(root, "modelTrigger")
+        pump(400)
         self.root = root
         return bridge, root
 
@@ -333,21 +340,25 @@ class PolishTests(WindowCase):
 
     def hover(self, item) -> None:
         from PySide6.QtTest import QTest
-        QTest.mouseMove(self.root, self.center(item)); pump(20)
+        QTest.mouseMove(self.root, self.center(item))
+        pump(20)
 
     def press(self, item) -> None:
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
-        QTest.mouseClick(self.root, Qt.LeftButton, Qt.NoModifier, self.center(item)); pump(260)
+        QTest.mouseClick(self.root, Qt.LeftButton, Qt.NoModifier, self.center(item))
+        pump(260)
 
     def key(self, key) -> None:
         from PySide6.QtTest import QTest
-        QTest.keyClick(self.root, key); pump(200)
+        QTest.keyClick(self.root, key)
+        pump(200)
 
     def tr(self, bridge) -> None:
         from jarvis.ui.i18n import localization
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        bridge.setLanguage("tr-TR"); pump(300)
+        bridge.setLanguage("tr-TR")
+        pump(300)
 
     def label_of(self, segment) -> str:
         return next(c.property("text") for c in segment.childItems() if isinstance(c.property("text"), str))
@@ -366,18 +377,23 @@ class PolishTests(WindowCase):
         self.assertAlmostEqual(0.05, hint.property("color").alphaF(), places=2)
         # Focus: the ring (only then).
         self.assertFalse(self.under(hint, "modelRowFocusRing"))
-        hint.forceActiveFocus(); pump(60)
+        hint.forceActiveFocus()
+        pump(60)
         self.assertTrue(self.under(hint, "modelRowFocusRing"))
         # Return does what a click does: the keeper, and nothing before.
         self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)
         self.key(Qt.Key_Return)
         self.assertEqual("claude-opus-5-5", self.store.load().settings.claude_model)
         # Space does the same, again from a fresh old selection.
-        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7"); pump(100)
-        self.click(root, "modelTrigger"); pump(300)                   # close and reopen: the panel re-reads the selection
-        self.click(root, "modelTrigger"); pump(400)
+        bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
+        pump(100)
+        self.click(root, "modelTrigger")
+        pump(300)                   # close and reopen: the panel re-reads the selection
+        self.click(root, "modelTrigger")
+        pump(400)
         hint = self.shown(root, "modelNewerHint")
-        hint.forceActiveFocus(); pump(60)
+        hint.forceActiveFocus()
+        pump(60)
         self.key(Qt.Key_Space)
         self.assertEqual("claude-opus-5-5", self.store.load().settings.claude_model)
 
@@ -391,7 +407,8 @@ class PolishTests(WindowCase):
         settle(lambda: abs(toggle.property("color").alphaF() - 0.05) < 0.003)
         self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)
         self.assertFalse(self.under(toggle, "modelRowFocusRing"))
-        toggle.forceActiveFocus(); pump(60)
+        toggle.forceActiveFocus()
+        pump(60)
         self.assertTrue(self.under(toggle, "modelRowFocusRing"))
         self.assertFalse(bridge.showOldModels)
         self.key(Qt.Key_Space)
@@ -474,12 +491,15 @@ class PolishTests(WindowCase):
         self.hover(hint)
         settle(lambda: abs(hint.property("color").alphaF() - 0.05) < 0.003)
         # Ambient effects off: every one of them at once.
-        bridge.setAmbientEffects(False); pump(100)
+        bridge.setAmbientEffects(False)
+        pump(100)
         toggle = self.shown(root, "showOldModelsToggle")
         self.assertEqual(0.0, toggle.property("color").alphaF())
         self.hover(toggle)
         self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)    # one pump, no animation
-        scroll.setProperty("contentY", 0); pump(10)
+        scroll.setProperty("contentY", 0)
+        pump(10)
         self.assertEqual(1.0, fade.property("opacity"))
-        scroll.setProperty("contentY", end); pump(10)
+        scroll.setProperty("contentY", end)
+        pump(10)
         self.assertEqual((0.0, False), (fade.property("opacity"), fade.property("visible")))

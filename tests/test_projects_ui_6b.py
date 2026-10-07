@@ -36,8 +36,10 @@ class InstructionTests(ProjectsUiCase):
         root = self.window(bridge)
         if archived:
             store.set_project_active(project.id, False)
-        bridge.showProject(project.id); pump(300)
-        self.click(root, "projectTab_instruction"); pump(200)
+        bridge.showProject(project.id)
+        pump(300)
+        self.click(root, "projectTab_instruction")
+        pump(200)
         return store, project, bridge, root
 
     def versions(self, store: SQLiteMemoryStore, project_id: str) -> int:
@@ -50,7 +52,8 @@ class InstructionTests(ProjectsUiCase):
         self.assertFalse(save.isEnabled())                               # no preselected classification
         self.assertIn("PUBLIC or INTERNAL", self.item(root, "instructionReason").property("text"))
         self.assertIn("never grants", self.item(root, "instructionPrecedence").property("text"))
-        editor.setProperty("text", "Yanıtları kısa tut."); pump(60)
+        editor.setProperty("text", "Yanıtları kısa tut.")
+        pump(60)
         self.assertEqual("19 / 2000", self.item(root, "instructionCounter").property("text"))
         self.click(root, "instructionClass_internal")
         self.assertTrue(save.isEnabled())
@@ -64,7 +67,9 @@ class InstructionTests(ProjectsUiCase):
         self.assertEqual("", editor.property("text"))                   # the STORED text is shown
         # A fresh window shows the stored version, classification prefilled.
         store.save_explicit_user_project_instruction(project.id, "Kaynak göster.", "public")
-        bridge.showProject(""); bridge.showProject(project.id); pump(200)
+        bridge.showProject("")
+        bridge.showProject(project.id)
+        pump(200)
         self.assertEqual("Kaynak göster.", editor.property("text"))
         self.assertTrue(save.isEnabled())
         self.assertEqual(0, self.execute_calls())
@@ -72,22 +77,26 @@ class InstructionTests(ProjectsUiCase):
     def test_a_refusals_write_nothing_and_are_shown(self) -> None:
         store, project, bridge, root = self.open()
         editor = self.item(root, "instructionEditor")
-        editor.setProperty("text", "x" * 2001); pump(60)
+        editor.setProperty("text", "x" * 2001)
+        pump(60)
         self.assertEqual("2001 / 2000", self.item(root, "instructionCounter").property("text"))
         self.click(root, "instructionClass_public")
         self.click(root, "instructionSave")
         self.assertIn("longer than 2000", self.item(root, "instructionNotice").property("text"))
         self.assertEqual("x" * 2001, editor.property("text"))           # what was typed stays
-        bridge.saveProjectInstruction(project.id, "kısa", ""); pump(60)
+        bridge.saveProjectInstruction(project.id, "kısa", "")
+        pump(60)
         self.assertIn("classification is required", bridge.projectInstructionNotice)
-        bridge.saveProjectInstruction(project.id, "kısa", "secret"); pump(60)
+        bridge.saveProjectInstruction(project.id, "kısa", "secret")
+        pump(60)
         self.assertIn("only be PUBLIC or INTERNAL", bridge.projectInstructionNotice)
         self.assertEqual(0, self.versions(store, project.id))
 
     def test_a_redacted_stored_text_is_shown_and_said(self) -> None:
         store, project, bridge, root = self.open()
         typed = "Notlar C:\\Users\\salih\\gizli\\plan.txt dosyasında."
-        bridge.saveProjectInstruction(project.id, typed, "internal"); pump(100)
+        bridge.saveProjectInstruction(project.id, typed, "internal")
+        pump(100)
         stored = store.load_project_instruction(project.id).text
         self.assertNotEqual(typed, stored)
         self.assertNotIn("salih", stored)
@@ -100,7 +109,8 @@ class InstructionTests(ProjectsUiCase):
         self.assertFalse(self.item(root, "instructionSave").isEnabled())
         self.assertFalse(self.item(root, "instructionClear").isEnabled())
         self.assertIn("read-only", self.item(root, "instructionReason").property("text"))
-        bridge.saveProjectInstruction(project.id, "zorla", "internal"); pump(60)
+        bridge.saveProjectInstruction(project.id, "zorla", "internal")
+        pump(60)
         self.assertIn("inactive project", bridge.projectInstructionNotice)
         self.assertEqual(0, self.versions(store, project.id))
 
@@ -117,8 +127,10 @@ class FileTests(ProjectsUiCase):
         project = store.create_project("Evim")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.showProject(project.id); pump(300)
-        self.click(root, "projectTab_files"); pump(200)
+        bridge.showProject(project.id)
+        pump(300)
+        self.click(root, "projectTab_files")
+        pump(200)
         return store, project, bridge, root
 
     def counters(self, root) -> tuple[str, str, str]:
@@ -155,28 +167,35 @@ class FileTests(ProjectsUiCase):
         store, project, bridge, root = self.open()
         self.assertEqual(("Active 0/20", "Retained 0/40", "Characters 0/2,000,000"), self.counters(root))
         self.assertFalse(self.item(root, "fileAdd").isEnabled())         # classification first
-        bridge.addProjectFile(project.id, self.file("a", "notes.md", "alpha " * 100), ""); pump(60)
+        bridge.addProjectFile(project.id, self.file("a", "notes.md", "alpha " * 100), "")
+        pump(60)
         self.assertIn("classification is required", bridge.projectFileNotice)
         self.assertEqual([], store.list_project_files(project.id))
         self.click(root, "fileClass_internal")
         self.assertTrue(self.item(root, "fileAdd").isEnabled())
         for folder, text in (("a", "alpha " * 100), ("b", "beta " * 50)):
-            bridge.addProjectFile(project.id, self.file(folder, "notes.md", text), "internal"); pump(60)
+            bridge.addProjectFile(project.id, self.file(folder, "notes.md", text), "internal")
+            pump(60)
             self.assertEqual("", bridge.projectFileNotice)
             self.assertEqual(self.expected(store, project.id), self.counters(root))
         first, second = (r["id"] for r in store.list_project_files(project.id))
         self.assertEqual(["notes.md", "notes.md"], self.texts(root, "fileRowName"))
         meta = self.texts(root, "fileRowMeta")[0]
-        self.assertIn("INTERNAL", meta); self.assertIn("600 bytes", meta); self.assertIn("active", meta)
+        self.assertIn("INTERNAL", meta)
+        self.assertIn("600 bytes", meta)
+        self.assertIn("active", meta)
         # Active project: no Purge on an active row.
         self.assertEqual({first: {"fileRetire": (True, True), "fileRestore": (False, True), "filePurge": (False, True)},
                           second: {"fileRetire": (True, True), "fileRestore": (False, True), "filePurge": (False, True)}},
                          self.rows(root))
-        bridge.retireProjectFile(project.id, first); bridge.retireProjectFile(project.id, second); pump(60)
+        bridge.retireProjectFile(project.id, first)
+        bridge.retireProjectFile(project.id, second)
+        pump(60)
         self.assertEqual(self.expected(store, project.id), self.counters(root))
         self.assertEqual(("Active 0/20", "Retained 2/40"), self.counters(root)[:2])
         self.assertTrue(self.rows(root)[first]["filePurge"][0])
-        bridge.restoreProjectFile(project.id, first); pump(60)
+        bridge.restoreProjectFile(project.id, first)
+        pump(60)
         self.assertEqual(self.expected(store, project.id), self.counters(root))
         self.assertEqual({"fileRetire": (True, True), "fileRestore": (False, True), "filePurge": (False, True)},
                          self.rows(root)[first])
@@ -185,7 +204,8 @@ class FileTests(ProjectsUiCase):
         self.assertFalse(bridge.purgeProjectFile(project.id, second, "notes"))
         self.assertFalse(bridge.purgeProjectFile(project.id, first, "notes.md"))      # active row: not offered
         self.assertEqual([], [c for c in calls if c[0] == "purge"])
-        self.assertTrue(bridge.purgeProjectFile(project.id, second, "notes.md")); pump(60)
+        self.assertTrue(bridge.purgeProjectFile(project.id, second, "notes.md"))
+        pump(60)
         self.assertEqual([("purge", {"file_id": second, "confirm": second})], [c for c in calls if c[0] == "purge"])
         lifecycles = {r["id"]: r["lifecycle"] for r in store.list_project_files(project.id, include_purged=True)}
         self.assertEqual({first: "active", second: "purged"}, lifecycles)
@@ -194,10 +214,13 @@ class FileTests(ProjectsUiCase):
 
     def test_b_purge_dialog_names_the_row_says_the_residue_and_needs_the_name(self) -> None:
         store, project, bridge, root = self.open()
-        bridge.addProjectFile(project.id, self.file("a", "rapor.txt", "gizli veri " * 30), "sensitive"); pump(60)
+        bridge.addProjectFile(project.id, self.file("a", "rapor.txt", "gizli veri " * 30), "sensitive")
+        pump(60)
         file_id = store.list_project_files(project.id)[0]["id"]
-        bridge.retireProjectFile(project.id, file_id); pump(100)
-        self.click(root, "filePurge"); pump(200)
+        bridge.retireProjectFile(project.id, file_id)
+        pump(100)
+        self.click(root, "filePurge")
+        pump(200)
         self.assertEqual("rapor.txt", self.item(root, "purgeIdentity").property("text"))
         self.assertIn("SENSITIVE", self.item(root, "purgeIdentityMeta").property("text"))
         residue = self.item(root, "purgeResidue").property("text")
@@ -205,9 +228,11 @@ class FileTests(ProjectsUiCase):
             self.assertIn(part, residue)
         confirm = self.item(root, "purgeConfirm")
         self.assertFalse(confirm.isEnabled())
-        self.item(root, "purgeConfirmName").setProperty("text", "rapor"); pump(60)
+        self.item(root, "purgeConfirmName").setProperty("text", "rapor")
+        pump(60)
         self.assertFalse(confirm.isEnabled())
-        self.item(root, "purgeConfirmName").setProperty("text", "rapor.txt"); pump(60)
+        self.item(root, "purgeConfirmName").setProperty("text", "rapor.txt")
+        pump(60)
         self.assertTrue(confirm.isEnabled())
         self.click(root, "purgeConfirm")
         self.assertEqual("purged", store.list_project_files(project.id, include_purged=True)[0]["lifecycle"])
@@ -216,18 +241,23 @@ class FileTests(ProjectsUiCase):
         store, project, bridge, root = self.open()
         self.click(root, "fileClass_public")
         for folder in ("a", "b"):
-            bridge.addProjectFile(project.id, self.file(folder, f"{folder}.md", folder * 40), "public"); pump(60)
+            bridge.addProjectFile(project.id, self.file(folder, f"{folder}.md", folder * 40), "public")
+            pump(60)
         first, second = (r["id"] for r in store.list_project_files(project.id))
-        bridge.retireProjectFile(project.id, second); pump(60)
-        bridge.archiveProject(project.id); pump(200)
+        bridge.retireProjectFile(project.id, second)
+        pump(60)
+        bridge.archiveProject(project.id)
+        pump(200)
         self.assertFalse(self.item(root, "fileAdd").isEnabled())
         self.assertIn("Purge stays available", self.item(root, "fileReason").property("text"))
         self.assertEqual({first: {"fileRetire": (True, False), "fileRestore": (False, False), "filePurge": (True, True)},
                           second: {"fileRetire": (False, False), "fileRestore": (True, False), "filePurge": (True, True)}},
                          self.rows(root))
-        bridge.retireProjectFile(project.id, first); pump(60)
+        bridge.retireProjectFile(project.id, first)
+        pump(60)
         self.assertIn("archived", bridge.projectFileNotice)                 # the store's refusal, as returned
-        self.assertTrue(bridge.purgeProjectFile(project.id, first, "a.md")); pump(60)
+        self.assertTrue(bridge.purgeProjectFile(project.id, first, "a.md"))
+        pump(60)
         self.assertEqual("purged", {r["id"]: r["lifecycle"] for r in store.list_project_files(
             project.id, include_purged=True)}[first])
         self.assertEqual(self.expected(store, project.id), self.counters(root))
@@ -235,7 +265,8 @@ class FileTests(ProjectsUiCase):
     def test_b_quota_refusal_is_shown_as_returned(self) -> None:
         store, project, bridge, root = self.open()
         for index in range(21):
-            bridge.addProjectFile(project.id, self.file(str(index), "n.txt", f"file {index}"), "internal"); pump(20)
+            bridge.addProjectFile(project.id, self.file(str(index), "n.txt", f"file {index}"), "internal")
+            pump(20)
         self.assertEqual(20, len(store.list_project_files(project.id)))
         self.assertEqual("A project can have at most 20 active files.", self.item(root, "fileNotice").property("text"))
         self.assertEqual("Active 20/20", self.counters(root)[0])
@@ -260,13 +291,15 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertEqual("Global", self.owner(root))
-        bridge.openConversation(owned.id); pump(300)
+        bridge.openConversation(owned.id)
+        pump(300)
         self.assertEqual("Evim", self.owner(root))
         self.assertEqual(["Evim", "Tez"], sorted(self.menu_labels(root)))       # no archived project
         self.assertTrue(self.item(root, "sidebarGlobal").isVisible())
         self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())     # "All projects" (Q10)
         self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
-        self.click(root, "sidebarProjectsLink"); pump(300)
+        self.click(root, "sidebarProjectsLink")
+        pump(300)
         self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
         self.assertIsNotNone(thesis)
 
@@ -283,10 +316,12 @@ class SelectorTests(ProjectsUiCase):
         self.assertEqual(older.id, bridge.conversationId)                   # archived newest skipped
         self.assertEqual("home", bridge.page)
         before = len(store.list_conversations(project_id=thesis.id))
-        self.assertTrue(bridge.openProjectScope(thesis.id)); pump(200)
+        self.assertTrue(bridge.openProjectScope(thesis.id))
+        pump(200)
         self.assertEqual(before + 1, len(store.list_conversations(project_id=thesis.id)))
         self.assertEqual(thesis.id, store.load_conversation(bridge.conversationId).project_id)
-        self.click(root, "sidebarGlobal"); pump(200)
+        self.click(root, "sidebarGlobal")
+        pump(200)
         self.assertEqual(global_open, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # An archived or unknown project is never opened through the selector.
@@ -312,19 +347,23 @@ class SelectorTests(ProjectsUiCase):
         owned = store.create_conversation(home.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(owned.id); pump(200)
+        bridge.openConversation(owned.id)
+        pump(200)
         self.click(root, "sidebarNewConversation")
         self.assertNotEqual(owned.id, bridge.conversationId)
         self.assertEqual(home.id, store.load_conversation(bridge.conversationId).project_id)
-        self.assertTrue(bridge.openProjectScope("")); pump(200)
+        self.assertTrue(bridge.openProjectScope(""))
+        pump(200)
         before = bridge.conversationId
         self.click(root, "sidebarNewConversation")
         self.assertNotEqual(before, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # Archived owner: disabled with its reason; nothing is created.
-        bridge.openConversation(owned.id); pump(200)
+        bridge.openConversation(owned.id)
+        pump(200)
         store.set_project_active(home.id, False)
-        bridge.refreshProjects(); pump(200)
+        bridge.refreshProjects()
+        pump(200)
         button = self.item(root, "sidebarNewConversation")
         self.assertFalse(button.property("allowed"))
         self.assertIn("archived", button.property("tip"))                      # its reason
@@ -342,13 +381,16 @@ class AuthorityTests(ProjectsUiCase):
                              task_proposal("code_analysis", objective="Bu projeyi incele."))
         decisions = []
         for scope in ("", project.id):
-            self.assertTrue(bridge.openProjectScope(scope)); pump(100)
-            bridge.submitText("Bu projeyi incele."); pump(100)
+            self.assertTrue(bridge.openProjectScope(scope))
+            pump(100)
+            bridge.submitText("Bu projeyi incele.")
+            pump(100)
             self.assertTrue(bridge.approvalPending)
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
             decisions.append((request.scope, request.risk_level, request.side_effect, request.reason))
-            bridge.deny(); pump(100)
+            bridge.deny()
+            pump(100)
         self.assertEqual(decisions[0], decisions[1])
         self.assertEqual(0, self.execute_calls())
 

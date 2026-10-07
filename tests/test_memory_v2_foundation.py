@@ -673,7 +673,7 @@ class LifecycleTests(MemoryV2TestCase):
             self.memory.retire_memory_item("proj-b", fact.id)
         with self.assertRaises(ValueError):
             MemoryLifecycle("archived")
-        retired = self.memory.retire_memory_item("proj-a", fact.id)
+        self.memory.retire_memory_item("proj-a", fact.id)
         with self.assertRaises(ValueError):
             # Retiring is not reversible and never idempotent silently.
             self.memory.retire_memory_item("proj-a", fact.id)

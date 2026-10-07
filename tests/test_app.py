@@ -22,7 +22,6 @@ from jarvis.app import (
     TaskInputError,
     build_default_app,
     build_envelope,
-    create_app,
     decode_task_json,
 )
 from jarvis.connectors import claude_code
@@ -48,7 +47,7 @@ from jarvis.destinations import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, open_app, safe_cleanup
 
 
 def task_document(**overrides: object) -> str:

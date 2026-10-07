@@ -59,7 +59,6 @@ from jarvis.ui.preferences import (
     CONTEXTUAL_PANELS,
     GLOBAL_SCOPE,
     PAGES,
-    PANEL_IDS,
     PIN_LIMIT,
     PROFILES,
     THEMES,
@@ -2942,7 +2941,7 @@ class Bridge(QObject):
     @Slot(str)
     def removeAttachment(self, attachment_id: str) -> None:
         """Remove exactly one attachment, wherever it is owned."""
-        for owner in [self._attachments] + [group["attachments"] for group in self._groups]:
+        for owner in [self._attachments] + [g["attachments"] for g in self._groups]:
             for item in owner:
                 if item["id"] == str(attachment_id):
                     owner.remove(item)

@@ -45,7 +45,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from jarvis.app import TaskInputError, create_app, decode_task_json
+from jarvis.app import TaskInputError, decode_task_json
 from jarvis.connectors import local_files
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.local_files import (

@@ -19,7 +19,6 @@ import tempfile
 import unittest
 import argparse
 import contextlib
-import hashlib
 import sys
 from pathlib import Path
 from unittest import mock
@@ -66,7 +65,6 @@ from jarvis.gmail import (
     GMAIL_DEFERRED_CAPABILITIES,
     GMAIL_ENABLED_CAPABILITIES,
     GMAIL_LIST_MAX_ITEMS,
-    GMAIL_READ_CAPABILITIES,
     GMAIL_RECIPIENTS_MAX,
     GMAIL_UPLOAD_CONTENT_TYPE,
     GMAIL_UPLOAD_NAME,
@@ -107,7 +105,6 @@ from jarvis.gmail_cli import (
     GmailCommandTimedOut,
     GmailTransportResidue,
     _run,
-    attested_credential,
     dotenv_refusal,
     gmail_controlled_login,
     gmail_route_check,
@@ -1194,7 +1191,7 @@ class LiveProbeTests(SeamTestCase):
                 output = _run((*plan.arguments, "--dry-run"), config_dir=self.config, cwd=directory, environ=dict(os.environ), popen=subprocess.Popen)
                 payload = json.loads(output.stdout)
                 self.assertIsNone(gmail_dry_run_refusal(payload), payload)
-                self.assertIn(f"/upload/gmail/v1/users/", payload["url"])
+                self.assertIn("/upload/gmail/v1/users/", payload["url"])
                 self.assertNotIn("raw", output.stdout)
 
     def test_the_installed_cli_refuses_an_empty_dedicated_directory(self) -> None:
@@ -1269,7 +1266,8 @@ class AttestationContractTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(CREDENTIAL_BYTES).hexdigest(), made.credentials_sha256)
         self.assertNotIn(CREDENTIAL_BYTES.decode(), json.dumps(made.to_dict()))
         self.assertEqual(made, gmail_attestation_from_dict(json.loads(json.dumps(made.to_dict()))))
-        judge = lambda **kw: gmail_attestation_refusal(made, **{"principal": ACCOUNT, "config_dir": CONFIG_DIR, "credentials": CREDENTIAL_BYTES, **kw})
+        def judge(**kw):
+            return gmail_attestation_refusal(made, **{"principal": ACCOUNT, "config_dir": CONFIG_DIR, "credentials": CREDENTIAL_BYTES, **kw})
         self.assertIsNone(judge())
         self.assertIsNotNone(judge(credentials=CREDENTIAL_BYTES[:-1] + b"X"))
         self.assertIsNotNone(judge(credentials=CREDENTIAL_BYTES + b"1"))
@@ -1420,7 +1418,6 @@ class StepLockTests(SeamTestCase):
         Path(self.fresh).mkdir()
 
     def steps(self):
-        answer = json.dumps({"emailAddress": ACCOUNT}).encode()
         return {
             "identity": lambda: observed_gmail_identity(ACCOUNT, self.config, path_lookup=fake_path_lookup, popen=self.runner, environ={}),
             "read": lambda: run_operation_plan(gmail_operation_plan(frame_for("gmail_thread_list")), config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=self.runner),
@@ -2030,7 +2027,8 @@ class CoreSeamTests(unittest.TestCase):
         self.assertEqual(ErrorCode.CONFIDENTIAL_CLEANUP_FAILED, done.error.code)
         self.assertFalse(done.error.retryable)
         self.assertIn(f"message id={MESSAGE_ID}", done.error.message)
-        real_calls = lambda: [c for c in popen.calls if "auth" not in c["argv"] and "--dry-run" not in c["argv"]]
+        def real_calls():
+            return [c for c in popen.calls if "auth" not in c["argv"] and "--dry-run" not in c["argv"]]
         self.assertEqual(1, len(real_calls()))
         again = self.core.resume(self.waiting.session.id, self.waiting.task.id, self.grant)
         self.assertNotEqual(RunStatus.COMPLETED, again.status)

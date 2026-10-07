@@ -203,13 +203,15 @@ class ArchiveControlsTests(ProjectsUiCase):
         say(store, owned.id, "merhaba")
         bridge = self.bridge(json.dumps({"kind": "chat", "reply": "never"}))
         root = self.window(bridge)
-        bridge.openConversation(owned.id); pump(300)
+        bridge.openConversation(owned.id)
+        pump(300)
         self.assertFalse(bridge.conversationReadOnly)
         self.assertTrue(self.item(root, "composerInput").isEnabled())
         self.assertEqual(["Evim"], self.selector_labels(root))
         # The detail's Archive button.
         bridge.showProject(project.id)
-        bridge.setPage("projects"); pump(400)
+        bridge.setPage("projects")
+        pump(400)
         self.assertEqual([], self.visible(root, "projectDetailUnarchive"))
         self.click_visible(root, "projectArchive")
         self.assertFalse(store.load_project(project.id).active)
@@ -219,27 +221,32 @@ class ArchiveControlsTests(ProjectsUiCase):
         self.assertEqual(1, len(self.visible(root, "projectUnarchive")))
         self.assertFalse(self.item(root, "projectNewConversation").isEnabled())
         # The open conversation is read-only, its composer off, the selector hides it.
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         self.assertTrue(bridge.conversationReadOnly)
         self.assertTrue(self.item(root, "readOnlyBanner").isVisible())
         self.assertFalse(self.item(root, "composerInput").isEnabled())
         self.assertEqual("Evim · archived", self.item(root, "chatHeaderScope").property("fullName"))
         self.assertEqual([], self.selector_labels(root))
-        bridge.submitText("zorla gönder"); pump(200)
+        bridge.submitText("zorla gönder")
+        pump(200)
         self.assertEqual([], self.model.calls)
         self.assertEqual(0, table(self.database, "SELECT COUNT(*) FROM tasks")[0][0])
         # The detail's Unarchive button.
-        bridge.setPage("projects"); pump(400)
+        bridge.setPage("projects")
+        pump(400)
         self.click_visible(root, "projectDetailUnarchive")
         self.assertTrue(store.load_project(project.id).active)
         self.assertFalse(self.item(root, "projectArchivedBanner").isVisible())
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         self.assertFalse(bridge.conversationReadOnly)
         self.assertFalse(self.item(root, "readOnlyBanner").isVisible())
         self.assertTrue(self.item(root, "composerInput").isEnabled())
         self.assertEqual(["Evim"], self.selector_labels(root))
         # The list row's Unarchive button.
-        bridge.setPage("projects"); pump(400)
+        bridge.setPage("projects")
+        pump(400)
         self.click_visible(root, "projectArchive")
         self.assertFalse(store.load_project(project.id).active)
         self.click_visible(root, "projectUnarchive")
@@ -258,7 +265,8 @@ class RestartTests(ProjectsUiCase):
         first = self.bridge()
         conversation_id = first.conversationId
         say(store, conversation_id, "taşınacak sohbet")
-        first.previewAttach(project.id, ""); pump(60)
+        first.previewAttach(project.id, "")
+        pump(60)
         self.assertTrue(first.confirmAttach(project.id, ""), first.attachNotice)
         # Restart: a brand-new backend and bridge on the same database.
         second = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
@@ -268,20 +276,23 @@ class RestartTests(ProjectsUiCase):
         self.assertNotIn(conversation_id, [row["id"] for row in second.conversations])     # excluded from History
         self.assertFalse(any(row["id"] == conversation_id for row in second.conversations))
         root = self.window(second)
-        self.assertTrue(second.openProjectScope(project.id)); pump(300)
+        self.assertTrue(second.openProjectScope(project.id))
+        pump(300)
         self.assertEqual(conversation_id, second.conversationId)                          # the moved conversation
         self.assertEqual("Evim", self.item(root, "chatHeaderScope").property("fullName"))
         self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()])
         self.assertFalse(second.canAttach)                                                  # never moves again
         # The next run is P-scoped.
-        second.submitText("Bu projeyi incele."); pump(100)
+        second.submitText("Bu projeyi incele.")
+        pump(100)
         self.assertTrue(second.approvalPending)
         ticket = second._ticket
         task = reopened.load_task(ticket.task_id)
         self.assertEqual(project.id, task.project_id)
         self.assertEqual(project.id, reopened.load_session(ticket.session_id).project_id)
         self.assertEqual(conversation_id, reopened.conversation_for_session(ticket.session_id))
-        second.deny(); pump(100)
+        second.deny()
+        pump(100)
         self.assertEqual(0, self.execute_calls())
 
 
@@ -321,8 +332,10 @@ class RealConnectorCardTests(ProjectsUiCase):
                                                 path=str(path), classification="internal").exit_code)
         bridge = self.bridge(task_proposal("code_planning", objective=OBJECTIVE))
         root = self.window(bridge)
-        self.assertTrue(bridge.openProjectScope(project.id)); pump(300)
-        bridge.submitText(OBJECTIVE); pump(300)
+        self.assertTrue(bridge.openProjectScope(project.id))
+        pump(300)
+        bridge.submitText(OBJECTIVE)
+        pump(300)
         self.assertTrue(bridge.approvalPending, [e["text"] for e in bridge.activity + bridge.feed])
         card = bridge.approval
         # The card: the stored instruction, complete, and the stored excerpt.
@@ -338,7 +351,8 @@ class RealConnectorCardTests(ProjectsUiCase):
         self.assertEqual(RELEVANT, shown_excerpt[0].property("text"))
         # Approving sends exactly what the card showed.
         with mock.patch.object(claude_code.subprocess, "Popen", return_value=FakeProcess(SUCCESS_CLI)) as popen:
-            bridge.approve(); pump(300)
+            bridge.approve()
+            pump(300)
         self.assertEqual(1, popen.call_count)
         command = popen.call_args.args[0]
         prompt = command[command.index("-p") + 1]

@@ -63,7 +63,7 @@ from jarvis.destinations import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, installed_cli, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, installed_cli, make_task, open_core, safe_cleanup
 from tests.test_claude_connector import (
     OAUTH_MAX_AUTH_STATUS,
     FakeProcess,

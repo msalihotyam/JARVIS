@@ -59,7 +59,7 @@ from jarvis.core import AgentCore, _LiveStopWatcher
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, make_task, open_core, safe_cleanup
 
 
 def _executable_source(obj) -> str:

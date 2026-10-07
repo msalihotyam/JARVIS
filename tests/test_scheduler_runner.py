@@ -19,7 +19,6 @@ model, auth or network call.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
 
 from jarvis.app import EXIT_INVALID_INPUT, EXIT_OK, create_app
 from jarvis.cli import main

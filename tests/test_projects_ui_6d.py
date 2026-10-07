@@ -68,7 +68,8 @@ class SwitcherCase(ProjectsUiCase):
         self.press(root, self.item(root, "conversationRenameItem"))
 
     def commit(self, root, text: str) -> None:
-        self.item(root, "conversationRenameField").setProperty("text", text); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", text)
+        pump(60)
         self.press(root, self.item(root, "conversationRenameSave"))
 
     def spy(self, bridge) -> list:
@@ -93,9 +94,11 @@ class SwitcherTests(SwitcherCase):
         owned = store.create_conversation(project.id, title="Proje sohbeti")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(second.id); pump(200)
+        bridge.openConversation(second.id)
+        pump(200)
         self.assertEqual("New Chat", self.text(root, "chatHeaderTitle"))
-        bridge.openConversation(first.id); pump(200)
+        bridge.openConversation(first.id)
+        pump(200)
         self.assertEqual("Birinci", self.text(root, "chatHeaderTitle"))
         # Global scope: exactly its non-archived conversations, newest first, the open one marked.
         expected = [c.id for c in store.list_conversations(project_id=None)]
@@ -108,17 +111,20 @@ class SwitcherTests(SwitcherCase):
         self.press(root, target)
         self.assertEqual(third.id, bridge.conversationId)
         self.assertEqual("Üçüncü", self.text(root, "chatHeaderTitle"))
-        self.assertFalse([l for l, _ in self.menu(root) if l in ("Arşiv", "Proje sohbeti")])
+        self.assertFalse([label for label, _ in self.menu(root) if label in ("Arşiv", "Proje sohbeti")])
         self.close_menu(root)
         # Project scope: only that project's conversations.
-        self.assertTrue(bridge.openProjectScope(project.id)); pump(300)
+        self.assertTrue(bridge.openProjectScope(project.id))
+        pump(300)
         self.assertEqual(owned.id, bridge.conversationId)
         self.assertEqual([("Proje sohbeti", True)], self.menu(root))
         self.close_menu(root)
         # The busy guard: nothing opens while busy, and the choices are disabled.
-        bridge.openProjectScope(""); pump(200)
+        bridge.openProjectScope("")
+        pump(200)
         bridge._busy = True
-        bridge.stateChanged.emit(); pump(60)
+        bridge.stateChanged.emit()
+        pump(60)
         self.assertTrue(self.visible(root, "sidebarConversation"))
         self.assertFalse(any(i.property("available") for i in self.visible(root, "sidebarConversation")))
         before = bridge.conversationId
@@ -133,9 +139,11 @@ class SwitcherTests(SwitcherCase):
         conversation = store.create_conversation(title=long_title.strip())
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(conversation.id); pump(300)
+        bridge.openConversation(conversation.id)
+        pump(300)
         for size in ((1280, 760), (1100, 700)):
-            root.resize(*size); pump(500)
+            root.resize(*size)
+            pump(500)
             with self.subTest(size=size):
                 self.assertEqual(long_title.strip(), self.text(root, "chatHeaderTitleTip"))
                 header, label = self.item(root, "chatHeader"), self.item(root, "chatHeaderTitle")
@@ -155,7 +163,8 @@ class RenameTests(SwitcherCase):
         root = self.window(bridge)
         calls = self.spy(bridge)
         conversation = store.create_conversation(title="Global ad")
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         # The conversation menu (the header's "…"): the one item, enabled, with no reason.
         self.open_actions(root)
         self.assertTrue(self.item(root, "conversationRenameItem").isEnabled())
@@ -173,10 +182,12 @@ class RenameTests(SwitcherCase):
         self.assertIn("Tatil planı 2025", [i.property("title") for i in self.visible(root, "sidebarConversation")])
         self.assertIn("Tatil planı 2025", [row["title"] for row in bridge.conversations])       # History
         # The project's conversation list shows a project conversation's new name.
-        bridge.openConversation(owned.id); pump(200)
+        bridge.openConversation(owned.id)
+        pump(200)
         self.start_edit(root)
         self.commit(root, "Yeni proje adı")
-        bridge.showProject(project.id); pump(300)
+        bridge.showProject(project.id)
+        pump(300)
         self.assertEqual(["Yeni proje adı"], [row["title"] for row in bridge.projectConversations])
         self.assertEqual(0, self.execute_calls())
 
@@ -185,21 +196,27 @@ class RenameTests(SwitcherCase):
         conversation = store.create_conversation(title="Ad")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         calls = self.spy(bridge)
         self.start_edit(root)
-        self.item(root, "conversationRenameField").setProperty("text", "Vazgeçildi"); pump(60)
-        QTest.keyClick(root, Qt.Key_Escape); pump(260)
+        self.item(root, "conversationRenameField").setProperty("text", "Vazgeçildi")
+        pump(60)
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(260)
         self.assertFalse(self.editing(root))
         self.assertEqual(([], "Ad"), (calls, store.load_conversation(conversation.id).title))
         self.start_edit(root)
-        self.item(root, "conversationRenameField").setProperty("text", "Enter ile"); pump(60)
-        QTest.keyClick(root, Qt.Key_Return); pump(260)
+        self.item(root, "conversationRenameField").setProperty("text", "Enter ile")
+        pump(60)
+        QTest.keyClick(root, Qt.Key_Return)
+        pump(260)
         self.assertEqual("Enter ile", store.load_conversation(conversation.id).title)
         self.assertFalse(self.editing(root))
         # Cancel reverts too.
         self.start_edit(root)
-        self.item(root, "conversationRenameField").setProperty("text", "İptal"); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", "İptal")
+        pump(60)
         self.press(root, self.item(root, "conversationRenameCancel"))
         self.assertEqual("Enter ile", store.load_conversation(conversation.id).title)
 
@@ -208,7 +225,8 @@ class RenameTests(SwitcherCase):
         conversation = store.create_conversation(title="Ad")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         calls = self.spy(bridge)
         self.start_edit(root)
         self.commit(root, " \n\t\x07 ")                                              # empty once normalized
@@ -233,7 +251,8 @@ class RenameTests(SwitcherCase):
         store.set_project_active(project.id, False)
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(owned.id); pump(300)
+        bridge.openConversation(owned.id)
+        pump(300)
         self.assertTrue(bridge.conversationReadOnly)
         self.open_actions(root)
         self.assertFalse(self.item(root, "conversationRenameItem").isEnabled())
@@ -253,9 +272,11 @@ class RaceTests(SwitcherCase):
         store = self.db()
         conversation = store.create_conversation()
         bridge = self.bridge(CHAT)
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         self.assertTrue(bridge.renameConversation(conversation.id, "Tatil planı"))
-        bridge.submitText("Bu proje hakkında bir şey sor"); pump(200)
+        bridge.submitText("Bu proje hakkında bir şey sor")
+        pump(200)
         self.assertEqual("Tatil planı", store.load_conversation(conversation.id).title)
         self.assertEqual("Tatil planı", bridge.conversationTitle)
 
@@ -263,19 +284,23 @@ class RaceTests(SwitcherCase):
         store = self.db()
         conversation = store.create_conversation()
         bridge = self.bridge(CHAT, CHAT)
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         self.assertEqual("", bridge.conversationTitle)
         message = "Bu projenin yapısını özetle"
-        bridge.submitText(message); pump(200)
+        bridge.submitText(message)
+        pump(200)
         automatic = task_title(message)
         self.assertTrue(automatic)
         self.assertEqual(automatic, store.load_conversation(conversation.id).title)
         self.assertEqual(automatic, bridge.conversationTitle)
         # It keeps that name (the second message names nothing) until renamed.
-        bridge.submitText("Şimdi başka bir konu"); pump(200)
+        bridge.submitText("Şimdi başka bir konu")
+        pump(200)
         self.assertEqual(automatic, store.load_conversation(conversation.id).title)
         self.assertTrue(bridge.renameConversation(conversation.id, "Benim adım"))
-        bridge.submitText("Bir şey daha"); pump(200)
+        bridge.submitText("Bir şey daha")
+        pump(200)
         self.assertEqual("Benim adım", store.load_conversation(conversation.id).title)
 
     def test_c_busy_disables_the_rename_and_a_manual_rename_then_wins(self) -> None:
@@ -283,7 +308,8 @@ class RaceTests(SwitcherCase):
         conversation = store.create_conversation()
         bridge = self.bridge(CHAT)
         root = self.window(bridge)
-        bridge.openConversation(conversation.id); pump(200)
+        bridge.openConversation(conversation.id)
+        pump(200)
         seen = {}
         real = bridge.backend.submit_text
 
@@ -297,7 +323,8 @@ class RaceTests(SwitcherCase):
             return real(*args, **kwargs)
         bridge.backend.submit_text = during
         message = "Bu projenin yapısını özetle"
-        bridge.submitText(message); pump(200)
+        bridge.submitText(message)
+        pump(200)
         self.assertEqual((True, False, False), (seen["busy"], seen["allowed"], seen["commit"]))
         self.assertIn("Wait", seen["notice"])
         self.assertEqual(task_title(message), seen["title_during"])                  # the automatic name came first
@@ -314,11 +341,14 @@ class RaceTests(SwitcherCase):
         b = store.create_conversation(title="B adı")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(a.id); pump(200)
+        bridge.openConversation(a.id)
+        pump(200)
         self.start_edit(root)
-        self.item(root, "conversationRenameField").setProperty("text", "A yeni"); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", "A yeni")
+        pump(60)
         # The open conversation changes under the edit: it is cancelled.
-        self.assertTrue(bridge.openConversation(b.id)); pump(300)
+        self.assertTrue(bridge.openConversation(b.id))
+        pump(300)
         self.assertFalse(self.editing(root))
         self.assertEqual(("A adı", "B adı"), (store.load_conversation(a.id).title, store.load_conversation(b.id).title))
         # A commit that still carries A's id renames A only, never the open B.
@@ -328,7 +358,8 @@ class RaceTests(SwitcherCase):
         self.assertEqual("B adı", self.text(root, "chatHeaderTitle"))
         # And the QML commit path uses the captured id, not the open one.
         self.start_edit(root)
-        self.item(root, "conversationRenameField").setProperty("text", "B yeni"); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", "B yeni")
+        pump(60)
         self.assertEqual(b.id, self.item(root, "conversationMenu").property("editId"))
         self.press(root, self.item(root, "conversationRenameSave"))
         self.assertEqual(("A yeni", "B yeni"), (store.load_conversation(a.id).title, store.load_conversation(b.id).title))
@@ -362,7 +393,8 @@ class AuthorityTests(SwitcherCase):
         for renamed in (False, True):
             if renamed:
                 self.assertTrue(bridge.renameConversation(bridge.conversationId, "Bambaşka ad"))
-            bridge.submitText("Bu projeyi incele."); pump(100)
+            bridge.submitText("Bu projeyi incele.")
+            pump(100)
             self.assertTrue(bridge.approvalPending)
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
@@ -370,7 +402,8 @@ class AuthorityTests(SwitcherCase):
             cards.append({k: v for k, v in bridge.approval.items() if k not in ("request_id", "fingerprint", "task_id", "session_id",
                                                                              "expires_at")})
             turns.append([t.message for t in store.load_conversation_state(bridge.conversationId).turns][:1])
-            bridge.deny(); pump(100)
+            bridge.deny()
+            pump(100)
         self.assertEqual(decisions[0], decisions[1])
         self.assertEqual(cards[0], cards[1])
         self.assertEqual(turns[0], turns[1])                                             # history turns untouched

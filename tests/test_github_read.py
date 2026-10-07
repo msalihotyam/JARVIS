@@ -43,7 +43,6 @@ from jarvis.github import (
     GITHUB_SEARCH_MAX_ITEMS,
     GITHUB_VIEWER_SELECTION,
     GITHUB_WRITE_CAPABILITIES,
-    github_atomic_read_content,
     GitHubExecutionUnavailable,
     GitHubIdentityBinding,
     GitHubOperationPlan,

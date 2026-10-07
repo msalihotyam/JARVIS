@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import unicodedata
 import unittest
-from pathlib import Path
 
 from tests.test_ui import _APP, pump  # noqa: F401 - the offscreen platform and the application
 
@@ -35,20 +34,23 @@ def qml_string_literals(source: str):
     while i < n:
         ch = source[i]
         if ch == "\n":
-            line += 1; i += 1
+            line += 1
+            i += 1
         elif ch == "/" and not source.startswith(("//", "/*"), i) and prev in "(,=:[!&|?{};+-*%<>~^":
             i, in_class = i + 1, False                   # a regex literal: up to its closing, unescaped "/"
             while i < n and source[i] != "\n" and (in_class or source[i] != "/"):
                 in_class = (in_class or source[i] == "[") and source[i] != "]"
                 i += 2 if source[i] == "\\" else 1
-            i += 1; prev = "/"
+            i += 1
+            prev = "/"
         elif source.startswith("//", i):
             i = source.find("\n", i)
             i = n if i < 0 else i
         elif source.startswith("/*", i):
             end = source.find("*/", i + 2)
             end = n if end < 0 else end + 2
-            line += source.count("\n", i, end); i = end
+            line += source.count("\n", i, end)
+            i = end
         elif ch in "\"'`":
             start, text, i = line, [], i + 1
             while i < n and source[i] != ch:
@@ -56,14 +58,23 @@ def qml_string_literals(source: str):
                 if c == "\\" and i + 1 < n:
                     nxt = source[i + 1]
                     if nxt == "u" and source[i + 2:i + 6].isalnum() and len(source[i + 2:i + 6]) == 4:
-                        text.append(chr(int(source[i + 2:i + 6], 16))); i += 6; continue
+                        text.append(chr(int(source[i + 2:i + 6], 16)))
+                        i += 6
+                        continue
                     if nxt == "x":
-                        text.append(chr(int(source[i + 2:i + 4], 16))); i += 4; continue
-                    text.append({"n": "\n", "t": "\t"}.get(nxt, nxt)); i += 2; continue
+                        text.append(chr(int(source[i + 2:i + 4], 16)))
+                        i += 4
+                        continue
+                    text.append({"n": "\n", "t": "\t"}.get(nxt, nxt))
+                    i += 2
+                    continue
                 if c == "\n":
                     line += 1
-                text.append(c); i += 1
-            out.append((start, "".join(text))); i += 1; prev = ch
+                text.append(c)
+                i += 1
+            out.append((start, "".join(text)))
+            i += 1
+            prev = ch
         else:
             prev = prev if ch.isspace() else ch
             i += 1
@@ -179,8 +190,10 @@ class IconRenderTests(unittest.TestCase):
         # A name changed later is judged by its NEW value: unknown warns, known never does.
         messages.clear()
         item = icons["icon_close_16"]
-        item.setProperty("name", "still-no-such-icon"); pump(50)
-        item.setProperty("name", "check"); pump(50)
+        item.setProperty("name", "still-no-such-icon")
+        pump(50)
+        item.setProperty("name", "check")
+        pump(50)
         self.assertEqual(['Icon: unknown icon name "still-no-such-icon"'], [m for m in messages if "Icon:" in m])
         self.assertTrue(item.property("known"))
 

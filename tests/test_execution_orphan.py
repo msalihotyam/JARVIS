@@ -45,7 +45,6 @@ from jarvis.contracts import (
     JobError,
     JobRunStatus,
     ORPHAN_MIN_AGE,
-    OutcomeStatus,
     PermissionGrant,
     SessionState,
     TaskStatus,
@@ -314,7 +313,7 @@ class OrphanDeclarationTests(OrphanTestCase):
         # Which other session or task owns an attempt is not a fact a refusal
         # may disclose, so all of these read the same.
         run, _dispatch = self.in_flight()
-        row = self.attempt()
+        self.attempt()
         other = SessionState(objective="somebody else's work")
         self.memory.save_session(other)
         for label, over in (

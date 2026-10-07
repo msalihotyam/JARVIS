@@ -22,7 +22,7 @@ import tempfile
 from datetime import timedelta
 from pathlib import Path
 
-from jarvis.app import EXIT_OK, create_app, job_create_result, project_create_result, project_lifecycle_result
+from jarvis.app import EXIT_OK, project_create_result, project_lifecycle_result
 from jarvis.contracts import (
     PROJECT_ID_PATTERN,
     DataClassification,
@@ -37,7 +37,6 @@ from jarvis.contracts import (
 from jarvis.dispatch import DISPATCH_REFUSED, DISPATCH_SETTLED
 from jarvis.intent import IntentStatus
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
-from jarvis.registry import ToolRegistry
 from jarvis.scheduler_runner import ACTION_DISPATCHED, ACTION_RECOVERED
 from jarvis.settings import Settings
 from tests.helpers import make_task, safe_cleanup

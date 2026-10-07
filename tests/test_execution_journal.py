@@ -47,7 +47,7 @@ from jarvis.lifecycle import is_terminal
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_core, safe_cleanup
 
 
 def free_claim(memory, *, gate_state: str = "test_free_route") -> BillingClaim:

@@ -517,7 +517,8 @@ class WindowCase(ProjectsUiCase):
 
     def context(self, root) -> None:
         """The open conversation's menu: the chat header's "…" (on the home page)."""
-        self.home.setPage("home"); pump(300)
+        self.home.setPage("home")
+        pump(300)
         self.press(root, self.item(root, "chatHeaderMenu"))
 
     def window(self, bridge):
@@ -552,18 +553,21 @@ class TransitionTests(WindowCase):
         first, second = store.create_conversation(project.id, title="Bir"), store.create_conversation(project.id)
         newer = store.create_conversation(title="Yeni")
         # Archive of the open Global conversation: the newest other Global one, on History.
-        bridge.openConversation(newer.id); pump(200)
+        bridge.openConversation(newer.id)
+        pump(200)
         self.archive_open(root)
         self.assertIsNotNone(store.load_conversation(newer.id).archived_at)
         self.assertEqual((older, "history"), (bridge.conversationId, bridge.page))
         self.assertIn(newer.id, [r["id"] for r in bridge.archivedConversations])
         # Archive of an open project conversation: the project's newest other one, on its detail.
-        bridge.openConversation(second.id); pump(200)
+        bridge.openConversation(second.id)
+        pump(200)
         self.archive_open(root)
         self.assertEqual((first.id, "projects", project.id), (bridge.conversationId, bridge.page, bridge.openProject["id"]))
         self.assertEqual([second.id], [r["id"] for r in bridge.projectArchivedConversations])
         # Delete of the OPEN archived Global conversation (opened read-only): the newest Global one.
-        bridge.openConversation(newer.id); pump(200)
+        bridge.openConversation(newer.id)
+        pump(200)
         self.assertTrue(bridge.conversationReadOnly)
         self.delete_open(root)
         self.gone(bridge, store, newer.id)
@@ -579,7 +583,8 @@ class TransitionTests(WindowCase):
         owned = store.create_conversation(project.id, title="Tez sohbeti")
         store.create_conversation(project.id, title="Başka")                   # never chosen: the project is archived
         store.set_project_active(project.id, False)
-        bridge.openConversation(owned.id); pump(200)
+        bridge.openConversation(owned.id)
+        pump(200)
         self.context(root)
         self.assertFalse(self.item(root, "conversationArchiveItem").isEnabled())    # already read-only
         self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())       # directly under an archived project
@@ -600,7 +605,8 @@ class TransitionTests(WindowCase):
         store.delete_conversation(startup, confirm=startup, expected_next_seq=preview["expected_next_seq"],
                                   expected_title=preview["title"])
         # Archive: the project has no other conversation and no Global one exists.
-        bridge.openConversation(only.id); pump(200)
+        bridge.openConversation(only.id)
+        pump(200)
         self.archive_open(root)
         created = bridge.conversationId
         self.assertNotIn(created, (startup, only.id))
@@ -611,7 +617,8 @@ class TransitionTests(WindowCase):
         preview = store.conversation_delete_preview(created)
         store.delete_conversation(created, confirm=created, expected_next_seq=preview["expected_next_seq"],
                                   expected_title=preview["title"])
-        bridge.openConversation(only.id); pump(200)
+        bridge.openConversation(only.id)
+        pump(200)
         self.delete_open(root)
         self.gone(bridge, store, only.id)
         fresh = bridge.conversationId
@@ -628,20 +635,24 @@ class ArchivedSectionTests(WindowCase):
         bridge = self.bridge()
         root = self.window(bridge)
         kept = bridge.conversationId                                                # startup: a new Global one
-        bridge.setPage("history"); pump(400)
+        bridge.setPage("history")
+        pump(400)
         rows = self.visible(root, "historyArchivedRow")
         self.assertEqual(1, len(rows))
         self.assertEqual([archived.id], [r["id"] for r in bridge.archivedConversations])
         self.assertNotIn(archived.id, [r["id"] for r in bridge.conversations])
         # Opening it: read-only, its own banner and its own name.
-        self.assertTrue(bridge.openConversation(archived.id)); pump(200)
+        self.assertTrue(bridge.openConversation(archived.id))
+        pump(200)
         self.assertEqual((True, True, "Arşivde"), (bridge.conversationReadOnly, bridge.conversationArchived,
                                                     bridge.conversationTitle))
-        bridge.setPage("home"); pump(300)
+        bridge.setPage("home")
+        pump(300)
         self.assertIn("this conversation is archived", self.item(root, "readOnlyReason").property("text"))
         self.assertTrue(self.item(root, "sidebarNewConversation").property("allowed"))   # a Global one may still start
         # Unarchive from History: back in the lists, writable again.
-        bridge.setPage("history"); pump(300)
+        bridge.setPage("history")
+        pump(300)
         self.press(root, self.visible(root, "historyUnarchive")[0])
         self.assertIsNone(store.load_conversation(archived.id).archived_at)
         self.assertIn(archived.id, [r["id"] for r in bridge.conversations])
@@ -657,14 +668,16 @@ class ArchivedSectionTests(WindowCase):
         live = store.create_conversation(project.id, title="Canlı")
         archived = store.create_conversation(project.id, title="Arşivli")
         store.archive_conversation(archived.id)
-        bridge.showProject(project.id); pump(400)
+        bridge.showProject(project.id)
+        pump(400)
         self.assertEqual([live.id], [r["id"] for r in bridge.projectConversations])
         self.assertEqual([archived.id], [r["id"] for r in bridge.projectArchivedConversations])
         self.assertFalse(self.visible(root, "projectConversationDelete"))                 # active project: archive first
         self.assertTrue(self.visible(root, "projectConversationUnarchive")[0].isEnabled())
         # Archived project: delete offered on every row, unarchive disabled with its reason.
         store.set_project_active(project.id, False)
-        bridge.refreshProjects(); pump(300)
+        bridge.refreshProjects()
+        pump(300)
         self.assertEqual(1, len(self.visible(root, "projectConversationDelete")))
         self.assertFalse(self.visible(root, "projectConversationUnarchive")[0].isEnabled())
         self.assertEqual("Unarchive the project first",
@@ -688,12 +701,15 @@ class DialogTests(WindowCase):
         imported = store.import_legacy_conversation(legacy)
         store.archive_conversation(imported.id)
         named = store.create_conversation(title="Tatil planı")
-        say(store, named.id, "bir"); say(store, named.id, "iki")
+        say(store, named.id, "bir")
+        say(store, named.id, "iki")
         store.archive_conversation(named.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.setLanguage("tr-TR"); pump(300)
-        bridge.setPage("history"); pump(400)
+        bridge.setLanguage("tr-TR")
+        pump(300)
+        bridge.setPage("history")
+        pump(400)
         texts = lambda name: self.visible(root, name)[0].property("text")           # noqa: E731
         by_id = {r["id"]: i for i, r in enumerate(bridge.archivedConversations)}
         self.press(root, self.visible(root, "historyDelete")[by_id[named.id]])
@@ -733,7 +749,8 @@ class DialogTests(WindowCase):
         store.archive_conversation(conversation.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.setPage("history"); pump(400)
+        bridge.setPage("history")
+        pump(400)
         self.press(root, self.visible(root, "historyDelete")[0])
         store.unarchive_conversation(conversation.id)
         store.set_conversation_title(conversation.id, "Başka ad")
@@ -754,13 +771,15 @@ class DialogTests(WindowCase):
         owned = store.create_conversation(store.create_project("Ev").id, title="Ev sohbeti")
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.openConversation(owned.id); pump(200)                                 # F7: a project's (Global: one step)
+        bridge.openConversation(owned.id)
+        pump(200)                                 # F7: a project's (Global: one step)
         self.context(root)
         self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
         self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))
         self.assertTrue(self.item(root, "conversationArchiveItem").isEnabled())
         bridge._busy = True
-        bridge.stateChanged.emit(); pump(60)
+        bridge.stateChanged.emit()
+        pump(60)
         for name in ("conversationRenameItem", "conversationArchiveItem", "conversationDeleteItem"):
             self.assertFalse(self.item(root, name).isEnabled(), name)
         conversation_id = bridge.conversationId
@@ -814,7 +833,7 @@ class GapATests(WindowCase):
     def test_h_a_late_reply_for_a_deleted_or_corrupt_conversation_is_dropped(self) -> None:
         store = self.db()
         bridge = self.bridge()
-        root = self.window(bridge)
+        self.window(bridge)
         doomed = store.create_conversation(title="Silinecek")
         session = self.linked(store, doomed.id)
         origin = bridge._load_conversation(store, doomed.id)                        # a request started in it
@@ -839,7 +858,8 @@ class GapATests(WindowCase):
         self.assertEqual(feed_before, list(bridge.feed))
         # useSession on a deleted conversation's session opens nothing.
         open_now, session_now = bridge.conversationId, bridge._session_id
-        bridge.useSession(session.id); pump(100)
+        bridge.useSession(session.id)
+        pump(100)
         self.assertEqual((open_now, session_now), (bridge.conversationId, bridge._session_id))
         # Its session leaves History's list; the corrupt one's stays.
         bridge._set_sessions({"sessions": [{"session_id": session.id}, {"session_id": broken.id}]})
@@ -856,7 +876,8 @@ class AttachReopenTests(WindowCase):
         say(store, conversation_id, "tezgah ölçüleri")
         say(store, conversation_id, "dolap rengi")
         store_state = store.load_conversation_state(conversation_id)
-        bridge.previewAttach(project.id, ""); pump(60)
+        bridge.previewAttach(project.id, "")
+        pump(60)
         self.assertTrue(bridge.confirmAttach(project.id, ""), bridge.attachNotice)
         self.assertEqual(conversation_id, bridge.conversationId)
         self.assertEqual(["tezgah ölçüleri", "dolap rengi"], [e["text"] for e in bridge.feed if e["kind"] == "user"])
@@ -868,7 +889,8 @@ class AttachReopenTests(WindowCase):
             seen["history"] = [t.message for t in kwargs["conversation"].turns]
             return real(*args, **kwargs)
         bridge.backend.submit_text = spy
-        bridge.submitText("üçüncü"); pump(200)
+        bridge.submitText("üçüncü")
+        pump(200)
         self.assertEqual(["tezgah ölçüleri", "dolap rengi"], seen["history"])
 
 

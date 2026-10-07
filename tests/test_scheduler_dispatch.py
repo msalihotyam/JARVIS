@@ -36,14 +36,12 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from jarvis.contracts import (
     AgentRun,
-    ActionScope,
-    ChainState,
     AttemptState,
     ChainStatus,
     ConditionKind,
@@ -63,7 +61,6 @@ from jarvis.contracts import (
     SideEffect,
     RiskLevel,
     SessionState,
-    Task,
     StructuredError,
     SideEffectProfile,
     TaskStatus,
@@ -75,7 +72,6 @@ from jarvis.dispatch import (
     DISPATCH_REFUSED,
     DISPATCH_SETTLED,
     DISPATCH_UNKNOWN,
-    DispatchOutcome,
     dispatch_job_run,
 )
 from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
@@ -986,7 +982,6 @@ class ResultMappingTests(DispatchTestCase):
         # first step really completes, then cancel_chain - the operator path -
         # marks the chain CANCELLED with the cursor and bindings preserved.
         run, lease = self.claimed(steps=2)
-        outer = self
         real = self.core
 
         class CancelAfterFirstStep(ScriptedCore):
@@ -1167,7 +1162,6 @@ class TerminalEvidenceTests(DispatchTestCase):
     def blocked_dispatch(self, mutate):
         """A dispatch whose real chain is sabotaged by ``mutate`` before it ends."""
         run, lease = self.claimed(steps=1)
-        outer = self
         real = self.core
 
         class Sabotage(ScriptedCore):
@@ -1375,7 +1369,7 @@ class TerminalEvidenceTests(DispatchTestCase):
         outer = self
 
         def foreign(session_id):
-            task_id = outer.task_ids(session_id)[0]
+            outer.task_ids(session_id)[0]
             real_attempts = outer.memory.execution_attempts
 
             def lying(asked_task_id):
@@ -1895,7 +1889,7 @@ class PostExceptionClockTests(DispatchTestCase):
         core = ScriptedCore(
             self.memory, None, raises=RuntimeError("driver fell over")
         )
-        outcome = dispatch_job_run(
+        dispatch_job_run(
             core, run.id, WORKER_A, lease.fencing_epoch, clock=lambda: self.during
         )
         after = self.reload(run.id)

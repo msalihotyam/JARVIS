@@ -13,9 +13,12 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from jarvis.conversation import ConversationRecord
 
 # Scheduler phase 1A kernels. Both are PURE - stdlib only, no persistence, no
 # clock, no Core import - so depending on them here creates no cycle, and the

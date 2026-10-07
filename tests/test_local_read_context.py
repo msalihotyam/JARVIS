@@ -33,7 +33,6 @@ from jarvis.app import (
     OUTPUT_SCHEMA_VERSION,
     TaskInputError,
     build_envelope,
-    create_app,
     decode_task_json,
 )
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
@@ -86,7 +85,7 @@ from jarvis.destinations import (
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, open_app, open_core, safe_cleanup
+from tests.helpers import open_app, safe_cleanup
 
 #: Well-formed by the reference grammar, never a real task.
 OTHER_ID = "1" * 36

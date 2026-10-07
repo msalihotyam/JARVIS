@@ -123,7 +123,8 @@ class UpdatedAtTests(SidebarDataCase):
         shown = {r["id"]: r["updated_at"] for r in bridge.scopeConversations}
         self.assertEqual(expected, shown)
         self.assertTrue(shown and all(isinstance(v, str) and v for v in shown.values()))   # the store's string, as it is
-        self.assertTrue(bridge.openProjectScope(self.many.id)); pump(100)
+        self.assertTrue(bridge.openProjectScope(self.many.id))
+        pump(100)
         expected = {r.id: r.updated_at for r in store.list_conversations(project_id=self.many.id)}
         shown = {r["id"]: r["updated_at"] for r in bridge.scopeConversations}
         self.assertEqual(expected, shown)
@@ -160,29 +161,37 @@ class CountTests(SidebarDataCase):
         seen = []
         bridge.projectsChanged.connect(lambda: seen.append("projects"))
         # create: a project's own new conversation, then Global's (no project moves)
-        self.assertTrue(bridge.newProjectConversation(self.one.id)); pump(100)
+        self.assertTrue(bridge.newProjectConversation(self.one.id))
+        pump(100)
         self.assertEqual((2, 0), self.counts(bridge)["Tek"])
         self.assertIn("projects", seen)
-        self.assertTrue(bridge.newConversation()); pump(100)
+        self.assertTrue(bridge.newConversation())
+        pump(100)
         self.assertEqual({"Boş": (0, 0), "Tek": (2, 0), "Çok": (3, 2), "Eski": (1, 0)}, self.counts(bridge))
         # archive / unarchive a project conversation
         victim = self.live[0].id
-        self.assertTrue(bridge.archiveConversation(victim)); pump(100)
+        self.assertTrue(bridge.archiveConversation(victim))
+        pump(100)
         self.assertEqual((2, 3), self.counts(bridge)["Çok"])
-        self.assertTrue(bridge.unarchiveConversation(victim)); pump(100)
+        self.assertTrue(bridge.unarchiveConversation(victim))
+        pump(100)
         self.assertEqual((3, 2), self.counts(bridge)["Çok"])
         # permanent delete of an archived one
         gone = next(r.id for r in store.list_conversations(project_id=self.many.id, include_archived=True) if r.archived_at)
-        bridge.previewDeleteConversation(gone); pump(60)
-        self.assertTrue(bridge.confirmDeleteConversation(gone)); pump(100)
+        bridge.previewDeleteConversation(gone)
+        pump(60)
+        self.assertTrue(bridge.confirmDeleteConversation(gone))
+        pump(100)
         self.assertEqual((3, 1), self.counts(bridge)["Çok"])
 
     def test_e_attach_moves_a_count_from_global_to_the_project(self) -> None:
         store = self.seed()
         bridge = self.bridge()
         say(store, bridge.conversationId, "tezgah ölçüleri")
-        bridge.previewAttach(self.empty.id, ""); pump(60)
-        self.assertTrue(bridge.confirmAttach(self.empty.id, ""), bridge.attachNotice); pump(100)
+        bridge.previewAttach(self.empty.id, "")
+        pump(60)
+        self.assertTrue(bridge.confirmAttach(self.empty.id, ""), bridge.attachNotice)
+        pump(100)
         self.assertEqual((1, 0), self.counts(bridge)["Boş"])
         self.assertEqual(self.empty.id, bridge.conversationProject["id"])
 
@@ -195,10 +204,12 @@ class CountTests(SidebarDataCase):
             self.assertEqual(1, spy.call_count)                        # four projects, one read
             self.assertEqual({"include_archived": True}, spy.call_args.kwargs)
             spy.reset_mock()
-            bridge.openProjectScope(self.many.id); pump(100)           # opening a scope refreshes once, too
+            bridge.openProjectScope(self.many.id)
+            pump(100)           # opening a scope refreshes once, too
             self.assertEqual(1, sum(1 for c in spy.call_args_list if c.kwargs == {"include_archived": True}))
             spy.reset_mock()
-            bridge.projectRecords; bridge.scopeConversations           # reading the properties reads no store
+            bridge.projectRecords
+            bridge.scopeConversations           # reading the properties reads no store
             self.assertEqual(0, spy.call_count)
 
     def test_g_reading_is_read_only(self) -> None:
@@ -327,9 +338,11 @@ class SidebarShellTests(SidebarShellCase):
                 self.assertAlmostEqual(height - 64, side.bottom(), delta=0.5)
         # Home only (Q11): every other page keeps its own width.
         for page in ("history", "projects", "tasks"):
-            bridge.setPage(page); pump(500)
+            bridge.setPage(page)
+            pump(500)
             self.assertFalse(self.item(root, "sidebar").isVisible(), page)
-        bridge.setPage("home"); pump(500)
+        bridge.setPage("home")
+        pump(500)
         self.assertTrue(self.item(root, "sidebar").isVisible())
         self.assertEqual(0, self.execute_calls())
 
@@ -342,17 +355,21 @@ class SidebarShellTests(SidebarShellCase):
             with self.subTest(size=(width, height)):
                 nav_full = self.box(root, "sidebarNav").height()
                 self.assertAlmostEqual(2 * tile + gap, self.box(root, "summaryRail").height(), delta=0.5)
-                bridge.setCardVisible("rail", "plan", False); pump(300)      # 3: two, then one across
+                bridge.setCardVisible("rail", "plan", False)
+                pump(300)      # 3: two, then one across
                 grid = self.box(root, "summaryRail")
                 self.assertAlmostEqual(grid.width(), self.box(root, "railMemory").width(), delta=0.5)
                 self.assertAlmostEqual(2 * tile + gap, grid.height(), delta=0.5)
-                bridge.setCardVisible("rail", "focus", False); pump(300)     # 2: one row
+                bridge.setCardVisible("rail", "focus", False)
+                pump(300)     # 2: one row
                 self.assertAlmostEqual(tile, self.box(root, "summaryRail").height(), delta=0.5)
                 self.assertAlmostEqual(self.box(root, "railTasks").top(), self.box(root, "railMemory").top(), delta=0.5)
                 self.assertGreater(self.box(root, "sidebarNav").height(), nav_full)   # the navigation takes the room
-                bridge.setCardVisible("rail", "tasks", False); pump(300)     # 1: across
+                bridge.setCardVisible("rail", "tasks", False)
+                pump(300)     # 1: across
                 self.assertAlmostEqual(self.box(root, "summaryRail").width(), self.box(root, "railMemory").width(), delta=0.5)
-                bridge.setCardVisible("rail", "memory", False); pump(300)    # none: no grid
+                bridge.setCardVisible("rail", "memory", False)
+                pump(300)    # none: no grid
                 self.assertFalse(self.item(root, "summaryRail").isVisible())
                 for key in ("tasks", "focus", "plan", "memory"):
                     bridge.setCardVisible("rail", key, True)
@@ -387,7 +404,8 @@ class SidebarShellTests(SidebarShellCase):
         root = self.window(bridge)
         pump(500)
         self.assertEqual([], self.all_items(root, "railUpdates"))
-        bridge.setEditMode(True); pump(300)
+        bridge.setEditMode(True)
+        pump(300)
         for key in TILES:
             self.assertTrue(self.item(root, "railMenu" + key).isVisible(), key)
             # The menu sits on the number's line: the title keeps its room.
@@ -403,7 +421,8 @@ class SidebarShellTests(SidebarShellCase):
         self.assertEqual([], self.all_items(root, "addToLayout_updates"))
         self.press(root, "addToLayout_focus")
         self.assertTrue(self.item(root, "railFocus").isVisible())
-        bridge.setEditMode(False); pump(300)
+        bridge.setEditMode(False)
+        pump(300)
         self.assertEqual(0, self.execute_calls())
 
 
@@ -449,7 +468,8 @@ class TileContentTests(TileContentCase):
         # Nothing yet.
         self.assertEqual(("—", "No task yet"), self.tile(root, "Tasks")[:2])
         # A waiting approval: amber, and the click goes to the approval (no peek).
-        bridge.submitText("Bu projeyi incele."); pump(400)
+        bridge.submitText("Bu projeyi incele.")
+        pump(400)
         self.assertTrue(bridge.approvalPending)
         value, line, tip = self.tile(root, "Tasks")
         self.assertEqual(("1", "approval waiting"), (value, line))
@@ -462,7 +482,8 @@ class TileContentTests(TileContentCase):
         self.assertTrue(feed.property("followEnd"))                     # brought to the end, where the approval is
         self.assertTrue(self.item(root, "safetyCard_approval").isVisible())
         # Approved and finished: the last task, its result, name and time.
-        bridge.approve(); pump(500)
+        bridge.approve()
+        pump(500)
         self.assertFalse(bridge.approvalPending)
         value, line, tip = self.tile(root, "Tasks")
         status = bridge.task["status"]
@@ -474,7 +495,8 @@ class TileContentTests(TileContentCase):
         bridge._busy = True
         bridge._task = {**bridge._task, "status": "running", "title": "Rapor özeti"}
         bridge._work_started_at = time.time() - 75
-        bridge.stateChanged.emit(); pump(1300)
+        bridge.stateChanged.emit()
+        pump(1300)
         value, line, tip = self.tile(root, "Tasks")
         self.assertRegex(value, r"^1:1\d$")
         self.assertEqual("Rapor özeti", line)
@@ -513,9 +535,11 @@ class TileContentTests(TileContentCase):
         bridge.backend.project_file("retire", project.id, file_id=retired)
         bridge.refreshProjects()
         root = self.window(bridge)
-        bridge.openConversation(global_one.id); pump(400)
+        bridge.openConversation(global_one.id)
+        pump(400)
         self.assertEqual(("Global", "no project context"), self.tile(root, "Focus")[:2])
-        bridge.openConversation(conversations[0].id); pump(400)
+        bridge.openConversation(conversations[0].id)
+        pump(400)
         facts = bridge.conversationProject
         self.assertEqual((True, 2), (facts["instruction"], facts["file_count"]))
         value, line, tip = self.tile(root, "Focus")
@@ -535,14 +559,18 @@ class TileContentTests(TileContentCase):
         tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).astimezone()
         later = tomorrow + timedelta(days=3)
         for owner in (global_one.id, conversations[0].id):
-            bridge.openConversation(owner); pump(300)
+            bridge.openConversation(owner)
+            pump(300)
             with self.subTest(scope=owner):
-                bridge._jobs = []; bridge.dataChanged.emit(); pump(200)
+                bridge._jobs = []
+                bridge.dataChanged.emit()
+                pump(200)
                 self.assertEqual(("—", "No scheduled job"), self.tile(root, "Plan")[:2])
                 bridge._jobs = [{"id": "j-2", "label": "Yedek", "enabled": True, "next_due_at_utc": later.isoformat()},
                                 {"id": "j-1", "label": "Haftalık rapor", "enabled": True, "next_due_at_utc": tomorrow.isoformat()},
                                 {"id": "j-3", "label": "Kapalı", "enabled": False, "next_due_at_utc": tomorrow.isoformat()}]
-                bridge.dataChanged.emit(); pump(200)
+                bridge.dataChanged.emit()
+                pump(200)
                 value, line, tip = self.tile(root, "Plan")
                 self.assertEqual("09:00", value)
                 self.assertIn(line, ("Haftalık rapor · tomorrow", "Haftalık rapor"))
@@ -553,11 +581,13 @@ class TileContentTests(TileContentCase):
         bridge = self.bridge()
         bridge.refreshConfig()
         root = self.window(bridge)
-        bridge.openConversation(conversations[0].id); pump(400)
+        bridge.openConversation(conversations[0].id)
+        pump(400)
         self.assertEqual(2, bridge.conversationProject["memory_count"])
         value, line, tip = self.tile(root, "Memory")
         self.assertEqual(("Available", "2 records"), (value, line))
-        bridge.openConversation(global_one.id); pump(400)
+        bridge.openConversation(global_one.id)
+        pump(400)
         value, line, tip = self.tile(root, "Memory")
         self.assertEqual("Available", value)
         self.assertRegex(line, r"^last record \d\d:\d\d$")
@@ -718,7 +748,8 @@ class SidebarNavTests(SidebarNavCase):
             self.stamp(store.create_conversation(title=title).id, when)
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge._refresh_conversations(); pump(300)
+        bridge._refresh_conversations()
+        pump(300)
         # F6: Daha eski starts collapsed; its heading opens it.
         self.tap(root, next(h for h in self.shown(root, "sidebarGroupHead") if h.property("key") == "earlier"))
         groups = {}
@@ -732,7 +763,8 @@ class SidebarNavTests(SidebarNavCase):
         self.assertEqual(f"{older.day} {older.strftime('%b')}", times["Daha eski"])
         # Empty groups are not shown.
         store.archive_conversation(next(r.id for r in store.list_conversations(project_id=None) if r.title == "Daha eski"))
-        bridge._refresh_conversations(); pump(300)
+        bridge._refresh_conversations()
+        pump(300)
         self.assertEqual(["Today", "Yesterday"], self.texts(root, "sidebarGroupLabel"))
 
     def test_v_a_scope_pick_is_the_6b_rule_and_a_row_pick_is_the_switcher_pick(self) -> None:
@@ -794,7 +826,8 @@ class SidebarNavTests(SidebarNavCase):
         self.tap(root, plus)
         self.assertEqual((self.one.id, 2), (bridge.conversationProject["id"], len(store.list_conversations(project_id=self.one.id))))
         # Under an archived project: dimmed, the reason in its tip, and a click does nothing.
-        bridge.openConversation(store.list_conversations(project_id=self.old.id)[0].id); pump(300)
+        bridge.openConversation(store.list_conversations(project_id=self.old.id)[0].id)
+        pump(300)
         self.assertFalse(plus.property("allowed"))
         self.assertAlmostEqual(0.38, plus.property("opacity"), places=2)
         self.assertEqual("The project is archived: unarchive it to start a new conversation.", plus.property("tip"))
@@ -806,7 +839,8 @@ class SidebarNavTests(SidebarNavCase):
         self.tap(root, self.item(root, "sidebarGlobal"))
         bridge._busy = True
         try:
-            bridge.stateChanged.emit(); pump(100)
+            bridge.stateChanged.emit()
+            pump(100)
             self.assertEqual("Wait for the current run to finish.", plus.property("tip"))
             self.tap(root, plus)
             self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
@@ -828,28 +862,38 @@ class SidebarNavTests(SidebarNavCase):
         self.assertEqual("2", self.link(root, "sidebarArchive"))
         # archive / unarchive
         victim = next(r for r in self.live if r.id != bridge.conversationId)
-        self.assertTrue(bridge.archiveConversation(victim.id)); pump(300)
+        self.assertTrue(bridge.archiveConversation(victim.id))
+        pump(300)
         self.assertEqual(("2", "3"), (count("Çok"), self.link(root, "sidebarArchive")))
         self.assertNotIn(victim.title, self.titles(root))
-        self.assertTrue(bridge.unarchiveConversation(victim.id)); pump(300)
+        self.assertTrue(bridge.unarchiveConversation(victim.id))
+        pump(300)
         self.assertEqual(("3", "2"), (count("Çok"), self.link(root, "sidebarArchive")))
         # permanent delete of an archived one
         gone = next(r.id for r in store.list_conversations(project_id=self.many.id, include_archived=True) if r.archived_at)
-        bridge.previewDeleteConversation(gone); pump(60)
-        self.assertTrue(bridge.confirmDeleteConversation(gone)); pump(300)
-        bridge.setPage("home"); pump(400)
+        bridge.previewDeleteConversation(gone)
+        pump(60)
+        self.assertTrue(bridge.confirmDeleteConversation(gone))
+        pump(300)
+        bridge.setPage("home")
+        pump(400)
         self.assertEqual("1", self.link(root, "sidebarArchive"))
         # attach: a Global conversation moves to Boş
         self.tap(root, self.item(root, "sidebarGlobal"))
         before = genel()
         say(store, bridge.conversationId, "tezgah ölçüleri")
-        bridge.previewAttach(self.empty.id, ""); pump(60)
-        self.assertTrue(bridge.confirmAttach(self.empty.id, ""), bridge.attachNotice); pump(300)
-        bridge.setPage("home"); pump(400)
+        bridge.previewAttach(self.empty.id, "")
+        pump(60)
+        self.assertTrue(bridge.confirmAttach(self.empty.id, ""), bridge.attachNotice)
+        pump(300)
+        bridge.setPage("home")
+        pump(400)
         self.assertEqual((str(int(before) - 1), "1"), (genel(), count("Boş")))
         # a project archived: one more in the archived link, its row gone
-        bridge.archiveProject(self.one.id); pump(400)
-        bridge.setPage("home"); pump(400)
+        bridge.archiveProject(self.one.id)
+        pump(400)
+        bridge.setPage("home")
+        pump(400)
         self.assertEqual("2", self.link(root, "sidebarArchivedProjects"))
         self.assertNotIn("Tek", [i.property("title") for i in self.shown(root, "sidebarProject")])
         self.assertEqual(0, self.execute_calls())
@@ -876,7 +920,8 @@ class SidebarNavTests(SidebarNavCase):
         self.tap(root, self.item(root, "conversationRenameItem"))
         self.assertTrue(self.editing(root))
         self.assertEqual(target.title, self.item(root, "conversationRenameField").property("text"))
-        self.item(root, "conversationRenameField").setProperty("text", "Satırdan yeni ad"); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", "Satırdan yeni ad")
+        pump(60)
         self.tap(root, self.item(root, "conversationRenameSave"))
         self.assertEqual([(target.id, "Satırdan yeni ad")], calls)
         self.assertFalse(self.editing(root))
@@ -895,7 +940,8 @@ class SidebarNavTests(SidebarNavCase):
         second = store.create_conversation(self.old.id, title="Eski ikinci")
         store.set_project_active(self.old.id, False)
         bridge.refreshProjects()
-        bridge.openConversation(store.list_conversations(project_id=self.old.id)[-1].id); pump(300)
+        bridge.openConversation(store.list_conversations(project_id=self.old.id)[-1].id)
+        pump(300)
         self.assertNotEqual(second.id, bridge.conversationId)
         self.tap(root, self.row(root, "sidebarConversation", "Eski ikinci"), Qt.RightButton)
         self.assertFalse(self.item(root, "conversationRenameItem").isEnabled())
@@ -907,7 +953,8 @@ class SidebarNavTests(SidebarNavCase):
         self.assertTrue(dialog.property("visible"))
         self.assertEqual(second.id, dialog.property("targetId"))
         self.assertNotEqual(second.id, bridge.conversationId)
-        QMetaObject.invokeMethod(dialog, "close"); pump(400)
+        QMetaObject.invokeMethod(dialog, "close")
+        pump(400)
         self.assertIsNotNone(store.load_conversation(second.id))
         self.assertEqual(0, self.execute_calls())
 
@@ -930,7 +977,8 @@ class SidebarNavTests(SidebarNavCase):
         button, header = self.box(root, "chatHeaderMenu"), self.box(root, "conversationContextHeader")
         self.assertGreater(header.top(), button.bottom())
         self.tap(root, self.item(root, "conversationRenameItem"))
-        self.item(root, "conversationRenameField").setProperty("text", "Üstten ad"); pump(60)
+        self.item(root, "conversationRenameField").setProperty("text", "Üstten ad")
+        pump(60)
         self.tap(root, self.item(root, "conversationRenameSave"))
         self.assertEqual("Üstten ad", store.load_conversation(bridge.conversationId).title)
         self.assertEqual("Üstten ad", self.item(root, "chatHeaderTitle").property("text"))
@@ -945,20 +993,24 @@ class SidebarNavTests(SidebarNavCase):
         for name in ("sidebarProjectsLink", "sidebarArchivedProjects"):
             self.tap(root, self.item(root, name))
             self.assertEqual(("projects", {}), (bridge.page, bridge.openProject), name)
-            bridge.setPage("home"); pump(400)
+            bridge.setPage("home")
+            pump(400)
         # Q9: the Projects page with its create field focused.
         self.tap(root, self.item(root, "sidebarNewProject"))
         self.assertEqual("projects", bridge.page)
         self.assertTrue(self.item(root, "projectNewName").property("activeFocus"))
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         # Arşiv (n): Genel -> History; a project -> its detail.
         self.tap(root, self.item(root, "sidebarArchive"))
         self.assertEqual("history", bridge.page)
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         self.tap(root, self.row(root, "sidebarProject", "Çok"))
         self.tap(root, self.item(root, "sidebarArchive"))
         self.assertEqual(("projects", self.many.id), (bridge.page, bridge.openProject.get("id")))
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         # No archived conversation: no link.
         self.tap(root, self.row(root, "sidebarProject", "Tek"))
         self.assertFalse(self.item(root, "sidebarArchive").isVisible())
@@ -989,7 +1041,8 @@ class SidebarNavTests(SidebarNavCase):
             self.assertEqual(("", self.many.id), (bridge.conversationTitle, bridge.conversationProject["id"]))
             self.tap(root, self.row(root, "sidebarConversation", other), Qt.RightButton)                 # rename
             self.tap(root, self.item(root, "conversationRenameItem"))
-            self.item(root, "conversationRenameField").setProperty("text", other + " 2"); pump(60)
+            self.item(root, "conversationRenameField").setProperty("text", other + " 2")
+            pump(60)
             self.tap(root, self.item(root, "conversationRenameSave"))
             self.tap(root, self.row(root, "sidebarConversation", other + " 2"), Qt.RightButton)          # archive
             self.tap(root, self.item(root, "conversationArchiveItem"))
@@ -1001,7 +1054,8 @@ class SidebarNavTests(SidebarNavCase):
             self.tap(root, self.item(root, "railTasks"))
             self.tap(root, self.item(root, "sidebarArchive"))                                            # Arşiv
             self.assertEqual("history", bridge.page)
-            bridge.setPage("home"); pump(400)
+            bridge.setPage("home")
+            pump(400)
             self.tap(root, self.item(root, "sidebarNewProject"))                                         # new project
             self.assertEqual("projects", bridge.page)
         self.assertEqual([], keys)
@@ -1012,20 +1066,27 @@ class SidebarNavTests(SidebarNavCase):
         bridge = self.bridge()
         root = self.window(bridge)
         genel = self.item(root, "sidebarGlobal")
-        genel.forceActiveFocus(); pump(200)
+        genel.forceActiveFocus()
+        pump(200)
         self.assertTrue(self.child(genel, "sidebarRowFocusRing").isVisible())
-        QTest.keyClick(root, Qt.Key_Tab); pump(200)
+        QTest.keyClick(root, Qt.Key_Tab)
+        pump(200)
         self.assertTrue(self.item(root, "sidebarProjectsLink").property("activeFocus"))
         row = self.row(root, "sidebarProject", "Çok")
-        row.forceActiveFocus(); pump(200)
-        QTest.keyClick(root, Qt.Key_Return); pump(400)
+        row.forceActiveFocus()
+        pump(200)
+        QTest.keyClick(root, Qt.Key_Return)
+        pump(400)
         self.assertEqual(self.many.id, bridge.conversationProject["id"])
         target = next(r for r in self.shown(root, "sidebarConversation") if not r.property("current"))
-        target.forceActiveFocus(); pump(200)
-        QTest.keyClick(root, Qt.Key_Menu); pump(400)
+        target.forceActiveFocus()
+        pump(200)
+        QTest.keyClick(root, Qt.Key_Menu)
+        pump(400)
         menu = self.item(root, "conversationMenu")
         self.assertEqual((True, target.property("itemId")), (menu.property("open"), menu.property("targetId")))
-        QTest.keyClick(root, Qt.Key_Escape); pump(400)
+        QTest.keyClick(root, Qt.Key_Escape)
+        pump(400)
         self.assertFalse(menu.property("open"))
 
     def test_dd_the_new_navigation_strings_are_turkish(self) -> None:
@@ -1080,7 +1141,8 @@ class ChatHeaderTests(SidebarNavCase):
         for theme in ("space", "dark"):
             bridge.setTheme(theme)
             for key, conversation in (("project", owned), ("global", global_long)):
-                bridge.openConversation(conversation.id); pump(300)
+                bridge.openConversation(conversation.id)
+                pump(300)
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 600)
                     with self.subTest(theme=theme, owner=key, size=(width, height)):
@@ -1128,7 +1190,8 @@ class ChatHeaderTests(SidebarNavCase):
         self.assertFalse(button.isVisible())                                            # a project's: no entry
         self.tap(root, self.item(root, "sidebarGlobal"))
         archived = next(r.id for r in store.list_conversations(project_id=None, include_archived=True) if r.archived_at)
-        bridge.openConversation(archived); pump(300)
+        bridge.openConversation(archived)
+        pump(300)
         self.assertFalse(button.isVisible())                                            # archived: no entry
         self.tap(root, self.item(root, "sidebarGlobal"))
         say(store, bridge.conversationId, "tezgah ölçüleri")
@@ -1165,7 +1228,8 @@ class ChatHeaderTests(SidebarNavCase):
         title, editor = self.box(root, "chatHeaderTitle"), self.box(root, "conversationRenameTitle")
         self.assertGreater(editor.top(), title.bottom())
         self.assertLess(abs(editor.left() - title.left()), 40)
-        field.setProperty("text", "Başlıktan ad"); pump(60)
+        field.setProperty("text", "Başlıktan ad")
+        pump(60)
         self.tap(root, self.item(root, "conversationRenameSave"))
         self.assertEqual("Başlıktan ad", store.load_conversation(opened).title)
         self.assertEqual("Başlıktan ad", self.item(root, "chatHeaderTitle").property("text"))
@@ -1201,7 +1265,8 @@ class ChatHeaderTests(SidebarNavCase):
         for gone in ("projectScope", "projectSelector", "conversationSwitcher", "newConversationButton"):
             self.assertEqual([], self.all_items(root, gone))
         for theme in ("space", "command"):
-            bridge.setTheme(theme); pump(400)
+            bridge.setTheme(theme)
+            pump(400)
             for width, height in SIZES:
                 self.resize_still(root, width, height, 600)
                 with self.subTest(theme=theme, size=(width, height)):
@@ -1225,7 +1290,8 @@ class ChatHeaderTests(SidebarNavCase):
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge.setTheme("command"); pump(500)
+        bridge.setTheme("command")
+        pump(500)
         self.assertFalse(self.item(root, "sidebar").isVisible())
         chip = self.item(root, "chatHeaderScope")
         # The canonical page's header may linger until its deferred deletion: the preset's menu is the shown one.
@@ -1251,7 +1317,8 @@ class ChatHeaderTests(SidebarNavCase):
         self.tap(root, chip)
         self.tap(root, self.item(root, "scopeMenuAll"))
         self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
-        bridge.setPage("home"); pump(400)
+        bridge.setPage("home")
+        pump(400)
         # "…" is the same conversation menu here.
         self.tap(root, self.item(root, "chatHeaderMenu"))
         self.assertTrue(self.item(root, "conversationMenu").property("open"))
@@ -1303,7 +1370,8 @@ class PunchListCase(SidebarNavCase):
         return [i for i in self.all_items(root, "hoverTipText") if i.isVisible()]
 
     def hover(self, root, item) -> None:
-        QTest.mouseMove(root, QPoint(2, 2)); pump(30)
+        QTest.mouseMove(root, QPoint(2, 2))
+        pump(30)
         QTest.mouseMove(root, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
 
     def running(self, bridge, name: str) -> None:
@@ -1320,7 +1388,8 @@ class TileTipTests(PunchListCase):
         bridge = self.bridge()
         root = self.window(bridge)
         for width, height in SIZES:
-            root.resize(width, height); pump(700)
+            root.resize(width, height)
+            pump(700)
             with self.subTest(size=(width, height), state="nothing elided"):
                 # The resting tiles say everything they have: hovering shows nothing, and the tips are off.
                 for key in TILES:
@@ -1332,7 +1401,8 @@ class TileTipTests(PunchListCase):
         long_name = "Kat malikleri toplantısı için hazırlanacak belgeler, aidat hesapları ve tadilat izinleri özeti"
         self.running(bridge, long_name)
         for width, height in SIZES:
-            root.resize(width, height); pump(1300)
+            root.resize(width, height)
+            pump(1300)
             with self.subTest(size=(width, height), state="elided"):
                 tile = self.item(root, "railTasks")
                 line = self.item(root, "railLineTasks")
@@ -1348,7 +1418,8 @@ class TileTipTests(PunchListCase):
                     self.apart(tip_box, self.box(root, "rail" + key), "tip over tile " + key)
                     self.apart(tip_box, self.box(root, "railTitle" + key), "tip over the title of " + key)
                 self.apart(tip_box, self.box(root, "sidebar"), "tip over the sidebar")
-                QTest.mouseMove(root, QPoint(width // 2, 2)); pump(300)
+                QTest.mouseMove(root, QPoint(width // 2, 2))
+                pump(300)
         # While its peek is open the tile's tip stays off.
         self.press(root, "railTasks")
         self.assertTrue(root.property("peekOpen"))
@@ -1376,21 +1447,26 @@ class ProjectListTests(PunchListCase):
         bridge = self.bridge()
         bridge.openConversation(self.talks[8].id)                            # open with the LAST project selected
         root = self.window(bridge)
-        root.resize(1100, 700); pump(900)
+        root.resize(1100, 700)
+        pump(900)
         self.assertTrue(self.item(root, "sidebarProjectList").property("contentHeight") > self.item(root, "sidebarProjectList").height())
         self.selected_in_view(root, 8, "on open")
         for index in (3, 5, 8, 0, 4, 7, 1):                                  # a scope change, 4th and beyond
             with self.subTest(scope=index):
-                self.assertTrue(bridge.openProjectScope(self.projects[index].id)); pump(300)
+                self.assertTrue(bridge.openProjectScope(self.projects[index].id))
+                pump(300)
                 self.selected_in_view(root, index, f"scope {index}")
         # A resize changes how many rows fit: the selection is still in view, at both ends.
-        bridge.openProjectScope(self.projects[6].id); pump(300)
+        bridge.openProjectScope(self.projects[6].id)
+        pump(300)
         for width, height in ((1920, 1080), (1100, 700), (1280, 760), (1920, 1080), (1100, 700)):
-            root.resize(width, height); pump(900)
+            root.resize(width, height)
+            pump(900)
             self.selected_in_view(root, 6, f"resize {width}x{height}")
         # The reader's own scrolling is left alone.
         plist = self.item(root, "sidebarProjectList")
-        plist.setProperty("contentY", 0); pump(300)
+        plist.setProperty("contentY", 0)
+        pump(300)
         self.assertEqual(0, plist.property("contentY"))
         self.assertEqual(0, self.execute_calls())
 
@@ -1433,7 +1509,8 @@ class MenuOpacityTests(PunchListCase):
             bridge.setTheme(theme)
             for width, height in SIZES[:2] + SIZES[2:]:
                 self.resize_still(root, width, height, 700)
-                bridge.openProjectScope(self.many.id); pump(400)
+                bridge.openProjectScope(self.many.id)
+                pump(400)
                 with self.subTest(theme=theme, size=(width, height)):
                     self.tap(root, self.shown(root, "sidebarConversation")[1], Qt.RightButton,
                              until=lambda: self.is_open(self.popup(root, "conversationSwitcherContext")))
@@ -1451,8 +1528,10 @@ class MenuOpacityTests(PunchListCase):
                         self.opaque(root, menu, "the composer")
                         self.closed(self.popup(root, menu), 400)
         # The Command preset's scope menu is the same material.
-        bridge.setTheme("command"); pump(500)
-        bridge.openProjectScope(self.many.id); pump(400)
+        bridge.setTheme("command")
+        pump(500)
+        bridge.openProjectScope(self.many.id)
+        pump(400)
         self.tap(root, self.item(root, "chatHeaderScope"))
         self.opaque(root, "chatHeaderScopeMenu", "the command preset's scope menu")
         self.assertEqual(0, self.execute_calls())
@@ -1606,7 +1685,7 @@ class SweepTests(SweepCase):
 
 class SweepPathTests(SweepCase):
     def test_qq_every_6f_action_has_a_mouse_path_at_every_size_in_both_themes(self) -> None:
-        store = self.seed()
+        self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
         keys = []
@@ -1617,7 +1696,8 @@ class SweepPathTests(SweepCase):
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 900)
                     with self.subTest(theme=theme, size=(width, height)):
-                        bridge.setPage("home"); bridge.openProjectScope("")
+                        bridge.setPage("home")
+                        bridge.openProjectScope("")
                         wait_until(lambda: root.property("loadedPage") == "home" and bridge.conversationProject["global"], 400)
                         self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])  # Genel
                         self.assertTrue(bridge.conversationProject["global"])
@@ -1651,7 +1731,8 @@ class SweepPathTests(SweepCase):
                             self.tap(root, self.item(root, "rail" + key), until=lambda: not root.property("peekOpen"))
                             self.assertFalse(root.property("peekOpen"))
                         listing = self.item(root, "sidebarConversationList")                                 # the link is the list's last
-                        listing.setProperty("contentY", max(0, listing.property("contentHeight") - listing.height())); pump(200)
+                        listing.setProperty("contentY", max(0, listing.property("contentHeight") - listing.height()))
+                        pump(200)
                         self.tap(root, self.item(root, "sidebarArchive"), until=lambda: bridge.page == "history")  # Arşiv
                         self.assertEqual("history", bridge.page)
                         self.home(root, bridge, 400)
@@ -1671,7 +1752,8 @@ class SweepPathTests(SweepCase):
     def scrolled_row(self, root, title: str):
         """The row, scrolled into the list's view as the reader's wheel would (the list keeps whole rows)."""
         row = self.row(root, "sidebarConversation", title)
-        row.forceActiveFocus(); pump(200)
+        row.forceActiveFocus()
+        pump(200)
         return row
 
     def opened_menu_named(self, root, name: str) -> bool:
@@ -1694,7 +1776,8 @@ class SweepDefectTests(SweepCase):
         self.assertTrue(header.property("truncated"))
         tip = [c for c in header.childItems() if "HoverTip" in c.metaObject().className()][0]
         self.assertEqual((True, bridge.conversationTitle), (tip.property("active"), tip.property("text")))
-        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close"); pump(400)
+        QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close")
+        pump(400)
         # The Focus peek names its projects, never their ids; every elided line in it has a tip.
         self.press(root, "railFocus")
         peek = self.item(root, "summaryPeek")
@@ -1736,9 +1819,11 @@ class NameFloorVarianceTests(SidebarNavCase):
                 self.assertEqual(family, self.item(root, "chatHeaderScopeName").property("font").family())
                 for language in ("en-US", "tr-TR"):
                     if language == "tr-TR":
-                        bridge.setLanguage("tr-TR"); pump(300)
+                        bridge.setLanguage("tr-TR")
+                        pump(300)
                     for conversation in (archived, live):
-                        bridge.openConversation(conversation.id); bridge.setPage("home")
+                        bridge.openConversation(conversation.id)
+                        bridge.setPage("home")
                         wait_until(lambda: bridge.conversationId == conversation.id and root.property("loadedPage") == "home", 300)
                         for width, height in SIZES:
                             self.resize_still(root, width, height, 400)
@@ -1749,7 +1834,8 @@ class NameFloorVarianceTests(SidebarNavCase):
                                                         (family, language, name, (width, height), text.property("text")))
                             # The pill stays (the chip's 32 % gave way to the floor, not the badge).
                             self.assertEqual(conversation is archived, self.item(root, "chatHeaderScopeArchived").isVisible())
-                bridge.setLanguage("en-US"); pump(200)
+                bridge.setLanguage("en-US")
+                pump(200)
         self.assertEqual(0, self.execute_calls())
 
 
@@ -1819,14 +1905,18 @@ class F6Case(SweepCase):
         self.into_view(root, row)
         grip = self.child(row, "sidebarPinGripArea")
         start = grip.mapToScene(QPointF(grip.width() / 2, grip.height() / 2)).toPoint()
-        self.hover(root, grip); pump(100)
-        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start); pump(50)
+        self.hover(root, grip)
+        pump(100)
+        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start)
+        pump(50)
         steps = 6
         for n in range(1, steps + 1):
-            QTest.mouseMove(root, QPoint(start.x(), round(start.y() + (target_y - start.y()) * n / steps))); pump(40)
+            QTest.mouseMove(root, QPoint(start.x(), round(start.y() + (target_y - start.y()) * n / steps)))
+            pump(40)
         if probe is not None:
             probe()
-        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(target_y))); pump(350)
+        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(target_y)))
+        pump(350)
 
     def gap_y(self, root, index: int) -> float:
         """The scene y of the gap above pinned row ``index`` (the one below the last row for len)."""
@@ -1882,8 +1972,10 @@ class CollapsibleGroupTests(F6Case):
         self.assertEqual(["· 2", "· 3"], self.texts(root, "sidebarGroupCount"))
         # The keyboard toggles it too (Return on the focused heading).
         head = self.head(root, "today")
-        head.forceActiveFocus(); pump(100)
-        QTest.keyClick(root, Qt.Key_Return); pump(300)
+        head.forceActiveFocus()
+        pump(100)
+        QTest.keyClick(root, Qt.Key_Return)
+        pump(300)
         self.assertTrue(bridge.sidebarGroups["today"])
         self.assertEqual(0, self.execute_calls())
 
@@ -1909,7 +2001,8 @@ class CollapsibleGroupTests(F6Case):
         self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
         self.assertNotIn("Genel eski", self.titles(root))
         # Switching to a conversation of a collapsed group opens that group.
-        self.assertTrue(bridge.openConversation(g_old.id)); pump(300)
+        self.assertTrue(bridge.openConversation(g_old.id))
+        pump(300)
         self.assertTrue(bridge.sidebarGroups["earlier"])
         self.assertTrue(self.row(root, "sidebarConversation", "Genel eski").property("current"))
         self.assertFalse(bridge.sidebarGroups["today"])                          # the others keep their state
@@ -2021,15 +2114,18 @@ class PinTests(F6Case):
         self.assertNotIn(convs[3].id, json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
         # A pin under a project archived afterwards stays; its menu offers the delete (the project is archived).
         store.set_project_active(tez.id, False)
-        bridge.refreshProjects(); pump(300)
+        bridge.refreshProjects()
+        pump(300)
         self.assertIn("Tez sohbeti", self.pinned(root))
         self.menu(root, self.pin_row(root, "Tez sohbeti"))
         self.assertTrue(self.item(root, "conversationDeleteItem").property("enabled"))
         self.assertFalse(self.item(root, "conversationArchiveItem").property("enabled"))
         self.close_menu(root)
         # The permanent delete (its existing preview + confirm): the pin goes.
-        bridge.previewDeleteConversation(owned.id); pump(60)
-        self.assertTrue(bridge.confirmDeleteConversation(owned.id)); pump(300)
+        bridge.previewDeleteConversation(owned.id)
+        pump(60)
+        self.assertTrue(bridge.confirmDeleteConversation(owned.id))
+        pump(300)
         self.assertIsNone(store.load_conversation(owned.id))
         self.assertNotIn("Tez sohbeti", self.pinned(root))
         self.assertNotIn(owned.id, json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
@@ -2054,7 +2150,8 @@ class PinOrderTests(F6Case):
         self.assertEqual(["D", "C", "B", "A"], self.pinned(root))
         # Hover shows the grip in place of the pin.
         row = self.pin_row(root, "D")
-        self.hover(root, self.child(row, "sidebarPinGripArea")); pump(200)
+        self.hover(root, self.child(row, "sidebarPinGripArea"))
+        pump(200)
         self.assertTrue(self.child(row, "sidebarPinGrip").isVisible())
         self.assertFalse(self.child(row, "sidebarPinIcon").isVisible())
         # A real mouse drag: D into the gap above A; the drop line shows the gap while it moves.
@@ -2096,7 +2193,8 @@ class PinOrderTests(F6Case):
         self.close_menu(root)
         # A new pin goes to the top of the manual order.
         other = store.create_conversation(title="E")
-        bridge._refresh_conversations(); pump(300)
+        bridge._refresh_conversations()
+        pump(300)
         self.choose(root, self.row(root, "sidebarConversation", "E"), "conversationPinItem")
         self.assertEqual(["E", "B", "A", "C", "D"], self.pinned(root))
         # The order persists across a reopen.
@@ -2144,16 +2242,20 @@ class PinOrderTests(F6Case):
         row = self.pin_row(root, order[0])
         grip = self.child(row, "sidebarPinGripArea")
         start = grip.mapToScene(QPointF(grip.width() / 2, grip.height() / 2)).toPoint()
-        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start); pump(50)
+        QTest.mousePress(root, Qt.LeftButton, Qt.NoModifier, start)
+        pump(50)
         edge = QPoint(start.x(), round(listing.bottom() - 6))
         for y in range(start.y(), edge.y() + 1, 12):
-            QTest.mouseMove(root, QPoint(start.x(), y)); pump(30)
+            QTest.mouseMove(root, QPoint(start.x(), y))
+            pump(30)
         QTest.mouseMove(root, edge)
         self.assertTrue(settle(lambda: flick.property("contentY") >= flick.property("contentHeight") - flick.height() - 0.5))
         # Held at the bottom: the gap below the last pin is the drop target.
         bottom = self.gap_y(root, 6)
-        QTest.mouseMove(root, QPoint(start.x(), round(min(bottom, listing.bottom() - 6)))); pump(100)
-        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(min(bottom, listing.bottom() - 6)))); pump(350)
+        QTest.mouseMove(root, QPoint(start.x(), round(min(bottom, listing.bottom() - 6))))
+        pump(100)
+        QTest.mouseRelease(root, Qt.LeftButton, Qt.NoModifier, QPoint(start.x(), round(min(bottom, listing.bottom() - 6))))
+        pump(350)
         self.assertEqual(order[1:] + order[:1], [p["title"] for p in bridge.pinnedConversations])
         self.assertEqual(0, self.execute_calls())
 
@@ -2166,7 +2268,8 @@ class SidebarPrefsStorageTests(F6Case):
         keep = [store.create_conversation(title=f"Genel {n}") for n in range(3)]
         owned = store.create_conversation(tez.id, title="Tez 0")
         bridge = self.bridge()
-        bridge.setTheme("dark"); bridge.setLanguage("en-US")                              # a main document on disk
+        bridge.setTheme("dark")
+        bridge.setLanguage("en-US")                              # a main document on disk
         root = self.window(bridge)
         main_before = self.prefs_path.read_bytes()
         db_before = dump(self.database)
@@ -2177,7 +2280,8 @@ class SidebarPrefsStorageTests(F6Case):
         self.tap(root, self.head(root, "today"))
         self.tap(root, self.head(root, "pinned"))
         self.tap(root, self.head(root, "pinned"))
-        bridge.pinConversation(owned.id); pump(200)
+        bridge.pinConversation(owned.id)
+        pump(200)
         # The conversation store and the main preferences document are byte-identical.
         self.assertEqual(db_before, dump(self.database))
         self.assertEqual(main_before, self.prefs_path.read_bytes())
@@ -2253,12 +2357,14 @@ class PinFitTests(F6Case):
                     # Whole rows inside the list at rest; scrolled to its end, the last row is reachable whole.
                     flick = self.item(root, "sidebarConversationList")
                     end = max(0, flick.property("contentHeight") - flick.height())
-                    flick.setProperty("contentY", end); pump(200)
+                    flick.setProperty("contentY", end)
+                    pump(200)
                     last = self.shown(root, "sidebarConversation")[-1]
                     self.inside(listing, self.rect(last), what + " last row")
                     self.no_clipped_text(root, last, what + " last row")
                     for contentY in (0,):
-                        flick.setProperty("contentY", contentY); pump(200)
+                        flick.setProperty("contentY", contentY)
+                        pump(200)
                         whole = 0
                         for name in ("sidebarPinnedConversation", "sidebarConversation", "sidebarPinnedHead", "sidebarGroupHead"):
                             for item in self.shown(root, name):
@@ -2269,7 +2375,8 @@ class PinFitTests(F6Case):
                                     self.no_clipped_text(root, item, f"{what} {name}")
                                     whole += 1
                         self.assertGreaterEqual(whole, 2, what)
-                    flick.setProperty("contentY", 0); pump(200)
+                    flick.setProperty("contentY", 0)
+                    pump(200)
                     self.assertEqual(10, len(self.shown(root, "sidebarPinnedConversation")))
                     # A pinned row: the title keeps six characters, the project label too, and they never touch.
                     for row in self.shown(root, "sidebarPinnedConversation"):
@@ -2372,22 +2479,27 @@ class ProjectListOffsetTests(F6Case):
         store.create_conversation(old.id, title="Arşivli sohbet")
         store.set_project_active(old.id, False)
         bridge = self.bridge()
-        bridge.openProjectScope(""); pump(200)
+        bridge.openProjectScope("")
+        pump(200)
         root = self.window(bridge)
         # Opened at every size: offset 0.
         for width, height in SIZES:
-            root.resize(width, height); pump(700)
+            root.resize(width, height)
+            pump(700)
             self.assertEqual(0, self.offset(root)[0], (width, height))
         # Scrolled to the last project, then a scope that is not a row (Genel; an archived project),
         # then across the breakpoint and back: whole rows, never past the end.
         for leave in (lambda: self.tap(root, self.item(root, "sidebarGlobal")),
                       lambda: (bridge.openConversation(store.list_conversations(project_id=old.id)[0].id), pump(400))):
-            root.resize(1100, 700); pump(700)
-            bridge.openProjectScope(projects[-1].id); pump(500)                  # the list scrolls to show it
+            root.resize(1100, 700)
+            pump(700)
+            bridge.openProjectScope(projects[-1].id)
+            pump(500)                  # the list scrolls to show it
             self.assertGreater(self.offset(root)[0], 0)
             leave()
             for width, height in ((1920, 1080), (1280, 760), (1100, 700), (1920, 1080), (1100, 700)):
-                root.resize(width, height); pump(700)
+                root.resize(width, height)
+                pump(700)
                 y, step, end = self.offset(root)
                 with self.subTest(size=(width, height), y=y, step=step):
                     self.assertAlmostEqual(0, y % step, delta=0.5)
@@ -2452,7 +2564,8 @@ class OneStepDeleteTests(F6Case):
         self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
         self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))
         self.close_menu(root)
-        bridge.previewDeleteConversation(t0.id); pump(60)
+        bridge.previewDeleteConversation(t0.id)
+        pump(60)
         self.assertIn("Archive this conversation first", bridge.deletePreview["blocked"])
         self.assertFalse(bridge.confirmDeleteConversation(t0.id))
         self.assertFalse(store.is_conversation_deleted(t0.id))
@@ -2469,7 +2582,8 @@ class RowMenuButtonTests(F6Case):
         return self.child(row, "sidebarRowMenuButton")
 
     def away(self, root) -> None:
-        QTest.mouseMove(root, QPoint(root.width() // 2, root.height() - 4)); pump(200)
+        QTest.mouseMove(root, QPoint(root.width() // 2, root.height() - 4))
+        pump(200)
 
     def test_fff_the_row_button_shows_on_hover_and_opens_that_rows_menu_without_opening_it(self) -> None:
         store = self.db()
@@ -2490,7 +2604,8 @@ class RowMenuButtonTests(F6Case):
                 self.assertEqual(1.0, self.child(row, "sidebarConversationTime").property("opacity"))
                 # Hover: "⋯" in place of the time, inside the row, the title clear of it.
                 self.into_view(root, row)
-                self.hover(root, row); pump(200)
+                self.hover(root, row)
+                pump(200)
                 button = self.button(row)
                 self.assertTrue(button.isVisible())
                 self.assertEqual(0.0, self.child(row, "sidebarConversationTime").property("opacity"))
@@ -2515,21 +2630,25 @@ class RowMenuButtonTests(F6Case):
                 self.close_menu(root)
                 self.assertFalse(self.button(row).isVisible())
                 # Keyboard focus shows it too.
-                row.forceActiveFocus(); pump(200)
+                row.forceActiveFocus()
+                pump(200)
                 self.assertTrue(self.button(row).isVisible())
-                row.setProperty("focus", False); pump(100)
+                row.setProperty("focus", False)
+                pump(100)
                 self.assertFalse(self.button(row).isVisible())
                 # A pinned row: in place of its project label.
                 pin = self.pin_row(root, "Tez sohbeti")
                 self.into_view(root, pin)
-                self.hover(root, pin); pump(200)
+                self.hover(root, pin)
+                pump(200)
                 self.assertTrue(self.button(pin).isVisible())
                 self.assertEqual(0.0, self.child(pin, "sidebarPinPlace").property("opacity"))
                 self.tap(root, self.button(pin))
                 self.assertEqual((pinned.id, b.id), (self.item(root, "conversationMenu").property("targetId"), bridge.conversationId))
                 self.close_menu(root)
                 # Project rows have none.
-                self.hover(root, self.shown(root, "sidebarProject")[0]); pump(200)
+                self.hover(root, self.shown(root, "sidebarProject")[0])
+                pump(200)
                 self.assertEqual([], [i for i in self.descendants(self.shown(root, "sidebarProject")[0])
                                       if i.objectName() == "sidebarRowMenuButton" and i.isVisible()])
         self.assertEqual(0, self.execute_calls())

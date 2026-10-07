@@ -41,7 +41,6 @@ from jarvis.destinations import CLAUDE_CODE_DESTINATION, DestinationGrant
 from jarvis.dispatch import (
     DISPATCH_REFUSED,
     DISPATCH_SETTLED,
-    dispatch_condition_watch_true,
     recover_job_run,
 )
 from jarvis.condition_watch import evaluate_condition_watch

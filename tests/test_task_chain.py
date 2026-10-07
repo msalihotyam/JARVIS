@@ -129,7 +129,7 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
-from tests.helpers import open_app, open_core, safe_cleanup
+from tests.helpers import open_core, safe_cleanup
 
 #: Sentinel for ``rewrite_binding``: remove the key rather than replace it.
 _DROPPED = object()

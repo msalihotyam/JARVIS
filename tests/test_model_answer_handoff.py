@@ -35,7 +35,6 @@ from jarvis.app import (
     OUTPUT_SCHEMA_VERSION,
     TaskInputError,
     build_envelope,
-    create_app,
     decode_task_json,
 )
 from jarvis.connectors.claude_code import EGRESS_TOOL_GRANTS, ClaudeCodeConnector
@@ -75,7 +74,7 @@ from jarvis.destinations import (
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, safe_cleanup
 from tests.test_model_answer import AnsweringConnector
 
 #: A realistic deliverable: indentation, a blank line, non-ASCII text and a

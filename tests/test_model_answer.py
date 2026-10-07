@@ -27,7 +27,6 @@ from unittest import mock
 from jarvis.app import (
     OUTPUT_SCHEMA_VERSION,
     build_envelope,
-    create_app,
     decode_task_json,
 )
 from jarvis.connectors import claude_code
@@ -68,7 +67,7 @@ from jarvis.destinations import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, open_core, safe_cleanup
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_app, safe_cleanup
 
 #: A marker inside the first 240 characters: it survives BOTH representations,
 #: so it proves the bounded summary path still works.

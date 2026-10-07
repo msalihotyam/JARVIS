@@ -16,7 +16,6 @@ from enum import Enum
 from pathlib import Path
 from unittest import mock
 
-from jarvis.app import create_app
 from jarvis.connectors import claude_code
 from jarvis.contracts import (
     LINEAR_LOOP_STAGES,

@@ -33,7 +33,6 @@ from jarvis.app import (
     OUTPUT_SCHEMA_VERSION,
     TaskInputError,
     _local_read_payload,
-    create_app,
     decode_task_json,
 )
 from jarvis.connectors import local_files
@@ -69,7 +68,7 @@ from jarvis.destinations import (
 )
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import DUMMY_CAPABILITY, open_app, safe_cleanup
+from tests.helpers import open_app, safe_cleanup
 from tests.test_local_read_context import PlanningConnector
 
 ELLIPSIS = "…"

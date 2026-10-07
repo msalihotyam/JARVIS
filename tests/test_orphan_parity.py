@@ -49,7 +49,7 @@ from jarvis.contracts import (
 from jarvis.schedules import Interval
 
 from tests.helpers import make_task
-from tests.test_scheduler_dispatch import LEASE, WORKER_A, WORKER_B
+from tests.test_scheduler_dispatch import LEASE, WORKER_A
 from tests.test_scheduler_recovery import ACTOR, WHY
 from tests.test_storage_abstraction import InMemoryStore
 

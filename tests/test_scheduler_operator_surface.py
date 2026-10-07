@@ -24,7 +24,6 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jarvis.app import (

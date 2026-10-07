@@ -281,7 +281,7 @@ class GitHubCliConnector(BaseConnector):
                 captured_at=utc_now(),
                 truncated=truncated,
             )
-        except Exception as exc:  # noqa: BLE001 - AttestationError and anything else
+        except Exception:  # noqa: BLE001 - AttestationError and anything else
             return self._refusal(
                 task, ErrorCode.EGRESS_REFUSED, "the response could not be attested"
             )

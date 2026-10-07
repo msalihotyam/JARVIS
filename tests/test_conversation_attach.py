@@ -332,7 +332,8 @@ class MovedArchivedConversationTests(IntentTestCase):
 class AttachWindowTests(ProjectsUiCase):
     def open_dialog(self, root) -> None:
         self.steady(root, "chatHeaderAttach")
-        self.click(root, "chatHeaderAttach"); pump(300)
+        self.click(root, "chatHeaderAttach")
+        pump(300)
 
     def choose(self, root, name: str) -> None:
         item = [i for i in self.all_items(root, "attachProject") if i.property("label") == name][0]
@@ -353,12 +354,15 @@ class AttachWindowTests(ProjectsUiCase):
         root = self.window(bridge)
         self.assertTrue(bridge.canAttach)
         self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())             # Global only (L3)
-        bridge.openConversation(owned.id); pump(200)
+        bridge.openConversation(owned.id)
+        pump(200)
         self.assertFalse(bridge.canAttach)
         self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
-        bridge.openProjectScope(""); pump(200)
+        bridge.openProjectScope("")
+        pump(200)
         store.archive_conversation(bridge.conversationId)
-        bridge.refreshProjects(); pump(100)
+        bridge.refreshProjects()
+        pump(100)
         self.assertFalse(bridge.canAttach)
         self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
 
@@ -423,7 +427,8 @@ class AttachWindowTests(ProjectsUiCase):
         task.status = TaskStatus.CANCELLED
         store.save_task(session.id, task)
         # A different target than previewed: refused, refreshed to the new choice, nothing written.
-        bridge.previewAttach(home.id, ""); pump(60)
+        bridge.previewAttach(home.id, "")
+        pump(60)
         before = snapshot(self.database)
         self.assertFalse(bridge.confirmAttach(thesis.id, ""))
         self.assertEqual(before, snapshot(self.database))
@@ -435,9 +440,11 @@ class AttachWindowTests(ProjectsUiCase):
         bridge._busy = False
         # A new project named in the dialog.
         self.item(root, "attachNewName").setProperty("text", "Mutfak")
-        bridge.previewAttach("", "Mutfak"); pump(60)
+        bridge.previewAttach("", "Mutfak")
+        pump(60)
         self.assertEqual("Target: new project: Mutfak", self.text(root, "attachTarget"))
-        self.assertTrue(bridge.confirmAttach("", "Mutfak")); pump(60)
+        self.assertTrue(bridge.confirmAttach("", "Mutfak"))
+        pump(60)
         owner = store.load_conversation(conversation_id).project_id
         self.assertEqual("Mutfak", store.load_project(owner).name)
 
@@ -449,14 +456,17 @@ class AttachWindowTests(ProjectsUiCase):
         decisions = []
         for moved in (False, True):
             if moved:
-                bridge.previewAttach(project.id, ""); pump(60)
+                bridge.previewAttach(project.id, "")
+                pump(60)
                 self.assertTrue(bridge.confirmAttach(project.id, ""), bridge.attachNotice)
-            bridge.submitText("Bu projeyi incele."); pump(100)
+            bridge.submitText("Bu projeyi incele.")
+            pump(100)
             self.assertTrue(bridge.approvalPending)
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
             decisions.append((request.scope, request.risk_level, request.side_effect, request.reason))
-            bridge.deny(); pump(100)
+            bridge.deny()
+            pump(100)
         self.assertEqual(project.id, store.load_conversation(bridge.conversationId).project_id)
         self.assertEqual(decisions[0], decisions[1])
         self.assertEqual(0, self.execute_calls())

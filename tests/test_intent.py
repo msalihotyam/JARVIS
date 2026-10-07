@@ -13,7 +13,6 @@ skipped and no connector is executed by the understanding step itself.
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import io
 import json
@@ -1409,7 +1408,8 @@ class WebResearchTests(IntentTestCase):
         raw = "I'll provide the best available answer. {\"answer\": \"cut"
         intent = self.research_app(raw).submit_text("yarın hava?").payload["intent"]
         self.assertEqual("research_failed", intent["status"])
-        self.assertNotIn("answer", intent["message"]); self.assertNotIn("I'll", intent["message"])
+        self.assertNotIn("answer", intent["message"])
+        self.assertNotIn("I'll", intent["message"])
         self.assertIsNone(intent["reply"])
         failed = self.research_app("x")
         failed.research_model.error = StructuredError(ErrorCode.CONNECTOR_FAILED, '{"answer": "partial"}', {"subtype": "error_max_turns", "redacted_items": 0})
@@ -1762,9 +1762,11 @@ class DailyUseStreamingTests(IntentTestCase):
         with patch.object(codex, "codex_state", side_effect=lambda: calls.append(1) or dict(fresh)), \
                 patch.object(codex, "prohibited_env_present", return_value=False):
             codex.forget_codex_state()
-            codex.reusable_codex_state(); codex.reusable_codex_state()
+            codex.reusable_codex_state()
+            codex.reusable_codex_state()
             self.assertEqual(1, len(calls))                                              # reused within the window
-            codex.forget_codex_state(); codex.reusable_codex_state()
+            codex.forget_codex_state()
+            codex.reusable_codex_state()
             self.assertEqual(2, len(calls))
             with patch.object(codex.time, "monotonic", return_value=time.monotonic() + codex.CODEX_STATE_REUSE_SECONDS + 1):
                 codex.reusable_codex_state()
