@@ -23,7 +23,18 @@ gate, 4 px travel, one HoverTip, calm idle core, destructive dialogs at once)
 is committed on lane branch `worktree-6g-k2-motion` (full suite green, 4764),
 waiting for Salih's "entegre et".
 
-## Open blockers: none.
+## Open blockers
+
+- OB1 Part 1 (K2 fix-up, destructive confirm input guard) BLOCKED: its full
+  suite had 3 failures, each green alone 3/3: `test_projects_ui_6f`
+  `SidebarShellTests.test_i...` at 1100x700 and 1920x1080 (still frame taken
+  mid-reflow, the F-ee2 defect) and `test_browser_lifecycle`
+  `FailClosedTests.test_a...`; none is on the load-sensitive list. Uncommitted
+  in `.claude/worktrees/6g-k2-motion`: `jarvis/ui/qml/theme/Theme.qml`,
+  `jarvis/ui/qml/components/JarvisDialog.qml`,
+  `jarvis/ui/qml/overlays/ConfirmDialog.qml`, `tests/test_projects_ui_6e.py`,
+  `tests/test_motion_6g.py`, `tests/test_conversation_lifecycle_6d.py`.
+  OB1 Parts 2-4 not started.
 
 ## Do not reopen
 
