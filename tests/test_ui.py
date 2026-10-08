@@ -82,6 +82,55 @@ def pump(ms: int = 0) -> None:
         time.sleep(0.005)
 
 
+# F-ee3 (the F-ee2 rule of tests/test_projects_ui_6f.py): after a resize the home frame is
+# still only when its sampled geometry stayed the same for STILL_SPAN (the longest reflow,
+# Theme.reflow / focusMs 220 ms, plus a frame) AND Main's own reflow values - the rail
+# margin and the ONE column span - reached their targets, evaluated in Main's context with
+# the product's formulas. A few equal samples of a frame that stalled under load are not
+# still. The ceiling is at least SETTLE_FLOOR_MS and running out of it fails the test.
+REFLOW_AT_REST = ("content.anchors.leftMargin === (content.command ? Theme.margin : Theme.railWidth(root.width))"
+                  " && Math.abs(content.columnSpan - (content.showColumn ? content.columnWidth + content.columnGap : 0)) < 0.5")
+STILL_SPAN = 0.25
+SETTLE_FLOOR_MS = 15000
+REFLOW_FRAME = ("sidebar", "canonicalWorkspace", "panelColumn", "canonicalComposer", "conversationFeed")
+
+
+def reflow_still(case: unittest.TestCase, root, ceiling_ms: int) -> None:
+    from PySide6.QtQml import QQmlEngine, QQmlExpression
+
+    def find(node, name):
+        if node.objectName() == name:
+            return node
+        for child in node.childItems():
+            found = find(child, name)
+            if found is not None:
+                return found
+        return None
+
+    def rect(item):
+        a = item.mapToScene(item.boundingRect().topLeft())
+        return (round(a.x(), 1), round(a.y(), 1), round(item.width(), 1), round(item.height(), 1), item.isVisible())
+
+    content = find(root.contentItem(), "panelColumn").parentItem()
+    at_rest = QQmlExpression(QQmlEngine.contextForObject(content), content, REFLOW_AT_REST)
+    last = {"sample": None, "since": 0.0}
+
+    def still() -> bool:
+        now = time.monotonic()
+        items = [find(root.contentItem(), name) for name in REFLOW_FRAME]
+        sample = (root.width(), root.height(), tuple(rect(i) for i in items if i is not None))
+        if sample != last["sample"]:
+            last["sample"], last["since"] = sample, now
+            return False
+        if now - last["since"] < STILL_SPAN:
+            return False
+        value, undefined = at_rest.evaluate()
+        case.assertFalse(undefined, REFLOW_AT_REST)
+        return value is True
+    ceiling = max(ceiling_ms, SETTLE_FLOOR_MS)
+    case.assertTrue(wait_until(still, ceiling, 20), f"the reflow to {root.width()}x{root.height()} did not settle in {ceiling} ms")
+
+
 class UiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -1129,7 +1178,7 @@ class MacroGeometryTests(UiTestCase):
         root.showNormal()
         for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
             root.resize(width, height)
-            pump(760)   # the work surface width and the column reflow both animate
+            reflow_still(self, root, 760)   # the work surface width and the column reflow both animate (F-ee3)
             self.assertEqual((width, height), (root.width(), root.height()))
 
             def box(name):
@@ -1194,10 +1243,10 @@ class MacroGeometryTests(UiTestCase):
         for width, height in ((1920, 1080), (1280, 760)):
             root.resize(width, height)
             bridge.setTheme("space")
-            pump(760)
+            reflow_still(self, root, 760)
             main = boxes()
             bridge.setTheme("dark")
-            pump(760)
+            reflow_still(self, root, 760)
             with self.subTest(size=(width, height)):
                 self.assertEqual(main, boxes())
         bridge.setColumnWidth(0.30)
@@ -2201,7 +2250,7 @@ class ConversationSurfaceTests(UiTestCase):
         root = self.window(bridge)
         for width, height in ((1920, 1080), (1536, 864), (1280, 760), (1100, 700)):
             root.resize(width, height)
-            wait_still(lambda: (root.width(), self.box(root, "sidebar"), self.box(root, "panelColumn")), 600)
+            reflow_still(self, root, 600)
             for key in self.SUMMARY:
                 with self.subTest(size=(width, height), module=key):
                     # S0b: open, then the peek at rest (it moves in); the old waits are the ceilings.
