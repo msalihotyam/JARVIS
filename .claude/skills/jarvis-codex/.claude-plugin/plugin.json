@@ -1,0 +1,6 @@
+{
+  "name": "jarvis-codex",
+  "version": "0.1.0",
+  "description": "JARVIS: an independent Codex CLI review of a git diff (/codex-inceleme), read-only, no Claude turn",
+  "author": { "name": "JARVIS" }
+}

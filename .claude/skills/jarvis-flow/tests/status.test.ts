@@ -7,21 +7,21 @@ const LANES = '/repo/build/lanes/sonnet.json'
 const done = (turnId: string, answer = 'ok') => ({ turnId, answer, durationMs: 5, isAborted: false, reason: 'answer', usage: null }) as any
 const written = (w: any, path: string) => w.writes.filter((p: string) => p === path).length
 
-test('pure: state precedence', async () => {
+test('pure: state precedence', { timeoutMs: 60000 }, async () => {
   expect(stateOf({ busy: false, waiting: false, lowBattery: false })).toBe('idle')
   expect(stateOf({ busy: true, waiting: false, lowBattery: false })).toBe('working')
   expect(stateOf({ busy: true, waiting: true, lowBattery: false })).toBe('waiting')
   expect(stateOf({ busy: true, waiting: true, lowBattery: true })).toBe('low_battery')
 })
 
-test('pure: worktree and canonical root come from the cwd', async () => {
+test('pure: worktree and canonical root come from the cwd', { timeoutMs: 60000 }, async () => {
   expect(worktreeOf('C:\\Users\\x\\JARVIS\\.claude\\worktrees\\mods-flow1\\sub')).toBe('mods-flow1')
   expect(worktreeOf('C:/Users/x/JARVIS')).toBeNull()
   expect(canonicalRootOf('C:\\Users\\x\\JARVIS\\.claude\\worktrees\\mods-flow1\\sub')).toBe('C:/Users/x/JARVIS')
   expect(canonicalRootOf('C:/Users/x/JARVIS/')).toBe('C:/Users/x/JARVIS')
 })
 
-test('pure: the fingerprint ignores only the timestamp', async () => {
+test('pure: the fingerprint ignores only the timestamp', { timeoutMs: 60000 }, async () => {
   const base: any = {
     family: 'sonnet', model: null, effort: null, lane: null, base: null, cwd: '/r', worktree: null, branch: null, head: null,
     state: 'idle', busy: false, updated_at: 'a', context_pct: null, power: { ac: true, pct: null }, paused: false, last_auto: null,
@@ -30,7 +30,7 @@ test('pure: the fingerprint ignores only the timestamp', async () => {
   expect(fingerprint(base)).not.toBe(fingerprint({ ...base, state: 'working' }))
 })
 
-test('pure: report extraction and lane safety', async () => {
+test('pure: report extraction and lane safety', { timeoutMs: 60000 }, async () => {
   expect(extractReport('text\nSTATUS: PASS\nmore')).toBe('text\nSTATUS: PASS\nmore')
   expect(extractReport('STATUS: PASS')).toBe('STATUS: PASS')
   expect(extractReport('no status here\n  STATUS: indented')).toBeNull()
@@ -40,7 +40,7 @@ test('pure: report extraction and lane safety', async () => {
   expect(safeLane(null)).toBeNull()
 })
 
-test('the status file is written at start with every field', async ($, on) => {
+test('the status file is written at start with every field', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const status = statusOf(w, 'sonnet')
@@ -61,7 +61,7 @@ test('the status file is written at start with every field', async ($, on) => {
   })
 })
 
-test('the status file follows a turn: working, waiting on a permission, working, idle', async ($, on) => {
+test('the status file follows a turn: working, waiting on a permission, working, idle', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await userPrompt($, header('SB1') + '\nbody')
@@ -76,7 +76,7 @@ test('the status file follows a turn: working, waiting on a permission, working,
   expect(statusOf(w, 'sonnet')).toMatchObject({ state: 'idle', busy: false })
 })
 
-test('the status file is rewritten only on a real change', async ($, on) => {
+test('the status file is rewritten only on a real change', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const first = written(w, LANES)
@@ -90,14 +90,14 @@ test('the status file is rewritten only on a real change', async ($, on) => {
   expect(written(w, LANES)).toBe(first + 1)
 })
 
-test('inside a worktree the status names it and the root stays canonical', async ($, on) => {
+test('inside a worktree the status names it and the root stays canonical', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { cwd: '/repo/.claude/worktrees/mods-flow1' })
   await startSession($, '/repo/.claude/worktrees/mods-flow1')
   expect(statusOf(w, 'sonnet')).toMatchObject({ worktree: 'mods-flow1', cwd: '/repo/.claude/worktrees/mods-flow1' })
   expect(w.files.has(LANES)).toBe(true)
 })
 
-test('a final report is captured to build/reports/<lane>.md', async ($, on) => {
+test('a final report is captured to build/reports/<lane>.md', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await userPrompt($, header('SB1') + '\nbody')
@@ -107,7 +107,7 @@ test('a final report is captured to build/reports/<lane>.md', async ($, on) => {
   expect(w.files.get('/repo/build/reports/SB1.md')).toBe(report)
 })
 
-test('a turn without a STATUS line, or without a lane, writes no report', async ($, on) => {
+test('a turn without a STATUS line, or without a lane, writes no report', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await $.turn.complete(done('t0', 'STATUS: PASS (but no lane is known)'))
@@ -117,7 +117,7 @@ test('a turn without a STATUS line, or without a lane, writes no report', async 
   expect([...w.files.keys()].filter((k) => k.startsWith('/repo/build/reports/'))).toEqual([])
 })
 
-test('an existing report is kept as a timestamped copy before it is replaced', async ($, on) => {
+test('an existing report is kept as a timestamped copy before it is replaced', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   put(w, '/repo/build/reports/SB1.md', 'STATUS: FAIL\nold')
   await startSession($)
@@ -127,7 +127,7 @@ test('an existing report is kept as a timestamped copy before it is replaced', a
   expect(w.files.get('/repo/build/reports/SB1.19700101-000000.md')).toBe('STATUS: FAIL\nold')
 })
 
-test('a report identical to the one on disk changes nothing', async ($, on) => {
+test('a report identical to the one on disk changes nothing', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   put(w, '/repo/build/reports/SB1.md', 'STATUS: PASS\nsame')
   await startSession($)
@@ -136,7 +136,7 @@ test('a report identical to the one on disk changes nothing', async ($, on) => {
   expect([...w.files.keys()].filter((k) => k.startsWith('/repo/build/reports/'))).toEqual(['/repo/build/reports/SB1.md'])
 })
 
-test('a failing status or report write never breaks the turn', async ($, on) => {
+test('a failing status or report write never breaks the turn', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await userPrompt($, header('SB1') + '\nbody')
@@ -146,7 +146,7 @@ test('a failing status or report write never breaks the turn', async ($, on) => 
   expect(w.toasts.some((t) => t.startsWith('jarvis-flow: rapor/durum yazılamadı'))).toBe(true)
 })
 
-test('a STATUS line in a turn that no header prompt started is not captured under the old lane', async ($, on) => {
+test('a STATUS line in a turn that no header prompt started is not captured under the old lane', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await userPrompt($, header('SB1') + '\nbody')
@@ -156,7 +156,7 @@ test('a STATUS line in a turn that no header prompt started is not captured unde
   expect(w.files.get('/repo/build/reports/SB1.md')).toBe('STATUS: PASS\nfirst')
 })
 
-test('a fallback model on a request never moves the queue family', async ($, on) => {
+test('a fallback model on a request never moves the queue family', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }

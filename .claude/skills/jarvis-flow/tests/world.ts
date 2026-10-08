@@ -2,6 +2,7 @@
 // answers, a battery, and a session. Register every stub through `world(...)`
 // before the test's first call on `$`.
 import { mock } from 'claude-code/testing'
+import { lockState } from '../hooks/lib/suite.ts'
 
 export const ROOT = '/repo'
 export const OPUS = 'claude-opus-5-5'
@@ -20,6 +21,9 @@ export type WorldOptions = {
   files?: Record<string, string>
   isJarvis?: boolean
   usagePercent?: number
+  sessionId?: string
+  // environment variables the mod may read
+  env?: Record<string, string>
 }
 
 export type World = {
@@ -39,6 +43,29 @@ export type World = {
   breakModel: boolean
   // make every file write fail
   failWrites: boolean
+  // wave 2: what the simulated shell tool answers, and what it was asked to run
+  toolText: string
+  toolError: boolean
+  toolRuns: string[]
+  // python processes and suite-runner processes the simulated machine reports
+  pyProcs: number
+  suiteProcs: number
+  // Start-Sleep calls (the suite queue waits inside these); the hook can free the lock mid-wait
+  sleeps: number
+  onSleep: ((n: number) => void) | null
+  // curl.exe calls: argv and stdin
+  curls: { argv: string[]; stdin: string }[]
+  curlExit: number
+  // plan percentages the usage noun reports
+  five: number
+  seven: number
+  // hold the simulated shell tool / a Start-Sleep until the test lets go
+  toolHold: Promise<void> | null
+  toolThrow: boolean
+  sleepHold: Promise<void> | null
+  // paths whose read fails (a directory, a locked file), and how many lock swaps fail with exit 4 first
+  unreadable: Set<string>
+  casFail: number
   clock: ReturnType<typeof mock.clock>
   calls: string[]
 }
@@ -64,6 +91,22 @@ export function world(on: any, opts: WorldOptions = {}): World {
     model: opts.model ?? SONNET,
     breakModel: false,
     failWrites: false,
+    toolText: '',
+    toolError: false,
+    toolRuns: [],
+    pyProcs: 3,
+    suiteProcs: 1,
+    sleeps: 0,
+    onSleep: null,
+    curls: [],
+    curlExit: 0,
+    five: 31,
+    seven: 10,
+    toolHold: null,
+    toolThrow: false,
+    sleepHold: null,
+    unreadable: new Set(),
+    casFail: 0,
     clock,
     calls: [],
   }
@@ -82,6 +125,8 @@ export function world(on: any, opts: WorldOptions = {}): World {
   })
   reg('ui.log', () => ({ value: undefined }))
   reg('ui.status', () => ({ value: undefined }))
+  mock.env(on, opts.env ?? {})
+  reg('session.id', () => ({ value: opts.sessionId ?? 'sess-me' }))
 
   reg('session.cwd', () => ({ value: cwd }))
   reg('session.model', () => (w.breakModel ? { deny: 'model unavailable' } : { value: w.model }))
@@ -89,13 +134,17 @@ export function world(on: any, opts: WorldOptions = {}): World {
     value: {
       startedAt: 0,
       context: { window: 1000000, tokens: 1000, percent: opts.usagePercent ?? 12 },
-      rateLimits: [{ kind: 'five_hour', percentUsed: 31 }],
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: w.five },
+        { kind: 'seven_day', percentUsed: w.seven },
+      ],
     },
   }))
 
   reg('fs.exists', (_$: any, e: any) => ({ value: w.files.has(norm(e.path)) }))
   reg('fs.read', (_$: any, e: any) => {
     const path = norm(e.path)
+    if (w.unreadable.has(path)) return { deny: 'EISDIR ' + path }
     // the compact template ships with the plugin, outside the simulated tree
     if (path.endsWith('/compact-template.md')) return { value: 'Keep: rules. lane={{lane}} base={{base}} head={{head}} wt={{worktree}} br={{branch}} cwd={{cwd}}' }
     return w.files.has(path) ? { value: w.files.get(path) } : { deny: 'ENOENT ' + path }
@@ -138,6 +187,10 @@ export function world(on: any, opts: WorldOptions = {}): World {
     w.runs.push(argv)
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
     const no = () => ({ value: { exitCode: 1, stdout: '', stderr: '' } })
+    if (argv[0].toLowerCase().endsWith('curl.exe')) {
+      w.curls.push({ argv, stdin: String((e.init && e.init.stdin) ?? '') })
+      return { value: { exitCode: w.curlExit, stdout: '', stderr: '' } }
+    }
     if (argv[0] === 'git') {
       if (argv.join(' ') === 'git rev-parse --short=12 main') return ok(w.mainHead + '\n')
       if (argv.join(' ') === 'git rev-parse --abbrev-ref HEAD') return ok('worktree-demo\n')
@@ -149,6 +202,46 @@ export function world(on: any, opts: WorldOptions = {}): World {
       const command = String(argv[argv.length - 1])
       if (command.includes('Win32_Battery')) return ok(w.battery)
       const env = (e.init && e.init.env) || {}
+      if (command.includes('JF_CAS')) {
+        const path = norm(env.JF_PATH)
+        if (w.casFail > 0 && env.JF_MODE === 'swap' && String(env.JF_NEW ?? '') === '') {
+          w.casFail--
+          return { value: { exitCode: 4, stdout: '', stderr: '' } }
+        }
+        const have = w.files.has(path)
+        const fresh = String(env.JF_NEW ?? '')
+        if (env.JF_MODE === 'create') {
+          if (have) return { value: { exitCode: 4, stdout: '', stderr: '' } }
+        } else if (env.JF_MODE === 'stale') {
+          if (!have) return { value: { exitCode: 4, stdout: '', stderr: '' } }
+          // same rule as the PowerShell: replace unless it is a valid, fresh record
+          if (lockState(String(w.files.get(path)), Number(env.JF_NOW), '').state === 'held') return { value: { exitCode: 3, stdout: '', stderr: '' } }
+        } else {
+          if (!have || String(w.files.get(path)).trim() !== String(env.JF_EXPECT ?? '').trim()) return { value: { exitCode: 3, stdout: '', stderr: '' } }
+        }
+        w.files.set(path, fresh)
+        w.writes.push(path)
+        touch(path)
+        return ok()
+      }
+      if (command.includes('JF_APPEND')) {
+        const path = norm(env.JF_PATH)
+        w.files.set(path, (w.files.get(path) ?? '') + String(env.JF_LINE) + '\n')
+        touch(path)
+        return ok()
+      }
+      if (command.includes('Start-Sleep')) {
+        w.sleeps++
+        const seconds = Number(env.JF_SECONDS ?? 0)
+        return (async () => {
+          if (w.sleepHold) await w.sleepHold
+          if (w.onSleep) w.onSleep(w.sleeps)
+          await w.clock.advance(seconds * 1000)
+          return ok()
+        })()
+      }
+      if (command.includes('JF_PYCOUNT')) return ok(String(w.pyProcs) + '\n')
+      if (command.includes('JF_SUITE_RUNNING')) return ok(String(w.suiteProcs) + '\n')
       if (command.includes('Move-Item')) {
         const from = norm(env.JF_SRC)
         const to = norm(env.JF_DST)
@@ -178,7 +271,14 @@ export function world(on: any, opts: WorldOptions = {}): World {
   reg('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
   reg('turn.complete', () => ({ text: '' }))
   reg('classic.PermissionRequest', () => ({}))
-  reg('tool.call', () => ({ result: 'ok' }))
+  reg('session.end', (_$: any, e: any) => ({ sessionId: e.sessionId }))
+  reg('classic.PostModelSwitch', () => ({}))
+  reg('tool.call', async (_$: any, e: any) => {
+    w.toolRuns.push(String(e.command ?? e.tool))
+    if (w.toolHold) await w.toolHold
+    if (w.toolThrow) throw new Error('tool exploded')
+    return w.toolError ? { result: 'err', text: w.toolText, isError: true } : { result: 'ok', text: w.toolText }
+  })
   reg('command.run', () => ({ text: '' }))
   return w
 }

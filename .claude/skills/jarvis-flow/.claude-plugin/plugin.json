@@ -1,6 +1,6 @@
 {
   "name": "jarvis-flow",
-  "version": "0.1.0",
-  "description": "JARVIS lane band, prompt lint, prompt inbox, report capture, power and pause",
+  "version": "0.2.0",
+  "description": "JARVIS lane band, prompt lint, prompt inbox, report capture, power and pause; wave 2: suite queue, flake radar, pager, slice ledger",
   "author": { "name": "JARVIS" }
 }

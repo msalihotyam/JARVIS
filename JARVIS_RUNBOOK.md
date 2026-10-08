@@ -320,6 +320,12 @@ failures are tests on the load-sensitive list in `JARVIS_ACTIVE_STATE.md`
 run counts as green and both results are recorded. Any other failure blocks.
 The parallel runner applies this itself.
 
+**Rule D addendum (Salih 2026-10-08):** if a required full suite fails only on
+tests NOT on the load-sensitive list, and each of them passes when rerun alone,
+rerun the FULL suite once on a quiet machine (the suite queue free, no own
+background runs). Green: the run counts as green; record both runs. Any
+failure again: STOP.
+
 **Full product suite:**
 
 - Run only when the tier above requires it.
@@ -399,9 +405,10 @@ Claude Code mod (function-hook plugin, Claude Code >= 2.1.287), wave 1, Salih
 skills-dir plugin: Claude Code loads it for any session whose project folder
 holds it) and is active only when `JARVIS_RUNBOOK.md` exists at the canonical
 root; code lanes inside `.claude/worktrees/<x>` still read and write the
-canonical `build/` folders. It makes no network calls and approves no tool
-permission. Runtime folders `build/queue/`, `build/lanes/` and `build/reports/`
-are gitignored and never committed.
+canonical `build/` folders. Wave 1 makes no network calls and approves no tool
+permission (the pager and `jarvis-codex` below are the only network uses).
+Runtime folders `build/queue/`, `build/lanes/` and `build/reports/` are
+gitignored and never committed.
 
 - **Prompt header.** The orchestrator writes this as the FIRST line of every
   prompt: `@jarvis lane=<slice-id> model=<opus|sonnet|haiku>
@@ -458,6 +465,77 @@ are gitignored and never committed.
   or interrupted. Windows power settings are not touched by the mod.
 - **Manual smoke test** (Salih, after integration): see the report of
   MB-flow1 in `build/reports/MB-flow1.md`.
+
+**Wave 2 (Salih 2026-10-08; MA1).** Same plugin, same activation rule. Runtime
+folders `build/locks/`, `build/flakes/`, `build/ledger/` and `build/reviews/`
+are gitignored like the others.
+
+- **Suite queue (A1).** At most one full suite (`python scripts\test_parallel.py`
+  in any form, or `scripts\test.ps1`) at a time across all sessions on this PC.
+  The lock is `build/locks/suite.json` (lane, session id, started_at, command,
+  heartbeat); it is taken and freed with an exclusive compare-and-swap open, so
+  two sessions cannot both win. The holder writes a heartbeat once a minute; a
+  lock is stale after 45 min without one (a forged future time or a garbage file
+  counts as stale too) and is then taken over. Another session's full-suite call
+  is HELD up to 40 min, the hook waiting inside `$.process.run` calls, with the
+  band showing "Test kuyruğu: <lane> koşuyor, <n> dk"; after 40 min the call is
+  refused with a reason that says wait, then retry. While a full suite holds the
+  lock, other sessions' `python -m unittest` runs that load UI tests (a
+  `test_ui*`-style target, a whole-suite `discover`) are held the same way. The
+  holder's own runs are never held. The lock is freed on the tool result, on an
+  error and on session end; a background full suite keeps it until the runner's
+  processes are gone. The hold hook fails closed: if the check itself breaks, the
+  suite or UI command is refused ("retry"), other commands pass. This is a
+  courtesy queue for model-driven commands, not a security boundary (a command
+  built to hide `test_parallel` from the match is not caught).
+- **Flake radar (A2).** After every test command (a full suite, or
+  `python -m unittest ...`) the result is parsed (Ran N, FAIL/ERROR ids with
+  subTest parameters, wall time) and one row is appended to
+  `build/flakes/ledger.jsonl`: time, lane, kind (`full|targeted|alone`; `alone` is
+  a single test-method id), targets, ran, failures, ok, wall_s, python_procs (at
+  the start of the command), other_lane_held (another session held the suite lock
+  when the run started or it had to wait). `/flaky` prints, per failing test id,
+  the fails under load, the passes and fails of `alone` runs of it, and when it
+  was last seen. No model call.
+- **Pager (A3, ntfy).** Setup, once, with the topic value from Salih (never
+  committed, never in the repo, logs, reports or ledgers):
+  `setx JARVIS_NTFY_TOPIC <topic>`, then restart Claude Code. Pushes (Turkish,
+  short, lane + what waits + since when) when this session has waited on a
+  permission prompt for 5 min (then every 30 min while it still waits), when the
+  battery is below 20% on battery, and when a header turn ends with `STATUS:
+  STOP`, `BLOCKED` or `FAIL`; at most one push per 10 min per session (a push
+  inside the gap is dropped). It runs `curl.exe` through `$.process.run` with a
+  fixed argument list; the topic and text go in on stdin as a curl config, so
+  neither is on a command line. Topic names are `[A-Za-z0-9_-]{1,64}`. With the
+  variable unset or invalid there is no network call and one toast.
+- **Slice ledger (A4).** For every turn started by an `@jarvis` header prompt one
+  row is appended to `build/ledger/slices.jsonl`: start, end, wall_s, lane, model,
+  effort, the turn's token usage, the `five_hour` and `seven_day` plan percentages
+  at start and at end, tool_calls, test_runs (kind, ran, failures, python_procs,
+  wall_s: the python process count is taken at the start of every test run) and
+  the final STATUS line. `/defter` prints today's rows.
+- **Band fix.** A model change the user makes (`/model`, the model picker, the
+  SDK) now moves the chat's family: band, `build/lanes/<family>.json` and the
+  queue folder follow. The start pin guards only the automatic fallback model.
+
+**jarvis-codex** (`.claude/skills/jarvis-codex/`, a separate plugin so it can be
+disabled on its own; Salih approved its network use on 2026-10-08).
+`/codex-inceleme <A..B> [name]` runs the Codex CLI non-interactively as an
+independent reviewer of `git diff <A..B>` (tracked files only) and writes
+`build/reviews/<name>-codex.md` (RANGE, VERDICT, run facts, then Codex's BLOCKER /
+MAJOR / MINOR findings with file:line and a verdict of READY, READY-WITH-NITS or
+NOT-READY). The band shows "Codex inceliyor…" and a toast says when it is done; no
+Claude turn is used. The only network use is Codex's own call to its model with the
+diff text. Codex is run as `codex exec -s read-only -c approval_policy=never
+--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -C
+build/reviews/_codex-cwd -o <file> -` with the prompt on stdin: the repository is
+not its working folder and no diff text is on a command line. Before each review
+the installed Codex must list the read-only sandbox flags in `codex exec --help`;
+if not, nothing runs. The command refuses (nothing is sent) when the diff touches
+`uv.lock`, `data/**`, `build/**`, `.git/`, `.env*`, key/certificate/database
+files, `.jarvis/`, `.codex/` or an 8.3 short name, when the diff is over 300 KB or
+empty, or when the range is not a plain `A..B`. The result file records whether
+`git status` changed during the run.
 
 ## V2.0 scope freeze
 

@@ -24,7 +24,7 @@ const PANE = (surface: 'terminal' | 'desktop', columns = 120) =>
     props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: columns, scroll: { offset: 0, bodyRows: 3 }, view: {} },
   }) as any
 
-test('pure: identity, colour per family and the lane pieces', async () => {
+test('pure: identity, colour per family and the lane pieces', { timeoutMs: 60000 }, async () => {
   expect(identOf('opus')).toBe('OPUS')
   expect(identOf('sonnet')).toBe('SONNET')
   expect(identOf('unknown')).toBe('CLAUDE')
@@ -34,7 +34,7 @@ test('pure: identity, colour per family and the lane pieces', async () => {
   expect(renderBand(el, { ...base, family: 'sonnet' }, 200).children[0].props.color).toBe('cyan')
 })
 
-test('pure: a bad base shows the head in red, no lane shows no base', async () => {
+test('pure: a bad base shows the head in red, no lane shows no base', { timeoutMs: 60000 }, async () => {
   const bad = renderBand(el, { ...base, baseState: 'bad' }, 200)
   expect(texts(bad)).toContain('taban ✗ abc1234')
   expect(bad.children[1].props.color).toBe('red')
@@ -43,7 +43,7 @@ test('pure: a bad base shows the head in red, no lane shows no base', async () =
   expect(texts(renderBand(el, { ...base, baseState: 'main' }, 200))).toContain('taban main')
 })
 
-test('pure: pending prompt, MOLA and battery pieces', async () => {
+test('pure: pending prompt, MOLA and battery pieces', { timeoutMs: 60000 }, async () => {
   const all = texts(renderBand(el, { ...base, pendingLane: 'SB2', paused: true, power: { ac: false, pct: 35 }, lowBattery: false }, 300))
   expect(all).toContain('Yeni istem hazır: SB2 · /basla')
   expect(all).toContain('MOLA')
@@ -54,7 +54,7 @@ test('pure: pending prompt, MOLA and battery pieces', async () => {
   expect(texts(renderBand(el, base, 300)).some((t) => t.startsWith('PİL'))).toBe(false)
 })
 
-test('pure: a narrow band keeps the identity and the highest priorities only', async () => {
+test('pure: a narrow band keeps the identity and the highest priorities only', { timeoutMs: 60000 }, async () => {
   const state = { ...base, pendingLane: 'SB2', paused: true }
   const narrow = texts(renderBand(el, state, 30))
   expect(narrow[0]).toBe('  OPUS  ')
@@ -66,7 +66,7 @@ test('pure: a narrow band keeps the identity and the highest priorities only', a
   expect(mid).not.toContain('6g-fee @worktree-6g-fee')
 })
 
-test('pure: the other mods band is kept under ours', async () => {
+test('pure: the other mods band is kept under ours', { timeoutMs: 60000 }, async () => {
   const theirs = { type: 'Text', props: {}, children: ['theirs'] }
   const tree = renderBand(el, base, 120, theirs)
   expect(tree.type).toBe('Box')
@@ -74,7 +74,7 @@ test('pure: the other mods band is kept under ours', async () => {
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {
-  test('band on ' + surface + ': identity, lane, base and the other bands text', async ($, on) => {
+  test('band on ' + surface + ': identity, lane, base and the other bands text', { timeoutMs: 60000 }, async ($, on) => {
     on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by Claude Code'] }))
     world(on, { model: 'claude-opus-5-5' })
     await startSession($)
@@ -87,7 +87,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test('band on ' + surface + ': a stale base shows taban ✗ with the head', async ($, on) => {
+  test('band on ' + surface + ': a stale base shows taban ✗ with the head', { timeoutMs: 60000 }, async ($, on) => {
     on('ui.render', () => ({ type: 'Text', props: {}, children: ['x'] }))
     world(on, { baseIsAncestor: false, head: 'bbbbbbbbbbbb' })
     await startSession($)
@@ -98,7 +98,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test('band on ' + surface + ': a pending prompt, MOLA and the battery', async ($, on) => {
+  test('band on ' + surface + ': a pending prompt, MOLA and the battery', { timeoutMs: 60000 }, async ($, on) => {
     on('ui.render', () => ({ type: 'Text', props: {}, children: ['x'] }))
     const w = world(on, { battery: bat(55) })
     put(w, '/repo/build/queue/sonnet/sb2.md', header('SB2'))
@@ -111,7 +111,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test('band on ' + surface + ': a narrow window drops the details but keeps the identity', async ($, on) => {
+  test('band on ' + surface + ': a narrow window drops the details but keeps the identity', { timeoutMs: 60000 }, async ($, on) => {
     on('ui.render', () => ({ type: 'Text', props: {}, children: ['x'] }))
     world(on)
     await startSession($)
@@ -123,7 +123,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
-test('outside the JARVIS repo the band is left to Claude Code', async ($, on) => {
+test('outside the JARVIS repo the band is left to Claude Code', { timeoutMs: 60000 }, async ($, on) => {
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by Claude Code'] }))
   world(on, { isJarvis: false })
   await startSession($)

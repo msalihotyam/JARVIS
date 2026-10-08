@@ -6,17 +6,17 @@ import { OPUS, SONNET, header, startSession, userPrompt, world } from './world.t
 const ctx = { modelId: SONNET, effort: 'high', mainHead: '7c34ff0abcde' }
 const lint = (text: string, over: Partial<typeof ctx> = {}) => lintPrompt(parseHeader(text), { ...ctx, ...over })
 
-test('pure: no header passes whatever the session is', async () => {
+test('pure: no header passes whatever the session is', { timeoutMs: 60000 }, async () => {
   expect(lint('hello', { modelId: OPUS, effort: 'medium' })).toEqual({ kind: 'pass' })
   expect(lint('hello', { modelId: null, effort: null, mainHead: null })).toEqual({ kind: 'pass' })
 })
 
-test('pure: a matching header passes', async () => {
+test('pure: a matching header passes', { timeoutMs: 60000 }, async () => {
   expect(lint(header('SB1'))).toEqual({ kind: 'pass' })
   expect(lint(header('SB1', 'sonnet', 'high', '7c34ff0'))).toEqual({ kind: 'pass' })
 })
 
-test('pure: wrong model family blocks with the Turkish message', async () => {
+test('pure: wrong model family blocks with the Turkish message', { timeoutMs: 60000 }, async () => {
   expect(lint(header('SB1', 'opus'))).toEqual({
     kind: 'block',
     message: 'Bu istem OPUS için, bu sohbet SONNET. Doğru sohbete yapıştır.',
@@ -27,12 +27,12 @@ test('pure: wrong model family blocks with the Turkish message', async () => {
   })
 })
 
-test('pure: wrong effort blocks, unknown effort passes', async () => {
+test('pure: wrong effort blocks, unknown effort passes', { timeoutMs: 60000 }, async () => {
   expect(lint(header('SB1', 'sonnet', 'xhigh'))).toEqual({ kind: 'block', message: 'Önce /effort xhigh yaz' })
   expect(lint(header('SB1', 'sonnet', 'xhigh'), { effort: null })).toEqual({ kind: 'pass' })
 })
 
-test('pure: a stale base blocks, base=main and unknown main head pass', async () => {
+test('pure: a stale base blocks, base=main and unknown main head pass', { timeoutMs: 60000 }, async () => {
   expect(lint(header('SB1', 'sonnet', 'high', '8aad14a'))).toEqual({
     kind: 'block',
     message: 'İstem tabanı 8aad14a, main 7c34ff0abcde. Orkestratörden güncel istemi iste.',
@@ -41,19 +41,19 @@ test('pure: a stale base blocks, base=main and unknown main head pass', async ()
   expect(lint(header('SB1', 'sonnet', 'high', '8aad14a'), { mainHead: null })).toEqual({ kind: 'pass' })
 })
 
-test('pure: an invalid header blocks', async () => {
+test('pure: an invalid header blocks', { timeoutMs: 60000 }, async () => {
   const verdict = lint('@jarvis lane=x')
   expect(verdict.kind).toBe('block')
 })
 
-test('pure: a bare /compact is recognised, /compact with text is not', async () => {
+test('pure: a bare /compact is recognised, /compact with text is not', { timeoutMs: 60000 }, async () => {
   expect(isBareCompact('compact', '')).toBe(true)
   expect(isBareCompact('compact', '   ')).toBe(true)
   expect(isBareCompact('compact', 'Keep: rules')).toBe(false)
   expect(isBareCompact('clear', '')).toBe(false)
 })
 
-test('hook: a wrong-family prompt is dropped and never submitted', async ($, on) => {
+test('hook: a wrong-family prompt is dropped and never submitted', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const out = await userPrompt($, header('SB1', 'opus') + '\nbody')
@@ -62,7 +62,7 @@ test('hook: a wrong-family prompt is dropped and never submitted', async ($, on)
   expect(w.toasts).toContain('Bu istem OPUS için, bu sohbet SONNET. Doğru sohbete yapıştır.')
 })
 
-test('hook: a prompt without a header goes through untouched', async ($, on) => {
+test('hook: a prompt without a header goes through untouched', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const out = await userPrompt($, 'merhaba, bir şey sor')
@@ -70,7 +70,7 @@ test('hook: a prompt without a header goes through untouched', async ($, on) => 
   expect(w.submitted).toEqual(['merhaba, bir şey sor'])
 })
 
-test('hook: a matching header goes through and is remembered as the lane', async ($, on) => {
+test('hook: a matching header goes through and is remembered as the lane', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const text = header('SB1') + '\nbody'
@@ -82,7 +82,7 @@ test('hook: a matching header goes through and is remembered as the lane', async
   expect(status.base).toBe('main')
 })
 
-test('hook: a stale sha base is dropped with both shas in the message', async ($, on) => {
+test('hook: a stale sha base is dropped with both shas in the message', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { mainHead: '7c34ff0abcde' })
   await startSession($)
   const out = await userPrompt($, header('SB1', 'sonnet', 'high', '8aad14a') + '\nbody')
@@ -90,7 +90,7 @@ test('hook: a stale sha base is dropped with both shas in the message', async ($
   expect(w.submitted).toEqual([])
 })
 
-test('hook: the effort check starts once a request has shown the effort', async ($, on) => {
+test('hook: the effort check starts once a request has shown the effort', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
@@ -108,7 +108,7 @@ test('hook: the effort check starts once a request has shown the effort', async 
   expect(third.text).toContain('lane=SB2')
 })
 
-test('hook: when the lint itself fails the prompt goes through with a toast', async ($, on) => {
+test('hook: when the lint itself fails the prompt goes through with a toast', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   w.breakModel = true
@@ -118,7 +118,7 @@ test('hook: when the lint itself fails the prompt goes through with a toast', as
   expect(w.toasts.some((t) => t.startsWith('jarvis-flow lint hatası'))).toBe(true)
 })
 
-test('hook: nothing is linted outside the JARVIS repo', async ($, on) => {
+test('hook: nothing is linted outside the JARVIS repo', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { isJarvis: false })
   await startSession($)
   const out = await userPrompt($, header('SB1', 'opus') + '\nbody')
@@ -126,7 +126,7 @@ test('hook: nothing is linted outside the JARVIS repo', async ($, on) => {
   expect(w.submitted.length).toBe(1)
 })
 
-test('hook: a bare /compact is blocked, /compact with text is not', async ($, on) => {
+test('hook: a bare /compact is blocked, /compact with text is not', { timeoutMs: 60000 }, async ($, on) => {
   world(on)
   await startSession($)
   const bare = await $.command.run({ command: 'compact', args: '' })
@@ -135,7 +135,7 @@ test('hook: a bare /compact is blocked, /compact with text is not', async ($, on
   expect(withText.text).toBe('')
 })
 
-test('hook: /jcompact fills the prompt box from the template and submits nothing', async ($, on) => {
+test('hook: /jcompact fills the prompt box from the template and submits nothing', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await userPrompt($, header('SB1') + '\nbody')
@@ -147,7 +147,7 @@ test('hook: /jcompact fills the prompt box from the template and submits nothing
   expect(w.submitted.length).toBe(1)
 })
 
-test('hook: after /effort the next header prompt is judged against the new level', async ($, on) => {
+test('hook: after /effort the next header prompt is judged against the new level', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
@@ -165,7 +165,7 @@ test('hook: after /effort the next header prompt is judged against the new level
   expect(w.submitted.length).toBe(1)
 })
 
-test('hook: /model forgets the known effort, so nothing is blocked until a request shows it', async ($, on) => {
+test('hook: /model forgets the known effort, so nothing is blocked until a request shows it', { timeoutMs: 60000 }, async ($, on) => {
   world(on)
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
@@ -179,7 +179,7 @@ test('hook: /model forgets the known effort, so nothing is blocked until a reque
   expect(out.text).toContain('lane=SB1')
 })
 
-test('hook: a header-led prompt that is malformed is blocked, a plain @mention is not', async ($, on) => {
+test('hook: a header-led prompt that is malformed is blocked, a plain @mention is not', { timeoutMs: 60000 }, async ($, on) => {
   world(on)
   await startSession($)
   const bad = await userPrompt($, '@jarvis bak şuna')

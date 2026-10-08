@@ -18,6 +18,8 @@ export type BandState = {
   lowBattery: boolean
   // the oldest pending prompt, if any
   pendingLane: string | null
+  // this session's test command is held behind another session's full suite
+  suiteWait?: { lane: string; minutes: number } | null
 }
 
 const COLORS: Record<string, string> = { opus: 'magenta', sonnet: 'cyan', haiku: 'yellow' }
@@ -37,6 +39,9 @@ export function pieces(state: BandState): Piece[] {
   })
   if (state.pendingLane !== null) {
     out.push({ text: 'Yeni istem hazır: ' + state.pendingLane + ' · /basla', props: { bold: true, color: 'green' } })
+  }
+  if (state.suiteWait) {
+    out.push({ text: 'Test kuyruğu: ' + state.suiteWait.lane + ' koşuyor, ' + state.suiteWait.minutes + ' dk', props: { bold: true, color: 'yellow' } })
   }
   if (state.paused) out.push({ text: 'MOLA', props: { bold: true, color: 'yellow' } })
   if (state.baseState === 'ok') out.push({ text: 'taban ✓', props: { color: 'green' } })

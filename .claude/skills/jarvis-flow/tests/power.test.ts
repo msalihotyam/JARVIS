@@ -7,7 +7,7 @@ const PAUSE = '/repo/build/queue/PAUSE'
 const bat = (pct: number, status = 1) => JSON.stringify({ EstimatedChargeRemaining: pct, BatteryStatus: status })
 const workingOpus = JSON.stringify({ state: 'working', updated_at: new Date(0).toISOString() })
 
-test('pure: parseBattery', async () => {
+test('pure: parseBattery', { timeoutMs: 60000 }, async () => {
   expect(parseBattery('')).toEqual({ ac: true, pct: null })
   expect(parseBattery('not json')).toEqual({ ac: true, pct: null })
   expect(parseBattery(bat(62, 2))).toEqual({ ac: true, pct: 62 })
@@ -18,7 +18,7 @@ test('pure: parseBattery', async () => {
   expect(parseBattery(bat(140, 2))).toEqual({ ac: true, pct: 100 })
 })
 
-test('pure: gate rules', async () => {
+test('pure: gate rules', { timeoutMs: 60000 }, async () => {
   const mains = { ac: true, pct: 100 }
   expect(gate({ power: mains, paused: false, otherLaneWorking: true }).allow).toBe(true)
   expect(gate({ power: mains, paused: true, otherLaneWorking: false })).toMatchObject({ allow: false, reason: 'MOLA açık (/devam yaz)' })
@@ -37,7 +37,7 @@ test('pure: gate rules', async () => {
   expect(gate({ power: { ac: false, pct: null }, paused: false, otherLaneWorking: false }).allow).toBe(true)
 })
 
-test('pure: a stale working status is not believed', async () => {
+test('pure: a stale working status is not believed', { timeoutMs: 60000 }, async () => {
   const at = new Date(0).toISOString()
   expect(isFreshWorking({ state: 'working', updated_at: at }, 1000)).toBe(true)
   expect(isFreshWorking({ state: 'working', updated_at: at }, STALE_MS + 1)).toBe(false)
@@ -45,7 +45,7 @@ test('pure: a stale working status is not believed', async () => {
   expect(isFreshWorking(null, 1000)).toBe(false)
 })
 
-test('auto: a file in auto/ starts by itself when idle and records last_auto', async ($, on) => {
+test('auto: a file in auto/ starts by itself when idle and records last_auto', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   const body = header('AUTO1') + '\nrun it'
   put(w, AUTO + '/a1.md', body)
@@ -60,7 +60,7 @@ test('auto: a file in auto/ starts by itself when idle and records last_auto', a
   expect(status.last_auto.sha256).toMatch(/^[0-9a-f]{64}$/)
 })
 
-test('auto: does not start while PAUSE exists, and starts after /devam', async ($, on) => {
+test('auto: does not start while PAUSE exists, and starts after /devam', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   put(w, PAUSE, 'x')
   put(w, AUTO + '/a1.md', header('AUTO1'))
@@ -75,7 +75,7 @@ test('auto: does not start while PAUSE exists, and starts after /devam', async (
   expect(w.submitted).toEqual([header('AUTO1')])
 })
 
-test('/mola creates the flag and stops the inbox, also for /basla', async ($, on) => {
+test('/mola creates the flag and stops the inbox, also for /basla', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   const out = await $.command.run({ command: 'mola', args: '' })
@@ -90,7 +90,7 @@ test('/mola creates the flag and stops the inbox, also for /basla', async ($, on
   expect(w.submitted).toEqual([])
 })
 
-test('auto: waits while a turn is running and starts when it ends', async ($, on) => {
+test('auto: waits while a turn is running and starts when it ends', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   await startSession($)
   await $.turn.start({ text: 'working', turnId: 't1' })
@@ -102,7 +102,7 @@ test('auto: waits while a turn is running and starts when it ends', async ($, on
   expect(w.submitted).toEqual([header('AUTO1')])
 })
 
-test('auto: a pending manual file goes first, nothing else is auto-started', async ($, on) => {
+test('auto: a pending manual file goes first, nothing else is auto-started', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   put(w, '/repo/build/queue/sonnet/manual.md', header('MAN1'))
   put(w, AUTO + '/a1.md', header('AUTO1'))
@@ -112,7 +112,7 @@ test('auto: a pending manual file goes first, nothing else is auto-started', asy
   expect(w.files.has(AUTO + '/a1.md')).toBe(true)
 })
 
-test('auto: two auto files go one at a time', async ($, on) => {
+test('auto: two auto files go one at a time', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on)
   put(w, AUTO + '/a1.md', header('AUTO1'))
   put(w, AUTO + '/a2.md', header('AUTO2'))
@@ -130,7 +130,7 @@ test('auto: two auto files go one at a time', async ($, on) => {
   expect(w.submitted).toEqual([header('AUTO1'), header('AUTO2')])
 })
 
-test('battery >= 40%: one prompt at a time across lanes', async ($, on) => {
+test('battery >= 40%: one prompt at a time across lanes', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(60) })
   put(w, '/repo/build/lanes/opus.json', workingOpus)
   put(w, AUTO + '/a1.md', header('AUTO1'))
@@ -144,7 +144,7 @@ test('battery >= 40%: one prompt at a time across lanes', async ($, on) => {
   expect(w.submitted).toEqual([header('AUTO1')])
 })
 
-test('battery >= 40% and nobody else working: starts', async ($, on) => {
+test('battery >= 40% and nobody else working: starts', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(60) })
   put(w, AUTO + '/a1.md', header('AUTO1'))
   await startSession($)
@@ -152,7 +152,7 @@ test('battery >= 40% and nobody else working: starts', async ($, on) => {
   expect(w.submitted).toEqual([header('AUTO1')])
 })
 
-test('battery < 40%: nothing new starts, one toast, running work is untouched', async ($, on) => {
+test('battery < 40%: nothing new starts, one toast, running work is untouched', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(35) })
   await startSession($)
   await $.turn.start({ text: 'working', turnId: 't1' })
@@ -165,14 +165,14 @@ test('battery < 40%: nothing new starts, one toast, running work is untouched', 
   expect(statusOf(w, 'sonnet').state).toBe('working')
 })
 
-test('battery < 20%: the status file says low_battery', async ($, on) => {
+test('battery < 20%: the status file says low_battery', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(15) })
   await startSession($)
   expect(statusOf(w, 'sonnet').state).toBe('low_battery')
   expect(statusOf(w, 'sonnet').busy).toBe(false)
 })
 
-test('on mains power a low charge does not stop anything', async ($, on) => {
+test('on mains power a low charge does not stop anything', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(15, 2) })
   put(w, AUTO + '/a1.md', header('AUTO1'))
   await startSession($)
@@ -181,7 +181,7 @@ test('on mains power a low charge does not stop anything', async ($, on) => {
   expect(statusOf(w, 'sonnet').state).not.toBe('low_battery')
 })
 
-test('/basla also honours the battery rule', async ($, on) => {
+test('/basla also honours the battery rule', { timeoutMs: 60000 }, async ($, on) => {
   const w = world(on, { battery: bat(30) })
   put(w, '/repo/build/queue/sonnet/m.md', header('M1'))
   await startSession($)

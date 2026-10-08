@@ -1,0 +1,4 @@
+{
+  "description": "The jarvis-codex hooks module",
+  "modules": ["./register.ts"]
+}
