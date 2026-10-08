@@ -691,7 +691,8 @@ async function judgeFind(args: Word[], kind: Kind, ctx: Ctx, box: Box, depth: nu
         i++
       }
       if (sub.length) {
-        const r = await judgeSimple({ words: sub, redirects: [], heredocs: [], piped: false, nested: [] }, kind, ctx, { dir: box.dir, altGit: box.altGit }, depth + 1, '')
+        // find runs it as its own process: no enclosing subshell, depth 0
+        const r = await judgeSimple({ words: sub, redirects: [], heredocs: [], piped: false, nested: [], depth: 0 }, kind, ctx, { dir: box.dir, altGit: box.altGit }, depth + 1, '')
         if (r) return r
       }
     }

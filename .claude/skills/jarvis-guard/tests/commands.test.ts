@@ -277,6 +277,10 @@ const CASES: Case[] = [
   ['find jarvis -type f -exec rm -f {} +', 'bash', 'R9'],
   ['find data -name "jarvis.db*" -exec rm {} \\;', 'bash', 'R10'],
   ['find build/fee2 -name "*.log" -exec rm {} +', 'bash', 'allow'],
+  // the -exec sub-command is judged as its own command (not a deleter or mover)
+  ['find . -maxdepth 0 -exec git push origin main \\;', 'bash', 'R1'],
+  ['find build/fee2 -execdir git stash +', 'bash', 'R4'],
+  ['find build/fee2 -name "*.log" -exec cat {} \\;', 'bash', 'allow'],
   ['Get-ChildItem -Recurse jarvis | Remove-Item -Force', 'powershell', 'R9'],
   ['ls -r data | rm', 'powershell', 'R9'],
   ['cp build/uv.lock .', 'bash', 'R10'],
