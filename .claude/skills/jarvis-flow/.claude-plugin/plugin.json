@@ -1,0 +1,6 @@
+{
+  "name": "jarvis-flow",
+  "version": "0.1.0",
+  "description": "JARVIS lane band, prompt lint, prompt inbox, report capture, power and pause",
+  "author": { "name": "JARVIS" }
+}

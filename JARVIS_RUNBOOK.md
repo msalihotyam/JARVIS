@@ -392,6 +392,73 @@ Pushing (Salih decision, 2026-10-08, "bulut: evet"):
 - A cloud prompt states its expected base SHA, and the session checks it
   first. On a mismatch: STOP.
 
+## Mods (jarvis-flow)
+
+Claude Code mod (function-hook plugin, Claude Code >= 2.1.287), wave 1, Salih
+2026-10-08. It lives in the repo at `.claude/skills/jarvis-flow/` (a project
+skills-dir plugin: Claude Code loads it for any session whose project folder
+holds it) and is active only when `JARVIS_RUNBOOK.md` exists at the canonical
+root; code lanes inside `.claude/worktrees/<x>` still read and write the
+canonical `build/` folders. It makes no network calls and approves no tool
+permission. Runtime folders `build/queue/`, `build/lanes/` and `build/reports/`
+are gitignored and never committed.
+
+- **Prompt header.** The orchestrator writes this as the FIRST line of every
+  prompt: `@jarvis lane=<slice-id> model=<opus|sonnet|haiku>
+  effort=<medium|high|xhigh> base=<sha|main>`. It is parsed strictly. A prompt
+  without the header is normal chat and passes untouched; a prompt that starts
+  with `@jarvis` but is malformed is blocked with the reason.
+- **Lane band** above the prompt: the chat identity (OPUS, SONNET, HAIKU, one
+  colour each), the lane id of the last header, `taban ✓` or `taban ✗ <head>`
+  (red; the header's base compared with this session's HEAD), the worktree and
+  branch, context %, plan %, a battery mark on battery, `MOLA` while paused, and
+  `Yeni istem hazır: <lane> · /basla` when a prompt is waiting. It shrinks by
+  priority in a narrow window.
+- **Status file** `build/lanes/<family>.json`, rewritten on turn start, turn
+  completion and permission waits, and only when something changed: family,
+  model, effort, lane, base, cwd, worktree, branch, head, state
+  (`working|idle|waiting|low_battery`), busy, updated_at, context_pct, power
+  `{ac,pct}`, paused, last_auto. The effort is the one the last request used, so
+  it is known only after the first turn of a session.
+- **Report capture.** When a turn ends and its final text has a line starting
+  `STATUS:`, the text is written to `build/reports/<lane>.md`. An existing,
+  different file is first kept as `<lane>.<yyyymmdd-hhmmss>.md`.
+- **Prompt lint** (on submit, never for the mod's own submissions): a header
+  model family that differs from this chat's blocks with "Bu istem <X> için, bu
+  sohbet <Y>. Doğru sohbete yapıştır."; a differing effort blocks with "Önce
+  /effort <x> yaz"; a sha base that is not canonical main's HEAD blocks with
+  "İstem tabanı <x>, main <y>. Orkestratörden güncel istemi iste." (not checked
+  for `base=main`). A bare `/compact` is blocked with "Boş /compact yok.
+  /jcompact kullan". The lint is fail-open: if it throws, the prompt passes and
+  a toast shows the error.
+- **/jcompact** fills the prompt box with `/compact <template>` built from
+  `.claude/skills/jarvis-flow/compact-template.md` (hard rules plus the lane
+  state). It does not submit; Salih presses Enter.
+- **Inbox** `build/queue/<opus|sonnet>/`, scanned every 5 s. Accepted files:
+  `*.md`, real path directly inside the folder (no traversal or link out), under
+  64 KB, starting with a valid `@jarvis` header whose model is this chat's
+  family and which passes the same lint as a typed prompt. `/kuyruk` lists
+  pending and refused files, `/basla` shows the oldest file's first 8 lines and a
+  short sha256, submits its full text as the next prompt and moves it to
+  `done/` with a timestamp (typing `/basla` IS the approval), `/atla <file>`
+  moves one to `done/` unsent. The command is `/basla`, not `/başla`: Claude
+  Code command names are ASCII only.
+- **Auto queue** `build/queue/<family>/auto/` (delegated to the orchestrator,
+  2026-10-08): the same acceptance rules, submitted automatically, oldest first,
+  only when the session is idle, no manual file is waiting, `PAUSE` is absent
+  and the power rules allow it. Each auto-start shows a toast and is recorded in
+  the status file as `last_auto` (file, sha256, time).
+- **Power and pause.** Every 2 minutes the battery is read; `PAUSE`
+  (`build/queue/PAUSE`, made by `/mola`, removed by `/devam`, or by the
+  orchestrator through the file) stops the inbox starting anything. On battery:
+  at 40% or more at most one prompt runs at a time (the inbox waits while another
+  lane's status says `working`, believed for 3 h); below 40% nothing new starts
+  (one toast); below 20% the status file says `low_battery` so the orchestrator
+  can tell the lanes to stop at a step boundary. A running turn is never killed
+  or interrupted. Windows power settings are not touched by the mod.
+- **Manual smoke test** (Salih, after integration): see the report of
+  MB-flow1 in `build/reports/MB-flow1.md`.
+
 ## V2.0 scope freeze
 
 Salih decision (2026-10-06): V2.0 scope is frozen. New ideas go to the

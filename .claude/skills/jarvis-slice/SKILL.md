@@ -70,3 +70,11 @@ its `NN-<slug>.report.md` (`jarvis-queue`).
 Every lane also writes the full report, exactly as reported, to
 `build/reports/<slice-id>.md` (gitignored; create the folder if missing) and
 still prints it in the chat, so Salih can just say "<slice-id> bitti".
+
+A prompt starts with the `@jarvis lane=<slice-id> model=<opus|sonnet|haiku>
+effort=<medium|high|xhigh> base=<sha|main>` header (RUNBOOK "Mods (jarvis-flow)").
+The jarvis-flow mod lints it, shows the lane band and the status file, and
+captures the final report: a turn whose last text has a line starting
+`STATUS:` is written to `build/reports/<lane>.md` by the mod, so the lane
+need not write it twice; the report block itself must still start its lines
+with `STATUS:`.
