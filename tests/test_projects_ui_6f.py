@@ -61,17 +61,19 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import time
 import unittest
 from datetime import timezone
 from unittest import mock
 
 from PySide6.QtCore import QMetaObject, QObject, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFontMetricsF
+from PySide6.QtQml import QQmlEngine, QQmlExpression
 from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
 from jarvis.memory import SQLiteMemoryStore
-from tests.helpers import wait_still, wait_until
+from tests.helpers import wait_until
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.test_ui import _APP, pump
@@ -227,6 +229,13 @@ class CountTests(SidebarDataCase):
 
 SIZES = ((1100, 700), (1280, 760), (1920, 1080))
 TILES = ("Tasks", "Focus", "Plan", "Memory")
+# F-ee2: the home frame's reflow (Main.qml) is at rest only when its own animated values
+# reached their targets - the rail margin and the ONE column span - evaluated in Main's
+# context with the product's own formulas, so the test never restates them.
+REFLOW_AT_REST = ("content.anchors.leftMargin === (content.command ? Theme.margin : Theme.railWidth(root.width))"
+                  " && Math.abs(content.columnSpan - (content.showColumn ? content.columnWidth + content.columnGap : 0)) < 0.5")
+STILL_SPAN = 0.25          # s: the longest reflow (Theme.reflow / focusMs, 220 ms) plus one frame
+SETTLE_FLOOR_MS = 15000    # a heavily loaded machine may take this long; the ceiling still fails loudly
 
 
 class SidebarShellCase(ProjectsUiCase):
@@ -251,19 +260,35 @@ class SidebarShellCase(ProjectsUiCase):
         else:                                       # S0b: the state the caller asserts next; the old wait is the ceiling
             wait_until(until, 350)
 
+    def reflow_at_rest(self, root) -> bool:
+        content = self.item(root, "panelColumn").parentItem()
+        value, undefined = QQmlExpression(QQmlEngine.contextForObject(content), content, REFLOW_AT_REST).evaluate()
+        self.assertFalse(undefined, REFLOW_AT_REST)
+        return value is True
+
     def resize_still(self, root, width: int, height: int, ceiling_ms: int, every=None) -> bool:
-        """Resize, then wait until the home frame (sidebar, header, composer, column) stops
-        moving - its width animates; the old fixed wait is the ceiling. ``every`` (F-ee) runs
-        its assertions on each sampled frame of the reflow, not only on the still one. True
-        once still; a caller that measures the still frame asserts it (F-ee)."""
+        """Resize, then wait until the home frame (sidebar, header, composer, column) is still.
+        F-ee2: still means the sampled geometry stayed the same for at least STILL_SPAN (the
+        longest reflow plus a frame) AND the reflow's own animated values are at their
+        targets - a few equal samples of a frame that stalled under load are not still. The
+        ceiling is the caller's, at least SETTLE_FLOOR_MS, and running out of it fails the
+        test. ``every`` (F-ee) runs its assertions on each sampled frame of the reflow."""
         root.resize(width, height)
         names = ("sidebar", "chatHeader", "canonicalComposer", "panelColumn")
+        last = {"sample": None, "since": 0.0}
 
-        def sample():
+        def still() -> bool:
             if every is not None:
                 every()
-            return (root.width(), root.height(), tuple(self.rect(i) for n in names for i in self.all_items(root, n)))
-        return wait_still(sample, ceiling_ms)
+            now = time.monotonic()
+            sample = (root.width(), root.height(), tuple(self.rect(i) for n in names for i in self.all_items(root, n)))
+            if sample != last["sample"]:
+                last["sample"], last["since"] = sample, now
+                return False
+            return now - last["since"] >= STILL_SPAN and self.reflow_at_rest(root)
+        ceiling = max(ceiling_ms, SETTLE_FLOOR_MS)
+        self.assertTrue(wait_until(still, ceiling, 20), f"the reflow to {width}x{height} did not settle in {ceiling} ms")
+        return True
 
     def closed(self, popup, ceiling_ms: int) -> None:
         """Close a popup; wait until it is gone (its exit transition ended); the old wait is the ceiling."""
