@@ -121,9 +121,9 @@ def at_rest_check(case: unittest.TestCase, root):
 
 def drawn_at_rest(case: unittest.TestCase, root, width: int, height: int, ceiling_ms: int) -> None:
     """THIZ, motion-free (ambient off: every Theme.dur is 0): the window is ``width`` x ``height``,
-    Main's reflow values are at their targets and two frames were drawn at that size since - the
-    polish before a frame is where Layouts place their items, and with no motion nothing moves
-    after it. At most max(ceiling_ms, SETTLE_FLOOR_MS); running out of it fails the test."""
+    Main's reflow values are at their targets and two frames were drawn at that size after this
+    call - the polish before a frame is where Layouts place their items, and with no motion nothing
+    moves after it. At most max(ceiling_ms, SETTLE_FLOOR_MS); running out of it fails the test."""
     at_rest = at_rest_check(case, root)
     frames = [0]
 
@@ -334,6 +334,7 @@ class BootstrapTests(UiTestCase):
         pump(600)
         self.assertEqual(space_accent.name(), QColor(root.property("accentToken")).name())
 
+    @ambient_on          # THIZ: it saves ambient effects off itself; the default must be the real one
     def test_theme_and_ambient_are_persisted_and_validated(self) -> None:
         bridge = self.bridge()
         bridge.setTheme("dark")
@@ -1482,9 +1483,8 @@ class LeftContextTests(UiTestCase):
         context = self.item(root, "leftContextCard")
         self.assertIsNotNone(source)
         original = source.property("now")
-        settled(1150, lambda: (
-            self.assertNotEqual(original, source.property("now"), "the system clock timer stopped"),
-        ))
+        pump(1150)                                     # THIZ: kept fixed - the tick within 1.15 s is the check
+        self.assertNotEqual(original, source.property("now"), "the system clock timer stopped")
         for date, clock in ((QDate(2032, 12, 31), QTime(23, 59, 59)),
                             (QDate(2033, 1, 1), QTime(0, 0, 0))):
             instant = QDateTime(date, clock)
@@ -3904,9 +3904,8 @@ class SchedulerSweepTests(UiTestCase):
         self.assertEqual(30_000, SWEEP_INTERVAL_MS)
         self.assertEqual(SWEEP_INTERVAL_MS, timer.interval())
         self.assertIs(bridge, timer.parent())          # the loop ends with the application
-        settled(3000, lambda: (  # the startup sweep
-            self.assertEqual(1, len(calls)),
-        ))
+        pump(3_000)                                    # the startup sweep (THIZ: kept fixed - exactly one in 3 s)
+        self.assertEqual(1, len(calls))
         timer.timeout.emit()                           # a periodic tick
         self.assertEqual(2, len(calls))
         # Nothing was invented for the person and no model was called.
@@ -7793,10 +7792,9 @@ class ContextMenuPolishTests(SurfaceCase):
         note = self.menu(root, "copyFeedback_composerEditMenu")
         self.assertTrue(note.property("visible"))
         self.assertIn("Copied", self.texts_of(note.property("contentItem")))
-        settled(1800, lambda: (
-            self.assertFalse(note.property("visible")),                                # it leaves by itself
-            self.assertEqual("merhaba dünya", editor.property("text")),                # nothing was cut
-        ))
+        pump(1800)                                                                      # THIZ: kept fixed - it leaves within 1.8 s
+        self.assertFalse(note.property("visible"))                                      # it leaves by itself
+        self.assertEqual("merhaba dünya", editor.property("text"))                      # nothing was cut
 
     def test_messages_get_a_read_only_copy_menu(self) -> None:
         from PySide6.QtGui import QGuiApplication

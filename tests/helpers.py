@@ -351,7 +351,10 @@ def settled(fixed_ms: int, check, poll_ms: int = 20) -> None:
     awaits nothing but time - a negative check ("nothing happens for N ms") or a state that was
     already there - so it keeps the full fixed wait and is then made again. Otherwise the loop
     turns until it holds, at most max(fixed_ms, CHECK_FLOOR_MS); out of time, its own assertion
-    fails (loud). The assertions are the same either way; only the wait before them changes."""
+    fails (loud). The assertions are the same either way; only the wait before them changes.
+    Not for a check whose time IS the subject (a timer's tick, a note that leaves within N ms,
+    exactly one sweep in N ms): those keep ``pump(fixed_ms)``. A negative part of a check that
+    first fails is made at the moment the whole holds, not N ms later."""
     import time
 
     from tests.test_ui import pump

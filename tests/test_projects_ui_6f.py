@@ -73,7 +73,7 @@ from PySide6.QtTest import QTest
 
 from jarvis.conversation import append_turn
 from jarvis.memory import SQLiteMemoryStore
-from tests.helpers import settled, wait_until
+from tests.helpers import settled, wait_still, wait_until
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.test_ui import _APP, ambient_on, drawn_at_rest, pump
@@ -1829,6 +1829,9 @@ class SweepTests(SweepCase):
                         self.press(root, "rail" + key, until=lambda: root.property("peekOpen"))
                         self.assertTrue(root.property("peekOpen"))
                         peek = self.item(root, "summaryPeek")
+                        # THIZ (the F-ee2 rule): measured once the peek and its texts are still for STILL_SPAN.
+                        self.assertTrue(wait_still(lambda: [self.rect(i) for i in self.descendants(peek) if i.isVisible()],
+                                                   SETTLE_FLOOR_MS, 50, 6), "the peek did not come to rest")
                         self.inside(window, self.rect(peek), "peek in the window")
                         self.apart(self.rect(peek), self.box(root, "sidebar"), "peek over the sidebar")
                         self.no_clipped_text(root, peek, what + " peek " + key)
