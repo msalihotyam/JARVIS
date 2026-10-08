@@ -371,6 +371,82 @@ Salih decision (2026-10-06):
 - After each slice the worker writes `NN-<slug>.report.md`. On BLOCKED or a
   red result it writes the report and stops the whole queue.
 
+## Mods (jarvis-guard)
+
+Claude Code mod (function-hook plugin, Claude Code >= 2.1.287), Salih M1
+2026-10-08: the hard rules of this runbook as deterministic tool-call
+refusals. Defense in depth beside Claude Code's own permissions, **not a
+sandbox**. It lives at `.claude/skills/jarvis-guard/` (the same project
+skills-dir mechanism as jarvis-flow) and is active only when
+`JARVIS_RUNBOOK.md` exists at the canonical root. It fails CLOSED: a guarded
+call it cannot judge (an error, a re-entry, a command line it cannot read) is
+refused. A refusal is Turkish and names its rule: `jarvis-guard reddetti
+[R1 ...]: ...`. It makes no network calls.
+
+- **Shell (Bash and PowerShell).** Chained commands (`;` `&&` `||` `|` `&`,
+  newlines), substitutions (`$(...)`, backticks, `<(...)`), here-documents an
+  interpreter reads, `bash -c` / `powershell -Command` / `cmd /c` /
+  `Invoke-Expression` / `Start-Process`, `git -C`, env prefixes, `sudo` /
+  `xargs` / `uv run` / `npx`, the `&` call operator, shell keywords, brace
+  expansion, `..`, case, both separators, links and junctions are read.
+  `-EncodedCommand` and a variable program name or `iex $x` are refused.
+  - R1 `git push`: only when every refspec targets `refs/heads/ci/*` (no
+    `--all/--mirror/--tags/--follow-tags/--prune/--delete`, no
+    `-c push.*`); `scripts\ci.ps1` itself is allowed.
+  - R2 `git add`: explicit file paths only (no `-A`, `--all`, `.`, `:/`,
+    magic pathspecs, globs, folders, `-u` without paths); never `uv.lock`.
+  - R3 `git commit -a/-am/--all`, `-i/-o` and path commits: refused.
+  - R4 `git reset` (any form), `restore`, `stash` (any form), `clean`,
+    `checkout -- <paths>`, `checkout .`, `checkout <file>`: refused.
+  - R5 `git switch --discard-changes` / `-f`: refused.
+  - R6 `git rebase` (and any `git pull` without `--ff-only` / `--no-rebase`,
+    which may rebase): only inside
+    `.claude/worktrees/<name>`, never with `GIT_DIR` / `--git-dir`.
+  - R7 `git worktree prune`, `git worktree remove --force`: refused.
+  - R8 `git branch -D`: only `worktree-*` names; `-d` is free.
+  - R9 recursive deletes (`rm -r`, `rmdir /s`, `del /s`,
+    `Remove-Item -Recurse`, `find -delete`, `find -exec rm`, `rsync --delete`,
+    `robocopy /mir`): only when every target is inside `build/` or a
+    `.claude/worktrees/<name>/`.
+  - R10 a protected path (or a folder holding one, or a glob that may match
+    one) in a write, move or delete position: `uv.lock`, `data\jarvis.db*`,
+    `data\jarvis.pre-v2.db`, `data\browser-profile\`, `data\chrome-profile\`,
+    `%USERPROFILE%\JARVIS-backups\`, `%USERPROFILE%\.jarvis\conversation.json`,
+    `.git\`; 8.3 short names are refused there too.
+  - Extra, same spirit: unknown git subcommands (possible aliases) and
+    `-c alias.*` (X1); `update-ref`, `filter-branch`, `reflog expire`,
+    `prune`, `branch -f/-M`, `checkout -B`, `switch -C` (X4); a forbidden
+    git call or a protected path inside `python -c`, `node -e`, a piped or
+    here-document script (X3).
+- **File tools** (Edit, Write, MultiEdit, NotebookEdit): R10 on the path
+  and on its resolved real path.
+- **Assert guard (R12)**, on `git commit` before it runs: the assertion calls
+  (`self.assert*`, `self.fail`, `assert`) of the staged `tests/**/*.py` may
+  not total lower than HEAD's (`--amend`: HEAD's parent). The only override:
+  `build/approvals/assert-drop-<lane>.txt` in the canonical folder, written by
+  the orchestrator after Salih approves, naming the lane and every file that
+  drops. The lane is the last `@jarvis` header's.
+- **Base guard (R13):** when the session's last `@jarvis` header names
+  `base=<sha>`, Edit/Write inside `.claude/worktrees/<name>` is refused unless
+  that worktree's start HEAD (recorded at EnterWorktree, or at the first edit)
+  is that commit; `base=main` means canonical main's HEAD at entry. Re-entering
+  a lane worktree whose HEAD moved needs a header with its current HEAD.
+- `ExitWorktree` with `discard_changes` is refused (X5).
+- **Known limits.** A script file (`.ps1`, `.sh`, `.py`) is not read: running
+  `scripts\ci.ps1`, `scripts\quality.ps1` or `python scripts\...` works for
+  this reason, and so would a script someone wrote to break a rule. Inline
+  interpreter code is only scanned for keywords (it can over- and
+  under-refuse). Variables are not evaluated: a delete, move or rebase whose target
+  is a variable is refused; a protected name hidden in a variable for a
+  non-recursive write may pass. Hard links and network paths are not
+  resolved. Read-only access to protected paths is not guarded.
+- **Cloud sessions:** the folder is in the repo, so a cloud session of this
+  repo loads it when its Claude Code version loads project skills-dir
+  plugins (>= 2.1.287); no hook needs a UI. Not yet observed there.
+- **Checks:** `claude plugin test .claude/skills/jarvis-guard` (the command
+  table holds every rule, the bypasses tried and the must-still-work list)
+  and `claude plugin validate .claude/skills/jarvis-guard`.
+
 ## Cloud sessions
 
 Salih decision (2026-10-06): docs slices, and core/logic slices whose required

@@ -1,0 +1,7 @@
+{
+  "name": "jarvis-guard",
+  "version": "0.1.0",
+  "description": "JARVIS hard rules as deterministic tool-call refusals: push, staging, reset/stash, rebase, branch, recursive deletes, protected paths, assert and base guards",
+  "author": { "name": "JARVIS" },
+  "types": "./types/index.d.ts"
+}
