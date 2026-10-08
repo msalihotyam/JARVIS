@@ -203,7 +203,7 @@ Item {
         Keys.onSpacePressed: bar.openSettings()
         Rectangle { anchors.fill: parent; anchors.margins: -5; radius: width / 2; color: "transparent"; border.color: Theme.accent; visible: orb.activeFocus }
         scale: orbArea.pressed ? 0.95 : 1
-        Behavior on scale { NumberAnimation { duration: 90 } }
+        Behavior on scale { NumberAnimation { duration: Theme.pressMs; easing.type: Theme.ease } }
         // Soft bloom, as in the reference mark: a gradient, so it has no edge.
         Shape {
             anchors.centerIn: parent; width: 106; height: 106
@@ -222,10 +222,9 @@ Item {
                 PathAngleArc { centerX: 53; centerY: 53; radiusX: 53; radiusY: 53; startAngle: 0; sweepAngle: 360 }
             }
         }
-        // Outer calibrated ring with nodes.
+        // Outer calibrated ring with nodes: static (K2, it never spins).
         Item {
             anchors.fill: parent
-            RotationAnimator on rotation { running: Theme.ambient && bar.settingsOpen; loops: Animation.Infinite; from: 0; to: 360; duration: 12000 }
             Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 1; border.color: Theme.accent; opacity: orb.lit ? 0.9 : 0.45; Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
             Repeater { model: 12
                 Rectangle { width: index % 3 === 0 ? 3 : 1; height: 3; radius: index % 3 === 0 ? 1.5 : 0; color: Theme.accent; opacity: orb.lit ? 0.95 : 0.6; x: orb.width / 2 - width / 2; y: index % 3 === 0 ? -1 : 2
@@ -249,12 +248,7 @@ Item {
         Rectangle { anchors.centerIn: parent; width: 24; height: 24; radius: 12; color: Theme.bg0; opacity: 0.92 }
         Rectangle { anchors.centerIn: parent; width: 34; height: 34; radius: 17; color: "transparent"; border.width: 1; border.color: Theme.alpha(Theme.accent, 0.3) }
         MouseArea { id: orbArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.openSettings() }
-        Rectangle {
-            visible: orb.hovered && !bar.settingsOpen
-            anchors.top: parent.bottom; anchors.topMargin: 10; anchors.horizontalCenter: parent.horizontalCenter
-            width: tipText.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
-            Text { id: tipText; anchors.centerIn: parent; text: qsTr("Settings"); color: Theme.text; font: Theme.caption }
-        }
+        HoverTip { text: qsTr("Settings"); active: !bar.settingsOpen; offsetX: (width - tipWidth) / 2; offsetY: height + 10 }
     }
     Text { id: wordmark; objectName: "brandWordmark"; x: 120; y: 21; text: "JARVIS"; color: Theme.text; font: Theme.brand
            lineHeightMode: Text.FixedHeight; lineHeight: 34 }
@@ -302,7 +296,7 @@ Item {
             color: bridge.coreState === "running" ? Theme.materialGlint : Theme.stateColor(bridge.coreState)
             font: Theme.caption
             lineHeightMode: Text.FixedHeight; lineHeight: 18
-            Behavior on color { ColorAnimation { duration: 200 } }
+            Behavior on color { ColorAnimation { duration: Theme.dur(200) } }
         }
     }
 

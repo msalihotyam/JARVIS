@@ -65,12 +65,12 @@ Item {
     property real sweepGain: 1                  // 0 while waiting: no scan
     property real markerGain: 1                 // 0 while waiting: no outward circulation
     property int rampMs: 550
-    Behavior on level { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
-    Behavior on mainSpeed { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
-    Behavior on secondSpeed { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
-    Behavior on sweepSpeed { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
-    Behavior on sweepGain { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
-    Behavior on markerGain { NumberAnimation { duration: core.rampMs; easing.type: Easing.InOutCubic } }
+    Behavior on level { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
+    Behavior on mainSpeed { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
+    Behavior on secondSpeed { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
+    Behavior on sweepSpeed { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
+    Behavior on sweepGain { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
+    Behavior on markerGain { NumberAnimation { duration: Theme.dur(core.rampMs); easing.type: Easing.InOutCubic } }
 
     property string previous: "idle"
     function applyState() {
@@ -130,16 +130,16 @@ Item {
         id: shutdown
         // 0-180 ms: circulation decelerates and stops; the sweep and the moving points go out.
         ParallelAnimation {
-            NumberAnimation { target: core; property: "spin"; to: 0; duration: 180; easing.type: Easing.OutCubic }
-            NumberAnimation { target: core; property: "spin2"; to: 0; duration: 180; easing.type: Easing.OutCubic }
-            NumberAnimation { target: core; property: "circulation"; to: 0; duration: 180; easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "spin"; to: 0; duration: Theme.dur(180); easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "spin2"; to: 0; duration: Theme.dur(180); easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "circulation"; to: 0; duration: Theme.dur(180); easing.type: Easing.OutCubic }
         }
         // 180-360: the segmented ring illumination drains.
-        NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
         // 360-540: the nucleus fades.
-        NumberAnimation { target: core; property: "nucleus"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        NumberAnimation { target: core; property: "nucleus"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
         // 540-720: the remaining emission disappears; the dark hardware stays.
-        NumberAnimation { target: core; property: "residual"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+        NumberAnimation { target: core; property: "residual"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
         ScriptAction { script: core.booted = true }
     }
     // Reduced motion (ambient effects off): a brief energy fade, no choreography.
@@ -148,10 +148,10 @@ Item {
         PropertyAction { target: core; property: "spin"; value: 0 }
         PropertyAction { target: core; property: "spin2"; value: 0 }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "circulation"; to: 0; duration: 250 }
-            NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: 250 }
-            NumberAnimation { target: core; property: "nucleus"; to: 0; duration: 250 }
-            NumberAnimation { target: core; property: "residual"; to: 0; duration: 250 }
+            NumberAnimation { target: core; property: "circulation"; to: 0; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "nucleus"; to: 0; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "residual"; to: 0; duration: Theme.dur(250) }
         }
         ScriptAction { script: core.booted = true }
     }
@@ -159,17 +159,17 @@ Item {
         id: wakeQuick
         ScriptAction { script: { core.bootFocus = 1; core.bootRim = 1; core.bootGlow = 0; core.spin = 1; core.spin2 = 1; core.booted = true } }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "circulation"; to: 1; duration: 250 }
-            NumberAnimation { target: core; property: "ringEnergy"; to: 1; duration: 250 }
-            NumberAnimation { target: core; property: "nucleus"; to: 1; duration: 250 }
-            NumberAnimation { target: core; property: "residual"; to: 1; duration: 250 }
+            NumberAnimation { target: core; property: "circulation"; to: 1; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "ringEnergy"; to: 1; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "nucleus"; to: 1; duration: Theme.dur(250) }
+            NumberAnimation { target: core; property: "residual"; to: 1; duration: Theme.dur(250) }
         }
     }
 
     // Typing: +3 % at the centre, +10 % on the micro highlight, 180 ms in,
     // 450 ms back after the composer's own 900 ms quiet time.
     property real typeBoost: typing ? 1 : 0
-    Behavior on typeBoost { NumberAnimation { duration: core.typing ? 180 : 450; easing.type: Easing.InOutCubic } }
+    Behavior on typeBoost { NumberAnimation { duration: Theme.dur(core.typing ? 180 : 450); easing.type: Easing.InOutCubic } }
     // Event-only light: added to the level (success peaks) and to the focus.
     property real eventLevel: 0
     property real focusBoost: 0
@@ -204,13 +204,21 @@ Item {
             chamberLight.rotation = (chamberLight.rotation + 360 / 53 * core.circulation * dt) % 360
             markerA.rotation = (markerA.rotation + 360 / 29 * core.markerGain * core.circulation * dt) % 360
             markerB.rotation = (markerB.rotation - 360 / 47 * core.markerGain * core.circulation * dt + 360) % 360
-            core.orbitPhase = (core.orbitPhase + 360 / 61 * core.markerGain * core.circulation * dt) % 360
+            core.orbitPhase = (core.orbitPhase + core.idleOrbitSpeed * core.markerGain * core.circulation * dt) % 360
             core.breath = 1 + 0.05 * core.nucleus * Math.sin(core.clockT * 2 * Math.PI / 6.7)
             core.rimPulse = 0.7 + 0.3 * core.nucleus * Math.sin(core.clockT * 2 * Math.PI / 11.3 + 2.1)
             core.pointA = 0.675 + 0.225 * Math.sin(core.clockT * 2 * Math.PI / 13 + 0.8)
         }
     }
-    // A low-energy radial wave now and then, gone within 900 ms.
+    // Idle life (Gate 6G K2): the wave every 23 s and the orbit packet stay,
+    // but in their OWN calmer look - fainter and slower than any real event -
+    // so idle life never reads as "sent" or "success". The event waves start
+    // at 0.7-1.0 and run 360-1100 ms; event packets start at 0.35-0.9.
+    readonly property real idleWavePeak: 0.16
+    readonly property int idleWaveMs: 1400
+    readonly property real idleOrbitPeak: 0.3
+    readonly property real idleOrbitSpeed: 360 / 90     // degrees per second
+    // A low-energy radial wave now and then.
     Timer { interval: 23000; repeat: true; running: core.alive && !core.calm && core.booted && !core.dormant; onTriggered: core.fire("ambient") }
 
     // -- startup: 2.2 s from dormant structure to stable life -------------------
@@ -224,53 +232,53 @@ Item {
     SequentialAnimation {
         id: awaken
         // 0-180 ms: the bed and a dim mechanical silhouette are simply there.
-        PauseAnimation { duration: 180 }
+        PauseAnimation { duration: Theme.dur(180) }
         ParallelAnimation {
             // 180-480: the small focus appears, light spreads into the chamber.
-            NumberAnimation { target: core; property: "bootFocus"; to: 1; duration: 300; easing.type: Easing.OutCubic }
-            NumberAnimation { target: core; property: "bootGlow"; to: 1; duration: 300; easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "bootFocus"; to: 1; duration: Theme.dur(300); easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "bootGlow"; to: 1; duration: Theme.dur(300); easing.type: Easing.OutCubic }
             SequentialAnimation {
                 // 480-900: the rim appears layer by layer; sectors energise in turn.
-                PauseAnimation { duration: 300 }
+                PauseAnimation { duration: Theme.dur(300) }
                 ParallelAnimation {
-                    NumberAnimation { target: core; property: "bootRim"; to: 1; duration: 420; easing.type: Easing.InOutCubic }
+                    NumberAnimation { target: core; property: "bootRim"; to: 1; duration: Theme.dur(420); easing.type: Easing.InOutCubic }
                     SequentialAnimation {
-                        PauseAnimation { duration: 40 }
-                        NumberAnimation { target: core; property: "litA"; to: 0.7; duration: 140 }
-                        NumberAnimation { target: core; property: "litA"; to: 0; duration: 220 }
+                        PauseAnimation { duration: Theme.dur(40) }
+                        NumberAnimation { target: core; property: "litA"; to: 0.7; duration: Theme.dur(140) }
+                        NumberAnimation { target: core; property: "litA"; to: 0; duration: Theme.dur(220) }
                     }
                     SequentialAnimation {
-                        PauseAnimation { duration: 220 }
-                        NumberAnimation { target: core; property: "litB"; to: 0.7; duration: 140 }
-                        NumberAnimation { target: core; property: "litB"; to: 0; duration: 220 }
+                        PauseAnimation { duration: Theme.dur(220) }
+                        NumberAnimation { target: core; property: "litB"; to: 0.7; duration: Theme.dur(140) }
+                        NumberAnimation { target: core; property: "litB"; to: 0; duration: Theme.dur(220) }
                     }
                     // 700-1300: the two rings acquire motion at different moments.
                     SequentialAnimation {
-                        PauseAnimation { duration: 220 }
-                        NumberAnimation { target: core; property: "spin"; to: 1; duration: 400; easing.type: Easing.InOutCubic }
+                        PauseAnimation { duration: Theme.dur(220) }
+                        NumberAnimation { target: core; property: "spin"; to: 1; duration: Theme.dur(400); easing.type: Easing.InOutCubic }
                     }
                     SequentialAnimation {
-                        PauseAnimation { duration: 420 }
-                        NumberAnimation { target: core; property: "spin2"; to: 1; duration: 400; easing.type: Easing.InOutCubic }
+                        PauseAnimation { duration: Theme.dur(420) }
+                        NumberAnimation { target: core; property: "spin2"; to: 1; duration: Theme.dur(400); easing.type: Easing.InOutCubic }
                     }
                     // 1200-1650: one brief alignment of the inner highlights.
                     SequentialAnimation {
-                        PauseAnimation { duration: 720 }
-                        NumberAnimation { target: core; property: "litA"; to: 0.5; duration: 150 }
-                        NumberAnimation { target: core; property: "litA"; to: 0; duration: 300 }
+                        PauseAnimation { duration: Theme.dur(720) }
+                        NumberAnimation { target: core; property: "litA"; to: 0.5; duration: Theme.dur(150) }
+                        NumberAnimation { target: core; property: "litA"; to: 0; duration: Theme.dur(300) }
                     }
                     SequentialAnimation {
-                        PauseAnimation { duration: 720 }
-                        NumberAnimation { target: core; property: "litB"; to: 0.5; duration: 150 }
-                        NumberAnimation { target: core; property: "litB"; to: 0; duration: 300 }
+                        PauseAnimation { duration: Theme.dur(720) }
+                        NumberAnimation { target: core; property: "litB"; to: 0.5; duration: Theme.dur(150) }
+                        NumberAnimation { target: core; property: "litB"; to: 0; duration: Theme.dur(300) }
                     }
                     // 1500-1950: a single light packet out to the near orbit.
                     SequentialAnimation {
-                        PauseAnimation { duration: 1020 }
+                        PauseAnimation { duration: Theme.dur(1020) }
                         ScriptAction { script: if (core.environment) core.packetOut(0.45, 450) }
-                        PauseAnimation { duration: 350 }
+                        PauseAnimation { duration: Theme.dur(350) }
                         // 1850-2200: the transient light fades; ambient motion stays.
-                        NumberAnimation { target: core; property: "bootGlow"; to: 0; duration: 350; easing.type: Easing.InOutCubic }
+                        NumberAnimation { target: core; property: "bootGlow"; to: 0; duration: Theme.dur(350); easing.type: Easing.InOutCubic }
                     }
                 }
             }
@@ -285,33 +293,33 @@ Item {
     SequentialAnimation {
         running: core.alive && core.listening && core.booted; loops: Animation.Infinite
         onRunningChanged: if (!running) { core.litA = 0; core.litB = 0 }
-        NumberAnimation { target: core; property: "litA"; to: 0.75; duration: 700; easing.type: Easing.InOutSine }
-        NumberAnimation { target: core; property: "litA"; to: 0; duration: 1200; easing.type: Easing.InOutSine }
-        NumberAnimation { target: core; property: "litB"; to: 0.75; duration: 700; easing.type: Easing.InOutSine }
-        NumberAnimation { target: core; property: "litB"; to: 0; duration: 1200; easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litA"; to: 0.75; duration: Theme.dur(700); easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litA"; to: 0; duration: Theme.dur(1200); easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litB"; to: 0.75; duration: Theme.dur(700); easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litB"; to: 0; duration: Theme.dur(1200); easing.type: Easing.InOutSine }
     }
     // Reasoning: the six sectors in two groups, one after the other.
     SequentialAnimation {
         running: core.alive && core.reasoning && core.booted; loops: Animation.Infinite
         onRunningChanged: if (!running) { core.litA = 0; core.litB = 0 }
-        NumberAnimation { target: core; property: "litA"; to: 0.85; duration: 420; easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litA"; to: 0.85; duration: Theme.dur(420); easing.type: Easing.InOutSine }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "litA"; to: 0.15; duration: 780; easing.type: Easing.InOutSine }
-            SequentialAnimation { PauseAnimation { duration: 260 } NumberAnimation { target: core; property: "litB"; to: 0.85; duration: 420; easing.type: Easing.InOutSine } }
+            NumberAnimation { target: core; property: "litA"; to: 0.15; duration: Theme.dur(780); easing.type: Easing.InOutSine }
+            SequentialAnimation { PauseAnimation { duration: Theme.dur(260) } NumberAnimation { target: core; property: "litB"; to: 0.85; duration: Theme.dur(420); easing.type: Easing.InOutSine } }
         }
-        NumberAnimation { target: core; property: "litB"; to: 0.15; duration: 780; easing.type: Easing.InOutSine }
+        NumberAnimation { target: core; property: "litB"; to: 0.15; duration: Theme.dur(780); easing.type: Easing.InOutSine }
     }
     // Executing: the sector light shares one rhythm (the rings keep their own speeds).
     SequentialAnimation {
         running: core.alive && core.executing && core.booted; loops: Animation.Infinite
         onRunningChanged: if (!running) { core.litA = 0; core.litB = 0 }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "litA"; to: 0.8; duration: 520; easing.type: Easing.InOutSine }
-            NumberAnimation { target: core; property: "litB"; to: 0.8; duration: 520; easing.type: Easing.InOutSine }
+            NumberAnimation { target: core; property: "litA"; to: 0.8; duration: Theme.dur(520); easing.type: Easing.InOutSine }
+            NumberAnimation { target: core; property: "litB"; to: 0.8; duration: Theme.dur(520); easing.type: Easing.InOutSine }
         }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "litA"; to: 0.3; duration: 900; easing.type: Easing.InOutSine }
-            NumberAnimation { target: core; property: "litB"; to: 0.3; duration: 900; easing.type: Easing.InOutSine }
+            NumberAnimation { target: core; property: "litA"; to: 0.3; duration: Theme.dur(900); easing.type: Easing.InOutSine }
+            NumberAnimation { target: core; property: "litB"; to: 0.3; duration: Theme.dur(900); easing.type: Easing.InOutSine }
         }
     }
 
@@ -361,8 +369,8 @@ Item {
     onHoldTargetChanged: holdAnim.restart()
     SequentialAnimation {
         id: holdAnim
-        PauseAnimation { duration: core.holdTarget > 0 ? 520 : 0 }
-        NumberAnimation { target: core; property: "hold"; to: core.holdTarget; duration: 350; easing.type: Easing.InOutCubic }
+        PauseAnimation { duration: Theme.dur(core.holdTarget > 0 ? 520 : 0) }
+        NumberAnimation { target: core; property: "hold"; to: core.holdTarget; duration: Theme.dur(350); easing.type: Easing.InOutCubic }
     }
     property real okLevel: 0
     readonly property var eventAnims: [successAnim, majorAnim, errorAnim, blockedAnim, modelAnim, modelLocalAnim, sentAnim, activityAnim, focusAnim, ambientAnim, launchAnim]
@@ -390,30 +398,30 @@ Item {
     function packetOut(to, ms) {   // centre -> the right connector trace
         packetMove.stop()
         packet.x = c - packet.width / 2; packet.y = c - packet.height / 2; packet.opacity = 0.9
-        packetMove.toX = c + s * to - packet.width / 2; packetMove.toY = packet.y; packetMove.duration = ms
+        packetMove.toX = c + s * to - packet.width / 2; packetMove.toY = packet.y; packetMove.ms = ms
         packetMove.start()
     }
     function packetDown(ms) {      // centre -> towards the lower connection, short
         packetMove.stop()
         packet.x = c - packet.width / 2; packet.y = c + s * 0.17 - packet.height / 2; packet.opacity = 0.75
-        packetMove.toX = packet.x; packetMove.toY = c + s * 0.44 - packet.height / 2; packetMove.duration = ms
+        packetMove.toX = packet.x; packetMove.toY = c + s * 0.44 - packet.height / 2; packetMove.ms = ms
         packetMove.start()
     }
     function packetIn(fromX, fromY, ms) {   // from the environment into the centre
         packetMove.stop()
         packet.x = c + s * fromX - packet.width / 2; packet.y = c + s * fromY - packet.height / 2; packet.opacity = 0.8
-        packetMove.toX = c - packet.width / 2; packetMove.toY = c - packet.height / 2; packetMove.duration = ms
+        packetMove.toX = c - packet.width / 2; packetMove.toY = c - packet.height / 2; packetMove.ms = ms
         packetMove.start()
     }
     SequentialAnimation {
         id: packetMove
-        property real toX: 0; property real toY: 0; property int duration: 400
+        property real toX: 0; property real toY: 0; property int ms: 400
         ParallelAnimation {
-            NumberAnimation { target: packet; property: "x"; to: packetMove.toX; duration: packetMove.duration; easing.type: Easing.InOutSine }
-            NumberAnimation { target: packet; property: "y"; to: packetMove.toY; duration: packetMove.duration; easing.type: Easing.InOutSine }
+            NumberAnimation { target: packet; property: "x"; to: packetMove.toX; duration: Theme.dur(packetMove.ms); easing.type: Easing.InOutSine }
+            NumberAnimation { target: packet; property: "y"; to: packetMove.toY; duration: Theme.dur(packetMove.ms); easing.type: Easing.InOutSine }
             SequentialAnimation {
-                PauseAnimation { duration: packetMove.duration * 0.55 }
-                NumberAnimation { target: packet; property: "opacity"; to: 0; duration: packetMove.duration * 0.45 }
+                PauseAnimation { duration: Theme.dur(packetMove.ms * 0.55) }
+                NumberAnimation { target: packet; property: "opacity"; to: 0; duration: Theme.dur(packetMove.ms * 0.45) }
             }
         }
     }
@@ -426,35 +434,35 @@ Item {
         ParallelAnimation {
             SequentialAnimation {
                 ParallelAnimation {
-                    NumberAnimation { target: core; property: "litA"; to: 0.6; duration: 150 }
-                    NumberAnimation { target: core; property: "litB"; to: 0.6; duration: 150 }
+                    NumberAnimation { target: core; property: "litA"; to: 0.6; duration: Theme.dur(150) }
+                    NumberAnimation { target: core; property: "litB"; to: 0.6; duration: Theme.dur(150) }
                 }
                 ParallelAnimation {
-                    NumberAnimation { target: core; property: "litA"; to: 0; duration: 400 }
-                    NumberAnimation { target: core; property: "litB"; to: 0; duration: 400 }
+                    NumberAnimation { target: core; property: "litA"; to: 0; duration: Theme.dur(400) }
+                    NumberAnimation { target: core; property: "litB"; to: 0; duration: Theme.dur(400) }
                 }
             }
             SequentialAnimation {
-                NumberAnimation { target: core; property: "eventLevel"; to: 0.65 - core.level; duration: 200; easing.type: Easing.OutCubic }
-                NumberAnimation { target: core; property: "focusBoost"; to: 0.3; duration: 120; easing.type: Easing.OutCubic }
+                NumberAnimation { target: core; property: "eventLevel"; to: 0.65 - core.level; duration: Theme.dur(200); easing.type: Easing.OutCubic }
+                NumberAnimation { target: core; property: "focusBoost"; to: 0.3; duration: Theme.dur(120); easing.type: Easing.OutCubic }
                 ParallelAnimation {
-                    NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 450; easing.type: Easing.InOutCubic }
-                    NumberAnimation { target: core; property: "eventLevel"; to: 0; duration: 450; easing.type: Easing.InOutCubic }
+                    NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(450); easing.type: Easing.InOutCubic }
+                    NumberAnimation { target: core; property: "eventLevel"; to: 0; duration: Theme.dur(450); easing.type: Easing.InOutCubic }
                 }
             }
             SequentialAnimation {
-                PauseAnimation { duration: 120 }
+                PauseAnimation { duration: Theme.dur(120) }
                 PropertyAction { target: wave; property: "scale"; value: 0.22 }
                 PropertyAction { target: wave; property: "opacity"; value: 0.85 }
                 ParallelAnimation {
-                    NumberAnimation { target: wave; property: "scale"; to: 0.82; duration: 520; easing.type: Easing.OutCubic }
-                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: 520; easing.type: Easing.InCubic }
+                    NumberAnimation { target: wave; property: "scale"; to: 0.82; duration: Theme.dur(520); easing.type: Easing.OutCubic }
+                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: Theme.dur(520); easing.type: Easing.InCubic }
                 }
             }
             SequentialAnimation {
-                PauseAnimation { duration: 380 }
-                NumberAnimation { target: core; property: "okLevel"; to: 0.9; duration: 80 }
-                NumberAnimation { target: core; property: "okLevel"; to: 0; duration: 220; easing.type: Easing.InCubic }
+                PauseAnimation { duration: Theme.dur(380) }
+                NumberAnimation { target: core; property: "okLevel"; to: 0.9; duration: Theme.dur(80) }
+                NumberAnimation { target: core; property: "okLevel"; to: 0; duration: Theme.dur(220); easing.type: Easing.InCubic }
             }
         }
         ScriptAction { script: core.strong = "" }
@@ -464,27 +472,27 @@ Item {
     SequentialAnimation {
         id: majorAnim
         ParallelAnimation {
-            NumberAnimation { target: core; property: "eventLevel"; to: 0.78 - core.level; duration: 200; easing.type: Easing.InCubic }
-            NumberAnimation { target: core; property: "focusBoost"; to: 0.4; duration: 200; easing.type: Easing.InCubic }
+            NumberAnimation { target: core; property: "eventLevel"; to: 0.78 - core.level; duration: Theme.dur(200); easing.type: Easing.InCubic }
+            NumberAnimation { target: core; property: "focusBoost"; to: 0.4; duration: Theme.dur(200); easing.type: Easing.InCubic }
         }
         ParallelAnimation {
             SequentialAnimation {
                 PropertyAction { target: wave; property: "scale"; value: 0.2 }
                 PropertyAction { target: wave; property: "opacity"; value: 1 }
                 ParallelAnimation {
-                    NumberAnimation { target: wave; property: "scale"; to: 1.18; duration: 550; easing.type: Easing.OutCubic }
-                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: 550; easing.type: Easing.InCubic }
+                    NumberAnimation { target: wave; property: "scale"; to: 1.18; duration: Theme.dur(550); easing.type: Easing.OutCubic }
+                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: Theme.dur(550); easing.type: Easing.InCubic }
                 }
             }
             SequentialAnimation {
-                PauseAnimation { duration: 120 }
+                PauseAnimation { duration: Theme.dur(120) }
                 ScriptAction { script: if (core.environment) { core.packetOut(0.56, 600); packet.opacity = 0.35 } }
             }
             SequentialAnimation {
-                PauseAnimation { duration: 200 }
+                PauseAnimation { duration: Theme.dur(200) }
                 ParallelAnimation {
-                    NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 650; easing.type: Easing.InOutCubic }
-                    NumberAnimation { target: core; property: "eventLevel"; to: 0; duration: 650; easing.type: Easing.InOutCubic }
+                    NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(650); easing.type: Easing.InOutCubic }
+                    NumberAnimation { target: core; property: "eventLevel"; to: 0; duration: Theme.dur(650); easing.type: Easing.InOutCubic }
                 }
             }
         }
@@ -501,12 +509,12 @@ Item {
         property int step: 70
         property int rise: 110
         property int fall: 260
-        SequentialAnimation { NumberAnimation { target: core; property: prefix + "0"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "0"; to: 0; duration: fall; easing.type: Easing.InCubic } }
-        SequentialAnimation { PauseAnimation { duration: step } NumberAnimation { target: core; property: prefix + "1"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "1"; to: 0; duration: fall; easing.type: Easing.InCubic } }
-        SequentialAnimation { PauseAnimation { duration: 2 * step } NumberAnimation { target: core; property: prefix + "2"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "2"; to: 0; duration: fall; easing.type: Easing.InCubic } }
-        SequentialAnimation { PauseAnimation { duration: 3 * step } NumberAnimation { target: core; property: prefix + "3"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "3"; to: 0; duration: fall; easing.type: Easing.InCubic } }
-        SequentialAnimation { PauseAnimation { duration: 4 * step } NumberAnimation { target: core; property: prefix + "4"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "4"; to: 0; duration: fall; easing.type: Easing.InCubic } }
-        SequentialAnimation { PauseAnimation { duration: 5 * step } NumberAnimation { target: core; property: prefix + "5"; to: peak; duration: rise } NumberAnimation { target: core; property: prefix + "5"; to: 0; duration: fall; easing.type: Easing.InCubic } }
+        SequentialAnimation { NumberAnimation { target: core; property: prefix + "0"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "0"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: Theme.dur(step) } NumberAnimation { target: core; property: prefix + "1"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "1"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: Theme.dur(2 * step) } NumberAnimation { target: core; property: prefix + "2"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "2"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: Theme.dur(3 * step) } NumberAnimation { target: core; property: prefix + "3"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "3"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: Theme.dur(4 * step) } NumberAnimation { target: core; property: prefix + "4"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "4"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
+        SequentialAnimation { PauseAnimation { duration: Theme.dur(5 * step) } NumberAnimation { target: core; property: prefix + "5"; to: peak; duration: Theme.dur(rise) } NumberAnimation { target: core; property: prefix + "5"; to: 0; duration: Theme.dur(fall); easing.type: Easing.InCubic } }
     }
     // ERROR: the strongest response - red travels the full circumference,
     // then the six faces hold a controlled red while the failure is current;
@@ -517,12 +525,12 @@ Item {
         ParallelAnimation {
             Travel { prefix: "sig"; peak: 1; step: 70; rise: 110; fall: 300 }
             SequentialAnimation {
-                NumberAnimation { target: core; property: "jolt"; to: 2.6; duration: 110; easing.type: Easing.OutCubic }
-                NumberAnimation { target: core; property: "jolt"; to: 0; duration: 560; easing.type: Easing.InOutCubic }
+                NumberAnimation { target: core; property: "jolt"; to: 2.6; duration: Theme.dur(110); easing.type: Easing.OutCubic }
+                NumberAnimation { target: core; property: "jolt"; to: 0; duration: Theme.dur(560); easing.type: Easing.InOutCubic }
             }
             SequentialAnimation {
-                NumberAnimation { target: core; property: "focusBoost"; to: -0.18; duration: 100 }
-                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 420; easing.type: Easing.InOutCubic }
+                NumberAnimation { target: core; property: "focusBoost"; to: -0.18; duration: Theme.dur(100) }
+                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(420); easing.type: Easing.InOutCubic }
             }
         }
         ScriptAction { script: core.strong = "" }
@@ -543,20 +551,20 @@ Item {
         id: modelAnim
         ParallelAnimation {
             SequentialAnimation {
-                NumberAnimation { target: core; property: "jolt"; to: -3.2; duration: 180; easing.type: Easing.OutCubic }
-                NumberAnimation { target: core; property: "jolt"; to: 0; duration: 620; easing.type: Easing.InOutCubic }
+                NumberAnimation { target: core; property: "jolt"; to: -3.2; duration: Theme.dur(180); easing.type: Easing.OutCubic }
+                NumberAnimation { target: core; property: "jolt"; to: 0; duration: Theme.dur(620); easing.type: Easing.InOutCubic }
             }
             SequentialAnimation {
-                NumberAnimation { target: core; property: "focusBoost"; to: -0.06; duration: 220; easing.type: Easing.InOutCubic }
-                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 700; easing.type: Easing.InOutCubic }
+                NumberAnimation { target: core; property: "focusBoost"; to: -0.06; duration: Theme.dur(220); easing.type: Easing.InOutCubic }
+                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(700); easing.type: Easing.InOutCubic }
             }
             SequentialAnimation {
                 ScriptAction { script: { core.sweepAngle = (core.sweepAngle + 14) % 360; if (core.environment) core.packetIn(1.05, 0, 520) } }
                 PropertyAction { target: ringWave; property: "scale"; value: 0.3 }
                 PropertyAction { target: ringWave; property: "opacity"; value: 0.7 }
                 ParallelAnimation {
-                    NumberAnimation { target: ringWave; property: "scale"; to: 0.98; duration: 1100; easing.type: Easing.InOutSine }
-                    SequentialAnimation { PauseAnimation { duration: 500 } NumberAnimation { target: ringWave; property: "opacity"; to: 0; duration: 600 } }
+                    NumberAnimation { target: ringWave; property: "scale"; to: 0.98; duration: Theme.dur(1100); easing.type: Easing.InOutSine }
+                    SequentialAnimation { PauseAnimation { duration: Theme.dur(500) } NumberAnimation { target: ringWave; property: "opacity"; to: 0; duration: Theme.dur(600) } }
                 }
             }
         }
@@ -565,28 +573,28 @@ Item {
     // A model applied during execution: a small local acknowledgement only.
     SequentialAnimation {
         id: modelLocalAnim
-        NumberAnimation { target: core; property: "focusBoost"; to: -0.06; duration: 160 }
-        NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 400; easing.type: Easing.InOutCubic }
+        NumberAnimation { target: core; property: "focusBoost"; to: -0.06; duration: Theme.dur(160) }
+        NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(400); easing.type: Easing.InOutCubic }
         ScriptAction { script: core.strong = "" }
     }
     // MESSAGE ACCEPTED: 90 ms of 1 % compression, a 360 ms blue wave, a
     // short transfer of light towards the lower connection. ~600 ms.
     SequentialAnimation {
         id: sentAnim
-        NumberAnimation { target: core; property: "squeeze"; to: 0.99; duration: 90; easing.type: Easing.OutCubic }
+        NumberAnimation { target: core; property: "squeeze"; to: 0.99; duration: Theme.dur(90); easing.type: Easing.OutCubic }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "squeeze"; to: 1; duration: 260; easing.type: Easing.OutCubic }
+            NumberAnimation { target: core; property: "squeeze"; to: 1; duration: Theme.dur(260); easing.type: Easing.OutCubic }
             SequentialAnimation {
                 PropertyAction { target: wave; property: "scale"; value: 0.2 }
                 PropertyAction { target: wave; property: "opacity"; value: 0.7 }
                 ParallelAnimation {
-                    NumberAnimation { target: wave; property: "scale"; to: 0.62; duration: 360; easing.type: Easing.OutCubic }
-                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: 360; easing.type: Easing.InCubic }
+                    NumberAnimation { target: wave; property: "scale"; to: 0.62; duration: Theme.dur(360); easing.type: Easing.OutCubic }
+                    NumberAnimation { target: wave; property: "opacity"; to: 0; duration: Theme.dur(360); easing.type: Easing.InCubic }
                 }
             }
             ScriptAction { script: core.packetDown(320) }
         }
-        PauseAnimation { duration: 150 }
+        PauseAnimation { duration: Theme.dur(150) }
         ScriptAction { script: core.strong = "" }
     }
     // NEW ACTIVITY: a packet on the near orbit comes in from the surroundings,
@@ -599,13 +607,13 @@ Item {
             // sector faces light in turn round the circumference, overlapping
             // briefly, then the accepted living motion continues.
             SequentialAnimation {
-                PauseAnimation { duration: 100 }
+                PauseAnimation { duration: Theme.dur(100) }
                 Travel { prefix: "blue"; peak: 0.8; step: 60; rise: 90; fall: 260 }
             }
             SequentialAnimation {
-                PauseAnimation { duration: 300 }
-                NumberAnimation { target: core; property: "focusBoost"; to: 0.08; duration: 60 }
-                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 180; easing.type: Easing.InOutCubic }
+                PauseAnimation { duration: Theme.dur(300) }
+                NumberAnimation { target: core; property: "focusBoost"; to: 0.08; duration: Theme.dur(60) }
+                NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
             }
         }
     }
@@ -613,23 +621,23 @@ Item {
     SequentialAnimation {
         id: focusAnim
         ParallelAnimation {
-            NumberAnimation { target: core; property: "focusBoost"; to: 0.04; duration: 120; easing.type: Easing.OutCubic }
-            NumberAnimation { target: rimPass; property: "opacity"; to: 0.9; duration: 120 }
+            NumberAnimation { target: core; property: "focusBoost"; to: 0.04; duration: Theme.dur(120); easing.type: Easing.OutCubic }
+            NumberAnimation { target: rimPass; property: "opacity"; to: 0.9; duration: Theme.dur(120) }
         }
         ParallelAnimation {
-            NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: 400; easing.type: Easing.InOutCubic }
-            NumberAnimation { target: rimPass; property: "rotation"; from: 0; to: 150; duration: 400; easing.type: Easing.InOutCubic }
-            NumberAnimation { target: rimPass; property: "opacity"; to: 0; duration: 400; easing.type: Easing.InCubic }
+            NumberAnimation { target: core; property: "focusBoost"; to: 0; duration: Theme.dur(400); easing.type: Easing.InOutCubic }
+            NumberAnimation { target: rimPass; property: "rotation"; from: 0; to: 150; duration: Theme.dur(400); easing.type: Easing.InOutCubic }
+            NumberAnimation { target: rimPass; property: "opacity"; to: 0; duration: Theme.dur(400); easing.type: Easing.InCubic }
         }
     }
-    // The idle radial wave: low energy, gone within 900 ms.
+    // The idle radial wave: low energy, in its own calmer look (K2).
     SequentialAnimation {
         id: ambientAnim
         PropertyAction { target: wave; property: "scale"; value: 0.25 }
-        PropertyAction { target: wave; property: "opacity"; value: 0.28 }
+        PropertyAction { target: wave; property: "opacity"; value: core.idleWavePeak }
         ParallelAnimation {
-            NumberAnimation { target: wave; property: "scale"; to: 0.74; duration: 900; easing.type: Easing.OutCubic }
-            NumberAnimation { target: wave; property: "opacity"; to: 0; duration: 900; easing.type: Easing.InCubic }
+            NumberAnimation { target: wave; property: "scale"; to: 0.74; duration: Theme.dur(core.idleWaveMs); easing.type: Easing.OutCubic }
+            NumberAnimation { target: wave; property: "opacity"; to: 0; duration: Theme.dur(core.idleWaveMs); easing.type: Easing.InCubic }
         }
     }
     // EXECUTION ENTRY: one light packet from the centre to the near header line.
@@ -741,7 +749,7 @@ Item {
         readonly property real rad: core.orbitPhase * Math.PI / 180
         x: core.c - core.s * 0.292 + core.s * 0.699 * Math.cos(rad) - width / 2
         y: core.c + core.s * 0.123 * Math.sin(rad) - height / 2
-        opacity: 0.75 * core.bootRim * core.circulation * Math.max(0, Math.min(1, (core.orbitPhase - 78) / 14, (282 - core.orbitPhase) / 14))
+        opacity: core.idleOrbitPeak * core.bootRim * core.circulation * Math.max(0, Math.min(1, (core.orbitPhase - 78) / 14, (282 - core.orbitPhase) / 14))
     }
     // Attention / failure: one emitting face inset into each of the six
     // sector housings (the same band, centres and span the housings were

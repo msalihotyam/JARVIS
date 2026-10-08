@@ -12,7 +12,7 @@ Item {
     z: 450
     Rectangle {
         id: dim; anchors.fill: parent; color: "#000000"; opacity: overlay.pending ? 0.56 : 0
-        Behavior on opacity { NumberAnimation { duration: Theme.approvalIn } }
+        Behavior on opacity { NumberAnimation { duration: Theme.approvalIn; easing.type: Theme.ease } }
         MouseArea { anchors.fill: parent; enabled: overlay.pending }
     }
     ApprovalCard {
@@ -20,7 +20,7 @@ Item {
         width: Math.min(760, parent.width - 140); height: Math.min(818, parent.height - 154)
         fixture: overlay.fixture && !bridge.approvalPending
         onDismissFixture: overlay.dismissFixture()
-        opacity: overlay.pending ? 1 : 0; scale: overlay.pending ? 1 : 0.975
+        opacity: overlay.pending ? 1 : 0; scale: overlay.pending ? 1 : 1 - 2 * Theme.travel / Math.max(1, width, height)   // the edges travel at most Theme.travel
         Behavior on opacity { NumberAnimation { duration: Theme.approvalIn; easing.type: Easing.OutCubic } }
         Behavior on scale { NumberAnimation { duration: Theme.approvalIn; easing.type: Easing.OutCubic } }
     }

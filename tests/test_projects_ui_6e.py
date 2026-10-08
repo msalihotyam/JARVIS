@@ -465,6 +465,9 @@ class DialogShellTests(SharedPartsCase):
                     button = self.rect(self.obj(name))
                     self.assertTrue(panel.contains(button), (name, button, panel))
                 body = self.obj("jarvisDialogBody")
+                # K2: this destructive dialog opens at once (it waited out pageMs before), so
+                # give its first layout pass the frame the motion used to give it.
+                settle(lambda: body.property("contentHeight") > body.height())
                 self.assertGreater(body.property("contentHeight"), body.height())      # the body scrolls
                 QMetaObject.invokeMethod(dialog, "close")
                 settle(lambda: not dialog.property("visible"))
@@ -521,23 +524,20 @@ class DialogShellTests(SharedPartsCase):
         settle(lambda: not dialog.property("visible"))
         self.assertEqual(2, harness.property("confirmed"))
 
-    def test_p_confirm_waits_for_the_motion_and_the_motion_keeps_its_tokens(self) -> None:
+    def test_p_a_destructive_dialog_has_no_motion_with_ambient_on(self) -> None:
+        # Gate 6G K2 (effect plan, no-effect list): a destructive dialog (danger)
+        # appears and goes at once; was pageMs 220 in / panelOut 150 out. The
+        # motion tokens stay pinned on a non-destructive dialog (test_aj).
         bridge = self.bridge()
         root, _ = self.harness(bridge)
         dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
-        samples = self.motion(root, dialog)
-        mark, called = len(samples), time.monotonic()
-        self.open(dialog)
-        self.assertFalse(confirm.isEnabled())                 # not while it is still opening
-        self.assertLess(dialog.property("opacity"), 1.0)
-        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 220)    # Theme.pageMs
-        settle(lambda: dialog.property("opened"))
-        self.assertTrue(confirm.isEnabled())
+        self.open(dialog)                                     # no pumping between the call and the checks
+        self.assertTrue(dialog.property("opened"))
         self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        mark, called = len(samples), time.monotonic()
+        self.assertTrue(confirm.isEnabled())
+        self.assertEqual([1.0], [s.opacity() for s in self.scrims()])
         QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(confirm.isEnabled())                 # nor while it is closing
-        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
+        self.assertFalse(dialog.property("visible"))
 
     def test_q_ambient_off_means_no_motion_and_end_states_at_once(self) -> None:
         bridge = self.bridge()
@@ -942,24 +942,21 @@ class DialogKeyboardTests(DialogAdoptionCase):
 
 
 class DialogMotionTests(DialogAdoptionCase):
-    def test_ab_confirm_waits_for_the_motion_and_ambient_off_is_instant(self) -> None:
+    def test_ab_the_delete_dialog_has_no_motion_and_ambient_off_is_instant(self) -> None:
         store, bridge, root = self.stage()
         bridge.setPage("history")
         pump(400)
         dialog = root.findChildren(QObject, "conversationDeleteDialog")[0]
         confirm = dialog.findChild(QObject, "deleteConfirm")
-        samples = self.motion(root, dialog)
-        mark, called = len(samples), time.monotonic()
+        # Gate 6G K2 (no-effect list): the destructive delete dialog appears and
+        # goes at once with ambient on too; was pageMs 220 in / panelOut 150 out.
         QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
         self.assertTrue(dialog.property("shown"))
-        self.assertFalse(confirm.isEnabled())                            # not while opening
-        self.assert_motion_within_token_plus_one_frame(samples, called, mark, True, 220)    # Theme.pageMs
-        settle(lambda: dialog.property("opened"))
+        self.assertTrue(dialog.property("opened"))
+        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
         self.assertTrue(confirm.isEnabled())
-        mark, called = len(samples), time.monotonic()
         QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(confirm.isEnabled())                            # nor while closing
-        self.assert_motion_within_token_plus_one_frame(samples, called, mark, False, 150)   # Theme.panelOut
+        self.assertFalse(dialog.property("visible"))
         # Ambient effects off: every dialog at once.
         bridge.setAmbientEffects(False)
         pump(100)

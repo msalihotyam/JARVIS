@@ -48,7 +48,7 @@ Item {
         Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 6; anchors.leftMargin: 2; anchors.rightMargin: -2
                     anchors.bottomMargin: -6; radius: parent.radius + 2; color: "#000000"; opacity: 0.32 }
         opacity: preview.open ? 1 : 0
-        scale: preview.open ? 1 : 0.98
+        scale: preview.open ? 1 : 1 - 2 * Theme.travel / Math.max(1, width, height)   // the edges travel at most Theme.travel
         Behavior on opacity { NumberAnimation { duration: Theme.panelIn } }
         Behavior on scale { NumberAnimation { duration: Theme.panelIn; easing.type: Easing.OutCubic } }
         Keys.onEscapePressed: preview.close()

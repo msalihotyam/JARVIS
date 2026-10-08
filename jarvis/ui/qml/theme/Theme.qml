@@ -13,23 +13,27 @@ QtObject {
     readonly property bool space: name === "space"
     readonly property bool command: name === "command"
 
-    // -- motion contract ------------------------------------------------
-    // Restrained and fast: hover ~110 ms, an overlay 180 ms in / 150 out
-    // with at most 4 px of travel. Reduced motion (ambient effects off)
-    // removes the travel and the decorative interpolation: the same states,
-    // shown at once.
-    readonly property int panelIn: ambient ? 180 : 0
-    readonly property int panelOut: ambient ? 150 : 0
-    readonly property int panelTravel: ambient ? 4 : 0
-    readonly property int reflow: 220
-    readonly property int pageMs: 220
-    readonly property int approvalIn: 260
-    readonly property int approvalOut: 200
-    readonly property int editMs: 200
-    readonly property int focusMs: 280
-    readonly property int themeMs: 400
-    readonly property int hoverMs: ambient ? 110 : 0
-    readonly property int attachMs: ambient ? 150 : 0
+    // -- motion contract (Gate 6G K2) -------------------------------------
+    // Motion only on a real state or transition: 120-220 ms, OutCubic, no
+    // bounce, at most `travel` px. ONE gate: every duration in the QML is
+    // dur(ms) or a token below built from it, so ambient effects off (reduced
+    // motion) is zero motion everywhere - the same states and colours, shown
+    // at once. The documented exceptions (the JarvisCore choreography, state
+    // rhythms, the starfield) still pass through dur(); tests/test_motion_6g.py
+    // holds the list. Known, not ours: the stock Basic ScrollBar's own hold +
+    // fade (Qt style code) is outside this gate.
+    function dur(ms) { return ambient ? ms : 0 }
+    readonly property int travel: ambient ? 4 : 0
+    readonly property int panelIn: dur(180)
+    readonly property int panelOut: dur(150)
+    readonly property int reflow: dur(220)
+    readonly property int pageMs: dur(220)
+    readonly property int approvalIn: dur(220)
+    readonly property int focusMs: dur(220)
+    readonly property int themeMs: dur(220)
+    readonly property int hoverMs: dur(120)
+    readonly property int pressMs: dur(120)
+    readonly property int attachMs: dur(150)
     readonly property int ease: Easing.OutCubic
     readonly property int easeInOut: Easing.InOutCubic
 
@@ -234,8 +238,8 @@ QtObject {
     property color commandEdgeDim: space ? "#1d4d6b" : "#193f57"
     property color commandGlass0: space ? "#f00d2230" : "#f00b1a22"
     property color commandGlass1: space ? "#f0060f1a" : "#f0050d12"
-    Behavior on commandEdge { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
-    Behavior on commandEdgeDim { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
+    Behavior on commandEdge { SequentialAnimation { PauseAnimation { duration: theme.dur(120) } ColorAnimation { duration: theme.dur(180); easing.type: Easing.InOutCubic } } }
+    Behavior on commandEdgeDim { SequentialAnimation { PauseAnimation { duration: theme.dur(120) } ColorAnimation { duration: theme.dur(180); easing.type: Easing.InOutCubic } } }
 
     // -- geometry (1920x1080 contract, scaled by the layout) -------------
     readonly property int radius: 11
@@ -256,19 +260,19 @@ QtObject {
 
     // -- stage 1: glow (0-120 ms) --------------------------------------
     property color glow: space ? "#3d8bff" : "#2a5fb0"
-    Behavior on glow { ColorAnimation { duration: 120; easing.type: Easing.InOutCubic } }
+    Behavior on glow { ColorAnimation { duration: theme.dur(120); easing.type: Easing.InOutCubic } }
     property real glowStrength: space ? 0.8 : command ? 0.6 : 0.18
-    Behavior on glowStrength { NumberAnimation { duration: 120; easing.type: Easing.InOutCubic } }
+    Behavior on glowStrength { NumberAnimation { duration: theme.dur(120); easing.type: Easing.InOutCubic } }
 
-    // -- stage 2: background (60-360 ms) --------------------------------
+    // -- stage 2: background (60-280 ms) --------------------------------
     property color bg0: space ? "#020910" : command ? "#020c13" : "#030709"
     property color bg1: space ? "#031222" : command ? "#04131e" : "#060c0f"
     property color horizon: space ? "#08192e" : command ? "#061b29" : "#030809"
-    Behavior on bg0 { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
-    Behavior on bg1 { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
-    Behavior on horizon { SequentialAnimation { PauseAnimation { duration: 60 } ColorAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
+    Behavior on bg0 { SequentialAnimation { PauseAnimation { duration: theme.dur(60) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on bg1 { SequentialAnimation { PauseAnimation { duration: theme.dur(60) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on horizon { SequentialAnimation { PauseAnimation { duration: theme.dur(60) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
     property real starOpacity: space ? 0.65 : 0.04
-    Behavior on starOpacity { SequentialAnimation { PauseAnimation { duration: 60 } NumberAnimation { duration: 300; easing.type: Easing.InOutCubic } } }
+    Behavior on starOpacity { SequentialAnimation { PauseAnimation { duration: theme.dur(60) } NumberAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
 
     // -- stage 3: core energy / accent (120-300 ms) ---------------------
     property color accent: space ? "#20c7f6" : command ? "#00d4ff" : "#1bbaff"
@@ -277,9 +281,9 @@ QtObject {
     // Structural Phase 3 glass only: never a success/status/module identity.
     readonly property color materialBlue: "#36aaff"
     readonly property color materialGlint: "#9dd8ff"
-    Behavior on accent { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
-    Behavior on accentSoft { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
-    Behavior on accentDeep { SequentialAnimation { PauseAnimation { duration: 120 } ColorAnimation { duration: 180; easing.type: Easing.InOutCubic } } }
+    Behavior on accent { SequentialAnimation { PauseAnimation { duration: theme.dur(120) } ColorAnimation { duration: theme.dur(180); easing.type: Easing.InOutCubic } } }
+    Behavior on accentSoft { SequentialAnimation { PauseAnimation { duration: theme.dur(120) } ColorAnimation { duration: theme.dur(180); easing.type: Easing.InOutCubic } } }
+    Behavior on accentDeep { SequentialAnimation { PauseAnimation { duration: theme.dur(120) } ColorAnimation { duration: theme.dur(180); easing.type: Easing.InOutCubic } } }
 
     // -- stage 4: surfaces and borders (180-400 ms) ---------------------
     // Material levels: 0 environment (bg*), 1 workspace glass, 2 panel glass,
@@ -293,15 +297,15 @@ QtObject {
     property color borderStrong: space ? "#8057b6e4" : "#705094ac"
     property color hud: space ? "#48b8f4" : "#318cab"
     property real hudOpacity: space ? 0.37 : command ? 0.5 : 0.22
-    Behavior on surfaceDeep { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on surfaceWorkspace { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on surface { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on surfaceRaised { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on sheen { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on border { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on borderStrong { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on hud { SequentialAnimation { PauseAnimation { duration: 180 } ColorAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
-    Behavior on hudOpacity { SequentialAnimation { PauseAnimation { duration: 180 } NumberAnimation { duration: 220; easing.type: Easing.InOutCubic } } }
+    Behavior on surfaceDeep { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on surfaceWorkspace { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on surface { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on surfaceRaised { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on sheen { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on border { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on borderStrong { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on hud { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } ColorAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on hudOpacity { SequentialAnimation { PauseAnimation { duration: theme.dur(180) } NumberAnimation { duration: theme.dur(220); easing.type: Easing.InOutCubic } } }
 
     // -- Global Glass: the material tiers ---------------------------------
     // Values are approximate EFFECTIVE navy coverage over the background
@@ -369,10 +373,10 @@ QtObject {
     property color textMuted: space ? "#98aabb" : "#93a4b0"       // metadata, placeholder, timestamps
     readonly property color eventMetaInk: textLabel                // a live event's secondary lines
     property color textDim: space ? "#6f8294" : "#6b7d89"         // tertiary / disabled
-    Behavior on text { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
-    Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
-    Behavior on textMuted { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
-    Behavior on textDim { SequentialAnimation { PauseAnimation { duration: 260 } ColorAnimation { duration: 160; easing.type: Easing.InOutCubic } } }
+    Behavior on text { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
+    Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
+    Behavior on textMuted { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
+    Behavior on textDim { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
 
     // -- semantic state colors (fixed across themes) --------------------
     readonly property color success: "#00d8ad"

@@ -13,9 +13,11 @@ import "../theme"
 //   starts on `initialFocus` - the SAFE control - and returns to the opener.
 //   Enter acts only on the focused button: a field confirms nothing unless the
 //   dialog opts in with `enterConfirms`, and a field in `enterGuard` never does.
-// - Motion: ConfirmDialog's (fade + .97 -> 1 over pageMs in, panelOut out).
-//   With ambient effects off there is no transition at all. `confirmItem` is
-//   enabled only while the dialog is fully open, never during either motion.
+// - Motion: ConfirmDialog's (fade + a scale whose edges travel at most
+//   Theme.travel, over pageMs in, panelOut out). A destructive dialog
+//   (`danger`) has no motion at all (K2, the effect plan's no-effect list),
+//   nor does any dialog with ambient effects off. `confirmItem` is enabled
+//   only while the dialog is fully open, never during either motion.
 Popup {
     id: dialog
     property string label: ""                 // the small UPPERCASE line beside the dot
@@ -47,15 +49,16 @@ Popup {
     Overlay.modal: Rectangle {
         objectName: "jarvisDialogScrim"
         color: Qt.rgba(0, 0, 0, Theme.scrimOpacity)
-        Behavior on opacity { enabled: Theme.ambient; NumberAnimation { duration: Theme.pageMs } }
+        Behavior on opacity { enabled: dialog.moves; NumberAnimation { duration: Theme.pageMs } }
     }
 
-    enter: Theme.ambient ? enterMotion : null
-    exit: Theme.ambient ? exitMotion : null
+    readonly property bool moves: Theme.ambient && !danger
+    enter: moves ? enterMotion : null
+    exit: moves ? exitMotion : null
     readonly property Transition enterMotion: Transition {
         ParallelAnimation {
             NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.pageMs; easing.type: Theme.ease }
-            NumberAnimation { property: "scale"; from: 0.97; to: 1; duration: Theme.pageMs; easing.type: Theme.ease }
+            NumberAnimation { property: "scale"; from: 1 - 2 * Theme.travel / Math.max(1, dialog.width, dialog.height); to: 1; duration: Theme.pageMs; easing.type: Theme.ease }
         }
     }
     readonly property Transition exitMotion: Transition {

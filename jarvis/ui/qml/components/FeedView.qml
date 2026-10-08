@@ -196,7 +196,7 @@ Item {
         // (only pulling back inside the range when the range shrank). New
         // content glides to the end - short, eased, no bounce - and a glide
         // already under way is simply re-aimed at the new end.
-        NumberAnimation { id: glide; target: flick; property: "contentY"; duration: 260; easing.type: Easing.OutCubic }
+        NumberAnimation { id: glide; target: flick; property: "contentY"; duration: Theme.dur(220); easing.type: Easing.OutCubic }
         function settle(smooth) {
             settling = true
             if (followEnd) {
@@ -252,7 +252,7 @@ Item {
                     // Appearance: fade + short slide, no bounce. A reply that streamed is
                     // already on screen: its final entry takes over without a second entrance.
                     opacity: modelData.streamed === true ? 1 : 0
-                    transform: Translate { id: slide; y: modelData.streamed === true ? 0 : 8 }
+                    transform: Translate { id: slide; y: modelData.streamed === true ? 0 : Theme.travel }
                     Component.onCompleted: if (modelData.streamed !== true) appear.start()
                     ParallelAnimation {
                         id: appear
@@ -635,10 +635,10 @@ Item {
                                 SequentialAnimation on opacity {
                                     running: activity.animated && streamRow.visible
                                     loops: Animation.Infinite
-                                    PauseAnimation { duration: index * 160 }
-                                    NumberAnimation { to: 1; duration: 320; easing.type: Easing.InOutSine }
-                                    NumberAnimation { to: 0.28; duration: 420; easing.type: Easing.InOutSine }
-                                    PauseAnimation { duration: (2 - index) * 160 + 120 }
+                                    PauseAnimation { duration: Theme.dur(index * 160) }
+                                    NumberAnimation { to: 1; duration: Theme.dur(320); easing.type: Easing.InOutSine }
+                                    NumberAnimation { to: 0.28; duration: Theme.dur(420); easing.type: Easing.InOutSine }
+                                    PauseAnimation { duration: Theme.dur((2 - index) * 160 + 120) }
                                 }
                             }
                         }
@@ -694,7 +694,7 @@ Item {
         width: 36; height: 36; radius: 18
         opacity: feed.jumpVisible ? 1 : 0
         visible: opacity > 0
-        Behavior on opacity { NumberAnimation { duration: 160 } }
+        Behavior on opacity { NumberAnimation { duration: Theme.dur(160); easing.type: Theme.ease } }
         color: jumpArea.containsMouse ? Theme.alpha(Theme.accent, 0.22) : Theme.glassPrimaryReading
         border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55)
         Accessible.role: Accessible.Button
@@ -717,13 +717,13 @@ Item {
         readonly property bool shown: engaged || flick.moving || recent
         Timer { id: hold; interval: 1000; onTriggered: bar.recent = false }
         function poke() { recent = true; hold.restart() }
-        // Any scroll the reader makes shows the bar at once; when the pointer
-        // leaves or the drag ends, hold, then fade.
+        // Any scroll the reader makes shows the bar; when the pointer leaves or
+        // the drag ends, hold, then fade. The fade runs both ways (K2: an exit
+        // only where there is an entry).
         Connections { target: flick; function onContentYChanged() { if (!flick.settling) bar.poke() } }
         onEngagedChanged: if (!engaged) poke()
-        opacity: 0
-        onShownChanged: { if (shown) { fadeOut.stop(); opacity = 1 } else fadeOut.restart() }
-        NumberAnimation { id: fadeOut; target: bar; property: "opacity"; to: 0; duration: 200 }
+        opacity: shown ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs; easing.type: Theme.ease } }
         Rectangle {
             id: thumb
             objectName: "feedScrollThumb"
@@ -733,7 +733,7 @@ Item {
             y: flick.endY > 0 ? bar.travel * Math.min(1, Math.max(0, flick.contentY / flick.endY)) : 0
             radius: 1.5
             color: bar.engaged ? "#5cc0f0" : "#3a9fdb"
-            Behavior on width { NumberAnimation { duration: 100 } }
+            Behavior on width { NumberAnimation { duration: Theme.hoverMs; easing.type: Theme.ease } }
         }
         MouseArea {
             id: hit

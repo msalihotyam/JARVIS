@@ -22,17 +22,18 @@ Item {
         dialog.cancelLabel = cancelLabel || qsTr("Back"); dialog.open = true
     }
 
+    // K2: a destructive confirmation (danger) has no motion - it appears and goes at once.
     Rectangle { id: dim; anchors.fill: parent; color: "#000000"; opacity: dialog.open ? 0.5 : 0
-        Behavior on opacity { NumberAnimation { duration: Theme.pageMs } }
+        Behavior on opacity { enabled: !dialog.danger; NumberAnimation { duration: Theme.pageMs } }
         MouseArea { anchors.fill: parent; enabled: dialog.open } }
     GlassPanel {
         raised: true
         anchors.centerIn: parent
         width: 460; height: column.height + 52
         border.color: dialog.danger ? Theme.danger : Theme.accent
-        opacity: dialog.open ? 1 : 0; scale: dialog.open ? 1 : 0.97
-        Behavior on opacity { NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
-        Behavior on scale { NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
+        opacity: dialog.open ? 1 : 0; scale: dialog.open ? 1 : 1 - 2 * Theme.travel / Math.max(1, width, height)   // the edges travel at most Theme.travel
+        Behavior on opacity { enabled: !dialog.danger; NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
+        Behavior on scale { enabled: !dialog.danger; NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
         padding: 26
         Column {
             id: column

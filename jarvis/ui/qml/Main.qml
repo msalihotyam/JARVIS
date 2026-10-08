@@ -36,7 +36,7 @@ Window {
     readonly property int textRenderToken: Theme.textRender
     readonly property int hoverToken: Theme.hoverMs
     readonly property int panelInToken: Theme.panelIn
-    readonly property int panelTravelToken: Theme.panelTravel
+    readonly property int panelTravelToken: Theme.travel
     // Observable from the outside (tests): the type ramp and the ink steps.
     readonly property var typeTokens: ({ label: Theme.label, caption: Theme.caption, captionStrong: Theme.captionStrong,
                                          body: Theme.body, bodyStrong: Theme.bodyStrong, lead: Theme.lead, subtitle: Theme.subtitle,
@@ -209,7 +209,7 @@ Window {
                 SequentialAnimation {
                     id: pageIn
                     PropertyAction { target: pageLoader; property: "opacity"; value: 0 }
-                    PropertyAction { target: pageSlide; property: "y"; value: 8 }
+                    PropertyAction { target: pageSlide; property: "y"; value: Theme.travel }
                     ParallelAnimation {
                         NumberAnimation { target: pageLoader; property: "opacity"; to: 1; duration: Theme.pageMs; easing.type: Easing.OutCubic }
                         NumberAnimation { target: pageSlide; property: "y"; to: 0; duration: Theme.pageMs; easing.type: Easing.OutCubic }
@@ -420,7 +420,8 @@ Window {
         Text { id: auditionText; anchors.centerIn: parent; color: "#ff8080"
             text: "DEV · " + (root.auditionIndex === 0 ? qsTr("CURRENT BACKGROUND") : qsTr("BACKGROUND %1 / %2").arg(root.auditionIndex).arg(bridge.devBackgroundCandidates.length))
             font: Theme.label }
-        SequentialAnimation { id: auditionFade; PauseAnimation { duration: 900 } NumberAnimation { target: auditionLabel; property: "opacity"; to: 0; duration: 250 } }
+        // Shown at once, gone at once after a hold (K2: no exit without an entry).
+        Timer { id: auditionFade; interval: 1150; onTriggered: auditionLabel.opacity = 0 }
     }
     Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
     Shortcut { sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }

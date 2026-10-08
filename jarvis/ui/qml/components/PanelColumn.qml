@@ -130,7 +130,7 @@ Item {
             Behavior on y { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
             Behavior on height { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
             opacity: 0
-            transform: Translate { id: slide; x: 10 }
+            transform: Translate { id: slide; x: Theme.travel }
             Component.onCompleted: appear.start()
             ParallelAnimation {
                 id: appear

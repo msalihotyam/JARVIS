@@ -36,7 +36,7 @@ Rectangle {
     scale: pressed ? 0.94 : 1
     Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-    Behavior on scale { NumberAnimation { duration: 90 } }
+    Behavior on scale { NumberAnimation { duration: Theme.pressMs; easing.type: Theme.ease } }
     // Keyboard focus: a crisp 2 px outline just outside the control, distinct from hover and active.
     Rectangle { anchors.fill: parent; anchors.margins: -3; radius: parent.radius + 2; color: "transparent"; border.width: 2; border.color: Theme.materialGlint; visible: button.activeFocus }
 
@@ -54,12 +54,5 @@ Rectangle {
         cursorShape: button.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
         onClicked: if (button.enabled) button.clicked()
     }
-    Rectangle {
-        visible: hovered && button.tip !== ""
-        anchors.top: parent.bottom; anchors.topMargin: 8; anchors.horizontalCenter: parent.horizontalCenter
-        width: tipText.width + 16; height: tipText.height + 10
-        radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.color: Theme.borderStrong; border.width: 1
-        z: 50
-        Text { id: tipText; anchors.centerIn: parent; text: button.tip; color: Theme.text; font: Theme.caption }
-    }
+    HoverTip { text: button.tip; offsetX: (width - tipWidth) / 2 }
 }

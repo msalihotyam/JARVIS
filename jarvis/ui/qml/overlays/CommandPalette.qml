@@ -58,7 +58,7 @@ Item {
         y: parent.height * 0.18
         width: Math.min(parent.width * 0.5, 640); height: 58 + list.height + 32
         opacity: palette.open ? 1 : 0
-        scale: palette.open ? 1 : 0.98
+        scale: palette.open ? 1 : 1 - 2 * Theme.travel / Math.max(1, width, height)   // the edges travel at most Theme.travel
         Behavior on opacity { NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
         Behavior on scale { NumberAnimation { duration: Theme.pageMs; easing.type: Easing.OutCubic } }
         padding: 16

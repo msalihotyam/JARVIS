@@ -21,6 +21,8 @@ Item {
     property real offsetX: 0
     property real offsetY: height + 8
     readonly property bool shown: popup.visible
+    // The tip's own width, so an owner can centre it (offsetX: (width - tipWidth) / 2).
+    readonly property real tipWidth: popup.width
     anchors.fill: target
 
     HoverHandler { id: hover; parent: tip.target && tip.target.enabled ? tip.target : tip }

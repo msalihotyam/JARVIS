@@ -25,21 +25,21 @@ Item {
                        xScale: orb.diameter / 60; yScale: orb.diameter / 60 }
 
     // Staged power: the core ignites first, the glass follows, the halo last
-    // (~420 ms). Powering down fades everything together (~300 ms).
+    // (~380 ms). Powering down fades everything together (220 ms).
     property real coreLevel: lit ? 1 : 0
     property real glassLevel: lit ? 1 : 0
     property real haloLevel: lit ? 1 : 0
-    Behavior on coreLevel { NumberAnimation { duration: orb.lit ? 160 : 260; easing.type: Easing.OutCubic } }
-    Behavior on glassLevel { SequentialAnimation { PauseAnimation { duration: orb.lit ? 80 : 0 } NumberAnimation { duration: orb.lit ? 240 : 300; easing.type: Easing.InOutCubic } } }
-    Behavior on haloLevel { SequentialAnimation { PauseAnimation { duration: orb.lit ? 160 : 0 } NumberAnimation { duration: orb.lit ? 260 : 300; easing.type: Easing.InOutCubic } } }
+    Behavior on coreLevel { NumberAnimation { duration: Theme.dur(orb.lit ? 160 : 220); easing.type: Easing.OutCubic } }
+    Behavior on glassLevel { SequentialAnimation { PauseAnimation { duration: Theme.dur(orb.lit ? 80 : 0) } NumberAnimation { duration: Theme.dur(220); easing.type: Easing.InOutCubic } } }
+    Behavior on haloLevel { SequentialAnimation { PauseAnimation { duration: Theme.dur(orb.lit ? 160 : 0) } NumberAnimation { duration: Theme.dur(220); easing.type: Easing.InOutCubic } } }
 
     // Extremely slow luminance breathing while lit.
     property real breath: 1.0
     SequentialAnimation on breath {
         running: orb.lit && orb.ambient && Theme.ambient && orb.visible && orb.Window.active
         loops: Animation.Infinite
-        NumberAnimation { to: 0.86; duration: 3400; easing.type: Easing.InOutSine }
-        NumberAnimation { to: 1.0; duration: 3400; easing.type: Easing.InOutSine }
+        NumberAnimation { to: 0.86; duration: Theme.dur(3400); easing.type: Easing.InOutSine }
+        NumberAnimation { to: 1.0; duration: Theme.dur(3400); easing.type: Easing.InOutSine }
     }
     readonly property real glow: glassLevel * breath
 

@@ -56,7 +56,7 @@ Item {
         height: 9
         Rectangle { y: 4; x: 8; width: parent.width - 16; height: 1; color: Theme.border }
     }
-    // The scope menus: glass, and the popover motion - opacity and panelTravel
+    // The scope menus: glass, and the popover motion - opacity and Theme.travel
     // over panelIn in, panelOut out; no motion at all with ambient effects off.
     component ScopeMenu: Popup {
         id: scopeMenu
@@ -70,7 +70,7 @@ Item {
         readonly property Transition menuIn: Transition {
             ParallelAnimation {
                 NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
-                NumberAnimation { property: "y"; from: scopeMenu.restY - Theme.panelTravel; to: scopeMenu.restY; duration: Theme.panelIn; easing.type: Theme.ease }
+                NumberAnimation { property: "y"; from: scopeMenu.restY - Theme.travel; to: scopeMenu.restY; duration: Theme.panelIn; easing.type: Theme.ease }
             }
         }
         readonly property Transition menuOut: Transition {

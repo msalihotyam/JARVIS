@@ -65,7 +65,7 @@ Item {
         y: Math.max(80, Math.min(context.anchorPoint.y, context.height - height - 16))
         opacity: context.open ? 1 : 0
         // Opening ~180 ms with 4 px of travel, closing slightly faster; no bounce.
-        transform: Translate { y: context.open ? 0 : -Theme.panelTravel; Behavior on y { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } } }
+        transform: Translate { y: context.open ? 0 : -Theme.travel; Behavior on y { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } } }
         Behavior on opacity { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } }
         Keys.onEscapePressed: context.open = false
         MouseArea { parent: panel; anchors.fill: parent; z: -0.5 }

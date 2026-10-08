@@ -104,7 +104,7 @@ Item {
         id: bar
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         height: composer.barHeight
-        Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        Behavior on height { NumberAnimation { duration: Theme.dur(140); easing.type: Easing.OutCubic } }
         radius: 10
         // The BODY only: very transparent at rest, a step darker under the
         // pointer, a step darker again while it has focus. The draft text, the

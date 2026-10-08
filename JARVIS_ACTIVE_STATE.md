@@ -17,9 +17,11 @@ on main; `ci/gate6f` ran green (run 37425225354). Installed:
 retained. Local `main` is ahead of `origin/main` `4f5a93d`, not pushed.
 
 S0 speed-up is done: S0a rules (2eb095b), S0b test/CI speed (7bb272b; local
-full suite 445 s, CI 4 shards 11.3 min). Now: **G0** (this docs slice,
-canonical main) and **S0c** (`scripts/test.ps1` Python selection, worktree
-`claude/s0c-python`). Next: **Gate 6G**, K1 icon set first.
+full suite 445 s, CI 4 shards 11.3 min). **Gate 6G** is under way: K1 icon
+set and the F-ee reflow fix are on main; **K2** motion contract (Theme.dur
+gate, 4 px travel, one HoverTip, calm idle core, destructive dialogs at once)
+is committed on lane branch `worktree-6g-k2-motion` (full suite green, 4764),
+waiting for Salih's "entegre et".
 
 ## Open blockers: none.
 
@@ -57,8 +59,8 @@ canonical main) and **S0c** (`scripts/test.ps1` Python selection, worktree
 
 ## Next action (in order)
 
-1. G0 commits; S0c lands. 2. Gate 6G (K1, K2, then the 6G slices; F8/F9
-folded in). 3. Gate 6H (authority review). 4. Full suite / CI on the
+1. Integrate K2 (on "entegre et"). 2. Gate 6G (the remaining 6G slices;
+F8/F9 folded in). 3. Gate 6H (authority review). 4. Full suite / CI on the
 integrated release HEAD. 5. Re-install (Salih's go). 6. Dogfood (D-2/D-3).
 7. Rollback (D-4). 8. V2.0 close.
 

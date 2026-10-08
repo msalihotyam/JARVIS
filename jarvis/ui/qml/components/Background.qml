@@ -169,8 +169,8 @@ Item {
             SequentialAnimation on opacity {
                 running: Theme.ambient && bg.active && Theme.space
                 loops: Animation.Infinite
-                NumberAnimation { to: 0.9; duration: 2600 + index * 900; easing.type: Easing.InOutSine }
-                NumberAnimation { to: 0.3; duration: 2600 + index * 900; easing.type: Easing.InOutSine }
+                NumberAnimation { to: 0.9; duration: Theme.dur(2600 + index * 900); easing.type: Easing.InOutSine }
+                NumberAnimation { to: 0.3; duration: Theme.dur(2600 + index * 900); easing.type: Easing.InOutSine }
             }
         }
     }

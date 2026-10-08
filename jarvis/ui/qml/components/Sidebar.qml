@@ -303,7 +303,7 @@ Rectangle {
         border.width: accent ? 1 : 0; border.color: Theme.alpha(Theme.commandEdge, 0.6)
         opacity: allowed ? 1 : 0.38
         scale: plusArea.pressed && allowed ? 0.94 : 1
-        Behavior on scale { enabled: Theme.ambient; NumberAnimation { duration: 90 } }
+        Behavior on scale { NumberAnimation { duration: Theme.pressMs; easing.type: Theme.ease } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button; Accessible.name: tip
         Accessible.onPressAction: if (allowed) activated()

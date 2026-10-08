@@ -69,7 +69,7 @@ Item {
         color: Theme.glassMenu
         border.width: 1; border.color: Theme.glassEdgeStrong
         MouseArea { anchors.fill: parent }        // clicks inside never close it
-        NumberAnimation { id: fadeIn; target: surface; property: "opacity"; from: 0; to: 1; duration: 140; easing.type: Easing.OutCubic }
+        NumberAnimation { id: fadeIn; target: surface; property: "opacity"; from: 0; to: 1; duration: Theme.dur(140); easing.type: Easing.OutCubic }
 
         Column {
             id: body

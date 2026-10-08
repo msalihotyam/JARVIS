@@ -180,7 +180,7 @@ Item {
         width: 12; height: 7
         preferredRendererType: Shape.CurveRenderer
         rotation: sel.open ? 180 : 0
-        Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+        Behavior on rotation { NumberAnimation { duration: Theme.dur(180); easing.type: Easing.OutCubic } }
         ShapePath {
             strokeColor: sel.active ? "#dbeeff" : Theme.alpha(sel.glint, 0.85)
             strokeWidth: 1.6; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin

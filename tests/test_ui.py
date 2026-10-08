@@ -5992,13 +5992,13 @@ class FinalPolishTests(SurfaceCase):
     def test_motion_is_short_and_reduced_motion_removes_the_travel(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual((110, 180, 4), (root.property("hoverToken"), root.property("panelInToken"), root.property("panelTravelToken")))
+        self.assertEqual((120, 180, 4), (root.property("hoverToken"), root.property("panelInToken"), root.property("panelTravelToken")))
         bridge.setAmbientEffects(False)
         pump(200)
         self.assertEqual((0, 0, 0), (root.property("hoverToken"), root.property("panelInToken"), root.property("panelTravelToken")))
         bridge.setAmbientEffects(True)
         pump(200)
-        self.assertEqual(110, root.property("hoverToken"))
+        self.assertEqual(120, root.property("hoverToken"))
 
     def test_references_keep_their_structure_with_readable_quotes_and_quiet_nested_cards(self) -> None:
         bridge = self.bridge()

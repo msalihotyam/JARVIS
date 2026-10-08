@@ -33,7 +33,7 @@ Rectangle {
     scale: pressed ? 0.97 : 1
     Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
     Behavior on border.color { ColorAnimation { duration: Theme.hoverMs } }
-    Behavior on scale { NumberAnimation { duration: 90 } }
+    Behavior on scale { NumberAnimation { duration: Theme.pressMs; easing.type: Theme.ease } }
 
     // Top sheen on the primary fill, so it reads as a lit key rather than a flat block.
     Rectangle {

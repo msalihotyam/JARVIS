@@ -27,7 +27,6 @@ Rectangle {
     radius: 10
     color: Theme.glassInteractive
     border.width: 1; border.color: Theme.alpha(tone, 0.6)
-    Behavior on border.color { ColorAnimation { duration: 160 } }
     Accessible.role: Accessible.AlertMessage
     Accessible.name: item.label || ""
 

@@ -47,7 +47,7 @@ Column {
         Rectangle { x: 0; y: 10; width: 3; height: surface.height - 20; radius: 1.5; color: surface.tone; opacity: 0.85 }
         // A short opacity entrance when the card appears; nothing loops.
         onVisibleChanged: if (visible) { opacity = 0; fade.restart() }
-        NumberAnimation { id: fade; target: surface; property: "opacity"; from: 0; to: 1; duration: 160; easing.type: Easing.OutCubic }
+        NumberAnimation { id: fade; target: surface; property: "opacity"; from: 0; to: 1; duration: Theme.dur(160); easing.type: Easing.OutCubic }
     }
     // A static state icon in a ring (Icon.qml): question unknown, close failed, check completed,
     // minus blocked, pause frozen, filled diamond approval.

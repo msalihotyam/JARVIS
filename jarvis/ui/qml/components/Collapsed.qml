@@ -53,7 +53,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             x: parent.width - 22; width: 10; height: 6
             rotation: field.open ? 180 : 0
-            Behavior on rotation { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+            Behavior on rotation { NumberAnimation { duration: Theme.dur(160); easing.type: Easing.OutCubic } }
             onPaint: { var c = getContext("2d"); c.reset(); c.strokeStyle = Theme.textLabel; c.lineWidth = 1.4
                        c.beginPath(); c.moveTo(1, 1); c.lineTo(5, 5); c.lineTo(9, 1); c.stroke() }
         }
