@@ -9,7 +9,8 @@ The serial run stays the reference when a result is disputed.
   same ids, the same number of times) before anything runs.
 * Work units are modules; a module whose recorded duration is large is split
   at TestCase level into duration-balanced chunks (``scripts/test_durations.json``,
-  ``--write-durations``). A module with ``load_tests`` is never split.
+  ``--write-durations``), and a long class goes into them one test method at a
+  time. A module with ``load_tests`` is never split.
 * Units that drive a real QML window or launch the app (modules importing
   PySide6 / jarvis.ui, directly or through another test module) run over K UI
   processes (default ``min(4, cpu_count // 3)``, at least 1); the rest over N
@@ -59,6 +60,8 @@ DURATIONS = Path(__file__).resolve().with_name("test_durations.json")
 
 #: A module recorded above this many seconds is split into chunks of about this size.
 CHUNK_SECONDS = 60.0
+#: THIZ: a class recorded above this many seconds goes into those chunks one test method at a time.
+SPLIT_CLASS_SECONDS = CHUNK_SECONDS / 4
 
 _UI_MARKERS = re.compile(r"^\s*(?:from|import)\s+(?:PySide6|jarvis\.ui)\b", re.MULTILINE)
 _TEST_IMPORT = re.compile(r"^\s*(?:from|import)\s+tests\.(test_\w+)", re.MULTILINE)
@@ -182,17 +185,21 @@ class Unit:
         return self.seconds if self.seconds is not None else 0.0
 
 
-def load_durations(path: Path = DURATIONS) -> dict[str, float]:
+def load_durations(path: Path = DURATIONS, key: str = "classes") -> dict[str, float]:
     try:
-        return {k: float(v) for k, v in json.loads(path.read_text(encoding="utf-8"))["classes"].items()}
-    except (OSError, ValueError, KeyError, TypeError):
+        return {k: float(v) for k, v in json.loads(path.read_text(encoding="utf-8")).get(key, {}).items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {}
 
 
-def build_units(discovery: dict, ui: set[str], durations: dict[str, float]) -> list[Unit]:
+def build_units(discovery: dict, ui: set[str], durations: dict[str, float], tests: dict[str, float] | None = None) -> list[Unit]:
     """Whole modules, except a module recorded above CHUNK_SECONDS: its classes in chunks of
-    about CHUNK_SECONDS each (consecutive, in the loader's order). A unit's seconds are the sum
-    of its classes' recorded seconds; None when any class has no record."""
+    about CHUNK_SECONDS each, longest first onto the least-loaded chunk. A class recorded above
+    SPLIT_CLASS_SECONDS goes into the chunks one test method at a time (THIZ: its seconds from
+    ``tests``, the recorded per-test seconds, else an equal share), so one long class is no
+    longer one long unit. A unit's seconds are the sum of its parts' recorded seconds; None when
+    any class has no record."""
+    tests = tests or {}
     units = []
     for module, info in sorted(discovery["modules"].items()):
         per: dict[str, float | None] = {}
@@ -200,10 +207,18 @@ def build_units(discovery: dict, ui: set[str], durations: dict[str, float]) -> l
             known = [durations.get(c) for c in sorted({t.rsplit(".", 1)[0] for t in ids})]
             per[attr] = None if any(k is None for k in known) else sum(known)
         total = None if any(v is None for v in per.values()) else sum(per.values())
-        if not info["split"] or total is None or total <= CHUNK_SECONDS or len(per) == 1:
+        if not info["split"] or total is None or total <= CHUNK_SECONDS or len(per) == 1 and len(next(iter(info["classes"].values()))) == 1:
             ids = [t for attr_ids in info["classes"].values() for t in attr_ids]
             units.append(Unit(module, [""], ids, total, module in ui))
             continue
+        members = {attr: info["classes"][attr] for attr in per}
+        for attr, seconds in list(per.items()):
+            ids = info["classes"][attr]
+            if seconds > SPLIT_CLASS_SECONDS and len(ids) > 1:
+                del per[attr], members[attr]
+                for test in ids:
+                    part = f"{attr}.{test.rsplit('.', 1)[1]}"
+                    per[part], members[part] = tests.get(test, seconds / len(ids)), [test]
         pieces = max(2, round(total / CHUNK_SECONDS))
         bins: list[list[str]] = [[] for _ in range(pieces)]
         loads = [0.0] * pieces
@@ -214,7 +229,7 @@ def build_units(discovery: dict, ui: set[str], durations: dict[str, float]) -> l
         for chunk, load in zip(bins, loads):
             if chunk:
                 chunk.sort()
-                ids = [t for attr in chunk for t in info["classes"][attr]]
+                ids = [t for attr in chunk for t in members[attr]]
                 units.append(Unit(module, chunk, ids, load, module in ui))
     return units
 
@@ -371,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.modules and collections.Counter(discovery["serial"]) != expected:
         _print_set_difference("the serial discover -s tests set", collections.Counter(discovery["serial"]), expected)
         return 1
-    units = build_units(discovery, ui_modules(names), load_durations())
+    units = build_units(discovery, ui_modules(names), load_durations(), load_durations(key="tests"))
     if shard is not None:
         units = shard_plan(units, shard[1])[shard[0] - 1]
     # The union of dispatched ids equals the discovered set exactly (the whole suite, or this shard's plan).
@@ -411,7 +426,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.durations:
             _print_durations(results, args.durations)
         if args.write_durations:
-            _write_durations(results, Path(args.write_durations))
+            _write_durations(_durations_of(results), [t for r in results for t in r.unit.ids], Path(args.write_durations),
+                             "one local parallel run")
         if args.report:
             _write_report(Path(args.report), shard, units, results, wall, green, rule_d, discovery)
         print("OK" if green else "FAILED", flush=True)
@@ -478,26 +494,28 @@ def _print_rows(rows: list[tuple[float, str]], top: int) -> None:
         print(f"  {seconds:8.3f}s  {name}")
 
 
-def _write_durations(results: list[Result], path: Path) -> None:
-    """Seconds per test class (``tests.module.Class``), averaged over the times it ran."""
+def _write_durations(rows: list[tuple[float, str]], dispatched: list[str], path: Path, source: str) -> None:
+    """Seconds per test class (``tests.module.Class``), averaged over the times it ran, and (THIZ)
+    per test (``tests.module.Class.test``) for a class long enough to be split by its methods."""
+    runs = collections.Counter(dispatched)
     total: dict[str, float] = collections.defaultdict(float)
-    for seconds, name in _durations_of(results):
+    tests: dict[str, float] = collections.defaultdict(float)
+    for seconds, name in rows:
         match = _SEEN.search(name)
         if match:
-            total[match.group(2).rsplit(".", 1)[0]] += seconds
-    runs: dict[str, int] = collections.Counter()
-    for r in results:
-        for cls in {t.rsplit(".", 1)[0] for t in r.unit.ids}:
-            runs[cls] += 1
-    classes = {cls: round(seconds / max(1, runs.get(cls, 1)), 3) for cls, seconds in sorted(total.items())}
-    for r in results:                                       # classes too fast to be listed still get a record
-        for cls in {t.rsplit(".", 1)[0] for t in r.unit.ids}:
-            classes.setdefault(cls, 0.0)
-    path.write_text(json.dumps({"version": 1, "about": "Seconds per test class from one local parallel run; "
-                                "scripts/test_parallel.py plans its units and CI shards from it "
-                                "(--write-durations regenerates it).", "classes": dict(sorted(classes.items()))},
+            share = seconds / max(1, runs.get(match.group(2), 1))
+            total[match.group(2).rsplit(".", 1)[0]] += share
+            tests[match.group(2)] += share
+    classes = {cls: round(seconds, 3) for cls, seconds in sorted(total.items())}
+    for cls in {t.rsplit(".", 1)[0] for t in dispatched}:  # classes too fast to be listed still get a record
+        classes.setdefault(cls, 0.0)
+    split = {t: round(s, 3) for t, s in sorted(tests.items()) if classes[t.rsplit(".", 1)[0]] > SPLIT_CLASS_SECONDS / 2}
+    path.write_text(json.dumps({"version": 1, "about": f"Seconds per test class from {source}, and per test for the long "
+                                "classes; scripts/test_parallel.py plans its units and CI shards from it (--write-durations "
+                                "regenerates it).",
+                                "classes": dict(sorted(classes.items())), "tests": split},
                                indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"wrote {len(classes)} class durations to {path}")
+    print(f"wrote {len(classes)} class and {len(split)} test durations to {path}")
 
 
 def _write_report(path: Path, shard, units, results, wall, green, rule_d, discovery) -> None:
@@ -525,7 +543,7 @@ def aggregate(args) -> int:
     names = discover([])
     discovery = discover_tests(args.python, names, serial=True)
     expected = discovered_ids(discovery)
-    units = build_units(discovery, ui_modules(names), load_durations())
+    units = build_units(discovery, ui_modules(names), load_durations(), load_durations(key="tests"))
     plan = shard_plan(units, shards) if shards > 0 else []
     reports = {}
     for file in sorted(directory.rglob("*.json")):

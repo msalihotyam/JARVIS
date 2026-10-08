@@ -308,10 +308,18 @@ class SidebarShellCase(ProjectsUiCase):
 
 class SidebarShellTests(SidebarShellCase):
     @ambient_on          # THIZ: the sidebar's one sweep with motion
-    def test_h_sidebar_tiles_and_strip_fit_at_every_size_in_both_themes(self) -> None:
+    def test_h_sidebar_tiles_and_strip_fit_at_every_size_in_space(self) -> None:
+        self.sweep_h(("space",))
+
+    @ambient_on          # THIZ: the sidebar's one sweep with motion
+    def test_h_sidebar_tiles_and_strip_fit_at_every_size_in_dark(self) -> None:
+        self.sweep_h(("dark",))
+
+    def sweep_h(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         bridge = self.bridge()
         root = self.window(bridge)
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES:
                 self.resize_still(root, width, height, 700)
@@ -720,7 +728,14 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
 
 
 class SidebarNavTests(SidebarNavCase):
-    def test_t_whole_rows_no_clip_no_overlap_and_long_names_elide_with_a_tip(self) -> None:
+    def test_t_whole_rows_no_clip_no_overlap_and_long_names_elide_with_a_tip_in_space(self) -> None:
+        self.sweep_t(("space",))
+
+    def test_t_whole_rows_no_clip_no_overlap_and_long_names_elide_with_a_tip_in_dark(self) -> None:
+        self.sweep_t(("dark",))
+
+    def sweep_t(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         store = self.seed()
         extra = [store.create_project(f"Proje {n}") for n in range(3)]
         longp = store.create_project(LONG_PROJECT)
@@ -731,7 +746,7 @@ class SidebarNavTests(SidebarNavCase):
         bridge.openConversation(owned.id)
         root = self.window(bridge)
         active = 3 + len(extra) + 1
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES:
                 self.resize_still(root, width, height, 700)
@@ -1219,7 +1234,15 @@ class ChatHeaderTests(SidebarNavCase):
         self.assertGreaterEqual(((nx - cx) ** 2 + (ny - cy) ** 2) ** 0.5, radius - 0.5, name)
 
     @ambient_on          # THIZ: it checks every mid-reflow frame
-    def test_ee_the_header_fits_at_every_size_in_both_themes_and_long_names_elide(self) -> None:
+    def test_ee_the_header_fits_at_every_size_and_long_names_elide_in_space(self) -> None:
+        self.sweep_ee(("space",))
+
+    @ambient_on          # THIZ: it checks every mid-reflow frame
+    def test_ee_the_header_fits_at_every_size_and_long_names_elide_in_dark(self) -> None:
+        self.sweep_ee(("dark",))
+
+    def sweep_ee(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         store = self.seed()
         longp = store.create_project(LONG_PROJECT)
         longest = (LONG_TITLE + ", " + LONG_TITLE.lower())[:120]                  # the store's limit; elides even at 1920
@@ -1235,7 +1258,7 @@ class ChatHeaderTests(SidebarNavCase):
                 self.apart(header, self.box(root, other), other + " mid-reflow")
         # F-ee: the first step below is the largest shrink, a 4K window to the minimum.
         self.assertTrue(self.resize_still(root, 3840, 2160, 3000, every=clear_mid_reflow), "4K did not settle")
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for key, conversation in (("project", owned), ("global", global_long)):
                 bridge.openConversation(conversation.id)
@@ -1354,7 +1377,14 @@ class ChatHeaderTests(SidebarNavCase):
         self.assertNotEqual(opened, bridge.conversationId)
         self.assertEqual(0, self.execute_calls())
 
-    def test_hh_the_top_bar_has_no_scope_group_and_nothing_overlaps_there(self) -> None:
+    def test_hh_the_top_bar_has_no_scope_group_and_nothing_overlaps_there_in_space(self) -> None:
+        self.sweep_hh(("space",))
+
+    def test_hh_the_top_bar_has_no_scope_group_and_nothing_overlaps_there_in_command(self) -> None:
+        self.sweep_hh(("command",))
+
+    def sweep_hh(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         from pathlib import Path
         qml = Path(__file__).resolve().parents[1] / "jarvis" / "ui" / "qml" / "components" / "TopBar.qml"
         source = qml.read_text(encoding="utf-8")
@@ -1369,7 +1399,7 @@ class ChatHeaderTests(SidebarNavCase):
         root = self.window(bridge)
         for gone in ("projectScope", "projectSelector", "conversationSwitcher", "newConversationButton"):
             self.assertEqual([], self.all_items(root, gone))
-        for theme in ("space", "command"):
+        for theme in themes:
             bridge.setTheme(theme)
             pump(400)
             for width, height in SIZES:
@@ -1614,13 +1644,21 @@ class MenuOpacityTests(PunchListCase):
         self.assertEqual([], bad, f"{name} shows what is behind it ({over})")
 
     @ambient_on          # THIZ: it reads the painted menu pixels
-    def test_oo_p2_every_menu_over_content_is_fully_opaque(self) -> None:
+    def test_oo_p2_every_menu_over_content_is_fully_opaque_in_space(self) -> None:
+        self.sweep_oo(("space",))
+
+    @ambient_on          # THIZ: it reads the painted menu pixels
+    def test_oo_p2_every_menu_over_content_is_fully_opaque_in_dark(self) -> None:
+        self.sweep_oo(("dark",))
+
+    def sweep_oo(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         store = self.seed()
         for n in range(3):
             store.create_conversation(self.many.id, title=f"Çok ek {n}")
         bridge = self.bridge()
         root = self.window(bridge)
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES[:2] + SIZES[2:]:
                 self.resize_still(root, width, height, 700)
@@ -1734,12 +1772,20 @@ class SweepTests(SweepCase):
         return menu
 
     @ambient_on          # THIZ: the home page's one sweep with motion
-    def test_pp_the_home_page_states_have_no_clipped_text_and_no_overlap(self) -> None:
+    def test_pp_the_home_page_states_have_no_clipped_text_and_no_overlap_in_space(self) -> None:
+        self.sweep_pp(("space",))
+
+    @ambient_on          # THIZ: the home page's one sweep with motion
+    def test_pp_the_home_page_states_have_no_clipped_text_and_no_overlap_in_dark(self) -> None:
+        self.sweep_pp(("dark",))
+
+    def sweep_pp(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         self.data()
         bridge = self.bridge()
         bridge.openConversation(self.long_conv.id)
         root = self.window(bridge)
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES:
                 self.resize_still(root, width, height, 900)
@@ -1800,14 +1846,21 @@ class SweepTests(SweepCase):
 
 
 class SweepPathTests(SweepCase):
-    def test_qq_every_6f_action_has_a_mouse_path_at_every_size_in_both_themes(self) -> None:
+    def test_qq_every_6f_action_has_a_mouse_path_at_every_size_in_space(self) -> None:
+        self.sweep_qq(("space",))
+
+    def test_qq_every_6f_action_has_a_mouse_path_at_every_size_in_dark(self) -> None:
+        self.sweep_qq(("dark",))
+
+    def sweep_qq(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
         keys = []
         real = QTest.keyClick
         with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
-            for theme in ("space", "dark"):
+            for theme in themes:
                 bridge.setTheme(theme)
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 900)
@@ -1918,10 +1971,20 @@ class NameFloorVarianceTests(SidebarNavCase):
         shown = QFontMetricsF(text_item.property("font")).elidedText(text, Qt.TextElideMode.ElideRight, text_item.width())
         return len(text) if shown == text else len(shown.rstrip("…"))
 
-    def test_ll_the_six_character_floor_holds_with_other_interface_faces(self) -> None:
+    def test_ll_the_six_character_floor_holds_with_another_interface_face_manrope(self) -> None:
+        self.sweep_ll(("chat",))
+
+    def test_ll_the_six_character_floor_holds_with_another_interface_face_inter(self) -> None:
+        self.sweep_ll(("placeholder",))
+
+    def test_ll_the_six_character_floor_holds_with_another_interface_face_space_grotesk(self) -> None:
+        self.sweep_ll(("display",))
+
+    def sweep_ll(self, keys) -> None:
+        # THIZ: one face per test method, so the parallel runner can spread them.
         from jarvis.ui import typography
         base = typography.load_fonts()
-        for family in (base["chat"], base["placeholder"], base["display"]):            # Manrope, Inter, Space Grotesk
+        for family in (base[key] for key in keys):                                   # Manrope, Inter, Space Grotesk
             faces = {**base, "ui": family, "uiStrong": family, "uiStrongWeight": 600, "reading": family, "sans": family}
             with self.subTest(face=family), mock.patch.object(typography, "_families", faces):
                 store = self.db()
@@ -2465,7 +2528,14 @@ class SidebarPrefsStorageTests(F6Case):
 
 
 class PinFitTests(F6Case):
-    def test_zz_ten_long_pins_fit_at_every_size_in_both_themes(self) -> None:
+    def test_zz_ten_long_pins_fit_at_every_size_in_space(self) -> None:
+        self.sweep_zz(("space",))
+
+    def test_zz_ten_long_pins_fit_at_every_size_in_dark(self) -> None:
+        self.sweep_zz(("dark",))
+
+    def sweep_zz(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         store = self.db()
         longp = store.create_project(LONG_PROJECT)
         short = store.create_project("Ev")
@@ -2478,7 +2548,7 @@ class PinFitTests(F6Case):
         for c in pins:
             self.assertTrue(bridge.pinConversation(c.id))
         root = self.window(bridge)
-        for theme in ("space", "dark"):
+        for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES:
                 self.resize_still(root, width, height, 900)
@@ -2537,7 +2607,14 @@ class PinFitTests(F6Case):
                     self.close_menu(root)
         self.assertEqual(0, self.execute_calls())
 
-    def test_aaa_every_f6_action_has_a_mouse_path_at_every_size_in_both_themes(self) -> None:
+    def test_aaa_every_f6_action_has_a_mouse_path_at_every_size_in_space(self) -> None:
+        self.sweep_aaa(("space",))
+
+    def test_aaa_every_f6_action_has_a_mouse_path_at_every_size_in_dark(self) -> None:
+        self.sweep_aaa(("dark",))
+
+    def sweep_aaa(self, themes) -> None:
+        # THIZ: one theme per test method, so the parallel runner can spread them.
         from datetime import datetime, timedelta
         store = self.db()
         tez = store.create_project("Tez")
@@ -2551,7 +2628,7 @@ class PinFitTests(F6Case):
         keys = []
         real = QTest.keyClick
         with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
-            for theme in ("space", "dark"):
+            for theme in themes:
                 bridge.setTheme(theme)
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 900)
