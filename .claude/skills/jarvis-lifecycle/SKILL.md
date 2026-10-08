@@ -51,6 +51,14 @@ turns a cleanup into a boundary violation.
   `--force`) and the branch deletion the runbook names. It must **never** be
   sent through helper `finish` / `finish-current` / `cleanup`. While inside
   it, never run git against the canonical checkout.
+- **Base check before any lane work:** the chat must have been launched in
+  canonical (a chat launched from a `dev.ps1` helper folder does not load
+  canonical's `.claude/settings.json`, so `EnterWorktree` would branch from
+  `fresh` origin/main, or from the helper's own HEAD). Right after
+  `EnterWorktree`, `git log -1` must equal the prompt's expected base SHA; on a
+  mismatch STOP. Recovery without a reset: re-enter the kept worktree, then
+  `git merge --ff-only <expected base>` (only if the wrong base is an
+  ancestor).
 - A **helper-managed** task (fallback) goes through the helper lifecycle end
   to end: `dev.ps1 new` → work → `dev.ps1 finish-current` → `dev.ps1
   cleanup`. Do not hand-roll `git worktree remove` or branch deletion for it.

@@ -54,6 +54,17 @@ changed 2026-10-07 (S0d): native worktrees, no chat rebinding.
 - **Fallback:** `dev.ps1 new` / `finish` / `cleanup` (sibling helper
   worktrees) stays available. The REBOUND attestation and the "Worktree
   lifecycle — HARD RULE" below apply only to those helper worktrees.
+- **Base check (2026-10-07, F-ee lane):** code lanes start ONLY from a chat
+  launched in canonical `C:\Users\realk\Masaüstü\JARVIS`. A chat launched
+  from a `dev.ps1` helper folder (e.g. `JARVIS-Claude-6g-k1-icons`) does not
+  load canonical's `.claude/settings.json`, so `EnterWorktree` falls back to
+  `baseRef "fresh"` (origin/main, about 64 commits behind then); even with
+  `"head"` it would resolve to that helper worktree's HEAD, not main.
+- **First check of every lane prompt:** `git log -1` inside the new worktree
+  must equal the expected base SHA. On a mismatch, STOP.
+- **Recovery without a reset:** re-enter the kept worktree, then `git merge
+  --ff-only <expected base>`. This works only when the wrong base is an
+  ancestor of the expected one.
 - **Gate close:** one full suite on the integrated main HEAD (CI on the same
   SHA allowed) covers the combined result.
 - Chats: one chat per lane, and at most one chat on canonical main outside a
