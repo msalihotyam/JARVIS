@@ -67,3 +67,6 @@ OPEN ISSUES: <none | list>
 
 Real counts and durations only. A queue slice also writes the same text to
 its `NN-<slug>.report.md` (`jarvis-queue`).
+Every lane also writes the full report, exactly as reported, to
+`build/reports/<slice-id>.md` (gitignored; create the folder if missing) and
+still prints it in the chat, so Salih can just say "<slice-id> bitti".

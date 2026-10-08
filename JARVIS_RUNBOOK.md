@@ -76,6 +76,13 @@ changed 2026-10-07 (S0d): native worktrees, no chat rebinding.
 2. **MODEL / EFFORT** — the model and effort level (see policy below).
 3. **SOHBET / WORKTREE** — which chat and which worktree the work happens in.
 
+**Report files (Salih 2026-10-08):** every Claude Code lane writes its final
+report, in full and exactly as reported, to `build/reports/<slice-id>.md`
+(`build/` is gitignored; create the folder if missing). It still prints the
+report in the chat. Salih may then just tell the orchestrator "<slice-id>
+bitti"; the orchestrator reads the file from the repo instead of needing a
+paste.
+
 ## Prompt shape
 
 Keep prompts short: current state + delta + boundaries + expected output.

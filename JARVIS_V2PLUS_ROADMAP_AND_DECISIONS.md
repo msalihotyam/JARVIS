@@ -284,6 +284,20 @@ Bu fikir KESİN V2+ tasarım yönüne dahil edilmiştir.
 - Kullanıcı doğrular.
 - Birkaç başarılı çalışmadan sonra Routine/Automation’a bağlanabilir.
 
+### Skill akışı (Salih 2026-10-08)
+V2.2 kapsamındadır; V2.0 dondurulmuş kalır, buraya hiçbir şey öne çekilmez.
+
+1. Bir işe başlamadan önce JARVIS uygun bir skill arar. Biri uyuyorsa onu kullanır ve işin başında söyler ("Bu iş için X skill'ini kullanıyorum"); kullanıcı hayır diyebilir.
+2. Uyan skill yok ama benzeri varsa JARVIS onu uyarlayıp YENİ bir skill üretir; özgün skill değişmeden kalır. Yeni skill ebeveynini (provenance) kaydeder.
+3. Hiçbir şey yoksa JARVIS işi kendisi yapar.
+4. Kendisi için yeni olan bir işten sonra JARVIS "Bunu skill olarak kaydedeyim mi?" diye sorar ve taslağı (adımlar, girdiler, kontroller) gösterir. Yalnız kullanıcı onaylarsa kaydedilir.
+5. Yeniden kullanılabilir parçaları olan tek bir iş birden fazla skill üretebilir.
+6. JARVIS yalnız tekrarlanabilir ve önemsiz olmayan işler için öneride bulunur, tek seferlik işler için değil. Kullanıcı "bu tür işler için sorma" diyebilir.
+7. Bir başarısızlıktan ya da kullanıcı bir skill'in sonucunu düzelttikten sonra JARVIS güncellenmiş bir sürüm önerir. Yalnız onayla kaydedilir; eski sürümler geri alma için durur.
+8. Bir skill asla sır, kimlik bilgisi ya da kişisel veri içermez. Veri sınıflandırmasına uyar; kapsamı global ya da tek bir proje olur.
+9. Her skill kullanım sayısını, son başarıyı ve başarısızlık sayılarını tutar (Skill Health'i besler). Kullanıcının skill'leri görüntüleyip düzenleyebildiği, devre dışı bırakıp silebildiği bir skill listesi vardır.
+10. Skill prosedürdür, otorite değildir: her adım yine Core politikasından ve onaydan geçer; skill hiçbir şeyi önceden onaylayamaz (V2.2 değişmezinin yinelenmesi).
+
 ---
 
 ## V2.3 — Deep Research
