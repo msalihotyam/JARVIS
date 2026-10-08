@@ -27,14 +27,15 @@ The serial run stays the reference when a result is disputed.
 * CI: ``--shard I/N`` runs shard I of a deterministic plan (the recorded
   durations, longest first onto the least-loaded shard; units without a
   recorded duration last, each onto the least-loaded shard) and ``--report``
-  writes what it dispatched and ran; ``--aggregate DIR --shards N`` checks all
-  the shard reports against a fresh discovery and the same plan and prints one
-  combined summary.
+  writes what it dispatched and ran (with every test's seconds);
+  ``--aggregate DIR --shards N`` checks all the shard reports against a fresh
+  discovery and the same plan and prints one combined summary, and with
+  ``--write-durations`` records CI's own seconds for the next plan.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH]
                                     [--write-durations PATH] [modules ...]
-    python scripts/test_parallel.py --aggregate DIR --shards N [--durations N]
+    python scripts/test_parallel.py --aggregate DIR --shards N [--durations N] [--write-durations PATH]
 """
 
 from __future__ import annotations
@@ -307,7 +308,7 @@ def run_unit(python: str, unit: Unit, env: dict[str, str], durations: int | None
 
 
 def execute(args, units: list[Unit], ui_workers: int, workers: int) -> tuple[list[Result], dict[str, float], float, list[Path]]:
-    durations = 0 if args.write_durations else (args.durations or None)
+    durations = 0 if args.write_durations or args.report else (args.durations or None)
     bases: list[Path] = []
     results: list[Result] = []
     lock = threading.Lock()
@@ -512,7 +513,7 @@ def _write_durations(rows: list[tuple[float, str]], dispatched: list[str], path:
     split = {t: round(s, 3) for t, s in sorted(tests.items()) if classes[t.rsplit(".", 1)[0]] > SPLIT_CLASS_SECONDS / 2}
     path.write_text(json.dumps({"version": 1, "about": f"Seconds per test class from {source}, and per test for the long "
                                 "classes; scripts/test_parallel.py plans its units and CI shards from it (--write-durations "
-                                "regenerates it).",
+                                "regenerates it; CI's aggregate job writes it as ci-durations.json).",
                                 "classes": dict(sorted(classes.items())), "tests": split},
                                indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {len(classes)} class and {len(split)} test durations to {path}")
@@ -531,7 +532,7 @@ def _write_report(path: Path, shard, units, results, wall, green, rule_d, discov
         "errors": sum(r.errors for r in results),
         "accounted": all(r.accounted for r in results) and len(results) == len(units),
         "rule_d": rule_d,
-        "durations": _durations_of(results)[:200],
+        "durations": _durations_of(results),                 # every test: the aggregate writes CI's durations from them
         "discovered": sum(discovered_ids(discovery).values()),
     }, ensure_ascii=False), encoding="utf-8")
 
@@ -576,8 +577,11 @@ def aggregate(args) -> int:
             problems.append(f"shard {index}/{shards}: ran {report['ran']} of {len(report['dispatched'])} dispatched")
         if not report["green"]:
             problems.append(f"shard {index}/{shards}: red")
+        planned_ui = sum(u.weight for u in plan[index - 1] if u.ui)
+        planned_other = sum(u.weight for u in plan[index - 1] if not u.ui)
         print(f"shard {index}/{shards}: {'green' if report['green'] else 'RED'}, {report['ran']} tests in {report['wall']:.0f}s"
-              f" (skipped={report['skipped']}, failures={report['failures']}, errors={report['errors']})"
+              f" (planned UI {planned_ui:.0f}s / other {planned_other:.0f}s;"
+              f" skipped={report['skipped']}, failures={report['failures']}, errors={report['errors']})"
               + (f", rule D: {report['rule_d']}" if report["rule_d"] else ""))
     if dispatched != expected:
         _print_set_difference("the shards' dispatched ids", dispatched, expected)
@@ -589,6 +593,9 @@ def aggregate(args) -> int:
     rows = sorted((tuple(row) for r in reports.values() for row in r["durations"]), reverse=True)
     if rows:
         _print_rows(rows, args.durations or 30)
+    if args.write_durations and rows and not problems:      # never a partial plan from a red or missing shard
+        _write_durations(rows, [t for r in reports.values() for t in r["dispatched"]], Path(args.write_durations),
+                         f"CI ({shards} shards)")
     for problem in problems:
         print(f"PROBLEM: {problem}")
     green = not problems

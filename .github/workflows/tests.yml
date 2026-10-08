@@ -14,6 +14,11 @@
 # against a fresh discovery - the total count and the exact test-id set - and
 # gives the one result. The shard count is the matrix below and --shards in
 # the aggregate step: change both together.
+#
+# THIZ: the plan's durations are CI's own. Each shard report carries every
+# test's seconds; the aggregate job writes them as ci-durations.json (in the
+# ci-summary artifact). Copied over scripts/test_durations.json, they balance
+# the next runs' shards by what each unit really takes here.
 name: tests
 
 on:
@@ -119,7 +124,7 @@ jobs:
       - name: Check and combine the shards
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --aggregate shards --shards 4 --durations 30 *> ci-summary.txt
+          python scripts/test_parallel.py --aggregate shards --shards 4 --durations 30 --write-durations ci-durations.json *> ci-summary.txt
           $code = $LASTEXITCODE
           # Per shard: its workers and totals when green, its whole summary (the traces) when not.
           foreach ($file in Get-ChildItem shards -Recurse -Filter shard-summary.txt | Sort-Object FullName) {
@@ -139,5 +144,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ci-summary
-          path: ci-summary.txt
+          path: |
+            ci-summary.txt
+            ci-durations.json
           if-no-files-found: warn
