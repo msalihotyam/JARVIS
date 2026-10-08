@@ -100,6 +100,8 @@ integrates and verifies. It is not forbidden from writing code.
   acceptance proof — nothing else.
 - **Return:** concise, target <= 15 lines. Raw logs stay with the subagent;
   they are not promoted into the chief's context.
+- **Scout:** the chief may delegate mechanical lookups to `jarvis-scout` to
+  save context; it re-checks any scout fact it acts on.
 
 ## Model policy
 
@@ -111,12 +113,15 @@ Salih decisions (2026-09-30, 2026-10-02):
 | Sonnet 5.5, high | Well-scoped implementation |
 | Opus 5.5, high | Design, preflight, diagnosis; DEFAULT for gates, including security-sensitive store/bridge/UI work backed by strong acceptance tests |
 | Opus 5.5, xhigh | Changes to Core authority / approval / attestation code, or after a high run got stuck once on the same problem |
+| Haiku 5.5 (jarvis-scout subagent only) | Mechanical read-only lookups: locate, list, count, extract from saved logs. Facts with path:line; the caller verifies anything it acts on |
 
 - Effort floor stays medium (no low), never above xhigh.
 - Opus stuck twice on the same problem: the orchestrator PROPOSES Fable 5.1.
   Fable 5.1 still runs only with Salih's explicit approval.
-- Read-only search / log / scan subagents may run on Sonnet 5.5; code-writing
-  and decision work stays on Opus.
+- Purely mechanical lookups go to `jarvis-scout` (Haiku 5.5); read-only work
+  that needs judgment (diagnosis, "why", review) stays on Sonnet 5.5 or Opus;
+  code-writing and decision work stays on Opus; Haiku never writes code, never
+  reviews, and never decides.
 - Every prompt carries `MODEL:` / `EFFORT:` lines.
 - Orchestrator chat default effort is high. When a turn needs more (6C design,
   V2.1 memory design, verifying Codex findings, unclear root cause), the
