@@ -363,8 +363,22 @@ Salih decision (2026-10-06):
 
 Salih decision (2026-10-06): docs slices, and core/logic slices whose required
 tier runs on Linux, may run in Claude Code cloud sessions while the PC is off.
-Slices that need Windows UI evidence may not. Pushing a cloud branch: **pending
-Salih decision** - cloud sessions are not used until it is recorded here.
+Slices that need Windows UI evidence may not.
+
+Pushing (Salih decision, 2026-10-08, "bulut: evet"):
+
+- A Claude Code cloud session may push ONLY its own `claude/*` (or `ci/*`)
+  branch to GitHub. Pushing `main`, or any branch that is not its own, is
+  forbidden. `main` is pushed only with Salih's explicit per-time
+  authorization, as before.
+- Integration of a cloud branch into `main` follows "Parallel lanes": only on
+  Salih's "entegre et"; done from a chat launched in canonical; fetch the
+  branch, then ff-merge or cherry-pick; on a conflict, abort and report; then
+  the tier's verification and `scripts\ci.ps1`.
+- Cloud slices keep the existing scope: docs, and core/logic slices whose
+  required tier runs on Linux. Never slices that need Windows UI evidence.
+- A cloud prompt states its expected base SHA, and the session checks it
+  first. On a mismatch: STOP.
 
 ## V2.0 scope freeze
 
