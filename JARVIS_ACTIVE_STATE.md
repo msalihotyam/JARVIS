@@ -25,16 +25,18 @@ waiting for Salih's "entegre et".
 
 ## Open blockers
 
-- OB1 Part 1 (K2 fix-up, destructive confirm input guard) BLOCKED: its full
-  suite had 3 failures, each green alone 3/3: `test_projects_ui_6f`
-  `SidebarShellTests.test_i...` at 1100x700 and 1920x1080 (still frame taken
-  mid-reflow, the F-ee2 defect) and `test_browser_lifecycle`
-  `FailClosedTests.test_a...`; none is on the load-sensitive list. Uncommitted
-  in `.claude/worktrees/6g-k2-motion`: `jarvis/ui/qml/theme/Theme.qml`,
-  `jarvis/ui/qml/components/JarvisDialog.qml`,
+- OB1 (continue) BLOCKED at step B: K2 fix-up (confirm input guard) + F-ee2
+  (6f still-frame) are done and every F-ee2 proof is green, but the one full
+  suite on the combined tree had 3 `test_ui` failures, each green alone 3/3:
+  `ConversationUxTests.test_a_new_reply_glides_once_to_the_end_and_idle_does_not_move`,
+  `ConversationSurfaceTests.test_conversation_scrolling_keeps_the_reading_position`,
+  `MacroGeometryTests.test_main_and_dark_share_one_macro_layout` (1280x760,
+  measured mid-reflow); 14 other python processes were running. None is on the
+  load-sensitive list. Uncommitted in `.claude/worktrees/6g-k2-motion`:
+  `jarvis/ui/qml/theme/Theme.qml`, `jarvis/ui/qml/components/JarvisDialog.qml`,
   `jarvis/ui/qml/overlays/ConfirmDialog.qml`, `tests/test_projects_ui_6e.py`,
-  `tests/test_motion_6g.py`, `tests/test_conversation_lifecycle_6d.py`.
-  OB1 Parts 2-4 not started.
+  `tests/test_motion_6g.py`, `tests/test_conversation_lifecycle_6d.py`,
+  `tests/test_projects_ui_6f.py`. OB1 Parts 3-4 not started.
 
 ## Do not reopen
 
@@ -53,8 +55,13 @@ waiting for Salih's "entegre et".
 ## Decisions / external / backlog
 
 - Load-sensitive list (RUNBOOK rule D; only the orchestrator edits):
-  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b` and
-  `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`.
+  `test_ui.RailSwitchTests.test_switching_cards_closes_a_then_opens_b`,
+  `test_ui.PrePolishTests.test_the_gauges_show_the_kernel_s_figures_or_nothing_at_all`
+  and
+  `test_browser_lifecycle.FailClosedTests.test_a_refusal_the_browser_will_not_acknowledge_destroys_the_tab`
+  (orchestrator 2026-10-08: CDP timing under load; passes alone 3/3; follow-up
+  F-bl makes its wait event-driven). `scripts/test_parallel.py` reruns only
+  `test_ui` ids itself; rule D for the others is applied by hand.
 - Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
 - Push: `main` not authorized; `ci/*` branches are standing-authorized
   (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
