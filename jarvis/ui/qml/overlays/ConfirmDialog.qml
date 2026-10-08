@@ -18,11 +18,17 @@ Item {
 
     property string cancelLabel: qsTr("Back")
     function ask(title, message, confirmLabel, danger, fn, cancelLabel) {
+        dialog.armed = false; armTimer.restart()           // a re-ask while open is guarded again
         dialog.title = title; dialog.message = message; dialog.confirmLabel = confirmLabel; dialog.danger = danger; dialog.onConfirm = fn
         dialog.cancelLabel = cancelLabel || qsTr("Back"); dialog.open = true
     }
 
-    // K2: a destructive confirmation (danger) has no motion - it appears and goes at once.
+    // K2: a destructive confirmation (danger) has no motion - it appears and goes at once -
+    // and an input guard instead: its confirm arms Theme.confirmGuardMs after it opens
+    // (ambient effects on or off) and disarms the moment it closes.
+    property bool armed: false
+    Timer { id: armTimer; interval: Theme.confirmGuardMs; onTriggered: dialog.armed = true }
+    onOpenChanged: { armTimer.stop(); armed = false; if (open) armTimer.start() }
     Rectangle { id: dim; anchors.fill: parent; color: "#000000"; opacity: dialog.open ? 0.5 : 0
         Behavior on opacity { enabled: !dialog.danger; NumberAnimation { duration: Theme.pageMs } }
         MouseArea { anchors.fill: parent; enabled: dialog.open } }
@@ -46,7 +52,8 @@ Item {
             Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font: Theme.body }
             Row { spacing: 10; anchors.right: parent.right
                 ActionButton { objectName: "confirmCancel"; label: dialog.cancelLabel; onClicked: dialog.open = false }
-                ActionButton { objectName: "confirmAccept"; label: dialog.confirmLabel; primary: true; danger: dialog.danger; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }
+                ActionButton { objectName: "confirmAccept"; label: dialog.confirmLabel; primary: true; danger: dialog.danger
+                               enabled: !dialog.danger || dialog.armed; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }
             }
         }
     }

@@ -298,6 +298,7 @@ Item {
     anchors.fill: parent; z: 10000                  // above the window's own full-size layers
     property int confirmed: 0
     property int lines: 2
+    readonly property int guardMs: Theme.confirmGuardMs
     ActionButton { id: before; objectName: "h6eBefore"; label: "Before"; x: 40; y: 300
                    onClicked: dialog.openFrom(before) }
     Segmented { objectName: "h6eSegmented"; x: 160; y: 300; value: "a"
@@ -511,47 +512,76 @@ class DialogShellTests(SharedPartsCase):
         settle(lambda: not dialog.property("visible"))
         self.assertEqual((0, "history"), (harness.property("confirmed"), bridge.page))
         self.assertTrue(self.obj("h6eBefore").hasActiveFocus())
-        # Enter on the focused confirm button confirms; with opt-in an unguarded field does too.
+        # Enter on the focused confirm button confirms; with opt-in an unguarded field does too
+        # (each once the confirm guard has armed: test_p / test_q).
         self.open(dialog)
-        settle(lambda: dialog.property("opened"))
+        settle(lambda: dialog.property("opened") and confirm.isEnabled())
         confirm.forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Return)
         settle(lambda: not dialog.property("visible"))
         self.open(dialog)
-        settle(lambda: dialog.property("opened"))
+        settle(lambda: dialog.property("opened") and confirm.isEnabled())
         field.forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Return)
         settle(lambda: not dialog.property("visible"))
         self.assertEqual(2, harness.property("confirmed"))
 
-    def test_p_a_destructive_dialog_has_no_motion_with_ambient_on(self) -> None:
-        # Gate 6G K2 (effect plan, no-effect list): a destructive dialog (danger)
-        # appears and goes at once; was pageMs 220 in / panelOut 150 out. The
-        # motion tokens stay pinned on a non-destructive dialog (test_aj).
-        bridge = self.bridge()
-        root, _ = self.harness(bridge)
-        dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
+    def assert_destructive_open_at_once_and_confirm_guarded(self, root, harness) -> None:
+        """Gate 6G K2: a destructive dialog has no motion (it is open, opaque and at full
+        scale at once) and, in its place, a motion-free input guard: confirm is off right
+        after it opens - a click, Enter (opted in) and Space all do nothing - arms only after
+        Theme.confirmGuardMs, and is off again the moment closing begins. A reopen guards
+        again; the armed confirm then works by Enter."""
+        dialog, confirm, field = self.obj("h6eDialog"), self.obj("h6eConfirm"), self.obj("h6eField")
+        guard = harness.property("guardMs") / 1000
+        self.assertEqual(0.3, guard)
+        dialog.setProperty("enterConfirms", True)
+        confirmed = harness.property("confirmed")
+        called = time.monotonic()
         self.open(dialog)                                     # no pumping between the call and the checks
         self.assertTrue(dialog.property("opened"))
         self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        self.assertTrue(confirm.isEnabled())
         self.assertEqual([1.0], [s.opacity() for s in self.scrims()])
+        self.assertFalse(confirm.isEnabled())                 # the guard: not right after it opens
+        center = confirm.mapToScene(QPointF(confirm.width() / 2, confirm.height() / 2)).toPoint()
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
+        field.forceActiveFocus()
+        QTest.keyClick(root, Qt.Key_Return)                   # Enter in an opted-in field: guarded too
+        confirm.forceActiveFocus()
+        QTest.keyClick(root, Qt.Key_Space)
+        if time.monotonic() - called < guard - 0.05:          # all of it inside the guard window
+            self.assertFalse(confirm.hasActiveFocus())        # nor can Space reach it
+            self.assertFalse(confirm.isEnabled())
+            self.assertEqual((confirmed, True), (harness.property("confirmed"), dialog.property("visible")))
+        settle(lambda: confirm.isEnabled())
+        self.assertTrue(confirm.isEnabled())
+        self.assertGreaterEqual(time.monotonic() - called, guard - 0.03)
+        self.assertEqual((confirmed, True), (harness.property("confirmed"), dialog.property("visible")))
         QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(dialog.property("visible"))
+        self.assertFalse(confirm.isEnabled())                 # off the moment closing begins
+        self.assertFalse(dialog.property("visible"))          # and closed at once
+        self.assertTrue(self.obj("h6eBefore").hasActiveFocus())
+        self.open(dialog)
+        self.assertFalse(confirm.isEnabled())                 # a reopen is guarded again
+        settle(lambda: confirm.isEnabled())
+        field.forceActiveFocus()
+        QTest.keyClick(root, Qt.Key_Return)
+        settle(lambda: not dialog.property("visible"))
+        self.assertEqual(confirmed + 1, harness.property("confirmed"))
 
-    def test_q_ambient_off_means_no_motion_and_end_states_at_once(self) -> None:
+    def test_p_a_destructive_dialog_opens_at_once_with_a_confirm_guard_ambient_on(self) -> None:
+        # Gate 6G K2: no motion (was pageMs 220 in / panelOut 150 out; the motion tokens
+        # stay pinned on a non-destructive dialog, test_aj) and confirm stays off while
+        # opening and closing, now by the motion-free guard.
+        bridge = self.bridge()
+        root, harness = self.harness(bridge)
+        self.assert_destructive_open_at_once_and_confirm_guarded(root, harness)
+
+    def test_q_ambient_off_means_no_motion_and_the_same_confirm_guard(self) -> None:
         bridge = self.bridge()
         bridge.setAmbientEffects(False)
-        root, _ = self.harness(bridge)
-        dialog, confirm = self.obj("h6eDialog"), self.obj("h6eConfirm")
-        self.open(dialog)                                     # no pumping between the call and the checks
-        self.assertTrue(dialog.property("opened"))
-        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        self.assertTrue(confirm.isEnabled())
-        self.assertEqual([1.0], [s.opacity() for s in self.scrims()])
-        QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(dialog.property("visible"))
-        self.assertTrue(self.obj("h6eBefore").hasActiveFocus())
+        root, harness = self.harness(bridge)
+        self.assert_destructive_open_at_once_and_confirm_guarded(root, harness)
 
 
 class SegmentedFocusTests(SharedPartsCase):
@@ -942,30 +972,31 @@ class DialogKeyboardTests(DialogAdoptionCase):
 
 
 class DialogMotionTests(DialogAdoptionCase):
-    def test_ab_the_delete_dialog_has_no_motion_and_ambient_off_is_instant(self) -> None:
+    def test_ab_the_delete_dialog_opens_at_once_with_a_confirm_guard_ambient_on_and_off(self) -> None:
         store, bridge, root = self.stage()
         bridge.setPage("history")
         pump(400)
         dialog = root.findChildren(QObject, "conversationDeleteDialog")[0]
         confirm = dialog.findChild(QObject, "deleteConfirm")
-        # Gate 6G K2 (no-effect list): the destructive delete dialog appears and
-        # goes at once with ambient on too; was pageMs 220 in / panelOut 150 out.
-        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
-        self.assertTrue(dialog.property("shown"))
-        self.assertTrue(dialog.property("opened"))
-        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        self.assertTrue(confirm.isEnabled())
-        QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(dialog.property("visible"))
-        # Ambient effects off: every dialog at once.
-        bridge.setAmbientEffects(False)
-        pump(100)
-        QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
-        self.assertTrue(dialog.property("opened"))
-        self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
-        self.assertTrue(confirm.isEnabled())
-        QMetaObject.invokeMethod(dialog, "close")
-        self.assertFalse(dialog.property("visible"))
+        # Gate 6G K2 (no-effect list): the destructive delete dialog appears and goes at
+        # once (was pageMs 220 in / panelOut 150 out); its confirm keeps the motion-free
+        # guard instead - off while opening and closing - with ambient effects on and off.
+        for ambient in (True, False):
+            with self.subTest(ambient=ambient):
+                bridge.setAmbientEffects(ambient)
+                pump(100)
+                called = time.monotonic()
+                QMetaObject.invokeMethod(dialog, "openFor", Q_ARG("QVariant", self.doomed))
+                self.assertTrue(dialog.property("shown"))
+                self.assertTrue(dialog.property("opened"))
+                self.assertEqual((1.0, 1.0), (dialog.property("opacity"), dialog.property("scale")))
+                self.assertFalse(confirm.isEnabled())                            # not while opening
+                settle(lambda: confirm.isEnabled())
+                self.assertTrue(confirm.isEnabled())
+                self.assertGreaterEqual(time.monotonic() - called, 0.3 - 0.03)   # Theme.confirmGuardMs
+                QMetaObject.invokeMethod(dialog, "close")
+                self.assertFalse(confirm.isEnabled())                            # nor while closing
+                self.assertFalse(dialog.property("visible"))
         for name in ("attachDialog", "purgeDialog"):
             if name == "purgeDialog":
                 bridge.showProject(self.home_project.id)

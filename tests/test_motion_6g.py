@@ -25,7 +25,7 @@ import unittest
 
 from tests.test_ui import _APP, UiTestCase, pump  # noqa: F401 - the offscreen platform and the application
 
-from PySide6.QtCore import QPointF, QUrl  # noqa: E402
+from PySide6.QtCore import Q_ARG, QMetaObject, QPointF, QUrl  # noqa: E402
 from PySide6.QtQml import QQmlComponent, QQmlEngine  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
@@ -117,7 +117,10 @@ class DurationGateTests(unittest.TestCase):
                           "hoverMs", "pressMs", "attachMs"}, set(tokens))
         for name, value in tokens.items():
             self.assertTrue(LOW <= int(value) <= HIGH, (name, value))
-        self.assertNotRegex(text, r"readonly property int \w+(?:Ms|In|Out|reflow): \d")
+        # The one plain number: the confirm guard is an input guard, not motion, so ambient
+        # off never removes it (K2 fix-up).
+        self.assertIn("readonly property int confirmGuardMs: 300", text)
+        self.assertNotRegex(text, r"readonly property int (?!confirmGuardMs:)\w+(?:Ms|In|Out|reflow): \d")
         for _line, _kind, expr in durations(text):
             self.assertTrue(expr.startswith("theme.dur("), expr)
 
@@ -252,6 +255,46 @@ class LiveMotionTests(UiTestCase):
                 QTest.mouseMove(root, root.contentItem().mapToScene(QPointF(960, 600)).toPoint())
                 pump(60)
                 self.assertFalse(tip.property("shown"))
+
+    def test_a_destructive_confirm_dialog_guards_its_confirm_with_ambient_on_and_off(self) -> None:
+        # K2 fix-up: ConfirmDialog (archive job, ...) with danger has no motion and a
+        # motion-free guard: confirm is off for Theme.confirmGuardMs after it opens and off
+        # the moment it closes; a non-destructive one (Quit) is unchanged.
+        import time
+        bridge, root = self.window()
+        accept = self.item(root, "confirmAccept")
+        dialog = accept.parentItem()
+        while dialog is not None and dialog.property("armed") is None:
+            dialog = dialog.parentItem()
+        self.assertIsNotNone(dialog)
+        for ambient in (True, False):
+            with self.subTest(ambient=ambient):
+                bridge.setAmbientEffects(ambient)
+                pump(100)
+                dialog.setProperty("danger", True)
+                called = time.monotonic()
+                dialog.setProperty("open", True)
+                self.assertFalse(accept.isEnabled())                      # not right after it opens
+                for _ in range(100):
+                    if accept.isEnabled():
+                        break
+                    pump(10)
+                self.assertTrue(accept.isEnabled())
+                self.assertGreaterEqual(time.monotonic() - called, 0.3 - 0.03)
+                dialog.setProperty("open", False)
+                self.assertFalse(accept.isEnabled())                      # off the moment it closes
+                dialog.setProperty("danger", False)
+                dialog.setProperty("open", True)
+                self.assertTrue(accept.isEnabled())                       # non-destructive: unchanged
+                pump(350)                                                 # up past the guard window
+                # A destructive re-ask while it is still open (Quit up, then Archive) is guarded again.
+                QMetaObject.invokeMethod(dialog, "ask", Q_ARG("QVariant", "Archive job"), Q_ARG("QVariant", "Archive?"),
+                                         Q_ARG("QVariant", "Archive"), Q_ARG("QVariant", True), Q_ARG("QVariant", ""),
+                                         Q_ARG("QVariant", "Back"))
+                self.assertTrue(dialog.property("open"))
+                self.assertFalse(accept.isEnabled())
+                dialog.setProperty("open", False)
+                pump(300)
 
     def test_the_core_s_idle_life_is_fainter_and_slower_than_every_real_event(self) -> None:
         _bridge, root = self.window()

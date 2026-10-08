@@ -20,23 +20,12 @@ S0 speed-up is done: S0a rules (2eb095b), S0b test/CI speed (7bb272b; local
 full suite 445 s, CI 4 shards 11.3 min). **Gate 6G** is under way: K1 icon
 set and the F-ee reflow fix are on main; **K2** motion contract (Theme.dur
 gate, 4 px travel, one HoverTip, calm idle core, destructive dialogs at once)
-is committed on lane branch `worktree-6g-k2-motion` (full suite green, 4764),
-waiting for Salih's "entegre et".
+is on lane branch `worktree-6g-k2-motion` with its fix-up (destructive
+confirm keeps a motion-free 300 ms input guard) and the test-settling fixes
+F-ee2 (6f) and F-ee3 (test_ui): one full suite green under rule D (4765).
+Next: OB1 Part 3 integrates the lane (delegated T1), then Part 4 (MA-guard).
 
-## Open blockers
-
-- OB1 (continue) BLOCKED at step B: K2 fix-up (confirm input guard) + F-ee2
-  (6f still-frame) are done and every F-ee2 proof is green, but the one full
-  suite on the combined tree had 3 `test_ui` failures, each green alone 3/3:
-  `ConversationUxTests.test_a_new_reply_glides_once_to_the_end_and_idle_does_not_move`,
-  `ConversationSurfaceTests.test_conversation_scrolling_keeps_the_reading_position`,
-  `MacroGeometryTests.test_main_and_dark_share_one_macro_layout` (1280x760,
-  measured mid-reflow); 14 other python processes were running. None is on the
-  load-sensitive list. Uncommitted in `.claude/worktrees/6g-k2-motion`:
-  `jarvis/ui/qml/theme/Theme.qml`, `jarvis/ui/qml/components/JarvisDialog.qml`,
-  `jarvis/ui/qml/overlays/ConfirmDialog.qml`, `tests/test_projects_ui_6e.py`,
-  `tests/test_motion_6g.py`, `tests/test_conversation_lifecycle_6d.py`,
-  `tests/test_projects_ui_6f.py`. OB1 Parts 3-4 not started.
+## Open blockers: none.
 
 ## Do not reopen
 
@@ -60,8 +49,13 @@ waiting for Salih's "entegre et".
   and
   `test_browser_lifecycle.FailClosedTests.test_a_refusal_the_browser_will_not_acknowledge_destroys_the_tab`
   (orchestrator 2026-10-08: CDP timing under load; passes alone 3/3; follow-up
-  F-bl makes its wait event-driven). `scripts/test_parallel.py` reruns only
-  `test_ui` ids itself; rule D for the others is applied by hand.
+  F-bl makes its wait event-driven),
+  `test_ui.ConversationUxTests.test_a_new_reply_glides_once_to_the_end_and_idle_does_not_move`
+  and
+  `test_ui.ConversationSurfaceTests.test_conversation_scrolling_keeps_the_reading_position`
+  (orchestrator 2026-10-08: scroll-animation timing under load; pass alone;
+  follow-up F-sc makes their waits event-driven). `scripts/test_parallel.py`
+  reruns only `test_ui` ids itself; rule D for the others is applied by hand.
 - Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
 - Push: `main` not authorized; `ci/*` branches are standing-authorized
   (RUNBOOK "Push"); CI = `scripts\ci.ps1`.

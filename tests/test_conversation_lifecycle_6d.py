@@ -44,7 +44,7 @@ from jarvis.conversation import ConversationState, ConversationStore, append_tur
 from jarvis.intent import IntentStatus
 from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import make_task, safe_cleanup
+from tests.helpers import make_task, safe_cleanup, wait_until
 from tests.test_chain_cancel_cli import DECLARATION
 from tests.test_intent import IntentTestCase, ScriptedModel, chat_proposal
 from tests.test_projects_ui import ProjectsUiCase
@@ -512,6 +512,13 @@ class WindowCase(ProjectsUiCase):
         QTest.mouseClick(root, button, Qt.NoModifier, center)
         pump(260)
 
+    def confirm_delete(self, root) -> None:
+        """Gate 6G K2: the destructive confirm arms Theme.confirmGuardMs (300 ms) after the
+        dialog opens; press it once armed (the old 260 ms wait fell inside the guard)."""
+        confirm = self.visible(root, "deleteConfirm")[0]
+        wait_until(confirm.isEnabled, 1000)
+        self.press(root, confirm)
+
     def visible(self, root, name) -> list:
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
@@ -532,7 +539,7 @@ class WindowCase(ProjectsUiCase):
     def delete_open(self, root) -> None:
         self.context(root)
         self.press(root, self.item(root, "conversationDeleteItem"))
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
 
     def gone(self, bridge, store, conversation_id: str) -> None:
         self.assertNotEqual(conversation_id, bridge.conversationId)
@@ -589,7 +596,7 @@ class TransitionTests(WindowCase):
         self.assertFalse(self.item(root, "conversationArchiveItem").isEnabled())    # already read-only
         self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())       # directly under an archived project
         self.press(root, self.item(root, "conversationDeleteItem"))
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
         self.gone(bridge, store, owned.id)
         self.assertEqual((global_id, "history"), (bridge.conversationId, bridge.page))
 
@@ -685,7 +692,7 @@ class ArchivedSectionTests(WindowCase):
         self.assertFalse(bridge.unarchiveConversation(archived.id))                       # a forced call meets the store
         self.assertIn("unarchive the project first", bridge.conversationNotice)
         self.press(root, self.visible(root, "projectArchivedConversationDelete")[0])
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
         self.assertTrue(store.is_conversation_deleted(archived.id))
         self.assertEqual([], bridge.projectArchivedConversations)
 
@@ -738,7 +745,7 @@ class DialogTests(WindowCase):
         self.assertTrue(texts("deleteIdentity").startswith("«Yeni Sohbet» · 1 mesaj · "))
         self.assertEqual("Ayrıca eski sürümün sohbet dosyası (~/.jarvis/conversation.json) yerinde kalır.",
                          texts("deleteLegacy"))
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
         self.assertTrue(store.is_conversation_deleted(imported.id))
         self.assertTrue(legacy.exists())                                            # S4: the file stays
         self.assertIsNone(store.import_legacy_conversation(legacy))
@@ -758,12 +765,12 @@ class DialogTests(WindowCase):
         calls, real = [], bridge.backend.conversation_delete
         bridge.backend.conversation_delete = lambda *a, **k: calls.append(k) or real(*a, **k)
         before = snapshot(self.database)
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
         self.assertEqual(before, snapshot(self.database))
         self.assertEqual(1, len(calls))                                             # one call, never retried
         self.assertIn("preview again", bridge.conversationNotice)
         self.assertEqual("Başka ad", bridge.deletePreview["title"])                # the refreshed preview
-        self.press(root, self.visible(root, "deleteConfirm")[0])
+        self.confirm_delete(root)
         self.assertTrue(store.is_conversation_deleted(conversation.id))
 
     def test_g_busy_disables_every_item_and_delete_needs_an_archive_first(self) -> None:

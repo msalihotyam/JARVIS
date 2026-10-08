@@ -34,6 +34,10 @@ QtObject {
     readonly property int hoverMs: dur(120)
     readonly property int pressMs: dur(120)
     readonly property int attachMs: dur(150)
+    // NOT motion, so NOT gated by ambient: a destructive dialog's confirm (and
+    // Enter) arm this long after it opens, so the second click of the gesture
+    // that opened it can never land on confirm.
+    readonly property int confirmGuardMs: 300
     readonly property int ease: Easing.OutCubic
     readonly property int easeInOut: Easing.InOutCubic
 

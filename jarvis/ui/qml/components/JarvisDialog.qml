@@ -65,7 +65,17 @@ Popup {
         NumberAnimation { property: "opacity"; to: 0; duration: Theme.panelOut; easing.type: Theme.ease }
     }
 
-    Binding { target: dialog.confirmItem; property: "enabled"; value: dialog.opened && dialog.confirmEnabled
+    // A destructive dialog has no motion, so an input guard keeps the opening
+    // gesture's second click off confirm: confirm (and Enter, which needs it
+    // enabled) arms Theme.confirmGuardMs after the dialog opens - ambient
+    // effects on or off - and disarms the moment it starts to close. A press
+    // that began before the dialog opened stays grabbed by its own item.
+    property bool armed: false
+    readonly property Timer armTimer: Timer { interval: Theme.confirmGuardMs; onTriggered: dialog.armed = true }
+    onOpened: { armed = false; armTimer.restart() }
+    onAboutToHide: { armTimer.stop(); armed = false }
+    Binding { target: dialog.confirmItem; property: "enabled"
+              value: dialog.opened && dialog.confirmEnabled && (!dialog.danger || dialog.armed)
               when: dialog.confirmItem !== null }
 
     onAboutToShow: if (!opener) opener = parent ? parent.Window.activeFocusItem : null
