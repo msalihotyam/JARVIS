@@ -1511,9 +1511,12 @@ class PunchListCase(SidebarNavCase):
         return [i for i in self.all_items(root, "hoverTipText") if i.isVisible()]
 
     def hover(self, root, item) -> None:
+        # THIZ: the point is read while ``item`` is the one asked for; a rail that rebuilds its
+        # tiles during the pump below would leave a deleted item (base 072d0fe hit it under load).
+        target = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseMove(root, QPoint(2, 2))
         pump(30)
-        QTest.mouseMove(root, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
+        QTest.mouseMove(root, target)
 
     def running(self, bridge, name: str) -> None:
         import time
