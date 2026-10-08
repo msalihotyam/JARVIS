@@ -37,7 +37,7 @@ from jarvis.memory import (
     SQLiteMemoryStore,
 )
 from jarvis.settings import Settings
-from tests.helpers import make_task, safe_cleanup
+from tests.helpers import make_task, safe_cleanup, settled
 from tests.test_chain_cancel_cli import DECLARATION
 from tests.test_intent import IntentTestCase, ScriptedModel, chat_proposal, task_proposal
 from tests.test_project_files import OBJECTIVE, RELEVANT, CoreFileCase
@@ -355,16 +355,18 @@ class AttachWindowTests(ProjectsUiCase):
         self.assertTrue(bridge.canAttach)
         self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())             # Global only (L3)
         bridge.openConversation(owned.id)
-        pump(200)
-        self.assertFalse(bridge.canAttach)
-        self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
+        settled(200, lambda: (
+            self.assertFalse(bridge.canAttach),
+            self.assertFalse(self.item(root, "chatHeaderAttach").isVisible()),
+        ))
         bridge.openProjectScope("")
         pump(200)
         store.archive_conversation(bridge.conversationId)
         bridge.refreshProjects()
-        pump(100)
-        self.assertFalse(bridge.canAttach)
-        self.assertFalse(self.item(root, "chatHeaderAttach").isVisible())
+        settled(100, lambda: (
+            self.assertFalse(bridge.canAttach),
+            self.assertFalse(self.item(root, "chatHeaderAttach").isVisible()),
+        ))
 
     def test_e_preview_changed_refresh_and_confirm(self) -> None:
         store = self.db()
@@ -460,8 +462,9 @@ class AttachWindowTests(ProjectsUiCase):
                 pump(60)
                 self.assertTrue(bridge.confirmAttach(project.id, ""), bridge.attachNotice)
             bridge.submitText("Bu projeyi incele.")
-            pump(100)
-            self.assertTrue(bridge.approvalPending)
+            settled(100, lambda: (
+                self.assertTrue(bridge.approvalPending),
+            ))
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
             decisions.append((request.scope, request.risk_level, request.side_effect, request.reason))

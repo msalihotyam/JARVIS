@@ -33,6 +33,7 @@ from jarvis.intent import NL_CAPABILITIES
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.ui.present import _compact, approval_card
 from tests import test_ui
+from tests.helpers import settled
 from tests.test_ui import UiTestCase, _APP, pump
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 
@@ -88,8 +89,9 @@ class NavigationTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.click(root, "navigationTrigger")
-        self.click(root, "navigate_projects")
-        self.assertEqual(("projects", "projects"), (bridge.page, root.property("loadedPage")))
+        self.click(root, "navigate_projects", then=lambda: (
+            self.assertEqual(("projects", "projects"), (bridge.page, root.property("loadedPage"))),
+        ))
         bridge.setPage("home")
         pump(300)
         QTest.keyClick(root, Qt.Key_6, Qt.ControlModifier)
@@ -98,13 +100,15 @@ class NavigationTests(ProjectsUiCase):
         # Window-only: a release that does not know the page never reads it.
         self.assertNotEqual("projects", json.loads(self.prefs_path.read_text(encoding="utf-8"))["page"])
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(400)
-        self.assertEqual("home", bridge.page)
+        settled(400, lambda: (
+            self.assertEqual("home", bridge.page),
+        ))
         QTest.keyClick(root, Qt.Key_5, Qt.ControlModifier)
-        pump(400)
-        self.assertEqual("history", root.property("loadedPage"))
-        self.assertNotIn(owned.id, [row["id"] for row in bridge.conversations])      # History: Global only
-        self.assertEqual(0, self.execute_calls())
+        settled(400, lambda: (
+            self.assertEqual("history", root.property("loadedPage")),
+            self.assertNotIn(owned.id, [row["id"] for row in bridge.conversations]),      # History: Global only
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
 
 class ListTests(ProjectsUiCase):
@@ -132,17 +136,19 @@ class ListTests(ProjectsUiCase):
         bridge.renameProject(records["Tez"]["id"], "Tez 2025")
         pump(60)
         bridge.archiveProject(records["Tez"]["id"])
-        pump(200)
-        self.assertEqual({"Evim": True, "Tez 2025": False}, {r["name"]: r["active"] for r in bridge.projectRecords})
-        self.assertTrue(self.item(root, "projectsArchivedHeading").isVisible())
+        settled(200, lambda: (
+            self.assertEqual({"Evim": True, "Tez 2025": False}, {r["name"]: r["active"] for r in bridge.projectRecords}),
+            self.assertTrue(self.item(root, "projectsArchivedHeading").isVisible()),
+        ))
         names = self.texts(root, "projectRowName")
         self.assertEqual(["Evim", "Tez 2025"], names)                           # active first, then archived
         self.assertFalse(any(text.startswith("p-") for text in names))
         self.assertEqual(1, len([u for u in self.all_items(root, "projectUnarchive") if u.isVisible()]))
         bridge.unarchiveProject(records["Tez"]["id"])
-        pump(200)
-        self.assertTrue(all(r["active"] for r in bridge.projectRecords))
-        self.assertFalse(self.item(root, "projectsArchivedHeading").isVisible())
+        settled(200, lambda: (
+            self.assertTrue(all(r["active"] for r in bridge.projectRecords)),
+            self.assertFalse(self.item(root, "projectsArchivedHeading").isVisible()),
+        ))
 
 
 class DetailTests(ProjectsUiCase):
@@ -154,20 +160,22 @@ class DetailTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.showProject(a.id)
-        pump(400)
-        self.assertEqual([a1.id], [row["id"] for row in bridge.projectConversations])
-        self.assertEqual("A", self.item(root, "projectDetailName").property("text"))
+        settled(400, lambda: (
+            self.assertEqual([a1.id], [row["id"] for row in bridge.projectConversations]),
+            self.assertEqual("A", self.item(root, "projectDetailName").property("text")),
+        ))
         before = len(store.list_conversations())
         self.assertTrue(bridge.newProjectConversation(a.id))
         self.assertEqual(before + 1, len(store.list_conversations()))
         self.assertEqual(a.id, store.load_conversation(bridge.conversationId).project_id)
         bridge.showProject(a.id)
-        pump(300)
-        self.assertEqual(2, len(bridge.projectConversations))
-        # No move control here: the only owner change is the Gate 6C
-        # Global -> project attach, offered in the top-bar selector alone.
-        self.assertEqual([], [n for n in ("projectMove", "conversationMove", "moveConversation")
-                              if self.all_items(root, n)])
+        settled(300, lambda: (
+            self.assertEqual(2, len(bridge.projectConversations)),
+            # No move control here: the only owner change is the Gate 6C
+            # Global -> project attach, offered in the top-bar selector alone.
+            self.assertEqual([], [n for n in ("projectMove", "conversationMove", "moveConversation")
+                                  if self.all_items(root, n)]),
+        ))
 
     def test_c_the_store_path_refuses_an_archived_or_unknown_owner(self) -> None:
         store = self.db()
@@ -234,26 +242,29 @@ class ArchivedTests(ProjectsUiCase):
         store.set_project_active(project.id, False)
         root = self.window(bridge)
         bridge.openConversation(owned.id)
-        pump(400)
-        self.assertTrue(bridge.conversationReadOnly)
-        self.assertTrue(self.item(root, "readOnlyBanner").isVisible())
-        self.assertIn("Tez", self.item(root, "readOnlyReason").property("text"))
-        self.assertFalse(self.item(root, "composerInput").isEnabled())
-        self.assertEqual("Tez · archived", self.item(root, "chatHeaderScope").property("fullName"))
+        settled(400, lambda: (
+            self.assertTrue(bridge.conversationReadOnly),
+            self.assertTrue(self.item(root, "readOnlyBanner").isVisible()),
+            self.assertIn("Tez", self.item(root, "readOnlyReason").property("text")),
+            self.assertFalse(self.item(root, "composerInput").isEnabled()),
+            self.assertEqual("Tez · archived", self.item(root, "chatHeaderScope").property("fullName")),
+        ))
         # A submit forced through the bridge still meets Core's refusal.
         bridge.submitText("zorla gönder")
-        pump(200)
-        self.assertEqual([], self.model.calls)
+        settled(200, lambda: (
+            self.assertEqual([], self.model.calls),
+        ))
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
         self.assertIn("read-only", "\n".join(e["text"] for e in bridge.activity + bridge.feed).lower())
         bridge.showProject(project.id)
-        pump(400)
-        self.assertTrue(self.item(root, "projectArchivedBanner").isVisible())
-        self.assertEqual(["Tez hatırlatma"], [job["label"] for job in bridge.projectJobs])
-        self.assertFalse(bridge.projectJobsBounded)
-        self.assertEqual("SCHEDULED JOBS", self.item(root, "projectJobsHeading").property("text"))
-        self.assertFalse(self.item(root, "projectNewConversation").isEnabled())
+        settled(400, lambda: (
+            self.assertTrue(self.item(root, "projectArchivedBanner").isVisible()),
+            self.assertEqual(["Tez hatırlatma"], [job["label"] for job in bridge.projectJobs]),
+            self.assertFalse(bridge.projectJobsBounded),
+            self.assertEqual("SCHEDULED JOBS", self.item(root, "projectJobsHeading").property("text")),
+            self.assertFalse(self.item(root, "projectNewConversation").isEnabled()),
+        ))
 
     def test_e_a_bounded_job_listing_never_claims_all(self) -> None:
         store = self.db()
@@ -264,10 +275,11 @@ class ArchivedTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.showProject(project.id)
-        pump(400)
-        self.assertTrue(bridge.projectJobsBounded)
-        self.assertEqual([], bridge.projectJobs)                    # the store's first 20 omit it
-        self.assertIn("first 20", self.item(root, "projectJobsHeading").property("text"))
+        settled(400, lambda: (
+            self.assertTrue(bridge.projectJobsBounded),
+            self.assertEqual([], bridge.projectJobs),                    # the store's first 20 omit it
+            self.assertIn("first 20", self.item(root, "projectJobsHeading").property("text")),
+        ))
 
 
 class MemoryNamesTests(ProjectsUiCase):

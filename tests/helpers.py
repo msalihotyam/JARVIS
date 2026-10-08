@@ -340,6 +340,41 @@ def wait_until(condition, ceiling_ms: int, poll_ms: int = 10) -> bool:
         pump(poll_ms)
 
 
+#: THIZ: a condition wait's ceiling is at least this long (the F-ee2 rule): it ends as soon as the
+#: state is there, so only a test that is failing anyway waits it out.
+CHECK_FLOOR_MS = 15000
+
+
+def settled(fixed_ms: int, check, poll_ms: int = 20) -> None:
+    """THIZ: in place of ``pump(fixed_ms)`` before the assertions ``check`` makes (a callable that
+    raises AssertionError until they hold). A ``check`` that already holds before the loop turns
+    awaits nothing but time - a negative check ("nothing happens for N ms") or a state that was
+    already there - so it keeps the full fixed wait and is then made again. Otherwise the loop
+    turns until it holds, at most max(fixed_ms, CHECK_FLOOR_MS); out of time, its own assertion
+    fails (loud). The assertions are the same either way; only the wait before them changes."""
+    import time
+
+    from tests.test_ui import pump
+
+    try:
+        check()
+    except AssertionError:
+        pass
+    else:
+        pump(fixed_ms)
+        check()
+        return
+    deadline = time.monotonic() + max(fixed_ms, CHECK_FLOOR_MS) / 1000
+    while True:
+        pump(poll_ms)
+        try:
+            check()
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+
+
 def wait_still(sample, ceiling_ms: int, poll_ms: int = 50, quiet: int = 3) -> bool:
     """``wait_until`` for motion: until ``sample()`` (e.g. some items' scene rectangles) is the
     same ``quiet`` times in a row, ``poll_ms`` apart - an animated reflow has ended; at most

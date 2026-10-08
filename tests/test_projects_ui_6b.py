@@ -24,7 +24,8 @@ from PySide6.QtCore import QUrl
 from jarvis.memory import SQLiteMemoryStore
 from tests.test_intent import task_proposal
 from tests.test_projects_ui import ProjectsUiCase
-from tests.test_ui import UiTestCase, _APP, pump
+from tests.helpers import settled
+from tests.test_ui import UiTestCase, _APP, ambient_on, pump
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 
 
@@ -55,8 +56,9 @@ class InstructionTests(ProjectsUiCase):
         editor.setProperty("text", "Yanıtları kısa tut.")
         pump(60)
         self.assertEqual("19 / 2000", self.item(root, "instructionCounter").property("text"))
-        self.click(root, "instructionClass_internal")
-        self.assertTrue(save.isEnabled())
+        self.click(root, "instructionClass_internal", then=lambda: (
+            self.assertTrue(save.isEnabled()),
+        ))
         self.click(root, "instructionSave")
         current = store.load_project_instruction(project.id)
         self.assertEqual(("Yanıtları kısa tut.", "internal"), (current.text, current.classification.value))
@@ -69,10 +71,11 @@ class InstructionTests(ProjectsUiCase):
         store.save_explicit_user_project_instruction(project.id, "Kaynak göster.", "public")
         bridge.showProject("")
         bridge.showProject(project.id)
-        pump(200)
-        self.assertEqual("Kaynak göster.", editor.property("text"))
-        self.assertTrue(save.isEnabled())
-        self.assertEqual(0, self.execute_calls())
+        settled(200, lambda: (
+            self.assertEqual("Kaynak göster.", editor.property("text")),
+            self.assertTrue(save.isEnabled()),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_a_refusals_write_nothing_and_are_shown(self) -> None:
         store, project, bridge, root = self.open()
@@ -81,9 +84,10 @@ class InstructionTests(ProjectsUiCase):
         pump(60)
         self.assertEqual("2001 / 2000", self.item(root, "instructionCounter").property("text"))
         self.click(root, "instructionClass_public")
-        self.click(root, "instructionSave")
-        self.assertIn("longer than 2000", self.item(root, "instructionNotice").property("text"))
-        self.assertEqual("x" * 2001, editor.property("text"))           # what was typed stays
+        self.click(root, "instructionSave", then=lambda: (
+            self.assertIn("longer than 2000", self.item(root, "instructionNotice").property("text")),
+            self.assertEqual("x" * 2001, editor.property("text")),           # what was typed stays
+        ))
         bridge.saveProjectInstruction(project.id, "kısa", "")
         pump(60)
         self.assertIn("classification is required", bridge.projectInstructionNotice)
@@ -163,6 +167,7 @@ class FileTests(ProjectsUiCase):
         bridge.backend.project_file = record
         return calls
 
+    @ambient_on          # THIZ: it reads a colour
     def test_b_add_retire_restore_purge_and_counters(self) -> None:
         store, project, bridge, root = self.open()
         self.assertEqual(("Active 0/20", "Retained 0/40", "Characters 0/2,000,000"), self.counters(root))
@@ -220,9 +225,10 @@ class FileTests(ProjectsUiCase):
         bridge.retireProjectFile(project.id, file_id)
         pump(100)
         self.click(root, "filePurge")
-        pump(200)
-        self.assertEqual("rapor.txt", self.item(root, "purgeIdentity").property("text"))
-        self.assertIn("SENSITIVE", self.item(root, "purgeIdentityMeta").property("text"))
+        settled(200, lambda: (
+            self.assertEqual("rapor.txt", self.item(root, "purgeIdentity").property("text")),
+            self.assertIn("SENSITIVE", self.item(root, "purgeIdentityMeta").property("text")),
+        ))
         residue = self.item(root, "purgeResidue").property("text")
         for part in ("does NOT reach", "provider", "approval previews", "conversation history", "backups", "WAL"):
             self.assertIn(part, residue)
@@ -247,12 +253,13 @@ class FileTests(ProjectsUiCase):
         bridge.retireProjectFile(project.id, second)
         pump(60)
         bridge.archiveProject(project.id)
-        pump(200)
-        self.assertFalse(self.item(root, "fileAdd").isEnabled())
-        self.assertIn("Purge stays available", self.item(root, "fileReason").property("text"))
-        self.assertEqual({first: {"fileRetire": (True, False), "fileRestore": (False, False), "filePurge": (True, True)},
-                          second: {"fileRetire": (False, False), "fileRestore": (True, False), "filePurge": (True, True)}},
-                         self.rows(root))
+        settled(200, lambda: (
+            self.assertFalse(self.item(root, "fileAdd").isEnabled()),
+            self.assertIn("Purge stays available", self.item(root, "fileReason").property("text")),
+            self.assertEqual({first: {"fileRetire": (True, False), "fileRestore": (False, False), "filePurge": (True, True)},
+                              second: {"fileRetire": (False, False), "fileRestore": (True, False), "filePurge": (True, True)}},
+                             self.rows(root)),
+        ))
         bridge.retireProjectFile(project.id, first)
         pump(60)
         self.assertIn("archived", bridge.projectFileNotice)                 # the store's refusal, as returned
@@ -299,9 +306,10 @@ class SelectorTests(ProjectsUiCase):
         self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())     # "All projects" (Q10)
         self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
         self.click(root, "sidebarProjectsLink")
-        pump(300)
-        self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
-        self.assertIsNotNone(thesis)
+        settled(300, lambda: (
+            self.assertEqual(("projects", {}), (bridge.page, bridge.openProject)),
+            self.assertIsNotNone(thesis),
+        ))
 
     def test_c_choosing_opens_the_newest_live_conversation_or_creates_one(self) -> None:
         store = self.db()
@@ -312,9 +320,10 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         global_open = bridge.conversationId
-        self.click_item(root, self.row(root, "Evim"))
-        self.assertEqual(older.id, bridge.conversationId)                   # archived newest skipped
-        self.assertEqual("home", bridge.page)
+        self.click_item(root, self.row(root, "Evim"), then=lambda: (
+            self.assertEqual(older.id, bridge.conversationId),                   # archived newest skipped
+            self.assertEqual("home", bridge.page),
+        ))
         before = len(store.list_conversations(project_id=thesis.id))
         self.assertTrue(bridge.openProjectScope(thesis.id))
         pump(200)
@@ -334,12 +343,15 @@ class SelectorTests(ProjectsUiCase):
         self.assertFalse(bridge.openProjectScope(home.id))
         bridge._busy = False
 
-    def click_item(self, root, item) -> None:
+    def click_item(self, root, item, then=None) -> None:
         from PySide6.QtCore import QPointF, Qt
         from PySide6.QtTest import QTest
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def test_c_new_conversation_in_the_current_scope(self) -> None:
         store = self.db()
@@ -384,8 +396,9 @@ class AuthorityTests(ProjectsUiCase):
             self.assertTrue(bridge.openProjectScope(scope))
             pump(100)
             bridge.submitText("Bu projeyi incele.")
-            pump(100)
-            self.assertTrue(bridge.approvalPending)
+            settled(100, lambda: (
+                self.assertTrue(bridge.approvalPending),
+            ))
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
             decisions.append((request.scope, request.risk_level, request.side_effect, request.reason))

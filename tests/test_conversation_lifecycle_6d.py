@@ -44,7 +44,7 @@ from jarvis.conversation import ConversationState, ConversationStore, append_tur
 from jarvis.intent import IntentStatus
 from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.settings import Settings
-from tests.helpers import make_task, safe_cleanup, wait_until
+from tests.helpers import make_task, safe_cleanup, settled, wait_until
 from tests.test_chain_cancel_cli import DECLARATION
 from tests.test_intent import IntentTestCase, ScriptedModel, chat_proposal
 from tests.test_projects_ui import ProjectsUiCase
@@ -507,10 +507,13 @@ class AuthorityScanTests(unittest.TestCase):
 
 
 class WindowCase(ProjectsUiCase):
-    def press(self, root, item, button=Qt.LeftButton) -> None:
+    def press(self, root, item, button=Qt.LeftButton, then=None) -> None:
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, button, Qt.NoModifier, center)
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def confirm_delete(self, root) -> None:
         """Gate 6G K2: the destructive confirm arms Theme.confirmGuardMs (300 ms) after the
@@ -574,8 +577,9 @@ class TransitionTests(WindowCase):
         self.assertEqual([second.id], [r["id"] for r in bridge.projectArchivedConversations])
         # Delete of the OPEN archived Global conversation (opened read-only): the newest Global one.
         bridge.openConversation(newer.id)
-        pump(200)
-        self.assertTrue(bridge.conversationReadOnly)
+        settled(200, lambda: (
+            self.assertTrue(bridge.conversationReadOnly),
+        ))
         self.delete_open(root)
         self.gone(bridge, store, newer.id)
         self.assertEqual((older, "history"), (bridge.conversationId, bridge.page))
@@ -650,13 +654,15 @@ class ArchivedSectionTests(WindowCase):
         self.assertNotIn(archived.id, [r["id"] for r in bridge.conversations])
         # Opening it: read-only, its own banner and its own name.
         self.assertTrue(bridge.openConversation(archived.id))
-        pump(200)
-        self.assertEqual((True, True, "Arşivde"), (bridge.conversationReadOnly, bridge.conversationArchived,
-                                                    bridge.conversationTitle))
+        settled(200, lambda: (
+            self.assertEqual((True, True, "Arşivde"), (bridge.conversationReadOnly, bridge.conversationArchived,
+                                                        bridge.conversationTitle)),
+        ))
         bridge.setPage("home")
-        pump(300)
-        self.assertIn("this conversation is archived", self.item(root, "readOnlyReason").property("text"))
-        self.assertTrue(self.item(root, "sidebarNewConversation").property("allowed"))   # a Global one may still start
+        settled(300, lambda: (
+            self.assertIn("this conversation is archived", self.item(root, "readOnlyReason").property("text")),
+            self.assertTrue(self.item(root, "sidebarNewConversation").property("allowed")),   # a Global one may still start
+        ))
         # Unarchive from History: back in the lists, writable again.
         bridge.setPage("history")
         pump(300)
@@ -719,8 +725,9 @@ class DialogTests(WindowCase):
         pump(400)
         texts = lambda name: self.visible(root, name)[0].property("text")           # noqa: E731
         by_id = {r["id"]: i for i, r in enumerate(bridge.archivedConversations)}
-        self.press(root, self.visible(root, "historyDelete")[by_id[named.id]])
-        self.assertEqual("Bu sohbet kalıcı olarak silinsin mi?", texts("deleteTitle"))
+        self.press(root, self.visible(root, "historyDelete")[by_id[named.id]], then=lambda: (
+            self.assertEqual("Bu sohbet kalıcı olarak silinsin mi?", texts("deleteTitle")),
+        ))
         identity = texts("deleteIdentity")
         self.assertTrue(identity.startswith("«Tatil planı» · 2 mesaj · oluşturma "), identity)
         self.assertIn(" · son değişiklik ", identity)
@@ -741,10 +748,11 @@ class DialogTests(WindowCase):
         self.assertEqual(before, snapshot(self.database))
         self.assertEqual([], self.visible(root, "deleteTitle"))
         # The legacy import: the untitled fallback and the legacy line.
-        self.press(root, self.visible(root, "historyDelete")[by_id[imported.id]])
-        self.assertTrue(texts("deleteIdentity").startswith("«Yeni Sohbet» · 1 mesaj · "))
-        self.assertEqual("Ayrıca eski sürümün sohbet dosyası (~/.jarvis/conversation.json) yerinde kalır.",
-                         texts("deleteLegacy"))
+        self.press(root, self.visible(root, "historyDelete")[by_id[imported.id]], then=lambda: (
+            self.assertTrue(texts("deleteIdentity").startswith("«Yeni Sohbet» · 1 mesaj · ")),
+            self.assertEqual("Ayrıca eski sürümün sohbet dosyası (~/.jarvis/conversation.json) yerinde kalır.",
+                             texts("deleteLegacy")),
+        ))
         self.confirm_delete(root)
         self.assertTrue(store.is_conversation_deleted(imported.id))
         self.assertTrue(legacy.exists())                                            # S4: the file stays
@@ -866,8 +874,9 @@ class GapATests(WindowCase):
         # useSession on a deleted conversation's session opens nothing.
         open_now, session_now = bridge.conversationId, bridge._session_id
         bridge.useSession(session.id)
-        pump(100)
-        self.assertEqual((open_now, session_now), (bridge.conversationId, bridge._session_id))
+        settled(100, lambda: (
+            self.assertEqual((open_now, session_now), (bridge.conversationId, bridge._session_id)),
+        ))
         # Its session leaves History's list; the corrupt one's stays.
         bridge._set_sessions({"sessions": [{"session_id": session.id}, {"session_id": broken.id}]})
         self.assertEqual([broken.id], [r["session_id"] for r in bridge.sessions])
@@ -897,8 +906,9 @@ class AttachReopenTests(WindowCase):
             return real(*args, **kwargs)
         bridge.backend.submit_text = spy
         bridge.submitText("üçüncü")
-        pump(200)
-        self.assertEqual(["tezgah ölçüleri", "dolap rengi"], seen["history"])
+        settled(200, lambda: (
+            self.assertEqual(["tezgah ölçüleri", "dolap rengi"], seen["history"]),
+        ))
 
 
 class CatalogTests(UiTestCase):

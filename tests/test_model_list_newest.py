@@ -25,7 +25,8 @@ from jarvis.model_retirement import codex_retirement, newest_per_name
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_projects_ui_6e import WindowCase as SixEWindowCase, settle
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
-from tests.test_ui import UiTestCase, _APP, pump
+from tests.helpers import settled
+from tests.test_ui import UiTestCase, _APP, ambient_on, pump
 
 EFFORTS = ["low", "medium", "high"]
 
@@ -188,12 +189,15 @@ class WindowTests(WindowCase):
         self.click_toggle(root)
         self.assertEqual(["opus", "sonnet", "haiku", "claude-fable-5-1"], self.listed(root, "claudeModel_"))
 
-    def click_toggle(self, root) -> None:
+    def click_toggle(self, root, then=None) -> None:
         from PySide6.QtCore import QPointF, Qt
         from PySide6.QtTest import QTest
         item = self.shown(root, "showOldModelsToggle")
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def test_b_codex_list_shows_the_newest(self) -> None:
         bridge = self.bridge()
@@ -208,8 +212,9 @@ class WindowTests(WindowCase):
         root = self.open_panel(bridge)
         bridge.setChatProvider("claude")
         before = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
-        self.click_toggle(root)
-        self.assertTrue(bridge.showOldModels)
+        self.click_toggle(root, then=lambda: (
+            self.assertTrue(bridge.showOldModels),
+        ))
         after = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
         self.assertEqual(before, after)                                              # ui-preferences.json: byte-identical
         if after is not None:
@@ -343,11 +348,14 @@ class PolishTests(WindowCase):
         QTest.mouseMove(self.root, self.center(item))
         pump(20)
 
-    def press(self, item) -> None:
+    def press(self, item, then=None) -> None:
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
         QTest.mouseClick(self.root, Qt.LeftButton, Qt.NoModifier, self.center(item))
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def key(self, key) -> None:
         from PySide6.QtTest import QTest
@@ -363,6 +371,7 @@ class PolishTests(WindowCase):
     def label_of(self, segment) -> str:
         return next(c.property("text") for c in segment.childItems() if isinstance(c.property("text"), str))
 
+    @ambient_on          # THIZ: it reads hover colours
     def test_f_the_hint_is_an_action_row_with_hover_focus_and_keys(self) -> None:
         from PySide6.QtCore import Qt
         bridge, root = self.stage(old=True)
@@ -397,6 +406,7 @@ class PolishTests(WindowCase):
         self.key(Qt.Key_Space)
         self.assertEqual("claude-opus-5-5", self.store.load().settings.claude_model)
 
+    @ambient_on          # THIZ: it reads hover colours
     def test_g_the_toggle_has_hover_focus_and_space(self) -> None:
         from PySide6.QtCore import Qt
         bridge, root = self.stage()
@@ -437,10 +447,12 @@ class PolishTests(WindowCase):
         bridge, root = self.stage("codex")
         self.tr(bridge)
         self.assertEqual(["düşük", "orta", "yüksek"], [self.label_of(self.shown(root, "codexEffort_" + v)) for v in EFFORTS])
-        self.press(self.shown(root, "codexEffort_high"))
-        self.assertEqual("high", bridge.codexEffort)
-        self.press(self.shown(root, "codexEffort_low"))
-        self.assertEqual("low", bridge.codexEffort)
+        self.press(self.shown(root, "codexEffort_high"), then=lambda: (
+            self.assertEqual("high", bridge.codexEffort),
+        ))
+        self.press(self.shown(root, "codexEffort_low"), then=lambda: (
+            self.assertEqual("low", bridge.codexEffort),
+        ))
 
     def test_i_the_panel_stays_inside_the_window_at_every_size(self) -> None:
         for size in ((1100, 700), (1280, 760), (1920, 1080)):
@@ -472,6 +484,7 @@ class PolishTests(WindowCase):
         settle(lambda: not fade())
         self.assertFalse(fade())
 
+    @ambient_on          # THIZ: its subject is motion
     def test_k_motion_follows_the_tokens_and_ambient_off_is_instant(self) -> None:
         bridge, root = self.stage(old=True, size=(1100, 700))
         scroll = self.shown(root, "modelPanelScroll")

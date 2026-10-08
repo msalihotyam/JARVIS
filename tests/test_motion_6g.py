@@ -213,6 +213,7 @@ class HoverTipSourceTests(unittest.TestCase):
 
 
 class LiveMotionTests(UiTestCase):
+    ambient = True      # THIZ: its subject is motion
     def window(self):
         bridge = self.bridge()
         root = self.load(bridge)

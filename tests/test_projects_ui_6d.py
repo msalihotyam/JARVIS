@@ -31,6 +31,7 @@ from jarvis.conversation import task_title
 from tests.test_intent import task_proposal
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
+from tests.helpers import settled
 from tests.test_ui import UiTestCase, _APP, pump
 
 CHAT = json.dumps({"kind": "chat", "reply": "tamam"})
@@ -40,10 +41,13 @@ class SwitcherCase(ProjectsUiCase):
     def visible(self, root, name) -> list:
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
-    def press(self, root, item, button=Qt.LeftButton) -> None:
+    def press(self, root, item, button=Qt.LeftButton, then=None) -> None:
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, button, Qt.NoModifier, center)
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def editing(self, root) -> bool:
         """The edit popup is open (its field is on screen; a Popup itself is no item)."""
@@ -187,9 +191,10 @@ class RenameTests(SwitcherCase):
         self.start_edit(root)
         self.commit(root, "Yeni proje adı")
         bridge.showProject(project.id)
-        pump(300)
-        self.assertEqual(["Yeni proje adı"], [row["title"] for row in bridge.projectConversations])
-        self.assertEqual(0, self.execute_calls())
+        settled(300, lambda: (
+            self.assertEqual(["Yeni proje adı"], [row["title"] for row in bridge.projectConversations]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_b_enter_commits_and_escape_reverts(self) -> None:
         store = self.db()
@@ -252,14 +257,16 @@ class RenameTests(SwitcherCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.openConversation(owned.id)
-        pump(300)
-        self.assertTrue(bridge.conversationReadOnly)
+        settled(300, lambda: (
+            self.assertTrue(bridge.conversationReadOnly),
+        ))
         self.open_actions(root)
         self.assertFalse(self.item(root, "conversationRenameItem").isEnabled())
         self.assertIn("archived", self.text(root, "conversationRenameReason"))
         self.assertTrue(self.item(root, "conversationRenameReason").isVisible())
-        self.press(root, self.item(root, "conversationRenameItem"))                 # clicking a disabled item does nothing
-        self.assertFalse(self.editing(root))
+        self.press(root, self.item(root, "conversationRenameItem"), then=lambda: (  # clicking a disabled item does nothing
+            self.assertFalse(self.editing(root)),
+        ))
         calls = self.spy(bridge)
         self.assertFalse(bridge.renameConversation(owned.id, "zorla"))             # a forced call meets the store
         self.assertEqual([(owned.id, "zorla")], calls)
@@ -285,8 +292,9 @@ class RaceTests(SwitcherCase):
         conversation = store.create_conversation()
         bridge = self.bridge(CHAT, CHAT)
         bridge.openConversation(conversation.id)
-        pump(200)
-        self.assertEqual("", bridge.conversationTitle)
+        settled(200, lambda: (
+            self.assertEqual("", bridge.conversationTitle),
+        ))
         message = "Bu projenin yapısını özetle"
         bridge.submitText(message)
         pump(200)
@@ -394,8 +402,9 @@ class AuthorityTests(SwitcherCase):
             if renamed:
                 self.assertTrue(bridge.renameConversation(bridge.conversationId, "Bambaşka ad"))
             bridge.submitText("Bu projeyi incele.")
-            pump(100)
-            self.assertTrue(bridge.approvalPending)
+            settled(100, lambda: (
+                self.assertTrue(bridge.approvalPending),
+            ))
             ticket = bridge._ticket
             request = store.load_pending_approval(ticket.task_id, ticket.session_id)
             decisions.append((request.scope, request.risk_level, request.side_effect, request.reason))

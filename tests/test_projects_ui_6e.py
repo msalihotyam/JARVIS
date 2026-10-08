@@ -37,7 +37,8 @@ from jarvis.conversation import append_turn
 from jarvis.ui.i18n import CATALOG_DIR, load_catalog, localization, render, tx
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
-from tests.test_ui import _APP, UiTestCase, pump
+from tests.helpers import settled
+from tests.test_ui import _APP, UiTestCase, ambient_on, pump
 
 SURFACES = ("TopBar", "HistoryPage", "ProjectsPage", "AttachDialog", "ConversationDeleteDialog", "Composer",
             "CommandPalette", "Bridge", "Sidebar", "ConversationMenu", "ChatHeader")
@@ -49,10 +50,13 @@ def say(memory, conversation_id: str, text: str) -> None:
 
 
 class WindowCase(ProjectsUiCase):
-    def press(self, root, item) -> None:
+    def press(self, root, item, then=None) -> None:
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def visible(self, root, name) -> list:
         return [i for i in self.all_items(root, name) if i.isVisible()]
@@ -395,6 +399,7 @@ class TokenTests(UiTestCase):
 
 
 class HoverTipTests(SharedPartsCase):
+    @ambient_on          # THIZ: it times the tip's delay
     def test_l_the_tip_waits_for_its_delay_then_shows_the_whole_name(self) -> None:
         root, _ = self.harness(self.bridge(), (1100, 700))
         tip = self.obj("h6eChildTip")
@@ -433,8 +438,9 @@ class HoverTipTests(SharedPartsCase):
         self.assertEqual(1, text.property("lineCount"))        # a short reason: one line, its own width
         self.assertLess(text.parentItem().width(), 480)
         QTest.mouseMove(root, QPoint(5, root.height() - 5))
-        pump(100)
-        self.assertFalse(tip.property("shown"))
+        settled(100, lambda: (
+            self.assertFalse(tip.property("shown")),
+        ))
 
 
 class DialogShellTests(SharedPartsCase):
@@ -442,6 +448,7 @@ class DialogShellTests(SharedPartsCase):
         QMetaObject.invokeMethod(self.obj("h6eBefore"), "forceActiveFocus")
         QMetaObject.invokeMethod(dialog, "openFrom", Q_ARG("QVariant", self.obj("h6eBefore")))
 
+    @ambient_on          # THIZ: the dialogs' one sweep with motion
     def test_n_scrim_size_and_footer_at_every_size(self) -> None:
         bridge = self.bridge()
         root, harness = self.harness(bridge)
@@ -569,6 +576,7 @@ class DialogShellTests(SharedPartsCase):
         settle(lambda: not dialog.property("visible"))
         self.assertEqual(confirmed + 1, harness.property("confirmed"))
 
+    @ambient_on          # THIZ: the confirm guard with ambient on
     def test_p_a_destructive_dialog_opens_at_once_with_a_confirm_guard_ambient_on(self) -> None:
         # Gate 6G K2: no motion (was pageMs 220 in / panelOut 150 out; the motion tokens
         # stay pinned on a non-destructive dialog, test_aj) and confirm stays off while
@@ -577,6 +585,7 @@ class DialogShellTests(SharedPartsCase):
         root, harness = self.harness(bridge)
         self.assert_destructive_open_at_once_and_confirm_guarded(root, harness)
 
+    @ambient_on          # THIZ: it turns ambient off itself
     def test_q_ambient_off_means_no_motion_and_the_same_confirm_guard(self) -> None:
         bridge = self.bridge()
         bridge.setAmbientEffects(False)
@@ -695,13 +704,15 @@ class ScopeKeyboardTests(ScopeGroupCase):
         for key in (Qt.Key_Return, Qt.Key_Space):
             self.item(root, "sidebarGlobal").forceActiveFocus()
             QTest.keyClick(root, key)
-            pump(300)
-            self.assertTrue(bridge.conversationProject["global"], key)
+            settled(300, lambda: (
+                self.assertTrue(bridge.conversationProject["global"], key),
+            ))
             row = [i for i in self.visible(root, "sidebarProject") if i.property("title") == LONG_PROJECT][0]
             row.forceActiveFocus()
             QTest.keyClick(root, key)
-            pump(300)
-            self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"], key)
+            settled(300, lambda: (
+                self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"], key),
+            ))
         # Menu / Shift+F10 on a row, and Return / Space on "…": the conversation menu.
         for key, modifier in ((Qt.Key_Menu, Qt.NoModifier), (Qt.Key_F10, Qt.ShiftModifier)):
             row = [i for i in self.visible(root, "sidebarConversation") if i.property("current")][0]
@@ -726,10 +737,11 @@ class ScopeKeyboardTests(ScopeGroupCase):
         before = bridge.conversationId
         self.item(root, "sidebarNewConversation").forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Return)
-        pump(400)
-        self.assertNotEqual(before, bridge.conversationId)
-        self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"])
-        self.assertEqual(0, self.execute_calls())
+        settled(400, lambda: (
+            self.assertNotEqual(before, bridge.conversationId),
+            self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
 
 class ScopeStateTests(ScopeGroupCase):
@@ -751,9 +763,11 @@ class ScopeStateTests(ScopeGroupCase):
             item = item.parentItem()
         self.assertEqual(1.0, opacity)
         before = bridge.conversationId
-        self.press(root, button)
-        self.assertEqual(before, bridge.conversationId)                           # still refused, as before
+        self.press(root, button, then=lambda: (
+            self.assertEqual(before, bridge.conversationId),                           # still refused, as before
+        ))
 
+    @ambient_on          # THIZ: its subject is motion
     def test_x_menu_motion_follows_its_tokens_and_stops_with_ambient_off(self) -> None:
         self.seed()
         bridge = self.bridge()
@@ -854,6 +868,7 @@ class DialogAdoptionCase(ScopeGroupCase):
 
 
 class DialogLayoutTests(DialogAdoptionCase):
+    @ambient_on          # THIZ: it reads the scrim's colour
     def test_y_every_dialog_stays_inside_the_window_with_its_footer_and_scrim(self) -> None:
         store, bridge, root = self.stage()
         cases = (("attach", self.open_attach, ("attachCancel", "attachConfirm")),
@@ -972,6 +987,7 @@ class DialogKeyboardTests(DialogAdoptionCase):
 
 
 class DialogMotionTests(DialogAdoptionCase):
+    ambient = True      # THIZ: its subject is motion and the confirm guard
     def test_ab_the_delete_dialog_opens_at_once_with_a_confirm_guard_ambient_on_and_off(self) -> None:
         store, bridge, root = self.stage()
         bridge.setPage("history")
@@ -1166,6 +1182,7 @@ class ListLayoutTests(ListCase):
 
 
 class ListStateTests(ListCase):
+    @ambient_on          # THIZ: it reads hover colours
     def test_ae_hover_open_mark_focus_ring_tab_keys_and_names(self) -> None:
         from PySide6.QtGui import QAccessible
         store, bridge, root = self.lists()
@@ -1276,8 +1293,9 @@ class ListStateTests(ListCase):
         garden = bridge.projectRecords[0]["id"]
         bridge.showProject("")
         bridge.setPage("projects")
-        pump(300)
-        self.assertEqual("Sohbetlerini görmek için bir proje seçin.", self.item(root, "projectsEmpty").property("text"))
+        settled(300, lambda: (
+            self.assertEqual("Sohbetlerini görmek için bir proje seçin.", self.item(root, "projectsEmpty").property("text")),
+        ))
         bridge.showProject(garden)
         pump(300)
         for name, text in (("projectConversationsEmpty", "Bu projede henüz sohbet yok."),
@@ -1341,6 +1359,7 @@ class ListStateTests(ListCase):
         self.assertTrue(shown)
         self.assertEqual([], [t for t in shown if re.search("konuşma", t, re.I)])
 
+    @ambient_on          # THIZ: its subject is the fade
     def test_ak_a_project_switch_fades_the_detail_in_and_not_with_ambient_off(self) -> None:
         store, bridge, root = self.lists()
         self.projects(bridge, root, self.project.id)
@@ -1356,6 +1375,7 @@ class ListStateTests(ListCase):
 
 
 class RenameDialogTests(ListCase):
+    @ambient_on          # THIZ: its subject is the dialog's motion
     def test_aj_the_rename_dialog_on_the_shell(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)

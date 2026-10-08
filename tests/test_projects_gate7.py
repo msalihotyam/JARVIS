@@ -41,7 +41,7 @@ from jarvis.contracts import (
 from jarvis.conversation import append_turn
 from jarvis.intent import IntentStatus
 from jarvis.registry import ToolRegistry
-from tests.helpers import installed_cli
+from tests.helpers import installed_cli, settled
 from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, FakeProcess, patch_oauth_environment
 from tests.test_egress_attestation import CLAUDE_TUPLES, SUCCESS_CLI
 from tests.test_intent import ScriptedModel, StubConnector, chat_proposal, task_proposal
@@ -277,23 +277,26 @@ class RestartTests(ProjectsUiCase):
         self.assertFalse(any(row["id"] == conversation_id for row in second.conversations))
         root = self.window(second)
         self.assertTrue(second.openProjectScope(project.id))
-        pump(300)
-        self.assertEqual(conversation_id, second.conversationId)                          # the moved conversation
-        self.assertEqual("Evim", self.item(root, "chatHeaderScope").property("fullName"))
-        self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()])
-        self.assertFalse(second.canAttach)                                                  # never moves again
+        settled(300, lambda: (
+            self.assertEqual(conversation_id, second.conversationId),                          # the moved conversation
+            self.assertEqual("Evim", self.item(root, "chatHeaderScope").property("fullName")),
+            self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()]),
+            self.assertFalse(second.canAttach),                                                  # never moves again
+        ))
         # The next run is P-scoped.
         second.submitText("Bu projeyi incele.")
-        pump(100)
-        self.assertTrue(second.approvalPending)
+        settled(100, lambda: (
+            self.assertTrue(second.approvalPending),
+        ))
         ticket = second._ticket
         task = reopened.load_task(ticket.task_id)
         self.assertEqual(project.id, task.project_id)
         self.assertEqual(project.id, reopened.load_session(ticket.session_id).project_id)
         self.assertEqual(conversation_id, reopened.conversation_for_session(ticket.session_id))
         second.deny()
-        pump(100)
-        self.assertEqual(0, self.execute_calls())
+        settled(100, lambda: (
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
 
 class RealConnectorCardTests(ProjectsUiCase):
@@ -335,8 +338,9 @@ class RealConnectorCardTests(ProjectsUiCase):
         self.assertTrue(bridge.openProjectScope(project.id))
         pump(300)
         bridge.submitText(OBJECTIVE)
-        pump(300)
-        self.assertTrue(bridge.approvalPending, [e["text"] for e in bridge.activity + bridge.feed])
+        settled(300, lambda: (
+            self.assertTrue(bridge.approvalPending, [e["text"] for e in bridge.activity + bridge.feed]),
+        ))
         card = bridge.approval
         # The card: the stored instruction, complete, and the stored excerpt.
         self.assertEqual(INSTRUCTION, card["project_instruction"])

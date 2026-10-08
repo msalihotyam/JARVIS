@@ -51,7 +51,7 @@ from jarvis.ui.preferences import (  # noqa: E402
     canonical_preferences,
     validate_preferences,
 )
-from tests.helpers import safe_cleanup, wait_still, wait_until  # noqa: E402
+from tests.helpers import safe_cleanup, settled, wait_still, wait_until  # noqa: E402
 from tests.test_intent import (  # noqa: E402
     ACCOUNT,
     OTHER_ACCOUNT,
@@ -95,17 +95,65 @@ SETTLE_FLOOR_MS = 15000
 REFLOW_FRAME = ("sidebar", "canonicalWorkspace", "panelColumn", "canonicalComposer", "conversationFeed")
 
 
-def reflow_still(case: unittest.TestCase, root, ceiling_ms: int) -> None:
+def find(node, name):
+    if node.objectName() == name:
+        return node
+    for child in node.childItems():
+        found = find(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def at_rest_check(case: unittest.TestCase, root):
+    """Main's reflow values at their targets (REFLOW_AT_REST), evaluated in Main's context."""
     from PySide6.QtQml import QQmlEngine, QQmlExpression
 
-    def find(node, name):
-        if node.objectName() == name:
-            return node
-        for child in node.childItems():
-            found = find(child, name)
-            if found is not None:
-                return found
-        return None
+    content = find(root.contentItem(), "panelColumn").parentItem()
+    at_rest = QQmlExpression(QQmlEngine.contextForObject(content), content, REFLOW_AT_REST)
+
+    def check() -> bool:
+        value, undefined = at_rest.evaluate()
+        case.assertFalse(undefined, REFLOW_AT_REST)
+        return value is True
+    return check
+
+
+def drawn_at_rest(case: unittest.TestCase, root, width: int, height: int, ceiling_ms: int) -> None:
+    """THIZ, motion-free (ambient off: every Theme.dur is 0): the window is ``width`` x ``height``,
+    Main's reflow values are at their targets and two frames were drawn at that size since - the
+    polish before a frame is where Layouts place their items, and with no motion nothing moves
+    after it. At most max(ceiling_ms, SETTLE_FLOOR_MS); running out of it fails the test."""
+    at_rest = at_rest_check(case, root)
+    frames = [0]
+
+    def drawn() -> None:
+        if (root.width(), root.height()) == (width, height):
+            frames[0] += 1
+    root.frameSwapped.connect(drawn)
+    try:
+        root.update()
+        ceiling = max(ceiling_ms, SETTLE_FLOOR_MS)
+        case.assertTrue(wait_until(lambda: frames[0] >= 2 and (root.width(), root.height()) == (width, height) and at_rest(),
+                                   ceiling, 10), f"the window at {width}x{height} was not drawn at rest in {ceiling} ms")
+    finally:
+        root.frameSwapped.disconnect(drawn)
+
+
+def window_ready(case, root, width: int, height: int, fixed_ms: int) -> None:
+    """After a window is shown and resized: with ambient on, the old fixed wait (that test's motion
+    runs on time); motion-free (THIZ), until it is drawn at rest at that size."""
+    if case.wants_ambient():
+        pump(fixed_ms)
+    else:
+        drawn_at_rest(case, root, width, height, fixed_ms)
+
+
+def reflow_still(case: unittest.TestCase, root, ceiling_ms: int) -> None:
+    if not getattr(case, "wants_ambient", lambda: True)():          # THIZ: motion-free, nothing animates
+        drawn_at_rest(case, root, root.width(), root.height(), ceiling_ms)
+        return
+    from PySide6.QtQml import QQmlEngine, QQmlExpression
 
     def rect(item):
         a = item.mapToScene(item.boundingRect().topLeft())
@@ -131,7 +179,15 @@ def reflow_still(case: unittest.TestCase, root, ceiling_ms: int) -> None:
     case.assertTrue(wait_until(still, ceiling, 20), f"the reflow to {root.width()}x{root.height()} did not settle in {ceiling} ms")
 
 
+def ambient_on(test):
+    """THIZ: this test's subject is motion or the ambient look: it runs with ambient effects on."""
+    test.ambient = True
+    return test
+
+
 class UiTestCase(unittest.TestCase):
+    ambient = False
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
@@ -198,9 +254,18 @@ class UiTestCase(unittest.TestCase):
                                codex_state=lambda: {"status": "not_installed", "models": []}, claude_catalog=lambda: [],
                                google_state=lambda: {"id": "google", "vendor": "Google", "name": "Antigravity",
                                                      "status": "not_installed", "models": [], "research": False})
-        bridge = Bridge(self.backend, UiPreferences(self.prefs_path), sync=sync)
+        prefs = UiPreferences(self.prefs_path)
+        if not self.prefs_path.exists() and not self.wants_ambient():
+            prefs.data["ambient_effects"] = False   # THIZ: in memory; a test's own save writes it like any choice
+        bridge = Bridge(self.backend, prefs, sync=sync)
         bridge.refreshConfig()
         return bridge
+
+    def wants_ambient(self) -> bool:
+        """THIZ: UI tests run motion-free - ambient effects off, so every Theme.dur is 0 (K2) - unless
+        their subject is motion or the ambient look: a class with ``ambient = True`` or an @ambient_on
+        test. A test that wrote its own preferences file keeps that file's choice."""
+        return getattr(getattr(self, self._testMethodName, None), "ambient", type(self).ambient)
 
     def load(self, bridge: Bridge):
         from jarvis.ui.app import teardown
@@ -244,6 +309,7 @@ class BootstrapTests(UiTestCase):
         self.assertTrue(bridge.executionEnabled)
         self.assertIn("JARVIS interface started", bridge.activity[0]["text"])
 
+    @ambient_on          # THIZ: it samples the theme mid-transition
     def test_canonical_theme_is_default_and_dark_theme_loads(self) -> None:
         bridge = self.bridge()
         root = self.load(bridge)
@@ -819,21 +885,23 @@ class PresentationTests(UiTestCase):
         self.assertIsNotNone(item, name)
         return item
 
-    def click(self, root, name, until=None):
+    def click(self, root, name, until=None, then=None):
         from PySide6.QtCore import QPointF
         item = self.item(root, name)
         center = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, center)
-        if until is None:
-            pump(260)
-        else:                       # S0b: the state the caller asserts next; the old wait is the ceiling
+        if until is not None:       # S0b: the state the caller asserts next; the old wait is the ceiling
             wait_until(until, 260)
+        elif then is not None:      # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def window(self, bridge):
         root = self.load(bridge)
         root.showNormal()
         root.resize(1920, 1080)
-        pump(350)
+        window_ready(self, root, 1920, 1080, 350)
         return root
 
     def test_distinct_anchored_contexts_toggle_escape_outside_and_selection(self):
@@ -844,35 +912,43 @@ class PresentationTests(UiTestCase):
                                         ("modelTrigger", "modelOpen", "modelSurface"),
                                         ("navigationTrigger", "navOpen", "navSurface")):
             with self.subTest(trigger=trigger):
-                self.click(root, trigger)
-                self.assertTrue(root.property(state))
-                self.assertEqual(1, sum(bool(root.property(key)) for key in ("settingsOpen", "modelOpen", "navOpen")))
+                self.click(root, trigger, then=lambda: (
+                    self.assertTrue(root.property(state)),
+                    self.assertEqual(1, sum(bool(root.property(key)) for key in ("settingsOpen", "modelOpen", "navOpen"))),
+                ))
                 panel = self.item(root, surface)
                 if trigger == "settingsOrb":
                     self.assertLess(panel.x(), 80)
                 else:
                     self.assertGreater(panel.x(), root.width() / 2)
                 self.assertGreaterEqual(panel.y(), 80)
-                self.click(root, trigger)
-                self.assertFalse(root.property(state))
+                self.click(root, trigger, then=lambda: (
+                    self.assertFalse(root.property(state)),
+                ))
                 self.click(root, trigger)
                 QTest.keyClick(root, Qt.Key_Escape)
-                pump(250)
-                self.assertFalse(root.property(state))
+                settled(250, lambda: (
+                    self.assertFalse(root.property(state)),
+                ))
                 self.click(root, trigger)
                 QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPoint(850, 920))
-                pump(250)
-                self.assertFalse(root.property(state))
+                settled(250, lambda: (
+                    self.assertFalse(root.property(state)),
+                ))
         self.click(root, "settingsOrb")
-        self.click(root, "modelTrigger")
-        self.assertFalse(root.property("settingsOpen"))
-        self.assertTrue(root.property("modelOpen"))
-        self.click(root, "navigationTrigger")
-        self.assertFalse(root.property("modelOpen"))
-        self.click(root, "navigate_tasks")
-        self.assertEqual("tasks", bridge.page)
-        self.assertFalse(root.property("navOpen"))
+        self.click(root, "modelTrigger", then=lambda: (
+            self.assertFalse(root.property("settingsOpen")),
+            self.assertTrue(root.property("modelOpen")),
+        ))
+        self.click(root, "navigationTrigger", then=lambda: (
+            self.assertFalse(root.property("modelOpen")),
+        ))
+        self.click(root, "navigate_tasks", then=lambda: (
+            self.assertEqual("tasks", bridge.page),
+            self.assertFalse(root.property("navOpen")),
+        ))
 
+    @ambient_on          # THIZ: the home context panels' one sweep with motion
     def test_context_and_protected_composer_bounds_at_all_required_sizes(self):
         from PySide6.QtCore import QPointF
 
@@ -976,17 +1052,19 @@ class PresentationTests(UiTestCase):
             before = self.store.path.read_bytes() if hasattr(self.store, "path") else None
             root = self.window(bridge)
             QTest.keyClick(root, Qt.Key_A, Qt.ControlModifier | Qt.ShiftModifier)
-            pump(300)
-            self.assertTrue(root.property("devApprovalVisible"))
-            self.assertFalse(bridge.approvalPending)
-            self.assertIsNone(bridge._ticket)
-            self.assertEqual({}, bridge.task)
-            self.assertEqual("", bridge.sessionId)
-            self.assertFalse(self.item(root, "approvalApprove").isEnabled())
-            self.click(root, "approvalApprove")
-            self.assertEqual(0, self.execute_calls())
-            self.assertIsNone(bridge._ticket)
-            self.assertEqual([], bridge.sessions)
+            settled(300, lambda: (
+                self.assertTrue(root.property("devApprovalVisible")),
+                self.assertFalse(bridge.approvalPending),
+                self.assertIsNone(bridge._ticket),
+                self.assertEqual({}, bridge.task),
+                self.assertEqual("", bridge.sessionId),
+                self.assertFalse(self.item(root, "approvalApprove").isEnabled()),
+            ))
+            self.click(root, "approvalApprove", then=lambda: (
+                self.assertEqual(0, self.execute_calls()),
+                self.assertIsNone(bridge._ticket),
+                self.assertEqual([], bridge.sessions),
+            ))
             if before is not None:
                 self.assertEqual(before, self.store.path.read_bytes())
 
@@ -999,13 +1077,14 @@ class PresentationTests(UiTestCase):
         self.assertIsNotNone(ticket)
         for name in ("session_id", "task_id", "request_id", "fingerprint", "expires_at"):
             self.assertTrue(bridge.approval[name], name)
-        self.click(root, "approvalApprove")
-        self.assertFalse(bridge.approvalPending)
-        self.assertEqual(1, self.claude.execute_calls)
-        # The run ended; a code_analysis that carried no evidence achieved nothing,
-        # so the core rests rather than reporting a completed objective.
-        self.assertEqual("idle", bridge.coreState)
-        self.assertEqual("unmet", bridge._last_outcome)
+        self.click(root, "approvalApprove", then=lambda: (
+            self.assertFalse(bridge.approvalPending),
+            self.assertEqual(1, self.claude.execute_calls),
+            # The run ended; a code_analysis that carried no evidence achieved nothing,
+            # so the core rests rather than reporting a completed objective.
+            self.assertEqual("idle", bridge.coreState),
+            self.assertEqual("unmet", bridge._last_outcome),
+        ))
 
 
 class SecondaryPageTests(UiTestCase):
@@ -1048,19 +1127,23 @@ class SecondaryPageTests(UiTestCase):
         pump(300)
         self.click(root, "jobSpecInput")
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertEqual("home", bridge.page)
+        settled(300, lambda: (
+            self.assertEqual("home", bridge.page),
+        ))
         bridge.setPage("automations")
         pump(300)
         self.click(root, "navigationTrigger")
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(250)
-        self.assertFalse(root.property("navOpen"))
-        self.assertEqual("automations", bridge.page)
+        settled(250, lambda: (
+            self.assertFalse(root.property("navOpen")),
+            self.assertEqual("automations", bridge.page),
+        ))
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertEqual("home", bridge.page)
+        settled(300, lambda: (
+            self.assertEqual("home", bridge.page),
+        ))
 
+    @ambient_on          # THIZ: the secondary pages' one sweep with motion
     def test_automations_creation_bounds_empty_and_populated_at_supported_sizes(self):
         from PySide6.QtCore import QPointF
         bridge = self.bridge()
@@ -1171,6 +1254,7 @@ class MacroGeometryTests(UiTestCase):
         "core centre X": 48.96, "core centre Y": 7.99,
     }
 
+    @ambient_on          # THIZ: the macro layout's one sweep with motion
     def test_canonical_macro_composition_holds_at_every_supported_size(self) -> None:
         from PySide6.QtCore import QPointF
         bridge = self.bridge()
@@ -1274,13 +1358,15 @@ class MacroGeometryTests(UiTestCase):
                 break
             canonical_left = now
         bridge.setTheme("command")
-        pump(600)
-        # The command preset is a different layout family: it must not inherit
-        # the canonical ambient rail inset.
-        self.assertEqual("command", root.property("themeName"))
+        settled(600, lambda: (
+            # The command preset is a different layout family: it must not inherit
+            # the canonical ambient rail inset.
+            self.assertEqual("command", root.property("themeName")),
+        ))
         bridge.setTheme("space")
-        pump(600)
-        self.assertAlmostEqual(canonical_left, self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x(), delta=1.0)
+        settled(600, lambda: (
+            self.assertAlmostEqual(canonical_left, self.item(root, "canonicalWorkspace").mapToScene(QPointF(0, 0)).x(), delta=1.0),
+        ))
 
 
 class CommandHeaderTests(UiTestCase):
@@ -1358,9 +1444,10 @@ class CommandHeaderTests(UiTestCase):
         self.assertFalse(chip.property("open"))
 
         self.click(root, "modelTrigger")
-        pump(300)
-        self.assertTrue(root.property("modelOpen"))
-        self.assertTrue(chip.property("open"))
+        settled(300, lambda: (
+            self.assertTrue(root.property("modelOpen")),
+            self.assertTrue(chip.property("open")),
+        ))
         # The model list is collapsed until it is asked for; a choice is persisted
         # at once, with no separate Apply step.
         self.click(root, "claudeModelField")
@@ -1395,8 +1482,9 @@ class LeftContextTests(UiTestCase):
         context = self.item(root, "leftContextCard")
         self.assertIsNotNone(source)
         original = source.property("now")
-        pump(1150)
-        self.assertNotEqual(original, source.property("now"), "the system clock timer stopped")
+        settled(1150, lambda: (
+            self.assertNotEqual(original, source.property("now"), "the system clock timer stopped"),
+        ))
         for date, clock in ((QDate(2032, 12, 31), QTime(23, 59, 59)),
                             (QDate(2033, 1, 1), QTime(0, 0, 0))):
             instant = QDateTime(date, clock)
@@ -1663,12 +1751,13 @@ class WeatherCardTests(UiTestCase):
         bridge = self.weather_bridge(net)
         root = self.window(bridge)
         bridge._weather_tick()
-        pump(200)
-        self.assertEqual(18, bridge.weather["temperature"])
-        self.assertEqual("18°", self.item(root, "contextTemperature").property("text"))
-        self.assertTrue(self.item(root, "contextTemperature").isVisible())
-        self.assertEqual("Partly cloudy", self.item(root, "contextWeatherCondition").property("text"))
-        self.assertEqual("Beşiktaş", self.item(root, "contextPlace").property("text"))
+        settled(200, lambda: (
+            self.assertEqual(18, bridge.weather["temperature"]),
+            self.assertEqual("18°", self.item(root, "contextTemperature").property("text")),
+            self.assertTrue(self.item(root, "contextTemperature").isVisible()),
+            self.assertEqual("Partly cloudy", self.item(root, "contextWeatherCondition").property("text")),
+            self.assertEqual("Beşiktaş", self.item(root, "contextPlace").property("text")),
+        ))
         reading = datetime.fromtimestamp(bridge.weather["observed_at"]).strftime("%H:%M")
         self.assertEqual("As of " + reading, self.item(root, "contextTimeZone").property("text"))
         self.assertEqual("cloud", self.item(root, "contextWeatherMark").property("family"))
@@ -1717,25 +1806,28 @@ class WeatherCardTests(UiTestCase):
         bridge = self.weather_bridge(net)
         root = self.window(bridge)
         bridge._weather_tick()
-        pump(200)
-        self.assertEqual("stale", bridge.weather["state"])
-        self.assertTrue(self.item(root, "contextTimeZone").property("text").startswith("Last reading "))
-        self.assertTrue(self.item(root, "leftContextCard").property("stale"))
+        settled(200, lambda: (
+            self.assertEqual("stale", bridge.weather["state"]),
+            self.assertTrue(self.item(root, "contextTimeZone").property("text").startswith("Last reading ")),
+            self.assertTrue(self.item(root, "leftContextCard").property("stale")),
+        ))
         bridge._weather_reading = {**bridge._weather_reading, "observed_at": time.time() - 3 * 3600}
         bridge._weather_tick()
-        pump(200)
-        self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather)
-        self.assertFalse(self.item(root, "contextTemperature").isVisible())
-        self.assertEqual("Local time", self.item(root, "contextPlace").property("text"))
+        settled(200, lambda: (
+            self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather),
+            self.assertFalse(self.item(root, "contextTemperature").isVisible()),
+            self.assertEqual("Local time", self.item(root, "contextPlace").property("text")),
+        ))
 
     def test_no_key_means_no_network_and_no_invented_weather(self) -> None:
         net = FakeWeatherNet()
         bridge = self.weather_bridge(net, key="")
         root = self.window(bridge)
         bridge._weather_tick()
-        pump(200)
-        self.assertEqual([], net.calls)
-        self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather)
+        settled(200, lambda: (
+            self.assertEqual([], net.calls),
+            self.assertEqual({"available": False, "state": "unavailable"}, bridge.weather),
+        ))
         texts = self.texts(root)
         for fake in ("0°", "Clear", "--°"):
             self.assertNotIn(fake, texts)
@@ -1806,13 +1898,15 @@ class WeatherCardTests(UiTestCase):
         bridge.setLanguage("tr-TR")
         pump(300)
         bridge._weather_tick()
-        pump(300)
-        self.assertEqual("Gök gürültülü sağanak", self.item(root, "contextWeatherCondition").property("text"))
-        self.assertTrue(self.item(root, "contextTimeZone").property("text").endswith(" itibarıyla"))
+        settled(300, lambda: (
+            self.assertEqual("Gök gürültülü sağanak", self.item(root, "contextWeatherCondition").property("text")),
+            self.assertTrue(self.item(root, "contextTimeZone").property("text").endswith(" itibarıyla")),
+        ))
         bridge._weather_reading = None
         bridge._publish_weather()
-        pump(200)
-        self.assertEqual("Hava yok", self.item(root, "contextWeatherCondition").property("text"))
+        settled(200, lambda: (
+            self.assertEqual("Hava yok", self.item(root, "contextWeatherCondition").property("text")),
+        ))
 
 
 def w_geo():
@@ -1997,11 +2091,13 @@ class ConversationSurfaceTests(UiTestCase):
                 self.assertLessEqual(work[3], height)
         # The sidebar is the home page's only (Q11).
         bridge.setPage("tasks")
-        pump(400)
-        self.assertFalse(self.item(root, "summaryRail").isVisible())
+        settled(400, lambda: (
+            self.assertFalse(self.item(root, "summaryRail").isVisible()),
+        ))
         bridge.setPage("home")
-        pump(400)
-        self.assertTrue(self.item(root, "summaryRail").isVisible())
+        settled(400, lambda: (
+            self.assertTrue(self.item(root, "summaryRail").isVisible()),
+        ))
         # A hidden tile reflows the grid: 3 -> two, then one across; 1 -> one across (Q3).
         root.resize(1920, 1080)
         pump(600)
@@ -2041,8 +2137,9 @@ class ConversationSurfaceTests(UiTestCase):
                 self.assertLessEqual(composer[3], work[3])
                 self.assertGreaterEqual(feed[1], height * 0.2 - 1)
         root.resize(1920, 1080)
-        pump(400)
-        self.assertTrue(self.item(root, "conversationWelcome").isVisible())
+        settled(400, lambda: (
+            self.assertTrue(self.item(root, "conversationWelcome").isVisible()),
+        ))
         bridge.submitText("Bu projeyi incele.")
         pump(500)
         bridge._tell("system", "Answer the pending approval first (Approve, Deny or Cancel).")
@@ -2091,17 +2188,19 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertNotIn("Waiting for your request. I’ll help you plan the next step and ask before an action needs your permission.", inside)
         # Typing alone keeps the welcome.
         composer.setProperty("text", "Bu projeyi incele.")
-        pump(200)
-        self.assertTrue(welcome.isVisible())
+        settled(200, lambda: (
+            self.assertTrue(welcome.isVisible()),
+        ))
         # The first accepted turn replaces it; the draft is cleared only then.
         QMetaObject.invokeMethod(composer, "submit")
-        pump(400)
-        self.assertEqual("", composer.property("text"))
-        self.assertFalse(welcome.isVisible())
-        self.assertTrue(feed.isVisible())
-        self.assertEqual("user", bridge.feed[0]["kind"])
-        # A refused submission (an approval is pending) keeps the draft.
-        self.assertTrue(bridge.approvalPending)
+        settled(400, lambda: (
+            self.assertEqual("", composer.property("text")),
+            self.assertFalse(welcome.isVisible()),
+            self.assertTrue(feed.isVisible()),
+            self.assertEqual("user", bridge.feed[0]["kind"]),
+            # A refused submission (an approval is pending) keeps the draft.
+            self.assertTrue(bridge.approvalPending),
+        ))
         composer.setProperty("text", "kept")
         pump(100)
         QMetaObject.invokeMethod(composer, "submit")
@@ -2143,9 +2242,10 @@ class ConversationSurfaceTests(UiTestCase):
         feed = self.item(root, "conversationFeed")
         bar = self.item(root, "feedScrollBar")
         bridge._say("user", "first")
-        pump(200)
-        self.assertFalse(feed.property("overflow"))
-        self.assertFalse(bar.isVisible())
+        settled(200, lambda: (
+            self.assertFalse(feed.property("overflow")),
+            self.assertFalse(bar.isVisible()),
+        ))
         for i in range(40):
             bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height at this width.")
         pump(600)
@@ -2159,23 +2259,28 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertAlmostEqual(bar.height() - thumb.height(), thumb.y(), delta=1.5, msg="the thumb reaches the end of its travel")
         # Reading older content: new entries and composer growth leave the position alone.
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 120.0))
-        pump(200)
-        self.assertFalse(feed.property("followEnd"))
+        settled(200, lambda: (
+            self.assertFalse(feed.property("followEnd")),
+        ))
         bridge._say("jarvis", "arrives while reading")
-        pump(400)
-        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
+        settled(400, lambda: (
+            self.assertAlmostEqual(120, feed.property("contentY"), delta=1),
+        ))
         composer = self.item(root, "canonicalComposer")
         composer.setProperty("text", "\n".join(["draft"] * 5))
-        pump(400)
-        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
+        settled(400, lambda: (
+            self.assertAlmostEqual(120, feed.property("contentY"), delta=1),
+        ))
         composer.setProperty("text", "")
-        pump(400)
-        self.assertAlmostEqual(120, feed.property("contentY"), delta=1)
-        self.assertAlmostEqual(0, thumb.y(), delta=bar.height() * 0.1)
+        settled(400, lambda: (
+            self.assertAlmostEqual(120, feed.property("contentY"), delta=1),
+            self.assertAlmostEqual(0, thumb.y(), delta=bar.height() * 0.1),
+        ))
         # Back at the end, following resumes.
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 1e9))
-        pump(200)
-        self.assertTrue(feed.property("followEnd"))
+        settled(200, lambda: (
+            self.assertTrue(feed.property("followEnd")),
+        ))
         bridge._say("user", "and one more")
         pump(400)
         end = feed.property("contentHeight") - feed.property("viewportHeight")
@@ -2191,10 +2296,11 @@ class ConversationSurfaceTests(UiTestCase):
         composer = self.box(root, "canonicalComposer")
 
         self.click(root, "railTasks")
-        pump(300)
-        self.assertTrue(root.property("peekOpen"))
-        self.assertEqual("Tasks", root.property("peekKey"))
-        self.assertTrue(self.item(root, "railTasks").property("active"))
+        settled(300, lambda: (
+            self.assertTrue(root.property("peekOpen")),
+            self.assertEqual("Tasks", root.property("peekKey")),
+            self.assertTrue(self.item(root, "railTasks").property("active")),
+        ))
         peek = self.box(root, "summaryPeek")
         rail = self.box(root, "summaryRail")
         self.assertGreaterEqual(peek[0], rail[2], "the peek opens to the right of the rail")
@@ -2206,44 +2312,52 @@ class ConversationSurfaceTests(UiTestCase):
 
         # Another card switches in place; exactly one card is active.
         self.click(root, "railPlan")
-        pump(300)
-        self.assertTrue(root.property("peekOpen"))
-        self.assertEqual("Plan", root.property("peekKey"))
-        self.assertEqual(["Plan"], [k for k in self.SUMMARY if self.item(root, "rail" + k).property("active")])
+        settled(300, lambda: (
+            self.assertTrue(root.property("peekOpen")),
+            self.assertEqual("Plan", root.property("peekKey")),
+            self.assertEqual(["Plan"], [k for k in self.SUMMARY if self.item(root, "rail" + k).property("active")]),
+        ))
         # The same card again closes it.
         self.click(root, "railPlan")
-        pump(300)
-        self.assertFalse(root.property("peekOpen"))
+        settled(300, lambda: (
+            self.assertFalse(root.property("peekOpen")),
+        ))
         # X, Escape and an outside click close it too.
         self.click(root, "railFocus")
         pump(300)
         self.click(root, "summaryPeekClose")
-        pump(300)
-        self.assertFalse(root.property("peekOpen"))
+        settled(300, lambda: (
+            self.assertFalse(root.property("peekOpen")),
+        ))
         self.click(root, "railPlan")
         pump(300)
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertFalse(root.property("peekOpen"))
+        settled(300, lambda: (
+            self.assertFalse(root.property("peekOpen")),
+        ))
         self.click(root, "railTasks")
         pump(300)
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPoint(1100, 620))
-        pump(300)
-        self.assertFalse(root.property("peekOpen"))
+        settled(300, lambda: (
+            self.assertFalse(root.property("peekOpen")),
+        ))
         # Only one context at a time: a peek closes the model panel.
         self.click(root, "modelTrigger")
-        pump(300)
-        self.assertTrue(root.property("modelOpen"))
+        settled(300, lambda: (
+            self.assertTrue(root.property("modelOpen")),
+        ))
         self.click(root, "railTasks")
-        pump(300)
-        self.assertTrue(root.property("peekOpen"))
-        self.assertFalse(root.property("modelOpen"))
+        settled(300, lambda: (
+            self.assertTrue(root.property("peekOpen")),
+            self.assertFalse(root.property("modelOpen")),
+        ))
         # The deep action is the existing full page.
         self.click(root, "summaryPeekAction")
-        pump(500)
-        self.assertEqual("tasks", bridge.page)
-        self.assertFalse(root.property("peekOpen"))
-        self.assertEqual(0, self.execute_calls())
+        settled(500, lambda: (
+            self.assertEqual("tasks", bridge.page),
+            self.assertFalse(root.property("peekOpen")),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_peek_stays_inside_the_viewport_and_shows_only_real_state(self) -> None:
         bridge = self.bridge()
@@ -2277,8 +2391,9 @@ class ConversationSurfaceTests(UiTestCase):
         pump(400)
         for key in ("Tasks", "Focus", "Plan"):
             self.click(root, "rail" + key)
-            pump(300)
-            self.assertTrue(self.item(root, "summaryPeekEmpty").isVisible(), f"{key} should be empty")
+            settled(300, lambda: (
+                self.assertTrue(self.item(root, "summaryPeekEmpty").isVisible(), f"{key} should be empty"),
+            ))
             self.click(root, "rail" + key)
             pump(300)
         self.assertEqual(0, self.execute_calls())
@@ -2287,6 +2402,7 @@ class ReactorStateTests(UiTestCase):
     """The core's semantic light follows the real state only; confirmed OFF is
     dormant; shutdown and re-enable are visual confirmations of a state that
     has already changed, and rapid toggles cancel obsolete transitions."""
+    ambient = True      # THIZ: its subject is the core's motion
 
     item = PresentationTests.item
     window = PresentationTests.window
@@ -2432,6 +2548,7 @@ class GlassMaterialTests(UiTestCase):
     """Global Glass: the shells are translucent theme tiers, the reading
     surfaces stay protected, ambient-off closes the shells, and none of it
     moves a pixel of geometry."""
+    ambient = True      # THIZ: its subject is the ambient glass
 
     item = PresentationTests.item
     window = PresentationTests.window
@@ -2726,18 +2843,21 @@ class LocalFitTests(UiTestCase):
                     break
             else:
                 self.fail("Regression point must overlap the visible sidebar")
-            pump(500)
-            self.assertEqual("dark", bridge.theme)
-            self.assertTrue(root.property("settingsOpen"))
-            self.assertFalse(root.property("peekOpen"))
+            settled(500, lambda: (
+                self.assertEqual("dark", bridge.theme),
+                self.assertTrue(root.property("settingsOpen")),
+                self.assertFalse(root.property("peekOpen")),
+            ))
             QTest.keyClick(root, Qt.Key_Escape)
-            pump(250)
-            self.assertFalse(root.property("settingsOpen"))
+            settled(250, lambda: (
+                self.assertFalse(root.property("settingsOpen")),
+            ))
             bridge.setTheme("space")
             pump(500)
             self.click(root, "settingsOrb")
-            self.click(root, "settingsSurfaceClose")
-            self.assertFalse(root.property("settingsOpen"))
+            self.click(root, "settingsSurfaceClose", then=lambda: (
+                self.assertFalse(root.property("settingsOpen")),
+            ))
         self.assertEqual(0, self.execute_calls())
 
     def test_entire_composer_rim_and_bloom_fit_every_clipping_ancestor(self):
@@ -2806,23 +2926,27 @@ class LayoutEditorTests(UiTestCase):
         root = self.window(bridge)
         rail_menu, stack_menu, toolbar = (self.item(root, n) for n in ("railMenuMemory", "stackMenu_system", "layoutToolbar"))
         self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)])
-        self.click(root, "editLayoutTrigger")
-        self.assertTrue(bridge.editMode)
-        self.assertTrue(all(i.isVisible() for i in (rail_menu, stack_menu, toolbar)))
+        self.click(root, "editLayoutTrigger", then=lambda: (
+            self.assertTrue(bridge.editMode),
+            self.assertTrue(all(i.isVisible() for i in (rail_menu, stack_menu, toolbar))),
+        ))
         # Editing suppresses card navigation: a rail card click opens no peek.
-        self.click(root, "railTasks")
-        self.assertFalse(root.property("peekOpen"))
+        self.click(root, "railTasks", then=lambda: (
+            self.assertFalse(root.property("peekOpen")),
+        ))
         menus = self.item(root, "layoutMenus")
-        self.click(root, "layoutCards")
-        self.assertEqual("cards", menus.property("mode"))
+        self.click(root, "layoutCards", then=lambda: (
+            self.assertEqual("cards", menus.property("mode")),
+        ))
         QTest.keyClick(root, Qt.Key_Escape)
         pump(60)
         self.assertEqual("", menus.property("mode"))
         self.assertTrue(bridge.editMode)
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertFalse(bridge.editMode)
-        self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)])
+        settled(300, lambda: (
+            self.assertFalse(bridge.editMode),
+            self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)]),
+        ))
         # Done exits too, and is not a save: nothing is written by it.
         bridge.setEditMode(True)
         pump(60)
@@ -2930,11 +3054,13 @@ class LayoutEditorTests(UiTestCase):
                 pump(450)
                 bridge.setEditMode(True)
                 pump(250)
-                self.click(root, "railMenuMemory")
-                self.assertEqual(("card", "rail", "memory"), tuple(menus.property(k) for k in ("mode", "region", "card")))
-                self.assertFalse(self.item(root, "menuMoveDown").isEnabled())   # the last card
-                self.click(root, "menuHide")
-                self.assertFalse(bridge.railCards[-1]["visible"])
+                self.click(root, "railMenuMemory", then=lambda: (
+                    self.assertEqual(("card", "rail", "memory"), tuple(menus.property(k) for k in ("mode", "region", "card"))),
+                    self.assertFalse(self.item(root, "menuMoveDown").isEnabled()),   # the last card
+                ))
+                self.click(root, "menuHide", then=lambda: (
+                    self.assertFalse(bridge.railCards[-1]["visible"]),
+                ))
                 self.click(root, "layoutCards")
                 popover = self.item(root, "layoutPopover")
                 self.assertEqual("6 visible · 2 hidden", self.item(root, "inventoryCount").property("text"))   # Gate 6F Q4: no Updates tile
@@ -2943,15 +3069,18 @@ class LayoutEditorTests(UiTestCase):
                 self.assertGreaterEqual(top_left.y(), 0)
                 self.assertLessEqual(top_left.x() + popover.width(), width)
                 self.assertLessEqual(top_left.y() + popover.height(), height)
-                self.click(root, "addToLayout_memory")
-                self.assertTrue(bridge.railCards[-1]["visible"])
-                self.assertEqual("cards", menus.property("mode"))                # stays open
+                self.click(root, "addToLayout_memory", then=lambda: (
+                    self.assertTrue(bridge.railCards[-1]["visible"]),
+                    self.assertEqual("cards", menus.property("mode")),                # stays open
+                ))
                 QTest.keyClick(root, Qt.Key_Escape)
                 pump(60)
-                self.click(root, "layoutReset")
-                self.assertEqual("reset", menus.property("mode"))
-                self.click(root, "resetConfirm")
-                self.assertEqual("", menus.property("mode"))
+                self.click(root, "layoutReset", then=lambda: (
+                    self.assertEqual("reset", menus.property("mode")),
+                ))
+                self.click(root, "resetConfirm", then=lambda: (
+                    self.assertEqual("", menus.property("mode")),
+                ))
                 bridge.setEditMode(False)
                 pump(150)
         self.assertEqual(0, self.execute_calls())
@@ -3184,9 +3313,10 @@ class SafetyUxTests(UiTestCase):
         self.assertFalse(lamp.property("lit"))
         self.assertTrue(self.item(root, "safetyCard_execution").isVisible())
         confirm = self.item(root, "resumeConfirm")
-        self.click(root, "killSwitchControl")
-        self.assertTrue(confirm.property("open"))
-        self.assertEqual("frozen", bridge.executionState)                     # the question resumes nothing
+        self.click(root, "killSwitchControl", then=lambda: (
+            self.assertTrue(confirm.property("open")),
+            self.assertEqual("frozen", bridge.executionState),                     # the question resumes nothing
+        ))
         self.click(root, "keepFrozen")
         self.assertFalse(confirm.property("open"))
         self.assertFalse(self.store.load().settings.execution_enabled)
@@ -3228,25 +3358,30 @@ class SafetyUxTests(UiTestCase):
         self.assertEqual(("Resume JARVIS", True), tray.lifecycle_action())
         self.assertTrue(tray.status_text().startswith("JARVIS — Frozen"))
         tray.toggle_lifecycle()
-        pump(100)
-        self.assertTrue(self.item(root, "resumeConfirm").property("open"))
-        self.assertEqual("frozen", bridge.executionState)
-        self.click(root, "resumeJarvis")
-        self.assertEqual("running", bridge.executionState)
+        settled(100, lambda: (
+            self.assertTrue(self.item(root, "resumeConfirm").property("open")),
+            self.assertEqual("frozen", bridge.executionState),
+        ))
+        self.click(root, "resumeJarvis", then=lambda: (
+            self.assertEqual("running", bridge.executionState),
+        ))
         # Quit with active work asks first; its warning promises no cancellation.
         bridge._busy = True
         tray.quit()
-        pump(200)
-        self.assertEqual([], quits)
-        self.assertIn("not stopped or undone", bridge.quitWarning)
-        self.assertNotIn("cancels", bridge.quitWarning)
-        self.click(root, "confirmCancel")
-        self.assertEqual([], quits)
+        settled(200, lambda: (
+            self.assertEqual([], quits),
+            self.assertIn("not stopped or undone", bridge.quitWarning),
+            self.assertNotIn("cancels", bridge.quitWarning),
+        ))
+        self.click(root, "confirmCancel", then=lambda: (
+            self.assertEqual([], quits),
+        ))
         tray.quit()
         pump(200)
-        self.click(root, "confirmAccept")
-        self.assertEqual([True], quits)
-        self.assertTrue(bridge.quitting)
+        self.click(root, "confirmAccept", then=lambda: (
+            self.assertEqual([True], quits),
+            self.assertTrue(bridge.quitting),
+        ))
         bridge._busy = False
         # Idle quit goes straight through the orderly path.
         idle = self.bridge()
@@ -3260,8 +3395,9 @@ class SafetyUxTests(UiTestCase):
         root = self.window(bridge)
         bridge.setCardVisible("stack", "workflow", False)
         bridge.submitText("Bu projeyi incele.")
-        pump(400)
-        self.assertTrue(bridge.approvalPending)
+        settled(400, lambda: (
+            self.assertTrue(bridge.approvalPending),
+        ))
         strip = self.item(root, "attentionStrip")
         self.assertTrue(strip.isVisible())
         self.assertEqual("Your approval is required", self.item(root, "attentionLabel").property("text"))
@@ -3274,19 +3410,22 @@ class SafetyUxTests(UiTestCase):
         QTest.keyClick(root, Qt.Key_Return)
         pump(100)
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(100)
-        self.assertTrue(bridge.approvalPending)
-        self.assertEqual(0, self.execute_calls())
+        settled(100, lambda: (
+            self.assertTrue(bridge.approvalPending),
+            self.assertEqual(0, self.execute_calls()),
+        ))
         # Review focuses the card heading, not the Approve button.
-        self.click(root, "attentionReview")
-        self.assertTrue(self.item(root, "safetyHeading_approval").hasActiveFocus())
-        self.assertFalse(self.item(root, "approvalApprove").hasActiveFocus())
-        self.assertTrue(bridge.approvalPending)
+        self.click(root, "attentionReview", then=lambda: (
+            self.assertTrue(self.item(root, "safetyHeading_approval").hasActiveFocus()),
+            self.assertFalse(self.item(root, "approvalApprove").hasActiveFocus()),
+            self.assertTrue(bridge.approvalPending),
+        ))
         # Resolution returns to calm; the receipt stays in the conversation.
-        self.click(root, "approvalApprove")
-        self.assertEqual("recorded", bridge.safety["decision"]["state"])
-        self.assertFalse(strip.isVisible())
-        self.assertEqual(1, self.execute_calls())
+        self.click(root, "approvalApprove", then=lambda: (
+            self.assertEqual("recorded", bridge.safety["decision"]["state"]),
+            self.assertFalse(strip.isVisible()),
+            self.assertEqual(1, self.execute_calls()),
+        ))
 
 
 class LocalizationTests(UiTestCase):
@@ -3407,9 +3546,10 @@ class LocalizationTests(UiTestCase):
         self.assertEqual("Onay gerekli: analyse -> anthropic/claude-code", bridge.activity[0]["text"])  # an earlier note, re-rendered
         self.assertIn("Bu projeyi incele.", self.feed_text(bridge))                               # the person's words, as written
         bridge.setEditMode(True)
-        pump(200)
-        self.assertEqual("Bitti", self.item(root, "layoutDone").property("label"))
-        self.assertEqual("DÜZENİ DÜZENLE", self.item(root, "layoutToolbar").childItems()[0].childItems()[1].childItems()[0].property("text"))
+        settled(200, lambda: (
+            self.assertEqual("Bitti", self.item(root, "layoutDone").property("label")),
+            self.assertEqual("DÜZENİ DÜZENLE", self.item(root, "layoutToolbar").childItems()[0].childItems()[1].childItems()[0].property("text")),
+        ))
         bridge.setEditMode(False)
         pump(100)
         tray = TrayController(bridge, root)
@@ -3511,9 +3651,10 @@ class HudProgressTests(UiTestCase):
             self.assertNotIn(stage, inside)
         # Resolved: the task is terminal and the header is calm again.
         bridge.approve()
-        pump(600)
-        self.assertIn(bridge.task["status"], ("completed", "failed"))
-        self.assertFalse(hud.isVisible())
+        settled(600, lambda: (
+            self.assertIn(bridge.task["status"], ("completed", "failed")),
+            self.assertFalse(hud.isVisible()),
+        ))
 
     def test_turkish_capability_is_yetkinlik(self) -> None:
         from jarvis.ui.i18n import catalog_path, load_catalog, localization
@@ -3547,23 +3688,25 @@ class GeneralChatUiTests(UiTestCase):
         bridge = self.bridge(self.chat("İyiyim, teşekkürler! Size nasıl yardımcı olabilirim?"))
         root = self.window(bridge)
         self.assertTrue(bridge.submitText("Merhaba, nasılsın?"))
-        pump(400)
-        self.assertEqual(["user", "jarvis"], self.kinds(bridge))
-        self.assertEqual("İyiyim, teşekkürler! Size nasıl yardımcı olabilirim?", bridge.feed[-1]["text"])  # as written
-        self.assertEqual({"active": False, "stages": []}, bridge.progress)
-        self.assertFalse(self.item(root, "hudProgress").isVisible())
-        self.assertFalse(bridge.task.get("task_id"))
-        self.assertFalse(bridge.approvalPending)
-        self.assertEqual("idle", bridge.coreState)
-        self.assertEqual([], [a for a in bridge.activity if a["kind"] == "error"])
-        self.assertEqual(0, self.execute_calls())
+        settled(400, lambda: (
+            self.assertEqual(["user", "jarvis"], self.kinds(bridge)),
+            self.assertEqual("İyiyim, teşekkürler! Size nasıl yardımcı olabilirim?", bridge.feed[-1]["text"]),  # as written
+            self.assertEqual({"active": False, "stages": []}, bridge.progress),
+            self.assertFalse(self.item(root, "hudProgress").isVisible()),
+            self.assertFalse(bridge.task.get("task_id")),
+            self.assertFalse(bridge.approvalPending),
+            self.assertEqual("idle", bridge.coreState),
+            self.assertEqual([], [a for a in bridge.activity if a["kind"] == "error"]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
         # An actionable request afterwards still becomes a real task with its approval.
         self.model.answers = [task_proposal("code_analysis", objective="Bu projeyi incele.")]
         bridge.submitText("Bu projeyi incele.")
-        pump(400)
-        self.assertTrue(bridge.approvalPending)
-        self.assertTrue(bridge.progress["active"])
-        self.assertEqual(0, self.execute_calls())
+        settled(400, lambda: (
+            self.assertTrue(bridge.approvalPending),
+            self.assertTrue(bridge.progress["active"]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_the_interface_language_is_sent_as_the_default_reply_language(self) -> None:
         from jarvis.ui.i18n import localization
@@ -3574,21 +3717,23 @@ class GeneralChatUiTests(UiTestCase):
         pump(300)
         bridge.setLanguage("en-US")
         bridge.submitText("Selam")
-        pump(300)
-        self.assertEqual(["tr-TR", "en-US"], [call.context["response_language"] for call in self.model.calls])
-        # The words themselves are never translated by JARVIS.
-        self.assertEqual(["Hello there", "Merhaba!", "Selam", "Hello!"], [e["text"] for e in bridge.feed])
+        settled(300, lambda: (
+            self.assertEqual(["tr-TR", "en-US"], [call.context["response_language"] for call in self.model.calls]),
+            # The words themselves are never translated by JARVIS.
+            self.assertEqual(["Hello there", "Merhaba!", "Selam", "Hello!"], [e["text"] for e in bridge.feed]),
+        ))
 
     def test_a_chat_backend_failure_is_shown_as_a_failure_not_a_reply(self) -> None:
         bridge = self.bridge()
         self.model.error = StructuredError(ErrorCode.CONNECTOR_UNAVAILABLE, "Claude Code CLI is not available")
         bridge.submitText("Merhaba")
-        pump(300)
-        self.assertEqual(["user", "error"], self.kinds(bridge))
-        self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"])
-        self.assertEqual({"active": False, "stages": []}, bridge.progress)
-        self.assertEqual(1, len(self.model.calls))
-        self.assertEqual(0, self.execute_calls())
+        settled(300, lambda: (
+            self.assertEqual(["user", "error"], self.kinds(bridge)),
+            self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"]),
+            self.assertEqual({"active": False, "stages": []}, bridge.progress),
+            self.assertEqual(1, len(self.model.calls)),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_frozen_jarvis_still_chats_but_starts_no_work(self) -> None:
         bridge = self.bridge(self.chat("Buradayım, dondurulmuş olsam da sohbet edebiliriz."), task_proposal("code_analysis"))
@@ -3598,8 +3743,9 @@ class GeneralChatUiTests(UiTestCase):
         during = []
         self.model.on_complete = lambda task: during.append(bridge.executionState)
         bridge.submitText("Merhaba")
-        pump(300)
-        self.assertEqual(["frozen"], during)                   # a chat is not work on its way to a safe point
+        settled(300, lambda: (
+            self.assertEqual(["frozen"], during),                   # a chat is not work on its way to a safe point
+        ))
         self.model.on_complete = None
         self.assertEqual("jarvis", self.kinds(bridge)[-1])
         self.assertEqual("Buradayım, dondurulmuş olsam da sohbet edebiliriz.", bridge.feed[-1]["text"])
@@ -3619,9 +3765,10 @@ class GeneralChatUiTests(UiTestCase):
         pump(100)
         self.model.answers = [task_proposal("code_analysis")]
         bridge.submitText("Bu projeyi incele.")
-        pump(300)
-        self.assertTrue(bridge.approvalPending)
-        self.assertEqual(0, self.execute_calls())
+        settled(300, lambda: (
+            self.assertTrue(bridge.approvalPending),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_no_task_stages_while_a_message_is_understood(self) -> None:
         bridge = self.bridge(self.chat("Merhaba!"), task_proposal("code_analysis"))
@@ -3632,12 +3779,13 @@ class GeneralChatUiTests(UiTestCase):
         bridge.submitText("Merhaba")
         pump(300)
         bridge.submitText("Bu projeyi incele.")
-        pump(300)
-        # Busy (REASONING) during both calls; no stages for either until a task exists.
-        self.assertEqual([(True, False, False), (True, False, False)], during)
-        self.assertTrue(bridge.approvalPending)
-        self.assertTrue(bridge.progress["active"])
-        self.assertTrue(hud.isVisible())       # a real task now
+        settled(300, lambda: (
+            # Busy (REASONING) during both calls; no stages for either until a task exists.
+            self.assertEqual([(True, False, False), (True, False, False)], during),
+            self.assertTrue(bridge.approvalPending),
+            self.assertTrue(bridge.progress["active"]),
+            self.assertTrue(hud.isVisible()),       # a real task now
+        ))
 
     def test_a_follow_up_carries_the_recent_chat_and_nothing_else(self) -> None:
         bridge = self.bridge(self.chat("Process ayrı bellekte çalışır; thread aynı süreci paylaşır."),
@@ -3649,15 +3797,16 @@ class GeneralChatUiTests(UiTestCase):
         bridge.deny()
         pump(300)
         bridge.submitText("Peki hangisi CPU ağırlıklı işlerde daha mantıklı?")
-        pump(300)
-        self.assertEqual([], self.model.calls[0].context["conversation"])
-        self.assertEqual([
-            {"role": "user", "text": "Python'da process ve thread farkı nedir?"},
-            {"role": "assistant", "text": "Process ayrı bellekte çalışır; thread aynı süreci paylaşır."},
-            {"role": "user", "text": "Bu projeyi incele."},
-        ], self.model.calls[2].context["conversation"])
-        # Around it there was an approval and a decision (live feed and cards); none of them is in the window.
-        self.assertTrue({"approval"} & {note["kind"] for note in bridge.activity})
+        settled(300, lambda: (
+            self.assertEqual([], self.model.calls[0].context["conversation"]),
+            self.assertEqual([
+                {"role": "user", "text": "Python'da process ve thread farkı nedir?"},
+                {"role": "assistant", "text": "Process ayrı bellekte çalışır; thread aynı süreci paylaşır."},
+                {"role": "user", "text": "Bu projeyi incele."},
+            ], self.model.calls[2].context["conversation"]),
+            # Around it there was an approval and a decision (live feed and cards); none of them is in the window.
+            self.assertTrue({"approval"} & {note["kind"] for note in bridge.activity}),
+        ))
         # No fixed turn window any more: while it fits the provider's budget, a
         # long chat reaches the next call whole, oldest turn first.
         self.model.answers = [self.chat(f"yanıt {i}") for i in range(8)]
@@ -3694,19 +3843,22 @@ class ClaudeAuthMessageTests(UiTestCase):
             "Billing route could not be established; the Claude model call was not started.",
             {"billing_evidence": AUTH_NOT_LOGGED_IN_EVIDENCE})
         bridge.submitText("Merhaba")
-        pump(300)
-        self.assertEqual("error", self.kinds(bridge)[-1])
-        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
+        settled(300, lambda: (
+            self.assertEqual("error", self.kinds(bridge)[-1]),
+            self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"]),
+        ))
         # Nothing of the probe's internals reaches the person.
         for internal in ("claude_auth_status", "billing_evidence", "Billing route could not be established"):
             self.assertNotIn(internal, self.feed_text(bridge))
         bridge.setLanguage("tr-TR")
-        pump(200)
-        self.assertEqual(self.TURKISH, bridge.feed[-1]["text"])               # the stored notice re-renders
+        settled(200, lambda: (
+            self.assertEqual(self.TURKISH, bridge.feed[-1]["text"]),               # the stored notice re-renders
+        ))
         bridge.setLanguage("en-US")
-        pump(200)
-        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
-        self.assertEqual(0, self.execute_calls())
+        settled(200, lambda: (
+            self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_other_route_failures_keep_the_truthful_generic_text(self) -> None:
         bridge = self.bridge()
@@ -3715,11 +3867,12 @@ class ClaudeAuthMessageTests(UiTestCase):
             "Billing route could not be established; the Claude model call was not started.",
             {"billing_evidence": "claude_env:prohibited_metered_credential_present"})
         bridge.submitText("Merhaba")
-        pump(300)
-        self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"])
-        self.assertIn("Billing route could not be established", bridge.feed[-1]["text"])
-        self.assertNotIn(self.ENGLISH, self.feed_text(bridge))
-        self.assertNotIn("claude_env", self.feed_text(bridge))
+        settled(300, lambda: (
+            self.assertIn("UNDERSTANDING MODEL UNAVAILABLE", bridge.feed[-1]["text"]),
+            self.assertIn("Billing route could not be established", bridge.feed[-1]["text"]),
+            self.assertNotIn(self.ENGLISH, self.feed_text(bridge)),
+            self.assertNotIn("claude_env", self.feed_text(bridge)),
+        ))
 
 
 class SchedulerSweepTests(UiTestCase):
@@ -3751,8 +3904,9 @@ class SchedulerSweepTests(UiTestCase):
         self.assertEqual(30_000, SWEEP_INTERVAL_MS)
         self.assertEqual(SWEEP_INTERVAL_MS, timer.interval())
         self.assertIs(bridge, timer.parent())          # the loop ends with the application
-        pump(3_000)                                    # the startup sweep
-        self.assertEqual(1, len(calls))
+        settled(3000, lambda: (  # the startup sweep
+            self.assertEqual(1, len(calls)),
+        ))
         timer.timeout.emit()                           # a periodic tick
         self.assertEqual(2, len(calls))
         # Nothing was invented for the person and no model was called.
@@ -3779,16 +3933,18 @@ class SchedulerSweepTests(UiTestCase):
         bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
         root = self.window(bridge)
         bridge.submitText("Bu projeyi incele.")
-        pump(400)
-        self.assertTrue(bridge.approvalPending)
+        settled(400, lambda: (
+            self.assertTrue(bridge.approvalPending),
+        ))
         before = (dict(bridge.approval), dict(bridge.task), bridge.coreState, len(bridge.feed), dict(bridge.progress))
         bridge.sweepDueWork()
         bridge.sweepDueWork()
-        pump(200)
-        self.assertEqual(before, (dict(bridge.approval), dict(bridge.task), bridge.coreState, len(bridge.feed), dict(bridge.progress)))
-        self.assertTrue(bridge.approvalPending)
-        self.assertTrue(self.item(root, "safetyCard_approval").isVisible())
-        self.assertEqual(0, self.execute_calls())
+        settled(200, lambda: (
+            self.assertEqual(before, (dict(bridge.approval), dict(bridge.task), bridge.coreState, len(bridge.feed), dict(bridge.progress))),
+            self.assertTrue(bridge.approvalPending),
+            self.assertTrue(self.item(root, "safetyCard_approval").isVisible()),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_hidden_to_tray_keeps_sweeping_and_a_stopped_loop_does_not(self) -> None:
         from jarvis.ui.app import install_scheduler_sweeps
@@ -3799,8 +3955,9 @@ class SchedulerSweepTests(UiTestCase):
         self.addCleanup(timer.stop)
         root.hide()
         bridge.noteHiddenToTray()
-        pump(100)
-        self.assertFalse(root.isVisible())
+        settled(100, lambda: (
+            self.assertFalse(root.isVisible()),
+        ))
         timer.timeout.emit()
         self.assertTrue(timer.isActive())
         self.assertEqual(1, len(calls))                # the tray keeps the loop running
@@ -3824,12 +3981,13 @@ class SchedulerSweepTests(UiTestCase):
         bridge.resumeJarvis()
         pump(100)
         bridge.sweepDueWork()
-        pump(200)
-        self.assertFalse(seen[-1]["claims_suspended"])         # resumed: the next sweep may claim
-        self.assertEqual([], seen[-1]["actions"])              # nothing was due, nothing materialized
-        self.assertEqual(0, self.execute_calls())
-        self.assertEqual([], self.model.calls)                 # a timer tick is never a model call
-        self.assertFalse(seen[-1]["retry_authorized"])         # unknown outcomes are never replayed
+        settled(200, lambda: (
+            self.assertFalse(seen[-1]["claims_suspended"]),         # resumed: the next sweep may claim
+            self.assertEqual([], seen[-1]["actions"]),              # nothing was due, nothing materialized
+            self.assertEqual(0, self.execute_calls()),
+            self.assertEqual([], self.model.calls),                 # a timer tick is never a model call
+            self.assertFalse(seen[-1]["retry_authorized"]),         # unknown outcomes are never replayed
+        ))
 
 
 class BrowserFailureCopyTests(UiTestCase):
@@ -3855,16 +4013,19 @@ class BrowserFailureCopyTests(UiTestCase):
         bridge = self.bridge()
         self.window(bridge)
         bridge._apply_run(self.failed_navigate(NO_CURRENT_TAB_MESSAGE))
-        pump(100)
-        self.assertEqual(["error"], self.kinds(bridge))
-        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
-        self.assertNotIn("ambiguous", self.feed_text(bridge))
+        settled(100, lambda: (
+            self.assertEqual(["error"], self.kinds(bridge)),
+            self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"]),
+            self.assertNotIn("ambiguous", self.feed_text(bridge)),
+        ))
         bridge.setLanguage("tr-TR")
-        pump(200)
-        self.assertEqual(self.TURKISH, bridge.feed[-1]["text"])
+        settled(200, lambda: (
+            self.assertEqual(self.TURKISH, bridge.feed[-1]["text"]),
+        ))
         bridge.setLanguage("en-US")
-        pump(200)
-        self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"])
+        settled(200, lambda: (
+            self.assertEqual(self.ENGLISH, bridge.feed[-1]["text"]),
+        ))
 
     def test_every_other_browser_failure_keeps_its_truthful_text(self) -> None:
         bridge = self.bridge()
@@ -3973,8 +4134,9 @@ class GmailReadPresentationTests(UiTestCase):
                          "See attached.", "Sınırlı sayıda sonuç gösteriliyor."):
             self.assertIn(expected, text)
         bridge.setLanguage("en-US")
-        pump(200)
-        self.assertIn("From: Bob <bob@example.com>", bridge.feed[-1]["text"])
+        settled(200, lambda: (
+            self.assertIn("From: Bob <bob@example.com>", bridge.feed[-1]["text"]),
+        ))
 
     def listed(self, snippet: str) -> dict:
         return self.envelope("thread_list", {"result_size_estimate": 1, "omitted": 0, "threads": [
@@ -4057,14 +4219,16 @@ class StateProjectionTests(UiTestCase):
         bridge = self.bridge()
         before = list(bridge.activity)
         bridge.sweepDueWork()
-        pump(100)                                              # nothing due: nothing noted
-        self.assertEqual(before, list(bridge.activity))
+        settled(100, lambda: (  # nothing due: nothing noted
+            self.assertEqual(before, list(bridge.activity)),
+        ))
         bridge.backend.scheduler_once = lambda: {"command": "scheduler-run", "claims_suspended": False, "retry_authorized": False,
                                                   "actions": [{"job_id": "job-7", "run_id": "r1", "action": "parked", "reason": "", "verdict": ""}]}
         bridge.sweepDueWork()
-        pump(100)
-        self.assertEqual(("scheduled", "Scheduled job job-7: parked"), (bridge.activity[0]["kind"], bridge.activity[0]["text"]))
-        self.assertEqual([], self.kinds(bridge))                                     # a background event, not a chat line
+        settled(100, lambda: (
+            self.assertEqual(("scheduled", "Scheduled job job-7: parked"), (bridge.activity[0]["kind"], bridge.activity[0]["text"])),
+            self.assertEqual([], self.kinds(bridge)),                                     # a background event, not a chat line
+        ))
 
 
 class ProviderSelectionTests(UiTestCase):
@@ -4197,21 +4361,23 @@ class ProviderSelectionTests(UiTestCase):
         # Codex interprets the SAME request into the SAME gated task: approval and destination unchanged.
         self.codex.answers = [task_proposal("code_analysis")]
         bridge.submitText("Bu projeyi incele.")
-        pump(300)
-        self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes)
-        self.assertEqual((1, 0), (len(self.codex.calls), len(self.model.calls)))
-        self.assertTrue(bridge.approvalPending)
-        self.assertEqual((CLAUDE_CODE_DESTINATION, 0), (bridge.approval["destination"], self.execute_calls()))
-        self.assertEqual("session", bridge.permissionMode)                             # untouched by the provider
+        settled(300, lambda: (
+            self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes),
+            self.assertEqual((1, 0), (len(self.codex.calls), len(self.model.calls))),
+            self.assertTrue(bridge.approvalPending),
+            self.assertEqual((CLAUDE_CODE_DESTINATION, 0), (bridge.approval["destination"], self.execute_calls())),
+            self.assertEqual("session", bridge.permissionMode),                             # untouched by the provider
+        ))
         bridge.deny()
         pump(200)
         # Research is refused with Codex - never re-routed to Claude.
         self.codex.answers = [proposal(kind="research", query="hava")]
         bridge.submitText("İstanbul'da hava kaç derece?")
-        pump(300)
-        self.assertEqual("notice", self.kinds(bridge)[-1])
-        self.assertIn("Web Research is not available with the selected chat provider", bridge.feed[-1]["text"])
-        self.assertEqual(0, len(self.model.calls))                                      # Claude was never called
+        settled(300, lambda: (
+            self.assertEqual("notice", self.kinds(bridge)[-1]),
+            self.assertIn("Web Research is not available with the selected chat provider", bridge.feed[-1]["text"]),
+            self.assertEqual(0, len(self.model.calls)),                                      # Claude was never called
+        ))
         # Back to Claude: Codex keeps its own choice.
         bridge.setChatProvider("claude")
         self.assertEqual(("claude", "gpt-5.6-luna", "low"), (bridge.chatProvider, bridge.codexModel, bridge.codexEffort))
@@ -4269,34 +4435,39 @@ class ProviderSelectionTests(UiTestCase):
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "medium")
         self.click(root, "modelTrigger")
-        pump(400)
-        self.assertEqual("5.6 Sol", self.item(root, "codexModel_gpt-5.6-sol").property("title"))
-        self.assertIn("Listed by Codex - not tried yet", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
-        self.assertIn("gpt-5.6-sol", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))   # the canonical id stays visible
+        settled(400, lambda: (
+            self.assertEqual("5.6 Sol", self.item(root, "codexModel_gpt-5.6-sol").property("title")),
+            self.assertIn("Listed by Codex - not tried yet", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+            self.assertIn("gpt-5.6-sol", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),   # the canonical id stays visible
+        ))
         self.click(root, "modelTrigger")
         pump(300)
         # A real failure: named provider, model and reason; no raw output; nothing falls back to Claude.
         self.codex.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.")
         bridge.submitText("Merhaba, kısaca kendini tanıt.")
-        pump(300)
-        self.assertEqual("error", self.kinds(bridge)[-1])
-        self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"])
-        self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes))
+        settled(300, lambda: (
+            self.assertEqual("error", self.kinds(bridge)[-1]),
+            self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"]),
+            self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes)),
+        ))
         self.click(root, "modelTrigger")
-        pump(400)
-        self.assertIn("Failed this session: ", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
-        self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
+        settled(400, lambda: (
+            self.assertIn("Failed this session: ", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+            self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+        ))
         self.click(root, "modelTrigger")
         pump(300)
         # The same model answering later is recorded as usable.
         self.codex.error, self.codex.answers = None, [proposal(kind="chat", reply="Merhaba! Ben JARVIS.")]
         bridge.submitText("Merhaba, kısaca kendini tanıt.")
-        pump(300)
-        self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState))
+        settled(300, lambda: (
+            self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState)),
+        ))
         self.click(root, "modelTrigger")
-        pump(400)
-        self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta"))
-        self.assertEqual(0, len(self.model.calls))
+        settled(400, lambda: (
+            self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+            self.assertEqual(0, len(self.model.calls)),
+        ))
 
 
 class ProviderCatalogUiTests(UiTestCase):
@@ -4501,6 +4672,8 @@ class ModelMigrationUiTests(UiTestCase):
 
 class ConversationUxTests(UiTestCase):
     """Smooth movement to new content, Copy / Quote on conversational turns only."""
+    ambient = True      # THIZ: its subject is the glide
+
     item = PresentationTests.item
     window = PresentationTests.window
 
@@ -4790,10 +4963,12 @@ class StreamingChatTests(UiTestCase):
                 self.assertEqual(self.PREVIEWS[1], QGuiApplication.clipboard().text())
         self.model.during = look
         bridge.submitText("Merhaba")
-        pump(200)
-        self.assertEqual(3, len(times))
-        self.assertEqual(1, len(set(times)))                                            # the time never changes while streaming
+        settled(200, lambda: (
+            self.assertEqual(3, len(times)),
+            self.assertEqual(1, len(set(times))),                                            # the time never changes while streaming
+        ))
 
+    @ambient_on          # THIZ: its subject is the glide
     def test_near_the_end_it_follows_and_reading_older_messages_it_never_pulls_down(self) -> None:
         lines = ["Satır %d: akış sırasında büyüyen uzun bir yanıt. " % i for i in range(1, 40)]
         previews = ["".join(lines[:n]) for n in range(4, 40, 6)]
@@ -4835,8 +5010,9 @@ class StreamingChatTests(UiTestCase):
         bridge = self.streaming(previews=("Kısmi bir yanıt",), error=failure)
         root = self.window(bridge)
         bridge.submitText("Merhaba")
-        pump(300)
-        self.assertEqual(["user", "jarvis", "error"], self.kinds(bridge))
+        settled(300, lambda: (
+            self.assertEqual(["user", "jarvis", "error"], self.kinds(bridge)),
+        ))
         partial = bridge.feed[1]
         self.assertEqual(("Kısmi bir yanıt", True), (partial["text"], partial.get("interrupted")))
         self.assertNotIn("chat", partial)                                               # never part of the conversation window
@@ -4864,6 +5040,7 @@ class ChatPresentationTests(UiTestCase):
     item = PresentationTests.item
     window = PresentationTests.window
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_a_reply_has_no_card_chrome_and_keeps_a_readable_measure(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -4909,8 +5086,9 @@ class WebResearchUiTests(UiTestCase):
         bridge.backend.app_factory = with_research
         root = self.window(bridge)
         bridge.submitText("İstanbul'da hava kaç derece ve bugün güneş kaçta batacak?")
-        pump(500)
-        self.assertEqual(["user", "jarvis"], self.kinds(bridge))
+        settled(500, lambda: (
+            self.assertEqual(["user", "jarvis"], self.kinds(bridge)),
+        ))
         entry = bridge.feed[-1]
         self.assertEqual(("22°C, gün batımı 19:28.", True, [links[1]], True), (entry["text"], entry["chat"], entry["sources"], entry["sources_cited"]))
         shown = [i for i in ConversationUxTests.all_items(self, root) if i.objectName() == "feedSources" and i.isVisible()]
@@ -4985,15 +5163,17 @@ class PermissionModeTests(UiTestCase):
         self.assertEqual("strict", self.store.load().settings.permission_mode.value)          # written through Core's config
         self.assertEqual("Ask", self.item(root, "permissionModeLabel").property("text"))
         bridge.submitText("notes.txt dosyasını oku")
-        pump(200)
-        self.assertTrue(bridge.approvalPending)                                          # STRICT: even a local read asks
-        self.assertEqual(0, self.reader.execute_calls)
+        settled(200, lambda: (
+            self.assertTrue(bridge.approvalPending),                                          # STRICT: even a local read asks
+            self.assertEqual(0, self.reader.execute_calls),
+        ))
         bridge.deny()
         pump(100)
         self.assertTrue(bridge.setPermissionMode("smart_auto"))
         bridge.submitText("notes.txt dosyasını oku")
-        pump(200)
-        self.assertEqual((False, "completed", 1), (bridge.approvalPending, bridge.task["run_status"], self.reader.execute_calls))
+        settled(200, lambda: (
+            self.assertEqual((False, "completed", 1), (bridge.approvalPending, bridge.task["run_status"], self.reader.execute_calls)),
+        ))
         bridge.submitText("Bu projeyi incele.")
         pump(200)
         self.assertTrue(bridge.approvalPending)                                          # the always-approval boundary holds
@@ -5026,29 +5206,34 @@ class WindowStateTests(UiTestCase):
                 pump(200)
                 self.assertEqual(name, QWindow.Visibility(root.property("restoreVisibility")).name)
                 bridge.minimizeWindow(root)
-                pump(150)
-                self.assertEqual("Minimized", root.visibility().name)
+                settled(150, lambda: (
+                    self.assertEqual("Minimized", root.visibility().name),
+                ))
                 self.restore(root)
                 self.assertEqual(name, root.visibility().name)                           # minimize -> restore
                 root.close()
-                pump(150)
-                self.assertFalse(root.isVisible())
+                settled(150, lambda: (
+                    self.assertFalse(root.isVisible()),
+                ))
                 tray.open()
-                pump(200)
-                self.assertEqual(name, root.visibility().name)                           # tray -> Open JARVIS
+                settled(200, lambda: (
+                    self.assertEqual(name, root.visibility().name),                           # tray -> Open JARVIS
+                ))
                 other.show()
                 other.requestActivate()
                 pump(100)
                 root.requestActivate()
-                pump(100)
-                self.assertEqual(name, root.visibility().name)                           # focus away and back
+                settled(100, lambda: (
+                    self.assertEqual(name, root.visibility().name),                           # focus away and back
+                ))
                 bridge.minimizeWindow(root)
                 pump(100)
                 root.close()
                 pump(100)                                                  # X while minimized
                 tray.open()
-                pump(200)
-                self.assertEqual(name, root.visibility().name)
+                settled(200, lambda: (
+                    self.assertEqual(name, root.visibility().name),
+                ))
         other.hide()
 
 
@@ -5063,7 +5248,7 @@ class SurfaceCase(UiTestCase):
         root = self.load(bridge)
         root.showNormal()
         root.resize(1920, 1080)
-        pump(350)
+        window_ready(self, root, 1920, 1080, 350)
         return root
 
     def item(self, root, name):
@@ -5079,12 +5264,15 @@ class SurfaceCase(UiTestCase):
         self.assertIsNotNone(found, name)
         return found
 
-    def click(self, root, name):
+    def click(self, root, name, then=None):
         from PySide6.QtCore import QPointF
         item = self.item(root, name)
         centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, centre)
-        pump(260)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
     def all_items(self, root):
         found, stack = [], [root.contentItem()]
@@ -5303,18 +5491,21 @@ class ContextReferenceTests(SurfaceCase):
         reply = [i for i in self.all_items(root) if i.objectName() == "feedMessage_jarvis"
                  and "Konu A:" in str(i.property("text"))][0]
         QMetaObject.invokeMethod(reply, "select", Q_ARG(int, 0), Q_ARG(int, 6))
-        pump(200)
-        self.assertTrue(tip.property("shown"))
+        settled(200, lambda: (
+            self.assertTrue(tip.property("shown")),
+        ))
         where = tip.y()
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 60.0))
-        pump(300)
-        self.assertAlmostEqual(where - 60, tip.y(), delta=1)
+        settled(300, lambda: (
+            self.assertAlmostEqual(where - 60, tip.y(), delta=1),
+        ))
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 0.0))
         pump(300)
-        self.click(root, "quoteTipButton")
-        self.assertEqual([("partial", "Konu A")], [(g["reference"]["selection"], g["reference"]["text"]) for g in bridge.contextGroups])
-        self.assertFalse(tip.property("shown"))
-        self.assertEqual("", self.item(root, "composerInput").property("text"))
+        self.click(root, "quoteTipButton", then=lambda: (
+            self.assertEqual([("partial", "Konu A")], [(g["reference"]["selection"], g["reference"]["text"]) for g in bridge.contextGroups]),
+            self.assertFalse(tip.property("shown")),
+            self.assertEqual("", self.item(root, "composerInput").property("text")),
+        ))
 
 
 class ReferenceNoteTests(SurfaceCase):
@@ -5439,8 +5630,9 @@ class AttachmentUiTests(SurfaceCase):
         self.assertIn("book.pdf", " ".join(e["text"] for e in bridge.feed))
         (folder / "notes.md").write_text("değişti", encoding="utf-8")
         bridge.submitText("Bunu özetle.")
-        pump(300)
-        self.assertEqual("# Rapor\nSatır", self.model.calls[-1].context["global_attachments"][0]["file_text"])
+        settled(300, lambda: (
+            self.assertEqual("# Rapor\nSatır", self.model.calls[-1].context["global_attachments"][0]["file_text"]),
+        ))
 
     def test_a_provider_that_cannot_take_a_kind_refuses_it_and_nothing_is_re_routed(self) -> None:
         from unittest.mock import patch
@@ -5562,8 +5754,9 @@ class EditMenuPasteTests(SurfaceCase):
         editor.forceActiveFocus()
         pump(50)
         QMetaObject.invokeMethod(menu, "popup")
-        pump(250)
-        self.assertTrue(menu.property("visible"))
+        settled(250, lambda: (
+            self.assertTrue(menu.property("visible")),
+        ))
         states = {name: self.entry(menu, name).property("enabled")
                   for name in ("editUndo", "editCut", "editCopy", "editSelectAll")}
         self.assertEqual({"editUndo": False, "editCut": False, "editCopy": False, "editSelectAll": False}, states)
@@ -5664,8 +5857,9 @@ class GroupSeparateTurnTests(SurfaceCase):
         self.draft(bridge)
         before = len(bridge.feed)
         bridge.submitText("Her birine kısa cevap ver.")
-        pump(400)
-        self.assertEqual(3, len(self.model.calls))
+        settled(400, lambda: (
+            self.assertEqual(3, len(self.model.calls)),
+        ))
         for label, task in zip("ABC", self.model.calls):
             notes = [g.get("note") for g in task.context["context_groups"]]
             self.assertEqual([f"{label} notu"], notes)                           # its own note, no other
@@ -5687,15 +5881,17 @@ class GroupSeparateTurnTests(SurfaceCase):
         # Changing the model while the turn runs affects only the NEXT turn.
         self.codex.on_complete = lambda task: bridge.setCodexModel("gpt-5.6-sol", "medium") if len(self.codex.calls) == 1 else None
         bridge.submitText("Kısa cevap ver.")
-        pump(400)
-        self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes)          # one adapter for the whole turn
-        self.assertEqual((3, 0), (len(self.codex.calls), len(self.model.calls)))
-        self.assertIn("C\nC yanıtı", bridge.feed[-1]["text"])
+        settled(400, lambda: (
+            self.assertEqual([("gpt-5.6-luna", "low")], self.codex_routes),          # one adapter for the whole turn
+            self.assertEqual((3, 0), (len(self.codex.calls), len(self.model.calls))),
+            self.assertIn("C\nC yanıtı", bridge.feed[-1]["text"]),
+        ))
         self.codex.on_complete = None
         self.codex.answers = [proposal(kind="chat", reply="Sonraki tur.")]
         bridge.submitText("Sonraki soru.")
-        pump(300)
-        self.assertEqual(("gpt-5.6-sol", "medium"), self.codex_routes[-1])
+        settled(300, lambda: (
+            self.assertEqual(("gpt-5.6-sol", "medium"), self.codex_routes[-1]),
+        ))
 
     def test_a_failed_group_is_said_in_the_reply_and_the_others_stay(self) -> None:
         bridge = self.bridge(proposal(kind="chat", reply="A yanıtı"), "this is not a proposal", proposal(kind="chat", reply="C yanıtı"))
@@ -5758,8 +5954,9 @@ class ScrollOwnershipTests(SurfaceCase):
         # Closed again, the wheel belongs to the conversation once more: blocking
         # the wheel must not leave the surface holding it afterwards.
         self.click(root, "modelTrigger")
-        pump(600)
-        self.assertFalse(self.item(root, "modelSurface").isVisible())
+        settled(600, lambda: (
+            self.assertFalse(self.item(root, "modelSurface").isVisible()),
+        ))
         self.wheel(root, feed)
         self.assertLess(feed.property("contentY"), 200)
 
@@ -5782,6 +5979,7 @@ class ScrollOwnershipTests(SurfaceCase):
 
 class GlassStateTests(SurfaceCase):
     """Only the BACKGROUND follows idle / hover / active; what is read never fades."""
+    ambient = True      # THIZ: its subject is the ambient glass
 
     def test_the_card_and_the_composer_darken_by_state_and_never_the_content(self) -> None:
         bridge = self.bridge()
@@ -5853,6 +6051,7 @@ class FinalPolishTests(SurfaceCase):
     def texts(self, root):
         return [str(i.property("text")) for i in self.all_items(root) if isinstance(i.property("text"), str) and i.isVisible()]
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_open_surfaces_are_one_foreground_material_and_move_nothing(self) -> None:
         from PySide6.QtCore import QObject, QPointF
         bridge = self.bridge()
@@ -5908,15 +6107,16 @@ class FinalPolishTests(SurfaceCase):
             self.assertNotIn(voice, self.texts(root))
         bridge._busy = True
         bridge._refresh_core_state()
-        pump(250)
-        self.assertEqual("running", bridge.coreState)
-        # Preparing/executing/awaiting are said once, in the conversation's own
-        # live turn (FeedView) - never a second time beside the core.
-        self.assertFalse(group.isVisible())
-        self.assertEqual("", label.property("text"))
-        self.assertFalse(label.property("truncated"))
-        # Chat generation is not an executable workflow: the workflow panel says so.
-        self.assertEqual("No active task", self.item(root, "workflowValue_Status").property("text"))
+        settled(250, lambda: (
+            self.assertEqual("running", bridge.coreState),
+            # Preparing/executing/awaiting are said once, in the conversation's own
+            # live turn (FeedView) - never a second time beside the core.
+            self.assertFalse(group.isVisible()),
+            self.assertEqual("", label.property("text")),
+            self.assertFalse(label.property("truncated")),
+            # Chat generation is not an executable workflow: the workflow panel says so.
+            self.assertEqual("No active task", self.item(root, "workflowValue_Status").property("text")),
+        ))
         # Right of the core, short of the command strip, whole, at every size.
         for width, height in self.sizes:
             root.resize(width, height)
@@ -5937,14 +6137,16 @@ class FinalPolishTests(SurfaceCase):
         # Executing is in-progress too: still said only in the conversation.
         bridge._executing = True
         bridge.stateChanged.emit()
-        pump(200)
-        self.assertEqual("", label.property("text"))
+        settled(200, lambda: (
+            self.assertEqual("", label.property("text")),
+        ))
         bridge._executing = False
         bridge._busy = False
         bridge._refresh_core_state()
-        pump(200)
-        self.assertFalse(group.isVisible())
-        self.assertEqual(0, self.execute_calls())
+        settled(200, lambda: (
+            self.assertFalse(group.isVisible()),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_a_low_quota_is_amber_attention_never_red(self) -> None:
         bridge = self.bridge()
@@ -6003,6 +6205,7 @@ class FinalPolishTests(SurfaceCase):
             self.assertFalse(any(label.property("truncated") for label in labels))
         self.assertEqual(0, self.execute_calls())
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_focus_is_distinct_from_hover_and_selection(self) -> None:
         from PySide6.QtCore import QPointF
         bridge = self.bridge()
@@ -6038,6 +6241,7 @@ class FinalPolishTests(SurfaceCase):
         self.assertFalse(self.store.load().settings.claude_model)
         self.assertEqual(0, self.execute_calls())
 
+    @ambient_on          # THIZ: its subject is motion
     def test_motion_is_short_and_reduced_motion_removes_the_travel(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -6049,6 +6253,7 @@ class FinalPolishTests(SurfaceCase):
         pump(200)
         self.assertEqual(120, root.property("hoverToken"))
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_references_keep_their_structure_with_readable_quotes_and_quiet_nested_cards(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -6262,12 +6467,13 @@ class ResponsePresentationTests(SurfaceCase):
         bridge = self.bridge()
         root = self.window(bridge)
         bridge._apply_run(self.inspected(model_answer={"content": self.FINDINGS, "truncated": False}), self.intent())
-        pump(400)
-        self.assertEqual("completed", bridge.safety["outcome"]["kind"])
-        self.assertEqual("completed", bridge._last_outcome)
-        self.assertEqual("Completed", str(self.item(root, "safetyHeading_outcome").property("text")))
-        self.assertIn("confirmed completion", str(self.item(root, "safetyOutcomeText").property("text")))
-        self.assertEqual([], [i for i in bridge.safety["attention"] if i["key"] == "outcome"])
+        settled(400, lambda: (
+            self.assertEqual("completed", bridge.safety["outcome"]["kind"]),
+            self.assertEqual("completed", bridge._last_outcome),
+            self.assertEqual("Completed", str(self.item(root, "safetyHeading_outcome").property("text"))),
+            self.assertIn("confirmed completion", str(self.item(root, "safetyOutcomeText").property("text"))),
+            self.assertEqual([], [i for i in bridge.safety["attention"] if i["key"] == "outcome"]),
+        ))
 
     def test_the_live_feed_never_claims_an_unmet_objective_completed(self) -> None:
         bridge = self.bridge()
@@ -6280,9 +6486,10 @@ class ResponsePresentationTests(SurfaceCase):
         self.assertIn("without achieving", note["text"])
         # A grounded run does say completed, once, in JARVIS's own words.
         bridge._apply_run(self.inspected(model_answer={"content": self.FINDINGS, "truncated": False}), self.intent())
-        pump(200)
-        self.assertEqual("system", bridge.activity[0]["kind"])
-        self.assertIn("completed", bridge.activity[0]["text"].lower())
+        settled(200, lambda: (
+            self.assertEqual("system", bridge.activity[0]["kind"]),
+            self.assertIn("completed", bridge.activity[0]["text"].lower()),
+        ))
 
     def test_jarvis_does_not_narrate_its_own_machinery(self) -> None:
         """By default the conversation carries intent, outcome and limits - not
@@ -6345,8 +6552,9 @@ class ResponsePresentationTests(SurfaceCase):
         bridge = self.bridge(proposal(kind="chat", reply=english), proposal(kind="chat", reply="Evet."))
         self.window(bridge)
         bridge.submitText("plan ver")
-        pump(300)
-        self.assertEqual(("jarvis", english), (bridge.feed[-1]["kind"], bridge.feed[-1]["text"]))
+        settled(300, lambda: (
+            self.assertEqual(("jarvis", english), (bridge.feed[-1]["kind"], bridge.feed[-1]["text"])),
+        ))
         bridge.submitText("niye ingilizce cevap verdin?")
         pump(300)
         window = self.model.calls[-1].context["conversation"]
@@ -6360,13 +6568,14 @@ class ResponsePresentationTests(SurfaceCase):
         bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi şimdi incele"))
         self.window(bridge)
         bridge.submitText("bu projeyi incele şimdi")
-        pump(300)
-        # Understood as a task: the authorization card decides it, and JARVIS
-        # claims nothing in the conversation.
-        self.assertTrue(bridge.approvalPending)
-        self.assertEqual(["user"], self.kinds(bridge))
-        self.assertEqual(0, self.execute_calls())
-        self.assertNotIn("planning component", self.feed_text(bridge))
+        settled(300, lambda: (
+            # Understood as a task: the authorization card decides it, and JARVIS
+            # claims nothing in the conversation.
+            self.assertTrue(bridge.approvalPending),
+            self.assertEqual(["user"], self.kinds(bridge)),
+            self.assertEqual(0, self.execute_calls()),
+            self.assertNotIn("planning component", self.feed_text(bridge)),
+        ))
         # Approved: the connector's account of the run arrives as the task's
         # result, and the conversation window keeps only its provenance line.
         bridge.approve()
@@ -6412,8 +6621,9 @@ class ResponsePresentationTests(SurfaceCase):
         bridge.quoteSelection(entry, "Konu B.")
         bridge.setResponseMode("separate")
         bridge.submitText("her gruba ayrı yanıt ver")
-        pump(400)
-        self.assertEqual("jarvis", bridge.feed[-1]["kind"])
+        settled(400, lambda: (
+            self.assertEqual("jarvis", bridge.feed[-1]["kind"]),
+        ))
         merged = bridge.feed[-1]["text"]
         self.assertIn("A yanıtı.", merged)
         self.assertIn("B yanıtı.", merged)
@@ -6486,8 +6696,9 @@ class ResponsePresentationTests(SurfaceCase):
                 self.assertGreater(row.height(), 0)
         self.model.on_complete = stream
         bridge.submitText("başlık ver")
-        pump(400)
-        self.assertFalse(self.item(root, "streamingReply").isVisible())
+        settled(400, lambda: (
+            self.assertFalse(self.item(root, "streamingReply").isVisible()),
+        ))
         rows = [i for i in self.all_items(root) if i.objectName() == "feedMessage_jarvis" and i.isVisible()]
         self.assertEqual(1, len(rows))                                    # one assistant row, not two
         self.assertEqual("## Başlık\n\n**tamam**", bridge.feed[-1]["text"])
@@ -6914,11 +7125,14 @@ class ConversationEntryTests(SurfaceCase):
     """The History page lists the saved conversations and opens or starts one;
     the palette starts one too. Every entry is a bridge slot."""
 
-    def press(self, root, item):
+    def press(self, root, item, then=None):
         from PySide6.QtCore import QPointF
         centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, centre)
-        pump(300)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(300, then)
+        else:
+            pump(300)
 
     def history(self, root):
         self.click(root, "navigationTrigger")
@@ -6938,9 +7152,10 @@ class ConversationEntryTests(SurfaceCase):
         title = next(r["title"] for r in bridge.conversations if r["id"] == first)
         target = [r for r in rows if r.childItems()[0].property("text").startswith(title)]
         self.assertEqual(1, len(target))
-        self.press(root, target[0])
-        self.assertEqual((first, "home"), (bridge.conversationId, bridge.page))
-        self.assertEqual(["A konuşması: Postgres kullan.", "A yanıtı."], [e["text"] for e in bridge.feed])
+        self.press(root, target[0], then=lambda: (
+            self.assertEqual((first, "home"), (bridge.conversationId, bridge.page)),
+            self.assertEqual(["A konuşması: Postgres kullan.", "A yanıtı."], [e["text"] for e in bridge.feed]),
+        ))
         # A new one from the page: distinct, open, empty.
         self.history(root)
         self.click(root, "historyNewConversation")
@@ -6955,10 +7170,11 @@ class ConversationEntryTests(SurfaceCase):
         root.activeFocusItem().setProperty("text", "New conversation")      # the palette's search field
         pump(50)
         QTest.keyClick(root, Qt.Key_Return)
-        pump(300)
-        self.assertNotIn(bridge.conversationId, (first, second, third))
-        self.assertEqual(4, len(bridge.conversations))
-        self.assertEqual(0, self.execute_calls())
+        settled(300, lambda: (
+            self.assertNotIn(bridge.conversationId, (first, second, third)),
+            self.assertEqual(4, len(bridge.conversations)),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
 
 class PresentationTypographyTests(SurfaceCase):
@@ -7367,11 +7583,12 @@ class PrePolishTests(SurfaceCase):
         self.assertEqual("claude-sonnet-5", self.store.load().settings.claude_model)
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-luna", "low")
-        pump(200)
-        self.assertEqual("Unavailable", self.item(root, "codexResearchStateBadge").property("text"))
-        self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value"))
-        # Google's quota is still retrieved - it just has no control here.
-        self.assertEqual(1, len(bridge.providers[2]["quota"]["groups"]))
+        settled(200, lambda: (
+            self.assertEqual("Unavailable", self.item(root, "codexResearchStateBadge").property("text")),
+            self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value")),
+            # Google's quota is still retrieved - it just has no control here.
+            self.assertEqual(1, len(bridge.providers[2]["quota"]["groups"])),
+        ))
 
     def invoke(self, root, name, signal):
         QMetaObject.invokeMethod(self.item(root, name), signal)
@@ -7385,10 +7602,11 @@ class PrePolishTests(SurfaceCase):
         # Same data source as the live feed: this session's activity notes. Gate 6F
         # (Q4): Updates has no tile - a layout that shows it keeps it, unshown.
         bridge.setCardVisible("rail", "updates", True)
-        pump(300)
-        self.assertTrue([c for c in bridge.railCards if c["id"] == "updates"][0]["visible"])
-        self.assertNotIn("railUpdates", [str(i.objectName()) for i in self.all_items(root)])
-        self.assertGreaterEqual(len(bridge.activity), 1)                 # what the live feed lists
+        settled(300, lambda: (
+            self.assertTrue([c for c in bridge.railCards if c["id"] == "updates"][0]["visible"]),
+            self.assertNotIn("railUpdates", [str(i.objectName()) for i in self.all_items(root)]),
+            self.assertGreaterEqual(len(bridge.activity), 1),                 # what the live feed lists
+        ))
 
     def test_attachments_preview_from_the_snapshot_in_the_draft_the_groups_and_the_sent_message(self) -> None:
         bridge = self.bridge(proposal(kind="chat", reply="Tamam."))
@@ -7421,20 +7639,23 @@ class PrePolishTests(SurfaceCase):
         self.assertEqual((True, "image", "shot.png"), (overlay.property("open"), overlay.property("kind"), overlay.property("file")["name"]))
         self.assertEqual(image["preview"], self.item(root, "attachmentPreviewImage").property("source").toString())
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertFalse(overlay.property("open"))
+        settled(300, lambda: (
+            self.assertFalse(overlay.property("open")),
+        ))
         # A text file: read-only, the snapshotted text, bounded; the X closes it.
         self.click(root, "attachmentOpen_" + note["id"])
         pump(300)
         body = self.item(root, "attachmentPreviewText")
         self.assertEqual(("text", "# Rapor\nSatır bir\nSatır iki", True), (overlay.property("kind"), body.property("text"), body.property("readOnly")))
         self.click(root, "attachmentPreviewClose")
-        pump(300)
-        self.assertFalse(overlay.property("open"))
+        settled(300, lambda: (
+            self.assertFalse(overlay.property("open")),
+        ))
         # Remove still works in the draft.
         self.click(root, "attachmentRemove_" + note["id"])
-        pump(200)
-        self.assertEqual([], bridge.globalAttachments)
+        settled(200, lambda: (
+            self.assertEqual([], bridge.globalAttachments),
+        ))
         bridge.attachFile((folder / "notes.md").as_uri())
         pump(200)
         # Sent: the message keeps its files, the group's one marked with its letter.
@@ -7538,6 +7759,7 @@ class ContextMenuPolishTests(SurfaceCase):
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_menus_carry_actions_only_and_a_lighter_glass(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -7571,9 +7793,10 @@ class ContextMenuPolishTests(SurfaceCase):
         note = self.menu(root, "copyFeedback_composerEditMenu")
         self.assertTrue(note.property("visible"))
         self.assertIn("Copied", self.texts_of(note.property("contentItem")))
-        pump(1800)
-        self.assertFalse(note.property("visible"))                                # it leaves by itself
-        self.assertEqual("merhaba dünya", editor.property("text"))                # nothing was cut
+        settled(1800, lambda: (
+            self.assertFalse(note.property("visible")),                                # it leaves by itself
+            self.assertEqual("merhaba dünya", editor.property("text")),                # nothing was cut
+        ))
 
     def test_messages_get_a_read_only_copy_menu(self) -> None:
         from PySide6.QtGui import QGuiApplication
@@ -7629,33 +7852,40 @@ class ComposerFocusTests(SurfaceCase):
             QTest.keyClick(root, ch)
         pump(100)
 
-    def press(self, root, x, y):
+    def press(self, root, x, y, then=None):
         from PySide6.QtCore import QPoint
         QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, QPoint(int(x), int(y)))
-        pump(300)
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(300, then)
+        else:
+            pump(300)
 
     def test_a_press_outside_the_composer_releases_its_focus(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
         pump(700)
         editor = self.item(root, "composerInput")
-        self.click(root, "composerInput")
-        self.assertTrue(editor.property("activeFocus"))                          # a click focuses the draft
+        self.click(root, "composerInput", then=lambda: (
+            self.assertTrue(editor.property("activeFocus")),                          # a click focuses the draft
+        ))
         self.type(root, "merhaba")
         self.assertEqual("merhaba", editor.property("text"))
         # An empty part of the conversation: focus leaves, nothing else happens.
         feed = self.item(root, "conversationFeed")
         from PySide6.QtCore import QPointF
         empty = feed.mapToScene(QPointF(feed.width() / 2, 40))
-        self.press(root, empty.x(), empty.y())
-        self.assertFalse(editor.property("activeFocus"))
-        self.assertEqual("merhaba", editor.property("text"))                     # the draft is kept
+        self.press(root, empty.x(), empty.y(), then=lambda: (
+            self.assertFalse(editor.property("activeFocus")),
+            self.assertEqual("merhaba", editor.property("text")),                     # the draft is kept
+        ))
         # Another control still receives its click, and the draft lets go.
-        self.click(root, "composerInput")
-        self.assertTrue(editor.property("activeFocus"))
-        self.click(root, "railTasks")
-        self.assertTrue(root.property("peekOpen"))
-        self.assertFalse(editor.property("activeFocus"))
+        self.click(root, "composerInput", then=lambda: (
+            self.assertTrue(editor.property("activeFocus")),
+        ))
+        self.click(root, "railTasks", then=lambda: (
+            self.assertTrue(root.property("peekOpen")),
+            self.assertFalse(editor.property("activeFocus")),
+        ))
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
         # The composer's own chip: its menu opens and the draft keeps focus.
@@ -7676,6 +7906,7 @@ class ComposerFocusTests(SurfaceCase):
 class RailSwitchTests(SurfaceCase):
     """Card A open, card B picked: A closes with its own transition, then B opens
     with its own - never an instant swap of content in an open surface."""
+    ambient = True      # THIZ: its subject is the mid-switch fade
 
     def press(self, root, name):
         from PySide6.QtCore import QPointF
@@ -7905,9 +8136,10 @@ class TaskTitleUiTests(SurfaceCase):
         field.setProperty("text", "Vazgeçilen")
         field.forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Escape)
-        pump(300)
-        self.assertEqual("Benim adım", bridge.sessions[0]["title"])
-        self.assertEqual(0, self.execute_calls())
+        settled(300, lambda: (
+            self.assertEqual("Benim adım", bridge.sessions[0]["title"]),
+            self.assertEqual(0, self.execute_calls()),
+        ))
 
     def test_live_notes_name_the_task_instead_of_its_id(self) -> None:
         bridge = self.started()
@@ -8142,6 +8374,7 @@ class TypographySystemTests(SurfaceCase):
         self.assertEqual("Space Grotesk", faces["display"])
         self.assertEqual(faces["ui"], faces["reading"])
 
+    @ambient_on          # THIZ: it reads the ambient glass
     def test_the_ramp_is_a_real_hierarchy_and_the_inks_read_on_glass(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -8340,6 +8573,7 @@ class LiveTurnTests(SurfaceCase):
         digits = "".join(c for c in self.text(root, "liveStatusTimer") if c.isdigit() or c in ".,").replace(",", ".")
         return float(digits)
 
+    @ambient_on          # THIZ: liveActivity.animated is ambient-gated
     def test_the_timer_starts_with_the_request_and_keeps_running_through_the_stream(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
@@ -8384,10 +8618,11 @@ class LiveTurnTests(SurfaceCase):
         self.model.during = lambda text: (pump(80), seen.append((self.item(root, "streamingReply").isVisible(),
                                                                   self.item(root, "liveStatusTimer").isVisible(), bridge.workStartedAt > 0)))
         bridge.submitText("Selam")
-        pump(400)
-        self.assertEqual([(True, True, True)] * 2, seen)                           # live while it streamed
-        self.assertFalse(self.item(root, "streamingReply").isVisible())            # gone with the answer
-        self.assertEqual(0, bridge.workStartedAt)
+        settled(400, lambda: (
+            self.assertEqual([(True, True, True)] * 2, seen),                           # live while it streamed
+            self.assertFalse(self.item(root, "streamingReply").isVisible()),            # gone with the answer
+            self.assertEqual(0, bridge.workStartedAt),
+        ))
         first = bridge.feed[-1]["telemetry"]
         self.assertEqual(6400, first["elapsed_ms"])                                # the one measured duration
         lines = [str(i.property("text")) for i in self.all_items(root) if i.objectName() == "feedTelemetry" and i.isVisible()]
@@ -8398,12 +8633,14 @@ class LiveTurnTests(SurfaceCase):
         started = []
         self.model.during = lambda text: started.append(bridge.workStartedAt)
         bridge.submitText("Tekrar selam")
-        pump(400)
-        self.assertEqual(3000, bridge.feed[-1]["telemetry"]["elapsed_ms"])
-        self.assertEqual(6400, [e for e in bridge.feed if e.get("telemetry")][0]["telemetry"]["elapsed_ms"])
+        settled(400, lambda: (
+            self.assertEqual(3000, bridge.feed[-1]["telemetry"]["elapsed_ms"]),
+            self.assertEqual(6400, [e for e in bridge.feed if e.get("telemetry")][0]["telemetry"]["elapsed_ms"]),
+        ))
         lines = [str(i.property("text")) for i in self.all_items(root) if i.objectName() == "feedTelemetry" and i.isVisible()]
         self.assertEqual(["3.0 s", "6.4 s"], sorted(line.split(" · ")[0] for line in lines))
 
+    @ambient_on          # THIZ: liveActivity.animated is ambient-gated
     def test_waiting_for_the_person_is_said_in_the_chat_calm_and_untimed(self) -> None:
         bridge = self.bridge(task_proposal("code_analysis", objective="Repoyu incele"))
         root = self.window(bridge)
