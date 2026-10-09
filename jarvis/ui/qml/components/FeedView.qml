@@ -117,6 +117,12 @@ Item {
     // never again for the history above a new entry. A reply that streamed and
     // a reopened conversation's turns are already there: no entrance either.
     property var shownIds: ({})
+    // Q8: which sent quotes are unfolded, by entry id and quote index - kept here,
+    // because a feed change rebuilds every row.
+    property var unfolded: ({})
+    function toggleUnfolded(key) { var next = Object.assign({}, unfolded); next[key] = !next[key]; unfolded = next }
+    // The draft's quotes, read once for every row's marks (Q5).
+    readonly property var draftGroups: bridge.contextGroups || []
 
     // -- Markdown: presented, never executed, and never the source of truth ----
     // The canonical assistant text (modelData.text) is what history, Copy and
@@ -268,6 +274,7 @@ Item {
                     height: Math.max(row.isUser ? 0 : avatar.height, card.height + stamp.height + stamp.gap)
                     readonly property string kind: modelData.kind
                     readonly property bool isUser: kind === "user"
+                    readonly property string entryId: modelData.id
                     readonly property bool isJarvis: kind === "jarvis" || kind === "clarify"
                     // What an approved task produced (a plan, an analysis, an account
                     // of what ran): shown, labelled with where it came from, and never
@@ -327,7 +334,7 @@ Item {
                         readonly property real pad: feed.referenceLayout ? 18 : 20
                         readonly property real maxUser: Math.min(720, Math.max(280, row.width * 0.62))
                         x: row.isUser ? row.width - width : feed.messageX
-                        width: row.isUser ? Math.min(maxUser, Math.ceil(probe.implicitWidth) + 2 * pad + 2)
+                        width: row.isUser ? (sentQuotes.visible ? maxUser : Math.min(maxUser, Math.ceil(probe.implicitWidth) + 2 * pad + 2))
                              : row.loud ? Math.min(row.width - x, Math.max(360, row.width * 0.694))
                              : row.width - x
                         readonly property real textWidth: (row.isUser || row.loud) ? width - 2 * pad : width
@@ -394,10 +401,63 @@ Item {
                                        color: modelData.interrupted === true ? Theme.warning : Theme.materialBlue
                                        font: Theme.chatAuthor
                                        lineHeightMode: Text.FixedHeight; lineHeight: 18 }
+                                // Q8: what the person quoted, before what they wrote - per quote
+                                // its letter, the quoted words faint behind a left bar (a long
+                                // quote folds: "Show more" / "Show less"), their comment and the
+                                // files that quote owned; a fine line, then the common message.
+                                Column {
+                                    id: sentQuotes
+                                    objectName: "sentQuotes"
+                                    visible: row.isUser && (modelData.groups || []).length > 0
+                                    width: parent.width
+                                    spacing: 10
+                                    Repeater {
+                                        model: row.isUser ? (modelData.groups || []) : []
+                                        Column {
+                                            id: sentQuote
+                                            objectName: "sentQuote_" + index
+                                            readonly property string key: row.entryId + "/" + index
+                                            readonly property bool expanded: feed.unfolded[key] === true
+                                            readonly property var files: modelData.attachments || []
+                                            width: sentQuotes.width
+                                            spacing: 5
+                                            Item {
+                                                width: parent.width; height: Math.max(18, excerpt.height)
+                                                Rectangle { width: 18; height: 18; radius: 9; y: 1
+                                                            color: Theme.alpha("#36aaff", 0.2); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.6)
+                                                            Text { objectName: "sentQuoteLabel_" + index; anchors.centerIn: parent
+                                                                   text: String.fromCharCode(65 + index); color: Theme.text; font: Theme.captionStrong } }
+                                                Rectangle { x: 26; width: 2; height: parent.height; radius: 1; color: Theme.alpha(Theme.textMuted, 0.5) }
+                                                Text { id: excerpt; objectName: "sentQuoteText_" + index
+                                                       x: 36; width: parent.width - 36
+                                                       text: String((modelData.reference || {}).text || ""); textFormat: Text.PlainText
+                                                       wrapMode: Text.Wrap; maximumLineCount: sentQuote.expanded ? 100000 : 3; elide: Text.ElideRight
+                                                       renderType: Theme.textRender; color: Theme.textMuted; font: Theme.body }
+                                            }
+                                            Text { objectName: "sentQuoteMore_" + index
+                                                   visible: excerpt.truncated || sentQuote.expanded
+                                                   x: 36; text: sentQuote.expanded ? qsTr("Show less") : qsTr("Show more")
+                                                   color: moreArea.containsMouse ? Theme.accent : Theme.materialBlue; font: Theme.caption
+                                                   Accessible.role: Accessible.Button; Accessible.name: text
+                                                   MouseArea { id: moreArea; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true
+                                                               cursorShape: Qt.PointingHandCursor; onClicked: feed.toggleUnfolded(sentQuote.key) } }
+                                            Text { objectName: "sentQuoteComment_" + index
+                                                   visible: text !== ""; x: 36; width: parent.width - 36
+                                                   text: String(modelData.note || ""); textFormat: Text.PlainText; wrapMode: Text.Wrap
+                                                   renderType: Theme.textRender; color: Theme.text; font: Theme.body }
+                                            Flow { objectName: "sentQuoteFiles_" + index
+                                                   visible: sentQuote.files.length > 0; x: 36; width: parent.width - 36; spacing: 6
+                                                   Repeater { model: sentQuote.files
+                                                              AttachmentCard { file: modelData; compact: true; nested: true
+                                                                               onOpened: bridge.previewAttachment(modelData) } } }
+                                        }
+                                    }
+                                    Rectangle { width: parent.width; height: 1; color: Theme.alpha("#57b6e4", 0.2) }
+                                }
                                 TextEdit {
                                     id: message
                                     x: 0
-                                    y: row.isJarvis ? name.y + name.height + 4 : 0
+                                    y: row.isJarvis ? name.y + name.height + 4 : sentQuotes.visible ? sentQuotes.height + 10 : 0
                                     width: row.isJarvis ? Math.min(parent.width, 760) : parent.width
                                     // Canonical text in, presented text out: the raw
                                     // assistant text is never rewritten for display.
@@ -406,7 +466,7 @@ Item {
                                     renderType: Theme.textRender
                                     readOnly: true
                                     selectByMouse: true
-                                    // A selection survives the click on "Quote selection".
+                                    // A selection survives the click on "Quote".
                                     persistentSelection: row.conversational
                                     wrapMode: Text.Wrap
                                     objectName: "feedMessage_" + row.kind
@@ -445,9 +505,59 @@ Item {
                                                  onTapped: function(point) { messageMenu.editor = message; messageMenu.wholeText = modelData.text
                                                                              messageMenu.openAt(message, point.position) } }
                                 }
+                                // Q5: in the message a draft quote came from, each quoted range
+                                // gets a thin dotted underline and its letter at its end; the
+                                // letter opens that quote's detail. Drawn from the draft itself,
+                                // so they leave with the quote: removed, or sent.
+                                Item {
+                                    id: quoteMarks
+                                    objectName: "quoteMarks"
+                                    x: message.x; y: message.y; width: message.width; height: message.height
+                                    readonly property var marks: row.conversational
+                                        ? feed.quoteMarks(message, modelData.id, feed.draftGroups, feed.quoteRanges, message.contentHeight, message.width) : []
+                                    Repeater {
+                                        model: quoteMarks.marks
+                                        Item {
+                                            id: mark
+                                            objectName: "quoteMark_" + modelData.label
+                                            readonly property var lines: modelData.lines
+                                            Repeater {
+                                                model: mark.lines
+                                                // A dot every 3 px: a Canvas, drawn the same on every
+                                                // scene-graph backend (a dashed Shape is not).
+                                                Canvas {
+                                                    objectName: "quoteUnderline"
+                                                    x: modelData.x; y: modelData.y; width: modelData.w; height: 1
+                                                    onWidthChanged: requestPaint()
+                                                    onPaint: {
+                                                        var ctx = getContext("2d")
+                                                        ctx.clearRect(0, 0, width, height)
+                                                        ctx.fillStyle = "rgba(87, 182, 228, 0.85)"      // #57b6e4; a Canvas reads CSS colours
+                                                        for (var dot = 0; dot < width; dot += 3) ctx.fillRect(dot, 0, 1.5, 1)
+                                                    }
+                                                }
+                                            }
+                                            Rectangle {
+                                                objectName: "quoteMarker_" + modelData.label
+                                                // Raised like a superscript after the last word, on a
+                                                // solid chip so it reads over the text it may touch.
+                                                x: modelData.end.x + 2; y: modelData.end.y - 7
+                                                width: 16; height: 16; radius: 8
+                                                color: markerArea.containsMouse ? "#123a57" : "#0b2131"
+                                                border.width: 1; border.color: Theme.alpha("#49bdfa", 0.85)
+                                                Accessible.role: Accessible.Button; Accessible.name: modelData.label
+                                                Text { anchors.centerIn: parent; text: modelData.label; color: Theme.text; font: Theme.label }
+                                                HoverTip { text: qsTranslate("QuoteDetail", "Quote") + " " + modelData.label }
+                                                MouseArea { id: markerArea; anchors.fill: parent; anchors.margins: -3; hoverEnabled: true
+                                                            cursorShape: Qt.PointingHandCursor; onClicked: quoteDetail.openFor(modelData.id) }
+                                            }
+                                        }
+                                    }
+                                }
                                 // What the person attached to this message, still visible after
-                                // sending: each file with the letter of the group that owned it,
-                                // then the message's own files. Same cards as the draft.
+                                // sending. `files` is every file with the letter of the group that
+                                // owned it (none: the message's own); a quote's files are drawn in
+                                // that quote's block above (Q8), so this strip draws the message's own.
                                 Flow {
                                     id: sent
                                     objectName: "sentAttachments"
@@ -462,24 +572,15 @@ Item {
                                         for (var j = 0; j < own.length; j++) out.push({ file: own[j], label: "" })
                                         return out
                                     }
-                                    // One gutter for the ownership letters: reserved for every card
-                                    // once any file belongs to a group, so the cards line up.
-                                    readonly property bool lettered: files.some(function(f) { return f.label !== "" })
-                                    visible: row.isUser && files.length > 0
+                                    readonly property var own: files.filter(function(f) { return f.label === "" })
+                                    visible: row.isUser && own.length > 0
                                     y: message.y + message.height + 8
                                     width: message.width
                                     spacing: 6
                                     Repeater {
-                                        model: sent.files
-                                        Item {
-                                            width: card.width + (sent.lettered ? 26 : 0); height: card.height
-                                            Rectangle { id: badge; visible: modelData.label !== ""; x: 0; y: (parent.height - 20) / 2; width: 20; height: 20; radius: 10
-                                                        color: Theme.alpha("#36aaff", 0.2); border.width: 1; border.color: Theme.alpha("#49bdfa", 0.6)
-                                                        Text { anchors.centerIn: parent; text: modelData.label; color: Theme.text
-                                                               font: Theme.captionStrong } }
-                                            AttachmentCard { id: card; x: sent.lettered ? 26 : 0; file: modelData.file; compact: true; nested: true
-                                                             onOpened: bridge.previewAttachment(modelData.file) }
-                                        }
+                                        model: sent.own
+                                        AttachmentCard { file: modelData.file; compact: true; nested: true
+                                                         onOpened: bridge.previewAttachment(modelData.file) }
                                     }
                                 }
                                 // Web Research: the public pages behind the answer. Untrusted
@@ -565,7 +666,7 @@ Item {
                         MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteMessage(modelData.id) }
                         MessageAction { objectName: "messageQuoteSelection_" + index; label: qsTr("Quote selection")
                                         visible: message.selectedText.length > 0
-                                        onActivated: { bridge.quoteSelection(modelData.id, message.selectedText); message.deselect(); feed.hideQuoteTip() } }
+                                        onActivated: feed.startQuote(message, modelData.id) }
                     }
                 }
             }
@@ -793,11 +894,109 @@ Item {
     // One read-only menu for every message: the right-clicked one is its editor.
     EditMenu { id: messageMenu; objectName: "messageEditMenu" }
 
-    // -- the contextual quote action ------------------------------------------
-    // Selecting text inside a message JARVIS or the person wrote offers to quote
-    // exactly that selection, right where the selection is. It follows the text
+    // -- the contextual quote action (Quoting v2) ---------------------------------
+    // Selecting text inside a message JARVIS or the person wrote offers ONE small
+    // "Quote" button right where the selection is (Q1). It follows the text
     // while the view scrolls, leaves as soon as the selection is cleared or the
-    // conversation is rebuilt, and never interferes with selecting.
+    // conversation is rebuilt, and never interferes with selecting. Pressing it
+    // takes the selection, snapped to whole words (Q11), as a new quote of the
+    // draft and opens the quote popup there for an optional comment and files
+    // (Q2'). Quotes are context only, never authority.
+
+    // Q11: a half-selected word is taken whole. A letter or a digit is part of a
+    // word, and so is an apostrophe between two of them (Turkish "OpenAI'ın").
+    function wordAt(edit, i) {
+        function plain(j) {
+            if (j < 0 || j >= edit.length) return false
+            var c = edit.getText(j, j + 1)
+            return c.length === 1 && (c.toLowerCase() !== c.toUpperCase() || /[0-9_]/.test(c))
+        }
+        if (plain(i)) return true
+        var c = i >= 0 && i < edit.length ? edit.getText(i, i + 1) : ""
+        return (c === "'" || c === "\u2019") && plain(i - 1) && plain(i + 1)
+    }
+    function snapToWords(edit) {
+        var s = Math.min(edit.selectionStart, edit.selectionEnd), e = Math.max(edit.selectionStart, edit.selectionEnd)
+        var a = s, b = e
+        while (a > 0 && wordAt(edit, a - 1) && wordAt(edit, a)) a--
+        while (b < edit.length && wordAt(edit, b - 1) && wordAt(edit, b)) b++
+        if (a !== s || b !== e) edit.select(a, b)
+    }
+    // A selection as the bridge stores it: the renderer's line marks are newlines.
+    function quoteText(text) { return String(text).replace(/[\u2028\u2029]/g, "\n").trim() }
+    function startQuote(edit, entryId) {
+        if (!edit || edit.selectedText.length === 0) return
+        snapToWords(edit)
+        var text = edit.selectedText
+        var start = Math.min(edit.selectionStart, edit.selectionEnd), end = Math.max(edit.selectionStart, edit.selectionEnd)
+        var first = edit.positionToRectangle(start), last = edit.positionToRectangle(end)
+        var before = (bridge.contextGroups || []).length
+        hideQuoteTip()
+        if (!bridge.quoteSelection(entryId, text)) { edit.deselect(); return }
+        var groups = bridge.contextGroups || [], picked = null
+        if (groups.length > before) {
+            picked = groups[groups.length - 1]
+            var ranges = Object.assign({}, quoteRanges)
+            ranges[picked.id] = { entry: entryId, start: start, end: end }
+            quoteRanges = ranges
+        } else for (var i = 0; i < groups.length; i++) {       // the same quote again: its popup, to edit
+            var at = quoteRanges[groups[i].id]
+            if (at ? at.entry === entryId && at.start === start && at.end === end
+                   : groups[i].reference.source_id === entryId && groups[i].reference.text === quoteText(text)) picked = groups[i]
+        }
+        edit.deselect()
+        if (picked) quotePopup.openFor(edit, Qt.point(first.x, last.y + last.height + 6), picked.id,
+                                       picked.reference.text, groups.length > before, picked.note)
+    }
+
+    // Where each selection quote was taken, by group id: the snapped range in its
+    // message, so the same words twice mark the one quoted and a long quote (the
+    // stored text is bounded) still ends where the selection ended.
+    property var quoteRanges: ({})
+
+    // Q5: where the draft's quotes of ONE message stand in it - per quote its id,
+    // letter, underline segments (one per visual line) and the end point for its
+    // letter. The range taken at quote time; else found by the quoted words in the
+    // message's own text (a whole-message quote is all of it). A quote that cannot
+    // be placed is not marked.
+    function quoteMarks(edit, entryId, groups, ranges) {
+        var out = [], shown = null
+        for (var i = 0; i < (groups || []).length; i++) {
+            var ref = groups[i].reference || {}
+            if (ref.source_id !== entryId) continue
+            if (shown === null) shown = edit.getText(0, edit.length).replace(/[\u2028\u2029]/g, "\n")
+            var s = 0, e = shown.length, taken = (ranges || {})[groups[i].id]
+            if (taken && taken.entry === entryId && taken.end <= shown.length) {
+                s = taken.start; e = taken.end
+            } else if (ref.selection === "partial") {
+                s = shown.indexOf(String(ref.text || ""))
+                if (s < 0 || !ref.text) continue
+                e = s + ref.text.length
+            } else {
+                while (e > s && /\s/.test(shown.charAt(e - 1))) e--
+            }
+            var end = edit.positionToRectangle(e)
+            out.push({ id: groups[i].id, label: groups[i].label, lines: rangeLines(edit, s, e),
+                       end: { x: end.x, y: end.y + (end.height - 16) / 2 } })
+        }
+        return out
+    }
+    // One underline segment per visual line of [s, e): walked line by line, not
+    // character by character, so a whole long message costs a few calls.
+    function rangeLines(edit, s, e) {
+        var out = [], p = s
+        for (var guard = 0; p < e && guard < 400; guard++) {
+            var r = edit.positionToRectangle(p)
+            var lineEnd = edit.positionAt(edit.width, r.y + r.height / 2)
+            var stop = Math.min(e, Math.max(lineEnd, p + 1))
+            var q = edit.positionToRectangle(stop)
+            var x2 = Math.abs(q.y - r.y) < 1 ? q.x : edit.positionToRectangle(stop - 1).x + 6
+            if (x2 > r.x) out.push({ x: r.x, y: r.y + r.height - 1, w: x2 - r.x })
+            var next = edit.positionAt(0, r.y + r.height + 2)
+            p = next > stop ? next : stop + 1
+        }
+        return out
+    }
     function offerQuote(edit, entryId) {
         if (!edit || edit.selectedText.length === 0) { hideQuoteTip(); return }
         quoteTip.source = edit
@@ -815,7 +1014,7 @@ Item {
         property bool shown: false
         visible: shown
         z: 60
-        width: tipLabel.width + 20; height: 26
+        width: tipRow.width + 20; height: 26
         function place() {
             if (!source || !source.visible || source.selectedText.length === 0) { shown = false; return }
             var start = Math.min(source.selectionStart, source.selectionEnd)
@@ -833,19 +1032,18 @@ Item {
             color: tipArea.containsMouse ? Theme.alpha(Theme.accent, 0.22) : Theme.glassMenu
             border.width: 1; border.color: Theme.glassEdgeStrong
         }
-        Text { id: tipLabel; anchors.centerIn: parent; text: qsTr("Quote selection"); color: Theme.text
-               font: Theme.captionStrong }
+        Row { id: tipRow; anchors.centerIn: parent; spacing: 6
+              Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Quote"); color: Theme.text; font: Theme.captionStrong }
+              Icon { anchors.verticalCenter: parent.verticalCenter; name: "quote"; size: 12; tint: Theme.text } }
         MouseArea {
             id: tipArea
             objectName: "quoteTipButton"
             anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-            onClicked: {
-                if (quoteTip.source) {
-                    bridge.quoteSelection(quoteTip.entryId, quoteTip.source.selectedText)
-                    quoteTip.source.deselect()
-                }
-                feed.hideQuoteTip()
-            }
+            onClicked: { if (quoteTip.source) feed.startQuote(quoteTip.source, quoteTip.entryId); else feed.hideQuoteTip() }
         }
     }
+
+    // Q2': the quote popup; Q9: a quote's detail, opened from its letter (Q5).
+    QuotePopup { id: quotePopup }
+    QuoteDetail { id: quoteDetail }
 }
