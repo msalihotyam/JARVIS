@@ -1260,7 +1260,7 @@ class TestReader(Base):
             self.assertNotIn(KEY, text, p)
         self.assertNotIn(KEY, " ".join(self.pushes))
 
-    def test_needs_salih_pages_others_do_not(self):
+    def test_needs_salih_is_attention_not_a_page(self):
         self.reply = answer({"kind": "blocked", "summary": "engel_bir", "next": "n"})
         self.finish_a()
         self.reply = answer({"kind": "needs_orchestrator", "summary": "engel_iki", "next": "n"})
@@ -1275,31 +1275,44 @@ class TestReader(Base):
         self.report("C", "PASS")
         self.t += 700
         self.c.pass_once()
-        pushed = "\n".join(self.pushes)
-        self.assertIn("C: Salih karar vermeli", pushed)
-        self.assertNotIn("engel_bir", pushed)
-        self.assertNotIn("engel_iki", pushed)
+        self.assertEqual(self.pushes, [])  # the reader never pages Salih directly
         self.assertEqual(self.attn(), ["A", "B", "C", conveyor.DRY_ID])
+        reasons = {i["id"]: i["reason"] for i in self.status()["attention"]}
+        self.assertEqual(reasons["C"], "reader says needs_salih: Salih karar vermeli")
+        self.assertEqual(reasons["A"], "reader blocked: engel_bir")
 
-    def test_needs_salih_not_paged_again_by_backstop(self):
+    def test_needs_salih_paged_once_by_escalation(self):
         self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
         self.finish_a()
+        self.assertEqual(self.pushes, [])
         self.t += conveyor.ATTENTION_PAGE_S + 3600
         self.c.pass_once()
-        self.assertEqual(len(self.pushes), 2)
-        self.assertEqual(self.pushes[0], "A: karar")
-        self.assertIn(conveyor.DRY_ID, self.pushes[1])  # only the dry backstop
-        self.assertNotIn("A:", self.pushes[1])
+        self.assertEqual(len(self.pushes), 1)  # A and the dry item escalate together
+        self.assertIn("A: reader says needs_salih: karar", self.pushes[0])
+        self.t += conveyor.ATTENTION_PAGE_S + 3600
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)  # once per item
 
-    def test_needs_salih_page_respects_gap(self):
+    def test_needs_salih_ack_prevents_escalation(self):
+        self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
+        self.finish_a()
+        ack = self.base / "ack"
+        ack.mkdir()
+        (ack / "A").write_text("")
+        os.utime(ack / "A", (self.t + 5, self.t + 5))
+        self.t += conveyor.ATTENTION_PAGE_S + 3600
+        self.c.pass_once()
+        self.assertNotIn("A:", "\n".join(self.pushes))
+        self.assertNotIn("A", self.attn())
+
+    def test_needs_salih_reading_does_not_page_inside_gap(self):
         self.c.page("earlier")
         self.c.flush_pages()
         self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
         self.finish_a()
-        self.assertEqual(self.pushes, ["earlier"])  # held inside PAGE_GAP_S
         self.t += conveyor.PAGE_GAP_S
         self.c.pass_once()
-        self.assertIn("A: karar", self.pushes[-1])
+        self.assertEqual(self.pushes, ["earlier"])  # no reader page, even after the gap
 
     def test_reading_never_changes_status_or_deps(self):
         self.reply = answer({"kind": "pass", "summary": "iyi", "next": "n"})

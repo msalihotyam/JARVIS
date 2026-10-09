@@ -555,7 +555,7 @@ class Conveyor:
 
     def read_report(self, name, ln, text):
         """Advisory reading of a finished/STUCK lane's report. Never changes status,
-        never raises; only sets ln["reading"], logs and may page (needs_salih)."""
+        never raises; only sets ln["reading"] and logs (never pages: attention() lists it)."""
         try:
             key = self.key()
             if not key:
@@ -598,9 +598,6 @@ class Conveyor:
                          "stop_reason": str(resp.get("stop_reason"))[:40]}
             ln["reading"] = {**r, "at": iso(self.now())}
             self.event("reader", lane=name, reading=r, **extra)
-            if r["kind"] == "needs_salih":
-                self.page(f"{name}: {r['summary']}")
-                self.backstop_done(name, self.since(ln))  # paged already: no backstop page
         except Exception as e:  # advisory: the conveyor goes on
             self.event("reader_error", lane=name, status=type(e).__name__)
 
@@ -1018,7 +1015,8 @@ class Conveyor:
                 why.append(f"STATUS {ln['status']}")
             r = ln.get("reading") or {}
             if r.get("kind", "pass") != "pass":
-                why.append(f"reader {r['kind']}: {r.get('summary', '')}")
+                lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
+                why.append(f"{lead}: {r.get('summary', '')}")
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
         dry = self.pager_flag("dry")
@@ -1038,18 +1036,14 @@ class Conveyor:
             items.append((BACKLOG_BAD_ID, f"backlog invalid: {bad[0]}", bad[1]))
         return [i for i in items if not self.acked(i[0], i[2])]
 
-    def backstop_done(self, item_id, since):
-        done = self.pager_flag("backstop") or {}
-        done[item_id] = since
-        self.pager_flag("backstop", done)
-
     def backstop(self, items):
         """Page Salih once per attention item the orchestrator left unacked ATTENTION_PAGE_S."""
         done = self.pager_flag("backstop") or {}
         for i, why, since in items:
             if self.now() - since >= ATTENTION_PAGE_S and done.get(i) != since:
                 self.page(f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}")
-                self.backstop_done(i, since)
+                done[i] = since
+                self.pager_flag("backstop", done)
 
     def write_status(self, lanes, items):
         status = {

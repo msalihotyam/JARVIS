@@ -685,10 +685,10 @@ the optional report reader below. One instance at a time
   creating or touching `build/conveyor/ack/<id>` (existence only, never
   deleted; an ack older than the item's `since` does not count, so a reused
   lane name needs a fresh touch). ntfy (topic from `JARVIS_NTFY_TOPIC`, same
-  rules as the jarvis-flow pager; never logged) reaches Salih only for: a
-  `needs_salih` reading; an attention item left unacked for 30 min
-  (`ATTENTION_PAGE_S`, "the orchestrator did not react"; once per item); and 3
-  failed conveyor passes in a row. At most one push per 10 min; pages inside the
+  rules as the jarvis-flow pager; never logged) reaches Salih only for: an
+  attention item left unacked for 30 min (`ATTENTION_PAGE_S`, "the
+  orchestrator did not react"; once per item); and 3 failed conveyor passes in
+  a row (plus the push notices below). At most one push per 10 min; pages inside the
   gap, or after a failed send, are held and sent together.
 - **Report reader (advisory, optional).** Salih approved it on 2026-10-09
   (monthly API credit). When a lane finishes by report or is marked `STUCK`,
@@ -706,8 +706,8 @@ the optional report reader below. One instance at a time
   whitespace collapsed, the key and anything `sk-ant-` shaped removed) and
   `stop_reason`.
   A reading that is not `pass` puts the lane in `attention` (above); only
-  `needs_salih` pages directly (same ntfy path and 10 min gap, no backstop page
-  after it).
+  `needs_salih` is listed with reason prefix "reader says needs_salih:" and
+  pages nobody directly: the 30 min escalation above is its only page.
   The reader is never the authority: it cannot approve integration, push,
   patch apply or any git action, and never changes the `STATUS:` handling,
   dependencies or slots above. Key: `JARVIS_READER_API_KEY` (user env var; on
@@ -766,11 +766,16 @@ the optional report reader below. One instance at a time
   integration lane): that push is information only, marked "(bilgi;
   orkestratör bakacak)", silent 02:00-08:00; the alarm path is the conveyor's
   attention list.
+- **D. The reader paged Salih (AGY2, 23:15).** Haiku labelled AGY2
+  `needs_salih` wrongly (the orchestrator resolved it alone) and the conveyor
+  paged the phone at once. Fix (CONV3): a reader verdict never pages; it is an
+  attention item ("reader says needs_salih: ...") and only the 30 min
+  escalation, failed passes and push notices reach Salih.
 - **Rules.** Efforts are `medium|high|xhigh` only (never `low` or `max`);
   models `opus|sonnet|haiku`; a sha base must be main's HEAD. A bad status or a
   problem lane goes to `attention` for the orchestrator, never straight to the
-  phone as an alarm; Salih is paged only by the backstop, a `needs_salih`
-  reading or repeated conveyor failures.
+  phone as an alarm; Salih is paged only by the backstop or repeated conveyor
+  failures (and push notices).
 
 ## V2.0 scope freeze
 
