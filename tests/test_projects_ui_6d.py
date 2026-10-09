@@ -3,7 +3,8 @@ through the real bridge, the real app path and the real QML.
 
 A. Switcher: the open conversation's name ("Yeni Sohbet" when it has none);
    the menu is exactly the CURRENT scope's non-archived conversations, newest
-   first, the open one marked; choosing opens it; the busy guard.
+   first, the open one marked; choosing opens it; the busy guard. (Sidebar v2:
+   the plain list is fixed; a project's conversations are its tree rows.)
 B. Rename: right-click -> edit -> commit through conversation_rename_result;
    normalization first, then the store alone decides; empty -> no call; the
    archived project's conversation is disabled and a forced call refused.
@@ -117,11 +118,14 @@ class SwitcherTests(SwitcherCase):
         self.assertEqual("Üçüncü", self.text(root, "chatHeaderTitle"))
         self.assertFalse([label for label, _ in self.menu(root) if label in ("Arşiv", "Proje sohbeti")])
         self.close_menu(root)
-        # Project scope: only that project's conversations.
+        # Project scope: only that project's conversations - Sidebar v2 V1/T1: in its tree rows,
+        # the open one marked; the plain list stays fixed (it does not follow the project).
         self.assertTrue(bridge.openProjectScope(project.id))
         pump(300)
         self.assertEqual(owned.id, bridge.conversationId)
-        self.assertEqual([("Proje sohbeti", True)], self.menu(root))
+        self.assertEqual([("Proje sohbeti", True)], [(i.property("title"), i.property("current"))
+                                                     for i in self.visible(root, "sidebarProjectConversation")])
+        self.assertEqual([(c.title or "New Chat", False) for c in store.list_conversations(project_id=None)], self.menu(root))
         self.close_menu(root)
         # The busy guard: nothing opens while busy, and the choices are disabled.
         bridge.openProjectScope("")
@@ -427,5 +431,8 @@ class CatalogTests(UiTestCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Yeni Sohbet", tx("ChatHeader", "New Chat"))
         self.assertEqual("Yeniden adlandır", tx("ConversationMenu", "Rename"))
-        self.assertEqual("SOHBETLER", tx("Sidebar", "CONVERSATIONS"))
+        # Sidebar v2 L3: no SOHBETLER heading (the string left the catalog: its source comes back);
+        # the list is headed by SABİTLENENLER and the day separators.
+        self.assertEqual("CONVERSATIONS", tx("Sidebar", "CONVERSATIONS"))
+        self.assertEqual("SABİTLENENLER", tx("Sidebar", "PINNED"))
         self.assertEqual("Bir ad yazın; eski ad korunur.", tx("Bridge", "Type a name; the old name is kept."))

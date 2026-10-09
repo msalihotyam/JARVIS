@@ -196,7 +196,9 @@ class BadgeTests(ProjectsUiCase):
     # Gate 6B (Salih decision 2026-09-30): the 6A badge became the project
     # selector in the same slot; Gate 6F: the owner is named by the chat
     # header's scope chip and the sidebar marks it; the sidebar lists the
-    # projects directly (the selector rules are in tests/test_projects_ui_6b.py).
+    # projects directly (the selector rules are in tests/test_projects_ui_6b.py). Sidebar v2:
+    # the chip shows for a project chat only (V7) and the sidebar marks the open conversation's
+    # own row (V1 plain list / T1 project tree); there is no "Genel" row.
     def test_d_selector_names_the_owner_and_opens_its_menu(self) -> None:
         store = self.db()
         project = store.create_project("Evim")
@@ -204,19 +206,28 @@ class BadgeTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         owner = lambda: self.item(root, "chatHeaderScope").property("fullName")  # noqa: E731
-        selected = lambda: [i.property("title") for i in self.all_items(root, "sidebarProject") if i.property("current")]  # noqa: E731
+        chip = lambda: self.item(root, "chatHeaderScope").isVisible()  # noqa: E731
+        # Sidebar v2 T1/T4: the open conversation is marked on its tree row; a project row is never "current".
+        selected = lambda: [i.property("itemId") for i in self.all_items(root, "sidebarProjectConversation") if i.property("current")]  # noqa: E731
         self.assertEqual("Global", owner())
-        self.assertTrue(self.item(root, "sidebarGlobal").property("current"))
+        self.assertFalse(chip())                                                        # V7: no scope line for a no-project chat
+        # V1: no "Genel" row; the open no-project conversation is marked in the fixed plain list.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal"))
+        self.assertEqual([bridge.conversationId], [i.property("itemId") for i in self.all_items(root, "sidebarConversation")
+                                                   if i.isVisible() and i.property("current")])
         bridge.openConversation(owned.id)
         pump(300)
         self.assertEqual("Evim", owner())
-        self.assertEqual(["Evim"], selected())
+        self.assertTrue(chip())
+        self.assertEqual([owned.id], selected())
+        self.assertEqual([], [i for i in self.all_items(root, "sidebarProject") if i.property("current")])
         self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())            # "All projects" (Q10)
         self.assertEqual(["Evim"], [i.property("title") for i in self.all_items(root, "sidebarProject") if i.isVisible()])
         self.assertEqual("home", bridge.page)
         bridge.newConversation()
         pump(300)
         self.assertEqual("Global", owner())
+        self.assertFalse(chip())
         self.assertEqual([], selected())
 
 

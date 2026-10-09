@@ -673,8 +673,17 @@ class ArchivedSectionTests(WindowCase):
         bridge.setPage("home")
         settled(300, lambda: (
             self.assertIn("this conversation is archived", self.item(root, "readOnlyReason").property("text")),
-            self.assertTrue(self.item(root, "sidebarNewConversation").property("allowed")),   # a Global one may still start
+            # Sidebar v2 (L2/N1): no scope "+" any more; "Yeni sohbet" is the entry and a new
+            # no-project one may still start from it.
+            self.assertEqual([], self.all_items(root, "sidebarNewConversation")),
+            self.assertTrue(self.item(root, "sidebarNewChat").property("available")),
         ))
+        before = len(store.list_conversations(project_id=None))
+        self.press(root, self.item(root, "sidebarNewChat"), then=lambda: (
+            self.assertEqual(before + 1, len(store.list_conversations(project_id=None))),
+            self.assertIsNone(store.load_conversation(bridge.conversationId).project_id),
+        ))
+        self.assertTrue(bridge.openConversation(archived.id))
         # Unarchive from History: back in the lists, writable again.
         bridge.setPage("history")
         pump(300)

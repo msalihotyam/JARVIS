@@ -53,6 +53,16 @@ top); archive and delete unpin. Window preferences only, in UiPreferences'
 sidebar file beside the main document: the store and the main document stay
 byte-identical, unknown ids are pruned on read, older files load.
 
+Gate 6G Sidebar v2 (build/6g/PLAN_DRAFT.txt "SIDEBAR v2", G6SB1T) supersedes parts of
+F3/F4/F6 and the tests say so where they changed: no Genel row, no scope chip, no
+round "+", no SOHBETLER heading (V1, L3, N1 "Yeni sohbet" instead); PROJELER's word
+is a link and the rest of its row a collapse (L2, no new-project "+"); projects are
+a tree whose row toggles its conversations and whose right-click opens its page (T1,
+T2, T4); no archived links (V9); SABİTLENENLER rows carry a folder / speech-bubble
+glyph and no project label (V3, V10); one date-group state for the fixed plain list;
+a no-project chat's header has no scope line (V7). The removed elements are asserted
+absent and their replacements are asserted instead.
+
 No test performs a live model, auth or network call or opens the live DB.
 """
 
@@ -694,7 +704,16 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
     def shown(self, root, name) -> list:
         return [i for i in self.all_items(root, name) if i.isVisible()]
 
+    def lists_at_rest(self, root) -> None:
+        """Sidebar v2 T3: a collapse or a new row re-shares the height between the tree and the list over a few
+        frames; wait until both (their boxes, content and offsets) are still before the next pointer action."""
+        views = [v for n in ("sidebarProjectList", "sidebarConversationList") for v in self.all_items(root, n)]
+        self.assertTrue(wait_still(lambda: [(self.rect(v), v.property("contentHeight"), v.property("contentY")) for v in views],
+                                   SETTLE_FLOOR_MS, 20, 3), "the sidebar lists did not come to rest")
+
     def tap(self, root, item, button=Qt.LeftButton, until=None, then=None) -> None:
+        if self.all_items(root, "sidebar"):
+            self.lists_at_rest(root)
         last = None
         for _ in range(60):                         # the work surface may still be reflowing (it animates its width)
             now = self.rect(item)
@@ -717,6 +736,13 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
 
     def titles(self, root) -> list:
         return [i.property("title") for i in self.shown(root, "sidebarConversation")]
+
+    def tree_titles(self, root) -> list:
+        return [i.property("title") for i in self.shown(root, "sidebarProjectConversation")]
+
+    def gone(self, root, *names) -> None:
+        """Sidebar v2: these 6F elements no longer exist anywhere in the window."""
+        self.assertEqual([], [n for n in names if self.all_items(root, n)])
 
     def child(self, item, name):
         found = [c for c in item.childItems() if c.objectName() == name]
@@ -772,7 +798,11 @@ class SidebarNavTests(SidebarNavCase):
         bridge = self.bridge()
         bridge.openConversation(owned.id)
         root = self.window(bridge)
-        active = 3 + len(extra) + 1
+        # Sidebar v2 (V1/L2/L3): no Genel row, no "+" new project, no scope chip, no round "+".
+        self.gone(root, "sidebarGlobal", "sidebarNewProject", "sidebarScopeChip", "sidebarNewConversation")
+        # T1/V9: every active project is a tree row (the archived Eski is not).
+        self.assertEqual(sorted(["Boş", "Tek", "Çok", LONG_PROJECT] + [p.name for p in extra]),
+                         sorted(i.property("title") for i in self.shown(root, "sidebarProject")))
         for theme in themes:
             bridge.setTheme(theme)
             for width, height in SIZES:
@@ -782,8 +812,7 @@ class SidebarNavTests(SidebarNavCase):
                     self.inside(side, nav, "nav")
                     tiles = [self.box(root, "rail" + key) for key in TILES]
                     plist, clist = self.box(root, "sidebarProjectList"), self.box(root, "sidebarConversationList")
-                    for name in ("sidebarGlobal", "sidebarProjectsLink", "sidebarNewProject", "sidebarScopeChip",
-                                 "sidebarNewConversation"):
+                    for name in ("sidebarNewChat", "sidebarProjectsLink", "sidebarProjectsToggle"):
                         box = self.box(root, name)
                         self.inside(nav, box, name)
                         for tile in tiles:
@@ -794,7 +823,8 @@ class SidebarNavTests(SidebarNavCase):
                             self.apart(box, tile, what)
                     # Whole rows: a row the list shows is wholly inside it.
                     shown = {}
-                    for name, box in (("sidebarProject", plist), ("sidebarConversation", clist)):
+                    for name, box in (("sidebarProject", plist), ("sidebarProjectConversation", plist),
+                                      ("sidebarConversation", clist)):
                         inside = 0
                         for item in self.shown(root, name):
                             r = self.rect(item)
@@ -803,12 +833,18 @@ class SidebarNavTests(SidebarNavCase):
                                 self.assertAlmostEqual(r.height(), cut.height(), delta=0.5, msg=name)
                                 inside += 1
                         shown[name] = inside
-                    # 5 at the 1920 class, 3 below.
-                    self.assertEqual(min(5 if width >= 1600 else 3, active), shown["sidebarProject"])
-                    self.assertGreaterEqual(shown["sidebarConversation"], 2)
+                    # T3: the tree and the list share the height (no fixed 5 / 3 project rows): both keep rows in
+                    # view - at the 1920 class two or more each; below it (SIZE: no polish) the halves keep one
+                    # whole row at least, and the list scrolls to the rest.
+                    self.assertGreaterEqual(shown["sidebarProject"] + shown["sidebarProjectConversation"], 2)
+                    self.assertGreaterEqual(shown["sidebarConversation"], 2 if width >= 1600 else 1)
+                    flick = self.item(root, "sidebarConversationList")
+                    if shown["sidebarConversation"] < len(self.shown(root, "sidebarConversation")):
+                        self.assertGreater(flick.property("contentHeight"), flick.height())
                     # Names elide (never under 6 characters) and the tip has them whole; counts and times never elide.
-                    for name, title_name, meta_name in (("sidebarGlobal", "sidebarGlobalName", "sidebarGlobalCount"),
-                                                        ("sidebarProject", "sidebarProjectName", "sidebarProjectCount"),
+                    for name, title_name, meta_name in (("sidebarProject", "sidebarProjectName", "sidebarProjectCount"),
+                                                        ("sidebarProjectConversation", "sidebarProjectConversationTitle",
+                                                         "sidebarProjectConversationTime"),
                                                         ("sidebarConversation", "sidebarConversationTitle", "sidebarConversationTime")):
                         for row in self.shown(root, name):
                             title, meta = self.child(row, title_name), self.child(row, meta_name)
@@ -826,13 +862,15 @@ class SidebarNavTests(SidebarNavCase):
                                 six = QFontMetricsF(title.property("font")).horizontalAdvance(row.property("title")[:6] + "…")
                                 self.assertGreaterEqual(title.width() + 0.5, six, name)
                                 self.assertTrue(tip.property("active"), name)
-                    self.assertTrue(self.row(root, "sidebarProject", LONG_PROJECT).property("current"))
+                    # T1: the open conversation's tree row is the marked one (a project row is a toggle, never marked).
+                    self.assertTrue(self.row(root, "sidebarProjectConversation", LONG_TITLE).property("current"))
+                    self.assertFalse(self.row(root, "sidebarProject", LONG_PROJECT).property("current"))
                     self.assertTrue(self.child(self.row(root, "sidebarProject", LONG_PROJECT), "sidebarProjectName").property("truncated"))
-                    self.assertTrue(self.child(self.row(root, "sidebarConversation", LONG_TITLE), "sidebarConversationTitle").property("truncated"))
-                    chip, chip_name = self.box(root, "sidebarScopeChip"), self.item(root, "sidebarScopeName")
-                    self.inside(chip, self.rect(chip_name), "chip name")
-                    self.assertEqual(LONG_PROJECT, self.item(root, "sidebarScopeTip").property("text"))
-                    self.apart(chip, self.box(root, "sidebarNewConversation"), "chip / +")
+                    self.assertTrue(self.child(self.row(root, "sidebarProjectConversation", LONG_TITLE),
+                                               "sidebarProjectConversationTitle").property("truncated"))
+                    # V1: the plain list stays the no-project conversations, whatever is open.
+                    self.assertEqual(sorted(c.title for c in self.global_live), sorted(self.titles(root)))
+                    self.gone(root, "sidebarScopeChip", "sidebarScopeName", "sidebarScopeTip")
         self.assertEqual(0, self.execute_calls())
 
     def test_u_grouping_by_the_local_day_of_the_last_change(self) -> None:
@@ -873,22 +911,36 @@ class SidebarNavTests(SidebarNavCase):
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        # A project: its newest non-archived conversation.
-        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        opened = bridge.conversationId
+        # Sidebar v2 T1: a project row toggles its own conversations; it opens nothing and creates nothing.
+        self.assertEqual(sorted([r.title for r in self.live] + ["Tek sohbet"]), sorted(self.tree_titles(root)))
+        before = len(store.list_conversations(include_archived=True))
+        self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (
+            self.assertEqual(["Tek sohbet"], self.tree_titles(root)),
+        ))
+        self.assertEqual(opened, bridge.conversationId)
+        self.assertFalse(self.row(root, "sidebarProject", "Çok").property("current"))
+        self.assertEqual("3", self.row(root, "sidebarProject", "Çok").property("meta"))              # T4: the count while collapsed
+        self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (
+            self.assertEqual(sorted([r.title for r in self.live] + ["Tek sohbet"]), sorted(self.tree_titles(root))),
+        ))
+        # An empty project: a row with nothing under it; its click creates nothing.
+        self.tap(root, self.row(root, "sidebarProject", "Boş"))
+        self.assertEqual((before, opened), (len(store.list_conversations(include_archived=True)), bridge.conversationId))
+        # V1: no Genel row; the plain list is the Global conversations whatever is open.
+        self.gone(root, "sidebarGlobal")
+        self.assertEqual(sorted(r.title for r in self.global_live), sorted(self.titles(root)))
+        # The 6B rule itself (bridge.openProjectScope) is unchanged.
+        self.assertTrue(bridge.openProjectScope(self.many.id))
+        pump(200)
         newest = store.list_conversations(project_id=self.many.id)[0]
         self.assertEqual((newest.id, self.many.id), (bridge.conversationId, bridge.conversationProject["id"]))
-        self.assertTrue(self.row(root, "sidebarProject", "Çok").property("current"))
-        self.assertEqual(sorted(r.title for r in self.live), sorted(self.titles(root)))
-        # An empty project: a new conversation in it.
-        before = len(store.list_conversations(project_id=self.empty.id))
-        self.tap(root, self.row(root, "sidebarProject", "Boş"))
-        self.assertEqual((before + 1, self.empty.id), (len(store.list_conversations(project_id=self.empty.id)),
-                                                       bridge.conversationProject["id"]))
-        self.assertEqual(["New Chat"], self.titles(root))
-        # Genel: the newest Global one.
-        self.tap(root, self.item(root, "sidebarGlobal"))
-        self.assertEqual(store.list_conversations(project_id=None)[0].id, bridge.conversationId)
-        self.assertTrue(self.item(root, "sidebarGlobal").property("current"))
+        self.assertTrue(self.row(root, "sidebarProjectConversation", newest.title).property("current"))
+        self.assertEqual(sorted(r.title for r in self.global_live), sorted(self.titles(root)))     # the list did not follow
+        # A tree row pick opens that project conversation.
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tek sohbet"), then=lambda: (
+            self.assertEqual(self.one.id, bridge.conversationProject["id"]),
+        ))
         # The archived project is not a row; openProjectScope refuses it anyway.
         self.assertNotIn("Eski", [i.property("title") for i in self.shown(root, "sidebarProject")])
         self.assertFalse(bridge.openProjectScope(self.old.id))
@@ -906,7 +958,7 @@ class SidebarNavTests(SidebarNavCase):
         bridge._busy = True
         try:
             self.tap(root, self.row(root, "sidebarConversation", "Genel 1"))
-            self.tap(root, self.row(root, "sidebarProject", "Tek"), then=lambda: (
+            self.tap(root, self.row(root, "sidebarProjectConversation", "Tek sohbet"), then=lambda: (
                 self.assertEqual(self.global_live[0].id, bridge.conversationId),
             ))
         finally:
@@ -914,70 +966,81 @@ class SidebarNavTests(SidebarNavCase):
         self.assertEqual(0, self.execute_calls())
 
     def test_w_the_round_plus_opens_a_new_conversation_in_the_selected_scope(self) -> None:
+        # Sidebar v2 N1/V4': the round "+" is gone; "Yeni sohbet" is a full row above PROJELER.
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        plus = self.item(root, "sidebarNewConversation")
-        self.assertEqual("New conversation in Global", plus.property("tip"))
+        self.gone(root, "sidebarNewConversation", "sidebarScopeChip", "sidebarScopeTip")
+        plus = self.item(root, "sidebarNewChat")
+        self.assertEqual("New chat", plus.property("title"))
+        self.assertLess(self.rect(plus).bottom(), self.box(root, "sidebarProjectsLink").top())
         count = len(store.list_conversations(project_id=None))
         self.tap(root, plus)
         self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
         self.assertTrue(bridge.conversationProject["global"])
         self.assertTrue(self.row(root, "sidebarConversation", "New Chat").property("current"))
-        self.tap(root, self.row(root, "sidebarProject", "Tek"), then=lambda: (
-            self.assertEqual("New conversation in Tek", plus.property("tip")),
+        # In an open, writable project's conversation: the new one starts in that project.
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tek sohbet"), then=lambda: (
+            self.assertEqual(self.one.id, bridge.conversationProject["id"]),
         ))
         self.tap(root, plus)
         self.assertEqual((self.one.id, 2), (bridge.conversationProject["id"], len(store.list_conversations(project_id=self.one.id))))
-        # Under an archived project: dimmed, the reason in its tip, and a click does nothing.
+        # Under an archived project: the new chat is a plain one; the archived project gets nothing.
         bridge.openConversation(store.list_conversations(project_id=self.old.id)[0].id)
         settled(300, lambda: (
-            self.assertFalse(plus.property("allowed")),
-            self.assertAlmostEqual(0.38, plus.property("opacity"), places=2),
-            self.assertEqual("The project is archived: unarchive it to start a new conversation.", plus.property("tip")),
+            self.assertTrue(bridge.conversationProject["archived"]),
         ))
         self.tap(root, plus)
         self.assertEqual(1, len(store.list_conversations(project_id=self.old.id)))
-        self.assertTrue(self.item(root, "sidebarScopeChip").property("archived"))
-        self.assertEqual("Eski · archived", self.item(root, "sidebarScopeTip").property("text"))
-        # While busy: the same.
-        self.tap(root, self.item(root, "sidebarGlobal"))
+        self.assertEqual(count + 2, len(store.list_conversations(project_id=None)))
+        self.assertTrue(bridge.conversationProject["global"])
+        # While busy: dimmed, the reason in its tip, and a click does nothing.
         bridge._busy = True
         try:
             bridge.stateChanged.emit()
             settled(100, lambda: (
-                self.assertEqual("Wait for the current run to finish.", plus.property("tip")),
+                self.assertFalse(plus.property("available")),
+                self.assertAlmostEqual(0.38, plus.property("opacity"), places=2),
+                self.assertEqual("Wait for the current run to finish.", self.child(plus, "sidebarRowTip").property("text")),
             ))
             self.tap(root, plus)
-            self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
+            self.assertEqual(count + 2, len(store.list_conversations(project_id=None)))
         finally:
             bridge._busy = False
         self.assertEqual(0, self.execute_calls())
 
     def test_x_the_counts_follow_archive_unarchive_attach_and_delete(self) -> None:
+        # Sidebar v2: T4 a project row shows its count while collapsed; P1 the plain list's count while hidden
+        # (was the Genel row's); V9 no archived links (sidebarArchivedProjects / sidebarArchive) - archived ones
+        # are simply not listed.
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        count = lambda title: self.child(self.row(root, "sidebarProject", title), "sidebarProjectCount").property("text")  # noqa: E731
-        genel = lambda: self.item(root, "sidebarGlobalCount").property("text")  # noqa: E731
-        self.assertEqual(("–", "1", "3"), (count("Boş"), count("Tek"), count("Çok")))
-        self.assertEqual(str(len(bridge.conversations)), genel())
-        self.assertEqual("1", self.link(root, "sidebarArchivedProjects"))
-        self.assertEqual("1", self.link(root, "sidebarArchive"))                       # Genel: History's archived
-        self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (
-            self.assertEqual("2", self.link(root, "sidebarArchive")),
+        self.gone(root, "sidebarGlobal", "sidebarGlobalCount", "sidebarArchivedProjects", "sidebarArchivedProjectsCount",
+                  "sidebarArchive")
+        for title in ("Boş", "Tek", "Çok"):
+            self.tap(root, self.row(root, "sidebarProject", title))                         # collapse: the count shows
+        self.tap(root, self.item(root, "sidebarPlainBar"), then=lambda: (
+            self.assertFalse(bridge.sidebarTree["plain_open"]),
         ))
+        count = lambda title: self.child(self.row(root, "sidebarProject", title), "sidebarProjectCount").property("text")  # noqa: E731
+        genel = lambda: self.item(root, "sidebarPlainCount").property("text")  # noqa: E731
+        plain = lambda: len(store.list_conversations(project_id=None))  # noqa: E731
+        self.assertEqual(("–", "1", "3"), (count("Boş"), count("Tek"), count("Çok")))
+        self.assertEqual(f"{plain()} conversations", genel())
         # archive / unarchive
+        bridge.openConversation(self.live[0].id)
+        pump(300)
         victim = next(r for r in self.live if r.id != bridge.conversationId)
         self.assertTrue(bridge.archiveConversation(victim.id))
         pump(300)
-        self.assertEqual(("2", "3"), (count("Çok"), self.link(root, "sidebarArchive")))
-        self.assertNotIn(victim.title, self.titles(root))
+        self.assertEqual("2", count("Çok"))
+        self.assertNotIn(victim.title, self.tree_titles(root) + self.titles(root))
         self.assertTrue(bridge.unarchiveConversation(victim.id))
         settled(300, lambda: (
-            self.assertEqual(("3", "2"), (count("Çok"), self.link(root, "sidebarArchive"))),
+            self.assertEqual("3", count("Çok")),
         ))
-        # permanent delete of an archived one
+        # permanent delete of an archived one: nothing listed changes
         gone = next(r.id for r in store.list_conversations(project_id=self.many.id, include_archived=True) if r.archived_at)
         bridge.previewDeleteConversation(gone)
         pump(60)
@@ -985,11 +1048,14 @@ class SidebarNavTests(SidebarNavCase):
         pump(300)
         bridge.setPage("home")
         settled(400, lambda: (
-            self.assertEqual("1", self.link(root, "sidebarArchive")),
+            self.assertEqual("3", count("Çok")),
+            self.assertTrue(store.is_conversation_deleted(gone)),
         ))
         # attach: a Global conversation moves to Boş
-        self.tap(root, self.item(root, "sidebarGlobal"))
-        before = genel()
+        bridge.openConversation(self.global_live[0].id)
+        pump(300)
+        before = plain()
+        self.assertEqual(f"{before} conversations", genel())
         say(store, bridge.conversationId, "tezgah ölçüleri")
         bridge.previewAttach(self.empty.id, "")
         pump(60)
@@ -997,28 +1063,30 @@ class SidebarNavTests(SidebarNavCase):
         pump(300)
         bridge.setPage("home")
         pump(400)
-        self.assertEqual((str(int(before) - 1), "1"), (genel(), count("Boş")))
-        # a project archived: one more in the archived link, its row gone
+        self.assertEqual(("1 conversation" if before - 1 == 1 else f"{before - 1} conversations", "1"), (genel(), count("Boş")))
+        # a project archived: its row gone
         bridge.archiveProject(self.one.id)
         pump(400)
         bridge.setPage("home")
         settled(400, lambda: (
-            self.assertEqual("2", self.link(root, "sidebarArchivedProjects")),
             self.assertNotIn("Tek", [i.property("title") for i in self.shown(root, "sidebarProject")]),
+            self.gone(root, "sidebarArchivedProjects", "sidebarArchive"),
             self.assertEqual(0, self.execute_calls()),
         ))
 
     def test_y_a_right_click_acts_on_that_row_and_does_not_open_it(self) -> None:
+        # Sidebar v2: a project's conversations are its tree rows (sidebarProjectConversation, T1).
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        self.tap(root, self.row(root, "sidebarProject", "Çok"))
+        self.assertTrue(bridge.openProjectScope(self.many.id))
+        pump(300)
         opened = bridge.conversationId
         target = next(r for r in self.live if r.id != opened)
         calls = []
         real = bridge.backend.conversation_rename
         bridge.backend.conversation_rename = lambda cid, title: (calls.append((cid, title)), real(cid, title))[1]
-        self.tap(root, self.row(root, "sidebarConversation", target.title), Qt.RightButton)
+        self.tap(root, self.row(root, "sidebarProjectConversation", target.title), Qt.RightButton)
         menu = self.item(root, "conversationMenu")
         self.assertTrue(menu.property("open"))
         self.assertEqual((target.id, opened), (menu.property("targetId"), bridge.conversationId))       # not opened
@@ -1037,26 +1105,29 @@ class SidebarNavTests(SidebarNavCase):
             self.assertEqual([(target.id, "Satırdan yeni ad")], calls),
             self.assertFalse(self.editing(root)),
             self.assertEqual(opened, bridge.conversationId),
-            self.assertIn("Satırdan yeni ad", self.titles(root)),
+            self.assertIn("Satırdan yeni ad", self.tree_titles(root)),
         ))
         # Archive from the row: that one leaves the list; the open one stays open.
-        self.tap(root, self.row(root, "sidebarConversation", "Satırdan yeni ad"), Qt.RightButton)
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Satırdan yeni ad"), Qt.RightButton)
         self.tap(root, self.item(root, "conversationArchiveItem"))
         self.assertIsNotNone(store.load_conversation(target.id).archived_at)
         self.assertEqual(opened, bridge.conversationId)
-        self.assertNotIn("Satırdan yeni ad", self.titles(root))
+        self.assertNotIn("Satırdan yeni ad", self.tree_titles(root))
         self.assertFalse(menu.property("open"))
         # Under an archived project: rename / archive disabled with their reasons; delete
-        # offered for that row, and the dialog is for that row.
+        # offered for that row, and the dialog is for that row. V9: the archived project's
+        # conversations are not in the sidebar - the row is the conversation's pin (V3: pins stay).
         store.set_project_active(self.old.id, True)                    # a second one, made before the archive
         second = store.create_conversation(self.old.id, title="Eski ikinci")
+        self.assertTrue(bridge.pinConversation(second.id))
         store.set_project_active(self.old.id, False)
         bridge.refreshProjects()
         bridge.openConversation(store.list_conversations(project_id=self.old.id)[-1].id)
         settled(300, lambda: (
             self.assertNotEqual(second.id, bridge.conversationId),
+            self.assertNotIn("Eski sohbet", self.tree_titles(root) + self.titles(root)),           # V9
         ))
-        self.tap(root, self.row(root, "sidebarConversation", "Eski ikinci"), Qt.RightButton, then=lambda: (
+        self.tap(root, self.row(root, "sidebarPinnedConversation", "Eski ikinci"), Qt.RightButton, then=lambda: (
             self.assertFalse(self.item(root, "conversationRenameItem").isEnabled()),
             self.assertIn("archived", self.item(root, "conversationRenameReason").property("text")),
             self.assertFalse(self.item(root, "conversationArchiveItem").isEnabled()),
@@ -1100,47 +1171,42 @@ class SidebarNavTests(SidebarNavCase):
         self.assertEqual(0, self.execute_calls())
 
     def test_aa_the_links_and_the_new_project_plus(self) -> None:
+        # Sidebar v2: L2 no "+" on the PROJELER row (a new project only from the Projects page or the
+        # new-chat picker); V9 no archived links (archived ones live on the Projects page); "Tüm projeler"
+        # stays under the tree.
         self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
+        self.gone(root, "sidebarNewProject", "sidebarArchivedProjects", "sidebarArchivedProjectsCount", "sidebarArchive")
         self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
-        for name in ("sidebarProjectsLink", "sidebarArchivedProjects"):
+        self.assertEqual("All projects", self.item(root, "sidebarAllProjects").property("text"))
+        for name in ("sidebarProjectsLink", "sidebarAllProjects"):
             self.tap(root, self.item(root, name), then=lambda: (
                 self.assertEqual(("projects", {}), (bridge.page, bridge.openProject), name),
             ))
             bridge.setPage("home")
             pump(400)
-        # Q9: the Projects page with its create field focused.
-        self.tap(root, self.item(root, "sidebarNewProject"), then=lambda: (
+        # Q9 moved: the Projects page's own create field ("Yeni proje") is where a project is made.
+        self.tap(root, self.item(root, "sidebarProjectsLink"), then=lambda: (
             self.assertEqual("projects", bridge.page),
-            self.assertTrue(self.item(root, "projectNewName").property("activeFocus")),
+            self.assertTrue(self.item(root, "projectNewName").isVisible()),
         ))
         bridge.setPage("home")
         pump(400)
-        # Arşiv (n): Genel -> History; a project -> its detail.
-        self.tap(root, self.item(root, "sidebarArchive"), then=lambda: (
-            self.assertEqual("history", bridge.page),
-        ))
-        bridge.setPage("home")
-        pump(400)
-        self.tap(root, self.row(root, "sidebarProject", "Çok"))
-        self.tap(root, self.item(root, "sidebarArchive"), then=lambda: (
+        # A project's page (with its archived conversations) is its row's right-click "Proje sayfasını aç" (T2).
+        self.tap(root, self.row(root, "sidebarProject", "Çok"), Qt.RightButton)
+        self.tap(root, self.item(root, "sidebarProjectOpenItem"), then=lambda: (
             self.assertEqual(("projects", self.many.id), (bridge.page, bridge.openProject.get("id"))),
         ))
         bridge.setPage("home")
         pump(400)
-        # No archived conversation: no link.
-        self.tap(root, self.row(root, "sidebarProject", "Tek"), then=lambda: (
-            self.assertFalse(self.item(root, "sidebarArchive").isVisible()),
-        ))
-        # Below 760 px of height the archived-projects link folds into the heading as "(n)".
+        # At 1100 x 700 both links stay inside the navigation, clear of each other.
         self.resize_still(root, 1100, 700, 600)
-        self.assertFalse(self.item(root, "sidebarArchivedProjects").isVisible())
-        folded = self.item(root, "sidebarArchivedProjectsCount")
-        self.assertEqual(("(1)", "Archived projects"), (folded.property("count"), folded.property("tip")))
-        self.inside(self.box(root, "sidebarNav"), self.rect(folded), "folded link")
-        self.apart(self.rect(folded), self.box(root, "sidebarNewProject"), "folded / +")
-        self.tap(root, folded, then=lambda: (
+        self.gone(root, "sidebarArchivedProjects", "sidebarArchivedProjectsCount")
+        for name in ("sidebarProjectsLink", "sidebarAllProjects"):
+            self.inside(self.box(root, "sidebarNav"), self.box(root, name), name)
+        self.apart(self.box(root, "sidebarProjectsLink"), self.box(root, "sidebarAllProjects"), "links")
+        self.tap(root, self.item(root, "sidebarAllProjects"), then=lambda: (
             self.assertEqual("projects", bridge.page),
             self.assertEqual(0, self.execute_calls()),
         ))
@@ -1151,63 +1217,83 @@ class SidebarNavTests(SidebarNavCase):
         root = self.window(bridge)
         keys = []
         real = QTest.keyClick
+        # Sidebar v2: the scope pick, Genel, the round "+", Arşiv and the new-project "+" are gone (V1, L2, V9, N1);
+        # their mouse paths are the tree row, the plain row, "Yeni sohbet", the project menu and the PROJELER link.
+        self.gone(root, "sidebarGlobal", "sidebarNewConversation", "sidebarArchive", "sidebarNewProject")
         with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
-            self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (  # scope pick
+            self.tap(root, self.row(root, "sidebarProjectConversation", "Çok 0"), then=lambda: (  # a project conversation
                 self.assertEqual(self.many.id, bridge.conversationProject["id"]),
             ))
-            other = next(t for t in self.titles(root) if not self.row(root, "sidebarConversation", t).property("current"))
-            self.tap(root, self.row(root, "sidebarConversation", other), then=lambda: (  # conversation pick
+            other = next(t for t in self.tree_titles(root)
+                         if t.startswith("Çok ") and not self.row(root, "sidebarProjectConversation", t).property("current"))
+            self.tap(root, self.row(root, "sidebarProjectConversation", other), then=lambda: (  # conversation pick
                 self.assertEqual(other, bridge.conversationTitle),
             ))
-            self.tap(root, self.item(root, "sidebarNewConversation"), then=lambda: (  # new conversation
+            self.tap(root, self.item(root, "sidebarNewChat"), then=lambda: (  # new conversation (Yeni sohbet)
                 self.assertEqual(("", self.many.id), (bridge.conversationTitle, bridge.conversationProject["id"])),
             ))
-            self.tap(root, self.row(root, "sidebarConversation", other), Qt.RightButton)                 # rename
+            self.tap(root, self.row(root, "sidebarProjectConversation", other), Qt.RightButton)          # rename
             self.tap(root, self.item(root, "conversationRenameItem"))
             self.item(root, "conversationRenameField").setProperty("text", other + " 2")
             pump(60)
             self.tap(root, self.item(root, "conversationRenameSave"))
-            self.tap(root, self.row(root, "sidebarConversation", other + " 2"), Qt.RightButton)          # archive
+            self.tap(root, self.row(root, "sidebarProjectConversation", other + " 2"), Qt.RightButton)   # archive
             self.tap(root, self.item(root, "conversationArchiveItem"), then=lambda: (
-                self.assertNotIn(other + " 2", self.titles(root)),
+                self.assertNotIn(other + " 2", self.tree_titles(root)),
             ))
-            self.tap(root, self.item(root, "sidebarGlobal"), then=lambda: (  # Genel
+            self.tap(root, self.row(root, "sidebarConversation", "Genel 0"), then=lambda: (  # a plain conversation
                 self.assertTrue(bridge.conversationProject["global"]),
             ))
+            self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (  # a project's tree toggle
+                self.assertIn(self.many.id, bridge.sidebarTree["closed"]),
+            ))
+            self.tap(root, self.item(root, "sidebarPlainBar"), then=lambda: (  # the P1 bar
+                self.assertFalse(bridge.sidebarTree["plain_open"]),
+            ))
+            self.tap(root, self.item(root, "sidebarProjectsToggle"), then=lambda: (  # PROJELER collapse
+                self.assertFalse(bridge.sidebarTree["projects_open"]),
+            ))
+            self.tap(root, self.item(root, "sidebarProjectsToggle"))
             self.tap(root, self.item(root, "railTasks"), then=lambda: (  # tiles / peek
                 self.assertTrue(root.property("peekOpen")),
             ))
             self.tap(root, self.item(root, "railTasks"))
-            self.tap(root, self.item(root, "sidebarArchive"), then=lambda: (  # Arşiv
-                self.assertEqual("history", bridge.page),
+            self.tap(root, self.row(root, "sidebarProject", "Tek"), Qt.RightButton)                       # the project page
+            self.tap(root, self.item(root, "sidebarProjectOpenItem"), then=lambda: (
+                self.assertEqual(("projects", self.one.id), (bridge.page, bridge.openProject.get("id"))),
             ))
             bridge.setPage("home")
             pump(400)
-            self.tap(root, self.item(root, "sidebarNewProject"), then=lambda: (  # new project
+            self.tap(root, self.item(root, "sidebarProjectsLink"), then=lambda: (  # the Projects page (new project there)
                 self.assertEqual("projects", bridge.page),
             ))
         self.assertEqual([], keys)
         self.assertEqual(0, self.execute_calls())
 
     def test_cc_the_keyboard_reaches_the_rows_with_a_ring(self) -> None:
+        # Sidebar v2: the first row is "Yeni sohbet" (N1; Genel is gone, V1); Return on a project row
+        # toggles its tree (T1) instead of the 6F scope pick.
         self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
-        genel = self.item(root, "sidebarGlobal")
-        genel.forceActiveFocus()
+        self.gone(root, "sidebarGlobal")
+        first = self.item(root, "sidebarNewChat")
+        first.forceActiveFocus()
         settled(200, lambda: (
-            self.assertTrue(self.child(genel, "sidebarRowFocusRing").isVisible()),
+            self.assertTrue(self.child(first, "sidebarRowFocusRing").isVisible()),
         ))
         QTest.keyClick(root, Qt.Key_Tab)
         settled(200, lambda: (
             self.assertTrue(self.item(root, "sidebarProjectsLink").property("activeFocus")),
         ))
+        opened = bridge.conversationId
         row = self.row(root, "sidebarProject", "Çok")
         row.forceActiveFocus()
         pump(200)
         QTest.keyClick(root, Qt.Key_Return)
         settled(400, lambda: (
-            self.assertEqual(self.many.id, bridge.conversationProject["id"]),
+            self.assertIn(self.many.id, bridge.sidebarTree["closed"]),
+            self.assertEqual(opened, bridge.conversationId),
         ))
         target = next(r for r in self.shown(root, "sidebarConversation") if not r.property("current"))
         target.forceActiveFocus()
@@ -1225,15 +1311,23 @@ class SidebarNavTests(SidebarNavCase):
         from jarvis.ui.i18n import localization, tx
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        for source, turkish in (("Global", "Genel"), ("PROJECTS", "PROJELER"), ("CONVERSATIONS", "SOHBETLER"),
-                                ("All projects", "Tüm projeler"), ("New project", "Yeni proje"),
-                                ("Archived projects", "Arşivlenmiş projeler"), ("Today", "Bugün"), ("Yesterday", "Dün"),
-                                ("Earlier", "Daha eski"), ("New Chat", "Yeni Sohbet"),
-                                ("No conversation in this scope yet. Press + to start one.",
-                                 "Bu kapsamda henüz sohbet yok. Başlatmak için + düğmesine basın.")):
+        for source, turkish in (("PROJECTS", "PROJELER"), ("All projects", "Tüm projeler"), ("Today", "Bugün"),
+                                ("Yesterday", "Dün"), ("Earlier", "Daha eski"), ("New Chat", "Yeni Sohbet"),
+                                # Sidebar v2 (N1, T2, P1): the strings that replaced them.
+                                ("New chat", "Yeni sohbet"), ("Open project page", "Proje sayfasını aç"),
+                                ("New conversation in this project", "Bu projede yeni sohbet"),
+                                ("Hide conversations", "Sohbetleri gizle"), ("Show conversations", "Sohbetleri göster")):
             self.assertEqual(turkish, tx("Sidebar", source))
-        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
-        self.assertEqual("Arşiv", _APP.translate("Sidebar", "Archive", "sidebar link"))     # the noun
+        # Sidebar v2 (V1 Genel, L3 SOHBETLER, L2 new project, V9 archived links and the scope "+"): gone from the
+        # sidebar and its catalog, so they fall back to their English source.
+        for source in ("Global", "CONVERSATIONS", "New project", "Archived projects",
+                       "No conversation in this scope yet. Press + to start one."):
+            self.assertEqual(source, tx("Sidebar", source))
+        self.assertEqual("New conversation in Evim", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        # The noun link ("Arşiv", disambiguated "sidebar link") is gone (V9): Qt falls back to the context's
+        # one "Archive", the project menu's verb.
+        self.assertEqual("Arşivle", _APP.translate("Sidebar", "Archive", "sidebar link"))
+        self.assertEqual("Arşivle", tx("Sidebar", "Archive"))                               # the project menu's verb (T2)
         self.assertEqual("Arşivle", tx("ConversationMenu", "Archive"))                      # the verb, unchanged
         for source, turkish in (("Rename", "Yeniden adlandır"), ("Delete permanently…", "Kalıcı sil…"),
                                 ("Archive it first", "Önce arşivleyin")):
@@ -1306,27 +1400,36 @@ class ChatHeaderTests(SidebarNavCase):
                             for item in self.shown(root, name):
                                 if item.width() > 0:
                                     self.clear(root, header, name, item)
+                        # Sidebar v2 V7: a no-project chat's header has no scope line - the title starts the row.
                         parts = ["chatHeaderScope", "chatHeaderTitle", "chatHeaderMenu"]
                         self.assertEqual(key == "global", self.item(root, "chatHeaderAttach").isVisible())
+                        self.assertEqual(key == "project", self.item(root, "chatHeaderScope").isVisible())
                         if key == "global":
                             parts.insert(2, "chatHeaderAttach")
+                            parts.remove("chatHeaderScope")
+                            self.assertAlmostEqual(header.left(), self.box(root, "chatHeaderTitle").left(), delta=0.5)
                         boxes = [self.box(root, name) for name in parts]
                         for name, box in zip(parts, boxes):
                             self.inside(header, box, name)
                         for left, right in zip(boxes, boxes[1:]):
                             self.assertLessEqual(left.right(), right.left() + 0.5, (parts, left, right))
-                        self.assertLessEqual(boxes[0].width(), round(header.width() * 0.32) + 0.5)
+                        if key == "project":
+                            self.assertLessEqual(boxes[0].width(), round(header.width() * 0.32) + 0.5)
                         # Long names elide (never under 6 characters) and their tips have them whole.
                         name, title = self.item(root, "chatHeaderScopeName"), self.item(root, "chatHeaderTitle")
-                        for text in (name, title):
+                        for text in ((name, title) if key == "project" else (title,)):
                             self.assertEqual(1, text.property("lineCount"))
                             if text.property("truncated"):
                                 six = QFontMetricsF(text.property("font")).horizontalAdvance(text.property("text")[:6] + "…")
                                 self.assertGreaterEqual(text.width() + 0.5, six)
-                        self.assertTrue(title.property("truncated"))
-                        self.assertEqual(bridge.conversationTitle, self.item(root, "chatHeaderTitleTip").property("text"))
-                        self.assertEqual(bridge.conversationProject["name"], self.item(root, "chatHeaderScopeTip").property("text"))
                         if key == "project":
+                            self.assertTrue(title.property("truncated"))
+                        else:                   # V7: the chip's room went to the title - all of it, up to the actions
+                            room = self.box(root, "chatHeaderAttach").left() - 12 - header.left()
+                            self.assertAlmostEqual(min(title.property("implicitWidth"), room), title.width(), delta=0.5)
+                        self.assertEqual(bridge.conversationTitle, self.item(root, "chatHeaderTitleTip").property("text"))
+                        if key == "project":
+                            self.assertEqual(bridge.conversationProject["name"], self.item(root, "chatHeaderScopeTip").property("text"))
                             self.assertTrue(name.property("truncated"))
                         # The stream starts below the header.
                         self.assertGreaterEqual(self.box(root, "conversationFeed").top(), header.bottom())
@@ -1336,21 +1439,23 @@ class ChatHeaderTests(SidebarNavCase):
         store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
+        # Sidebar v2: a project conversation is opened from its tree row, a Global one from the plain list (no Genel row).
         button = self.item(root, "chatHeaderAttach")
         self.assertTrue((bridge.canAttach, True) == (True, button.isVisible()))
-        self.tap(root, self.row(root, "sidebarProject", "Çok"), then=lambda: (
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Çok 0"), then=lambda: (
             self.assertFalse(button.isVisible()),                                            # a project's: no entry
         ))
-        self.tap(root, self.item(root, "sidebarGlobal"))
+        self.tap(root, self.row(root, "sidebarConversation", "Genel 0"))
         archived = next(r.id for r in store.list_conversations(project_id=None, include_archived=True) if r.archived_at)
         bridge.openConversation(archived)
         settled(300, lambda: (
             self.assertFalse(button.isVisible()),                                            # archived: no entry
         ))
-        self.tap(root, self.item(root, "sidebarGlobal"))
+        self.tap(root, self.row(root, "sidebarConversation", "Genel 0"))
         say(store, bridge.conversationId, "tezgah ölçüleri")
         moving = bridge.conversationId
         self.assertTrue(button.isVisible())
+        self.assertFalse(self.item(root, "chatHeaderScope").isVisible())                    # V7: no scope line
         self.tap(root, button)
         dialog = attach_dialog(root)
         self.assertTrue(dialog.property("visible"))
@@ -1361,6 +1466,7 @@ class ChatHeaderTests(SidebarNavCase):
         self.tap(root, self.item(root, "attachConfirm"))
         self.assertEqual(self.empty.id, store.load_conversation(moving).project_id)
         self.assertEqual("Boş", self.item(root, "chatHeaderScope").property("fullName"))
+        self.assertTrue(self.item(root, "chatHeaderScope").isVisible())
         self.assertFalse(button.isVisible())
         self.assertEqual(0, self.execute_calls())
 
@@ -1609,8 +1715,10 @@ class ProjectListTests(PunchListCase):
         return store
 
     def selected_in_view(self, root, index: int, what: str) -> None:
+        # Sidebar v2 T1: the marked row is the open conversation's tree row (a project row is a toggle).
         pump(300)
-        row = self.row(root, "sidebarProject", f"Proje {index}")
+        self.assertFalse(self.row(root, "sidebarProject", f"Proje {index}").property("current"), what)
+        row = self.row(root, "sidebarProjectConversation", f"Proje {index} sohbeti")
         self.assertTrue(row.property("current"), what)
         box, view = self.rect(row), self.rect(self.item(root, "sidebarProjectList"))
         self.assertGreaterEqual(box.top(), view.top() - 0.5, what)
@@ -1697,7 +1805,9 @@ class MenuOpacityTests(PunchListCase):
                 bridge.openProjectScope(self.many.id)
                 pump(400)
                 with self.subTest(theme=theme, size=(width, height)):
-                    self.tap(root, self.shown(root, "sidebarConversation")[1], Qt.RightButton,
+                    # Sidebar v2 T1/T3: the project's conversations are its tree rows; the open one is kept in view.
+                    row = next(r for r in self.shown(root, "sidebarProjectConversation") if r.property("current"))
+                    self.tap(root, row, Qt.RightButton,
                              until=lambda: self.is_open(self.popup(root, "conversationSwitcherContext")))
                     self.opaque(root, "conversationSwitcherContext", "the sidebar row menu")
                     self.tap(root, self.item(root, "conversationRenameItem"),
@@ -1753,6 +1863,18 @@ class SweepCase(PunchListCase):
                     return True
         return False
 
+    def scrolled_ink(self, text, ink: QRectF):
+        """``ink`` cut to every clipping scroll view (clip on, a contentY) it sits in: None when nothing of it
+        shows. Only those views: any other ancestor, clipping or not, leaves the ink as it is."""
+        node = text.parentItem()
+        while node is not None:
+            if node.property("clip") and node.property("contentY") is not None:
+                ink = ink.intersected(self.rect(node))
+                if ink.width() <= 0.5 or ink.height() <= 0.5:
+                    return None
+            node = node.parentItem()
+        return ink
+
     def no_clipped_text(self, root, region, what: str) -> None:
         """In ``region`` every visible Text is painted inside the window and inside its own box, and is
         cut (elided) only with its tip."""
@@ -1767,6 +1889,11 @@ class SweepCase(PunchListCase):
                 continue
             ink = self.rect(text)
             ink.setWidth(min(ink.width(), text.property("contentWidth")))
+            # G6SB1T: a text inside a clipping scroll view (a Flickable with clip) is painted only where
+            # that view shows it - a row scrolled out of the Sidebar v2 tree is not painted at all.
+            ink = self.scrolled_ink(text, ink)
+            if ink is None:
+                continue
             self.inside(window, ink, f"{what}: {value[:30]!r} outside the window")
             if text.property("truncated"):
                 self.assertTrue(self.has_tip(text), f"{what}: {value[:40]!r} is elided without a tip")
@@ -1900,21 +2027,30 @@ class SweepPathTests(SweepCase):
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 900)
                     with self.subTest(theme=theme, size=(width, height)):
+                        # Sidebar v2: no Genel row (V1), no round "+" (N1), no Arşiv / archived-projects links (V9),
+                        # no new-project "+" (L2); their mouse paths are the plain and tree rows, "Yeni sohbet",
+                        # the project menu and the PROJELER / Tüm projeler links.
+                        self.gone(root, "sidebarGlobal", "sidebarNewConversation", "sidebarArchive", "sidebarNewProject",
+                                  "sidebarArchivedProjects", "sidebarArchivedProjectsCount")
                         bridge.setPage("home")
                         bridge.openProjectScope("")
                         wait_until(lambda: root.property("loadedPage") == "home" and bridge.conversationProject["global"], 400)
-                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])  # Genel
+                        self.tap(root, self.scrolled_row(root, "Genel 0"),
+                                 until=lambda: bridge.conversationTitle == "Genel 0")                        # a plain one
                         self.assertTrue(bridge.conversationProject["global"])
-                        self.tap(root, self.row(root, "sidebarProject", "Çok"),
-                                 until=lambda: bridge.conversationProject["id"] == self.many.id)               # a project
+                        self.tap(root, self.scrolled_row(root, "Çok 0", "sidebarProjectConversation"),
+                                 until=lambda: bridge.conversationProject["id"] == self.many.id)               # a project's
                         self.assertEqual(self.many.id, bridge.conversationProject["id"])
-                        other = next(t for t in self.titles(root) if t.startswith("Çok ") and not self.row(root, "sidebarConversation", t).property("current"))
-                        self.tap(root, self.scrolled_row(root, other), until=lambda: bridge.conversationTitle == other)  # a conversation
+                        other = next(t for t in self.tree_titles(root) if t.startswith("Çok ")
+                                     and not self.row(root, "sidebarProjectConversation", t).property("current"))
+                        self.tap(root, self.scrolled_row(root, other, "sidebarProjectConversation"),
+                                 until=lambda: bridge.conversationTitle == other)                            # a conversation
                         self.assertEqual(other, bridge.conversationTitle)
                         before = bridge.conversationId
-                        self.tap(root, self.item(root, "sidebarNewConversation"), until=lambda: bridge.conversationId != before)  # the round +
+                        self.tap(root, self.item(root, "sidebarNewChat"), until=lambda: bridge.conversationId != before)  # Yeni sohbet
                         self.assertNotEqual(before, bridge.conversationId)
-                        self.tap(root, self.scrolled_row(root, other), Qt.RightButton)                       # its row menu
+                        self.assertEqual(self.many.id, bridge.conversationProject["id"])
+                        self.tap(root, self.scrolled_row(root, other, "sidebarProjectConversation"), Qt.RightButton)  # its row menu
                         self.assertTrue(self.opened_menu_named(root, "conversationSwitcherContext"))
                         for item in ("conversationRenameItem", "conversationArchiveItem", "conversationDeleteItem"):
                             self.assertTrue(self.item(root, item).isVisible(), item)
@@ -1922,7 +2058,8 @@ class SweepPathTests(SweepCase):
                         self.tap(root, self.item(root, "chatHeaderMenu"))                                    # the header "…"
                         self.assertTrue(self.opened_menu_named(root, "conversationSwitcherContext"))
                         self.closed(self.popup_named(root, "conversationSwitcherContext"), 400)
-                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])
+                        self.tap(root, self.scrolled_row(root, "Genel 0"),
+                                 until=lambda: bridge.conversationProject["global"])
                         self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())                     # Projeye bağla
                         self.tap(root, self.item(root, "chatHeaderAttach"))
                         dialog = attach_dialog(root)
@@ -1934,28 +2071,36 @@ class SweepPathTests(SweepCase):
                             self.assertEqual((True, key), (root.property("peekOpen"), root.property("peekKey")))
                             self.tap(root, self.item(root, "rail" + key), until=lambda: not root.property("peekOpen"))
                             self.assertFalse(root.property("peekOpen"))
-                        listing = self.item(root, "sidebarConversationList")                                 # the link is the list's last
-                        listing.setProperty("contentY", max(0, listing.property("contentHeight") - listing.height()))
+                        listing = self.item(root, "sidebarConversationList")                                 # the bar is the list's first
+                        listing.setProperty("contentY", 0)
                         pump(200)
-                        self.tap(root, self.item(root, "sidebarArchive"), until=lambda: bridge.page == "history")  # Arşiv
-                        self.assertEqual("history", bridge.page)
-                        self.home(root, bridge, 400)
+                        self.tap(root, self.item(root, "sidebarPlainBar"),
+                                 until=lambda: not bridge.sidebarTree["plain_open"])                         # the P1 bar
+                        self.assertFalse(bridge.sidebarTree["plain_open"])
+                        self.tap(root, self.item(root, "sidebarPlainBar"), until=lambda: bridge.sidebarTree["plain_open"])
                         self.tap(root, self.item(root, "sidebarProjectsLink"), until=lambda: bridge.page == "projects")  # PROJELER
                         self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
                         self.home(root, bridge, 400)
-                        self.tap(root, self.item(root, "sidebarNewProject"), until=lambda: bridge.page == "projects")  # new project
-                        self.assertEqual("projects", bridge.page)
+                        self.tap(root, self.item(root, "sidebarAllProjects"), until=lambda: bridge.page == "projects")  # Tüm projeler
+                        self.assertEqual(("projects", {}), (bridge.page, bridge.openProject))
                         self.home(root, bridge, 400)
-                        self.tap(root, self.item(root, "sidebarArchivedProjects") if self.shown(root, "sidebarArchivedProjects")
-                                 else self.item(root, "sidebarArchivedProjectsCount"),
-                                 until=lambda: bridge.page == "projects")                                    # archived projects
-                        self.assertEqual("projects", bridge.page)
+                        self.tap(root, self.scrolled_row(root, "Tek", "sidebarProject"), Qt.RightButton)  # the project menu
+                        self.assertTrue(self.opened_menu_named(root, "sidebarProjectMenu"))
+                        self.tap(root, self.item(root, "sidebarProjectOpenItem"),
+                                 until=lambda: bridge.page == "projects")                                    # its page
+                        self.assertEqual(("projects", self.one.id), (bridge.page, bridge.openProject.get("id")))
+                        self.home(root, bridge, 400)
+                        self.tap(root, self.item(root, "sidebarProjectsToggle"),
+                                 until=lambda: not bridge.sidebarTree["projects_open"])                      # PROJELER collapse
+                        self.assertFalse(bridge.sidebarTree["projects_open"])
+                        self.tap(root, self.item(root, "sidebarProjectsToggle"), until=lambda: bridge.sidebarTree["projects_open"])
+                        self.assertTrue(bridge.sidebarTree["projects_open"])
         self.assertEqual([], keys)                                                                           # no shortcut anywhere
         self.assertEqual(0, self.execute_calls())
 
-    def scrolled_row(self, root, title: str):
+    def scrolled_row(self, root, title: str, name: str = "sidebarConversation"):
         """The row, scrolled into the list's view as the reader's wheel would (the list keeps whole rows)."""
-        row = self.row(root, "sidebarConversation", title)
+        row = self.row(root, name, title)
         row.forceActiveFocus()
         pump(200)
         return row
@@ -2050,10 +2195,14 @@ class NameFloorVarianceTests(SidebarNavCase):
                         for width, height in SIZES:
                             self.resize_still(root, width, height, 400)
                             self.steady(root, "chatHeader")
-                            for name in ("chatHeaderScopeName", "chatHeaderTitle", "sidebarScopeName"):
-                                text = self.item(root, name)
+                            # Sidebar v2 (V1/L3): the sidebar's scope chip is gone; the long project's name is its
+                            # tree row (T1; the archived project has none, V9).
+                            self.gone(root, "sidebarScopeChip", "sidebarScopeName")
+                            texts = [self.item(root, "chatHeaderScopeName"), self.item(root, "chatHeaderTitle"),
+                                     self.child(self.row(root, "sidebarProject", longp.name), "sidebarProjectName")]
+                            for text in texts:
                                 self.assertGreaterEqual(self.painted(text), min(6, len(text.property("text"))),
-                                                        (family, language, name, (width, height), text.property("text")))
+                                                        (family, language, text.objectName(), (width, height), text.property("text")))
                             # The pill stays (the chip's 32 % gave way to the floor, not the badge).
                             self.assertEqual(conversation is archived, self.item(root, "chatHeaderScopeArchived").isVisible())
                 bridge.setLanguage("en-US")
@@ -2083,6 +2232,8 @@ class F6Case(SweepCase):
         wait_until(lambda: abs(flick.property("contentY") - target) < 0.5, 150)       # S0b: at once when no scroll
 
     def tap(self, root, item, button=Qt.LeftButton, until=None, then=None) -> None:
+        if self.all_items(root, "sidebar"):
+            self.lists_at_rest(root)                # Sidebar v2 T3: scroll into view on the settled layout
         self.into_view(root, item)
         super().tap(root, item, button, until, then)
 
@@ -2219,16 +2370,16 @@ class CollapsibleGroupTests(F6Case):
         store.create_conversation(tez.id, title="Tez yeni")
         bridge = self.bridge()
         root = self.window(bridge)
+        # Sidebar v2 V1: the date groups belong to the ONE fixed plain list - no per-scope state; a project's
+        # conversations are its tree rows (T1), never date-grouped.
         self.fixed_today(root, now)                                             # THIZ2: once per test
-        self.tap(root, self.head(root, "today"))                                # Genel: Bugün collapsed
-        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (  # Tez: its own defaults
-            self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups),
+        self.tap(root, self.head(root, "today"))                                # the plain list: Bugün collapsed
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez yeni"), then=lambda: (  # a project chat: same state
+            self.assertEqual(tez.id, bridge.conversationProject["id"]),
+            self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": False}, bridge.sidebarGroups),
         ))
-        self.tap(root, self.head(root, "earlier"), then=lambda: (  # Tez: Daha eski open
-            self.assertIn("Tez eski", self.titles(root)),
-        ))
-        self.tap(root, self.item(root, "sidebarGlobal"))                        # back to Genel: as it was left
-        self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
+        self.assertEqual(["Tez yeni", "Tez eski"], self.tree_titles(root))
+        self.assertNotIn("Tez eski", self.titles(root))
         self.assertNotIn("Genel eski", self.titles(root))
         # Switching to a conversation of a collapsed group opens that group.
         self.assertTrue(bridge.openConversation(g_old.id))
@@ -2237,7 +2388,7 @@ class CollapsibleGroupTests(F6Case):
             self.assertTrue(self.row(root, "sidebarConversation", "Genel eski").property("current")),
             self.assertFalse(bridge.sidebarGroups["today"]),                          # the others keep their state
         ))
-        # A reopened window has every scope's state.
+        # A reopened window has the list's state.
         root.hide()
         bridge = self.bridge()
         root = self.window(bridge)
@@ -2246,13 +2397,13 @@ class CollapsibleGroupTests(F6Case):
         self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": True}, bridge.sidebarGroups)
         self.assertEqual(["Genel yeni", "Genel eski"], self.titles(root))             # the open one stays in view
         self.assertEqual(["· 1"], self.texts(root, "sidebarGroupCount"))
-        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
-            self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": True}, bridge.sidebarGroups),
-            self.assertEqual(["Tez yeni", "Tez eski"], self.titles(root)),
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez yeni"), then=lambda: (
+            self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": True}, bridge.sidebarGroups),
+            self.assertEqual(["Genel eski"], self.titles(root)),
         ))
         saved = json.loads(self.sidebar_file().read_text(encoding="utf-8"))["groups"]
-        self.assertEqual({"global": {"today": False, "yesterday": True, "earlier": True},
-                          tez.id: {"today": True, "yesterday": True, "earlier": True}}, saved)
+        self.assertEqual({"global": {"today": False, "yesterday": True, "earlier": True}}, saved)
+        self.assertNotIn(tez.id, saved)
         self.assertEqual(0, self.execute_calls())
 
 
@@ -2274,46 +2425,49 @@ class PinTests(F6Case):
         self.assertEqual(["Genel 0"], self.pinned(root))
         self.assertTrue(self.item(root, "sidebarPinned").isVisible())
         self.assertNotIn("Genel 0", self.titles(root))
+        # Sidebar v2: SABİTLENENLER (V3); the kind glyph replaces the pin glyph and the project label (V10).
         self.assertEqual(["PINNED"], self.texts(root, "sidebarPinnedLabel"))
+        self.gone(root, "sidebarPinPlace", "sidebarPinIcon", "sidebarGlobal")
         row = self.pin_row(root, "Genel 0")
-        self.assertFalse(self.child(row, "sidebarPinPlace").isVisible())               # Genel: no label
-        self.assertTrue(self.child(row, "sidebarPinIcon").isVisible())
+        self.assertEqual("chat", self.child(row, "sidebarRowLead").property("name"))     # speech bubble: no project
+        self.assertTrue(self.child(row, "sidebarRowLead").isVisible())
         tip = self.child(row, "sidebarRowTip")
-        self.assertEqual(("Genel 0\nGlobal", True), (tip.property("text"), tip.property("active")))
+        self.assertEqual(("Genel 0", False), (tip.property("text"), tip.property("active")))  # nothing more to say
         # The header "…": the open conversation; a new pin goes to the top.
         self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton, label="Pin")
         self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
         self.assertTrue(self.pin_row(root, "Genel 2").property("current"))
-        # Another scope: its pin joins the same list, labelled with its project.
-        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
-            self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root)),                      # every scope's pins
+        # A project's conversation (its tree row, T1): its pin joins the same list, with the folder glyph.
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 0"), then=lambda: (
+            self.assertEqual(self.tez.id, bridge.conversationProject["id"]),
+            self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root)),                      # every owner's pins
         ))
-        self.choose(root, self.row(root, "sidebarConversation", "Tez 1"), "conversationPinItem", label="Pin")
+        self.choose(root, self.row(root, "sidebarProjectConversation", "Tez 1"), "conversationPinItem", label="Pin")
         self.assertEqual(["Tez 1", "Genel 2", "Genel 0"], self.pinned(root))
-        self.assertNotIn("Tez 1", self.titles(root))
+        self.assertNotIn("Tez 1", self.tree_titles(root) + self.titles(root))
         row = self.pin_row(root, "Tez 1")
-        self.assertTrue(self.child(row, "sidebarPinPlace").isVisible())
-        self.assertEqual(["Tez"], [t.property("text") for t in self.descendants(row) if t.objectName() == "sidebarPinPlaceName"])
+        self.assertEqual("folder", self.child(row, "sidebarRowLead").property("name"))   # folder: a project's
+        self.assertEqual([], [t for t in self.descendants(row) if t.objectName() == "sidebarPinPlaceName"])
         self.assertEqual("Tez 1\nIn the Tez project", self.child(row, "sidebarRowTip").property("text"))
-        # A pin of another scope opens there: the scope pick and the conversation pick.
+        # A pin of another owner opens that conversation (the conversation pick).
         self.tap(root, self.pin_row(root, "Genel 0"), then=lambda: (
             self.assertEqual((self.genel[0].id, True), (bridge.conversationId, bridge.conversationProject["global"])),
-            self.assertTrue(self.item(root, "sidebarGlobal").property("current")),
+            self.assertFalse(self.item(root, "chatHeaderScope").isVisible()),                    # V7
             self.assertTrue(self.pin_row(root, "Genel 0").property("current")),
         ))
         self.tap(root, self.pin_row(root, "Tez 1"), then=lambda: (
             self.assertEqual((self.tezc[1].id, self.tez.id), (bridge.conversationId, bridge.conversationProject["id"])),
-            self.assertTrue(self.row(root, "sidebarProject", "Tez").property("current")),
+            self.assertEqual("Tez", self.item(root, "chatHeaderScopeName").property("text")),
+            self.assertTrue(self.pin_row(root, "Tez 1").property("current")),
             self.assertEqual("Tez 1", self.item(root, "chatHeaderTitle").property("text")),
         ))
-        # Sabitlemeyi kaldır: from a pinned row of another scope, and from the header.
+        # Sabitlemeyi kaldır: from a pinned row of another owner, and from the header.
         self.choose(root, self.pin_row(root, "Genel 2"), "conversationPinItem", label="Unpin")
         self.assertEqual(["Tez 1", "Genel 0"], self.pinned(root))
         self.choose(root, self.item(root, "chatHeaderMenu"), "conversationPinItem", Qt.LeftButton, label="Unpin")
         self.assertEqual(["Genel 0"], self.pinned(root))
-        self.assertIn("Tez 1", self.titles(root))                                        # back in its date group
-        self.tap(root, self.item(root, "sidebarGlobal"))
-        self.assertIn("Genel 2", self.titles(root))
+        self.assertIn("Tez 1", self.tree_titles(root))                                   # back in its project's tree
+        self.assertIn("Genel 2", self.titles(root))                                      # back in its date group
         self.assertEqual([self.genel[0].id], json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
         self.assertEqual(0, self.execute_calls())
 
@@ -2386,12 +2540,14 @@ class PinOrderTests(F6Case):
         self.assertEqual(["C", "B", "A"], self.pinned(root))                             # each new pin on top
         self.choose(root, self.row(root, "sidebarConversation", "D"), "conversationPinItem")
         self.assertEqual(["D", "C", "B", "A"], self.pinned(root))
-        # Hover shows the grip in place of the pin.
+        # Hover shows the grip in place of the kind glyph (Sidebar v2 V10: the speech bubble replaced the pin glyph).
         row = self.pin_row(root, "D")
+        self.gone(root, "sidebarPinIcon")
+        self.assertTrue(self.child(row, "sidebarRowLead").isVisible())
         self.hover(root, self.child(row, "sidebarPinGripArea"))
         settled(200, lambda: (
             self.assertTrue(self.child(row, "sidebarPinGrip").isVisible()),
-            self.assertFalse(self.child(row, "sidebarPinIcon").isVisible()),
+            self.assertFalse(self.child(row, "sidebarRowLead").isVisible()),
         ))
         # A real mouse drag: D into the gap above A; the drop line shows the gap while it moves.
         seen = {}
@@ -2635,18 +2791,23 @@ class PinFitTests(F6Case):
                     settled(200, lambda: (
                         self.assertEqual(10, len(self.shown(root, "sidebarPinnedConversation"))),
                     ))
-                    # A pinned row: the title keeps six characters, the project label too, and they never touch.
+                    # A pinned row: the title keeps six characters; Sidebar v2 V10: no project label - the kind
+                    # glyph (folder / speech bubble) sits inside the row before the title, never touching it,
+                    # and the tip says the project.
+                    self.gone(root, "sidebarPinPlace", "sidebarPinPlaceName")
+                    QTest.mouseMove(root, QPoint(width // 2, height - 4))       # no row hovered: no grip in place of a glyph
+                    pump(150)
                     for row in self.shown(root, "sidebarPinnedConversation"):
                         title = self.child(row, "sidebarPinnedTitle")
                         self.assertGreaterEqual(self.painted(title), 6, (what, row.property("title")))
-                        place = self.child(row, "sidebarPinPlace")
-                        if place.isVisible():
-                            name = next(t for t in self.descendants(place) if t.objectName() == "sidebarPinPlaceName")
-                            self.assertGreaterEqual(self.painted(name), min(6, len(name.property("text"))), what)
-                            self.assertLessEqual(title.mapToScene(QPointF(title.width(), 0)).x(),
-                                                 self.rect(place).left() - 4, what)
-                            self.inside(self.rect(row), self.rect(place), what)
+                        lead = self.child(row, "sidebarRowLead")
+                        self.assertTrue(lead.isVisible(), what)
+                        self.assertEqual("chat" if "genel" in row.property("title") else "folder", lead.property("name"))
+                        self.assertLessEqual(self.rect(lead).right(), self.rect(title).left() - 4, what)
+                        self.inside(self.rect(row), self.rect(lead), what)
                         self.assertTrue(self.child(row, "sidebarRowTip").property("active"))
+                        if lead.property("name") == "folder":
+                            self.assertIn("\nIn the ", self.child(row, "sidebarRowTip").property("text"))
                     # The menu with its pin items, on a pinned row, inside the window and unclipped.
                     menu = self.menu(root, self.shown(root, "sidebarPinnedConversation")[1])
                     for name in ("conversationPinItem", "conversationPinUpItem", "conversationPinDownItem"):
@@ -2674,6 +2835,7 @@ class PinFitTests(F6Case):
         for n in range(3):
             store.create_conversation(title=f"Genel {n}")
         store.create_conversation(tez.id, title="Tez 0")
+        store.create_conversation(tez.id, title="Tez 1")              # Sidebar v2: a second one, hidden by the collapse
         bridge = self.bridge()
         root = self.window(bridge)
         self.fixed_today(root, now)
@@ -2685,7 +2847,12 @@ class PinFitTests(F6Case):
                 for width, height in SIZES:
                     self.resize_still(root, width, height, 900)
                     with self.subTest(theme=theme, size=(width, height)):
-                        self.tap(root, self.item(root, "sidebarGlobal"), until=lambda: bridge.conversationProject["global"])
+                        # Sidebar v2: no Genel row (V1) - a plain conversation is its own row; a project's
+                        # conversations are its tree (T1), toggled by its row, with no date groups.
+                        self.gone(root, "sidebarGlobal")
+                        self.tap(root, self.row(root, "sidebarConversation", "Genel 2"),
+                                 until=lambda: bridge.conversationTitle == "Genel 2")
+                        self.assertTrue(bridge.conversationProject["global"])
                         self.tap(root, self.head(root, "earlier"), until=lambda: "Eski" in self.titles(root))   # expand
                         self.assertIn("Eski", self.titles(root))
                         self.tap(root, self.head(root, "earlier"), until=lambda: "Eski" not in self.titles(root))  # collapse
@@ -2697,9 +2864,25 @@ class PinFitTests(F6Case):
                         self.assertEqual(["Genel 0", "Genel 2"], self.pinned(root))
                         self.drag(root, self.pin_row(root, "Genel 2"), self.gap_y(root, 0))               # drag
                         self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
-                        self.tap(root, self.row(root, "sidebarProject", "Tez"), until=lambda: bridge.conversationProject["name"] == "Tez")
-                        self.tap(root, self.head(root, "today"), until=lambda: not bridge.sidebarGroups["today"])  # a project's group
-                        self.tap(root, self.head(root, "today"), until=lambda: bridge.sidebarGroups["today"])
+                        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 0"),
+                                 until=lambda: bridge.conversationProject["name"] == "Tez")
+                        # A tree toggle re-shares the height (T3): the list comes to rest before the next click.
+                        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (               # a project's tree
+                            self.assertIn(tez.id, bridge.sidebarTree["closed"]),
+                            self.assertEqual(["Tez 0"], self.tree_titles(root)),                            # the open one stays
+                        ))
+                        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
+                            self.assertNotIn(tez.id, bridge.sidebarTree["closed"]),
+                        ))
+                        self.lists_at_rest(root)
+                        self.tap(root, self.head(root, "today"), then=lambda: (                              # the list's group
+                            self.assertFalse(bridge.sidebarGroups["today"]),
+                        ))
+                        self.lists_at_rest(root)
+                        self.tap(root, self.head(root, "today"), then=lambda: (
+                            self.assertTrue(bridge.sidebarGroups["today"]),
+                        ))
+                        self.lists_at_rest(root)
                         self.tap(root, self.pin_row(root, "Genel 0"), until=lambda: bridge.conversationTitle == "Genel 0")  # another scope's pin
                         self.assertEqual(bridge.conversationTitle, "Genel 0")
                         self.tap(root, self.head(root, "pinned"), until=lambda: not bridge.sidebarGroups["pinned"])
@@ -2721,7 +2904,8 @@ class PinFitTests(F6Case):
                                 ("At most %1 conversations can be pinned: unpin one first.",
                                  "En fazla %1 sohbet sabitlenebilir: önce birinin sabitlemesini kaldırın.")):
             self.assertEqual(turkish, tx("ConversationMenu", source))
-        for source, turkish in (("PINNED", "SABİTLENDİ"), ("In the %1 project", "%1 projesinde"),
+        for source, turkish in (("PINNED", "SABİTLENENLER"),                       # Sidebar v2 V3 (was SABİTLENDİ)
+                                ("In the %1 project", "%1 projesinde"),
                                 ("Expanded", "Açık"), ("Collapsed", "Kapalı")):
             self.assertEqual(turkish, tx("Sidebar", source))
 
@@ -2753,9 +2937,11 @@ class ProjectListOffsetTests(F6Case):
             root.resize(width, height)
             pump(700)
             self.assertEqual(0, self.offset(root)[0], (width, height))
-        # Scrolled to the last project, then a scope that is not a row (Genel; an archived project),
-        # then across the breakpoint and back: whole rows, never past the end.
-        for leave in (lambda: self.tap(root, self.item(root, "sidebarGlobal")),
+        # Scrolled to the last project, then a conversation that is not a tree row (Genel - Sidebar v2 V1: no
+        # Genel row, the 6B pick itself; an archived project's, V9), then across the breakpoint and back:
+        # whole rows, never past the end.
+        self.gone(root, "sidebarGlobal")
+        for leave in (lambda: (bridge.openProjectScope(""), pump(400)),
                       lambda: (bridge.openConversation(store.list_conversations(project_id=old.id)[0].id), pump(400))):
             root.resize(1100, 700)
             pump(700)
@@ -2771,7 +2957,8 @@ class ProjectListOffsetTests(F6Case):
                     self.assertAlmostEqual(0, y % step, delta=0.5)
                     self.assertLessEqual(y, end + 0.5)
                     top = self.box(root, "sidebarProjectList").top()
-                    first = min(self.rect(r).top() for r in self.shown(root, "sidebarProject") if self.rect(r).bottom() > top + 0.5)
+                    rows = self.shown(root, "sidebarProject") + self.shown(root, "sidebarProjectConversation")   # T1: one tree
+                    first = min(self.rect(r).top() for r in rows if self.rect(r).bottom() > top + 0.5)
                     self.assertAlmostEqual(top, first, delta=0.5)             # the first row in view is whole
         self.assertEqual(0, self.execute_calls())
 
@@ -2819,14 +3006,17 @@ class OneStepDeleteTests(F6Case):
         self.tap(root, next(i for i in self.all_items(root, "deleteCancel") if i.isVisible()))
         self.assertEqual(before, dump(self.database))
         self.assertEqual(1, len(calls))
-        # A pinned Global conversation seen from a project scope: offered too.
+        # A pinned Global conversation seen from a project conversation: offered too. Sidebar v2 T1: the
+        # project's conversation is its tree row.
         bridge.pinConversation(g1.id)
-        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez sohbeti"), then=lambda: (
+            self.assertEqual(t0.id, bridge.conversationId),
+        ))
         self.menu(root, self.pin_row(root, "Genel 1"))
         self.assertTrue(self.item(root, "conversationDeleteItem").isEnabled())
         self.close_menu(root)
         # A project's conversation: unchanged - archive first, with its reason; Core refuses it too.
-        self.menu(root, self.row(root, "sidebarConversation", "Tez sohbeti"))
+        self.menu(root, self.row(root, "sidebarProjectConversation", "Tez sohbeti"))
         self.assertFalse(self.item(root, "conversationDeleteItem").isEnabled())
         self.assertEqual("Archive it first", self.item(root, "conversationDeleteReason").property("text"))
         self.close_menu(root)
@@ -2902,13 +3092,17 @@ class RowMenuButtonTests(F6Case):
                 row.setProperty("focus", False)
                 pump(100)
                 self.assertFalse(self.button(row).isVisible())
-                # A pinned row: in place of its project label.
+                # A pinned row: at its right end (Sidebar v2 V10: it has no project label to replace),
+                # inside the row, its title clear of it.
                 pin = self.pin_row(root, "Tez sohbeti")
                 self.into_view(root, pin)
                 self.hover(root, pin)
                 pump(200)
                 self.assertTrue(self.button(pin).isVisible())
-                self.assertEqual(0.0, self.child(pin, "sidebarPinPlace").property("opacity"))
+                self.gone(root, "sidebarPinPlace")
+                self.inside(self.rect(pin), self.rect(self.button(pin)), "button in the pinned row")
+                pin_title = self.child(pin, "sidebarPinnedTitle")
+                self.assertLessEqual(self.rect(pin_title).left() + pin_title.width(), self.rect(self.button(pin)).left() - 4)
                 self.tap(root, self.button(pin), until=lambda: bool(menu.property("opened")))   # THIZ: open before it closes
                 self.assertEqual((pinned.id, b.id), (self.item(root, "conversationMenu").property("targetId"), bridge.conversationId))
                 self.close_menu(root)

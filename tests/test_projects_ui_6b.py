@@ -298,11 +298,16 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertEqual("Global", self.owner(root))
+        self.assertFalse(self.item(root, "chatHeaderScope").isVisible())        # Sidebar v2 V7: no scope line here
         bridge.openConversation(owned.id)
         pump(300)
         self.assertEqual("Evim", self.owner(root))
+        self.assertTrue(self.item(root, "chatHeaderScope").isVisible())
         self.assertEqual(["Evim", "Tez"], sorted(self.menu_labels(root)))       # no archived project
-        self.assertTrue(self.item(root, "sidebarGlobal").isVisible())
+        # Sidebar v2 V1: no "Genel" row; the fixed plain list holds the no-project conversations instead.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal"))
+        self.assertEqual(sorted(c.id for c in store.list_conversations(project_id=None)),
+                         sorted(i.property("itemId") for i in self.all_items(root, "sidebarConversation") if i.isVisible()))
         self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())     # "All projects" (Q10)
         self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
         self.click(root, "sidebarProjectsLink")
@@ -320,7 +325,18 @@ class SelectorTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         global_open = bridge.conversationId
+        # Sidebar v2 T1: a project row's click folds / unfolds its conversations and opens nothing.
         self.click_item(root, self.row(root, "Evim"), then=lambda: (
+            self.assertEqual(global_open, bridge.conversationId),
+            self.assertEqual("home", bridge.page),
+            self.assertIn(home.id, bridge.sidebarTree["closed"]),
+        ))
+        self.click_item(root, self.row(root, "Evim"), then=lambda: (
+            self.assertNotIn(home.id, bridge.sidebarTree["closed"]),
+        ))
+        # The 6B rule itself (openProjectScope, still the scope pick of the slot) is unchanged.
+        self.assertTrue(bridge.openProjectScope(home.id))
+        settled(200, lambda: (
             self.assertEqual(older.id, bridge.conversationId),                   # archived newest skipped
             self.assertEqual("home", bridge.page),
         ))
@@ -329,8 +345,10 @@ class SelectorTests(ProjectsUiCase):
         pump(200)
         self.assertEqual(before + 1, len(store.list_conversations(project_id=thesis.id)))
         self.assertEqual(thesis.id, store.load_conversation(bridge.conversationId).project_id)
-        self.click(root, "sidebarGlobal")
-        pump(200)
+        # Sidebar v2 V1: no "Genel" row; the no-project conversation is picked in the plain list.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal"))
+        self.click_item(root, [i for i in self.all_items(root, "sidebarConversation")
+                               if i.isVisible() and i.property("itemId") == global_open][0])
         self.assertEqual(global_open, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # An archived or unknown project is never opened through the selector.
@@ -361,29 +379,36 @@ class SelectorTests(ProjectsUiCase):
         root = self.window(bridge)
         bridge.openConversation(owned.id)
         pump(200)
-        self.click(root, "sidebarNewConversation")
+        # Sidebar v2 N1: no scope "+"; "Yeni sohbet" starts in the open conversation's project when writable.
+        self.assertEqual([], self.all_items(root, "sidebarNewConversation"))
+        self.click(root, "sidebarNewChat")
         self.assertNotEqual(owned.id, bridge.conversationId)
         self.assertEqual(home.id, store.load_conversation(bridge.conversationId).project_id)
         self.assertTrue(bridge.openProjectScope(""))
         pump(200)
         before = bridge.conversationId
-        self.click(root, "sidebarNewConversation")
+        self.click(root, "sidebarNewChat")
         self.assertNotEqual(before, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
-        # Archived owner: disabled with its reason; nothing is created.
+        # Archived owner: the scope's own new conversation is still refused, nothing is created there;
+        # "Yeni sohbet" stays available and starts a no-project one (N1: else plain).
         bridge.openConversation(owned.id)
         pump(200)
         store.set_project_active(home.id, False)
         bridge.refreshProjects()
         pump(200)
-        button = self.item(root, "sidebarNewConversation")
-        self.assertFalse(button.property("allowed"))
-        self.assertIn("archived", button.property("tip"))                      # its reason
+        self.assertEqual([], self.all_items(root, "sidebarNewConversation"))
+        button = self.item(root, "sidebarNewChat")
+        self.assertTrue(button.property("available"))
         count = len(store.list_conversations(include_archived=True))
-        self.click(root, "sidebarNewConversation")
         self.assertFalse(bridge.newConversationInScope())
         self.assertEqual((owned.id, count), (bridge.conversationId, len(store.list_conversations(include_archived=True))))
         self.assertEqual("Evim · archived", self.owner(root))
+        owned_count = len(store.list_conversations(project_id=home.id, include_archived=True))
+        self.click(root, "sidebarNewChat")
+        self.assertEqual(count + 1, len(store.list_conversations(include_archived=True)))
+        self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
+        self.assertEqual(owned_count, len(store.list_conversations(project_id=home.id, include_archived=True)))
 
 class AuthorityTests(ProjectsUiCase):
     def test_d_the_selected_project_changes_no_approval_decision(self) -> None:
@@ -414,5 +439,9 @@ class CatalogTests(UiTestCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Tüm projeler", tx("Sidebar", "All projects"))
-        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        # Sidebar v2: "New conversation in %1" left with the scope "+" (its source comes back);
+        # the project menu's item and the "Yeni sohbet" row replace it.
+        self.assertEqual("New conversation in Evim", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        self.assertEqual("Bu projede yeni sohbet", tx("Sidebar", "New conversation in this project"))
+        self.assertEqual("Yeni sohbet", tx("Sidebar", "New chat"))
         self.assertEqual("Kalıcı sil", tx("ProjectsPage", "Purge"))

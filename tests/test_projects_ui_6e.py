@@ -223,7 +223,11 @@ class UntitledNameTests(WindowCase):
     def test_g_the_actions_stay_sentence_case(self) -> None:
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual("Evim içinde yeni sohbet", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        # Sidebar v2: the scope "+" and its "New conversation in %1" are gone (the source comes back);
+        # its successors stay sentence case: the "Yeni sohbet" row and the project menu's item.
+        self.assertEqual("New conversation in Evim", tx("Sidebar", "New conversation in %1").replace("%1", "Evim"))
+        self.assertEqual("Yeni sohbet", tx("Sidebar", "New chat"))
+        self.assertEqual("Bu projede yeni sohbet", tx("Sidebar", "New conversation in this project"))
         self.assertEqual("Yeni sohbet", tx("HistoryPage", "New conversation"))
         self.assertEqual("Yeni sohbet", tx("CommandPalette", "New conversation"))
         self.assertEqual("Evim içinde yeni sohbet", tx("ProjectsPage", "New conversation in %1").replace("%1", "Evim"))
@@ -261,7 +265,9 @@ class CatalogTests(UiTestCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("SOHBETLER", tx("HistoryPage", "CONVERSATIONS"))
         self.assertEqual("SOHBETLER", tx("ProjectsPage", "CONVERSATIONS"))
-        self.assertEqual("SOHBETLER", tx("Sidebar", "CONVERSATIONS"))
+        # Sidebar v2 L3: no SOHBETLER heading in the sidebar (the source comes back); SABİTLENENLER heads its list.
+        self.assertEqual("CONVERSATIONS", tx("Sidebar", "CONVERSATIONS"))
+        self.assertEqual("SABİTLENENLER", tx("Sidebar", "PINNED"))
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", tx("ProjectsPage", "ARCHIVED CONVERSATIONS"))
         self.assertEqual("ARŞİVLENMİŞ PROJELER", tx("ProjectsPage", "ARCHIVED PROJECTS"))
         self.assertEqual("Bu projede henüz sohbet yok.", tx("ProjectsPage", "No conversation in this project yet."))
@@ -658,8 +664,17 @@ class ScopeLayoutTests(ScopeGroupCase):
                         root.resize(width, height)
                         pump(400)
                         name, title = self.item(root, "chatHeaderScopeName"), self.item(root, "chatHeaderTitle")
-                        side = self.item(root, "sidebarScopeName")
-                        for text_item in (name, title, side):
+                        # Sidebar v2 V7: a no-project chat's header has no scope chip.
+                        self.assertEqual(key != "global", self.item(root, "chatHeaderScope").isVisible())
+                        # Sidebar v2 V1/T1/V9: no scope chip in the sidebar; the open conversation's own row names
+                        # it - a tree row (active project), a plain row (no project), none (archived project).
+                        self.assertEqual([], self.all_items(root, "sidebarScopeName") + self.all_items(root, "sidebarScopeTip"))
+                        rows = [(r, "sidebarProjectConversationTitle") for r in self.visible(root, "sidebarProjectConversation")]
+                        rows += [(r, "sidebarConversationTitle") for r in self.visible(root, "sidebarConversation")]
+                        rows = [(r, n) for r, n in rows if r.property("current")]
+                        self.assertEqual({"long": 1, "thesis": 0, "global": 1}[key], len(rows))
+                        sides = [[c for c in r.childItems() if c.objectName() == n][0] for r, n in rows]
+                        for text_item in ((name, title, *sides) if key != "global" else (title, *sides)):   # V7: no chip
                             self.assertGreaterEqual(self.painted(text_item), min(6, len(text_item.property("text"))),
                                                     text_item.property("text"))
                         badge = self.item(root, "chatHeaderScopeArchived")
@@ -668,10 +683,11 @@ class ScopeLayoutTests(ScopeGroupCase):
                         if key == "thesis":
                             self.assertEqual({"en-US": "ARCHIVED", "tr-TR": "ARŞİV"}[language], badge.property("text"))
                             self.assertEqual(name.property("text") + suffix, self.item(root, "chatHeaderScopeTip").property("text"))
-                            self.assertEqual(side.property("text") + suffix, self.item(root, "sidebarScopeTip").property("text"))
-                        else:
+                        elif key != "global":                                        # V7: a no-project chat has no chip tip
                             self.assertEqual(name.property("text"), self.item(root, "chatHeaderScopeTip").property("text"))
-                            self.assertEqual(side.property("text"), self.item(root, "sidebarScopeTip").property("text"))
+                        for row, _ in rows:                                          # the row's tip has its name whole
+                            tip = [c for c in row.childItems() if c.objectName() == "sidebarRowTip"][0]
+                            self.assertEqual(bridge.conversationTitle, tip.property("text"))
                         tip = self.item(root, "chatHeaderTitleTip")
                         self.assertEqual(bridge.conversationTitle, tip.property("text"))           # the whole title
 
@@ -683,11 +699,14 @@ class ScopeKeyboardTests(ScopeGroupCase):
         root = self.window(bridge)
         self.home(bridge, "long")
         # Gate 6F: the scope picks are the sidebar's rows and its "+" (the pills left the bar).
-        rings = {"sidebarGlobal": "sidebarRowFocusRing", "sidebarProject": "sidebarRowFocusRing",
-                 "sidebarNewConversation": "sidebarPlusFocusRing", "sidebarConversation": "sidebarRowFocusRing",
+        # Sidebar v2 (V1, L2, N1, T1): no "Genel" row and no scope "+"; "Yeni sohbet" leads, then the
+        # project tree's rows and the plain list's rows - every one a row with its ring.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal") + self.all_items(root, "sidebarNewConversation"))
+        rings = {"sidebarNewChat": "sidebarRowFocusRing", "sidebarProject": "sidebarRowFocusRing",
+                 "sidebarProjectConversation": "sidebarRowFocusRing", "sidebarConversation": "sidebarRowFocusRing",
                  "chatHeaderMenu": None}
         reached = set()
-        self.item(root, "sidebarGlobal").forceActiveFocus()
+        self.item(root, "sidebarNewChat").forceActiveFocus()
         pump(30)
         for _ in range(16):
             focused = root.activeFocusItem()
@@ -698,24 +717,33 @@ class ScopeKeyboardTests(ScopeGroupCase):
                     self.assertTrue(ring.isVisible(), focused.objectName())
             QTest.keyClick(root, Qt.Key_Tab)
             pump(20)
-        self.assertLessEqual({"sidebarGlobal", "sidebarProject", "sidebarNewConversation", "sidebarConversation"}, reached)
+        self.assertLessEqual({"sidebarNewChat", "sidebarProject", "sidebarProjectConversation", "sidebarConversation"}, reached)
         menu = lambda name: root.findChild(QObject, name)  # noqa: E731
-        # Return / Space on a scope row: the 6B pick.
+        project_id = next(p["id"] for p in bridge.projectRecords if p["name"] == LONG_PROJECT)
+        titled = lambda name, title: [i for i in self.visible(root, name) if i.property("title") == title][0]  # noqa: E731
+        # Return / Space on a row: a plain row opens its no-project conversation; a project row (T1)
+        # folds / unfolds its conversations and opens nothing; a tree row opens that conversation.
         for key in (Qt.Key_Return, Qt.Key_Space):
-            self.item(root, "sidebarGlobal").forceActiveFocus()
+            titled("sidebarConversation", "Kısa").forceActiveFocus()
             QTest.keyClick(root, key)
             settled(300, lambda: (
                 self.assertTrue(bridge.conversationProject["global"], key),
             ))
-            row = [i for i in self.visible(root, "sidebarProject") if i.property("title") == LONG_PROJECT][0]
-            row.forceActiveFocus()
+            for closed in (True, False):
+                titled("sidebarProject", LONG_PROJECT).forceActiveFocus()
+                QTest.keyClick(root, key)
+                settled(300, lambda: (
+                    self.assertEqual(closed, project_id in bridge.sidebarTree["closed"], key),
+                    self.assertTrue(bridge.conversationProject["global"], key),
+                ))
+            titled("sidebarProjectConversation", LONG_NAME).forceActiveFocus()
             QTest.keyClick(root, key)
             settled(300, lambda: (
                 self.assertEqual(LONG_PROJECT, bridge.conversationProject["name"], key),
             ))
         # Menu / Shift+F10 on a row, and Return / Space on "…": the conversation menu.
         for key, modifier in ((Qt.Key_Menu, Qt.NoModifier), (Qt.Key_F10, Qt.ShiftModifier)):
-            row = [i for i in self.visible(root, "sidebarConversation") if i.property("current")][0]
+            row = [i for i in self.visible(root, "sidebarProjectConversation") if i.property("current")][0]
             row.forceActiveFocus()
             QTest.keyClick(root, key, modifier)
             pump(300)
@@ -733,9 +761,9 @@ class ScopeKeyboardTests(ScopeGroupCase):
             QTest.keyClick(root, Qt.Key_Escape)
             pump(300)
             self.assertFalse(menu("conversationSwitcherContext").property("visible"))
-        # Return on "+" does what its click does: a new conversation in this scope.
+        # Return on "Yeni sohbet" does what its click does: a new conversation in this (writable) project (N1).
         before = bridge.conversationId
-        self.item(root, "sidebarNewConversation").forceActiveFocus()
+        self.item(root, "sidebarNewChat").forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Return)
         settled(400, lambda: (
             self.assertNotEqual(before, bridge.conversationId),
@@ -746,26 +774,46 @@ class ScopeKeyboardTests(ScopeGroupCase):
 
 class ScopeStateTests(ScopeGroupCase):
     def test_v_the_disabled_new_button_tip_is_at_full_opacity(self) -> None:
-        self.seed()
+        store = self.seed()
         bridge = self.bridge()
         root = self.window(bridge)
         self.home(bridge, "thesis")
-        button = self.item(root, "sidebarNewConversation")
-        self.assertLess(button.opacity(), 1.0)                                    # dimmed: not allowed here
-        QTest.mouseMove(root, button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint())
-        tip = [c for c in button.childItems() if c.objectName() == "sidebarPlusTip"][0]
-        settle(lambda: tip.property("shown"))
-        text = [t for t in self.visible(root, "hoverTipText")
-                if t.property("text").startswith("The project is archived")][0]
-        opacity, item = 1.0, text
-        while item is not None:
-            opacity *= item.opacity()
-            item = item.parentItem()
-        self.assertEqual(1.0, opacity)
-        before = bridge.conversationId
+        # Sidebar v2 (L2, N1): no scope "+" to refuse under an archived project; "Yeni sohbet" is not
+        # refused there (it starts a no-project conversation). Its disabled state is the busy one.
+        self.assertEqual([], self.all_items(root, "sidebarNewConversation"))
+        button = self.item(root, "sidebarNewChat")
+        self.assertEqual(1.0, button.opacity())
+        bridge._busy = True
+        try:
+            bridge.stateChanged.emit()
+            settled(100, lambda: (
+                self.assertLess(button.opacity(), 1.0),                              # dimmed: not allowed now
+            ))
+            QTest.mouseMove(root, button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint())
+            tip = [c for c in button.childItems() if c.objectName() == "sidebarRowTip"][0]
+            settle(lambda: tip.property("shown"))
+            text = [t for t in self.visible(root, "hoverTipText")
+                    if t.property("text").startswith("Wait for the current run")][0]
+            opacity, item = 1.0, text
+            while item is not None:
+                opacity *= item.opacity()
+                item = item.parentItem()
+            self.assertEqual(1.0, opacity)
+            before = bridge.conversationId
+            self.press(root, button, then=lambda: (
+                self.assertEqual(before, bridge.conversationId),                       # still refused, as before
+            ))
+        finally:
+            bridge._busy = False
+            bridge.stateChanged.emit()
+        # Not busy, under the archived project: a new no-project conversation, nothing in that project.
+        thesis = store.load_conversation(self.ids["thesis"]).project_id
+        count = len(store.list_conversations(project_id=thesis, include_archived=True))
         self.press(root, button, then=lambda: (
-            self.assertEqual(before, bridge.conversationId),                           # still refused, as before
+            self.assertIsNone(store.load_conversation(bridge.conversationId).project_id),
+            self.assertNotEqual(self.ids["thesis"], bridge.conversationId),
         ))
+        self.assertEqual(count, len(store.list_conversations(project_id=thesis, include_archived=True)))
 
     @ambient_on          # THIZ: its subject is motion
     def test_x_menu_motion_follows_its_tokens_and_stops_with_ambient_off(self) -> None:
@@ -1457,10 +1505,15 @@ class LiveLanguageTests(ListCase):
         self.untitled_global(store, bridge)
         owner = lambda: self.item(root, "chatHeaderScopeName").property("text")  # noqa: E731
         switcher = lambda: self.item(root, "chatHeaderTitle").property("text")  # noqa: E731
-        side = lambda: self.item(root, "sidebarGlobal").property("title")  # noqa: E731
-        self.assertEqual(("Global", "New Chat", "Global"), (owner(), switcher(), side()))
+        # Sidebar v2 V1: no "Genel" row; the sidebar's projected labels are the "Yeni sohbet" row and the
+        # open plain row's untitled name. V7: a no-project chat's header shows no scope chip.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal"))
+        self.assertFalse(self.item(root, "chatHeaderScope").isVisible())
+        side = lambda: (self.item(root, "sidebarNewChat").property("title"),  # noqa: E731
+                        [i.property("title") for i in self.visible(root, "sidebarConversation") if i.property("current")])
+        self.assertEqual(("Global", "New Chat", ("New chat", ["New Chat"])), (owner(), switcher(), side()))
         self.tr(bridge)                                                       # no refresh of any kind after the switch
-        self.assertEqual(("Genel", "Yeni Sohbet", "Genel"), (owner(), switcher(), side()))
+        self.assertEqual(("Genel", "Yeni Sohbet", ("Yeni sohbet", ["Yeni Sohbet"])), (owner(), switcher(), side()))
         self.assertEqual("Genel", bridge.conversationProject["name"])
         # The open project's detail: the untitled row and the archived section rewrite as well.
         bridge.showProject(self.project.id)

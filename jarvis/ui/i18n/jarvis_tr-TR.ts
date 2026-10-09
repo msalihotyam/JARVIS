@@ -1556,6 +1556,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Kopyala</translation>
     </message>
     <message>
+        <source>Copied</source>
+        <translation>Kopyalandı</translation>
+    </message>
+    <message>
         <source>Quote</source>
         <translation>Alıntıla</translation>
     </message>
@@ -3685,28 +3689,12 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Daha eski</translation>
     </message>
     <message>
-        <source>Global</source>
-        <translation>Genel</translation>
-    </message>
-    <message>
         <source>PROJECTS</source>
         <translation>PROJELER</translation>
     </message>
     <message>
         <source>All projects</source>
         <translation>Tüm projeler</translation>
-    </message>
-    <message>
-        <source>Archived projects</source>
-        <translation>Arşivlenmiş projeler</translation>
-    </message>
-    <message>
-        <source>New project</source>
-        <translation>Yeni proje</translation>
-    </message>
-    <message>
-        <source>The project is archived: unarchive it to start a new conversation.</source>
-        <translation>Proje arşivlendi: yeni sohbet başlatmak için arşivden çıkarın.</translation>
     </message>
     <message>
         <source>Wait for the current run to finish.</source>
@@ -3725,42 +3713,56 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Kapalı</translation>
     </message>
     <message>
-        <source>CONVERSATIONS</source>
-        <translation>SOHBETLER</translation>
-    </message>
-    <message>
-        <source>archived</source>
-        <translation>arşivlendi</translation>
-    </message>
-    <message>
-        <source>ARCHIVED</source>
-        <translation>ARŞİV</translation>
-    </message>
-    <message>
-        <source>New conversation in %1</source>
-        <translation>%1 içinde yeni sohbet</translation>
-    </message>
-    <message>
         <source>PINNED</source>
-        <translation>SABİTLENDİ</translation>
+        <translation>SABİTLENENLER</translation>
     </message>
     <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
     </message>
     <message>
+        <source>Open project page</source>
+        <translation>Proje sayfasını aç</translation>
+    </message>
+    <message>
+        <source>New conversation in this project</source>
+        <translation>Bu projede yeni sohbet</translation>
+    </message>
+    <message>
+        <source>Unpin</source>
+        <translation>Sabitlemeyi kaldır</translation>
+    </message>
+    <message>
+        <source>Pin</source>
+        <translation>Sabitle</translation>
+    </message>
+    <message>
+        <source>Archive</source>
+        <translation>Arşivle</translation>
+    </message>
+    <message>
+        <source>New chat</source>
+        <translation>Yeni sohbet</translation>
+    </message>
+    <message>
         <source>In the %1 project</source>
         <translation>%1 projesinde</translation>
     </message>
     <message>
-        <source>No conversation in this scope yet. Press + to start one.</source>
-        <translation>Bu kapsamda henüz sohbet yok. Başlatmak için + düğmesine basın.</translation>
+        <source>1 conversation</source>
+        <translation>1 sohbet</translation>
     </message>
     <message>
-        <source>Archive</source>
-        <comment>sidebar link</comment>
-        <extracomment>the noun - the archived conversations (a link), not the verb &quot;Archive&quot;</extracomment>
-        <translation>Arşiv</translation>
+        <source>%1 conversations</source>
+        <translation>%1 sohbet</translation>
+    </message>
+    <message>
+        <source>Hide conversations</source>
+        <translation>Sohbetleri gizle</translation>
+    </message>
+    <message>
+        <source>Show conversations</source>
+        <translation>Sohbetleri göster</translation>
     </message>
 </context>
 <context>
@@ -3834,10 +3836,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Odak</translation>
     </message>
     <message>
-        <source>Active projects in memory</source>
-        <translation>Hafızadaki aktif projeler</translation>
-    </message>
-    <message>
         <source>Active projects</source>
         <translation>Aktif projeler</translation>
     </message>
@@ -3850,20 +3848,8 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Hafıza öğeleri</translation>
     </message>
     <message>
-        <source>%1 memory items</source>
-        <translation>%1 hafıza öğesi</translation>
-    </message>
-    <message>
-        <source>Active project</source>
-        <translation>Aktif proje</translation>
-    </message>
-    <message>
         <source>No active focus context yet.</source>
         <translation>Henüz aktif odak bağlamı yok.</translation>
-    </message>
-    <message>
-        <source>Projects appear here once memory holds one.</source>
-        <translation>Hafızada bir proje olduğunda projeler burada görünür.</translation>
     </message>
     <message>
         <source>Open Memory</source>

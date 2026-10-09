@@ -40,8 +40,11 @@ class OpenConversationRemovedTests(F6Case):
         settled(400, lambda: (
             self.assertEqual("home", root.property("loadedPage")),
             self.assertTrue(self.item(root, "conversationWelcome").isVisible()),
-            self.assertTrue(self.item(root, "chatHeaderScope").isVisible()),            # the scope (project) chip
+            # Sidebar v2 V7: the scope (project) chip names a project chat's project; a no-project chat has none.
+            self.assertEqual(project_id is not None, self.item(root, "chatHeaderScope").isVisible()),
         ))
+        if project_id is not None:
+            self.assertEqual(bridge.conversationProject["name"], self.item(root, "chatHeaderScope").property("fullName"))
         return now
 
     def confirm_delete(self, root) -> None:
@@ -71,14 +74,18 @@ class OpenConversationRemovedTests(F6Case):
         bridge = self.bridge()
         root = self.window(bridge)
         # A project conversation, archived from its own sidebar row: a new chat in the same project.
-        self.tap(root, self.row(root, "sidebarProject", "Tez"))
+        # Sidebar v2 T1: its row is in the project's tree (picked there), not in the plain list.
+        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 0"))
         bridge.openConversation(self.tezc[0].id)
         wait_until(lambda: bridge.conversationId == self.tezc[0].id, 400)
-        self.choose(root, self.row(root, "sidebarConversation", "Tez 0"), "conversationArchiveItem", label="Archive")
+        self.assertNotIn("Tez 0", self.titles(root))
+        self.choose(root, self.row(root, "sidebarProjectConversation", "Tez 0"), "conversationArchiveItem", label="Archive")
         self.assertIsNotNone(store.load_conversation(self.tezc[0].id).archived_at)
         self.new_chat(root, bridge, store, [c.id for c in self.tezc], self.tez.id)
         # A Global conversation, deleted from its own sidebar row: a new Global chat.
-        self.tap(root, self.item(root, "sidebarGlobal"))
+        # Sidebar v2 V1: no "Genel" row; the plain list is always shown and its row is picked there.
+        self.assertEqual([], self.all_items(root, "sidebarGlobal"))
+        self.tap(root, self.row(root, "sidebarConversation", "Genel 1"))
         bridge.openConversation(self.genel[1].id)
         wait_until(lambda: bridge.conversationId == self.genel[1].id, 400)
         self.choose(root, self.row(root, "sidebarConversation", "Genel 1"), "conversationDeleteItem")
