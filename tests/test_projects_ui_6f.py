@@ -2841,7 +2841,6 @@ class RowMenuButtonTests(F6Case):
         QTest.mouseMove(root, QPoint(root.width() // 2, root.height() - 4))
         pump(200)
 
-    @ambient_on          # THIZ: with ambient off its menu opens 100 px off the row after a resize (reported, not ours to fix)
     def test_fff_the_row_button_shows_on_hover_and_opens_that_rows_menu_without_opening_it(self) -> None:
         store = self.db()
         tez = store.create_project("Tez")
@@ -2910,6 +2909,39 @@ class RowMenuButtonTests(F6Case):
                                           if i.objectName() == "sidebarRowMenuButton" and i.isVisible()]),
                 ))
         self.assertEqual(0, self.execute_calls())
+
+    def anchored_after_resizes(self) -> None:
+        """G6F1: each row's menu opens next to that row - after the previous menu closed
+        elsewhere and after every resize (THIZ F1: 100 px off with ambient effects off)."""
+        store = self.db()
+        tez = store.create_project("Tez")
+        pinned = store.create_conversation(tez.id, title="Tez sohbeti")
+        a = store.create_conversation(title="Bir sohbet")
+        store.create_conversation(title="Açık sohbet")
+        bridge = self.bridge()
+        bridge.pinConversation(pinned.id)
+        root = self.window(bridge)
+        menu = self.popup_named(root, "conversationSwitcherContext")
+        for width, height in SIZES:
+            self.resize_still(root, width, height, 700)
+            for row in (self.pin_row(root, "Tez sohbeti"), self.row(root, "sidebarConversation", a.title)):
+                with self.subTest(size=(width, height), row=row.property("title")):
+                    self.into_view(root, row)
+                    self.hover(root, row)
+                    self.tap(root, self.button(row), until=lambda: bool(menu.property("opened")) and menu.property("opacity") == 1.0)
+                    self.assertTrue(settle(lambda: bool(menu.property("opened")) and menu.property("opacity") == 1.0))
+                    body, box = self.rect(menu.property("background")), self.rect(row)
+                    self.assertGreaterEqual(body.left(), box.right() - 0.5)
+                    self.assertAlmostEqual(box.top(), body.top(), delta=1)
+                    self.close_menu(root)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_hhh_a_rows_menu_opens_at_its_row_after_a_resize_motion_free(self) -> None:
+        self.anchored_after_resizes()
+
+    @ambient_on          # G6F1: the same with the menu's motion
+    def test_hhh_a_rows_menu_opens_at_its_row_after_a_resize_with_motion(self) -> None:
+        self.anchored_after_resizes()
 
     def test_ggg_the_row_button_string_is_turkish(self) -> None:
         from jarvis.ui.i18n import localization, tx

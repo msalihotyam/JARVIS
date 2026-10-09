@@ -76,7 +76,9 @@ Item {
         readonly property Transition menuOut: Transition {
             NumberAnimation { property: "opacity"; to: 0; duration: Theme.panelOut; easing.type: Theme.ease }
         }
-        onClosed: { opacity = 1; y = restY }
+        // G6F1: re-bind y, never assign it: an assignment broke `y: restY`, and only
+        // menuIn (ambient on) wrote y again, so motion-free the next open kept the last place.
+        onClosed: { opacity = 1; y = Qt.binding(() => restY) }
     }
 
     // What the menu acts on: "" = the open conversation; else a listed row of
