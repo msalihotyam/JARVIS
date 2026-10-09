@@ -617,32 +617,41 @@ the optional report reader below. One instance at a time
   its silent session stopped (`claude stop`, the conversation is kept) and is
   re-dispatched from its saved prompt with a short "continue from where you
   stopped" preface; after 2 re-dispatches it is finished as `STUCK` (slot freed,
-  paged). An idle or finished session never blocks a new lane of the same name.
+  in `attention`). An idle or finished session never blocks a new lane of the same name.
 - **PAUSE.** `build/conveyor/PAUSE` present: nothing new starts (no dispatch,
   no re-dispatch); tracking, report collection and respawn go on.
 - **Usage guard.** `claude` has no plan-usage command, so the newest
   `build/ledger/slices.jsonl` row (jarvis-flow slice ledger, `seven_day`) is
   read; at 85% or more of the weekly limit no new lane starts (a row older than
   7 days is ignored). `status.json` shows `usage_pct` and `usage_hold`.
-- **Pager (ntfy).** Topic from `JARVIS_NTFY_TOPIC` (same rules as the
-  jarvis-flow pager; never logged). Pushes only for a lane report `STATUS:
-  BLOCKED/STOP/FAIL` (or `STUCK`), 3 failed passes in a row, and the backlog
-  running dry (no lane running, no inbox file waiting and nothing to dispatch;
-  once per episode). At most one push per 10 min; pages inside the gap, or after
-  a failed send, are held and sent together.
+- **Attention and pager (ntfy).** Salih's rule (2026-10-09): lane events go to
+  the orchestrator, not to Salih. A lane report `STATUS: BLOCKED/STOP/FAIL`, a
+  `STUCK` lane, a non-`pass` reading (below) and the backlog running dry (no
+  lane running, no inbox file waiting and nothing to dispatch; id
+  `backlog-dry`, one item per episode) are items in `status.json` `attention`
+  (`{id, reason, since}`), not pushes. The orchestrator acks an item by
+  creating or touching `build/conveyor/ack/<id>` (existence only, never
+  deleted; an ack older than the item's `since` does not count, so a reused
+  lane name needs a fresh touch). ntfy (topic from `JARVIS_NTFY_TOPIC`, same
+  rules as the jarvis-flow pager; never logged) reaches Salih only for: a
+  `needs_salih` reading; an attention item left unacked for 30 min
+  (`ATTENTION_PAGE_S`, "the orchestrator did not react"; once per item); and 3
+  failed conveyor passes in a row. At most one push per 10 min; pages inside the
+  gap, or after a failed send, are held and sent together.
 - **Report reader (advisory, optional).** Salih approved it on 2026-10-09
   (monthly API credit). When a lane finishes by report or is marked `STUCK`,
   its report (only the report text, at most 12,000 chars, head + tail; a
   `STUCK` lane without a report sends a fixed note) goes with a fixed
-  instruction to Claude Haiku 4.5 (`claude-haiku-4-5-20251001`, Anthropic
-  Messages API, stdlib, 20 s timeout). The strict-JSON answer `{kind, summary,
+  instruction to Claude Haiku 5.5 (`claude-haiku-5-5`, effort `low` via
+  `output_config`, Anthropic Messages API, stdlib, 20 s timeout; no assistant
+  prefill, which Haiku 5.5 rejects with 400: JSON comes from the instruction and
+  strict validation). The strict-JSON answer `{kind, summary,
   next}` (kind `pass`/`blocked`/`stalled`/`needs_orchestrator`/`needs_salih`)
   is stored as `reading` on the lane in `status.json` plus a `reader` event;
   invalid output becomes `needs_orchestrator` "reader: invalid output".
-  `status.json` `attention` lists lanes whose reading is not `pass` and not
-  acknowledged; the orchestrator acks by creating or touching
-  `build/conveyor/ack/<lane>` (existence only, never deleted; an ack older than
-  the lane's start does not count, so a reused lane name needs a fresh touch). Only `needs_salih` pages (same ntfy path and 10 min gap).
+  A reading that is not `pass` puts the lane in `attention` (above); only
+  `needs_salih` pages directly (same ntfy path and 10 min gap, no backstop page
+  after it).
   The reader is never the authority: it cannot approve integration, push,
   patch apply or any git action, and never changes the `STATUS:` handling,
   dependencies or slots above. Key: `JARVIS_READER_API_KEY` (user env var; on
@@ -651,7 +660,8 @@ the optional report reader below. One instance at a time
   `ANTHROPIC_API_KEY` (that would switch Claude Code lanes to API billing); it
   is never logged or written anywhere. No key: the reader is off (one
   `reader_disabled` event per day). Every call is recorded in
-  `build/ledger/api.jsonl` (tokens, model, lane, `est_usd`); at $20
+  `build/ledger/api.jsonl` (tokens, model, lane, `est_usd` at $0.10 / $0.50
+  per MTok input / output); at $20
   (`READER_MONTHLY_USD`) estimated for the current month, calls stop until the
   next month. Network error, timeout, non-200 or the cap: no reading, a
   `reader_error` event with the HTTP status only, the conveyor goes on.

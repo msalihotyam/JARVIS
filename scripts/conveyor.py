@@ -27,8 +27,10 @@ PASS_S = 60
 USAGE_S = 1800  # build/conveyor/usage_ledger.py cadence (optional runtime script)
 FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
-MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, paged)
+MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, in attention)
 PAGE_GAP_S = 600
+ATTENTION_PAGE_S = 1800  # an attention item unacked this long pages Salih (orchestrator did not react)
+DRY_ID = "backlog-dry"  # attention id (and ack file) of the "backlog ran dry" episode
 CRASH_PAGE = 3
 USAGE_LIMIT = 85  # % of the weekly plan; no new lanes at or above it
 USAGE_FRESH_S = 7 * 86400  # weekly % never drops before the window resets
@@ -38,8 +40,9 @@ CONTINUE = ("Continue from where you stopped: this lane was re-dispatched becaus
             "respawned session did not resume its turn. Check your worktree's git status "
             "and git log first and do not redo finished work.\n\n")
 READER_URL = "https://api.anthropic.com/v1/messages"
-READER_MODEL = "claude-haiku-4-5-20251001"
-READER_USD_PER_TOKEN = (1 / 1e6, 5 / 1e6)  # Haiku 4.5 input, output
+READER_MODEL = "claude-haiku-5-5"
+READER_EFFORT = "low"
+READER_USD_PER_TOKEN = (0.10 / 1e6, 0.50 / 1e6)  # Haiku 5.5 input, output (prompts <= 100K tokens)
 READER_MONTHLY_USD = 20
 READER_MAX_CHARS = 12000
 READER_KINDS = {"pass", "blocked", "stalled", "needs_orchestrator", "needs_salih"}
@@ -353,7 +356,9 @@ class Conveyor:
             self.track(lanes, agents)
             self.dispatch(lanes, agents)
         self.save_lanes(lanes)
-        self.write_status(lanes)
+        items = self.attention(lanes)
+        self.write_status(lanes, items)
+        self.backstop(items)
         self.flush_pages()
         return agents is not None
 
@@ -373,8 +378,7 @@ class Conveyor:
         self.event("finish", lane=name, id=ln["id"], status=status, report=ln["report"])
         if quiet:
             return
-        if status in BAD:
-            self.page(f"{name}: STATUS {status}")
+        ln["finished_ts"] = self.now()  # since of its attention item (bad STATUS, non-pass reading)
         try:
             text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -412,8 +416,9 @@ class Conveyor:
             if self.api_spent(month) >= READER_MONTHLY_USD:
                 self.event("reader_error", lane=name, status="budget")
                 return
+            # no assistant prefill (Haiku 5.5 rejects it with 400): JSON only by instruction
             body = {"model": READER_MODEL, "max_tokens": 300, "temperature": 0,
-                    "system": READER_SYSTEM,
+                    "output_config": {"effort": READER_EFFORT}, "system": READER_SYSTEM,
                     "messages": [{"role": "user", "content": clip(text or STUCK_NOTE)}]}
             status, resp = self.post(key, body)
             if status != 200 or not isinstance(resp, dict):
@@ -433,6 +438,7 @@ class Conveyor:
             self.event("reader", lane=name, reading=r)
             if r["kind"] == "needs_salih":
                 self.page(f"{name}: {r['summary']}")
+                self.backstop_done(name, self.since(ln))  # paged already: no backstop page
         except Exception as e:  # advisory: the conveyor goes on
             self.event("reader_error", lane=name, status=type(e).__name__)
 
@@ -472,9 +478,8 @@ class Conveyor:
                     and self.now() - ln["respawned_ts"] >= IDLE_REDISPATCH_S
                     and not self.active_since(name, ln["respawned_ts"], a.get("cwd"))):
                 if ln.get("redispatches", 0) >= MAX_REDISPATCH:
-                    ln.update(finished=True, status="STUCK")
+                    ln.update(finished=True, status="STUCK", finished_ts=self.now())
                     self.event("finish", lane=name, id=ln["id"], status="STUCK")
-                    self.page(f"{name}: STUCK (yeniden başlatıldı, ilerlemiyor)")
                     self.read_report(name, ln, None)
                 else:
                     self.redispatch(name, ln)
@@ -619,9 +624,8 @@ class Conveyor:
             started = self.dispatch_backlog(lanes, busy) or started
         if started or waiting or self.running(lanes):
             self.pager_flag("dry", False)
-        elif not self.pager_flag("dry"):
-            self.pager_flag("dry", True)
-            self.page("Konveyor: kuyruk boş, çalışan lane yok")
+        elif self.pager_flag("dry") in (None, False, True):  # True: a v1 flag without a time
+            self.pager_flag("dry", self.now())  # the dry episode's attention since
 
     def started_path(self, name):
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
@@ -725,15 +729,51 @@ class Conveyor:
         (d / (f.name + ".reason.txt")).write_text(reason + "\n", encoding="utf-8")
         self.event("reject", file=f.name, reason=reason)
 
-    def acked(self, name, ln):
-        """Orchestrator ack: build/conveyor/ack/<lane> exists (never deleted here) and is
-        not older than this lane run, so an earlier same-name ack hides nothing new."""
+    def since(self, ln):
+        return ln.get("finished_ts") or self.started_ts(ln)
+
+    def acked(self, item_id, since):
+        """Orchestrator ack: build/conveyor/ack/<id> exists (never deleted here) and is
+        not older than the item, so an earlier same-name ack hides nothing new."""
         try:
-            return (self.base / "ack" / name).stat().st_mtime >= self.started_ts(ln)
+            return (self.base / "ack" / item_id).stat().st_mtime >= since
         except OSError:
             return False
 
-    def write_status(self, lanes):
+    def attention(self, lanes):
+        """Unacked items for the orchestrator as (id, reason, since): a lane with a bad
+        STATUS or STUCK, a non-pass reading, and the backlog running dry."""
+        items = []
+        for n, ln in lanes.items():
+            if "finished_ts" not in ln:  # running, a quiet v0 lane, or read before this version
+                continue
+            why = []
+            if ln.get("status") in BAD or ln.get("status") == "STUCK":
+                why.append(f"STATUS {ln['status']}")
+            r = ln.get("reading") or {}
+            if r.get("kind", "pass") != "pass":
+                why.append(f"reader {r['kind']}: {r.get('summary', '')}")
+            if why:
+                items.append((n, "; ".join(why), self.since(ln)))
+        dry = self.pager_flag("dry")
+        if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
+            items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
+        return [i for i in items if not self.acked(i[0], i[2])]
+
+    def backstop_done(self, item_id, since):
+        done = self.pager_flag("backstop") or {}
+        done[item_id] = since
+        self.pager_flag("backstop", done)
+
+    def backstop(self, items):
+        """Page Salih once per attention item the orchestrator left unacked ATTENTION_PAGE_S."""
+        done = self.pager_flag("backstop") or {}
+        for i, why, since in items:
+            if self.now() - since >= ATTENTION_PAGE_S and done.get(i) != since:
+                self.page(f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}")
+                self.backstop_done(i, since)
+
+    def write_status(self, lanes, items):
         status = {
             "updated_at": iso(self.now()),
             "pid": self.pid,
@@ -748,9 +788,7 @@ class Conveyor:
                        "reading": ln.get("reading")}
                       for n, ln in lanes.items()],
             "backlog": self.backlog_view,
-            "attention": [n for n, ln in lanes.items()
-                          if (ln.get("reading") or {}).get("kind", "pass") != "pass"
-                          and not self.acked(n, ln)],
+            "attention": [{"id": i, "reason": why, "since": iso(since)} for i, why, since in items],
         }
         tmp = self.base / "status.json.tmp"
         tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")

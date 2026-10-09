@@ -120,6 +120,9 @@ class Base(unittest.TestCase):
     def view(self):
         return {r["id"]: r["state"] for r in self.status()["backlog"] if "id" in r}
 
+    def attn(self):
+        return [a["id"] for a in self.status()["attention"]]
+
 
 class TestHeader(unittest.TestCase):
     def test_valid(self):
@@ -175,6 +178,7 @@ class TestInbox(Base):
         self.assertTrue((self.base / "inbox" / "a.md").exists())
         self.assertTrue(self.status()["paused"])
         self.assertEqual(self.pushes, [])  # paused is not "dry"
+        self.assertNotIn(conveyor.DRY_ID, self.attn())
 
     def test_max_three_lanes_oldest_first(self):
         for i, n in enumerate("EDCBA"):
@@ -298,6 +302,7 @@ class TestBacklog(Base):
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), [])
         self.assertEqual(self.pushes, [])  # a waiting inbox file is not "dry"
+        self.assertNotIn(conveyor.DRY_ID, self.attn())
         self.fake.agents[0]["status"] = "idle"
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "S"])
@@ -379,6 +384,7 @@ class TestFinishedByReport(Base):
         self.c.pass_once()
         self.assertEqual(self.lanes()["OLD"]["status"], "BLOCKED")
         self.assertFalse(any("OLD" in p for p in self.pushes))
+        self.assertNotIn("OLD", self.attn())
 
 
 class TestRedispatch(Base):
@@ -440,8 +446,13 @@ class TestRedispatch(Base):
         self.c.pass_once()
         ln = self.lanes()["A"]
         self.assertEqual((ln["finished"], ln["status"]), (True, "STUCK"))
-        self.assertTrue(any("STUCK" in p for p in self.pushes))
+        self.assertIn({"id": "A", "reason": "STATUS STUCK", "since": conveyor.iso(self.t)},
+                      self.status()["attention"])
+        self.assertFalse(any("STUCK" in p for p in self.pushes))  # to the orchestrator first
         self.assertEqual(self.fake.bg_names(), ["A", "A", "A"])
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertTrue(any("A: STATUS STUCK" in p for p in self.pushes))  # not acked: backstop page
 
     def test_stuck_lane_read_with_fixed_note(self):
         self.key = "k"
@@ -460,7 +471,8 @@ class TestRedispatch(Base):
         (body,) = self.posts
         self.assertEqual(body["messages"][0]["content"], conveyor.STUCK_NOTE)
         self.assertEqual(self.lanes()["A"]["status"], "STUCK")
-        self.assertEqual(self.status()["attention"], ["A"])
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
+        self.assertEqual(self.status()["attention"][0]["reason"], "STATUS STUCK; reader stalled: ilerlemiyor")
 
     def test_pause_holds_redispatch(self):
         self.setup_respawned()
@@ -492,29 +504,62 @@ class TestRedispatch(Base):
 
 
 class TestPager(Base):
-    def test_bad_status_paged_with_rate_limit(self):
+    def test_bad_status_to_attention_then_backstop_with_rate_limit(self):
+        t0 = self.t
         self.backlog({"id": "A"}, {"id": "B"}, {"id": "C"})
         self.c.pass_once()
         self.report("A", "BLOCKED")
         self.c.pass_once()
-        self.assertEqual(self.pushes, ["A: STATUS BLOCKED"])
+        self.assertEqual(self.pushes, [])  # the orchestrator first, not Salih
+        self.assertEqual(self.status()["attention"],
+                         [{"id": "A", "reason": "STATUS BLOCKED", "since": conveyor.iso(t0)}])
         self.t += 60
         self.report("B", "FAIL")
-        self.c.pass_once()
-        self.assertEqual(len(self.pushes), 1)   # inside the 10 min gap: held
         self.report("C", "PASS")
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.attn(), ["A", "B", conveyor.DRY_ID])
+        self.t = t0 + conveyor.ATTENTION_PAGE_S  # A unacked 30 min: backstop page
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("A: STATUS BLOCKED", self.pushes[0])
+        self.t += 60                             # B and dry due, inside the 10 min gap: held
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
         self.t += 600
         self.c.pass_once()
-        self.assertTrue(self.pushes[1].startswith("B: STATUS FAIL\n"))  # held page, coalesced
-        self.assertIn("boş", self.pushes[1])                            # with "dry"
+        self.assertIn("B: STATUS FAIL\n", self.pushes[1])  # held pages, coalesced
+        self.assertIn("boş", self.pushes[1])               # with "dry"
         self.assertNotIn("C: STATUS", " ".join(self.pushes))
+        self.t += 3600
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 2)  # one backstop page per item
 
-    def test_dry_paged_once(self):
+    def test_dry_to_attention_backstop_once(self):
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.status()["attention"], [{"id": conveyor.DRY_ID, "since": conveyor.iso(self.t),
+                                                       "reason": "kuyruk boş, çalışan lane yok"}])
+        self.t += 3600
         self.c.pass_once()
         self.t += 3600
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)
         self.assertIn("boş", self.pushes[0])
+
+    def test_acked_item_leaves_attention_and_is_not_paged(self):
+        self.c.pass_once()  # dry
+        ack = self.base / "ack"
+        ack.mkdir()
+        (ack / conveyor.DRY_ID).write_text("")
+        os.utime(ack / conveyor.DRY_ID, (self.t - 5, self.t - 5))  # older than the item: no ack
+        self.c.pass_once()
+        self.assertEqual(self.attn(), [conveyor.DRY_ID])
+        os.utime(ack / conveyor.DRY_ID, (self.t + 5, self.t + 5))
+        self.t += 3600
+        self.c.pass_once()
+        self.assertEqual(self.status()["attention"], [])
+        self.assertEqual(self.pushes, [])
 
     def test_three_crashes_in_a_row_page_once(self):
         (self.base / "PAUSE").write_text("")
@@ -541,6 +586,24 @@ class TestPager(Base):
         self.c.loop(once=True)
         self.assertEqual(self.pushes, [])
 
+    def test_earlier_version_state_does_not_page(self):
+        # v1 "dry": true (already paged) and a lane read by 137095c (no finished_ts, needs_salih paged)
+        self.c.pager_flag("dry", True)
+        (self.base / "lanes.json").write_text(json.dumps({"A": {
+            "id": "0000aaaa", "model": "opus", "effort": "high", "base": "072d0fe",
+            "started_at": conveyor.iso(self.t - 7200), "started_ts": self.t - 7200, "state": "done",
+            "finished": True, "status": "BLOCKED", "prompt": "prompts/A.md",
+            "reading": {"kind": "needs_salih", "summary": "s", "next": "n", "at": conveyor.iso(self.t - 7000)}}}))
+        (self.base / "PAUSE").write_text("")
+        self.c.pass_once()
+        self.assertEqual(self.status()["attention"], [])
+        (self.base / "PAUSE").unlink()
+        self.c.pass_once()  # dispatch() gives the episode a time
+        self.t += conveyor.ATTENTION_PAGE_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.attn(), [conveyor.DRY_ID])
+        self.assertEqual(self.pushes, [])
+
     def test_ntfy_without_topic_makes_no_call(self):
         with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": "bad topic/../x"}), \
                 mock.patch.object(conveyor.urllib.request, "urlopen") as op:
@@ -558,7 +621,7 @@ class TestPager(Base):
         self.assertEqual(self.events()[-1]["result"], "error OSError")
         self.assertIn("A: STATUS BLOCKED", self.c.pager_flag("pending"))
 
-    def test_bad_report_after_state_done_still_paged(self):
+    def test_bad_report_after_state_done_still_in_attention(self):
         self.drop("a.md", HDR.format("A"))
         self.c.pass_once()
         self.fake.agent("A")["state"] = "done"
@@ -566,7 +629,9 @@ class TestPager(Base):
         self.report("A", "STOP")
         self.c.pass_once()
         self.assertEqual(self.lanes()["A"]["status"], "STOP")
-        self.t += 600  # the "dry" push went first; this one waits out the gap
+        self.assertIn("A", self.attn())
+        self.assertEqual(self.pushes, [])
+        self.t += conveyor.ATTENTION_PAGE_S  # unacked: the backstop page
         self.c.pass_once()
         self.assertIn("A: STATUS STOP", self.pushes[-1])
 
@@ -639,8 +704,8 @@ class TestReader(Base):
     def test_valid_reading_recorded(self):
         rep = self.finish_a()
         (body,) = self.posts
-        self.assertEqual((body["model"], body["max_tokens"], body["temperature"]),
-                         ("claude-haiku-4-5-20251001", 300, 0))
+        self.assertEqual((body["model"], body["max_tokens"], body["temperature"], body["output_config"]),
+                         ("claude-haiku-5-5", 300, 0, {"effort": "low"}))
         self.assertEqual(body["system"], conveyor.READER_SYSTEM)
         self.assertEqual(body["messages"], [{"role": "user", "content": rep.read_text(encoding="utf-8")}])
         r = self.lane_a()["reading"]
@@ -649,21 +714,29 @@ class TestReader(Base):
         ev = [e for e in self.events() if e["event"] == "reader"]
         self.assertEqual([(e["lane"], e["reading"]) for e in ev],
                          [("A", {"kind": "pass", "summary": "testler yeşil", "next": "entegre et"})])
-        self.assertEqual(self.status()["attention"], [])
+        self.assertEqual(self.attn(), [conveyor.DRY_ID])  # a pass reading needs no attention
         (row,) = [json.loads(x) for x in (self.root / "build" / "ledger" / "api.jsonl").read_text().splitlines()]
         self.assertEqual({k: row[k] for k in ("model", "lane", "input_tokens", "output_tokens")},
-                         {"model": "claude-haiku-4-5-20251001", "lane": "A",
+                         {"model": "claude-haiku-5-5", "lane": "A",
                           "input_tokens": 1000, "output_tokens": 50})
-        self.assertAlmostEqual(row["est_usd"], 0.00125)
+        self.assertAlmostEqual(row["est_usd"], 0.000125)  # $0.10 / $0.50 per MTok
         self.c.pass_once()
         self.assertEqual(len(self.posts), 1)  # one reading per finish
+
+    def test_request_has_no_prefill_and_low_effort(self):
+        self.finish_a()
+        (body,) = self.posts
+        self.assertEqual(body["model"], "claude-haiku-5-5")
+        self.assertEqual(body["output_config"], {"effort": "low"})
+        self.assertEqual([m["role"] for m in body["messages"]], ["user"])
+        self.assertNotEqual(body["messages"][-1]["role"], "assistant")  # Haiku 5.5: prefill is a 400
 
     def test_invalid_output_needs_orchestrator(self):
         self.reply = answer("```json\n{\"kind\": \"pass\"}\n```")
         self.finish_a()
         r = self.lane_a()["reading"]
         self.assertEqual((r["kind"], r["summary"]), ("needs_orchestrator", "reader: invalid output"))
-        self.assertEqual(self.status()["attention"], ["A"])
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
         self.assertEqual(self.lanes()["A"]["status"], "PASS")
 
     def test_parse_reading_is_strict(self):
@@ -788,7 +861,17 @@ class TestReader(Base):
         self.assertIn("C: Salih karar vermeli", pushed)
         self.assertNotIn("engel_bir", pushed)
         self.assertNotIn("engel_iki", pushed)
-        self.assertEqual(self.status()["attention"], ["A", "B", "C"])
+        self.assertEqual(self.attn(), ["A", "B", "C", conveyor.DRY_ID])
+
+    def test_needs_salih_not_paged_again_by_backstop(self):
+        self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
+        self.finish_a()
+        self.t += conveyor.ATTENTION_PAGE_S + 3600
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[0], "A: karar")
+        self.assertIn(conveyor.DRY_ID, self.pushes[1])  # only the dry backstop
+        self.assertNotIn("A:", self.pushes[1])
 
     def test_needs_salih_page_respects_gap(self):
         self.c.page("earlier")
@@ -804,7 +887,8 @@ class TestReader(Base):
         self.reply = answer({"kind": "pass", "summary": "iyi", "next": "n"})
         self.finish_a(status="BLOCKED")
         self.assertEqual(self.lanes()["A"]["status"], "BLOCKED")
-        self.assertIn("A: STATUS BLOCKED", "\n".join(self.pushes))
+        self.assertEqual(self.status()["attention"][0]["reason"], "STATUS BLOCKED")  # pass reading: status stays
+        self.assertNotIn("A: STATUS BLOCKED", "\n".join(self.pushes))
         self.reply = answer({"kind": "needs_salih", "summary": "dur", "next": "n"})
         self.backlog({"id": "X"}, {"id": "Y", "depends_on": ["X"]})
         self.c.pass_once()
@@ -820,10 +904,10 @@ class TestReader(Base):
         os.utime(ack / "A", (self.t - 3600, self.t - 3600))  # an ack from an earlier A
         self.reply = answer({"kind": "blocked", "summary": "s", "next": "n"})
         self.finish_a()
-        self.assertEqual(self.status()["attention"], ["A"])
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
         os.utime(ack / "A", (self.t + 5, self.t + 5))
         self.c.pass_once()
-        self.assertEqual(self.status()["attention"], [])
+        self.assertEqual(self.attn(), [conveyor.DRY_ID])
         self.assertTrue((ack / "A").exists())
 
     def test_reader_key_env_then_registry(self):
