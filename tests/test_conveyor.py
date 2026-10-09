@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -16,7 +17,7 @@ conveyor = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(conveyor)
 Conveyor, parse_header, files_overlap = conveyor.Conveyor, conveyor.parse_header, conveyor.files_overlap
 
-HDR = "@jarvis lane={} model=opus effort=high base=072d0fe\n"
+HDR = "@jarvis lane={} model=opus effort=high base=1234567\n"  # FakeGit's main (MAIN) starts 1234567
 
 
 class FakeClaude:
@@ -128,7 +129,7 @@ class Base(unittest.TestCase):
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
                           send=lambda text: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
-                          cmd=self.git, disk=self.fake_disk)
+                          cmd=self.git, disk=self.fake_disk, projects=self.root / "projects")
         self.base = self.root / "build" / "conveyor"
 
     def fake_disk(self, path):
@@ -200,13 +201,80 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(parse_header("@jarvis lane=A model=opus effort=high base=main")["base"], "main")
 
     def test_bom_and_crlf(self):
-        self.assertIsNotNone(parse_header("﻿@jarvis lane=A-1 model=sonnet effort=max base=abcdef1\r\n"))
+        self.assertIsNotNone(parse_header("﻿@jarvis lane=A-1 model=sonnet effort=xhigh base=abcdef1\r\n"))
 
     def test_invalid(self):
         for bad in ["", "TASK X", "@jarvis lane=A model=opus effort=huge base=072d0fe",
                     "@jarvis lane=A model=opus effort=high", "@jarvis lane=A B model=opus effort=high base=072d0fe",
                     "@jarvis lane=A model=opus effort=high base=xyz"]:
             self.assertIsNone(parse_header(bad), bad)
+
+    def test_lint_rules(self):
+        """The jarvis-flow lint's parseHeader: any field order, exact families and efforts."""
+        ok = conveyor.check_header("@jarvis base=main effort=medium model=haiku lane=g6.k3\nbody")
+        self.assertEqual(ok, ({"lane": "g6.k3", "model": "haiku", "effort": "medium", "base": "main"}, None))
+        cases = {"@jarvis lane=AGY0 model=opus effort=low base=main": "effort invalid: low",
+                 "@jarvis lane=A model=opus effort=max base=main": "effort invalid: max",
+                 "@jarvis lane=A model=claude-opus-5-5 effort=high base=main": "model invalid",
+                 "@jarvis lane=A model=opus effort=High base=main": "effort invalid",
+                 "@jarvis lane=-A model=opus effort=high base=main": "lane invalid",
+                 "@jarvis lane=" + "A" * 65 + " model=opus effort=high base=main": "lane invalid",
+                 "@jarvis lane=A model=opus effort=high base=ABCDEF1": "base invalid",
+                 "@jarvis lane=A model=opus effort=high base=main lane=B": "duplicate field: lane",
+                 "@jarvis lane=A model=opus effort=high base=main tier=T1": "unknown field: tier",
+                 "@jarvis lane=A model=opus effort=high base=main x": "bad token: x",
+                 "@jarvis lane=A model=opus base=main": "missing field: effort",
+                 "@jarvisx lane=A model=opus effort=high base=main": "not an '@jarvis"}
+        for line, why in cases.items():
+            hdr, reason = conveyor.check_header(line)
+            self.assertIsNone(hdr, line)
+            self.assertIn(why, reason, line)
+
+    def test_rules_match_lint_source(self):
+        """Drift guard: the table in conveyor.py equals header.ts's constants."""
+        src = (Path(__file__).resolve().parents[1] / ".claude" / "skills" / "jarvis-flow" / "hooks"
+               / "lib" / "header.ts").read_text(encoding="utf-8")
+
+        def arr(name):
+            m = re.search(rf"export const {name}: readonly \w+\[\] = \[([^\]]*)\]", src)
+            self.assertIsNotNone(m, name)
+            return tuple(re.findall(r"'([^']*)'", m.group(1)))
+
+        def regex(name):
+            m = re.search(rf"const {name} = /(.*)/\s*$", src, re.M)
+            self.assertIsNotNone(m, name)
+            return m.group(1)
+        self.assertEqual(arr("FAMILIES"), conveyor.FAMILIES)
+        self.assertEqual(arr("EFFORTS"), conveyor.EFFORTS)
+        self.assertEqual(regex("LANE"), conveyor.LANE_RE.pattern)
+        self.assertEqual(regex("SHA"), conveyor.SHA_HDR_RE.pattern)
+        m = re.search(r"const REQUIRED = \[([^\]]*)\]", src)
+        self.assertEqual(tuple(re.findall(r"'([^']*)'", m.group(1))), conveyor.HEADER_KEYS)
+        self.assertIn(r"/^([a-z]+)=(\S+)$/", src)  # token shape mirrored in check_header
+        self.assertIn(r"/^@jarvis(\s|$)/", src)  # header detection mirrored in check_header
+        lint = (Path(__file__).resolve().parents[1] / ".claude" / "skills" / "jarvis-flow" / "hooks"
+                / "lib" / "lint.ts").read_text(encoding="utf-8")
+        # lint.ts blocks every header parseHeader calls invalid, and a sha base that is not
+        # canonical main's HEAD (check_header's `main`); its model/effort checks are per session
+        self.assertIn("if (parsed.kind === 'invalid') return { kind: 'block'", lint)
+        self.assertIn("header.base !== 'main' && ctx.mainHead !== null && !shaMatches(header.base, ctx.mainHead)",
+                      lint)
+        self.assertIn("if (x.length < 7 || y.length < 7) return false", src)
+        self.assertIn("return x.startsWith(y) || y.startsWith(x)", src)
+
+    def test_base_must_be_main_head(self):
+        line = "@jarvis lane=A model=opus effort=high base=abcdef1"
+        self.assertIsNotNone(conveyor.check_header(line)[0])  # main unknown: passes, like the lint
+        self.assertIsNotNone(conveyor.check_header(line, "abcdef1234567890")[0])
+        self.assertIsNotNone(conveyor.check_header(line.replace("abcdef1", "abcdef1234"), "abcdef12")[0])
+        hdr, why = conveyor.check_header(line, "1234567" + "a" * 33)
+        self.assertIsNone(hdr)
+        self.assertEqual(why, "base abcdef1 is not main 1234567aaaaa")
+        self.assertIsNotNone(conveyor.check_header(line.replace("abcdef1", "main"), "1234567")[0])
+
+    def test_js_whitespace(self):
+        self.assertIsNotNone(parse_header("@jarvis lane=A model=opus　effort=high base=main"))
+        self.assertIsNone(parse_header("@jarvis lane=A\x1cmodel=opus effort=high base=main"))
 
 
 class TestOverlap(unittest.TestCase):
@@ -238,6 +306,59 @@ class TestInbox(Base):
         self.assertTrue((rej / "bad.md").exists())
         self.assertIn("header", (rej / "bad.md.reason.txt").read_text())
         self.assertEqual(self.fake.bg_calls(), [])
+
+    def test_lint_invalid_header_moved_to_rejected_with_attention(self):
+        """Incident A: effort=low passed the old check, the lint dropped it, an empty session
+        held a slot. Now it is never dispatched, moved (not deleted), and in attention."""
+        text = "@jarvis lane=AGY0 model=opus effort=low base=main\nbody\n"
+        self.drop("agy0.md", text)
+        self.drop("ok.md", HDR.format("B"), age=1)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["B"])
+        rej = self.base / "inbox" / "rejected"
+        self.assertEqual((rej / "agy0.md").read_text(encoding="utf-8"), text)
+        self.assertIn("effort invalid: low", (rej / "agy0.md.reason.txt").read_text())
+        (item,) = [a for a in self.status()["attention"] if a["id"] == "reject-agy0"]
+        self.assertTrue(item["reason"].startswith("header invalid: effort invalid: low"))
+        self.assertNotIn("AGY0", self.lanes())
+        # the same file name again: the earlier rejected file is kept, not overwritten
+        self.t += 1
+        self.drop("agy0.md", "@jarvis lane=AGY0 model=opus effort=max base=main\n")
+        self.c.pass_once()
+        self.assertEqual((rej / "agy0.md").read_text(encoding="utf-8"), text)
+        self.assertEqual(len(list(rej.glob("*agy0.md"))), 2)
+        self.assertEqual(len([i for i in self.attn() if i.startswith("reject-")]), 2)
+        # acked: gone from attention, never backstop-paged after
+        (self.base / "ack").mkdir()
+        for i in self.attn():
+            (self.base / "ack" / i).write_text("")
+            os.utime(self.base / "ack" / i, (self.t, self.t))
+        self.t += conveyor.ATTENTION_PAGE_S + 1
+        self.c.pass_once()
+        self.assertEqual([i for i in self.attn() if i.startswith("reject-")], [])
+        self.assertEqual(self.pushes, [])
+
+    def test_stale_base_rejected_like_the_lint(self):
+        self.drop("old.md", "@jarvis lane=OLD model=opus effort=high base=072d0fe\n")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertIn(f"base 072d0fe is not main {MAIN[:12]}",
+                      (self.base / "inbox" / "rejected" / "old.md.reason.txt").read_text())
+        self.assertIn("reject-old", self.attn())
+        self.git.fail[("git", "rev-parse")] = (128, "fatal")  # main unknown: passes, like the lint
+        self.drop("old2.md", "@jarvis lane=OLD2 model=opus effort=high base=072d0fe\n")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["OLD2"])
+
+    def test_unacked_reject_backstop_pages_once(self):
+        self.drop("x.md", "@jarvis lane=X model=gpt effort=high base=main\n")
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])  # orchestrator first, never straight to the phone
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.t += conveyor.PAGE_GAP_S
+        self.c.pass_once()
+        self.assertEqual(len([p for p in self.pushes if "reject-x" in p]), 1)
 
     def test_pause_flag(self):
         (self.base / "PAUSE").write_text("")
@@ -334,6 +455,7 @@ class TestBacklog(Base):
 
     def test_prompt_header_replaced_by_backlog_values(self):
         self.backlog({"id": "A", "model": "opus", "effort": "high"})
+        self.git.main = "abc1234" + "0" * 33  # the kept base must be main's HEAD (lint rule)
         (self.base / "prompts" / "A.md").write_text(
             "@jarvis lane=X model=haiku effort=low base=abc1234\nTASK\n", encoding="utf-8")
         self.c.pass_once()
@@ -382,6 +504,25 @@ class TestBacklog(Base):
         self.backlog({"id": "A"}, {"id": "B", "depends_on": ["A"]})
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["B"])
+
+    def test_lint_invalid_slices_held_in_attention(self):
+        self.backlog({"id": "LOW", "effort": "low"}, {"id": "OLD"}, {"id": "OK"})
+        (self.base / "prompts" / "OLD.md").write_text(
+            "@jarvis lane=OLD model=opus effort=high base=072d0fe\nTASK\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["OK"])
+        self.assertTrue(self.view()["OLD"].startswith("held: base 072d0fe is not main"))
+        (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.BACKLOG_BAD_ID]
+        self.assertIn("bad effort", item["reason"])
+        self.assertIn("slice OLD: held: base 072d0fe is not main", item["reason"])
+        since = item["since"]
+        self.t += 120
+        self.c.pass_once()
+        (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.BACKLOG_BAD_ID]
+        self.assertEqual(item["since"], since)  # stable: an ack holds
+        self.backlog({"id": "OK"})
+        self.c.pass_once()
+        self.assertNotIn(conveyor.BACKLOG_BAD_ID, self.attn())
 
     def test_invalid_slices_reported(self):
         self.backlog({"id": "A", "tier": "T9"}, {"id": "B"})
@@ -457,6 +598,91 @@ class TestFinishedByReport(Base):
         self.assertNotIn("OLD", self.attn())
 
 
+class TestDeadSession(Base):
+    """Incident A: dispatched sessions whose prompt never arrived held 2 of 3 slots."""
+
+    def transcript(self, a, *types):
+        d = self.root / "projects" / "C--repo"
+        d.mkdir(parents=True, exist_ok=True)
+        meta = [{"type": "custom-title"}, {"type": "system", "subtype": "informational"}]
+        rows = meta + [{"type": t} for t in types]
+        (d / f"{a['sessionId']}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows) + "not json\n", encoding="utf-8")
+
+    def start3(self):
+        for i, n in enumerate("ABCD"):
+            self.drop(f"{n}.md", HDR.format(n), age=i)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B", "C"])
+
+    def test_undelivered_prompt_frees_slot_after_5_min(self):
+        self.start3()
+        a, b, c = (self.fake.agent(n) for n in "ABC")
+        a.update(status="idle", state="blocked")  # the lint dropped its prompt
+        self.transcript(a)                           # metadata only, no message
+        self.transcript(b, "user", "assistant")      # delivered
+        b.update(status="idle", state="blocked")     # e.g. waiting on a permission
+        self.transcript(c)                           # no message yet, but busy
+        self.t += conveyor.DEAD_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B", "C"])  # not before 5 min
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B", "C", "D"])
+        ln = self.lanes()
+        self.assertEqual((ln["A"]["status"], ln["A"]["finished"]), ("DEAD", True))
+        self.assertIn("prompt not delivered", ln["A"]["dead"])
+        self.assertTrue(ln["B"]["delivered"])
+        self.assertNotIn("status", ln["B"])
+        self.assertNotIn("status", ln["C"])
+        (item,) = [x for x in self.status()["attention"] if x["id"] == "A"]
+        self.assertTrue(item["reason"].startswith("prompt not delivered / session gone: "))
+        self.assertEqual(self.posts, [])  # no reader call for a lane that never ran
+        self.assertEqual(self.pushes, [])  # attention first, not the phone
+        self.assertNotIn(["stop", a["id"]], self.fake.calls)  # the session is left alone
+        self.assertNotIn(["rm", a["id"]], self.fake.calls)
+
+    def test_session_gone_frees_slot(self):
+        self.start3()
+        self.fake.agents = [x for x in self.fake.agents if x["name"] != "A"]  # archived/removed
+        self.t += conveyor.DEAD_S
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B", "C", "D"])
+        self.assertIn("session gone", self.lanes()["A"]["dead"])
+        self.assertIn("A", self.attn())
+
+    def test_no_transcript_found_keeps_the_slot(self):
+        self.start3()
+        self.fake.agent("A").update(status="idle", state="blocked")
+        self.t += conveyor.DEAD_S * 3
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B", "C"])
+        self.assertFalse(self.lanes()["A"].get("finished"))
+
+    def test_dead_lane_later_report_finishes_it(self):
+        self.start3()
+        a = self.fake.agent("A")
+        a.update(status="idle", state="blocked")
+        self.transcript(a)
+        self.t += conveyor.DEAD_S
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["status"], "DEAD")
+        self.report("A", "PASS", mtime=self.t)  # the orchestrator rescued the session in place
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["status"], "PASS")
+        self.assertNotIn("A", self.attn())
+
+    def test_report_wins_over_dead(self):
+        self.start3()
+        a = self.fake.agent("A")
+        a.update(status="idle", state="blocked")
+        self.transcript(a)
+        self.t += conveyor.DEAD_S
+        self.report("A", "PASS", mtime=self.t)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["status"], "PASS")
+
+
 class TestRedispatch(Base):
     def setup_respawned(self, cwd_files_age=None):
         self.drop("a.md", HDR.format("A") + "do things\n")
@@ -472,6 +698,18 @@ class TestRedispatch(Base):
         self.c.pass_once()                 # respawn
         a.update(pid=7, status="idle")     # back, but did not resume its turn
         return a, wt
+
+    def test_redispatch_with_stale_base_not_sent(self):
+        a, _ = self.setup_respawned()
+        self.git.main = "9" * 40  # main moved since dispatch: the lint would drop the prompt
+        self.t += conveyor.IDLE_REDISPATCH_S + 1
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertNotIn(["stop", a["id"]], self.fake.calls)
+        ln = self.lanes()["A"]
+        self.assertEqual(ln["status"], "DEAD")
+        self.assertEqual(ln["dead"], "re-dispatch not sent: base 1234567 is not main 999999999999")
+        self.assertIn("A", self.attn())
 
     def test_idle_respawned_lane_redispatched_from_prompt(self):
         a, _ = self.setup_respawned()
@@ -815,13 +1053,61 @@ class TestReader(Base):
     def test_two_objects_or_bad_fields_need_orchestrator(self):
         ok = '{"kind": "pass", "summary": "s", "next": "n"}'
         for text in (ok + " " + ok, '{"kind": "nope", "summary": "s", "next": "n"}',
-                     '{"kind": "pass", "summary": "' + "x" * 141 + '", "next": "n"}',
                      '{"kind": "pass", "summary": "s", "next": "n", "extra": 1}'):
             with self.subTest(text=text[:40]):
                 self.setUp()
                 self.reply = answer(text)
                 self.finish_a()
                 self.assertEqual(self.lane_a()["reading"]["summary"], "reader: invalid output")
+        # over 140 characters is the model miscounting, not a bad answer: clipped (CONV2)
+        self.setUp()
+        self.reply = answer('{"kind": "pass", "summary": "' + "x" * 141 + '", "next": "n"}')
+        self.finish_a()
+        self.assertEqual(self.lane_a()["reading"]["summary"], "x" * 139 + "…")
+
+    def test_real_failure_shapes_accepted(self):
+        """Shapes of the 2026-10-09 'reader: invalid output' answers (AGY0 and AGY0B: same
+        report, same 164 output tokens, one accepted): a Turkish field over 140 characters,
+        and the near-misses a well-formed answer can take."""
+        long_tr = ("Lane düşürüldü: effort=low başlığı jarvis-flow lint tarafından kabul edilmedi, "
+                   "oturum boş kaldı ve iki slotu kırk dakika tuttu; AGY0C ile değiştirildi.")
+        self.assertGreater(len(long_tr), 140)
+        shapes = {
+            "long summary": json.dumps({"kind": "needs_orchestrator", "summary": long_tr,
+                                        "next": "AGY0C'yi izle"}, ensure_ascii=False),
+            "long next": json.dumps({"kind": "blocked", "summary": "AGY1 BLOCKED",
+                                     "next": long_tr}, ensure_ascii=False),
+            "raw newline in string": '{"kind": "pass", "summary": "G6K3 PASS\nreview PASS", "next": "entegre et"}',
+            "JSON fence label upper": '```JSON\n{"kind": "pass", "summary": "s", "next": "n"}\n```',
+            "prose then object": 'Okuma:\n{"kind": "blocked", "summary": "INT6 BLOCKED: CI {tests} kırmızı", '
+                                 '"next": "CI\'yi yeniden koş"}',
+        }
+        for label, text in shapes.items():
+            with self.subTest(label):
+                r = conveyor.parse_reading(answer(text)[1])
+                self.assertIsNotNone(r, label)
+                self.assertTrue(all(0 < len(r[k]) <= 140 for k in ("summary", "next")), label)
+        r = conveyor.parse_reading(answer(shapes["long summary"])[1])
+        self.assertEqual(r["summary"], long_tr[:139] + "…")
+        self.assertEqual(r["kind"], "needs_orchestrator")
+
+    def test_invalid_output_logs_redacted_snippet(self):
+        raw = ('{"kind": "pass", "summary": "s", "next": "n"} ' * 2 + KEY + " sk-ant-api03-OTHER_key-x "
+               + "ntfy-Topic_77 " + "y" * 500)
+        self.reply = (200, {**answer(raw)[1], "stop_reason": "max_tokens"})
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": "ntfy-Topic_77"}):
+            self.finish_a()
+        self.assertNotIn("ntfy-Topic_77", json.dumps(self.events()))
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"]["summary"], "reader: invalid output")
+        self.assertEqual(e["stop_reason"], "max_tokens")
+        self.assertLessEqual(len(e["raw"]), 300)
+        self.assertTrue(e["raw"].startswith('{"kind": "pass"'))
+        self.assertNotIn(KEY, json.dumps(self.events()))
+        self.assertNotIn("sk-ant-", e["raw"])
+        self.assertNotIn("raw", self.lane_a()["reading"])  # status.json carries no model text
+        ok = [x for x in self.events() if x["event"] == "reader" and "raw" in x]
+        self.assertEqual(len(ok), 1)
 
     def test_pass_error_logs_filename_and_location(self):
         def boom():
@@ -856,8 +1142,10 @@ class TestReader(Base):
         ok = {"kind": "blocked", "summary": "s", "next": "n"}
         self.assertEqual(conveyor.parse_reading(answer(ok)[1]), ok)
         for bad in [{**ok, "kind": "approve_push"}, {**ok, "extra": 1}, {"kind": "pass", "summary": "s"},
-                    {**ok, "summary": "x" * 141}, {**ok, "next": ""}, {**ok, "summary": 5}, [ok], "nope"]:
+                    {**ok, "next": ""}, {**ok, "next": "  "}, {**ok, "summary": 5}, [ok], "nope"]:
             self.assertIsNone(conveyor.parse_reading(answer(bad)[1]), bad)
+        self.assertEqual(conveyor.parse_reading(answer({**ok, "summary": "x" * 141})[1])["summary"],
+                         "x" * 139 + "…")  # clipped, not rejected (CONV2)
         for resp in [None, {}, {"content": "x"}, {"content": [{"type": "text"}]}]:
             self.assertIsNone(conveyor.parse_reading(resp), resp)
 
@@ -1249,7 +1537,8 @@ class TestCleanup(Base):
         self.assertEqual(len(self.cli("rm")), conveyor.CLEANUP_PER_PASS + 1)
 
     def test_ledger_prefers_scripts_copy(self):
-        c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk)
+        c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk,
+                     projects=self.root / "projects")
         mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
               "    Path(out).write_text('{}')\n"
         (self.root / "scripts").mkdir()

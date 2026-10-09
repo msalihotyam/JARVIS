@@ -37,9 +37,11 @@ CLEAN_STATES = {"done", "blocked", "failed"}  # session states cleanup acts on; 
 FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
 MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, in attention)
+DEAD_S = 300  # a dispatched session gone or with no message this long after dispatch is DEAD
 PAGE_GAP_S = 600
 ATTENTION_PAGE_S = 1800  # an attention item unacked this long pages Salih (orchestrator did not react)
 DRY_ID = "backlog-dry"  # attention id (and ack file) of the "backlog ran dry" episode
+BACKLOG_BAD_ID = "backlog-invalid"  # attention id of invalid backlog entries (one per error text)
 CRASH_PAGE = 3
 USAGE_LIMIT = 85  # % of the weekly plan; no new lanes at or above it
 USAGE_FRESH_S = 7 * 86400  # weekly % never drops before the window resets
@@ -65,8 +67,8 @@ READER_SYSTEM = (
     "blocked (the lane stopped on a blocker it reported); stalled (no or incomplete report, "
     "no progress); needs_orchestrator (the orchestrator should act: re-dispatch, small fix, "
     "unclear report); needs_salih (only a human decision or action can unblock it: approval, "
-    "credentials, scope or risk decision). summary: Turkish, at most 140 characters. "
-    "next: the single next step, at most 140 characters.")
+    "credentials, scope or risk decision). summary: Turkish, one short sentence, at most "
+    "100 characters. next: the single next step, at most 100 characters. Both non-empty.")
 PUSH_RETRY_S = 600  # a blocked approval is re-checked at most once per 10 min
 APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
 REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
@@ -76,23 +78,62 @@ MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
 STUCK_NOTE ="(no report: the conveyor marked this lane STUCK - re-dispatched twice, no progress)"
 
-HEADER_RE = re.compile(
-    r"^@jarvis lane=([A-Za-z0-9_-]+) model=([A-Za-z0-9._\[\]-]+) "
-    r"effort=(low|medium|high|xhigh|max) base=([0-9a-f]{7,40}|main)\s*$"
-)
+# The jarvis-flow lint's header rules (.claude/skills/jarvis-flow/hooks/lib/header.ts), the
+# single table here: a header the lint would block leaves an empty session (incident A,
+# 2026-10-09), so such a prompt is never dispatched. tests/test_conveyor.py fails on drift.
+FAMILIES = ("opus", "sonnet", "haiku")
+EFFORTS = ("medium", "high", "xhigh")
+LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SHA_HDR_RE = re.compile(r"^[0-9a-f]{7,40}$")
+HEADER_KEYS = ("lane", "model", "effort", "base")
+JS_WS = "\t\n\v\f\r    -     　﻿"  # JS \s
 BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
 STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*([A-Za-z]+)")
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
-MODEL_RE = re.compile(r"[A-Za-z0-9._\[\]-]+")
-EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def sha_matches(a, b):
+    """header.ts shaMatches: one is a prefix of the other, both at least 7 chars."""
+    x, y = a.lower(), b.lower()
+    return len(x) >= 7 and len(y) >= 7 and (x.startswith(y) or y.startswith(x))
+
+
+def check_header(text, main=None):
+    """(header dict, None) or (None, reason), by the lint's rules: header.ts parseHeader,
+    then lint.ts's base check against canonical main's HEAD (`main`; None = unknown, passes)."""
+    first = text.removeprefix("﻿").split("\n", 1)[0].removesuffix("\r")
+    if not re.match(rf"@jarvis([{JS_WS}]|$)", first):
+        return None, "line 1 is not an '@jarvis lane=.. model=.. effort=.. base=..' header"
+    found = {}
+    for tok in filter(None, re.split(rf"[{JS_WS}]+", first[len("@jarvis"):])):
+        m = re.fullmatch(rf"([a-z]+)=([^{JS_WS}]+)", tok)
+        if not m:
+            return None, f"bad token: {tok}"
+        k, v = m.groups()
+        if k not in HEADER_KEYS:
+            return None, f"unknown field: {k}"
+        if k in found:
+            return None, f"duplicate field: {k}"
+        found[k] = v
+    for k in HEADER_KEYS:
+        if k not in found:
+            return None, f"missing field: {k}"
+    if not LANE_RE.fullmatch(found["lane"]):
+        return None, f"lane invalid: {found['lane']}"
+    if found["model"] not in FAMILIES:
+        return None, f"model invalid: {found['model']} (allowed: {'|'.join(FAMILIES)})"
+    if found["effort"] not in EFFORTS:
+        return None, f"effort invalid: {found['effort']} (allowed: {'|'.join(EFFORTS)})"
+    if found["base"] != "main" and not SHA_HDR_RE.fullmatch(found["base"]):
+        return None, f"base invalid: {found['base']}"
+    if found["base"] != "main" and main and not sha_matches(found["base"], main):
+        return None, f"base {found['base']} is not main {main[:12]}"
+    return found, None
 
 
 def parse_header(line):
-    m = HEADER_RE.match(line.lstrip("﻿").rstrip("\r\n"))
-    if not m:
-        return None
-    return dict(zip(("lane", "model", "effort", "base"), m.groups()))
+    return check_header(line)[0]
 
 
 def claude_exe():
@@ -173,11 +214,11 @@ def single_object(text):
     fences = re.findall(r"```(?:json)?\s*(.*?)```", text, re.S)
     if len(fences) == 1:
         text = fences[0]
-    try:
-        return json.loads(text)  # bare JSON stays strict: a list or string is not wrapped prose
+    try:  # strict=False: a raw newline inside a string is still the model's answer
+        return json.loads(text, strict=False)  # bare JSON: a list or string is not wrapped prose
     except ValueError:
         pass
-    dec, objs, i = json.JSONDecoder(), [], 0
+    dec, objs, i = json.JSONDecoder(strict=False), [], 0
     while (i := text.find("{", i)) >= 0:
         try:
             obj, i = dec.raw_decode(text, i)
@@ -187,18 +228,34 @@ def single_object(text):
     return objs[0] if len(objs) == 1 else None
 
 
-def parse_reading(resp):
-    """Strict {kind, summary, next} from a Messages API response, else None."""
+def reply_text(resp):
+    """The text blocks of a Messages API response joined, else None."""
     try:
-        text = "".join(b["text"] for b in resp["content"] if b.get("type") == "text")
+        return "".join(b["text"] for b in resp["content"] if b.get("type") == "text")
     except (TypeError, KeyError, AttributeError):
         return None
-    r = single_object(text)
+
+
+def parse_reading(resp):
+    """Strict {kind, summary, next} from a Messages API response, else None. A summary or
+    next over 140 characters is clipped, not rejected: Haiku cannot count Turkish
+    characters exactly, and every 'reader: invalid output' of 2026-10-09 came from that."""
+    text = reply_text(resp)
+    r = single_object(text) if text is not None else None
     if not isinstance(r, dict) or set(r) != {"kind", "summary", "next"} or r["kind"] not in READER_KINDS:
         return None
-    if not all(isinstance(r[k], str) and 0 < len(r[k]) <= 140 for k in ("summary", "next")):
+    if not all(isinstance(r[k], str) and r[k].strip() for k in ("summary", "next")):
         return None
-    return r
+    return {**r, **{k: r[k] if len(r[k]) <= 140 else r[k][:139] + "…" for k in ("summary", "next")}}
+
+
+def redacted(text, key, n=300):
+    """At most n chars of model text for a log: the key, anything key-shaped and the ntfy
+    topic removed."""
+    for secret, mark in ((key, "[key]"), (os.environ.get("JARVIS_NTFY_TOPIC", "").strip(), "[topic]")):
+        if secret:
+            text = text.replace(secret, mark)
+    return re.sub(r"sk-ant-[A-Za-z0-9_-]+", "[key]", " ".join(text.split()))[:n]
 
 
 def clip(text, n=READER_MAX_CHARS):
@@ -259,9 +316,9 @@ def report_status(path):
 def validate_slice(s):
     if not isinstance(s, dict):
         return "not an object"
-    if not isinstance(s.get("id"), str) or not ID_RE.fullmatch(s["id"]):
+    if not isinstance(s.get("id"), str) or not ID_RE.fullmatch(s["id"]) or not LANE_RE.fullmatch(s["id"]):
         return "bad id"
-    if not isinstance(s.get("model"), str) or not MODEL_RE.fullmatch(s["model"]):
+    if s.get("model") not in FAMILIES:  # the generated header must pass the lint
         return "bad model"
     if s.get("effort") not in EFFORTS:
         return "bad effort"
@@ -277,8 +334,12 @@ def validate_slice(s):
 
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
-                 post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage):
+                 post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
+                 projects=None):
         self.root = Path(root)
+        # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
+        self.projects = Path(projects) if projects else \
+            Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
         self.base = self.root / "build" / "conveyor"
         self.reports = self.root / "build" / "reports"
         self.run = runner
@@ -300,6 +361,7 @@ class Conveyor:
         self.last_error = None
         self.usage = None
         self.backlog_view = []
+        self.main_sha = False
 
     # ---- lock -------------------------------------------------------
     def acquire_lock(self):
@@ -416,9 +478,20 @@ class Conveyor:
             raise RuntimeError(f"claude agents rc={rc}: {out[:300]}")
         return json.loads(out[out.index("["):])
 
+    def main_head(self):
+        """Canonical main's sha (as the lint's base check sees it), once per pass; None if unknown."""
+        if self.main_sha is False:
+            try:
+                rc, out = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
+                self.main_sha = out.strip() if rc == 0 and SHA_RE.fullmatch(out.strip()) else None
+            except Exception:
+                self.main_sha = None
+        return self.main_sha
+
     def pass_once(self):
         """One pass; returns False when `claude agents` could not be read."""
         self.last_error = None
+        self.main_sha = False  # not looked up yet this pass
         lanes = self.load_lanes()
         try:
             agents = self.agents()
@@ -517,10 +590,14 @@ class Conveyor:
             with open(led / "api.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": iso(self.now()), "model": READER_MODEL, "lane": name,
                                     "input_tokens": tin, "output_tokens": tout, "est_usd": usd}) + "\n")
-            r = parse_reading(resp) or {"kind": "needs_orchestrator",
-                                        "summary": "reader: invalid output", "next": ""}
+            r = parse_reading(resp)
+            extra = {}
+            if r is None:  # why: a redacted snippet of what the model said, and why it stopped
+                r = {"kind": "needs_orchestrator", "summary": "reader: invalid output", "next": ""}
+                extra = {"raw": redacted(reply_text(resp) or "", key),
+                         "stop_reason": str(resp.get("stop_reason"))[:40]}
             ln["reading"] = {**r, "at": iso(self.now())}
-            self.event("reader", lane=name, reading=r)
+            self.event("reader", lane=name, reading=r, **extra)
             if r["kind"] == "needs_salih":
                 self.page(f"{name}: {r['summary']}")
                 self.backstop_done(name, self.since(ln))  # paged already: no backstop page
@@ -536,13 +613,18 @@ class Conveyor:
             ln["state"] = state if alive or state in FINISHED or a is None else "stopped"
             ln["idle"] = alive and a.get("status") == "idle"
             ln["updated_at"] = iso(self.now())
-            if ln.get("finished") and ln.get("status"):
-                continue
+            if ln.get("finished") and ln.get("status") and ln["status"] != "DEAD":
+                continue  # DEAD: a report the rescued session writes later still finishes it
             found = self.find_report(name, self.started_ts(ln), a and a.get("cwd"))
             if found:  # a report wins over any session state
                 self.finish(name, ln, *found)
                 continue
             if ln.get("finished"):
+                continue
+            dead = self.dead_reason(ln, a)
+            if dead:  # frees the slot; the session is left for the orchestrator
+                ln.update(finished=True, status="DEAD", dead=dead, finished_ts=self.now())
+                self.event("finish", lane=name, id=ln["id"], status="DEAD", reason=dead)
                 continue
             if state in FINISHED:
                 ln["finished"] = True
@@ -568,6 +650,37 @@ class Conveyor:
                     self.read_report(name, ln, None)
                 else:
                     self.redispatch(name, ln)
+
+    def dead_reason(self, ln, a):
+        """Why a lane's session is dead DEAD_S after its dispatch, else None. Signals (the
+        listing has no archived flag or message count): the session id is gone from
+        `claude agents --all`, or the session is not busy and its transcript
+        <projects>/*/<sessionId>.jsonl holds no user/assistant entry - the jarvis-flow lint
+        blocked the prompt, so it was never submitted (AGY0/AGY0B, 2026-10-09)."""
+        if self.now() - (ln.get("sent_ts") or self.started_ts(ln)) < DEAD_S:
+            return None
+        if a is None:
+            return "session gone (not in `claude agents --all`)"
+        if ln.get("delivered") or a.get("status") == "busy":
+            return None
+        sid = str(a.get("sessionId") or "")
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
+            return None
+        for tx in self.projects.glob(f"*/{sid}.jsonl"):
+            try:
+                with open(tx, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        try:
+                            kind = json.loads(line).get("type")
+                        except (ValueError, AttributeError):
+                            continue
+                        if kind in ("user", "assistant"):
+                            ln["delivered"] = True
+                            return None
+            except OSError:
+                return None  # unreadable: no verdict
+            return f"prompt not delivered (no message in transcript {sid[:8]})"
+        return None  # ponytail: no transcript found -> no verdict, the lane keeps its slot
 
     def active_since(self, name, t, cwd):
         """Any new file in the lane worktree or test-ledger row for it since t."""
@@ -605,17 +718,23 @@ class Conveyor:
         except (OSError, KeyError) as e:
             self.error(f"redispatch {name}: prompt: {e}", lane=name)
             return
-        rc, out = self.run(["stop", ln["id"]])
-        self.event("stop", lane=name, id=ln["id"], rc=rc, output=out[-300:])
         first, _, rest = text.partition("\n")
         hdr = parse_header(first) or {"base": ln.get("base", "main")}
         header = f"@jarvis lane={name} model={ln['model']} effort={ln['effort']} base={hdr['base']}\n"
+        _, why = check_header(header, self.main_head() if hdr["base"] != "main" else None)
+        if why:  # the lint would drop it (e.g. main moved past its base): not sent, orchestrator decides
+            dead = f"re-dispatch not sent: {why}"
+            ln.update(finished=True, status="DEAD", dead=dead, finished_ts=self.now())
+            self.event("finish", lane=name, id=ln["id"], status="DEAD", reason=dead)
+            return
+        rc, out = self.run(["stop", ln["id"]])
+        self.event("stop", lane=name, id=ln["id"], rc=rc, output=out[-300:])
         sid = self.start(name, ln["model"], ln["effort"], header + CONTINUE + rest)
         if sid:
             self.event("redispatch", lane=name, old_id=ln["id"], id=sid)
             ln.setdefault("prev_ids", []).append(ln["id"])
             ln.update(id=sid, state="working", idle=False, respawn_pending=False,
-                      updated_at=iso(self.now()))
+                      updated_at=iso(self.now()), sent_ts=self.now(), delivered=False)
 
     def running(self, lanes):
         return [n for n, ln in lanes.items()
@@ -704,9 +823,11 @@ class Conveyor:
             except OSError as e:
                 self.error(f"read {f.name}: {e}")
                 continue
-            hdr = parse_header(text.splitlines()[0] if text else "")
+            hdr, why = check_header(text)
+            if hdr and hdr["base"] != "main":
+                hdr, why = check_header(text, self.main_head())
             if hdr is None:
-                self.reject(f, "line 1 is not a valid '@jarvis lane=.. model=.. effort=.. base=..' header")
+                self.reject(f, why)
                 continue
             name = hdr["lane"]
             if len(self.running(lanes)) >= MAX_LANES:
@@ -786,32 +907,62 @@ class Conveyor:
                 view[sid] = "overlap"
             elif sid in busy:
                 view[sid] = "same_name_busy"
+            elif why := self.slice_lint(s):
+                view[sid] = "held: " + why  # the lint would drop its header
             else:
                 view[sid] = "ready"
                 choice = choice or s
         return choice, view
 
+    def slice_text(self, s):
+        """(prompt text with the backlog's header, base) for a slice; OSError if unreadable.
+        The prompt's own @jarvis line (valid or not) gives way to the backlog's; its base stays."""
+        body = (self.root / s["prompt"]).read_text(encoding="utf-8")
+        first, _, rest = body.partition("\n")
+        hdr = re.match(r"﻿?@jarvis(\s|$)", first)
+        m = re.search(r"(?:^|\s)base=([0-9a-f]{7,40}|main)(?:\s|$)", first) if hdr else None
+        base = m.group(1) if m else "main"
+        return (f"@jarvis lane={s['id']} model={s['model']} effort={s['effort']} base={base}\n"
+                + (rest if hdr else body)), base
+
+    def slice_lint(self, s):
+        """Why the lint would drop this slice's header, else None (an unreadable prompt: None,
+        dispatch reports it)."""
+        try:
+            text, base = self.slice_text(s)
+        except OSError:
+            return None
+        return check_header(text, self.main_head() if base != "main" else None)[1]
+
+    def note_backlog_errors(self, errors):
+        """One backlog-invalid attention episode per distinct error text."""
+        text = "; ".join(errors)[:300]
+        cur = self.pager_flag("backlog_invalid")
+        if text and (not cur or cur[0] != text):
+            self.pager_flag("backlog_invalid", [text, self.now()])
+        elif not text and cur:
+            self.pager_flag("backlog_invalid", False)
+
     def dispatch_backlog(self, lanes, busy):
         slices, errors = self.load_backlog()
-        started = False
+        started, first_pick = False, True
         while True:
             s, view = self.pick_slice(slices, lanes, busy)
             self.backlog_view = [{"id": k, "state": v} for k, v in view.items()] + \
                                 [{"error": e} for e in errors]
+            if first_pick:  # every slice judged once: a stable item for the attention list
+                first_pick = False
+                self.note_backlog_errors(errors + [f"slice {k}: {v}" for k, v in view.items()
+                                                   if v.startswith("held: ")])
             if s is None or len(self.running(lanes)) >= MAX_LANES:
                 return started
             name = s["id"]
             try:
-                body = (self.root / s["prompt"]).read_text(encoding="utf-8")
+                text, base = self.slice_text(s)
             except OSError as e:
                 self.error(f"backlog {name}: prompt: {e}", lane=name)
                 slices = [x for x in slices if x is not s]
                 continue
-            first, _, rest = body.partition("\n")
-            hdr = parse_header(first)
-            base = hdr["base"] if hdr else "main"
-            text = (f"@jarvis lane={name} model={s['model']} effort={s['effort']} base={base}\n"
-                    + (rest if hdr else body))
             sid = self.start(name, s["model"], s["effort"], text)
             if not sid:
                 slices = [x for x in slices if x is not s]  # retry next pass
@@ -826,12 +977,21 @@ class Conveyor:
                        file=dest.name, backlog=True, tier=s["tier"])
 
     def reject(self, f, reason):
+        """Move (never delete) a prompt with an invalid header to inbox/rejected/ and
+        keep it in attention until acked."""
         d = self.inbox / "rejected"
         d.mkdir(exist_ok=True)
-        dest = d / f.name
+        dest, n = d / f.name, 0
+        while dest.exists():  # an earlier same-name reject is kept
+            n += 1
+            ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
+            dest = d / f"{ts}{'-' + str(n) if n > 1 else ''}-{f.name}"
         os.replace(f, dest)
-        (d / (f.name + ".reason.txt")).write_text(reason + "\n", encoding="utf-8")
-        self.event("reject", file=f.name, reason=reason)
+        (d / (dest.name + ".reason.txt")).write_text(reason + "\n", encoding="utf-8")
+        self.event("reject", file=dest.name, reason=reason)
+        rej = self.pager_flag("rejects") or {}
+        rej["reject-" + dest.stem] = [reason, self.now()]
+        self.pager_flag("rejects", rej)
 
     def since(self, ln):
         return ln.get("finished_ts") or self.started_ts(ln)
@@ -852,7 +1012,9 @@ class Conveyor:
             if "finished_ts" not in ln:  # running, a quiet v0 lane, or read before this version
                 continue
             why = []
-            if ln.get("status") in BAD or ln.get("status") == "STUCK":
+            if ln.get("status") == "DEAD":
+                why.append(f"prompt not delivered / session gone: {ln.get('dead')}")
+            elif ln.get("status") in BAD or ln.get("status") == "STUCK":
                 why.append(f"STATUS {ln['status']}")
             r = ln.get("reading") or {}
             if r.get("kind", "pass") != "pass":
@@ -868,6 +1030,12 @@ class Conveyor:
                                    f"(< {MIN_FREE_GB}): lane başlatılmıyor", low))
         for name, st in self.load_json(self.push_file, {}).items():
             items.append((name, f"push blocked: {st['reason']}", st["since"]))
+        # ponytail: acked rejects stay in pager.json (a few bytes each); prune if it ever grows
+        for rid, (why, since) in (self.pager_flag("rejects") or {}).items():
+            items.append((rid, f"header invalid: {why}", since))
+        bad = self.pager_flag("backlog_invalid")
+        if bad:
+            items.append((BACKLOG_BAD_ID, f"backlog invalid: {bad[0]}", bad[1]))
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop_done(self, item_id, since):

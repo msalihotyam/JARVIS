@@ -541,8 +541,9 @@ are gitignored like the others.
   short, lane + what waits + since when) when this session has waited on a
   permission prompt for 5 min (then every 30 min while it still waits), when the
   battery is below 20% on battery, and when a header turn ends with `STATUS:
-  STOP`, `BLOCKED` or `FAIL`; at most one push per 10 min per session (a push
-  inside the gap is dropped). It runs `curl.exe` through `$.process.run` with a
+  STOP`, `BLOCKED` or `FAIL` (information only since CONV2's incident C, silent
+  02:00-08:00; the conveyor's attention list is the alarm); at most one push
+  per 10 min per session (a push inside the gap is dropped). It runs `curl.exe` through `$.process.run` with a
   fixed argument list; the topic and text go in on stdin as a curl config, so
   neither is on a command line. Topic names are `[A-Za-z0-9_-]{1,64}`. With the
   variable unset or invalid there is no network call and one toast.
@@ -590,9 +591,30 @@ the optional report reader below. One instance at a time
 - **Dispatch.** Each lane is a fresh `claude --bg --name <lane> --model <m>
   --effort <e> --settings build/conveyor/lanes.settings.json <prompt>`; at most
   3 lanes at a time. Inbox first: `inbox/*.md`, oldest first, line 1 a valid
-  `@jarvis` header (`base=main` allowed); bad headers go to `inbox/rejected/`
-  with a reason, started prompts to `inbox/started/`. Only when the inbox is
-  empty does the backlog dispatch.
+  `@jarvis` header by exactly the jarvis-flow lint's rules (model
+  `opus|sonnet|haiku`, effort `medium|high|xhigh`, base `main` or 7-40 hex, any
+  field order; a sha base must prefix-match canonical `main`'s HEAD, as in
+  `lint.ts`; one table in `conveyor.py`, a test fails if it drifts from
+  `header.ts`/`lint.ts`). A bad header is never dispatched: the prompt is moved
+  (never deleted; an earlier same-name reject is kept) to `inbox/rejected/`
+  with a reason file and is an attention item `reject-<file>` "header invalid:
+  <reason>". A backlog slice whose generated header the lint would block (bad
+  model/effort/id, stale base) is not dispatched: `held: <reason>` in the
+  backlog view and one `backlog-invalid` attention item (also for invalid
+  entries) per distinct error text. A re-dispatch whose base is no longer main
+  is not sent; the lane is finished `DEAD` "re-dispatch not sent: ...". Started
+  prompts go to `inbox/started/`. Only when the inbox is empty does the backlog
+  dispatch.
+- **Dead session.** 5 min (`DEAD_S`) after dispatch (or re-dispatch), a lane
+  whose session is gone from `claude agents --all`, or whose session is not
+  busy and whose transcript `~/.claude/projects/*/<sessionId>.jsonl` holds no
+  `user`/`assistant` entry (the prompt was never submitted), is finished as
+  `DEAD`: its slot is freed, the session is left alone (no stop/rm), no reader
+  call, and it is an attention item "prompt not delivered / session gone".
+  The listing has no archived flag or message count, so these are the only
+  signals; a session with no transcript found keeps its slot. A `DEAD` lane
+  whose session is rescued in place and later writes its report is finished by
+  that report as usual.
 - **Backlog** `build/conveyor/backlog.json`, written by the orchestrator:
   `{"slices": [{id, title, model, effort, tier, files, depends_on, prompt,
   approved}]}` in order. `tier` is T0/T1/T2; `files` are repo globs the slice
@@ -678,7 +700,11 @@ the optional report reader below. One instance at a time
   strict validation). The strict-JSON answer `{kind, summary,
   next}` (kind `pass`/`blocked`/`stalled`/`needs_orchestrator`/`needs_salih`)
   is stored as `reading` on the lane in `status.json` plus a `reader` event;
-  invalid output becomes `needs_orchestrator` "reader: invalid output".
+  a summary or next over 140 characters is clipped (`…`), not rejected;
+  invalid output becomes `needs_orchestrator` "reader: invalid output" and its
+  `reader` event carries `raw` (at most 300 chars of the model text,
+  whitespace collapsed, the key and anything `sk-ant-` shaped removed) and
+  `stop_reason`.
   A reading that is not `pass` puts the lane in `attention` (above); only
   `needs_salih` pages directly (same ntfy path and 10 min gap, no backstop page
   after it).
@@ -718,6 +744,33 @@ the optional report reader below. One instance at a time
   `scripts/usage_ledger.py` (tests `tests/test_usage_ledger.py`; it merges into
   `build/ledger/usage.json` and never drops a known session; an unreadable file
   is left untouched), else the older runtime `build/conveyor/usage_ledger.py`.
+
+### Incidents and lessons
+
+- **A. Lint-dropped prompts held slots (2026-10-09 evening).** Prompts with
+  `effort=low` passed the conveyor's own looser header check and were
+  dispatched; the jarvis-flow lint blocked them inside the session, leaving
+  empty sessions (AGY0, AGY0B) that held 2 of 3 slots for 40 min. Archiving
+  them in the desktop app did not free the slots (`claude agents` still showed
+  `blocked`). Fix (CONV2): the pre-dispatch check uses the lint's rules
+  exactly, and the dead-session rule frees such a slot after 5 min.
+- **B. "reader: invalid output" (G6K3, INT6, G6N2FIX, AGY0B, AGY1).** The
+  accepted readings' fields were 96-130 chars, against a hard 140-char reject;
+  AGY0 and AGY0B (same report, same 164 output tokens) were accepted and
+  rejected respectively: Haiku miscounts Turkish characters. Fix (CONV2): over
+  140 is clipped, the instruction asks for 100, a raw newline inside a string
+  is accepted, and an invalid answer logs a redacted snippet and stop reason.
+- **C. The plugin paged on STATUS BLOCKED.** jarvis-flow pushed a bad
+  `STATUS:` straight to Salih's phone as an alarm, bypassing the orchestrator.
+  Fix: the orchestrator's change to `register.ts`/`pager.ts` (committed by the
+  integration lane): that push is information only, marked "(bilgi;
+  orkestratör bakacak)", silent 02:00-08:00; the alarm path is the conveyor's
+  attention list.
+- **Rules.** Efforts are `medium|high|xhigh` only (never `low` or `max`);
+  models `opus|sonnet|haiku`; a sha base must be main's HEAD. A bad status or a
+  problem lane goes to `attention` for the orchestrator, never straight to the
+  phone as an alarm; Salih is paged only by the backstop, a `needs_salih`
+  reading or repeated conveyor failures.
 
 ## V2.0 scope freeze
 
