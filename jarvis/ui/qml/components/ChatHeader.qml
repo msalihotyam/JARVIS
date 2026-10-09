@@ -13,6 +13,8 @@ import "../theme"
 // In the Command preset (Q2) the chip is a button: it opens the scope menu
 // (projects, Genel, the two actions, then the scope's conversations) - the
 // TopBar's former selector and switcher menus, moved.
+// Gate 6G Sidebar v2 V7: a no-project conversation has no scope line - the
+// title stands alone (in the Command preset the chip stays: it is the menu).
 Item {
     id: header
     objectName: "chatHeader"
@@ -23,6 +25,7 @@ Item {
     readonly property var owner: bridge.conversationProject || ({})
     readonly property bool archived: !!owner.archived
     readonly property color tint: archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
+    readonly property bool scoped: !owner.global || scopeMenu
     height: big ? 52 : 44
 
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: Theme.alpha(Theme.glassEdge, 0.25) }
@@ -46,6 +49,7 @@ Item {
     Rectangle {
         id: chip
         objectName: "chatHeaderScope"
+        visible: header.scoped
         readonly property string fullName: (header.owner.name || "") + (header.archived ? " · " + qsTr("archived") : "")
         readonly property bool pillFits: !header.archived || 34 + archivedPill.width + 6 + header.nameFloor + 12 <= header.chipMax
         readonly property real lead: 10 + 18 + 6 + (header.archived ? (pillFits ? archivedPill.width + 6 : 12) : 0)
@@ -87,6 +91,7 @@ Item {
     // The separator: a drawn chevron (no font glyph).
     Shape {
         id: separator
+        visible: header.scoped
         x: chip.width + 10; anchors.verticalCenter: parent.verticalCenter
         width: 6; height: 10
         preferredRendererType: Shape.CurveRenderer
@@ -97,7 +102,7 @@ Item {
     Text {
         id: title
         objectName: "chatHeaderTitle"
-        x: separator.x + separator.width + 10; anchors.verticalCenter: parent.verticalCenter
+        x: header.scoped ? separator.x + separator.width + 10 : 0; anchors.verticalCenter: parent.verticalCenter
         width: Math.max(0, Math.min(implicitWidth, actions.x - 12 - x))
         text: bridge.conversationTitle || qsTr("New Chat"); textFormat: Text.PlainText; elide: Text.ElideRight
         color: bridge.conversationTitle ? Theme.text : Theme.textLabel; font: Theme.subtitle

@@ -260,6 +260,7 @@ class Bridge(QObject):
         self._store_run = uuid4().hex[:8]         # this window's turns, for idempotent appends
         self._conversation_list: list[dict] = []
         self._scope_conversations: list[dict] = []
+        self._sidebar_lists: dict[str, list[dict]] = {}
         # Gate 6F F6: the pinned conversations' records (any scope) and their owners' names.
         self._pin_records: dict[str, Any] = {}
         self._pin_projects: dict[str, dict] = {}
@@ -645,6 +646,14 @@ class Bridge(QObject):
                                   if r.origin == "legacy-import" else "")}
             for r in scope
         ]
+        # Gate 6G Sidebar v2: every owner's non-archived conversations, newest first ("" = no project).
+        self._sidebar_lists = {}
+        for r in everything:
+            if r.archived_at is None:
+                self._sidebar_lists.setdefault(r.project_id or "", []).append(
+                    {"id": r.id, "updated_at": r.updated_at,
+                     "title": r.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                          if r.origin == "legacy-import" else "")})
         # Gate 6F F6: pins of conversations no longer listed (archived, deleted, unknown) are
         # pruned on this read - never on a failed one, which lists nothing.
         if listed:
@@ -1214,12 +1223,57 @@ class Bridge(QObject):
 
     @Property("QVariantMap", notify=sidebarChanged)
     def sidebarGroups(self) -> dict:
-        """Which sidebar sections are open: SABİTLENDİ ("pinned", every
-        scope) and the open scope's today / yesterday / earlier."""
+        """Which sidebar sections are open: SABİTLENENLER ("pinned") and the
+        no-project list's today / yesterday / earlier (Sidebar v2 V1: one
+        fixed list, whatever conversation is open)."""
         return {"pinned": self.prefs.sidebar["pins_open"], **self.prefs.groups_open(self._sidebar_scope())}
 
     def _sidebar_scope(self) -> str:
-        return self._conversation_owner.get("id") or GLOBAL_SCOPE
+        return GLOBAL_SCOPE
+
+    # -- Gate 6G Sidebar v2: the fixed list, the project tree and its states ---
+    #
+    # Read-only views of the same store read, and window preferences only
+    # (UiPreferences' tree file): nothing here writes a conversation or a project.
+
+    @Property("QVariantMap", notify=conversationChanged)
+    def sidebarConversations(self) -> dict:
+        """Every owner's non-archived conversations, newest first: "" = no
+        project, else the project id. Untitled = "" (the window says "New Chat")."""
+        open_id = self._conversation_store.id
+        return {owner: [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
+                         "active": row["id"] == open_id} for row in rows]
+                for owner, rows in self._sidebar_lists.items()}
+
+    @Property("QVariantMap", notify=sidebarChanged)
+    def sidebarTree(self) -> dict:
+        """projects_open (L2), plain_open (P1), closed (T1: collapsed project
+        ids) and pinned_projects (T2, newest pin first)."""
+        tree = self.prefs.tree
+        return {"projects_open": tree["projects_open"], "plain_open": tree["plain_open"],
+                "closed": list(tree["closed"]), "pinned_projects": list(tree["pinned_projects"])}
+
+    def _tree_saved(self, changed: bool) -> bool:
+        if changed:
+            self.prefs.save_tree()
+            self.sidebarChanged.emit()
+        return changed
+
+    @Slot(bool)
+    def setProjectsOpen(self, open_: bool) -> None:
+        self._tree_saved(self.prefs.set_tree_flag("projects_open", bool(open_)))
+
+    @Slot(bool)
+    def setPlainOpen(self, open_: bool) -> None:
+        self._tree_saved(self.prefs.set_tree_flag("plain_open", bool(open_)))
+
+    @Slot(str, bool)
+    def setProjectOpen(self, project_id: str, open_: bool) -> None:
+        self._tree_saved(self.prefs.set_tree_member("closed", str(project_id), not open_))
+
+    @Slot(str, bool)
+    def setProjectPinned(self, project_id: str, pinned: bool) -> None:
+        self._tree_saved(self.prefs.set_tree_member("pinned_projects", str(project_id), bool(pinned)))
 
     def _sidebar_saved(self, changed: bool) -> bool:
         if changed:
@@ -1266,16 +1320,17 @@ class Bridge(QObject):
         return "today" if day >= today else "yesterday" if day == today - timedelta(days=1) else "earlier"
 
     def _expand_group_of(self, conversation_id: str) -> None:
-        """Switching to a conversation opens its date group (a pinned one has none)."""
+        """Switching to a no-project conversation opens its date group (a pinned
+        or a project one has none)."""
         if conversation_id in self.prefs.sidebar["pins"]:
             return
-        row = next((r for r in self._scope_conversations if r["id"] == conversation_id), None)
+        row = next((r for r in self._sidebar_lists.get("", []) if r["id"] == conversation_id), None)
         if row is not None:
             self.setGroupOpen(self._date_group(row["updated_at"]), True)
 
     @Slot(str, bool)
     def setGroupOpen(self, key: str, open_: bool) -> None:
-        """Open or collapse SABİTLENDİ ("pinned") or one of the open scope's date groups."""
+        """Open or collapse SABİTLENENLER ("pinned") or one of the no-project list's date groups."""
         self._sidebar_saved(self.prefs.set_group_open(self._sidebar_scope(), str(key), bool(open_)))
 
     # -- Gate 6C "Projeye bağla": attach the open Global conversation --------

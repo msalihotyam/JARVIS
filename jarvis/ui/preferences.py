@@ -333,6 +333,31 @@ def validate_sidebar(candidate: Any) -> dict[str, Any]:
             "groups": {scope: dict(state) for scope, state in groups.items()}}
 
 
+TREE_VERSION = 1
+
+
+def canonical_tree() -> dict[str, Any]:
+    """Gate 6G Sidebar v2: PROJELER open (L2), the plain conversations shown
+    (P1), the projects whose conversation list is collapsed (T1; default all
+    open) and the pinned projects, newest pin first (T2 "Sabitle")."""
+    return {"version": TREE_VERSION, "projects_open": True, "plain_open": True, "closed": [], "pinned_projects": []}
+
+
+def validate_tree(candidate: Any) -> dict[str, Any]:
+    """The tree document, or the canonical one when ANY part is malformed."""
+    defaults = canonical_tree()
+    if not isinstance(candidate, dict) or set(candidate) != set(defaults) or candidate["version"] != TREE_VERSION:
+        return defaults
+    if type(candidate["projects_open"]) is not bool or type(candidate["plain_open"]) is not bool:
+        return defaults
+    for key in ("closed", "pinned_projects"):
+        ids = candidate[key]
+        if not isinstance(ids, list) or len(set(map(str, ids))) != len(ids) or any(type(i) is not str or not i for i in ids):
+            return defaults
+    return {"version": TREE_VERSION, "projects_open": candidate["projects_open"], "plain_open": candidate["plain_open"],
+            "closed": list(candidate["closed"]), "pinned_projects": list(candidate["pinned_projects"])}
+
+
 def default_preferences_path() -> Path:
     return Path.home() / ".jarvis" / "ui-preferences.json"
 
@@ -521,3 +546,49 @@ class UiPreferences:
         groups[key] = bool(open_)
         self.sidebar["groups"][scope or GLOBAL_SCOPE] = groups
         return changed
+
+    # -- Gate 6G Sidebar v2: the project tree's and the plain list's states -----
+    #
+    # A second sibling file (``<prefs>.sidebar-tree.json``) for the same reason
+    # as the F6 one: validate_sidebar is all-or-nothing on its key set, so an
+    # added key would read every F6 document (its pins) as the defaults.
+
+    @property
+    def tree_path(self) -> Path:
+        return self.path.with_suffix(".sidebar-tree.json")
+
+    @property
+    def tree(self) -> dict[str, Any]:
+        if not hasattr(self, "_tree"):
+            try:
+                self._tree = validate_tree(json.loads(self.tree_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, UnicodeDecodeError):
+                self._tree = canonical_tree()
+        return self._tree
+
+    def save_tree(self) -> bool:
+        self._tree = validate_tree(self.tree)
+        try:
+            self.tree_path.parent.mkdir(parents=True, exist_ok=True)
+            self.tree_path.write_text(json.dumps(self._tree, indent=2), encoding="utf-8")
+        except OSError:
+            return False
+        return True
+
+    def set_tree_flag(self, key: str, value: bool) -> bool:
+        """``projects_open`` (L2) or ``plain_open`` (P1)."""
+        if key not in ("projects_open", "plain_open") or self.tree[key] == bool(value):
+            return False
+        self.tree[key] = bool(value)
+        return True
+
+    def set_tree_member(self, key: str, project_id: str, member: bool) -> bool:
+        """Add (on top) or remove a project id in ``closed`` or ``pinned_projects``."""
+        ids = self.tree.get(key) if key in ("closed", "pinned_projects") else None
+        if ids is None or not project_id or (project_id in ids) == bool(member):
+            return False
+        if member:
+            ids.insert(0, project_id)
+        else:
+            ids.remove(project_id)
+        return True

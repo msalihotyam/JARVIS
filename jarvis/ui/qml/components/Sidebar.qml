@@ -4,18 +4,22 @@ import QtQuick.Shapes
 import "../theme"
 
 // Gate 6F (L2): the one left panel of the home page. Top to bottom: the
-// navigation (Genel, projects, the selected scope's conversations - F3), the
-// summary tiles (SummaryRail) and the clock strip (LeftContextCard). The
-// navigation takes whatever height the tiles and the strip leave.
-// Navigation (L4): the same bridge calls as the TopBar scope group - a scope
-// pick opens that scope's newest non-archived conversation (or a new one), a
-// row pick opens that conversation, "+" starts one in the selected scope; a
-// right-click on a row opens the conversation menu for THAT row (Q8). It
-// selects, grants and approves nothing.
-// F6: SABİTLENDİ (the pins of every scope, in their manual order - drag by
-// the grip or Yukarı / Aşağı taşı in the menu) above the date groups; every
-// group collapses on its heading (the open conversation stays in view). Both
-// are window preferences (bridge.sidebarGroups, bridge.pinnedConversations).
+// navigation, the summary tiles (SummaryRail) and the clock strip
+// (LeftContextCard). The navigation takes whatever height the tiles and the
+// strip leave.
+// Gate 6G Sidebar v2 (slice 1, list structure): "Yeni sohbet" (N1), PROJELER
+// (L2: the word links to the Projects page, the rest of its row collapses the
+// list) over the project TREE (T1-T4: a project row toggles its conversations,
+// its right-click menu opens its page, a new conversation, Sabitle, Arşivle),
+// "Tüm projeler", then one list: SABİTLENENLER (V3: every owner's pins, a
+// folder or a speech bubble says which), the P1 bar that hides the plain
+// conversations, and those conversations by day (V1/L3: no "Genel", no
+// heading; the list never follows the open conversation). Archived projects
+// and conversations are not here (V9). A row pick opens that conversation; a
+// right-click on it opens the conversation menu for THAT row (Q8). Collapse
+// states are window preferences (bridge.sidebarGroups, bridge.sidebarTree);
+// the open conversation stays in view in a collapsed section. It selects,
+// grants and approves nothing.
 Rectangle {
     id: sidebar
     objectName: "sidebar"
@@ -53,14 +57,16 @@ Rectangle {
         property string titleName: ""
         property string meta: ""
         property string metaName: ""
-        property string icon: ""
         property string itemId: ""
         property bool current: false
         property bool muted: false
-        // F6, a pinned row: the pin (the grip on hover - drag it to reorder),
-        // its project faint on the right ("" = Genel: none), a tip saying where.
+        property bool strong: false
+        // A small drawn glyph before the name (V3/V10: folder = a project's
+        // conversation, speech bubble = a plain one; N1: the muted "+").
+        property string lead: ""
+        // F6, a pinned row: the grip on hover over its lead - drag it to
+        // reorder; a tip saying where.
         property bool pinned: false
-        property string place: ""
         property string tip: ""
         property bool dragging: false
         // F7, a conversation row: "⋯" in place of its time (or project) while the
@@ -68,7 +74,7 @@ Rectangle {
         property bool menuButton: false
         readonly property bool menuHere: !!sidebar.conversationMenu && sidebar.conversationMenu.open && sidebar.conversationMenu.opener === row
         readonly property bool showMenu: menuButton && !dragging && (hovered || activeFocus || menuHere)
-        readonly property bool available: !bridge.busy
+        property bool available: !bridge.busy
         readonly property bool hovered: area.containsMouse || gripArea.containsMouse || menuArea.containsMouse
         signal activated()
         signal contextRequested(point position)
@@ -83,7 +89,7 @@ Rectangle {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
-        Accessible.name: meta !== "" ? title + ", " + meta : place !== "" ? title + ", " + place : title
+        Accessible.name: meta !== "" ? title + ", " + meta : title
         Accessible.onPressAction: if (available) activated()
         Accessible.description: available ? "" : busyReason.text
         Keys.onShortcutOverride: function (event) {
@@ -109,51 +115,31 @@ Rectangle {
                 return
             }
         }
-        Rectangle {
-            id: well
-            visible: row.icon !== ""
-            x: 6; anchors.verticalCenter: parent.verticalCenter
-            width: sidebar.well; height: width; radius: Theme.radiusTiny
-            color: Theme.alpha(row.current ? Theme.accent : Theme.text, row.current ? 0.16 : 0.06)
-            SummaryIcon { anchors.centerIn: parent; icon: row.icon; tint: row.current ? Theme.accent : Theme.textLabel }
-        }
         Text {
             id: nameText
             objectName: row.titleName
-            x: row.icon !== "" ? well.x + well.width + 8 : row.pinned ? 28 : 10
+            x: row.pinned || row.lead !== "" ? 28 : 10
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, Math.min(implicitWidth, (placeRow.visible ? placeRow.x : metaText.x) - 8 - x,
+            width: Math.max(0, Math.min(implicitWidth, metaText.x - 8 - x,
                                         row.showMenu ? rowMenu.x - 8 - x : implicitWidth))
             text: row.title; textFormat: Text.PlainText; elide: Text.ElideRight
             color: row.current ? Theme.accent : row.muted ? Theme.textLabel : Theme.text
-            font: sidebar.big ? Theme.pageRow : Theme.body
+            font: row.strong ? (sidebar.big ? Theme.pageRowStrong : Theme.bodyStrong) : sidebar.big ? Theme.pageRow : Theme.body
             Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         }
         Text { id: metaText; objectName: row.metaName; text: row.meta; textFormat: Text.PlainText
                x: row.width - 10 - implicitWidth; anchors.verticalCenter: parent.verticalCenter
                opacity: row.showMenu ? 0 : 1
                color: Theme.textMuted; font: Theme.captionFigures }
-        // The pin, or on hover the grip (two columns of three dots).
-        SummaryIcon { objectName: "sidebarPinIcon"; visible: row.pinned && !row.hovered && !row.dragging
-                      x: 5; anchors.verticalCenter: parent.verticalCenter; scale: 0.78
-                      icon: "pin"; tint: row.current ? Theme.accent : Theme.textLabel }
+        // The lead glyph, or on a pinned row's hover the grip (two columns of three dots).
+        Icon { objectName: "sidebarRowLead"; visible: row.lead !== "" && !(row.pinned && (row.hovered || row.dragging))
+               x: 8; anchors.verticalCenter: parent.verticalCenter; size: 14; name: row.lead
+               tint: row.current ? Theme.accent : row.lead === "folder" ? Theme.alpha(Theme.accent, 0.75) : Theme.textLabel }
         Grid {
             objectName: "sidebarPinGrip"
             visible: row.pinned && (row.hovered || row.dragging)
             x: 9; anchors.verticalCenter: parent.verticalCenter; columns: 2; spacing: 3
             Repeater { model: 6; Rectangle { width: 3; height: 3; radius: 1.5; color: gripArea.containsMouse || row.dragging ? Theme.text : Theme.textLabel } }
-        }
-        Row {
-            id: placeRow
-            objectName: "sidebarPinPlace"
-            visible: row.place !== ""
-            opacity: row.showMenu ? 0 : 1
-            x: row.width - 10 - width; anchors.verticalCenter: parent.verticalCenter; spacing: 3
-            Item { width: 12; height: 12; anchors.verticalCenter: parent.verticalCenter
-                   SummaryIcon { anchors.centerIn: parent; scale: 0.67; icon: "project"; tint: Theme.textDim } }
-            Text { objectName: "sidebarPinPlaceName"; anchors.verticalCenter: parent.verticalCenter
-                   width: Math.min(implicitWidth, Math.max(row.width * 0.34, 56)); text: row.place
-                   textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.textDim; font: Theme.caption }
         }
         Rectangle { objectName: "sidebarRowEdge"; x: 0; y: 8; width: 2; height: row.height - 16; radius: 1; color: Theme.accent
                     opacity: row.current ? 1 : 0
@@ -208,7 +194,7 @@ Rectangle {
         HoverTip { objectName: "sidebarRowTip"; text: !row.available ? busyReason.text : row.tip || row.title
                    active: !row.dragging && !menuArea.containsMouse && (row.tip !== "" || nameText.truncated || !row.available) }
     }
-    // A collapsible heading (SABİTLENDİ, Bugün / Dün / Daha eski): a click,
+    // A collapsible heading (SABİTLENENLER, Bugün / Dün / Daha eski): a click,
     // Return or Space toggles it; collapsed it shows its count; the chevron
     // turns (instant with ambient effects off).
     component GroupHead: Item {
@@ -236,158 +222,191 @@ Rectangle {
                    Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
             Text { objectName: "sidebarGroupCount"; visible: !head.open; height: parent.height; verticalAlignment: Text.AlignBottom; bottomPadding: 3
                    text: "· " + head.count; font: Theme.captionFigures; color: Theme.textDim }
-            Shape {
-                objectName: "sidebarGroupChevron"
-                width: 10; height: 10; y: parent.height - 3 - 12
-                rotation: head.open ? 90 : 0
-                Behavior on rotation { NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
-                preferredRendererType: Shape.CurveRenderer
-                ShapePath { strokeColor: headArea.containsMouse ? Theme.textMuted : Theme.textDim; strokeWidth: 1.5; fillColor: "transparent"
-                            capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
-                            startX: 3.5; startY: 2; PathLine { x: 7; y: 5 } PathLine { x: 3.5; y: 8 } }
-            }
+            Chevron { objectName: "sidebarGroupChevron"; y: parent.height - 3 - 12
+                      open: head.open; ink: headArea.containsMouse ? Theme.textMuted : Theme.textDim }
         }
         Rectangle { objectName: "sidebarGroupFocusRing"; visible: head.activeFocus; anchors.fill: parent; radius: Theme.radiusTiny
                     color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
         MouseArea { id: headArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: head.toggle() }
     }
-    // A small text link (PROJELER, archived projects, Arşiv): hover lifts its
+    // A small text link (PROJELER, Tüm projeler): hover lifts its
     // ink; a tip when it says less than its whole meaning.
     component NavLink: Rectangle {
         id: link
         property string text: ""
-        property string count: ""
         property string tip: ""
-        property bool dot: false
-        property bool current: false
         property font face: Theme.caption
         signal activated()
         width: linkRow.width + 16; height: 26; radius: Theme.radiusTiny
-        color: current ? Theme.alpha(Theme.accent, 0.10) : linkArea.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
+        color: linkArea.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Link
-        Accessible.name: (tip || text) + (count !== "" ? ", " + count : "")
+        Accessible.name: tip || text
         Accessible.onPressAction: activated()
         Keys.onReturnPressed: activated()
         Keys.onSpacePressed: activated()
         Row {
             id: linkRow
             x: 8; anchors.verticalCenter: parent.verticalCenter; spacing: 8
-            Rectangle { visible: link.dot; width: 6; height: 6; radius: 3; color: Theme.warning; anchors.verticalCenter: parent.verticalCenter }
             Text { visible: link.text !== ""; text: link.text; font: link.face; anchors.verticalCenter: parent.verticalCenter
-                   color: linkArea.containsMouse || link.current ? Theme.text : Theme.textMuted
+                   color: linkArea.containsMouse ? Theme.text : Theme.textMuted
                    Behavior on color { ColorAnimation { duration: Theme.hoverMs } } }
-            Text { visible: link.count !== ""; text: link.count; font: Theme.captionFigures; color: Theme.textDim
-                   anchors.verticalCenter: parent.verticalCenter }
         }
-        Rectangle { visible: link.current; x: 0; y: 6; width: 2; height: link.height - 12; radius: 1; color: Theme.accent }
         Rectangle { objectName: "sidebarLinkFocusRing"; visible: link.activeFocus; anchors.fill: parent; anchors.margins: 1; radius: link.radius - 1
                     color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
         MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: link.activated() }
         HoverTip { text: link.tip; active: link.tip !== "" }
     }
-    // A drawn plus (no font glyph): the PROJELER "+" (ghost) and the round
-    // accent "+" of SOHBETLER. Not `allowed`: dimmed, its reason in the tip.
-    component PlusButton: Rectangle {
-        id: plus
-        property string tip: ""
-        property bool allowed: true
-        property bool accent: false
-        signal activated()
-        readonly property bool hovered: plusArea.containsMouse
-        radius: accent ? width / 2 : Theme.radiusTiny
-        color: accent ? Theme.alpha(Theme.accent, hovered && allowed ? 0.28 : 0.18)
-                      : hovered && allowed ? Theme.alpha(Theme.text, 0.07) : "transparent"
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-        border.width: accent ? 1 : 0; border.color: Theme.alpha(Theme.commandEdge, 0.6)
-        opacity: allowed ? 1 : 0.38
-        scale: plusArea.pressed && allowed ? 0.94 : 1
-        Behavior on scale { NumberAnimation { duration: Theme.pressMs; easing.type: Theme.ease } }
-        activeFocusOnTab: true
-        Accessible.role: Accessible.Button; Accessible.name: tip
-        Accessible.onPressAction: if (allowed) activated()
-        Keys.onReturnPressed: if (allowed) activated()
-        Keys.onSpacePressed: if (allowed) activated()
-        Rectangle { anchors.centerIn: parent; width: plus.accent ? 13 : 12; height: 1.8; radius: 0.9; color: plus.accent ? Theme.text : Theme.textLabel }
-        Rectangle { anchors.centerIn: parent; width: 1.8; height: plus.accent ? 13 : 12; radius: 0.9; color: plus.accent ? Theme.text : Theme.textLabel }
-        Rectangle { objectName: "sidebarPlusFocusRing"; visible: plus.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: plus.radius + 3
-                    color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
-        MouseArea { id: plusArea; anchors.fill: parent; hoverEnabled: true
-                    cursorShape: plus.allowed ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: if (plus.allowed) plus.activated() }
-        HoverTip { objectName: "sidebarPlusTip"; text: plus.tip }
+    // The drawn chevron of a collapsible section: right when collapsed, down
+    // when open; it turns over panelIn (at once with ambient effects off).
+    component Chevron: Shape {
+        id: chevron
+        property bool open: true
+        property color ink: Theme.textDim
+        width: 10; height: 10
+        rotation: open ? 90 : 0
+        Behavior on rotation { NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath { strokeColor: chevron.ink; strokeWidth: 1.5; fillColor: "transparent"
+                    capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+                    startX: 3.5; startY: 2; PathLine { x: 7; y: 5 } PathLine { x: 3.5; y: 8 } }
     }
 
     // -- the navigation's data and metrics ------------------------------------
     Text { id: busyReason; visible: false; text: qsTr("Wait for the current run to finish.") }
     readonly property var owner: bridge.conversationProject || ({})
-    readonly property var projects: bridge.projectRecords.filter(function (p) { return p.active })
-    readonly property int archivedProjects: bridge.projectRecords.length - projects.length
-    readonly property var ownerRecord: bridge.projectRecords.filter(function (p) { return p.id === sidebar.owner.id })[0] || ({})
-    readonly property int scopeArchived: owner.global ? bridge.archivedConversations.length : (ownerRecord.archived_count || 0)
+    readonly property var tree: bridge.sidebarTree
+    readonly property var lists: bridge.sidebarConversations
+    // V9: active projects only; T2 "Sabitle": the pinned ones first, newest pin on top.
+    readonly property var projects: {
+        var active = bridge.projectRecords.filter(function (p) { return p.active })
+        var pinnedFirst = []
+        for (var i = 0; i < tree.pinned_projects.length; ++i)
+            for (var j = 0; j < active.length; ++j) if (active[j].id === tree.pinned_projects[i]) pinnedFirst.push(active[j])
+        return pinnedFirst.concat(active.filter(function (p) { return tree.pinned_projects.indexOf(p.id) < 0 }))
+    }
     readonly property int rowH: big ? Theme.rowHeight : Theme.menuRowHeight
-    readonly property int well: big ? 26 : 22
     readonly property int step: rowH + 2
     readonly property int labelH: 22
     readonly property int linkH: 26
-    // Below 760 px of height the archived-projects link folds into the
-    // PROJELER heading as "(n)", so the conversations keep their room.
-    readonly property bool fold: (Window.height || 1080) < 760
+    readonly property int barH: 20
     function count(n) { return n > 0 ? String(n) : "–" }
     // The conversations by the local calendar day of their last change.
     function stamp(v) { return new Date(String(v || "").replace(/(\.\d{3})\d+/, "$1")).getTime() }
     readonly property real today: new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-    // F6: the pins (every scope) and which sections are open; a pinned row is
-    // not repeated in its date group.
+    readonly property real yesterday: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime()
+    // F6: the pins (every owner) and which sections are open; a pinned
+    // conversation is not repeated in its date group or its project's tree.
     readonly property var pins: bridge.pinnedConversations
+    readonly property var pinnedIds: { var out = {}; for (var p = 0; p < pins.length; ++p) out[pins[p].id] = true; return out }
     readonly property var openGroups: bridge.sidebarGroups
     function shownRows(items, open) { return open ? items : items.filter(function (c) { return !!c.active }) }
+    // V1: the plain (no-project) conversations, whatever is open; P1 hides them
+    // all but the open one.
+    readonly property var plain: (lists[""] || []).filter(function (c) { return !pinnedIds[c.id] })
     readonly property var groups: {
-        var start = new Date(today), yesterday = new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1).getTime()
         var out = [[], [], []]
-        var pinned = {}
-        for (var p = 0; p < pins.length; ++p) pinned[pins[p].id] = true
-        var list = bridge.scopeConversations.filter(function (c) { return !pinned[c.id] })
-        for (var i = 0; i < list.length; ++i) {
-            var t = stamp(list[i].updated_at)
-            out[isNaN(t) || t < yesterday ? 2 : t < today ? 1 : 0].push(list[i])
+        for (var i = 0; i < plain.length; ++i) {
+            var t = stamp(plain[i].updated_at)
+            out[isNaN(t) || t < yesterday ? 2 : t < today ? 1 : 0].push(plain[i])
         }
+        var plainOpen = tree.plain_open
         return [{ key: "today", label: qsTr("Today"), items: out[0] }, { key: "yesterday", label: qsTr("Yesterday"), items: out[1] },
-                { key: "earlier", label: qsTr("Earlier"), items: out[2] }].filter(function (g) { return g.items.length > 0 })
+                { key: "earlier", label: qsTr("Earlier"), items: out[2] }].map(function (g) {
+            g.shown = plainOpen ? sidebar.shownRows(g.items, sidebar.openGroups[g.key]) : g.items.filter(function (c) { return !!c.active })
+            return g
+        }).filter(function (g) { return plainOpen ? g.items.length > 0 : g.shown.length > 0 })
     }
-    function when(c, group) {
+    function when(c) {
         var t = stamp(c.updated_at)
-        // Under Today / Yesterday the time of day; Earlier gets its day from the one formatter.
-        return isNaN(t) ? "" : group === "earlier" ? i18n.when(c.updated_at, today, "day") : new Date(t).toLocaleString(Qt.locale(i18n.qtLocale), "HH:mm")
+        // Today / yesterday the time of day; earlier its day from the one formatter.
+        return isNaN(t) ? "" : t < yesterday ? i18n.when(c.updated_at, today, "day") : new Date(t).toLocaleString(Qt.locale(i18n.qtLocale), "HH:mm")
     }
-    // Height: the fixed blocks, then the project list (5 / 3 whole rows, fewer
-    // while the conversations would keep less than two whole rows under a
-    // label), then the conversations - whole rows only, then their own scroll.
-    readonly property real fixedH: rowH + 2 + 28 + 2 + (!fold && archivedProjects > 0 ? linkH + 2 : 0) + 9 + 2 + 32 + 2
-    readonly property real room: navigation.height - fixedH
-    readonly property int projectRows: projects.length === 0 ? 0
-        : Math.max(1, Math.min(big ? 5 : 3, projects.length, Math.floor((room - (labelH + 2 * step)) / step)))
-    readonly property real conversationRoom: room - projectRows * step
-    // The tallest run of whole items, from the top, that fits the room.
-    readonly property real conversationH: {
+    // T1: the project tree, flat - a project row, then (open) its unpinned
+    // conversations newest first; a collapsed one keeps only the open one.
+    readonly property var treeRows: {
+        var out = []
+        if (!tree.projects_open) return out
+        for (var i = 0; i < projects.length; ++i) {
+            var p = projects[i], open = tree.closed.indexOf(p.id) < 0
+            out.push({ kind: "project", id: p.id, title: p.name, open: open, count: p.conversation_count || 0 })
+            var rows = shownRows((lists[p.id] || []).filter(function (c) { return !pinnedIds[c.id] }), open)
+            for (var k = 0; k < rows.length; ++k)
+                out.push({ kind: "conversation", id: rows[k].id, title: rows[k].title, updated_at: rows[k].updated_at, active: rows[k].active })
+        }
+        return out
+    }
+    // The tallest run of whole items, from the top, that fits `room`.
+    function fit(sizes, room) {
+        var h = 0
+        for (var k = 0; k < sizes.length; ++k) {
+            var next = h + (k > 0 ? 2 : 0) + sizes[k]
+            if (next > room) break
+            h = next
+        }
+        return h
+    }
+    // Height (T3): the fixed rows, then the tree and the list share the rest -
+    // each its whole content when both fit, else the shorter keeps its own and
+    // the longer the remainder, else half each; whole items only, each its own scroll.
+    readonly property real fixedH: step + 28 + 2 + (tree.projects_open ? linkH + 2 : 0) + 9 + 2
+    readonly property real room: navigation.height - fixedH - (treeRows.length > 0 ? 2 : 0)
+    readonly property var treeSizes: treeRows.map(function () { return rowH })
+    readonly property var listSizes: {
         var sizes = []
         if (pins.length > 0) {
             sizes.push(labelH)
             for (var p = 0; p < shownRows(pins, openGroups.pinned).length; ++p) sizes.push(rowH)
         }
+        if (plain.length > 0) sizes.push(barH)
         for (var g = 0; g < groups.length; ++g) {
             sizes.push(labelH)
-            for (var i = 0; i < shownRows(groups[g].items, openGroups[groups[g].key]).length; ++i) sizes.push(rowH)
+            for (var i = 0; i < groups[g].shown.length; ++i) sizes.push(rowH)
         }
-        if (emptyLine.visible) sizes.push(emptyLine.implicitHeight)
-        if (scopeArchived > 0) sizes.push(linkH + 4)
-        var h = 0
-        for (var k = 0; k < sizes.length; ++k) {
-            var next = h + (k > 0 ? 2 : 0) + sizes[k]
-            if (next > conversationRoom) break
-            h = next
+        return sizes
+    }
+    readonly property real treeH: {
+        var want = fit(treeSizes, Infinity), other = fit(listSizes, Infinity), half = room / 2
+        return fit(treeSizes, want + other <= room || want <= half ? want : other <= half ? room - other : half)
+    }
+    readonly property real listH: fit(listSizes, room - treeH)
+
+    // T2: a project row's right-click menu (the K4 menu style).
+    function openProjectMenu(row, position, project) {
+        if (conversationMenu) conversationMenu.dismiss()
+        projectMenu.project = project
+        projectMenu.popupAt(row, position, { flip: true })
+    }
+    // `plain`: a no-project row (its one-step delete, F7); a tree row is an active project's.
+    function openRowMenu(row, position, id, title, plain) {
+        projectMenu.close()
+        if (conversationMenu) conversationMenu.openFor(id, title, row, position, null, null, false, plain)
+    }
+    MenuSurface {
+        id: projectMenu
+        objectName: "sidebarProjectMenu"
+        property var project: ({})
+        readonly property bool pinned: (sidebar.tree.pinned_projects || []).indexOf(project.id) >= 0
+        width: 280
+        Column {
+            width: projectMenu.availableWidth
+            spacing: 2
+            Text { objectName: "sidebarProjectMenuHeader"; width: parent.width; leftPadding: 12; rightPadding: 12
+                   bottomPadding: 4; elide: Text.ElideRight; textFormat: Text.PlainText
+                   text: projectMenu.project.title || ""; color: Theme.textMuted; font: Theme.caption }
+            ConversationMenu.ScopeChoice { objectName: "sidebarProjectOpenItem"; icon: "project"; label: qsTr("Open project page")
+                                           onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.showProject(id) } }
+            ConversationMenu.ScopeChoice { objectName: "sidebarProjectNewItem"; icon: "plus"; label: qsTr("New conversation in this project")
+                                           onTriggered: { var id = projectMenu.project.id; projectMenu.close()
+                                                          if (bridge.newProjectConversation(id)) bridge.setPage("home") } }
+            ConversationMenu.ScopeChoice { objectName: "sidebarProjectPinItem"; icon: "pin"
+                                           label: projectMenu.pinned ? qsTr("Unpin") : qsTr("Pin")
+                                           onTriggered: { var id = projectMenu.project.id, on = !projectMenu.pinned; projectMenu.close()
+                                                          bridge.setProjectPinned(id, on) } }
+            ConversationMenu.ScopeChoice { objectName: "sidebarProjectArchiveItem"; icon: "archive"; label: qsTr("Archive")
+                                           onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.archiveProject(id) } }
         }
-        return h
     }
 
     // The navigation region: everything above the tiles.
@@ -401,18 +420,22 @@ Rectangle {
         Column {
             width: parent.width; spacing: 2
 
+            // N1: "Yeni sohbet" - the New chat screen (a new, empty conversation): in
+            // the open conversation's project when that one is writable, else plain.
             NavRow {
-                objectName: "sidebarGlobal"
-                titleName: "sidebarGlobalName"; metaName: "sidebarGlobalCount"
-                icon: "global"; title: qsTr("Global"); meta: sidebar.count(bridge.conversations.length)
-                current: !!sidebar.owner.global
-                onActivated: bridge.openProjectScope("")
+                objectName: "sidebarNewChat"
+                titleName: "sidebarNewChatName"
+                lead: "plus"; title: qsTr("New chat"); muted: true
+                onActivated: sidebar.owner.global || sidebar.owner.archived ? bridge.newConversation() : bridge.newConversationInScope()
             }
 
-            // PROJELER: the label is a link to the Projects page (Q10); "+" opens
-            // it with its create field focused (Q9).
+            // L2: the word PROJELER links to the Projects page; the rest of the row
+            // collapses / opens the tree (the chevron at the right, the count while collapsed).
             Item {
+                id: projectsHead
                 width: parent.width; height: 28
+                readonly property bool open: sidebar.tree.projects_open
+                function toggle() { bridge.setProjectsOpen(!open) }
                 NavLink {
                     id: projectsLink
                     objectName: "sidebarProjectsLink"
@@ -420,50 +443,58 @@ Rectangle {
                     text: i18n.upper(qsTr("PROJECTS")); face: Theme.label; tip: qsTr("All projects")
                     onActivated: bridge.showProject("")
                 }
-                NavLink {
-                    objectName: "sidebarArchivedProjectsCount"
-                    visible: sidebar.fold && sidebar.archivedProjects > 0
-                    x: projectsLink.x + projectsLink.width; anchors.bottom: parent.bottom
-                    dot: true; count: "(" + sidebar.archivedProjects + ")"; tip: qsTr("Archived projects")
-                    current: !!sidebar.owner.archived
-                    onActivated: bridge.showProject("")
-                }
-                PlusButton {
-                    objectName: "sidebarNewProject"
-                    anchors.right: parent.right; anchors.rightMargin: 4; anchors.bottom: parent.bottom; anchors.bottomMargin: 1
-                    width: 24; height: 24
-                    tip: qsTr("New project")
-                    onActivated: sidebar.newProjectRequested()
+                Rectangle {
+                    id: projectsToggle
+                    objectName: "sidebarProjectsToggle"
+                    x: projectsLink.x + projectsLink.width + 2; anchors.bottom: parent.bottom
+                    width: parent.width - x; height: projectsLink.height; radius: Theme.radiusTiny
+                    color: toggleArea.containsMouse ? Theme.alpha(Theme.text, 0.05) : "transparent"
+                    Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.Button
+                    Accessible.name: i18n.upper(qsTr("PROJECTS")) + ", " + sidebar.projects.length
+                    Accessible.description: projectsHead.open ? qsTr("Expanded") : qsTr("Collapsed")
+                    Accessible.onPressAction: projectsHead.toggle()
+                    Keys.onReturnPressed: projectsHead.toggle()
+                    Keys.onSpacePressed: projectsHead.toggle()
+                    Row {
+                        anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+                        Text { objectName: "sidebarProjectsCount"; visible: !projectsHead.open; anchors.verticalCenter: parent.verticalCenter
+                               text: String(sidebar.projects.length); font: Theme.captionFigures; color: Theme.textDim }
+                        Chevron { objectName: "sidebarProjectsChevron"; anchors.verticalCenter: parent.verticalCenter
+                                  open: projectsHead.open; ink: toggleArea.containsMouse ? Theme.textMuted : Theme.textDim }
+                    }
+                    Rectangle { visible: projectsToggle.activeFocus; anchors.fill: parent; anchors.margins: 1; radius: parent.radius
+                                color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+                    MouseArea { id: toggleArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                onClicked: projectsHead.toggle() }
                 }
             }
 
             Flickable {
                 id: projectList
                 objectName: "sidebarProjectList"
-                visible: sidebar.projectRows > 0
-                width: parent.width; height: sidebar.projectRows * sidebar.step - 2
+                visible: sidebar.treeH > 0
+                width: parent.width; height: sidebar.treeH
                 clip: true; contentHeight: projectColumn.height
                 // The drawn icons stay inside the clip with every scene-graph backend.
                 layer.enabled: true
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                // Whole rows at rest.
+                // Whole rows at rest (every tree row is one step).
                 onMovementEnded: contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height))
-                // The selected project's row stays in view (P3): on open, on a scope change, when the
-                // list or its room changes. Only those events move it - never the reader's own scrolling.
+                // The open conversation's row stays in view (P3): on open, on a switch, when the tree or
+                // its room changes. Only those events move it - never the reader's own scrolling.
                 function keepSelected() {
                     var at = -1
-                    for (var i = 0; i < sidebar.projects.length; ++i) if (sidebar.projects[i].id === sidebar.owner.id) at = i
+                    for (var i = 0; i < sidebar.treeRows.length; ++i) if (sidebar.treeRows[i].active) at = i
                     if (height <= 0) return
-                    // F7-3: no listed project selected (Genel, an archived one) - whole rows, in bounds. A
-                    // resize across the 1600 px breakpoint clamps the list while its content still has the
-                    // old row size, which left it half a row off when nothing re-aligned it.
                     if (at < 0) { contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height)); return }
                     var top = at * sidebar.step, bottom = top + sidebar.step - 2
                     if (top < contentY) contentY = top
                     else if (bottom > contentY + height) contentY = Math.min(Math.max(0, contentHeight - height), Math.max(0, (at + 1 - Math.round((height + 2) / sidebar.step)) * sidebar.step))
                 }
-                readonly property string selected: sidebar.owner.id || ""
+                readonly property string selected: bridge.conversationId
                 onSelectedChanged: Qt.callLater(keepSelected)
                 onHeightChanged: Qt.callLater(keepSelected)
                 onContentHeightChanged: Qt.callLater(keepSelected)
@@ -472,25 +503,41 @@ Rectangle {
                     id: projectColumn
                     width: projectList.width - (projectList.contentHeight > projectList.height ? 10 : 0); spacing: 2
                     Repeater {
-                        model: sidebar.projects
+                        model: sidebar.treeRows
                         NavRow {
-                            objectName: "sidebarProject"
-                            titleName: "sidebarProjectName"; metaName: "sidebarProjectCount"
-                            icon: "project"; itemId: modelData.id; title: modelData.name
-                            meta: sidebar.count(modelData.conversation_count || 0)
-                            current: sidebar.owner.id === modelData.id
-                            onActivated: bridge.openProjectScope(modelData.id)
+                            id: treeRow
+                            readonly property bool isProject: modelData.kind === "project"
+                            objectName: isProject ? "sidebarProject" : "sidebarProjectConversation"
+                            titleName: isProject ? "sidebarProjectName" : "sidebarProjectConversationTitle"
+                            metaName: isProject ? "sidebarProjectCount" : "sidebarProjectConversationTime"
+                            itemId: modelData.id
+                            title: isProject ? modelData.title : modelData.title || qsTr("New Chat")
+                            muted: !isProject && !modelData.title
+                            strong: isProject
+                            // T4: a project row shows its count only while collapsed; T1 its click
+                            // toggles the tree (never busy-gated: nothing runs).
+                            // A tree row has no day heading: today's time, else its day (K3).
+                            meta: isProject ? (modelData.open ? "" : sidebar.count(modelData.count)) : i18n.when(modelData.updated_at, sidebar.today, "short")
+                            available: isProject || !bridge.busy
+                            menuButton: !isProject
+                            current: !isProject && !!modelData.active
+                            Accessible.description: isProject ? (modelData.open ? qsTr("Expanded") : qsTr("Collapsed"))
+                                                              : available ? "" : busyReason.text
+                            onActivated: isProject ? bridge.setProjectOpen(modelData.id, !modelData.open) : bridge.openConversation(modelData.id)
+                            onContextRequested: function (position) {
+                                if (treeRow.isProject) sidebar.openProjectMenu(treeRow, position, modelData)
+                                else sidebar.openRowMenu(treeRow, position, modelData.id, modelData.title, false)
+                            }
                         }
                     }
                 }
             }
 
             NavLink {
-                objectName: "sidebarArchivedProjects"
-                visible: !sidebar.fold && sidebar.archivedProjects > 0
+                objectName: "sidebarAllProjects"
+                visible: sidebar.tree.projects_open
                 height: sidebar.linkH
-                dot: true; text: qsTr("Archived projects"); count: String(sidebar.archivedProjects)
-                current: !!sidebar.owner.archived
+                text: qsTr("All projects")
                 onActivated: bridge.showProject("")
             }
 
@@ -507,90 +554,21 @@ Rectangle {
                 }
             }
 
-            // SOHBETLER + the selected scope's chip + the round "+".
-            Item {
-                id: conversationHead
-                width: parent.width; height: 32
-                readonly property bool allowed: !sidebar.owner.archived && !bridge.busy
-                readonly property string reason: sidebar.owner.archived
-                    ? qsTr("The project is archived: unarchive it to start a new conversation.")
-                    : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-                // The heading gives way (elides) before the chip goes under six
-                // characters of the scope's name.
-                Text { id: conversationsLabel; x: 10; anchors.verticalCenter: parent.verticalCenter
-                       width: Math.max(0, Math.min(implicitWidth, newConversation.x - 8 - 8 - x - scopeChip.floor))
-                       elide: Text.ElideRight
-                       text: i18n.upper(qsTr("CONVERSATIONS")); color: Theme.textMuted; font: Theme.label
-                       HoverTip { objectName: "sidebarConversationsTip"; text: conversationsLabel.text; active: conversationsLabel.truncated } }
-                Rectangle {
-                    id: scopeChip
-                    objectName: "sidebarScopeChip"
-                    readonly property bool archived: !!sidebar.owner.archived
-                    readonly property color tint: archived ? Theme.warning : Theme.accent
-                    // G2, measured as the name is laid out (a hidden Text in its own
-                    // font and renderer, not TextMetrics' design advances): seven characters and the
-                    // ellipsis - one measured character of headroom, so a slightly
-                    // wider face or rasterizer still paints six (1 px past it: an
-                    // elide at exactly a string's advance keeps one character fewer).
-                    readonly property real floor: 16 + (archived ? 12 : 0) + Math.min(chipName.implicitWidth, Math.ceil(chipSeven.implicitWidth) + 1)
-                    readonly property real room: Math.min(Math.max(parent.width * 0.55, floor), newConversation.x - 8 - x)
-                    // The ARŞİV pill when it fits beside the floor of the
-                    // name; else a warning dot (the tip and name say archived).
-                    Text { id: chipSeven; visible: false; font: chipName.font; textFormat: Text.PlainText; text: (sidebar.owner.name || "").slice(0, 7) + "…" }
-                    readonly property bool pillFits: archived && room >= archivedPill.width + 6 + Math.ceil(chipSeven.implicitWidth) + 17
-                    readonly property real lead: archived ? (pillFits ? archivedPill.width + 6 : 12) : 0
-                    readonly property string fullName: (sidebar.owner.name || "") + (archived ? " · " + qsTr("archived") : "")
-                    x: conversationsLabel.x + conversationsLabel.width + 8; anchors.verticalCenter: parent.verticalCenter
-                    width: Math.max(0, Math.min(room, 16 + lead + chipName.implicitWidth))
-                    height: 22; radius: 11
-                    color: Theme.alpha(tint, 0.10); border.width: 1; border.color: Theme.alpha(tint, 0.28)
-                    Accessible.role: Accessible.StaticText; Accessible.name: fullName
-                    Pill { id: archivedPill; objectName: "sidebarScopeArchived"; visible: scopeChip.archived && scopeChip.pillFits
-                           x: 3; anchors.verticalCenter: parent.verticalCenter; implicitHeight: 16; dot: false
-                           text: qsTr("ARCHIVED"); tint: Theme.warning }
-                    Rectangle { visible: scopeChip.archived && !scopeChip.pillFits; x: 8; anchors.verticalCenter: parent.verticalCenter
-                                width: 6; height: 6; radius: 3; color: Theme.warning }
-                    Text {
-                        id: chipName
-                        objectName: "sidebarScopeName"
-                        x: 8 + scopeChip.lead; anchors.verticalCenter: parent.verticalCenter
-                        width: Math.max(0, Math.min(implicitWidth, scopeChip.width - x - 8))
-                        text: sidebar.owner.name || ""; textFormat: Text.PlainText; elide: Text.ElideRight
-                        color: scopeChip.archived ? Theme.textLabel : Theme.accent; font: Theme.caption
-                    }
-                    HoverTip { objectName: "sidebarScopeTip"; text: scopeChip.fullName; active: chipName.truncated || scopeChip.archived }
-                }
-                PlusButton {
-                    id: newConversation
-                    objectName: "sidebarNewConversation"
-                    anchors.right: parent.right; anchors.rightMargin: 2; anchors.verticalCenter: parent.verticalCenter
-                    width: 30; height: 30; accent: true
-                    allowed: conversationHead.allowed
-                    tip: conversationHead.reason || qsTr("New conversation in %1").arg(sidebar.owner.name || "")
-                    onActivated: bridge.newConversationInScope()
-                }
-            }
-
-            // The selected scope's conversations: the one flexible block.
+            // SABİTLENENLER, the P1 bar and the plain conversations by day.
             Flickable {
                 id: conversationList
                 objectName: "sidebarConversationList"
-                width: parent.width; height: sidebar.conversationH
+                width: parent.width; height: sidebar.listH
                 clip: true; contentHeight: conversationColumn.height
-                // The drawn pins and chevrons stay inside the clip with every scene-graph backend.
+                // The drawn glyphs and chevrons stay inside the clip with every scene-graph backend.
                 layer.enabled: true
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                // A scope change fades the list in (as the 6E project switch).
-                readonly property string scope: sidebar.owner.id || ""
-                onScopeChanged: { contentY = 0; if (Theme.ambient) scopeFade.restart() }
-                NumberAnimation { id: scopeFade; target: conversationColumn; property: "opacity"; from: 0; to: 1
-                                  duration: Theme.panelIn; easing.type: Theme.ease }
                 Column {
                     id: conversationColumn
                     width: conversationList.width - (conversationList.contentHeight > conversationList.height ? 10 : 0); spacing: 2
-                    // SABİTLENDİ: hidden when nothing is pinned. A pin of another scope
-                    // opens there (the sidebar follows the open conversation's scope).
+                    // SABİTLENENLER (V3): hidden when nothing is pinned. One list for
+                    // every owner; the lead glyph says which kind (V10).
                     Column {
                         id: pinSection
                         objectName: "sidebarPinned"
@@ -643,13 +621,14 @@ Rectangle {
                                         objectName: "sidebarPinnedConversation"
                                         titleName: "sidebarPinnedTitle"
                                         itemId: modelData.id; pinned: true; menuButton: true
+                                        lead: modelData.project_id !== "" ? "folder" : "chat"
                                         title: modelData.title || qsTr("New Chat"); muted: !modelData.title
-                                        place: modelData.project_id !== "" ? modelData.project_name : ""
-                                        tip: title + "\n" + (modelData.project_id !== "" ? qsTr("In the %1 project").arg(modelData.project_name) : qsTr("Global"))
+                                        tip: modelData.project_id !== "" ? title + "\n" + qsTr("In the %1 project").arg(modelData.project_name) : ""
                                         current: !!modelData.active
                                         dragging: pinSection.dragId === modelData.id
                                         onActivated: bridge.openConversation(modelData.id)
                                         onContextRequested: function (position) {
+                                            projectMenu.close()
                                             if (sidebar.conversationMenu) sidebar.conversationMenu.openFor(modelData.id, modelData.title, pinRow, position,
                                                                                                            null, null, modelData.project_archived,
                                                                                                            modelData.project_id === "")
@@ -668,6 +647,52 @@ Rectangle {
                             }
                         }
                     }
+                    // P1: a transparent, label-less bar over the plain conversations - a
+                    // click hides / shows them all (the open one stays); the chevron on
+                    // hover, "n sohbet" while hidden.
+                    Item {
+                        id: plainBar
+                        objectName: "sidebarPlainBar"
+                        readonly property bool open: sidebar.tree.plain_open
+                        readonly property bool hovered: plainArea.containsMouse || activeFocus
+                        readonly property string countText: sidebar.plain.length === 1 ? qsTr("1 conversation")
+                                                                                       : qsTr("%1 conversations").arg(sidebar.plain.length)
+                        function toggle() { bridge.setPlainOpen(!open) }
+                        visible: sidebar.plain.length > 0
+                        width: parent.width; height: sidebar.barH
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: countText
+                        Accessible.description: open ? qsTr("Expanded") : qsTr("Collapsed")
+                        Accessible.onPressAction: toggle()
+                        Keys.onReturnPressed: toggle()
+                        Keys.onSpacePressed: toggle()
+                        Row {
+                            id: plainTail
+                            anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; spacing: 6
+                            Text { objectName: "sidebarPlainCount"; visible: !plainBar.open; anchors.verticalCenter: parent.verticalCenter
+                                   text: plainBar.countText; textFormat: Text.PlainText; font: Theme.caption; color: Theme.textDim }
+                            Chevron { objectName: "sidebarPlainChevron"; anchors.verticalCenter: parent.verticalCenter
+                                      opacity: plainBar.hovered ? 1 : 0; open: plainBar.open
+                                      ink: plainBar.hovered ? Theme.textMuted : Theme.textDim
+                                      Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
+                        }
+                        Rectangle {
+                            x: 6; anchors.verticalCenter: parent.verticalCenter; height: 1
+                            width: Math.max(0, (plainBar.open && !plainBar.hovered ? parent.width - 6 : plainTail.x - 6) - x)
+                            gradient: Gradient {
+                                orientation: Gradient.Horizontal
+                                GradientStop { position: 0; color: Theme.alpha(Theme.accent, 0) }
+                                GradientStop { position: 0.5; color: Theme.alpha(Theme.accent, plainArea.containsMouse ? 0.5 : 0.32) }
+                                GradientStop { position: 1; color: Theme.alpha(Theme.accent, 0) }
+                            }
+                        }
+                        Rectangle { visible: plainBar.activeFocus; anchors.fill: parent; radius: Theme.radiusTiny
+                                    color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+                        MouseArea { id: plainArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: plainBar.toggle() }
+                        HoverTip { objectName: "sidebarPlainTip"; text: plainBar.open ? qsTr("Hide conversations") : qsTr("Show conversations") }
+                    }
                     Repeater {
                         model: sidebar.groups
                         Column {
@@ -679,42 +704,19 @@ Rectangle {
                                 text: modelData.label; count: modelData.items.length; open: !!sidebar.openGroups[group.key]
                             }
                             Repeater {
-                                model: sidebar.shownRows(modelData.items, sidebar.openGroups[group.key])
+                                model: modelData.shown
                                 NavRow {
                                     id: conversationRow
                                     objectName: "sidebarConversation"; menuButton: true
                                     titleName: "sidebarConversationTitle"; metaName: "sidebarConversationTime"
                                     itemId: modelData.id
                                     title: modelData.title || qsTr("New Chat"); muted: !modelData.title
-                                    meta: sidebar.when(modelData, group.key)
+                                    meta: sidebar.when(modelData)
                                     current: !!modelData.active
                                     onActivated: bridge.openConversation(modelData.id)
-                                    onContextRequested: function (position) {
-                                        if (sidebar.conversationMenu) sidebar.conversationMenu.openFor(modelData.id, modelData.title, conversationRow, position)
-                                    }
+                                    onContextRequested: function (position) { sidebar.openRowMenu(conversationRow, position, modelData.id, modelData.title, true) }
                                 }
                             }
-                        }
-                    }
-                    Text {
-                        id: emptyLine
-                        objectName: "sidebarConversationEmpty"
-                        visible: bridge.scopeConversations.length === 0
-                        x: 10; width: parent.width - 20; topPadding: 4; bottomPadding: 4
-                        wrapMode: Text.Wrap; textFormat: Text.PlainText
-                        text: qsTr("No conversation in this scope yet. Press + to start one.")
-                        color: Theme.textMuted; font: Theme.caption
-                    }
-                    // Arşiv (n) (Q10): Genel -> History; a project -> its detail.
-                    Item {
-                        visible: sidebar.scopeArchived > 0
-                        width: parent.width; height: sidebar.linkH + 4
-                        NavLink {
-                            objectName: "sidebarArchive"
-                            anchors.bottom: parent.bottom
-                            //: the noun - the archived conversations (a link), not the verb "Archive"
-                            text: qsTr("Archive", "sidebar link"); count: String(sidebar.scopeArchived)
-                            onActivated: sidebar.owner.global ? bridge.setPage("history") : bridge.showProject(sidebar.owner.id)
                         }
                     }
                 }
