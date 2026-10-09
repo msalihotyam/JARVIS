@@ -320,9 +320,12 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int) -> tuple[lis
         env, began = worker_env(index, bases), time.monotonic()
         while True:
             with lock:
-                if not queues[kind]:
+                # THIZ2: an idle UI process takes the leftover non-UI units (never the reverse);
+                # every unit is its own subprocess, so nothing carries over between them.
+                queue = queues[kind] or (queues["plain"] if kind == "ui" else [])
+                if not queue:
                     break
-                unit = queues[kind].pop(0)
+                unit = queue.pop(0)
             result = run_unit(args.python, unit, env, durations)
             with lock:
                 results.append(result)
