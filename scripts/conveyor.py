@@ -1,6 +1,7 @@
 """JARVIS Konveyor v1 - dispatches inbox prompts and backlog slices as `claude --bg` lanes.
 
-Stdlib only. No git, never deletes files. Runtime state lives in build/conveyor/
+Stdlib only. No git, deletes no file itself; finished lane sessions it started are
+removed with `claude rm` after a grace period. Runtime state lives in build/conveyor/
 (gitignored). One pass every 60 s; `--once` runs one pass. The one model call is
 the optional, advisory report reader (Claude Haiku over the Anthropic API, key
 from JARVIS_READER_API_KEY, monthly cap): it only adds a "reading" to status.json
@@ -8,6 +9,7 @@ and events and may page; it never approves or triggers anything.
 See JARVIS_RUNBOOK.md "Konveyor".
 """
 import calendar
+import importlib.util
 import json
 import os
 import re
@@ -17,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
@@ -24,7 +27,10 @@ SETTINGS = "build/conveyor/lanes.settings.json"
 MAX_LANES = 3
 STALE_LOCK_S = 300
 PASS_S = 60
-USAGE_S = 1800  # build/conveyor/usage_ledger.py cadence (optional runtime script)
+USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
+CLEANUP_S = 7200  # a finished lane's session is removed this long after its report was collected
+CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
+CLEAN_STATES = {"done", "blocked", "failed"}  # session states cleanup acts on; anything else: leave
 FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
 MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, in attention)
@@ -355,8 +361,11 @@ class Conveyor:
         if agents is not None:
             self.track(lanes, agents)
             self.dispatch(lanes, agents)
-        self.save_lanes(lanes)
+        self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
         items = self.attention(lanes)
+        if agents is not None:
+            self.cleanup(lanes, agents, {i for i, _, _ in items})
+            self.save_lanes(lanes)
         self.write_status(lanes, items)
         self.backstop(items)
         self.flush_pages()
@@ -547,7 +556,9 @@ class Conveyor:
         return m.group(1)
 
     def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False):
-        lanes[name] = {"id": sid, "model": model, "effort": effort, "base": base,
+        old = lanes.get(name)  # a same-name earlier lane: its sessions stay known for cleanup
+        prev = [*old.get("prev_ids", []), old["id"]] if old and "cleanup" not in old else []
+        lanes[name] = {"id": sid, "prev_ids": prev, "model": model, "effort": effort, "base": base,
                        "started_at": iso(self.now()), "started_ts": self.now(),
                        "updated_at": iso(self.now()), "state": "working",
                        "prompt": str(prompt.relative_to(self.base)), "files": files or [],
@@ -802,12 +813,112 @@ class Conveyor:
             self.page(f"Konveyor: {n} geçiş üst üste hata verdi ({self.last_error})")
 
     def usage_ledger(self):
-        script = self.base / "usage_ledger.py"
-        if script.exists():  # optional runtime script; read-only transcript parse
-            if str(self.base) not in sys.path:
-                sys.path.insert(0, str(self.base))
-            import usage_ledger
-            usage_ledger.main()
+        """Run the usage ledger (read-only transcript parse into build/ledger/usage.json):
+        scripts/usage_ledger.py, else the older runtime copy in build/conveyor/."""
+        for script in (self.root / "scripts" / "usage_ledger.py", self.base / "usage_ledger.py"):
+            if script.exists():
+                spec = importlib.util.spec_from_file_location("usage_ledger", script)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.main(out=self.root / "build" / "ledger" / "usage.json")
+                return
+
+    # ---- cleanup of finished lane sessions -----------------------------
+    def collected_ts(self, ln):
+        """When a finished lane's report was collected (STUCK: when it was marked), else None."""
+        if ln.get("status") == "STUCK":
+            return ln.get("finished_ts")
+        try:
+            mt = Path(ln["report"]).stat().st_mtime
+        except (KeyError, TypeError, OSError):
+            return None  # not finished by report
+        return ln.get("finished_ts") or mt  # finished before finished_ts existed: report mtime
+
+    def ledger_has(self, sids, after):
+        """usage.json was generated at/after `after` and counts every session id in sids."""
+        data = self.load_json(self.root / "build" / "ledger" / "usage.json", {})
+        try:
+            gen = datetime.fromisoformat(data["generated_at"]).timestamp()
+            known = {s["session_id"] for s in data["sessions"]}
+        except (KeyError, TypeError, ValueError):
+            return False
+        return gen >= after and all(s in known for s in sids)
+
+    def lane_sessions(self, name, ids, agents):
+        """(listed sessions of these lane ids, doubt or None). A doubt is any row that is not
+        this lane's finished background session: other kind or name, unknown state, busy,
+        or no session id of its own."""
+        by_id = {a.get("id"): a for a in agents}
+        sess = [by_id[i] for i in ids if i in by_id]
+        doubt = next((f"{a.get('id')}: kind/name/state/session not as expected" for a in sess
+                      if a.get("kind") != "background" or a.get("name") != name
+                      or a.get("state") not in CLEAN_STATES or a.get("status") == "busy"
+                      or not str(a.get("sessionId") or "").startswith(a["id"])), None)
+        return sess, doubt
+
+    def cleanup(self, lanes, agents, attention_ids):
+        """Stop (if alive) and `claude rm` the sessions of lanes this conveyor started
+        (lanes.json only) that finished by report or STUCK at least CLEANUP_S ago, are not
+        in attention, and whose usage the ledger has counted since. Any doubt leaves the
+        session; a stop/rm error leaves it for good (ln["cleanup"] records it)."""
+        ledger_ran, done = False, 0
+        for name, ln in lanes.items():
+            if done >= CLEANUP_PER_PASS:
+                return
+            if not ln.get("finished") or "cleanup" in ln or name in attention_ids:
+                continue
+            t = self.collected_ts(ln)
+            if t is None or self.now() - t < CLEANUP_S:
+                continue
+            ids = ln.get("prev_ids", []) + [ln["id"]]
+            sess, doubt = self.lane_sessions(name, ids, agents)
+            if not sess and not doubt:
+                continue  # nothing listed to remove
+            sids = [a["sessionId"] for a in sess] if doubt is None else []
+            if doubt is None and not self.ledger_has(sids, t + CLEANUP_S):
+                # at most once per USAGE_S: a ledger that keeps failing is not re-parsed every pass
+                if not ledger_ran and self.now() - (self.pager_flag("cleanup_ledger_ts") or 0) >= USAGE_S:
+                    ledger_ran = True
+                    self.pager_flag("cleanup_ledger_ts", self.now())
+                    try:
+                        self.usage_ledger()
+                    except Exception as e:
+                        self.error(f"usage ledger: {e!r}")
+                if not self.ledger_has(sids, t + CLEANUP_S):
+                    doubt = "usage ledger has not counted the session since"
+            if doubt is None:  # the pass may be minutes old: act only on a fresh listing
+                try:
+                    sess, doubt = self.lane_sessions(name, ids, self.agents())
+                except Exception as e:
+                    sess, doubt = [], f"agents: {type(e).__name__}"
+                if not sess and not doubt:
+                    continue
+                if doubt is None and not self.ledger_has([a["sessionId"] for a in sess], t + CLEANUP_S):
+                    doubt = "usage ledger has not counted the session since"
+            if doubt:
+                if ln.get("cleanup_skip") != doubt:  # once per reason, not every pass
+                    ln["cleanup_skip"] = doubt
+                    self.event("cleanup_skip", lane=name, reason=doubt)
+                continue
+            done += 1
+            steps = []
+            for a in sess:
+                for cmd in (["stop"] if "pid" in a else []) + ["rm"]:
+                    try:
+                        rc, out = self.run([cmd, a["id"]])
+                    except Exception as e:  # e.g. a timeout: an error, the session is left
+                        rc, out = type(e).__name__, ""
+                    steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:]})
+                    if rc != 0:
+                        break
+                if steps[-1]["rc"] != 0:
+                    break
+            ok = steps[-1]["rc"] == 0
+            ln["cleanup"] = {"at": iso(self.now()), "result": "removed" if ok else "error",
+                             "ids": [a["id"] for a in sess]}
+            self.event("cleanup", lane=name, result=ln["cleanup"]["result"], steps=steps)
+            if not ok:
+                self.error(f"cleanup {name}: {steps[-1]['cmd']} rc={steps[-1]['rc']}", lane=name)
 
     def loop(self, once=False):
         if not self.acquire_lock():

@@ -580,7 +580,8 @@ empty, or when the range is not a plain `A..B`. The result file records whether
 Salih approved the design on 2026-10-09. `scripts/conveyor.py` (stdlib only,
 tests `tests/test_conveyor.py`) keeps development flowing while the PC is on.
 It runs under a Windows Task Scheduler task, one pass every 60 s (`--once` for
-one pass). It runs no git command and deletes no file; its only model call is
+one pass). It runs no git command and deletes no file itself (lane sessions:
+see Cleanup below); its only model call is
 the optional report reader below. One instance at a time
 (`build/conveyor/conveyor.lock`, stale after 5 min). Runtime folder
 `build/conveyor/` (gitignored): `inbox/`, `backlog.json`, `lanes.json`,
@@ -665,10 +666,29 @@ the optional report reader below. One instance at a time
   (`READER_MONTHLY_USD`) estimated for the current month, calls stop until the
   next month. Network error, timeout, non-200 or the cap: no reading, a
   `reader_error` event with the HTTP status only, the conveyor goes on.
+- **Cleanup** (Salih 2026-10-09: lane sessions must not pile up). A lane in
+  `lanes.json` finished by report (or `STUCK`) whose report was collected 2 h
+  ago or more (`CLEANUP_S`; older lanes without `finished_ts`: the report's
+  mtime), and that is not an unacked attention item, has its sessions (incl.
+  re-dispatched or same-name earlier `prev_ids`), checked again on a fresh
+  `claude agents` listing, stopped if alive (`claude stop`) and removed with
+  `claude rm <id>` (the CLI has no archive; `rm` also removes the session's
+  worktree only "when that is safe" - the conveyor never passes
+  `--discard-unpushed` or `--force-remove-worktree`). First the usage ledger
+  must have counted every session after the grace time (else cleanup runs it,
+  at most once per 30 min), so token history survives a removed transcript. Any doubt
+  (session not `background`, other name, state not done/blocked/failed, busy,
+  no session id, ledger not counted) leaves the session (`cleanup_skip` event,
+  once per reason); a stop/rm error leaves it for good (`cleanup` event with
+  `result: error`, `last_error`). At most 5 lanes per pass; one `cleanup`
+  event per lane. Sessions not in `lanes.json` (Salih's, the orchestrator's)
+  are never touched.
 - **Switch-over.** The scheduled task runs `scripts/conveyor.py` from the
   canonical checkout (v0 was `build/conveyor/conveyor.py`); it reads the same
-  `build/conveyor/` state, and still runs the optional runtime
-  `build/conveyor/usage_ledger.py` every 30 min when that file exists.
+  `build/conveyor/` state. Every 30 min it runs the usage ledger
+  `scripts/usage_ledger.py` (tests `tests/test_usage_ledger.py`; it merges into
+  `build/ledger/usage.json` and never drops a known session; an unreadable file
+  is left untouched), else the older runtime `build/conveyor/usage_ledger.py`.
 
 ## V2.0 scope freeze
 

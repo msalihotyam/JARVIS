@@ -27,6 +27,7 @@ class FakeClaude:
         self.calls = []
         self.n = 0
         self.fail_agents = False
+        self.rm_rc = 0
 
     def __call__(self, args, timeout=120):
         self.calls.append(args)
@@ -36,13 +37,18 @@ class FakeClaude:
             self.n += 1
             sid = f"{self.n:08x}"
             self.agents.append({"id": sid, "pid": 100 + self.n, "kind": "background", "status": "busy",
-                                "name": args[args.index("--name") + 1], "state": "working"})
+                                "name": args[args.index("--name") + 1], "state": "working",
+                                "sessionId": sid + "-0000-4000-8000-000000000000"})
             return 0, f"backgrounded · {sid} · x\n"
         if args[0] == "respawn":
             return 0, "respawned"
         if args[0] == "stop":
             next(a for a in self.agents if a["id"] == args[1]).pop("pid", None)
             return 0, "stopped"
+        if args[0] == "rm":
+            if self.rm_rc == 0:
+                self.agents = [a for a in self.agents if a["id"] != args[1]]
+            return self.rm_rc, "removed" if self.rm_rc == 0 else "rm failed"
         return 1, "unknown"
 
     def bg_calls(self):
@@ -933,6 +939,203 @@ class TestReader(Base):
             self.assertEqual(conveyor.reader_key(), "k2")
             Reg.QueryValueEx = staticmethod(mock.Mock(side_effect=FileNotFoundError()))
             self.assertEqual(conveyor.reader_key(), "")
+
+
+class TestCleanup(Base):
+    """Finished lane sessions are stopped and `claude rm`ed after CLEANUP_S, usage counted first."""
+
+    def setUp(self):
+        super().setUp()
+        self.ledger_runs = 0
+        self.ledger_error = None
+        self.ledger_skip = set()  # session ids the fake ledger does not count
+        self.c.usage_ledger = self.fake_ledger
+        self.ledger = self.root / "build" / "ledger" / "usage.json"
+
+    def fake_ledger(self):
+        self.ledger_runs += 1
+        if self.ledger_error:
+            raise self.ledger_error
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text(json.dumps({
+            "generated_at": conveyor.datetime.fromtimestamp(self.t).astimezone().isoformat(),
+            "sessions": [{"session_id": a["sessionId"]} for a in self.fake.agents
+                         if a.get("sessionId") and a["sessionId"] not in self.ledger_skip]}))
+
+    def finished(self, name="A", status="PASS", agent=None):
+        self.drop(f"{name}.md", HDR.format(name))
+        self.c.pass_once()
+        a = self.fake.agent(name)
+        a.update({"state": "done", "status": "idle", **(agent or {})})
+        self.report(name, status)
+        self.c.pass_once()
+        self.assertTrue(self.lanes()[name]["finished"])
+        return a["id"]
+
+    def cli(self, *cmds):
+        return [c for c in self.fake.calls if c[0] in cmds]
+
+    def test_stop_then_rm_after_grace_only_lane_sessions(self):
+        self.fake.agents += [  # Salih's / the orchestrator's sessions: never in lanes.json
+            {"id": "ffff0001", "name": "A", "kind": "background", "state": "done", "status": "idle",
+             "pid": 1, "sessionId": "ffff0001-x"},
+            {"id": "ffff0002", "name": "orchestrator", "kind": "interactive", "state": "done",
+             "sessionId": "ffff0002-x"}]
+        sid = self.finished()
+        self.t += conveyor.CLEANUP_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(self.ledger_runs, 1)  # counted after the grace, before the rm
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid], ["rm", sid]])
+        ev = [e for e in self.events() if e["event"] == "cleanup"]
+        self.assertEqual((len(ev), ev[0]["lane"], ev[0]["result"]), (1, "A", "removed"))
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("stop", "rm")), 2)
+        self.assertEqual(sorted(a["id"] for a in self.fake.agents), ["ffff0001", "ffff0002"])
+
+    def test_fresh_ledger_is_not_rerun_and_stopped_session_only_removed(self):
+        sid = self.finished()
+        self.fake.agent("A").pop("pid")
+        self.t += conveyor.CLEANUP_S
+        self.fake_ledger()
+        self.c.pass_once()
+        self.assertEqual(self.ledger_runs, 1)
+        self.assertEqual(self.cli("stop", "rm"), [["rm", sid]])
+
+    def test_doubt_leaves_session_and_logs_once(self):
+        for st in ({"state": "working", "status": "busy"}, {"state": "mystery"},
+                   {"name": "renamed"}, {"sessionId": None}, {"kind": "interactive"}):
+            with self.subTest(st=st):
+                self.tearDown()
+                self.setUp()
+                self.finished(agent=st)
+                self.t += conveyor.CLEANUP_S
+                self.c.pass_once()
+                self.c.pass_once()
+                self.assertEqual(self.cli("stop", "rm"), [])
+                self.assertEqual(len([e for e in self.events() if e["event"] == "cleanup_skip"]), 1)
+
+    def test_usage_not_counted_leaves_session(self):
+        sid = self.finished()
+        self.ledger_skip.add(self.fake.agent("A")["sessionId"])
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.ledger_skip.clear()
+        self.ledger_error = OSError("disk")
+        self.t += 60
+        self.c.pass_once()  # within USAGE_S: the ledger is not re-run every pass
+        self.assertEqual(self.ledger_runs, 1)
+        self.t += conveyor.USAGE_S
+        self.c.pass_once()
+        self.assertEqual((self.ledger_runs, self.cli("stop", "rm")), (2, []))
+        self.assertIn("usage ledger", self.status()["last_error"])
+        self.ledger_error = None
+        self.c.pass_once()
+        self.assertEqual(self.ledger_runs, 2)
+        self.t += conveyor.USAGE_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+
+    def test_cli_error_leaves_session_for_good(self):
+        sid = self.finished()
+        self.fake.rm_rc = 1
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
+        self.assertIn(sid, [a["id"] for a in self.fake.agents])
+
+    def test_fresh_listing_busy_or_timeout_leaves_session(self):
+        sid = self.finished()
+        self.t += conveyor.CLEANUP_S
+        run = self.c.run
+        listings = []
+
+        def reattached(args, timeout=120):  # Salih attaches between the pass's listing and the rm
+            out = run(args, timeout)
+            if args[0] == "agents":
+                listings.append(args)
+                if len(listings) == 2:  # the fresh listing right before stop/rm
+                    return 0, json.dumps([{**a, "status": "busy"} for a in self.fake.agents])
+            return out
+        self.c.run = reattached
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.assertEqual([e["reason"] for e in self.events() if e["event"] == "cleanup_skip"],
+                         [f"{sid}: kind/name/state/session not as expected"])
+
+        def timeout(args, timeout=120):
+            if args[0] == "stop":
+                raise conveyor.subprocess.TimeoutExpired(args, timeout)
+            return run(args, timeout)
+        self.c.run = timeout
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
+        self.assertIn(sid, [a["id"] for a in self.fake.agents])
+
+    def test_same_name_redispatch_keeps_old_session_for_cleanup(self):
+        old = self.finished()
+        self.drop("a2.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["prev_ids"], [old])
+        self.assertNotEqual(self.lanes()["A"]["id"], old)
+
+    def test_unreported_or_unacked_lane_is_kept(self):
+        b = self.finished("B", "BLOCKED")  # in attention until the orchestrator acks it
+        self.drop("c.md", HDR.format("C"))
+        self.c.pass_once()
+        self.fake.agent("C").update(state="done", status="idle")  # finished without a report
+        self.c.pass_once()
+        self.t += conveyor.CLEANUP_S * 2
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        (self.base / "ack").mkdir()
+        (self.base / "ack" / "B").touch()
+        os.utime(self.base / "ack" / "B", (self.t, self.t))
+        self.c.pass_once()
+        self.assertEqual([c[1] for c in self.cli("rm")], [b])
+
+    def test_lane_finished_before_finished_ts_uses_report_mtime(self):
+        rep = self.report("OLD", "PASS", where=None, mtime=self.t - conveyor.CLEANUP_S)
+        self.fake.agents.append({"id": "0000aaaa", "name": "OLD", "kind": "background", "state": "done",
+                                 "sessionId": "0000aaaa-x"})
+        (self.base / "lanes.json").write_text(json.dumps({"OLD": {
+            "id": "0000aaaa", "model": "opus", "effort": "high", "started_at": conveyor.iso(self.t - 9000),
+            "state": "done", "finished": True, "status": "PASS", "report": str(rep)}}))
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["rm", "0000aaaa"]])
+
+    def test_at_most_per_pass(self):
+        lanes = {}
+        for i in range(conveyor.CLEANUP_PER_PASS + 1):
+            rep = self.report(f"L{i}", "PASS", where=None, mtime=self.t - conveyor.CLEANUP_S)
+            self.fake.agents.append({"id": f"0000000{i}", "name": f"L{i}", "kind": "background",
+                                     "state": "done", "sessionId": f"0000000{i}-x"})
+            lanes[f"L{i}"] = {"id": f"0000000{i}", "finished": True, "status": "PASS", "report": str(rep),
+                              "started_at": conveyor.iso(self.t - 9000)}
+        (self.base / "lanes.json").write_text(json.dumps(lanes))
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), conveyor.CLEANUP_PER_PASS)
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), conveyor.CLEANUP_PER_PASS + 1)
+
+    def test_ledger_prefers_scripts_copy(self):
+        c = Conveyor(self.root, self.fake, now=lambda: self.t)
+        mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
+              "    Path(out).write_text('{}')\n"
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "usage_ledger.py").write_text(mod.replace("'{}'", "'scripts'"))
+        (self.base / "usage_ledger.py").write_text(mod.replace("'{}'", "'build'"))
+        c.usage_ledger()
+        self.assertEqual(self.ledger.read_text(), "scripts")
+        (self.root / "scripts" / "usage_ledger.py").unlink()
+        c.usage_ledger()
+        self.assertEqual(self.ledger.read_text(), "build")
 
 
 class TestLock(Base):
