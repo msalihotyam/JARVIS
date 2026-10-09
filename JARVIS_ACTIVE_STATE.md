@@ -25,6 +25,11 @@ confirm keeps a motion-free 300 ms input guard) and the test-settling fixes
 F-ee2 (6f) and F-ee3 (test_ui): one full suite green under rule D (4765).
 Next: OB1 Part 3 integrates the lane (delegated T1), then Part 4 (MA-guard).
 
+Integrated on local main (Salih 2026-10-09, INTNIGHT, not pushed): THIZ (UI
+tests motion-free by default, condition waits, split sweeps, duration-balanced
+CI shards; 58c2f75) and MA1 (jarvis-flow wave 2 + jarvis-codex review bridge +
+rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
+
 ## Open blockers: none.
 
 ## Do not reopen
