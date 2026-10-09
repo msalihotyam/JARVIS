@@ -17,7 +17,7 @@ import {
 import { BATTERY_ARGV, gate, isFreshWorking, parseBattery, type Gate, type Power } from './lib/power.ts'
 import { canonicalRootOf, fingerprint, stateOf, worktreeOf, type LastAuto, type Status } from './lib/status.ts'
 import { extractReport, safeLane } from './lib/report.ts'
-import { renderBand, type BandState } from './lib/band.ts'
+import { conveyorOf, renderBand, type BandState, type Conveyor } from './lib/band.ts'
 import {
   BEAT_MS,
   CAS_ARGV,
@@ -61,6 +61,7 @@ import { LOW_BATTERY_PCT, curlArgv, MIN_GAP_MS, curlConfig, isBadStatus, nextWai
 const TICK_MS = 5000
 const POWER_MS = 120000
 const START_GUARD_MS = 60000
+const CONVEYOR_MS = 60000
 
 type Item = { dir: string; kind: 'manual' | 'auto'; name: string; abs: string; text: string; sha: string; header: Header }
 type Rejection = { kind: 'manual' | 'auto'; name: string; reason: string }
@@ -85,6 +86,8 @@ let power: Power = { ac: true, pct: null }
 let paused = false
 let lowBattery = false
 let lowToasted = false
+let conveyor: Conveyor | null = null
+let conveyorReadAt: number | null = null
 let manual: Item[] = []
 let auto: Item[] = []
 let rejected: Rejection[] = []
@@ -189,6 +192,18 @@ async function currentGate($: any): Promise<Gate> {
   const g = gate({ power, paused, otherLaneWorking: others })
   lowBattery = g.lowBattery
   return g
+}
+
+// The band's conveyor piece, from the tick (never from the render), at most once per CONVEYOR_MS.
+async function refreshConveyor($: any, now: number): Promise<void> {
+  if (conveyorReadAt !== null && now - conveyorReadAt < CONVEYOR_MS) return
+  conveyorReadAt = now
+  try {
+    const text: string = await $.fs.read(root + '/build/conveyor/status.json')
+    conveyor = conveyorOf(text, await $.fs.exists(root + '/build/conveyor/PAUSE'), now)
+  } catch {
+    conveyor = null
+  }
 }
 
 async function writeStatus($: any): Promise<void> {
@@ -368,6 +383,8 @@ async function tick($: any): Promise<void> {
   if (!active || ticking) return
   ticking = true
   try {
+    // first, so a failing queue scan cannot freeze it (it never throws)
+    await refreshConveyor($, await $.clock.now())
     const g = await currentGate($)
     await scanQueue($)
     for (const item of [...manual, ...auto]) {
@@ -908,11 +925,8 @@ async function takeBackgroundResult($: any, res: any): Promise<void> {
 function bandState(): BandState {
   return {
     family: famName,
-    lane: lane ? lane.lane : null,
     baseState,
     head,
-    worktree: worktreeOf(cwd),
-    branch,
     contextPct,
     planPct,
     power,
@@ -920,6 +934,7 @@ function bandState(): BandState {
     lowBattery,
     pendingLane: manual.length > 0 ? (manual[0] as Item).header.lane : null,
     suiteWait: suiteWaiting.on,
+    conveyor,
   }
 }
 
