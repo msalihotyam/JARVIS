@@ -361,9 +361,19 @@ class AttachWindowTests(ProjectsUiCase):
         ))
         bridge.openProjectScope("")
         pump(200)
-        store.archive_conversation(bridge.conversationId)
+        archived = bridge.conversationId
+        store.archive_conversation(archived)
         bridge.refreshProjects()
+        # N2: the archived open conversation is left for a new, empty Global chat - writable, so attachable.
+        self.assertNotEqual(archived, bridge.conversationId)
         settled(100, lambda: (
+            self.assertTrue(bridge.canAttach),
+            self.assertTrue(self.item(root, "chatHeaderAttach").isVisible()),
+        ))
+        # The archived one, opened read-only, cannot attach.
+        self.assertTrue(bridge.openConversation(archived))
+        self.assertEqual((archived, True), (bridge.conversationId, bridge.conversationReadOnly))
+        settled(200, lambda: (
             self.assertFalse(bridge.canAttach),
             self.assertFalse(self.item(root, "chatHeaderAttach").isVisible()),
         ))
