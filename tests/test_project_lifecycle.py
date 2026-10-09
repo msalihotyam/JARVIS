@@ -19,9 +19,11 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
+import jarvis.app as jarvis_app
 from jarvis.app import EXIT_OK, project_create_result, project_lifecycle_result
 from jarvis.contracts import (
     PROJECT_ID_PATTERN,
@@ -428,7 +430,16 @@ class ScopeIsNotAuthorityTests(IntentTestCase):
         }
 
     def test_global_a_and_b_have_identical_authority(self) -> None:
-        worlds = {owner: self.world(owner) for owner in (None, "proj-a", "proj-b")}
+        # The catalog carries a minute-resolution local_time: one frozen moment for all worlds.
+        moment = datetime(2026, 9, 16, 10, 0, 30).astimezone()
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        with mock.patch.object(jarvis_app, "datetime", FrozenDatetime):
+            worlds = {owner: self.world(owner) for owner in (None, "proj-a", "proj-b")}
         self.assertEqual({None: None, "proj-a": "proj-a", "proj-b": "proj-b"},
                          {owner: world.pop("project") for owner, world in worlds.items()})
         self.assertIsNotNone(worlds[None]["approval"]["attestation"])
