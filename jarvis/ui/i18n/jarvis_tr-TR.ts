@@ -1232,10 +1232,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>ContextStrip</name>
     <message>
-        <source>Answer</source>
-        <translation>Yanıt</translation>
-    </message>
-    <message>
         <source>Evaluate together</source>
         <translation>Birlikte değerlendir</translation>
     </message>
@@ -1254,10 +1250,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>whole message</source>
         <translation>mesajın tamamı</translation>
-    </message>
-    <message>
-        <source>+ File</source>
-        <translation>+ Dosya</translation>
     </message>
     <message>
         <source>Attach a file or an image to this group</source>
@@ -1286,14 +1278,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Attached to the message</source>
         <translation>Mesajın ekleri</translation>
-    </message>
-    <message>
-        <source>Note</source>
-        <translation>Not</translation>
-    </message>
-    <message>
-        <source>+ Note</source>
-        <translation>+ Not</translation>
     </message>
 </context>
 <context>
@@ -1542,6 +1526,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>INTERRUPTED - INCOMPLETE ANSWER</source>
         <translation>YARIDA KESİLDİ - EKSİK YANIT</translation>
+    </message>
+    <message>
+        <source>Show less</source>
+        <translation>Daha az</translation>
+    </message>
+    <message>
+        <source>Show more</source>
+        <translation>Devamını göster</translation>
     </message>
     <message>
         <source>Sources</source>
@@ -3243,6 +3235,32 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>%1% left</source>
         <translation>%%1 kaldı</translation>
+    </message>
+</context>
+<context>
+    <name>QuoteDetail</name>
+    <message>
+        <source>Edit</source>
+        <translation>Düzenle</translation>
+    </message>
+    <message>
+        <source>Quote</source>
+        <translation>Alıntı</translation>
+    </message>
+    <message>
+        <source>Comment</source>
+        <translation>Yorum</translation>
+    </message>
+    <message>
+        <source>Delete quote</source>
+        <translation>Alıntıyı sil</translation>
+    </message>
+</context>
+<context>
+    <name>QuoteEditor</name>
+    <message>
+        <source>Add a comment (optional)…</source>
+        <translation>Yorum ekle (isteğe bağlı)…</translation>
     </message>
 </context>
 <context>
