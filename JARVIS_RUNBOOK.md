@@ -575,6 +575,65 @@ files, `.jarvis/`, `.codex/` or an 8.3 short name, when the diff is over 300 KB 
 empty, or when the range is not a plain `A..B`. The result file records whether
 `git status` changed during the run.
 
+## Konveyor
+
+Salih approved the design on 2026-10-09. `scripts/conveyor.py` (stdlib only,
+tests `tests/test_conveyor.py`) keeps development flowing while the PC is on.
+It runs under a Windows Task Scheduler task, one pass every 60 s (`--once` for
+one pass). It makes no model call, runs no git command and deletes no file;
+one instance at a time (`build/conveyor/conveyor.lock`, stale after 5 min).
+Runtime folder `build/conveyor/` (gitignored): `inbox/`, `backlog.json`,
+`lanes.json`, `status.json`, `events.jsonl`, `pager.json`.
+
+- **Dispatch.** Each lane is a fresh `claude --bg --name <lane> --model <m>
+  --effort <e> --settings build/conveyor/lanes.settings.json <prompt>`; at most
+  3 lanes at a time. Inbox first: `inbox/*.md`, oldest first, line 1 a valid
+  `@jarvis` header (`base=main` allowed); bad headers go to `inbox/rejected/`
+  with a reason, started prompts to `inbox/started/`. Only when the inbox is
+  empty does the backlog dispatch.
+- **Backlog** `build/conveyor/backlog.json`, written by the orchestrator:
+  `{"slices": [{id, title, model, effort, tier, files, depends_on, prompt,
+  approved}]}` in order. `tier` is T0/T1/T2; `files` are repo globs the slice
+  may touch; `depends_on` slice ids; `prompt` a path from the repo root (its
+  own `@jarvis` line, if any, is replaced by one built from the backlog, keeping
+  its base; otherwise `base=main`). The first slice is dispatched whose
+  dependencies have a PASS/COMPLETE/DONE/GREEN/OK report, whose files do not
+  overlap a running lane's files (literal prefix before the first wildcard,
+  conservative; inbox lanes have no files) and, for T2, only with
+  `"approved": true` (Salih approves T2 at plan level). A slice that already
+  has a report is not dispatched again. `status.json` `backlog` shows each
+  slice's state (`ready`, `waiting_deps`, `overlap`, `needs_t2_approval`, a
+  STATUS, ...) and invalid entries.
+- **Finished by report.** A lane is finished when `<lane>.md` with a `STATUS:`
+  line, written after its start, exists in `build/reports/`, in any
+  `.claude/worktrees/*/build/reports/` or in the session's cwd, whatever the
+  session shows (idle, blocked). Its slot is freed, it is never respawned, and
+  a worktree report is copied to the canonical `build/reports/` (a different
+  older file there is kept as `<lane>.<yyyymmdd-hhmmss>.md`).
+- **Reboot.** A lane without a report whose session stopped is `claude
+  respawn`ed (once per stop). A respawned lane with no activity for 10 min (no
+  new file in its worktree, no `build/flakes/ledger.jsonl` row, no report) has
+  its silent session stopped (`claude stop`, the conversation is kept) and is
+  re-dispatched from its saved prompt with a short "continue from where you
+  stopped" preface; after 2 re-dispatches it is finished as `STUCK` (slot freed,
+  paged). An idle or finished session never blocks a new lane of the same name.
+- **PAUSE.** `build/conveyor/PAUSE` present: nothing new starts (no dispatch,
+  no re-dispatch); tracking, report collection and respawn go on.
+- **Usage guard.** `claude` has no plan-usage command, so the newest
+  `build/ledger/slices.jsonl` row (jarvis-flow slice ledger, `seven_day`) is
+  read; at 85% or more of the weekly limit no new lane starts (a row older than
+  7 days is ignored). `status.json` shows `usage_pct` and `usage_hold`.
+- **Pager (ntfy).** Topic from `JARVIS_NTFY_TOPIC` (same rules as the
+  jarvis-flow pager; never logged). Pushes only for a lane report `STATUS:
+  BLOCKED/STOP/FAIL` (or `STUCK`), 3 failed passes in a row, and the backlog
+  running dry (no lane running, no inbox file waiting and nothing to dispatch;
+  once per episode). At most one push per 10 min; pages inside the gap, or after
+  a failed send, are held and sent together.
+- **Switch-over.** The scheduled task runs `scripts/conveyor.py` from the
+  canonical checkout (v0 was `build/conveyor/conveyor.py`); it reads the same
+  `build/conveyor/` state, and still runs the optional runtime
+  `build/conveyor/usage_ledger.py` every 30 min when that file exists.
+
 ## V2.0 scope freeze
 
 Salih decision (2026-10-06): V2.0 scope is frozen. New ideas go to the
