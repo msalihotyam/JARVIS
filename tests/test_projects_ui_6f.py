@@ -726,6 +726,26 @@ class SidebarNavCase(SidebarShellCase, SidebarDataCase):
             connection.execute("UPDATE conversations SET updated_at = ? WHERE id = ?",
                                (when.astimezone(timezone.utc).isoformat(), conversation_id))
 
+    def fixed_today(self, root, now) -> None:
+        """THIZ2: "today" from ``now``, computed once by the test, in the window's sidebar (its clock binding is
+        replaced) and in the bridge's date groups (its ``datetime.now``), so a run across midnight groups the
+        conversations as it began. Test side only."""
+        from datetime import datetime
+
+        from PySide6.QtCore import QDateTime
+        from PySide6.QtQml import QQmlProperty
+
+        class Fixed(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz)
+
+        # A QQmlProperty write drops the `now: clock.now` binding (setProperty would be undone by the next tick).
+        self.assertTrue(QQmlProperty(self.item(root, "sidebar"), "now").write(QDateTime.fromMSecsSinceEpoch(round(now.timestamp() * 1000))))
+        patcher = mock.patch("jarvis.ui.bridge.datetime", Fixed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
 
 class SidebarNavTests(SidebarNavCase):
     def test_t_whole_rows_no_clip_no_overlap_and_long_names_elide_with_a_tip_in_space(self) -> None:
@@ -811,7 +831,8 @@ class SidebarNavTests(SidebarNavCase):
     def test_u_grouping_by_the_local_day_of_the_last_change(self) -> None:
         from datetime import datetime, timedelta
         store = self.db()
-        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        now = datetime.now().astimezone()                                       # THIZ2: once per test
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         cases = (("Bugün ilk", midnight + timedelta(seconds=30)),                # just after midnight: today
                  ("Dün son", midnight - timedelta(seconds=30)),                  # just before it: yesterday
                  ("Dün ilk", midnight - timedelta(days=1) + timedelta(seconds=30)),
@@ -820,6 +841,7 @@ class SidebarNavTests(SidebarNavCase):
             self.stamp(store.create_conversation(title=title).id, when)
         bridge = self.bridge()
         root = self.window(bridge)
+        self.fixed_today(root, now)
         bridge._refresh_conversations()
         pump(300)
         # F6: Daha eski starts collapsed; its heading opens it.
@@ -2120,7 +2142,7 @@ class CollapsibleGroupTests(F6Case):
     def dated(self):
         from datetime import datetime, timedelta
         store = self.db()
-        now = datetime.now().astimezone()
+        now = self.now = datetime.now().astimezone()                         # THIZ2: once per test
         today = [store.create_conversation(title=f"Bugün {n}") for n in range(2)]
         yesterday = store.create_conversation(title="Dün 0")
         self.stamp(yesterday.id, now - timedelta(days=1))
@@ -2133,6 +2155,7 @@ class CollapsibleGroupTests(F6Case):
         store, today, yesterday, older = self.dated()
         bridge = self.bridge()
         root = self.window(bridge)
+        self.fixed_today(root, self.now)
         self.assertEqual(today[1].id, bridge.conversationId)
         # Bugün + Dün open, Daha eski collapsed; SABİTLENDİ open (and hidden: nothing pinned).
         self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups)
@@ -2181,6 +2204,7 @@ class CollapsibleGroupTests(F6Case):
         store.create_conversation(tez.id, title="Tez yeni")
         bridge = self.bridge()
         root = self.window(bridge)
+        self.fixed_today(root, now)                                             # THIZ2: once per test
         self.tap(root, self.head(root, "today"))                                # Genel: Bugün collapsed
         self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (  # Tez: its own defaults
             self.assertEqual({"pinned": True, "today": True, "yesterday": True, "earlier": False}, bridge.sidebarGroups),
@@ -2202,6 +2226,7 @@ class CollapsibleGroupTests(F6Case):
         root.hide()
         bridge = self.bridge()
         root = self.window(bridge)
+        self.fixed_today(root, now)
         self.assertTrue(bridge.conversationProject["global"])
         self.assertEqual({"pinned": True, "today": False, "yesterday": True, "earlier": True}, bridge.sidebarGroups)
         self.assertEqual(["Genel yeni", "Genel eski"], self.titles(root))             # the open one stays in view
@@ -2467,7 +2492,10 @@ class PinOrderTests(F6Case):
 
 class SidebarPrefsStorageTests(F6Case):
     def test_yy_only_the_sidebar_file_is_written_pruned_on_read_and_old_files_load(self) -> None:
+        from datetime import datetime
+
         from jarvis.ui.preferences import UiPreferences, canonical_preferences, validate_preferences
+        now = datetime.now().astimezone()                                       # THIZ2: once per test
         store = self.db()
         tez = store.create_project("Tez")
         keep = [store.create_conversation(title=f"Genel {n}") for n in range(3)]
@@ -2476,6 +2504,7 @@ class SidebarPrefsStorageTests(F6Case):
         bridge.setTheme("dark")
         bridge.setLanguage("en-US")                              # a main document on disk
         root = self.window(bridge)
+        self.fixed_today(root, now)
         main_before = self.prefs_path.read_bytes()
         db_before = dump(self.database)
         # Pin, reorder, collapse - all by mouse.
@@ -2624,13 +2653,15 @@ class PinFitTests(F6Case):
         from datetime import datetime, timedelta
         store = self.db()
         tez = store.create_project("Tez")
+        now = datetime.now().astimezone()                                       # THIZ2: once per test
         old = store.create_conversation(title="Eski")
-        self.stamp(old.id, datetime.now().astimezone() - timedelta(days=5))
+        self.stamp(old.id, now - timedelta(days=5))
         for n in range(3):
             store.create_conversation(title=f"Genel {n}")
         store.create_conversation(tez.id, title="Tez 0")
         bridge = self.bridge()
         root = self.window(bridge)
+        self.fixed_today(root, now)
         keys = []
         real = QTest.keyClick
         with mock.patch.object(QTest, "keyClick", side_effect=lambda *a, **k: (keys.append(a), real(*a, **k))):
