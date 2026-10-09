@@ -90,6 +90,44 @@ Do not repeat closed architecture or project history in the prompt — the
 worker can read `ARCHITECTURE.md`, `PROJECT_CONTEXT.md`, and prior commits
 itself. State only what changed and what is now being asked for.
 
+## Prompt template (lanes)
+
+Salih decision (2026-10-09): short prompts for 5.5-generation models. Stable
+rules live in `CLAUDE.md` and are enforced by hooks / deny rules, so a prompt
+does not repeat them (repo safety, protected paths, no push, `uv.lock`, tests
+never open the live DB, `SCHEMA_VERSION`, fail-closed, rule D, GREEN MEANS
+STOP, `python -m unittest` only). A prompt states only what is new.
+
+- **Length and tone:** 15-30 lines, calm language, no capitals-for-emphasis.
+  Give the reason for every rule that is specific to this prompt; a rule with
+  a reason is followed more reliably than a bare command.
+- **Line 1 is the header** (the mod parses it strictly, see "Mods"):
+  `@jarvis lane=<slice-id> model=<opus|sonnet|haiku> effort=<medium|high|xhigh>
+  base=<sha|main>`
+- **Then four blocks, in this order:**
+  - **Goal:** the one outcome wanted, in a sentence or two.
+  - **Why:** the decision or need behind it, with its source (Salih decision
+    date, file:line). This is what lets the worker judge edge cases.
+  - **Scope:** the owned files, the risk tier (T0 / T1 / T2), what is out of
+    bounds, and any first check (e.g. the base SHA).
+  - **Done when:** the acceptance criteria, the required run (or "no tests"),
+    the commit subject, and where the report goes (`build/reports/<slice-id>.md`).
+- Do not repeat what `CLAUDE.md` or this runbook already say; link the section.
+
+Example:
+
+```
+@jarvis lane=docs-x1 model=sonnet effort=medium base=main
+Goal: add the missing "Cloud sessions" cross-link to the Push section.
+Why: Salih approved cloud pushes of claude/* branches on 2026-10-08; the Push
+  section does not mention them, so a reader of Push alone would think the
+  rule is stricter than it is.
+Scope: JARVIS_RUNBOOK.md only (T0, docs). First check: git log -1 equals base.
+  Nothing under jarvis/ or tests/.
+Done when: git diff --check is clean; no tests (docs only); commit
+  docs(runbook): link Push to Cloud sessions; report in build/reports/docs-x1.md.
+```
+
 ## Orchestration — chief and subagents
 
 The main Claude Code session is the **chief**: it plans, delegates,
