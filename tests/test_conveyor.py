@@ -710,8 +710,9 @@ class TestReader(Base):
     def test_valid_reading_recorded(self):
         rep = self.finish_a()
         (body,) = self.posts
-        self.assertEqual((body["model"], body["max_tokens"], body["temperature"], body["output_config"]),
-                         ("claude-haiku-5-5", 300, 0, {"effort": "low"}))
+        self.assertEqual((body["model"], body["max_tokens"], body["output_config"]),
+                         ("claude-haiku-5-5", 300, {"effort": "low"}))
+        self.assertNotIn("temperature", body)
         self.assertEqual(body["system"], conveyor.READER_SYSTEM)
         self.assertEqual(body["messages"], [{"role": "user", "content": rep.read_text(encoding="utf-8")}])
         r = self.lane_a()["reading"]
@@ -770,6 +771,22 @@ class TestReader(Base):
         self.assertEqual([e["status"] for e in self.events() if e["event"] == "reader_error"],
                          [529, "TimeoutError"])
         self.assertEqual(self.lanes()["B"]["status"], "PASS")
+
+    def test_api_error_type_and_message_recorded(self):
+        msg = "temperature is not supported " + "x" * 300 + KEY
+        self.reply = (400, {"type": "error", "error": {"type": "invalid_request_error", "message": msg}})
+        self.finish_a()
+        (e,) = [e for e in self.events() if e["event"] == "reader_error"]
+        self.assertEqual((e["lane"], e["status"], e["error_type"]), ("A", 400, "invalid_request_error"))
+        self.assertEqual(e["error_message"], msg[:200])
+        self.assertNotIn(KEY, json.dumps(self.events()))
+        self.assertNotIn("temperature", self.posts[0])
+
+    def test_anthropic_post_returns_error_body(self):
+        import io
+        http = conveyor.urllib.error.HTTPError(conveyor.READER_URL, 400, "bad", {}, io.BytesIO(b'{"error": {"type": "t"}}'))
+        with mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=http):
+            self.assertEqual(conveyor.anthropic_post(KEY, {}), (400, {"error": {"type": "t"}}))
 
     def test_anthropic_post_request_and_errors(self):
         with mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=TimeoutError()) as op:

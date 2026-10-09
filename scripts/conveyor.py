@@ -136,7 +136,10 @@ def anthropic_post(key, body):
         with urllib.request.urlopen(req, timeout=20) as r:  # nosec B310 - fixed https URL
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        return e.code, None
+        try:  # the API's JSON error body (type/message) explains the status
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return e.code, None
     except Exception as e:  # never str(e)
         return type(e).__name__, None
 
@@ -426,12 +429,18 @@ class Conveyor:
                 self.event("reader_error", lane=name, status="budget")
                 return
             # no assistant prefill (Haiku 5.5 rejects it with 400): JSON only by instruction
-            body = {"model": READER_MODEL, "max_tokens": 300, "temperature": 0,
+            body = {"model": READER_MODEL, "max_tokens": 300,
                     "output_config": {"effort": READER_EFFORT}, "system": READER_SYSTEM,
                     "messages": [{"role": "user", "content": clip(text or STUCK_NOTE)}]}
             status, resp = self.post(key, body)
             if status != 200 or not isinstance(resp, dict):
-                self.event("reader_error", lane=name, status=status if isinstance(status, int) else str(status)[:40])
+                err = resp.get("error") if isinstance(resp, dict) else None
+                extra = {}
+                if isinstance(err, dict):  # only the API's own error fields, never request/headers/key
+                    extra = {"error_type": str(err.get("type"))[:60],
+                             "error_message": str(err.get("message")).replace(key, "")[:200]}
+                self.event("reader_error", lane=name,
+                           status=status if isinstance(status, int) else str(status)[:40], **extra)
                 return
             use = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
             tin, tout = (int(use.get(k) or 0) for k in ("input_tokens", "output_tokens"))
