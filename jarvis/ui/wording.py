@@ -25,7 +25,7 @@ DAY_WORDS = {
     1: QT_TRANSLATE_NOOP("Wording", "tomorrow"),
 }
 
-#: Core vocabularies the window shows (jarvis.contracts LoopStage, JobKind, ProjectMemoryKind).
+#: Core vocabularies the window shows (jarvis.contracts LoopStage, JobKind, ProjectMemoryKind, ...).
 CODE_WORDS = {
     "stage": {
         "understand": QT_TRANSLATE_NOOP("Wording", "Understanding"),
@@ -53,6 +53,37 @@ CODE_WORDS = {
         "decision": QT_TRANSLATE_NOOP("Wording", "Decision"),
         "rule": QT_TRANSLATE_NOOP("Wording", "Rule"),
         "thread": QT_TRANSLATE_NOOP("Wording", "Thread"),
+    },
+    # K6: the pages' remaining codes (TaskStatus, DataClassification, MemoryLifecycle, MemoryOrigin).
+    "task_status": {
+        "pending": QT_TRANSLATE_NOOP("Wording", "Pending"),
+        "awaiting_clarification": QT_TRANSLATE_NOOP("Wording", "Needs a detail"),
+        "awaiting_approval": QT_TRANSLATE_NOOP("Wording", "Awaiting your approval"),
+        "awaiting_cost_override": QT_TRANSLATE_NOOP("Wording", "Awaiting a cost decision"),
+        "running": QT_TRANSLATE_NOOP("Wording", "Running"),
+        "verifying": QT_TRANSLATE_NOOP("Wording", "Verifying"),
+        "completed": QT_TRANSLATE_NOOP("Wording", "Completed"),
+        "failed": QT_TRANSLATE_NOOP("Wording", "Failed"),
+        "rejected": QT_TRANSLATE_NOOP("Wording", "Denied"),
+        "cancel_requested": QT_TRANSLATE_NOOP("Wording", "Cancelling"),
+        "cancelled": QT_TRANSLATE_NOOP("Wording", "Cancelled"),
+    },
+    "memory_classification": {
+        "public": QT_TRANSLATE_NOOP("Wording", "Public"),
+        "internal": QT_TRANSLATE_NOOP("Wording", "Internal"),
+        "sensitive": QT_TRANSLATE_NOOP("Wording", "Sensitive"),
+        "secret": QT_TRANSLATE_NOOP("Wording", "Secret"),
+    },
+    "memory_lifecycle": {
+        "active": QT_TRANSLATE_NOOP("Wording", "In use"),
+        "superseded": QT_TRANSLATE_NOOP("Wording", "Replaced by a newer record"),
+        "retired": QT_TRANSLATE_NOOP("Wording", "Retired"),
+    },
+    "memory_origin": {
+        "explicit_user": QT_TRANSLATE_NOOP("Wording", "Written by you"),
+        "system_decision": QT_TRANSLATE_NOOP("Wording", "JARVIS decision"),
+        "inferred": QT_TRANSLATE_NOOP("Wording", "Inferred"),
+        "imported": QT_TRANSLATE_NOOP("Wording", "Imported"),
     },
 }
 

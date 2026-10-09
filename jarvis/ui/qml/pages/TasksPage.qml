@@ -20,6 +20,13 @@ SecondaryPage {
     ]
 
     RenameMenu { id: renameMenu }
+    // K6: a task reads as words (its status and stage); the exact capability and
+    // connector names stay beside them, muted, as data.
+    function joined(parts) { return parts.filter(function(v) { return !!v }).join("  ·  ") }
+    // The session whose tasks are still on their way: no "no tasks" verdict before they arrive.
+    // ponytail: any dataChanged ends the wait; a load-specific signal if a slow store shows the verdict early.
+    property string loadingSession: ""
+    Connections { target: bridge; function onDataChanged() { page.loadingSession = "" } }
 
     Row {
         anchors.fill: parent
@@ -27,6 +34,10 @@ SecondaryPage {
         Column {
             width: parent.width * 0.32; height: parent.height; spacing: 8
             Text { text: qsTr("SESSIONS (most recent %1)").arg(20); color: Theme.textLabel; font: Theme.pageSection }
+            PageEmpty { objectName: "tasksSessionsEmpty"; width: parent.width; visible: bridge.sessions.length === 0
+                        title: qsTr("No task sessions yet.")
+                        note: qsTr("A session starts the first time you ask JARVIS for something; its tasks are listed here.")
+                        action: qsTr("Write to JARVIS"); onActed: bridge.setPage("home") }
             ListView {
                 width: parent.width; height: parent.height - 30; clip: true; spacing: 4
                 model: bridge.sessions
@@ -39,10 +50,11 @@ SecondaryPage {
                     Column { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 4
                         Text { text: modelData.title || qsTr("Untitled session"); color: modelData.title ? Theme.text : Theme.textMuted
                                font: Theme.pageRowStrong; width: parent.parent.width - 20; elide: Text.ElideRight }
-                        Text { objectName: "tasksSessionMeta"; text: page.when(modelData.updated_at) + "  ·  " + (modelData.task_count === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(modelData.task_count || 0)) + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : ""); color: Theme.textMuted; font: Theme.pageMetaFigures
+                        Text { objectName: "tasksSessionMeta"; text: page.when(modelData.updated_at) + "  ·  " + (modelData.task_count === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(modelData.task_count || 0)) + (modelData.readable === false ? "  ·  " + qsTr("cannot be read") : ""); color: Theme.textMuted; font: Theme.pageMetaFigures
                                width: parent.parent.width - 20; elide: Text.ElideRight }
                     }
-                    MouseArea { anchors.fill: parent; onClicked: { page.selectedSession = modelData.session_id; page.selectedTask = ""; page.selectedTaskRow = null; bridge.loadTasks(modelData.session_id) } }
+                    MouseArea { anchors.fill: parent; onClicked: { page.selectedSession = modelData.session_id; page.selectedTask = ""; page.selectedTaskRow = null
+                                                                 page.loadingSession = modelData.session_id; bridge.loadTasks(modelData.session_id) } }
                     TapHandler { acceptedButtons: Qt.RightButton
                                  onTapped: function(point) { renameMenu.openFor(parent, point.position, modelData.session_id, modelData.title) } }
                 }
@@ -51,6 +63,8 @@ SecondaryPage {
         Column {
             width: parent.width * 0.30; height: parent.height; spacing: 8
             Text { text: qsTr("TASKS"); color: Theme.textLabel; font: Theme.pageSection }
+            PageEmpty { objectName: "tasksTasksEmpty"; width: parent.width; visible: page.selectedSession === "" || (bridge.tasks.length === 0 && page.loadingSession === "")
+                        title: page.selectedSession === "" ? qsTr("Pick a session to see its tasks.") : qsTr("This session has no tasks.") }
             ListView {
                 width: parent.width; height: parent.height - 30; clip: true; spacing: 4
                 model: page.selectedSession !== "" ? bridge.tasks : []
@@ -62,11 +76,13 @@ SecondaryPage {
                     border.width: 1; border.color: current ? Theme.accent : Theme.border
                     Column { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 4
                         // The task's name first; its id stays in the snapshot.
-                        Text { text: modelData.title || ((modelData.capability || "?") + "  ·  " + (modelData.status || "?")); color: Theme.text
+                        Text { objectName: "tasksTaskTitle"; text: modelData.title || qsTr("Untitled task"); color: modelData.title ? Theme.text : Theme.textMuted
                                font: Theme.pageRowStrong; width: parent.parent.width - 20; elide: Text.ElideRight }
-                        Text { visible: !!modelData.title; text: (modelData.capability || "?") + "  ·  " + (modelData.status || "?"); color: Theme.textLabel; font: Theme.pageMeta
+                        Text { objectName: "tasksTaskStatus"; visible: text !== ""; color: Theme.textLabel; font: Theme.pageMeta
+                               text: page.joined([i18n.word("task_status", modelData.status || ""), i18n.word("stage", modelData.stage || "")])
                                width: parent.parent.width - 20; elide: Text.ElideRight }
-                        Text { text: (modelData.stage || "") + "  ·  " + (modelData.selected_connector || "—"); color: Theme.textMuted; font: Theme.pageMeta
+                        Text { objectName: "tasksTaskSource"; visible: text !== ""; color: Theme.textMuted; font: Theme.pageMeta
+                               text: page.joined([modelData.capability, modelData.selected_connector])
                                width: parent.parent.width - 20; elide: Text.ElideRight }
                     }
                     MouseArea { anchors.fill: parent; onClicked: { page.selectedTask = modelData.task_id; page.selectedTaskRow = modelData; bridge.showTask(page.selectedSession, modelData.task_id) } }
@@ -78,6 +94,9 @@ SecondaryPage {
         Column {
             width: parent.width - parent.width * 0.62 - Theme.gap * 2; height: parent.height; spacing: 8
             Text { text: qsTr("SNAPSHOT"); color: Theme.textLabel; font: Theme.pageSection }
+            PageEmpty { objectName: "tasksSnapshotEmpty"; width: parent.width; visible: page.selectedTask === ""
+                        title: qsTr("Pick a task to see where it stands.")
+                        note: qsTr("The snapshot shows the task's exact state, stage and record as JARVIS stored them.") }
             ListView {
                 width: parent.width; height: parent.height - 30; clip: true; spacing: 10
                 model: page.selectedTask !== "" ? bridge.taskDetail : []

@@ -27,6 +27,12 @@ Item {
     readonly property color edge: Theme.glassEdge
     readonly property int shellRadius: Theme.radius
     readonly property int inset: roomy ? 16 : 8
+    // K6: the greeting follows the real time of day: a minute clock (a test
+    // sets it) re-picks it when the period turns. A night hour is evening.
+    property date now: new Date()
+    Timer { interval: 60000; running: page.empty; repeat: true; triggeredOnStart: true; onTriggered: page.now = new Date() }
+    readonly property string greeting: { var h = page.now.getHours()
+        return (h >= 5 && h < 12 ? qsTr("Good morning, %1.") : h >= 12 && h < 18 ? qsTr("Good afternoon, %1.") : qsTr("Good evening, %1.")).arg(bridge.operatorName) }
 
     // -- the shell material: plain rectangles, no effects -----------------------
     // The fill appears over the fade band, then continues as a square-topped
@@ -96,7 +102,7 @@ Item {
             spacing: page.roomy ? 8 : 6
             readonly property int tier: Theme.tier(page.Window.width)
             Text { objectName: "welcomeGreeting"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
-                   text: (function() { var h = new Date().getHours(); return (h < 12 ? qsTr("Good morning, %1.") : h < 18 ? qsTr("Good afternoon, %1.") : qsTr("Good evening, %1.")).arg(bridge.operatorName) })()
+                   text: page.greeting
                    color: Theme.text; font: Theme.greeting(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingLine(welcome.tier) }
             Text { objectName: "welcomeSupport"; width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap

@@ -28,10 +28,17 @@ SecondaryPage {
                 model: bridge.projectRecords.filter(function(p) { return p.active })
                 ActionButton { objectName: "memoryProject"; label: modelData.name; primary: modelData.id === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData.id; bridge.refreshMemory(modelData.id, page.includeInactive) } }
             }
-            Text { visible: bridge.projects.length === 0; anchors.verticalCenter: parent.verticalCenter; text: qsTr("No project exists yet (%1).").arg("'jarvis project create'"); color: Theme.textMuted; font: Theme.pageMeta }
         }
+        // K6: the honest empty states - no project to hold memory, or a project with none yet.
+        PageEmpty { objectName: "memoryEmpty"; width: parent.width; visible: bridge.memoryItems.length === 0
+                    title: bridge.projects.length === 0 ? qsTr("No project yet, so there is no project memory.") : qsTr("No memory records to show for this project.")
+                    note: bridge.projects.length === 0 ? qsTr("Memory belongs to a project. Create one on the Projects page.")
+                          : page.includeInactive ? qsTr("Records appear here once something is saved to this project's memory.")
+                          : qsTr("Records appear here once something is saved to this project's memory. Replaced or retired ones, if any, show with the button above.")
+                    action: bridge.projects.length === 0 ? qsTr("Open Projects") : ""
+                    onActed: bridge.setPage("projects") }
         ListView {
-            width: parent.width; height: parent.height - 104; clip: true; spacing: 8
+            width: parent.width; height: parent.height - 104; clip: true; spacing: 8; visible: count > 0
             model: bridge.memoryItems
             ScrollBar.vertical: ScrollBar {}
             delegate: Rectangle {
@@ -42,9 +49,9 @@ SecondaryPage {
                         // The kind's word as a heading; an unknown kind's fallback carries its exact code, so it is not uppercased.
                         Text { readonly property string word: i18n.word("memory_kind", modelData.kind || "")
                                text: modelData.kind && word.indexOf(modelData.kind) >= 0 ? word : i18n.upper(word); color: Theme.accent; font: Theme.pageSection }
-                        Text { text: modelData.classification || ""; color: Theme.textLabel; font: Theme.pageMeta }
-                        Text { text: modelData.lifecycle || ""; color: modelData.active ? Theme.success : Theme.textMuted; font: Theme.pageMeta }
-                        Text { text: modelData.origin || ""; color: Theme.textMuted; font: Theme.pageMeta }
+                        Text { objectName: "memoryClassification"; text: i18n.word("memory_classification", modelData.classification || ""); color: Theme.textLabel; font: Theme.pageMeta }
+                        Text { objectName: "memoryLifecycle"; text: i18n.word("memory_lifecycle", modelData.lifecycle || ""); color: modelData.active ? Theme.success : Theme.textMuted; font: Theme.pageMeta }
+                        Text { objectName: "memoryOrigin"; text: i18n.word("memory_origin", modelData.origin || ""); color: Theme.textMuted; font: Theme.pageMeta }
                         Text { text: page.when(modelData.created_at); color: Theme.textMuted; font: Theme.pageMetaFigures }
                     }
                     TextEdit { width: parent.width; readOnly: true; selectByMouse: true; wrapMode: Text.Wrap; text: modelData.text || ""; color: Theme.text; font: Theme.pageRow }

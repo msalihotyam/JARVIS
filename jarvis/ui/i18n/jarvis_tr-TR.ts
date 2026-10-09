@@ -1000,6 +1000,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <source>Type a command…</source>
         <translation>Bir komut yazın…</translation>
     </message>
+    <message>
+        <source>No command matches &quot;%1&quot;.</source>
+        <translation>&quot;%1&quot; ile eşleşen komut yok.</translation>
+    </message>
 </context>
 <context>
     <name>CommandPreset</name>
@@ -1080,24 +1084,8 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Disk</translation>
     </message>
     <message>
-        <source>Agent capacity</source>
-        <translation>Ajan kapasitesi</translation>
-    </message>
-    <message>
-        <source>Coding agents</source>
-        <translation>Kodlama ajanları</translation>
-    </message>
-    <message>
-        <source>Research agents</source>
-        <translation>Araştırma ajanları</translation>
-    </message>
-    <message>
-        <source>Browser agents</source>
-        <translation>Tarayıcı ajanları</translation>
-    </message>
-    <message>
-        <source>Unavailable in this build</source>
-        <translation>Bu sürümde kullanılamıyor</translation>
+        <source>This computer&apos;s load cannot be read, so no gauge is shown.</source>
+        <translation>Bu bilgisayarın yükü okunamıyor; bu yüzden gösterge yok.</translation>
     </message>
     <message>
         <source>Intelligence feed</source>
@@ -1106,14 +1094,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Quick commands</source>
         <translation>Hızlı komutlar</translation>
-    </message>
-    <message>
-        <source>Voice — N/A</source>
-        <translation>Ses — yok</translation>
-    </message>
-    <message>
-        <source>Calendar — N/A</source>
-        <translation>Takvim — yok</translation>
     </message>
 </context>
 <context>
@@ -1610,12 +1590,24 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>BU ARAYÜZ OTURUMU</translation>
     </message>
     <message>
+        <source>Nothing has happened in this window yet.</source>
+        <translation>Bu pencerede henüz bir şey olmadı.</translation>
+    </message>
+    <message>
+        <source>What JARVIS does while this window is open is listed here, newest first.</source>
+        <translation>Bu pencere açıkken JARVIS&apos;in yaptıkları burada listelenir; en yenisi en üstte.</translation>
+    </message>
+    <message>
         <source>CONVERSATIONS</source>
         <translation>SOHBETLER</translation>
     </message>
     <message>
         <source>New conversation</source>
         <translation>Yeni sohbet</translation>
+    </message>
+    <message>
+        <source>No conversations yet. Start one with New conversation.</source>
+        <translation>Henüz sohbet yok. Yeni sohbet ile bir tane başlatın.</translation>
     </message>
     <message>
         <source>open</source>
@@ -1662,8 +1654,8 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>bir görev etkin</translation>
     </message>
     <message>
-        <source>UNREADABLE</source>
-        <translation>OKUNAMADI</translation>
+        <source>cannot be read</source>
+        <translation>okunamıyor</translation>
     </message>
     <message>
         <source>1 task</source>
@@ -2009,8 +2001,28 @@ yok</translation>
         <translation>PROJE</translation>
     </message>
     <message>
-        <source>No project exists yet (%1).</source>
-        <translation>Henüz proje yok (%1).</translation>
+        <source>No project yet, so there is no project memory.</source>
+        <translation>Henüz proje yok, bu yüzden proje hafızası da yok.</translation>
+    </message>
+    <message>
+        <source>No memory records to show for this project.</source>
+        <translation>Bu proje için gösterilecek hafıza kaydı yok.</translation>
+    </message>
+    <message>
+        <source>Memory belongs to a project. Create one on the Projects page.</source>
+        <translation>Hafıza bir projeye aittir. Projeler sayfasından bir proje oluşturun.</translation>
+    </message>
+    <message>
+        <source>Records appear here once something is saved to this project&apos;s memory.</source>
+        <translation>Bu projenin hafızasına bir şey kaydedildiğinde kayıtlar burada görünür.</translation>
+    </message>
+    <message>
+        <source>Records appear here once something is saved to this project&apos;s memory. Replaced or retired ones, if any, show with the button above.</source>
+        <translation>Bu projenin hafızasına bir şey kaydedildiğinde kayıtlar burada görünür. Yenisiyle değiştirilen ya da kullanımdan kaldırılan kayıtlar varsa yukarıdaki düğmeyle görünür.</translation>
+    </message>
+    <message>
+        <source>Open Projects</source>
+        <translation>Projeleri aç</translation>
     </message>
 </context>
 <context>
@@ -4108,6 +4120,18 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>OTURUMLAR (son %1)</translation>
     </message>
     <message>
+        <source>No task sessions yet.</source>
+        <translation>Henüz görev oturumu yok.</translation>
+    </message>
+    <message>
+        <source>A session starts the first time you ask JARVIS for something; its tasks are listed here.</source>
+        <translation>JARVIS&apos;ten ilk kez bir şey istediğinizde bir oturum başlar; görevleri burada listelenir.</translation>
+    </message>
+    <message>
+        <source>Write to JARVIS</source>
+        <translation>JARVIS&apos;e yazın</translation>
+    </message>
+    <message>
         <source>Untitled session</source>
         <translation>Adsız oturum</translation>
     </message>
@@ -4116,16 +4140,36 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>%1 görev</translation>
     </message>
     <message>
-        <source>UNREADABLE</source>
-        <translation>OKUNAMADI</translation>
+        <source>Pick a task to see where it stands.</source>
+        <translation>Durumunu görmek için bir görev seçin.</translation>
+    </message>
+    <message>
+        <source>The snapshot shows the task&apos;s exact state, stage and record as JARVIS stored them.</source>
+        <translation>Anlık görünüm, görevin durumunu, aşamasını ve kaydını JARVIS&apos;in sakladığı haliyle gösterir.</translation>
     </message>
     <message>
         <source>1 task</source>
         <translation>1 görev</translation>
     </message>
     <message>
+        <source>cannot be read</source>
+        <translation>okunamıyor</translation>
+    </message>
+    <message>
         <source>TASKS</source>
         <translation>GÖREVLER</translation>
+    </message>
+    <message>
+        <source>Pick a session to see its tasks.</source>
+        <translation>Görevlerini görmek için bir oturum seçin.</translation>
+    </message>
+    <message>
+        <source>This session has no tasks.</source>
+        <translation>Bu oturumda görev yok.</translation>
+    </message>
+    <message>
+        <source>Untitled task</source>
+        <translation>Adsız görev</translation>
     </message>
     <message>
         <source>SNAPSHOT</source>
@@ -4405,7 +4449,7 @@ DOĞRULANMADI</translation>
     </message>
     <message>
         <source>Understanding</source>
-        <extracomment>Core vocabularies the window shows (jarvis.contracts LoopStage, JobKind, ProjectMemoryKind).</extracomment>
+        <extracomment>Core vocabularies the window shows (jarvis.contracts LoopStage, JobKind, ProjectMemoryKind, ...).</extracomment>
         <translation>Anlama</translation>
     </message>
     <message>
@@ -4487,6 +4531,82 @@ DOĞRULANMADI</translation>
     <message>
         <source>Thread</source>
         <translation>Konu</translation>
+    </message>
+    <message>
+        <source>Pending</source>
+        <translation>Bekliyor</translation>
+    </message>
+    <message>
+        <source>Needs a detail</source>
+        <translation>Bir ayrıntı gerekiyor</translation>
+    </message>
+    <message>
+        <source>Awaiting your approval</source>
+        <translation>Onayınız bekleniyor</translation>
+    </message>
+    <message>
+        <source>Awaiting a cost decision</source>
+        <translation>Maliyet kararınız bekleniyor</translation>
+    </message>
+    <message>
+        <source>Running</source>
+        <translation>Çalışıyor</translation>
+    </message>
+    <message>
+        <source>Completed</source>
+        <translation>Tamamlandı</translation>
+    </message>
+    <message>
+        <source>Denied</source>
+        <translation>Reddedildi</translation>
+    </message>
+    <message>
+        <source>Cancelling</source>
+        <translation>İptal ediliyor</translation>
+    </message>
+    <message>
+        <source>Public</source>
+        <translation>Herkese açık</translation>
+    </message>
+    <message>
+        <source>Internal</source>
+        <translation>Dahili</translation>
+    </message>
+    <message>
+        <source>Sensitive</source>
+        <translation>Hassas</translation>
+    </message>
+    <message>
+        <source>Secret</source>
+        <translation>Gizli</translation>
+    </message>
+    <message>
+        <source>In use</source>
+        <translation>Kullanımda</translation>
+    </message>
+    <message>
+        <source>Replaced by a newer record</source>
+        <translation>Yenisiyle değiştirildi</translation>
+    </message>
+    <message>
+        <source>Retired</source>
+        <translation>Kullanımdan kaldırıldı</translation>
+    </message>
+    <message>
+        <source>Written by you</source>
+        <translation>Sizin yazdığınız</translation>
+    </message>
+    <message>
+        <source>JARVIS decision</source>
+        <translation>JARVIS kararı</translation>
+    </message>
+    <message>
+        <source>Inferred</source>
+        <translation>Çıkarım</translation>
+    </message>
+    <message>
+        <source>Imported</source>
+        <translation>İçe aktarıldı</translation>
     </message>
     <message>
         <source>Unrecognized (%1)</source>

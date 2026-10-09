@@ -24,6 +24,8 @@ Item {
     property int surfaceShellMargin: 0
     property int surfaceShellBorder: 0
     property int surfaceRadius: 0
+    // The lowest y the surface may reach (K6: the summary peek stops above the composer).
+    property real bottomLimit: height
     default property alias content: inner.data
     readonly property real surfaceX: panel.x
     readonly property real surfaceY: panel.y
@@ -60,9 +62,9 @@ Item {
             anchors.fill: parent; anchors.margins: -context.surfaceShellMargin
             border { left: context.surfaceShellBorder; top: context.surfaceShellBorder; right: context.surfaceShellBorder; bottom: context.surfaceShellBorder } }
         width: Math.min(context.panelWidth, context.width - 32)
-        height: Math.min(context.panelHeight, context.height - 108)
+        height: Math.min(context.panelHeight, context.bottomLimit - 108)
         x: Math.max(16, Math.min(context.anchorPoint.x, context.width - width - 16))
-        y: Math.max(80, Math.min(context.anchorPoint.y, context.height - height - 16))
+        y: Math.max(80, Math.min(context.anchorPoint.y, context.bottomLimit - height - 16))
         opacity: context.open ? 1 : 0
         // Opening ~180 ms with 4 px of travel, closing slightly faster; no bounce.
         transform: Translate { y: context.open ? 0 : -Theme.travel; Behavior on y { NumberAnimation { duration: context.open ? Theme.panelIn : Theme.panelOut; easing.type: Easing.OutCubic } } }

@@ -32,8 +32,22 @@ ContextPanel {
     readonly property int metricsHeight: 76
     readonly property int rowHeight: 52
     readonly property int emptyHeight: 112
+    // K6: the peek never covers the composer - it ends above the composer's top
+    // (measured when it opens and when the window resizes; nothing can be typed while it is
+    // open). Closing keeps the last value, so the surface does not change size as it fades out.
+    onHeightChanged: if (open) bottomLimit = composerTop()
+    function composerTop() {
+        var stack = [peek.Window.contentItem]
+        while (stack.length) {
+            var node = stack.pop()
+            if (!node || !node.visible) continue
+            if (node.objectName === "canonicalComposer") return Math.min(peek.height, node.mapToItem(peek, 0, 0).y)
+            for (var i = 0; i < node.children.length; i++) stack.push(node.children[i])
+        }
+        return peek.height
+    }
     // Optional detail is the first thing to give way on a short viewport.
-    readonly property int maxRows: Math.max(2, Math.min(5, Math.floor((height - 108 - 50 - 16 - metricsHeight - 28 - 62 - 44) / rowHeight)))
+    readonly property int maxRows: Math.max(2, Math.min(5, Math.floor((bottomLimit - 108 - 50 - 16 - metricsHeight - 28 - 62 - 44) / rowHeight)))
     readonly property var rows: spec ? spec.rows.slice(0, maxRows) : []
     readonly property int listHeight: rows.length ? rows.length * rowHeight : emptyHeight
 
@@ -41,6 +55,17 @@ ContextPanel {
     function projectName(id) {
         var hit = bridge.projectRecords.filter(function(p) { return p.id === id })[0]
         return hit ? hit.name : id
+    }
+    // K6: the Focus count is the first active project's records IN USE. The
+    // listing holds whatever the Memory page loaded last (another project, or
+    // replaced / retired records too), so the peek reloads the default one on
+    // open and counts only what belongs to it.
+    readonly property string firstProject: bridge.projects.length ? bridge.projects[0] : ""
+    readonly property int firstProjectItems: bridge.memoryItems.filter(function(m) { return m.project_id === peek.firstProject && !!m.active }).length
+    onOpenChanged: {
+        if (!open) return
+        bottomLimit = composerTop()
+        if (key === "Focus") bridge.refreshMemory("", false)
     }
 
     readonly property var spec: {
@@ -60,7 +85,7 @@ ContextPanel {
                 var count = (s.task_count || 0) === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(s.task_count || 0)
                 rows.push({ title: s.title || count, sub: s.title ? count : qsTr("Untitled session"),
                             id: s.session_id, named: s.title || "", pill: s.active_task_id ? qsTr("Active task") : "",
-                            meta: i18n.when(s.updated_at, r.now, "day"), dot: s.active_task_id ? "live" : "quiet" })
+                            meta: i18n.when(s.updated_at, r.now, "day"), dot: s.active_task_id ? "live" : "quiet", page: "tasks" })
             })
             return { title: qsTr("Tasks"), subtitle: qsTr("The live task and recorded sessions"), icon: "tasks", tone: "#1b7fe0",
                      metrics: [{ value: bridge.taskLive ? 1 : 0, label: qsTr("Active task"), tone: Theme.accent },
@@ -71,11 +96,11 @@ ContextPanel {
         case "Focus":
             return { title: qsTr("Focus"), subtitle: qsTr("Active projects in memory"), icon: "focus", tone: "#b7801e",
                      metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
-                               { value: bridge.memoryItems.length,
-                                 label: bridge.projects.length ? qsTr("Items in %1").arg(peek.projectName(bridge.projects[0])) : qsTr("Memory items"), tone: Theme.textLabel }],
+                               { value: peek.firstProjectItems,
+                                 label: bridge.projects.length ? qsTr("Items in %1").arg(peek.projectName(peek.firstProject)) : qsTr("Memory items"), tone: Theme.textLabel }],
                      rows: bridge.projects.map(function(p, i) {
-                         return { title: peek.projectName(p), sub: i === 0 ? qsTr("%1 memory items").arg(bridge.memoryItems.length) : qsTr("Active project"),
-                                  pill: "", meta: "", dot: "live" } }),
+                         return { title: peek.projectName(p), sub: i === 0 ? qsTr("%1 memory items").arg(peek.firstProjectItems) : qsTr("Active project"),
+                                  pill: "", meta: "", dot: "quiet", project: p } }),
                      empty: qsTr("No active focus context yet."), emptyNote: qsTr("Projects appear here once memory holds one."),
                      action: { label: qsTr("Open Memory"), note: qsTr("Projects and reference data"), page: "memory" } }
         case "Plan":
@@ -84,7 +109,7 @@ ContextPanel {
                                { value: r.liveJobs.length - r.enabledJobs.length, label: qsTr("Paused"), tone: Theme.textLabel }],
                      rows: r.liveJobs.map(function(j) {
                          return { title: j.label || j.id, sub: j.kind ? i18n.word("job_kind", j.kind) : qsTr("Job"), pill: j.enabled ? qsTr("Scheduled") : qsTr("Paused"),
-                                  meta: j.enabled ? r.dueShort(j.next_due_at_utc) : "", dot: j.enabled ? "live" : "quiet" } }),
+                                  meta: j.enabled ? r.dueShort(j.next_due_at_utc) : "", dot: j.enabled ? "live" : "quiet", page: "automations" } }),
                      empty: qsTr("Nothing scheduled yet."), emptyNote: qsTr("Scheduled work appears here once a job exists."),
                      action: { label: qsTr("Open Automations"), note: qsTr("Scheduled jobs and their next runs"), page: "automations" } }
         }
@@ -134,7 +159,7 @@ ContextPanel {
                     Rectangle { x: 12; y: 1; width: parent.width - 24; height: 1; color: Theme.alpha(Theme.materialGlint, 0.35) }
                     Column {
                         x: 16; anchors.verticalCenter: parent.verticalCenter; spacing: -1
-                        Text { text: modelData.value; color: modelData.tone; font: Theme.figure(34) }
+                        Text { objectName: "summaryPeekMetricValue"; text: modelData.value; color: modelData.tone; font: Theme.figure(34) }
                         Row {
                             spacing: 7
                             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 7; height: 7; radius: 3.5; color: modelData.tone; opacity: 0.9 }
@@ -163,6 +188,23 @@ ContextPanel {
                         id: peekRow
                         objectName: "summaryPeekRow"
                         width: parent.width; height: peek.rowHeight
+                        // K6: a row with a place to go opens it (hover, pointer, Return); one without one is plain text.
+                        readonly property bool actionable: !!modelData.page || !!modelData.project
+                        function activate() {
+                            if (!actionable) return
+                            var page = modelData.page, project = modelData.project
+                            peek.open = false
+                            if (project) bridge.showProject(project); else bridge.setPage(page)
+                        }
+                        activeFocusOnTab: actionable
+                        Accessible.role: actionable ? Accessible.Button : Accessible.StaticText
+                        Accessible.name: modelData.title
+                        Keys.onReturnPressed: activate()
+                        Keys.onSpacePressed: activate()
+                        Rectangle { objectName: "summaryPeekRowHover"; anchors.fill: parent; anchors.leftMargin: -4; anchors.rightMargin: -4; radius: 8
+                                    visible: peekRow.actionable && (rowHit.containsMouse || peekRow.activeFocus); color: Theme.alpha(Theme.accent, 0.10) }
+                        MouseArea { id: rowHit; anchors.fill: parent; enabled: peekRow.actionable; hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor; onClicked: peekRow.activate() }
                         // Right-click a task or a session: Rename.
                         TapHandler { acceptedButtons: Qt.RightButton; enabled: !!modelData.id
                                      onTapped: function(point) { renameMenu.openFor(peekRow, point.position, modelData.id, modelData.named) } }

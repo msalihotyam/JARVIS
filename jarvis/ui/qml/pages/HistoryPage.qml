@@ -23,6 +23,9 @@ SecondaryPage {
         Column {
             width: parent.width * page.split - Theme.gap / 2; height: parent.height; spacing: 8
             Text { text: qsTr("THIS INTERFACE SESSION"); color: Theme.textLabel; font: Theme.pageSection }
+            PageEmpty { objectName: "historyActivityEmpty"; width: parent.width; visible: bridge.activity.length === 0
+                        title: qsTr("Nothing has happened in this window yet.")
+                        note: qsTr("What JARVIS does while this window is open is listed here, newest first.") }
             ListView {
                 width: parent.width; height: parent.height - 30; clip: true; spacing: 10
                 model: bridge.activity
@@ -52,6 +55,8 @@ SecondaryPage {
                            text: qsTr("CONVERSATIONS"); color: Theme.textLabel; font: Theme.pageSection }
                     ActionButton { objectName: "historyNewConversation"; anchors.right: parent.right; compact: true; label: qsTr("New conversation")
                                    onClicked: { bridge.newConversation(); bridge.setPage("home") } } }
+                Text { objectName: "historyConversationsEmpty"; visible: bridge.conversations.length === 0; width: parent.width; wrapMode: Text.Wrap
+                       text: qsTr("No conversations yet. Start one with New conversation."); color: Theme.textLabel; font: Theme.pageMeta }
                 Column {
                     width: parent.width; spacing: 4
                     Repeater {
@@ -114,7 +119,7 @@ SecondaryPage {
                             detail: page.when(modelData.updated_at) + "  ·  "
                                     + (modelData.task_count === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(modelData.task_count || 0))
                                     + (modelData.active_task_id ? "  ·  " + qsTr("a task is active") : "")
-                                    + (modelData.readable === false ? "  ·  " + qsTr("UNREADABLE") : "")
+                                    + (modelData.readable === false ? "  ·  " + qsTr("cannot be read") : "")
                             onActivated: { bridge.useSession(modelData.session_id); bridge.setPage("home") }
                             onContextRequested: function (position) { renameMenu.openFor(sessionRow, position, modelData.session_id, modelData.title) }
                         }
