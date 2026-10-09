@@ -1,0 +1,657 @@
+"""JARVIS Konveyor v1 - dispatches inbox prompts and backlog slices as `claude --bg` lanes.
+
+Stdlib only. No model calls, no git, never deletes files. Runtime state lives
+in build/conveyor/ (gitignored). One pass every 60 s; `--once` runs one pass.
+See JARVIS_RUNBOOK.md "Konveyor".
+"""
+import calendar
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
+SETTINGS = "build/conveyor/lanes.settings.json"
+MAX_LANES = 3
+STALE_LOCK_S = 300
+PASS_S = 60
+USAGE_S = 1800  # build/conveyor/usage_ledger.py cadence (optional runtime script)
+FINISHED = {"done", "idle"}
+IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
+MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, paged)
+PAGE_GAP_S = 600
+CRASH_PAGE = 3
+USAGE_LIMIT = 85  # % of the weekly plan; no new lanes at or above it
+USAGE_FRESH_S = 7 * 86400  # weekly % never drops before the window resets
+GOOD = {"PASS", "COMPLETE", "DONE", "GREEN", "OK"}
+BAD = {"BLOCKED", "STOP", "FAIL", "FAILED"}
+CONTINUE = ("Continue from where you stopped: this lane was re-dispatched because the "
+            "respawned session did not resume its turn. Check your worktree's git status "
+            "and git log first and do not redo finished work.\n\n")
+
+HEADER_RE = re.compile(
+    r"^@jarvis lane=([A-Za-z0-9_-]+) model=([A-Za-z0-9._\[\]-]+) "
+    r"effort=(low|medium|high|xhigh|max) base=([0-9a-f]{7,40}|main)\s*$"
+)
+BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
+STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*([A-Za-z]+)")
+TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+MODEL_RE = re.compile(r"[A-Za-z0-9._\[\]-]+")
+EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def parse_header(line):
+    m = HEADER_RE.match(line.lstrip("﻿").rstrip("\r\n"))
+    if not m:
+        return None
+    return dict(zip(("lane", "model", "effort", "base"), m.groups()))
+
+
+def claude_exe():
+    return shutil.which("claude") or str(Path.home() / ".local/bin/claude.exe")
+
+
+def real_runner(args, timeout=120):
+    """Run claude with args; return (returncode, combined output)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # stdin=DEVNULL: under pythonw claude otherwise blocks reading stdin
+    p = subprocess.run([claude_exe(), *args], cwd=ROOT, capture_output=True,
+                       stdin=subprocess.DEVNULL,
+                       timeout=timeout, creationflags=flags)
+    out = (p.stdout or b"") + (p.stderr or b"")
+    return p.returncode, out.decode("utf-8", "replace")
+
+
+def ntfy_send(text):
+    """Push text to ntfy. Returns a short result; the topic never leaves this function."""
+    topic = os.environ.get("JARVIS_NTFY_TOPIC", "")
+    if not TOPIC_RE.fullmatch(topic):
+        return "no-topic"
+    req = urllib.request.Request("https://ntfy.sh/" + topic, data=text.encode("utf-8"),
+                                 headers={"Title": "JARVIS Konveyor"})
+    try:
+        with urllib.request.urlopen(req, timeout=15):  # nosec B310 - fixed https URL, topic validated
+            return "sent"
+    except Exception as e:  # never str(e): keep any URL out of the log
+        return "error " + type(e).__name__
+
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+
+
+def glob_prefix(g):
+    """Literal part of a glob before its first wildcard, normalised."""
+    g = g.replace("\\", "/").lower()
+    if g.startswith("./"):
+        g = g[2:]
+    return re.split(r"[*?\[]", g, maxsplit=1)[0]
+
+
+def files_overlap(a, b):
+    # ponytail: literal-prefix test, conservative (jarvis/*.py vs jarvis/ui/x counts as overlap);
+    # a real glob intersection only if serialised slices hurt throughput
+    pa, pb = [glob_prefix(g) for g in a], [glob_prefix(g) for g in b]
+    return any(x.startswith(y) or y.startswith(x) for x in pa for y in pb)
+
+
+def utc_ts(s):
+    """Epoch of an ISO UTC time such as 2026-10-09T10:24:35.107Z."""
+    return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+
+
+def report_status(path):
+    try:
+        m = STATUS_RE.search(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    return m.group(1).upper() if m else None
+
+
+def validate_slice(s):
+    if not isinstance(s, dict):
+        return "not an object"
+    if not isinstance(s.get("id"), str) or not ID_RE.fullmatch(s["id"]):
+        return "bad id"
+    if not isinstance(s.get("model"), str) or not MODEL_RE.fullmatch(s["model"]):
+        return "bad model"
+    if s.get("effort") not in EFFORTS:
+        return "bad effort"
+    if s.get("tier") not in ("T0", "T1", "T2"):
+        return "bad tier"
+    if not isinstance(s.get("prompt"), str) or not s["prompt"]:
+        return "bad prompt"
+    for k in ("files", "depends_on"):
+        if not isinstance(s.get(k, []), list) or not all(isinstance(x, str) for x in s.get(k, [])):
+            return f"bad {k}"
+    return None
+
+
+class Conveyor:
+    def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send):
+        self.root = Path(root)
+        self.base = self.root / "build" / "conveyor"
+        self.reports = self.root / "build" / "reports"
+        self.run = runner
+        self.now = now
+        self.send = send
+        self.inbox = self.base / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.lock = self.base / "conveyor.lock"
+        self.state_file = self.base / "lanes.json"  # lanes this conveyor owns
+        self.pager_file = self.base / "pager.json"
+        self.pid = os.getpid()
+        self.last_error = None
+        self.usage = None
+        self.backlog_view = []
+
+    # ---- lock -------------------------------------------------------
+    def acquire_lock(self):
+        try:
+            cur = json.loads(self.lock.read_text())
+            if cur.get("pid") != self.pid and self.now() - cur.get("heartbeat", 0) < STALE_LOCK_S:
+                return False
+        except (OSError, ValueError):
+            pass
+        self.heartbeat()
+        return True
+
+    def heartbeat(self):
+        self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": self.now()}))
+
+    def own_lock(self):
+        try:
+            return json.loads(self.lock.read_text()).get("pid") == self.pid
+        except (OSError, ValueError):
+            return False
+
+    # ---- persistence ------------------------------------------------
+    def load_json(self, path, default):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return default
+
+    def load_lanes(self):
+        return self.load_json(self.state_file, {})
+
+    def save_lanes(self, lanes):
+        self.state_file.write_text(json.dumps(lanes, indent=2))
+
+    def event(self, kind, **kw):
+        rec = {"ts": iso(self.now()), "event": kind, **kw}
+        with open(self.base / "events.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def error(self, msg, **kw):
+        self.last_error = f"{iso(self.now())} {msg}"
+        self.event("error", message=msg, **kw)
+
+    # ---- pager --------------------------------------------------------
+    def page(self, text):
+        p = self.load_json(self.pager_file, {})
+        p.setdefault("pending", []).append(text)
+        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+
+    def flush_pages(self):
+        """Send pending pages as one push, at most one push per PAGE_GAP_S."""
+        p = self.load_json(self.pager_file, {})
+        if not p.get("pending") or self.now() - p.get("last_push", 0) < PAGE_GAP_S:
+            return
+        text = "\n".join(p["pending"])[:1000]
+        result = self.send(text)
+        self.event("page", result=result, lines=len(p["pending"]))
+        if result != "no-topic":
+            p["last_push"] = self.now()
+        if result in ("sent", "no-topic"):
+            p["pending"] = []  # on a send error they are retried after the gap
+        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+
+    def pager_flag(self, key, value=None):
+        p = self.load_json(self.pager_file, {})
+        if value is None:
+            return p.get(key)
+        p[key] = value
+        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+
+    # ---- reports ------------------------------------------------------
+    def find_report(self, name, since=0.0, cwd=None):
+        """Newest <name>.md with a STATUS line, written at/after `since`, in the
+        canonical build/reports, any .claude/worktrees/*/build/reports or the lane cwd."""
+        cands = [self.reports / f"{name}.md"]
+        cands += (self.root / ".claude" / "worktrees").glob(f"*/build/reports/{name}.md")
+        if cwd:
+            cands.append(Path(cwd) / "build" / "reports" / f"{name}.md")
+        best = None
+        for c in cands:
+            try:
+                mt = c.stat().st_mtime
+            except OSError:
+                continue
+            st = report_status(c) if mt >= since else None
+            if st and (best is None or mt > best[1]):
+                best = (c, mt, st)
+        return best and (best[0], best[2])
+
+    def collect(self, name, src):
+        """Copy a worktree report into the canonical build/reports (an older,
+        different canonical file is kept as <name>.<ts>.md)."""
+        dest = self.reports / f"{name}.md"
+        try:
+            if src.resolve() == dest.resolve():
+                return dest
+            self.reports.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                if dest.read_bytes() == src.read_bytes():
+                    return dest
+                ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
+                os.replace(dest, dest.with_name(f"{name}.{ts}.md"))
+            shutil.copy2(src, dest)
+            self.event("collect", lane=name, src=str(src))
+        except OSError as e:
+            self.error(f"collect {name}: {e}", lane=name)
+            return src
+        return dest
+
+    # ---- one pass ---------------------------------------------------
+    def agents(self):
+        rc, out = self.run(["agents", "--json", "--all"])
+        if rc != 0:
+            raise RuntimeError(f"claude agents rc={rc}: {out[:300]}")
+        return json.loads(out[out.index("["):])
+
+    def pass_once(self):
+        """One pass; returns False when `claude agents` could not be read."""
+        self.last_error = None
+        lanes = self.load_lanes()
+        try:
+            agents = self.agents()
+        except Exception as e:  # keep going, report it
+            self.error(f"agents: {e}")
+            agents = None
+        self.usage = self.usage_pct()
+        if agents is not None:
+            self.track(lanes, agents)
+            self.dispatch(lanes, agents)
+        self.save_lanes(lanes)
+        self.write_status(lanes)
+        self.flush_pages()
+        return agents is not None
+
+    def started_ts(self, ln):
+        if "started_ts" in ln:
+            return ln["started_ts"]
+        try:
+            return time.mktime(time.strptime(ln["started_at"], "%Y-%m-%dT%H:%M:%S"))
+        except (KeyError, ValueError):
+            return 0.0
+
+    def finish(self, name, ln, report, status):
+        quiet = ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
+        ln["finished"] = True
+        ln["status"] = status
+        ln["report"] = str(self.collect(name, report))
+        self.event("finish", lane=name, id=ln["id"], status=status, report=ln["report"])
+        if status in BAD and not quiet:
+            self.page(f"{name}: STATUS {status}")
+
+    def track(self, lanes, agents):
+        by_id = {a.get("id"): a for a in agents}
+        for name, ln in lanes.items():
+            a = by_id.get(ln["id"])
+            state = "missing" if a is None else a.get("state") or a.get("status") or "unknown"
+            alive = a is not None and "pid" in a
+            ln["state"] = state if alive or state in FINISHED or a is None else "stopped"
+            ln["idle"] = alive and a.get("status") == "idle"
+            ln["updated_at"] = iso(self.now())
+            if ln.get("finished") and ln.get("status"):
+                continue
+            found = self.find_report(name, self.started_ts(ln), a and a.get("cwd"))
+            if found:  # a report wins over any session state
+                self.finish(name, ln, *found)
+                continue
+            if ln.get("finished"):
+                continue
+            if state in FINISHED:
+                ln["finished"] = True
+                self.event("finish", lane=name, id=ln["id"], state=state)
+                continue
+            if alive:
+                ln["respawn_pending"] = False
+            elif a is not None and not ln.get("respawn_pending"):
+                # stopped without finishing or reporting (reboot/sleep): respawn, once per stop
+                ln.update(respawned=True, respawn_pending=True, respawned_ts=self.now())
+                rc, out = self.run(["respawn", ln["id"]])
+                self.event("respawn", lane=name, id=ln["id"], rc=rc, output=out[-300:])
+                if rc != 0:
+                    self.error(f"respawn {name} rc={rc}", lane=name)
+                continue
+            if (ln.get("respawned_ts") and a is not None and a.get("status") != "busy"
+                    and not self.hold()
+                    and self.now() - ln["respawned_ts"] >= IDLE_REDISPATCH_S
+                    and not self.active_since(name, ln["respawned_ts"], a.get("cwd"))):
+                if ln.get("redispatches", 0) >= MAX_REDISPATCH:
+                    ln.update(finished=True, status="STUCK")
+                    self.event("finish", lane=name, id=ln["id"], status="STUCK")
+                    self.page(f"{name}: STUCK (yeniden başlatıldı, ilerlemiyor)")
+                else:
+                    self.redispatch(name, ln)
+
+    def active_since(self, name, t, cwd):
+        """Any new file in the lane worktree or test-ledger row for it since t."""
+        ledger = self.root / "build" / "flakes" / "ledger.jsonl"
+        try:
+            for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
+                try:
+                    row = json.loads(line)
+                    ts = utc_ts(row["time"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if row.get("lane") == name and ts >= t:
+                    return True
+        except OSError:
+            pass
+        if not cwd or Path(cwd).resolve() == self.root.resolve():
+            return False  # ponytail: a lane still in the canonical root is judged by the ledger only
+        for d, ds, fs in os.walk(cwd):
+            ds[:] = [x for x in ds if x not in (".git", "__pycache__", "node_modules", ".venv")]
+            for f in fs:
+                try:
+                    if os.stat(os.path.join(d, f)).st_mtime >= t:
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def redispatch(self, name, ln):
+        """Stop the silent respawned session (its conversation is kept) and start the
+        lane again from its saved prompt with a 'continue' preface."""
+        ln["redispatches"] = ln.get("redispatches", 0) + 1
+        ln.pop("respawned_ts", None)
+        try:
+            text = (self.base / ln["prompt"]).read_text(encoding="utf-8")
+        except (OSError, KeyError) as e:
+            self.error(f"redispatch {name}: prompt: {e}", lane=name)
+            return
+        rc, out = self.run(["stop", ln["id"]])
+        self.event("stop", lane=name, id=ln["id"], rc=rc, output=out[-300:])
+        first, _, rest = text.partition("\n")
+        hdr = parse_header(first) or {"base": ln.get("base", "main")}
+        header = f"@jarvis lane={name} model={ln['model']} effort={ln['effort']} base={hdr['base']}\n"
+        sid = self.start(name, ln["model"], ln["effort"], header + CONTINUE + rest)
+        if sid:
+            self.event("redispatch", lane=name, old_id=ln["id"], id=sid)
+            ln.setdefault("prev_ids", []).append(ln["id"])
+            ln.update(id=sid, state="working", idle=False, respawn_pending=False,
+                      updated_at=iso(self.now()))
+
+    def running(self, lanes):
+        return [n for n, ln in lanes.items()
+                if not ln.get("finished") and ln.get("state") not in ("missing",)]
+
+    def start(self, name, model, effort, text):
+        """`claude --bg` one lane; returns its short id or None."""
+        rc, out = self.run(["--bg", "--name", name, "--model", model,
+                            "--effort", effort, "--settings", SETTINGS, text])
+        m = BG_ID_RE.search(out)
+        if rc != 0 or not m:
+            self.error(f"dispatch {name} rc={rc}", output=out[-300:])
+            return None
+        return m.group(1)
+
+    def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False):
+        lanes[name] = {"id": sid, "model": model, "effort": effort, "base": base,
+                       "started_at": iso(self.now()), "started_ts": self.now(),
+                       "updated_at": iso(self.now()), "state": "working",
+                       "prompt": str(prompt.relative_to(self.base)), "files": files or [],
+                       "slice": slice_}
+
+    def usage_pct(self):
+        """Weekly plan % from the newest jarvis-flow slice-ledger row (claude has no
+        usage command); None when unknown or older than USAGE_FRESH_S."""
+        f = self.root / "build" / "ledger" / "slices.jsonl"
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(max(0, fh.seek(0, 2) - 65536))
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+                pct = row["seven_day"]["end"]
+                if pct is None:
+                    pct = row["seven_day"]["start"]
+                ts = utc_ts(row["end"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(pct, (int, float)):
+                return pct if self.now() - ts <= USAGE_FRESH_S else None
+        return None
+
+    def busy_names(self, lanes, agents):
+        done_ids = {ln["id"] for ln in lanes.values() if ln.get("finished")}
+        names = {a.get("name") for a in agents
+                 if "pid" in a and a.get("id") not in done_ids and a.get("status") != "idle"
+                 and (a.get("state") or a.get("status")) not in FINISHED}
+        names |= {n for n in self.running(lanes) if not lanes[n].get("idle")}
+        return names
+
+    def hold(self):
+        """PAUSE flag or usage guard: nothing new starts."""
+        return (self.base / "PAUSE").exists() or (self.usage is not None and self.usage >= USAGE_LIMIT)
+
+    def dispatch(self, lanes, agents):
+        if self.hold():
+            return
+        busy = self.busy_names(lanes, agents)
+        started = False
+        files = sorted(self.inbox.glob("*.md"), key=lambda p: p.stat().st_mtime)
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except OSError as e:
+                self.error(f"read {f.name}: {e}")
+                continue
+            hdr = parse_header(text.splitlines()[0] if text else "")
+            if hdr is None:
+                self.reject(f, "line 1 is not a valid '@jarvis lane=.. model=.. effort=.. base=..' header")
+                continue
+            name = hdr["lane"]
+            if len(self.running(lanes)) >= MAX_LANES:
+                return
+            if name in busy:
+                continue  # same-name lane still working; wait
+            sid = self.start(name, hdr["model"], hdr["effort"], text)
+            if not sid:
+                continue
+            dest = self.started_path(name)
+            os.replace(f, dest)
+            self.record(lanes, name, sid, hdr["model"], hdr["effort"], hdr["base"], dest)
+            busy.add(name)
+            started = True
+            self.event("dispatch", lane=name, id=sid, model=hdr["model"],
+                       effort=hdr["effort"], file=dest.name)
+        waiting = list(self.inbox.glob("*.md"))
+        if not waiting:
+            started = self.dispatch_backlog(lanes, busy) or started
+        if started or waiting or self.running(lanes):
+            self.pager_flag("dry", False)
+        elif not self.pager_flag("dry"):
+            self.pager_flag("dry", True)
+            self.page("Konveyor: kuyruk boş, çalışan lane yok")
+
+    def started_path(self, name):
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
+        dest = self.inbox / "started" / f"{ts}-{name}.md"
+        dest.parent.mkdir(exist_ok=True)
+        return dest
+
+    # ---- backlog ------------------------------------------------------
+    def load_backlog(self):
+        f = self.base / "backlog.json"
+        if not f.exists():
+            return [], []
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            return [], [f"backlog.json: {e}"]
+        slices = data.get("slices") if isinstance(data, dict) else data
+        if not isinstance(slices, list):
+            return [], ["backlog.json: no slices list"]
+        good, errors = [], []
+        for i, s in enumerate(slices):
+            why = validate_slice(s)
+            if why:
+                errors.append(f"slice {i} ({s.get('id') if isinstance(s, dict) else '?'}): {why}")
+            else:
+                good.append(s)
+        return good, errors
+
+    def slice_done(self, sid, lanes):
+        ln = lanes.get(sid)
+        if ln and ln.get("status"):
+            return ln["status"] in GOOD
+        found = self.find_report(sid)
+        return bool(found) and found[1] in GOOD
+
+    def pick_slice(self, slices, lanes, busy):
+        """First dispatchable slice (or None) and a {id: state} view of the backlog."""
+        view, choice = {}, None
+        run_files = [lanes[n].get("files", []) for n in self.running(lanes)]
+        for s in slices:
+            sid = s["id"]
+            if sid in lanes:
+                ln = lanes[sid]
+                view[sid] = ln.get("status") or ("finished" if ln.get("finished") else "running")
+                continue
+            found = self.find_report(sid)
+            if found:
+                view[sid] = found[1]
+            elif s["tier"] == "T2" and s.get("approved") is not True:
+                view[sid] = "needs_t2_approval"
+            elif not all(self.slice_done(d, lanes) for d in s.get("depends_on", [])):
+                view[sid] = "waiting_deps"
+            elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
+                view[sid] = "overlap"
+            elif sid in busy:
+                view[sid] = "same_name_busy"
+            else:
+                view[sid] = "ready"
+                choice = choice or s
+        return choice, view
+
+    def dispatch_backlog(self, lanes, busy):
+        slices, errors = self.load_backlog()
+        started = False
+        while True:
+            s, view = self.pick_slice(slices, lanes, busy)
+            self.backlog_view = [{"id": k, "state": v} for k, v in view.items()] + \
+                                [{"error": e} for e in errors]
+            if s is None or len(self.running(lanes)) >= MAX_LANES:
+                return started
+            name = s["id"]
+            try:
+                body = (self.root / s["prompt"]).read_text(encoding="utf-8")
+            except OSError as e:
+                self.error(f"backlog {name}: prompt: {e}", lane=name)
+                slices = [x for x in slices if x is not s]
+                continue
+            first, _, rest = body.partition("\n")
+            hdr = parse_header(first)
+            base = hdr["base"] if hdr else "main"
+            text = (f"@jarvis lane={name} model={s['model']} effort={s['effort']} base={base}\n"
+                    + (rest if hdr else body))
+            sid = self.start(name, s["model"], s["effort"], text)
+            if not sid:
+                slices = [x for x in slices if x is not s]  # retry next pass
+                continue
+            dest = self.started_path(name)
+            dest.write_text(text, encoding="utf-8")
+            self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
+                        files=s.get("files", []), slice_=True)
+            busy.add(name)
+            started = True
+            self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
+                       file=dest.name, backlog=True, tier=s["tier"])
+
+    def reject(self, f, reason):
+        d = self.inbox / "rejected"
+        d.mkdir(exist_ok=True)
+        dest = d / f.name
+        os.replace(f, dest)
+        (d / (f.name + ".reason.txt")).write_text(reason + "\n", encoding="utf-8")
+        self.event("reject", file=f.name, reason=reason)
+
+    def write_status(self, lanes):
+        status = {
+            "updated_at": iso(self.now()),
+            "pid": self.pid,
+            "paused": (self.base / "PAUSE").exists(),
+            "last_error": self.last_error,
+            "usage_pct": self.usage,
+            "usage_hold": self.usage is not None and self.usage >= USAGE_LIMIT,
+            "lanes": [{"name": n, "id": ln["id"], "model": ln.get("model"),
+                       "effort": ln.get("effort"), "state": ln.get("state"),
+                       "status": ln.get("status"), "report": ln.get("report"),
+                       "started_at": ln.get("started_at"), "updated_at": ln.get("updated_at")}
+                      for n, ln in lanes.items()],
+            "backlog": self.backlog_view,
+        }
+        tmp = self.base / "status.json.tmp"
+        tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.base / "status.json")
+
+    def note_pass(self, ok):
+        """Count failed passes in a row; page once at CRASH_PAGE."""
+        n = 0 if ok else (self.pager_flag("crashes") or 0) + 1
+        self.pager_flag("crashes", n)
+        if n == CRASH_PAGE:
+            self.page(f"Konveyor: {n} geçiş üst üste hata verdi ({self.last_error})")
+
+    def usage_ledger(self):
+        script = self.base / "usage_ledger.py"
+        if script.exists():  # optional runtime script; read-only transcript parse
+            if str(self.base) not in sys.path:
+                sys.path.insert(0, str(self.base))
+            import usage_ledger
+            usage_ledger.main()
+
+    def loop(self, once=False):
+        if not self.acquire_lock():
+            return 0  # another instance is alive
+        last_usage = 0.0
+        while True:
+            ok = False
+            try:
+                self.heartbeat()
+                ok = self.pass_once()
+                if not once and self.now() - last_usage >= USAGE_S:
+                    last_usage = self.now()
+                    self.usage_ledger()
+            except Exception as e:
+                try:
+                    self.error(f"pass: {e!r}")
+                except Exception:
+                    pass
+            try:
+                self.note_pass(ok)
+                self.flush_pages()
+            except Exception:
+                pass
+            if once:  # release: a zero heartbeat is stale at once
+                self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": 0}))
+                return 0
+            time.sleep(PASS_S)
+            if not self.own_lock():
+                return 0  # someone took the lock over
+
+
+if __name__ == "__main__":
+    sys.exit(Conveyor().loop(once="--once" in sys.argv))
