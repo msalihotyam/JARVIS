@@ -357,7 +357,8 @@ Rectangle {
     }
     function when(c, group) {
         var t = stamp(c.updated_at)
-        return isNaN(t) ? "" : new Date(t).toLocaleString(Qt.locale(i18n.qtLocale), group === "earlier" ? "d MMM" : "HH:mm")
+        // Under Today / Yesterday the time of day; Earlier gets its day from the one formatter.
+        return isNaN(t) ? "" : group === "earlier" ? i18n.when(c.updated_at, today, "day") : new Date(t).toLocaleString(Qt.locale(i18n.qtLocale), "HH:mm")
     }
     // Height: the fixed blocks, then the project list (5 / 3 whole rows, fewer
     // while the conversations would keep less than two whole rows under a

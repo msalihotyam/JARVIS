@@ -42,11 +42,6 @@ ContextPanel {
         var hit = bridge.projectRecords.filter(function(p) { return p.id === id })[0]
         return hit ? hit.name : id
     }
-    function shortDate(v) {
-        if (!v) return ""
-        var d = new Date(v)
-        return isNaN(d.getTime()) ? String(v).slice(0, 10) : d.toLocaleDateString(Qt.locale(i18n.qtLocale), "d MMM")
-    }
 
     readonly property var spec: {
         if (!rail) return null
@@ -57,7 +52,7 @@ ContextPanel {
             if (bridge.taskLive)
                 rows.push({ title: bridge.task.title || bridge.task.capability || qsTr("Current request"),
                             id: bridge.task.task_id || "", named: bridge.task.title || "",
-                            sub: bridge.task.stage ? qsTr("Stage: %1").arg(bridge.task.stage) : (bridge.task.connector || qsTr("Live task")),
+                            sub: bridge.task.stage ? qsTr("Stage: %1").arg(i18n.word("stage", bridge.task.stage)) : (bridge.task.connector || qsTr("Live task")),
                             pill: r.statusWord(bridge.task.status) || qsTr("Running"), meta: qsTr("Now"),
                             dot: bridge.coreState === "awaiting_approval" ? "warn" : (bridge.coreState === "error" || bridge.coreState === "unknown") ? "alert" : "live" })
             bridge.sessions.forEach(function(s) {
@@ -65,7 +60,7 @@ ContextPanel {
                 var count = (s.task_count || 0) === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(s.task_count || 0)
                 rows.push({ title: s.title || count, sub: s.title ? count : qsTr("Untitled session"),
                             id: s.session_id, named: s.title || "", pill: s.active_task_id ? qsTr("Active task") : "",
-                            meta: peek.shortDate(s.updated_at), dot: s.active_task_id ? "live" : "quiet" })
+                            meta: i18n.when(s.updated_at, r.now, "day"), dot: s.active_task_id ? "live" : "quiet" })
             })
             return { title: qsTr("Tasks"), subtitle: qsTr("The live task and recorded sessions"), icon: "tasks", tone: "#1b7fe0",
                      metrics: [{ value: bridge.taskLive ? 1 : 0, label: qsTr("Active task"), tone: Theme.accent },
@@ -88,7 +83,7 @@ ContextPanel {
                      metrics: [{ value: r.enabledJobs.length, label: qsTr("Scheduled"), tone: "#37c4f0" },
                                { value: r.liveJobs.length - r.enabledJobs.length, label: qsTr("Paused"), tone: Theme.textLabel }],
                      rows: r.liveJobs.map(function(j) {
-                         return { title: j.label || j.id, sub: j.kind || qsTr("Job"), pill: j.enabled ? qsTr("Scheduled") : qsTr("Paused"),
+                         return { title: j.label || j.id, sub: j.kind ? i18n.word("job_kind", j.kind) : qsTr("Job"), pill: j.enabled ? qsTr("Scheduled") : qsTr("Paused"),
                                   meta: j.enabled ? r.dueShort(j.next_due_at_utc) : "", dot: j.enabled ? "live" : "quiet" } }),
                      empty: qsTr("Nothing scheduled yet."), emptyNote: qsTr("Scheduled work appears here once a job exists."),
                      action: { label: qsTr("Open Automations"), note: qsTr("Scheduled jobs and their next runs"), page: "automations" } }

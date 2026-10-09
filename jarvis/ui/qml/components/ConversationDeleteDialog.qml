@@ -26,10 +26,7 @@ JarvisDialog {
     readonly property bool shown: !!preview.conversation_id && preview.conversation_id === targetId
     function openFor(conversationId) { targetId = conversationId || ""; bridge.previewDeleteConversation(targetId); open() }
     onClosed: bridge.previewDeleteConversation("")
-    function when(v) {
-        var d = new Date(v)
-        return !v ? "" : isNaN(d.getTime()) ? String(v) : d.toLocaleString(Qt.locale(i18n.qtLocale), "d MMM yyyy HH:mm")
-    }
+    function when(v) { return !v ? "" : i18n.when(v, Date.now(), "time") || String(v) }
 
     component Line: Text {
         width: parent ? parent.width : 0; wrapMode: Text.Wrap; textFormat: Text.PlainText; color: Theme.text; font: Theme.pageMeta

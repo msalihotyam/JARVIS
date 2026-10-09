@@ -44,16 +44,15 @@ Item {
         return s < 60 ? qsTr("%1s ago").arg(s) : s < 3600 ? qsTr("%1m ago").arg(Math.floor(s / 60))
              : s < 86400 ? qsTr("%1h ago").arg(Math.floor(s / 3600)) : qsTr("%1d ago").arg(Math.floor(s / 86400))
     }
-    function dueShort(iso) {
-        if (!iso) return ""
-        var d = new Date(iso)
-        if (isNaN(d.getTime())) return ""
-        var loc = Qt.locale(i18n.qtLocale)
-        return d.toDateString() === new Date(rail.now).toDateString() ? d.toLocaleTimeString(loc, "HH:mm") : d.toLocaleDateString(loc, "ddd d MMM")
-    }
+    // K3: dates through the one formatter - a time today, else the day ("yesterday", "3 Oct").
+    function dueShort(iso) { return i18n.when(iso, rail.now, "short") }
+    // Every Core task status as a word; an unknown code is named as such and kept exact.
     function statusWord(s) {
-        return ({ running: qsTr("Running"), awaiting_approval: qsTr("Awaiting you"), awaiting_clarification: qsTr("Needs a detail"),
-                  completed: qsTr("Completed"), failed: qsTr("Failed"), rejected: qsTr("Denied"), cancelled: qsTr("Cancelled") })[s] || (s || "")
+        return ({ pending: qsTr("Pending"), running: qsTr("Running"), verifying: qsTr("Verifying"), awaiting_approval: qsTr("Awaiting you"),
+                  awaiting_clarification: qsTr("Needs a detail"), awaiting_cost_override: qsTr("Cost check"),
+                  completed: qsTr("Completed"), failed: qsTr("Failed"), rejected: qsTr("Denied"),
+                  cancel_requested: qsTr("Cancelling"), cancelling: qsTr("Cancelling"), cancelled: qsTr("Cancelled") })[s]
+               || (s ? qsTr("Unrecognized (%1)").arg(s) : "")
     }
 
     // -- real state, shaped once ------------------------------------------
@@ -132,13 +131,7 @@ Item {
     }
 
     // -- T3: the next scheduled job ----------------------------------------
-    function dayOf(iso) {
-        var d = new Date(iso), today = new Date(rail.now)
-        var tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1)
-        if (d.toDateString() === today.toDateString()) return qsTr("today")
-        if (d.toDateString() === tomorrow.toDateString()) return qsTr("tomorrow")
-        return d.toLocaleDateString(Qt.locale(i18n.qtLocale), "ddd d MMM")
-    }
+    function dayOf(iso) { return i18n.when(iso, rail.now, "day") }
     readonly property var planTile: {
         var tile = { id: "plan", key: "Plan", title: qsTr("Plan"), icon: "plan", tone: "#9b7bff" }
         var job = rail.nextJob

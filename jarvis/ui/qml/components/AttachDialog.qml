@@ -33,10 +33,7 @@ JarvisDialog {
         bridge.previewAttach("", ""); open()
     }
     function repreview() { bridge.previewAttach(useNew ? "" : chosenId, useNew ? newName.text : "") }
-    function when(v) {
-        var d = new Date(v)
-        return !v ? "" : isNaN(d.getTime()) ? String(v) : d.toLocaleString(Qt.locale(i18n.qtLocale), "d MMM yyyy HH:mm")
-    }
+    function when(v) { return !v ? "" : i18n.when(v, Date.now(), "time") || String(v) }
 
     component Choice: Rectangle {
         id: choice

@@ -39,7 +39,7 @@ ContextPanel {
     readonly property var reported: usage.reported || ({})
     readonly property int calls: usage.call_count > 1 ? usage.call_count : 1
     function tokens(value) { return value === undefined ? "—" : Number(value).toLocaleString(Qt.locale(i18n.qtLocale), "f", 0) }
-    function when(epoch) { return epoch ? new Date(epoch * 1000).toLocaleString(Qt.locale(i18n.qtLocale), Locale.ShortFormat) : "" }
+    function when(epoch) { return epoch ? i18n.when(epoch, Date.now(), "time") : "" }
     function percent(fraction) { return Math.round(fraction * 100) }
     function selectable(p) { return !!p && (p.id === "claude" || p.id === "codex") && p.status === "available" }
     function statusText(p) {

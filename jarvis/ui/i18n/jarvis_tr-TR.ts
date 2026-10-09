@@ -2407,6 +2407,10 @@ yok</translation>
         <translation>iptal edildi</translation>
     </message>
     <message>
+        <source>unrecognized (%1)</source>
+        <translation>tanınmayan (%1)</translation>
+    </message>
+    <message>
         <source>EDIT</source>
         <translation>DÜZENLE</translation>
     </message>
@@ -3921,8 +3925,20 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Sizi bekliyor</translation>
     </message>
     <message>
+        <source>Pending</source>
+        <translation>Bekliyor</translation>
+    </message>
+    <message>
+        <source>Verifying</source>
+        <translation>Doğrulanıyor</translation>
+    </message>
+    <message>
         <source>Needs a detail</source>
         <translation>Bir ayrıntı gerekiyor</translation>
+    </message>
+    <message>
+        <source>Cost check</source>
+        <translation>Maliyet onayı</translation>
     </message>
     <message>
         <source>Completed</source>
@@ -3939,6 +3955,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Cancelled</source>
         <translation>İptal edildi</translation>
+    </message>
+    <message>
+        <source>Cancelling</source>
+        <translation>İptal ediliyor</translation>
+    </message>
+    <message>
+        <source>Unrecognized (%1)</source>
+        <translation>Tanınmayan (%1)</translation>
     </message>
     <message>
         <source>Tasks</source>
@@ -4015,14 +4039,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>%1 conversations</source>
         <translation>%1 sohbet</translation>
-    </message>
-    <message>
-        <source>today</source>
-        <translation>bugün</translation>
-    </message>
-    <message>
-        <source>tomorrow</source>
-        <translation>yarın</translation>
     </message>
     <message>
         <source>No scheduled job</source>
@@ -4370,6 +4386,111 @@ DOĞRULANMADI</translation>
     <message>
         <source>JARVIS is still running in the background.</source>
         <translation>JARVIS arka planda çalışmaya devam ediyor.</translation>
+    </message>
+</context>
+<context>
+    <name>Wording</name>
+    <message>
+        <source>yesterday</source>
+        <extracomment>Calendar-day distance -&gt; its word.</extracomment>
+        <translation>dün</translation>
+    </message>
+    <message>
+        <source>today</source>
+        <translation>bugün</translation>
+    </message>
+    <message>
+        <source>tomorrow</source>
+        <translation>yarın</translation>
+    </message>
+    <message>
+        <source>Understanding</source>
+        <extracomment>Core vocabularies the window shows (jarvis.contracts LoopStage, JobKind, ProjectMemoryKind).</extracomment>
+        <translation>Anlama</translation>
+    </message>
+    <message>
+        <source>Gathering context</source>
+        <translation>Bağlam toplama</translation>
+    </message>
+    <message>
+        <source>Clarifying</source>
+        <translation>Netleştirme</translation>
+    </message>
+    <message>
+        <source>Planning</source>
+        <translation>Planlama</translation>
+    </message>
+    <message>
+        <source>Checking permission</source>
+        <translation>İzin denetimi</translation>
+    </message>
+    <message>
+        <source>Checking cost</source>
+        <translation>Maliyet denetimi</translation>
+    </message>
+    <message>
+        <source>Choosing a tool</source>
+        <translation>Araç seçimi</translation>
+    </message>
+    <message>
+        <source>Executing</source>
+        <translation>Yürütme</translation>
+    </message>
+    <message>
+        <source>Verifying</source>
+        <translation>Doğrulama</translation>
+    </message>
+    <message>
+        <source>Presenting</source>
+        <translation>Sunma</translation>
+    </message>
+    <message>
+        <source>Recording</source>
+        <translation>Kaydetme</translation>
+    </message>
+    <message>
+        <source>Done</source>
+        <translation>Bitti</translation>
+    </message>
+    <message>
+        <source>Failed</source>
+        <translation>Başarısız</translation>
+    </message>
+    <message>
+        <source>Cancelled</source>
+        <translation>İptal edildi</translation>
+    </message>
+    <message>
+        <source>One-time</source>
+        <translation>Tek seferlik</translation>
+    </message>
+    <message>
+        <source>Recurring</source>
+        <translation>Yinelenen</translation>
+    </message>
+    <message>
+        <source>Condition watch</source>
+        <translation>Koşul izleme</translation>
+    </message>
+    <message>
+        <source>Fact</source>
+        <translation>Bilgi</translation>
+    </message>
+    <message>
+        <source>Decision</source>
+        <translation>Karar</translation>
+    </message>
+    <message>
+        <source>Rule</source>
+        <translation>Kural</translation>
+    </message>
+    <message>
+        <source>Thread</source>
+        <translation>Konu</translation>
+    </message>
+    <message>
+        <source>Unrecognized (%1)</source>
+        <translation>Tanınmayan (%1)</translation>
     </message>
 </context>
 </TS>

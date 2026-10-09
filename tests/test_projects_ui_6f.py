@@ -678,10 +678,12 @@ class TileContentTests(TileContentCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         for source, turkish in (("1 approval waiting", "1 onay bekliyor"), ("No task yet", "Henüz görev yok"),
                                 ("no project context", "proje bağlamı yok"), ("instruction ✓", "talimat ✓"),
-                                ("%1 files", "%1 dosya"), ("%1 conversations", "%1 sohbet"), ("tomorrow", "yarın"),
+                                ("%1 files", "%1 dosya"), ("%1 conversations", "%1 sohbet"),
                                 ("No scheduled job", "Zamanlanmış iş yok"), ("%1 records", "%1 kayıt"),
                                 ("last record %1", "son kayıt %1")):
             self.assertEqual(turkish, tx("SummaryRail", source))
+        # 6G K3: the tile's day word now comes from the one date formatter (jarvis.ui.wording).
+        self.assertEqual("yarın", tx("Wording", "tomorrow"))
 
 
 LONG_PROJECT = "İstanbul Beşiktaş daire tadilatı, taşınma planlaması ve kira sözleşmesi takibi 2026"

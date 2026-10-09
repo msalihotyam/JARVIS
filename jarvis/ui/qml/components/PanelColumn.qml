@@ -29,12 +29,19 @@ Item {
     // Gap between stacked panels: proportional to the stack, as in the reference.
     readonly property int gapPx: Theme.stackGap(height)
     property real nowSec: Date.now() / 1000
-    Timer { interval: 30000; running: column.visible; repeat: true; onTriggered: column.nowSec = Date.now() / 1000 }
+    // triggeredOnStart: a column shown again judges "live" by the clock of now, not of when it was hidden.
+    Timer { interval: 30000; running: column.visible; repeat: true; triggeredOnStart: true; onTriggered: column.nowSec = Date.now() / 1000 }
     function ago(ts, fallback) {
         if (!ts) return fallback
         var s = Math.max(0, column.nowSec - ts)
-        return s < 60 ? qsTr("just now") : s < 3600 ? qsTr("%1 min ago").arg(Math.floor(s / 60)) : s < 86400 ? qsTr("%1 h ago").arg(Math.floor(s / 3600)) : fallback
+        return s < 60 ? qsTr("just now") : s < 3600 ? qsTr("%1 min ago").arg(Math.floor(s / 60)) : s < 86400 ? qsTr("%1 h ago").arg(Math.floor(s / 3600))
+             : i18n.when(ts, column.nowSec * 1000, "day")
     }
+    // K3: the feed's "live" badge only while an approved execution runs or its
+    // newest event is under five minutes old - never as decoration.
+    readonly property int liveWindowSec: 300
+    readonly property bool liveNow: (bridge.busy && bridge.executing)
+                                    || (bridge.activity.length > 0 && column.nowSec - bridge.activity[0].ts < column.liveWindowSec)
 
     // Every shown panel gets its minimum first; the remainder is split by
     // share. The sum therefore never exceeds the column, whatever the shares.
@@ -57,12 +64,13 @@ Item {
         return out
     }
     // Stages of the current task that are complete (the reference's "4/6").
-    // A task status code as words; unknown codes stay as Core wrote them.
+    // A task (or run) status code as words; an unknown code is named as such and kept exact.
     function statusWord(s) {
         return ({ pending: qsTr("pending"), running: qsTr("running"), verifying: qsTr("verifying"), awaiting_approval: qsTr("awaiting approval"),
                   awaiting_clarification: qsTr("awaiting clarification"), awaiting_cost_override: qsTr("awaiting cost override"),
                   completed: qsTr("completed"), failed: qsTr("failed"), rejected: qsTr("rejected"),
-                  cancel_requested: qsTr("cancellation requested"), cancelled: qsTr("cancelled") })[s] || s
+                  cancel_requested: qsTr("cancellation requested"), cancelling: qsTr("cancellation requested"), cancelled: qsTr("cancelled") })[s]
+               || (s ? qsTr("unrecognized (%1)").arg(s) : "")
     }
     function stagesDone() {
         var t = bridge.task, cs = bridge.coreState, has = !!t.task_id
@@ -147,7 +155,7 @@ Item {
                 title: (column.commandMode ? {system: qsTr("Model & execution"), workflow: qsTr("Active task"), activity: qsTr("Recent actions"), automations: qsTr("Memory context")}
                                            : { system: qsTr("System status"), workflow: qsTr("Active workflow"), activity: qsTr("Live intelligence feed"), automations: qsTr("Automations") })[modelData.id]
                 badge: modelData.id === "system" ? (bridge.executionState === "unconfirmed" ? qsTr("unconfirmed") : bridge.configRefused ? qsTr("config refused") : bridge.executionState === "freeze_requested" ? qsTr("freezing") : (bridge.executionEnabled ? qsTr("running") : qsTr("frozen")))
-                     : modelData.id === "activity" ? qsTr("live")
+                     : modelData.id === "activity" ? (column.liveNow ? qsTr("live") : "")
                      : modelData.id === "automations" ? (column.commandMode ? qsTr("%1 projects").arg(bridge.projects.length) : (bridge.jobs.length === 1 ? qsTr("1 job") : qsTr("%1 jobs").arg(bridge.jobs.length)))
                      : ""
                 badgeRight: !column.commandMode || modelData.id !== "system"
@@ -172,7 +180,7 @@ Item {
                             visible: !bridge.editMode && modelData.id === "workflow"
                             ActionButton { label: qsTr("Cancel"); danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
                             ActionButton { label: qsTr("New session"); compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
-                            Text { objectName: "workflowCounter"; text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font: Theme.counter }
+                            Text { objectName: "workflowCounter"; visible: !!bridge.task.task_id; text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font: Theme.counter }
                         }
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: qsTr("PINNED"); color: Theme.textDim; font: Theme.label }
                     }
@@ -268,7 +276,9 @@ Item {
     component WRow: Item {
         id: wrow
         property string icon: "diamond"; property color tint: Theme.accent; property string k: ""; property string label: k; property string v: ""; property color vColor: "#9fb6d0"; property bool empty: false; property bool last: false
+        property string tip: ""                              // the exact codes behind a worded value
         width: parent.width; height: 41
+        HoverTip { objectName: "workflowTip_" + wrow.k; text: wrow.tip; active: wrow.tip !== "" }
         readonly property bool compact: height < 30
         readonly property int slot: height >= 38 ? 28 : 24
         readonly property int tile: Math.min(slot, height - 4)
@@ -422,7 +432,8 @@ Item {
             WRow { height: workflowWell.pitch; icon: "diamond"; k: "Status"; label: qsTr("Status"); empty: !workflowWell.has
                 tint: workflowWell.approvalShown ? Theme.warning : Theme.stateColor(bridge.coreState)
                 vColor: workflowWell.approvalShown ? Theme.warning : bridge.coreState === "running" ? Theme.accent : "#cfdceb"
-                v: workflowWell.approvalShown ? qsTr("Approval required") : workflowWell.has ? (column.statusWord(bridge.task.status) || "—") + (bridge.task.stage ? " / " + bridge.task.stage : "") : qsTr("No active task") }
+                v: workflowWell.approvalShown ? qsTr("Approval required") : workflowWell.has ? (column.statusWord(bridge.task.status) || "—") + (bridge.task.stage ? " / " + i18n.word("stage", bridge.task.stage) : "") : qsTr("No active task")
+                tip: workflowWell.has ? [bridge.task.status, bridge.task.stage].filter(function(c) { return !!c }).join(" · ") : "" }
             WRow { height: workflowWell.pitch; icon: "plug"; tint: Theme.accent; k: "Connector"; label: qsTr("Connector"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : qsTr("Waiting for your request…") }
             WRow { height: workflowWell.pitch; icon: "spark"; tint: Theme.accent; k: "Capability"; label: qsTr("Capability"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : qsTr("Chosen by Core") }
             WRow { height: workflowWell.pitch; icon: "arrow-up-right"; tint: Theme.accent; k: "Destination"; label: qsTr("Destination"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : qsTr("Granted destinations only") }
@@ -529,7 +540,7 @@ Item {
                 model: bridge.jobs.slice(0, 5)
                 WRow { icon: "retry"; tint: modelData.enabled ? Theme.success : Theme.textDim; last: index === Math.min(bridge.jobs.length, 5) - 1
                     k: modelData.readable ? (modelData.label.length > 12 ? modelData.label.substring(0, 12) + "…" : modelData.label) : qsTr("(unreadable)")
-                    v: modelData.next_due_at_utc ? qsTr("next %1").arg(modelData.next_due_at_utc.substring(5, 16) + "Z") : "—" }
+                    v: modelData.next_due_at_utc ? qsTr("next %1").arg(i18n.when(modelData.next_due_at_utc, column.nowSec * 1000, "time")) : "—" }
             }
         }
     }

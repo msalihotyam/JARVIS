@@ -2616,6 +2616,9 @@ class RightStackCohesionTests(UiTestCase):
         bridge = self.bridge()
         for _ in range(3):
             bridge._note("Intent unsupported_capability", "error")   # historical rows stay local
+        # 6G K3: the stage counter exists only with a task (hidden without one:
+        # tests/test_indicators_6g.py), so the shared boundary is checked with one.
+        bridge._task = {"task_id": "t-cohesion", "status": "pending"}
         root = self.window(bridge)
         native_fonts = bool(QFontDatabase.families())
         for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
@@ -2633,9 +2636,9 @@ class RightStackCohesionTests(UiTestCase):
                     self.assertLessEqual(self.box(title)[1] + title.height(), p[1] + 44, msg=f"{key} stays inside its header")
                     if native_fonts:
                         self.assertFalse(title.property("truncated"), key)
-                    # ENABLED / 0/4 / LIVE share one right-hand boundary, 12 px in.
+                    # ENABLED / 1/4 / LIVE share one right-hand boundary, 12 px in.
                     right = [self.box(n) for n in self.walk(panel, []) if n.isVisible()
-                             and ("Pill" in n.metaObject().className() or n.property("text") == "0/4") and self.box(n)[1] < p[1] + 44]
+                             and ("Pill" in n.metaObject().className() or n.property("text") == "1/4") and self.box(n)[1] < p[1] + 44]
                     self.assertTrue(right, key)
                     self.assertAlmostEqual(12, p[2] - max(r[2] for r in right), delta=1.5, msg=key)
                 # All five lifecycle labels whole; values stop before the trailing slot.

@@ -166,6 +166,23 @@ class Localization(QObject):
         """Locale-correct uppercase (Turkish i -> İ), for tracked headings."""
         return QLocale(self.qtLocale).toUpper(str(text))
 
+    @Slot("QVariant", float, str, result=str)
+    def when(self, value, now_ms: float, style: str) -> str:
+        """The window's one date formatter (``jarvis.ui.wording.human_date``);
+        ``now_ms`` is the caller's clock, so its binding follows that clock."""
+        from datetime import datetime
+
+        from jarvis.ui.wording import human_date
+        # ponytail: today's UTC offset for every moment; a DST zone would shift
+        # moments across its change by an hour (Türkiye has none).
+        return human_date(value, datetime.fromtimestamp(now_ms / 1000).astimezone(), self.qtLocale, style)
+
+    @Slot(str, str, result=str)
+    def word(self, kind: str, code: str) -> str:
+        """A Core code as a word (``jarvis.ui.wording.code_word``)."""
+        from jarvis.ui.wording import code_word
+        return code_word(kind, code)
+
 
 _localization: Localization | None = None
 

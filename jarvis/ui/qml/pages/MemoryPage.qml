@@ -39,11 +39,13 @@ SecondaryPage {
                 color: Theme.surfaceRaised; border.width: 1; border.color: Theme.border
                 Column { id: body; x: 14; y: 14; width: parent.width - 28; spacing: 6
                     Row { spacing: 12
-                        Text { text: (modelData.kind || "").toUpperCase(); color: Theme.accent; font: Theme.pageSection }
+                        // The kind's word as a heading; an unknown kind's fallback carries its exact code, so it is not uppercased.
+                        Text { readonly property string word: i18n.word("memory_kind", modelData.kind || "")
+                               text: modelData.kind && word.indexOf(modelData.kind) >= 0 ? word : i18n.upper(word); color: Theme.accent; font: Theme.pageSection }
                         Text { text: modelData.classification || ""; color: Theme.textLabel; font: Theme.pageMeta }
                         Text { text: modelData.lifecycle || ""; color: modelData.active ? Theme.success : Theme.textMuted; font: Theme.pageMeta }
                         Text { text: modelData.origin || ""; color: Theme.textMuted; font: Theme.pageMeta }
-                        Text { text: modelData.created_at || ""; color: Theme.textMuted; font: Theme.pageMetaFigures }
+                        Text { text: page.when(modelData.created_at); color: Theme.textMuted; font: Theme.pageMetaFigures }
                     }
                     TextEdit { width: parent.width; readOnly: true; selectByMouse: true; wrapMode: Text.Wrap; text: modelData.text || ""; color: Theme.text; font: Theme.pageRow }
                 }
