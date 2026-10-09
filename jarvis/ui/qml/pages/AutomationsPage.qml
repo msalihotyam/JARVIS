@@ -67,7 +67,8 @@ SecondaryPage {
                 Row { anchors.fill: parent; anchors.margins: 10; spacing: 16
                     Rectangle { width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter; color: modelData.archived ? Theme.textDim : (modelData.enabled ? Theme.success : Theme.warning) }
                     Text { anchors.verticalCenter: parent.verticalCenter; width: 320; elide: Text.ElideRight; text: modelData.readable ? modelData.label : qsTr("(unreadable definition)"); color: Theme.text; font: Theme.pageRowStrong }
-                    Text { anchors.verticalCenter: parent.verticalCenter; width: 140; elide: Text.ElideRight; objectName: "automationsKind"; text: i18n.word("job_kind", modelData.kind || ""); color: Theme.textLabel; font: Theme.pageMeta }
+                    // The column grows for a longer word or the exact "Unrecognized (<code>)" fallback, never cut.
+                    Text { anchors.verticalCenter: parent.verticalCenter; width: Math.max(140, implicitWidth); objectName: "automationsKind"; text: i18n.word("job_kind", modelData.kind || ""); color: Theme.textLabel; font: Theme.pageMeta }
                     Text { anchors.verticalCenter: parent.verticalCenter; width: 250; elide: Text.ElideRight; objectName: "automationsNext"; text: qsTr("next: %1").arg(page.when(modelData.next_due_at_utc) || "—"); color: Theme.textMuted; font: Theme.pageMetaFigures }
                     Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("rev %1").arg(modelData.revision) + "  ·  " + (modelData.archived ? qsTr("archived") : modelData.enabled ? qsTr("enabled") : qsTr("disabled")); color: Theme.textMuted; font: Theme.pageMeta }
                 }
