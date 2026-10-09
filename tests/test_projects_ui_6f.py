@@ -618,7 +618,12 @@ class TileContentTests(TileContentCase):
         store, project, conversations, global_one = self.scoped()
         bridge = self.bridge()
         root = self.window(bridge)
-        tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).astimezone()
+        from PySide6.QtQml import QQmlProperty
+
+        now = datetime.now().astimezone()                                       # TCLOCK: once per test
+        # The rail's own slow clock (`now: Date.now()`) is pinned to it, so "tomorrow" cannot move under a midnight run.
+        self.assertTrue(QQmlProperty(self.item(root, "summaryRail"), "now").write(now.timestamp() * 1000))
+        tomorrow = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         later = tomorrow + timedelta(days=3)
         for owner in (global_one.id, conversations[0].id):
             bridge.openConversation(owner)
