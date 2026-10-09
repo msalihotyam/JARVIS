@@ -270,6 +270,7 @@ class Bridge(QObject):
         # preview (what the confirm will send) and the last lifecycle answer.
         self._archived_conversations: list[dict] = []
         self._conversation_archived = False
+        self._open_seen: tuple[str, bool] = ("", False)     # N2: the open one as last read: (id, live)
         self._open_title: Any = ""
         self._delete_preview: dict[str, Any] = {}
         self._lifecycle_notice = ""
@@ -384,6 +385,8 @@ class Bridge(QObject):
             if self._work_started is not None:
                 self._work_ms = max(0, round((self._clock() - self._work_started) * 1000))
         handler(result)
+        if kind == "task" and not self._busy:
+            self._recheck_open()
         if kind == "task" and self._freeze_waiting and not self._busy:
             # The operation that was running when Freeze arrived has returned
             # (at its next safe point, or finished): now JARVIS is frozen.
@@ -611,10 +614,24 @@ class Bridge(QObject):
             for r in records if r.archived_at is not None
         ]
         open_id = self._conversation_store.id if hasattr(self, "_conversation_store") else None
+        readable = store is not None and bool(open_id)
         try:
-            open_record = store.load_conversation(open_id) if store is not None and open_id else None
+            open_record = store.load_conversation(open_id) if readable else None
         except Exception:  # noqa: BLE001 - a label only
-            open_record = None
+            open_record, readable = None, False
+        if readable:
+            live = open_record is not None and open_record.archived_at is None
+            seen_id, was_live = self._open_seen
+            if open_id == seen_id and (open_record is None or (was_live and not live)):
+                # N2: deleted, or archived since it was opened, by any path (incl. a change
+                # in the store): never stay on it. An archived one opened read-only stays.
+                # While a run is busy it is left when the run ends (_on_finished).
+                if not self._busy:
+                    self._open_seen = ("", False)
+                    self._leave_open_conversation(*self._open_scope())
+                    return
+            else:
+                self._open_seen = (open_id, live) if open_record is not None else ("", False)
         self._conversation_archived = open_record is not None and open_record.archived_at is not None
         self._open_title = "" if open_record is None else (open_record.title or (
             ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
@@ -903,9 +920,7 @@ class Bridge(QObject):
         if self._open_project and not any(r["id"] == self._open_project for r in self._project_records):
             self._open_project = ""
         self._load_project_detail()
-        self._conversation_owner = self._owner_of(self._conversation_db(), self._conversation_store.id)
-        self._scope_facts = self._read_scope_facts(self._conversation_db(), self._conversation_owner.get("id") or None)
-        self.conversationChanged.emit()
+        self._refresh_conversations()           # the open one's owner and scope facts; N2 if it is gone
         self.projectsChanged.emit()
 
     def _load_project_detail(self) -> None:
@@ -1378,50 +1393,47 @@ class Bridge(QObject):
         owner = self._conversation_owner
         return (owner.get("id") or None, bool(owner.get("active"))) if owner else (None, True)
 
+    def _recheck_open(self) -> None:
+        """N2: one read of the open conversation only; deleted or archived since
+        it was last read (by any path) -> the full refresh, which leaves it."""
+        seen_id, was_live = self._open_seen
+        store = self._conversation_db()
+        if self._busy or store is None or not seen_id or seen_id != self._conversation_store.id:
+            return
+        try:
+            record = store.load_conversation(seen_id)
+        except Exception:  # noqa: BLE001 - unreadable is not removed
+            return
+        if record is None or (was_live and record.archived_at is not None):
+            self._refresh_conversations()
+
     def _leave_open_conversation(self, scope: str | None, writable: bool) -> None:
         """The open conversation was archived or deleted: never stay on it.
-        The newest non-archived conversation of its scope when that scope is
-        writable, else the newest non-archived Global one, else a new Global
-        one (the startup rule); then that conversation's own list surface."""
+        N2 (Salih 2026-10-05): the New chat screen - a new, empty conversation
+        in its scope when that scope is writable, else in Global (the store
+        refuses an owner archived meanwhile), on the chat page."""
         store = self._conversation_db()
-        opened = None
+        opened, error = None, None
         for owner in ([scope] if writable and scope is not None else []) + [None]:
             try:
-                records = store.list_conversations(project_id=owner) if store is not None else []
-            except Exception:  # noqa: BLE001 - storage boundary
-                records = []
-            for record in records:
-                opened = self._load_conversation(store, record.id)
-                if opened is not None:
-                    break
-            if opened is not None:
+                opened = PersistedConversation(store, store.create_conversation(owner).id)
                 break
-        if opened is None:
-            try:
-                opened = PersistedConversation(store, store.create_conversation().id)
             except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
-                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
-                            (type(exc).__name__,)), "error")
-                opened = PersistedConversation(None, None)
+                error = exc
+        if opened is None:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
+                        (type(error).__name__,)), "error")
+            opened = PersistedConversation(None, None)
         self._activate(opened)
-        owner = self._conversation_owner
-        if owner:
-            self.showProject(owner["id"])
-        else:
-            self.refreshProjects()
-            self.setPage("history")
+        self.refreshProjects()
+        self.setPage("home")
 
-    def _lifecycle_done(self, conversation_id: str, payload: Any, leaves: bool,
-                        scope: tuple[str | None, bool]) -> bool:
+    def _lifecycle_done(self, conversation_id: str, payload: Any, leaves: bool) -> bool:
         self._lifecycle_notice = self._error_message(payload)
         if not self._lifecycle_notice:
             if leaves and self.prefs.unpin(conversation_id):      # archived or deleted: its pin goes (F6)
                 self.prefs.save_sidebar()
-            if leaves and conversation_id == self._conversation_store.id:
-                self._leave_open_conversation(*scope)
-            else:
-                self._refresh_conversations()
-                self.refreshProjects()
+            self.refreshProjects()                                 # the open one archived or deleted: N2
         self.conversationLifecycleChanged.emit()
         return self._lifecycle_notice == ""
 
@@ -1441,8 +1453,7 @@ class Bridge(QObject):
         conversation_id = str(conversation_id)
         if self._lifecycle_refused(conversation_id):
             return False
-        scope = self._open_scope()
-        return self._lifecycle_done(conversation_id, self.backend.conversation_archive(conversation_id), True, scope)
+        return self._lifecycle_done(conversation_id, self.backend.conversation_archive(conversation_id), True)
 
     @Slot(str, result=bool)
     def unarchiveConversation(self, conversation_id: str) -> bool:
@@ -1451,8 +1462,7 @@ class Bridge(QObject):
         conversation_id = str(conversation_id)
         if self._lifecycle_refused(conversation_id):
             return False
-        return self._lifecycle_done(conversation_id, self.backend.conversation_unarchive(conversation_id), False,
-                                    self._open_scope())
+        return self._lifecycle_done(conversation_id, self.backend.conversation_unarchive(conversation_id), False)
 
     @Slot(str)
     def previewDeleteConversation(self, conversation_id: str) -> None:
@@ -1475,7 +1485,6 @@ class Bridge(QObject):
         held = self._delete_preview
         if self._busy or not held or held.get("blocked") or held.get("conversation_id") != conversation_id:
             return False
-        scope = self._open_scope()
         payload = self.backend.conversation_delete(conversation_id, confirm=conversation_id,
                                                    expected_next_seq=held["expected_next_seq"],
                                                    expected_title=held["title"])
@@ -1486,7 +1495,7 @@ class Bridge(QObject):
             self.conversationLifecycleChanged.emit()
             return False
         self._delete_preview = {}
-        self._lifecycle_done(conversation_id, payload, True, scope)
+        self._lifecycle_done(conversation_id, payload, True)
         self._set_sessions({"sessions": self._sessions})
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation deleted permanently"), ()), "system")
         return True
@@ -2303,6 +2312,7 @@ class Bridge(QObject):
 
     @Slot()
     def refreshHistory(self) -> None:
+        self._recheck_open()
         self._run("sessions", self.backend.sessions, self._set_sessions)
 
     def _of_deleted_conversation(self, session_id: str) -> bool:
@@ -3503,6 +3513,7 @@ class Bridge(QObject):
 
     @Slot(str)
     def setPage(self, page: str) -> None:
+        self._recheck_open()                    # N2 first; then the page asked for
         if page == "projects":
             if not self._page_override:
                 self._page_override = "projects"

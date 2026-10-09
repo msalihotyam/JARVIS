@@ -553,6 +553,19 @@ class WindowCase(ProjectsUiCase):
 
 
 class TransitionTests(WindowCase):
+    """N2 (Salih 2026-10-05, replacing the Gate 6D-b "newest of the scope, on its list" rule):
+    the open conversation archived or deleted -> the New chat screen: a new, empty
+    conversation of its scope when writable, else Global, on the chat page."""
+
+    def new_chat(self, bridge, store, before, project_id=None) -> str:
+        now = bridge.conversationId
+        self.assertNotIn(now, before)
+        record = store.load_conversation(now)
+        self.assertEqual((project_id, None, ""), (record.project_id, record.archived_at, record.title))
+        self.assertEqual(0, len(store.load_conversation_state(now).turns))
+        self.assertEqual(([], "home", False), (bridge.feed, bridge.page, bridge.conversationReadOnly))
+        return now
+
     def test_g_writable_scope_with_another_conversation(self) -> None:
         store = self.db()
         bridge = self.bridge()
@@ -562,30 +575,37 @@ class TransitionTests(WindowCase):
         project = store.create_project("Evim")
         first, second = store.create_conversation(project.id, title="Bir"), store.create_conversation(project.id)
         newer = store.create_conversation(title="Yeni")
-        # Archive of the open Global conversation: the newest other Global one, on History.
+        say(store, newer.id, "silinecek")
+        # Archive of the open Global conversation: a new Global one, not the newest other one.
         bridge.openConversation(newer.id)
         pump(200)
         self.archive_open(root)
         self.assertIsNotNone(store.load_conversation(newer.id).archived_at)
-        self.assertEqual((older, "history"), (bridge.conversationId, bridge.page))
+        fresh = self.new_chat(bridge, store, (older, newer.id))
         self.assertIn(newer.id, [r["id"] for r in bridge.archivedConversations])
-        # Archive of an open project conversation: the project's newest other one, on its detail.
+        settled(300, lambda: (
+            self.assertEqual("home", root.property("loadedPage")),
+            self.assertTrue(self.item(root, "conversationWelcome").isVisible()),
+        ))
+        # Archive of an open project conversation: a new one of that project, on the chat page.
         bridge.openConversation(second.id)
         pump(200)
         self.archive_open(root)
-        self.assertEqual((first.id, "projects", project.id), (bridge.conversationId, bridge.page, bridge.openProject["id"]))
+        self.new_chat(bridge, store, (first.id, second.id, fresh), project.id)
+        self.assertIsNotNone(store.load_conversation(second.id).archived_at)
+        bridge.showProject(project.id)
         self.assertEqual([second.id], [r["id"] for r in bridge.projectArchivedConversations])
-        # Delete of the OPEN archived Global conversation (opened read-only): the newest Global one.
+        # Delete of the OPEN archived Global conversation (opened read-only): a new Global one.
         bridge.openConversation(newer.id)
         settled(200, lambda: (
             self.assertTrue(bridge.conversationReadOnly),
         ))
         self.delete_open(root)
         self.gone(bridge, store, newer.id)
-        self.assertEqual((older, "history"), (bridge.conversationId, bridge.page))
+        self.new_chat(bridge, store, (older, newer.id, fresh))
         self.assertEqual(0, self.execute_calls())
 
-    def test_g_archived_project_falls_back_to_the_newest_global_on_history(self) -> None:
+    def test_g_archived_project_falls_back_to_a_new_global_chat(self) -> None:
         store = self.db()
         bridge = self.bridge()
         root = self.window(bridge)
@@ -602,7 +622,7 @@ class TransitionTests(WindowCase):
         self.press(root, self.item(root, "conversationDeleteItem"))
         self.confirm_delete(root)
         self.gone(bridge, store, owned.id)
-        self.assertEqual((global_id, "history"), (bridge.conversationId, bridge.page))
+        self.new_chat(bridge, store, (global_id, owned.id))                          # never in the archived project
 
     def test_g_no_global_conversation_opens_a_new_one(self) -> None:
         store = self.db()
@@ -615,26 +635,18 @@ class TransitionTests(WindowCase):
         preview = store.conversation_delete_preview(startup)
         store.delete_conversation(startup, confirm=startup, expected_next_seq=preview["expected_next_seq"],
                                   expected_title=preview["title"])
-        # Archive: the project has no other conversation and no Global one exists.
+        # Archive: the project has no other conversation and no Global one exists - a new one of the project.
         bridge.openConversation(only.id)
         pump(200)
         self.archive_open(root)
-        created = bridge.conversationId
-        self.assertNotIn(created, (startup, only.id))
-        self.assertIsNone(store.load_conversation(created).project_id)
-        self.assertEqual("history", bridge.page)
-        # Delete: the same branch after the new Global one is gone too.
-        store.archive_conversation(created)
-        preview = store.conversation_delete_preview(created)
-        store.delete_conversation(created, confirm=created, expected_next_seq=preview["expected_next_seq"],
-                                  expected_title=preview["title"])
+        created = self.new_chat(bridge, store, (startup, only.id), project.id)
+        # Delete under the project archived meanwhile: a new Global one.
+        store.set_project_active(project.id, False)
         bridge.openConversation(only.id)
         pump(200)
         self.delete_open(root)
         self.gone(bridge, store, only.id)
-        fresh = bridge.conversationId
-        self.assertNotIn(fresh, (startup, only.id, created))
-        self.assertEqual((None, "history"), (store.load_conversation(fresh).project_id, bridge.page))
+        self.new_chat(bridge, store, (startup, only.id, created))
 
 
 class ArchivedSectionTests(WindowCase):
