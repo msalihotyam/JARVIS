@@ -67,7 +67,7 @@ Item {
         var heading = safetyLoader.item ? safetyLoader.item.headingFor(key) : null
         if (heading && heading.visible) {
             var card = heading.parent.parent
-            scrollTo(safetyLoader.y + card.y - 12)
+            scrollTo(card.mapToItem(stack, 0, 0).y - 12)
             flick.followEnd = flick.contentY >= flick.endY - 6
             heading.forceActiveFocus()
         } else {
@@ -75,19 +75,48 @@ Item {
         }
     }
 
-    // One compact, visually secondary message action.
+    // One compact, visually secondary message action. With a confirmation it
+    // says so briefly after it ran ("Copied"): a word that stays a moment, not
+    // a motion, so it reads the same with ambient effects off.
     component MessageAction: Text {
+        id: action
         property string label: ""
+        property string confirmation: ""
+        readonly property alias confirming: held.running
         signal activated()
-        text: label
+        function trigger() { activated(); if (confirmation !== "") held.restart() }
+        Timer { id: held; interval: 1500 }
+        text: confirming ? confirmation : label
         renderType: Theme.textRender
-        color: actionArea.containsMouse ? Theme.accent : Theme.textMuted
+        color: confirming ? Theme.success : actionArea.containsMouse ? Theme.accent : Theme.textMuted
         font: Theme.chatMeta
         Accessible.role: Accessible.Button
-        Accessible.name: label
+        Accessible.name: text
         MouseArea { id: actionArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor; onClicked: parent.activated() }
+                    cursorShape: Qt.PointingHandCursor; onClicked: action.trigger() }
     }
+
+    // JARVIS's identity mark: the simplified Reactor-derived ring - a dark
+    // circular housing, one controlled blue annulus with three subdued radial
+    // cuts, a dark optical centre. 32 px, minimal bloom, inside a 36 px reserve
+    // so nothing clips. ONE mark for the streaming turn and the finished reply,
+    // so nothing changes under the reader when the answer stands.
+    component JarvisMark: Item {
+        width: 32; height: 32
+        Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: Theme.alpha("#36aaff", 0.09) }
+        Rectangle { anchors.fill: parent; radius: 16; color: "#061424"; border.width: 1; border.color: "#2a5f8f" }
+        Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
+        Repeater { model: 3
+            Rectangle { width: 1.5; height: 8; color: "#061424"; x: 16 - 0.75; y: 16 - 11.5
+                transform: Rotation { origin.x: 0.75; origin.y: 11.5; angle: 90 + index * 120 } } }
+        Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" }
+    }
+
+    // The entries already on screen, by id. A feed change rebuilds every row,
+    // so a row makes its entrance only the first time its entry is shown -
+    // never again for the history above a new entry. A reply that streamed and
+    // a reopened conversation's turns are already there: no entrance either.
+    property var shownIds: ({})
 
     // -- Markdown: presented, never executed, and never the source of truth ----
     // The canonical assistant text (modelData.text) is what history, Copy and
@@ -249,11 +278,18 @@ Item {
                     // untrusted external data never do.
                     readonly property bool markdown: modelData.chat === true || isResult
                     readonly property color tone: feed.railColor(kind)
-                    // Appearance: fade + short slide, no bounce. A reply that streamed is
-                    // already on screen: its final entry takes over without a second entrance.
+                    // Appearance: fade + short slide, no bounce, for a new entry only
+                    // (feed.shownIds); any other row stands at once, before it is drawn.
+                    // For inspection: whether this row made an entrance.
+                    property bool entered: false
                     opacity: modelData.streamed === true ? 1 : 0
                     transform: Translate { id: slide; y: modelData.streamed === true ? 0 : Theme.travel }
-                    Component.onCompleted: if (modelData.streamed !== true) appear.start()
+                    Component.onCompleted: {
+                        entered = modelData.streamed !== true && modelData.restored !== true && feed.shownIds[modelData.id] !== true
+                        feed.shownIds[modelData.id] = true
+                        if (entered) appear.start()
+                        else { opacity = 1; slide.y = 0 }
+                    }
                     ParallelAnimation {
                         id: appear
                         NumberAnimation { target: row; property: "opacity"; to: 1; duration: Theme.panelIn; easing.type: Easing.OutCubic }
@@ -265,21 +301,11 @@ Item {
                         visible: !row.isUser
                         width: feed.avatarSize; height: width
                         readonly property real k: width / 60
-                        // JARVIS: the simplified Reactor-derived identity mark - a dark
-                        // circular housing, one controlled blue annulus with three
-                        // subdued radial cuts, a dark optical centre. 32 px, minimal
-                        // bloom, inside a 36 px reserve so nothing clips.
-                        Item {
+                        // JARVIS: the identity mark.
+                        JarvisMark {
                             objectName: row.isJarvis ? "feedAvatar_jarvis" : ""
                             visible: row.isJarvis
-                            anchors.centerIn: parent; width: 32; height: 32
-                            Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: Theme.alpha("#36aaff", 0.09) }
-                            Rectangle { anchors.fill: parent; radius: 16; color: "#061424"; border.width: 1; border.color: "#2a5f8f" }
-                            Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
-                            Repeater { model: 3
-                                Rectangle { width: 1.5; height: 8; color: "#061424"; x: 16 - 0.75; y: 16 - 11.5
-                                    transform: Rotation { origin.x: 0.75; origin.y: 11.5; angle: 90 + index * 120 } } }
-                            Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" }
+                            anchors.centerIn: parent
                         }
                         // Everything else: a state marker on the rail.
                         Rectangle {
@@ -527,12 +553,13 @@ Item {
                     Row {
                         objectName: "messageActions_" + index
                         visible: row.conversational
-                        opacity: rowHover.hovered || message.selectedText.length > 0 ? 1 : 0
+                        opacity: rowHover.hovered || message.selectedText.length > 0 || copyAction.confirming ? 1 : 0
                         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
                         spacing: 14
                         y: stamp.y
                         x: row.isUser ? stamp.x - width - 16 : (telemetry.visible ? telemetry.x + telemetry.width : stamp.x + stamp.width) + 16
-                        MessageAction { objectName: "messageCopy_" + index; label: qsTr("Copy"); onActivated: bridge.copyText(modelData.text) }
+                        MessageAction { id: copyAction; objectName: "messageCopy_" + index; label: qsTr("Copy"); confirmation: qsTr("Copied")
+                                        onActivated: bridge.copyText(modelData.text) }
                         // Quoting adds a REFERENCE to the draft - it never writes into
                         // the message being composed, and it authorizes nothing.
                         MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteMessage(modelData.id) }
@@ -575,11 +602,7 @@ Item {
                 height: visible ? Math.max(feed.avatarSize, liveStatus.y + liveStatus.height + 6) : 0
                 Item {
                     width: feed.avatarSize; height: width
-                    Item { anchors.centerIn: parent; width: 32; height: 32
-                        Rectangle { anchors.centerIn: parent; width: 36; height: 36; radius: 18; color: Theme.alpha("#36aaff", 0.09) }
-                        Rectangle { anchors.fill: parent; radius: 16; color: "#061424"; border.width: 1; border.color: "#2a5f8f" }
-                        Rectangle { anchors.centerIn: parent; width: 22; height: 22; radius: 11; color: "transparent"; border.width: 4; border.color: "#3aa8f0" }
-                        Rectangle { anchors.centerIn: parent; width: 12; height: 12; radius: 6; color: "#03101c" } }
+                    JarvisMark { objectName: "streamAvatar"; anchors.centerIn: parent }
                 }
                 Text { id: streamName; x: feed.messageX; y: 7; text: "JARVIS"; color: Theme.materialBlue
                        renderType: Theme.textRender
@@ -608,6 +631,18 @@ Item {
                         formatting = true
                         typography.setLineHeight(textDocument, Theme.conversationLine, Theme.conversationParagraph, true)
                         formatting = false }
+                    // The caret at the end of the growing text: only while text really
+                    // arrives for the request that is running. A final, stopped or failed
+                    // reply has none. Static: it marks the place, it does not blink.
+                    Rectangle {
+                        objectName: "streamCaret"
+                        visible: streamRow.streaming && bridge.busy
+                        readonly property rect end: { streamText.contentHeight; streamText.width
+                                                      return streamText.positionToRectangle(streamText.length) }
+                        x: end.x + 2; y: end.y + 3
+                        width: 2; height: Math.max(8, end.height - 6); radius: 1
+                        color: Theme.accent
+                    }
                 }
                 // The one live line: activity mark, what is happening, for how long.
                 Row {
@@ -664,11 +699,12 @@ Item {
                 HoverHandler { id: streamHover }
                 Row {
                     visible: streamRow.streaming
-                    opacity: streamHover.hovered ? 1 : 0
+                    opacity: streamHover.hovered || streamCopy.confirming ? 1 : 0
                     spacing: 14
                     anchors.verticalCenter: liveStatus.verticalCenter
                     x: liveStatus.x + liveStatus.width + 18
-                    MessageAction { objectName: "streamCopy"; label: qsTr("Copy"); onActivated: bridge.copyText(bridge.streamText) }
+                    MessageAction { id: streamCopy; objectName: "streamCopy"; label: qsTr("Copy"); confirmation: qsTr("Copied")
+                                    onActivated: bridge.copyText(bridge.streamText) }
                 }
             }
             Loader {

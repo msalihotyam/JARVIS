@@ -14,7 +14,7 @@ Column {
     property real inset: 0                      // the JARVIS message column
     readonly property var s: bridge.safety
     // Whether the approval card is on screen, for the conversation to bring it into view.
-    readonly property bool approvalShown: approvalCard.visible
+    readonly property bool approvalShown: approvalCard.current && approvalCard.visible
     readonly property real cardWidth: Math.min(760, width - inset)
     readonly property bool narrow: cardWidth < 560
     spacing: 16
@@ -45,8 +45,9 @@ Column {
         border.width: 1; border.color: Theme.alpha(tone, 0.55)
         // A static structural accent on the leading edge: shape and label carry meaning, not colour alone.
         Rectangle { x: 0; y: 10; width: 3; height: surface.height - 20; radius: 1.5; color: surface.tone; opacity: 0.85 }
-        // A short opacity entrance when the card appears; nothing loops.
-        onVisibleChanged: if (visible) { opacity = 0; fade.restart() }
+        // A short opacity entrance when the card appears; nothing loops. Ambient effects off: at once.
+        // Opaque either way: a card that faded out earlier never comes back invisible.
+        onVisibleChanged: if (visible) { if (Theme.ambient) { opacity = 0; fade.restart() } else opacity = 1 }
         NumberAnimation { id: fade; target: surface; property: "opacity"; from: 0; to: 1; duration: Theme.dur(160); easing.type: Easing.OutCubic }
     }
     // A static state icon in a ring (Icon.qml): question unknown, close failed, check completed,
@@ -141,101 +142,135 @@ Column {
         }
     }
 
-    // -- the approval request ---------------------------------------------------
-    Surface {
-        id: approvalCard
-        objectName: "safetyCard_approval"
-        readonly property var a: cards.s.approval || ({})
-        visible: Object.keys(a).length > 0
-        tone: Theme.warning
-        border.width: 1.5
-        height: visible ? approvalBody.height + 36 : 0
-        StateIcon { x: 20; y: 18; tone: Theme.warning; icon: "diamond-filled" }
-        Column {
-            id: approvalBody
-            x: 76; y: 18; width: parent.width - 96; spacing: 8
-            Heading { id: approvalHeading; objectName: "safetyHeading_approval"; width: parent.width; color: Theme.warning
-                      text: approvalCard.a.complete ? qsTr("Approval required") : qsTr("Approval details unavailable") }
-            Text { objectName: "safetyApprovalText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; renderType: Theme.textRender
-                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22
-                   text: approvalCard.a.complete ? (approvalCard.a.summary || approvalCard.a.reason || qsTr("Review this action before authorizing it."))
-                                                 : qsTr("Core's request is missing details needed to approve it safely, so approval is unavailable.") }
-            Column {
-                width: parent.width
-                Field { k: qsTr("Action"); v: (approvalCard.a.action || qsTr("Not reported")) + (approvalCard.a.target ? " — " + approvalCard.a.target : "") }
-                Field { k: qsTr("Connector"); v: approvalCard.a.connector || qsTr("Not reported") }
-                Field { k: qsTr("Capability"); v: approvalCard.a.capability || qsTr("Not reported") }
-                Field { k: qsTr("Destination"); v: approvalCard.a.destination || qsTr("Not reported"); vColor: Theme.accent }
-                Field { k: qsTr("Authority"); v: approvalCard.a.data_classification ? qsTr("This request only · %1 data").arg(approvalCard.a.data_classification) : qsTr("This request only") }
-                Field { visible: !!approvalCard.a.effect; k: qsTr("Consequence")
-                        v: cards.effectWord(approvalCard.a.effect || "") + " · " + (approvalCard.a.reversible ? qsTr("reversible") : qsTr("not reversible")) }
-            }
-            AttestedText { visible: !!approvalCard.a.project_instruction; sectionName: "approvalInstruction"
-                           label: qsTr("PROJECT INSTRUCTION · attested, sent with this request")
-                           body: approvalCard.a.project_instruction || "" }
-            Repeater {
-                model: approvalCard.a.project_files || []
-                AttestedText { sectionName: "approvalExcerpt"
-                               label: modelData.chunk_index >= 0
-                                      ? qsTr("PROJECT FILE EXCERPT · %1 · part %2 · %3").arg(modelData.name).arg(modelData.chunk_index + 1).arg(modelData.classification)
-                                      : qsTr("PROJECT FILE EXCERPTS")
-                               body: modelData.text }
-            }
-            // Review action details: what Core attached to the exact request.
-            Item {
-                width: parent.width; height: 36
-                Text { id: detailsToggle; objectName: "approvalDetailsToggle"; anchors.verticalCenter: parent.verticalCenter
-                       property bool open: false
-                       text: (open ? qsTr("Hide action details") : qsTr("Review action details")) + "  ›"; color: Theme.accent; font: Theme.uiLabel
-                       activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: qsTr("Review action details")
-                       Keys.onReturnPressed: open = !open; Keys.onSpacePressed: open = !open
-                       MouseArea { anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.PointingHandCursor; onClicked: detailsToggle.open = !detailsToggle.open } }
-            }
-            Column {
-                visible: detailsToggle.open; width: parent.width
-                Field { k: qsTr("Why"); v: approvalCard.a.reason || qsTr("Not reported") }
-                Field { visible: !!approvalCard.a.outbound_preview; k: qsTr("Outbound"); v: approvalCard.a.outbound_preview || "" }
-                Field { k: qsTr("Expires"); v: approvalCard.a.expires_at || qsTr("Not reported") }
-                Field { k: qsTr("Request"); v: (approvalCard.a.request_id || qsTr("Not reported")) + "\n" + (approvalCard.a.fingerprint || "") ; vColor: Theme.textLabel }
-            }
-            Text { visible: !!approvalCard.a.hold; width: parent.width; wrapMode: Text.Wrap; color: Theme.warning; renderType: Theme.textRender
-                   font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22; text: approvalCard.a.hold || "" }
-            Flow {
-                width: parent.width; spacing: 10
-                ActionButton { objectName: "approvalApprove"; label: qsTr("Approve action"); primary: true; accent: Theme.warning; height: 44
-                    width: cards.narrow ? parent.width : implicitWidth + 12; enabled: approvalCard.a.actionable === true
-                    onClicked: bridge.approveRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
-                ActionButton { objectName: "approvalDeny"; label: qsTr("Reject"); height: 44
-                    // Rejecting executes nothing, so it stays available while JARVIS is frozen.
-                    width: cards.narrow ? parent.width : implicitWidth + 24; enabled: approvalCard.a.rejectable === true
-                    onClicked: bridge.rejectRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
-            }
-            Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
-                   text: qsTr("Approve authorizes the displayed request only. It is not a completion claim.") }
+    // -- the approval request and the receipt of the decision, in one place --------
+    // The receipt replaces the request with a crossfade: the request, as it was
+    // shown and with its buttons off, fades out while the receipt fades in over
+    // it, and the place shrinks to the receipt in the same time - no jump. With
+    // ambient effects off it happens at once. A request still pending beside a
+    // receipt (a decision Core refused before touching it) stands above it.
+    Item {
+        id: decisionSlot
+        objectName: "safetyDecisionSlot"
+        width: cards.width
+        property real hold: 1
+        clip: leave.running
+        visible: approvalCard.shown || decisionCard.shown
+        height: approvalCard.current ? approvalCard.height + (decisionCard.shown ? 16 + decisionCard.height : 0)
+                                     : decisionCard.height + Math.max(0, approvalCard.height - decisionCard.height) * hold
+        ParallelAnimation {
+            id: leave
+            NumberAnimation { target: approvalCard; property: "opacity"; to: 0; duration: Theme.dur(160); easing.type: Easing.OutCubic }
+            NumberAnimation { target: decisionSlot; property: "hold"; from: 1; to: 0; duration: Theme.dur(160); easing.type: Easing.OutCubic }
+            onRunningChanged: if (!running && !approvalCard.current) approvalCard.shown = false
         }
-    }
+        Surface {
+            id: approvalCard
+            objectName: "safetyCard_approval"
+            readonly property var live: cards.s.approval || ({})
+            readonly property bool current: Object.keys(live).length > 0
+            // What is shown: the live request, kept as it was only while it fades out.
+            property var a: ({})
+            property bool shown: false
+            onLiveChanged: if (Object.keys(live).length > 0) a = live      // not `current`: it may not be re-evaluated yet
+            Component.onCompleted: { if (current) a = live; shown = current }
+            onCurrentChanged: {
+                if (current) { if (leave.running) { leave.stop(); opacity = 1 } shown = true }
+                else if (shown && Theme.ambient) leave.restart()
+                else shown = false
+            }
+            visible: shown
+            tone: Theme.warning
+            border.width: 1.5
+            height: visible ? approvalBody.height + 36 : 0
+            StateIcon { x: 20; y: 18; tone: Theme.warning; icon: "diamond-filled" }
+            Column {
+                id: approvalBody
+                x: 76; y: 18; width: parent.width - 96; spacing: 8
+                Heading { id: approvalHeading; objectName: "safetyHeading_approval"; width: parent.width; color: Theme.warning
+                          text: approvalCard.a.complete ? qsTr("Approval required") : qsTr("Approval details unavailable") }
+                Text { objectName: "safetyApprovalText"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; renderType: Theme.textRender
+                       font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22
+                       text: approvalCard.a.complete ? (approvalCard.a.summary || approvalCard.a.reason || qsTr("Review this action before authorizing it."))
+                                                     : qsTr("Core's request is missing details needed to approve it safely, so approval is unavailable.") }
+                Column {
+                    width: parent.width
+                    Field { k: qsTr("Action"); v: (approvalCard.a.action || qsTr("Not reported")) + (approvalCard.a.target ? " — " + approvalCard.a.target : "") }
+                    Field { k: qsTr("Connector"); v: approvalCard.a.connector || qsTr("Not reported") }
+                    Field { k: qsTr("Capability"); v: approvalCard.a.capability || qsTr("Not reported") }
+                    Field { k: qsTr("Destination"); v: approvalCard.a.destination || qsTr("Not reported"); vColor: Theme.accent }
+                    Field { k: qsTr("Authority"); v: approvalCard.a.data_classification ? qsTr("This request only · %1 data").arg(approvalCard.a.data_classification) : qsTr("This request only") }
+                    Field { visible: !!approvalCard.a.effect; k: qsTr("Consequence")
+                            v: cards.effectWord(approvalCard.a.effect || "") + " · " + (approvalCard.a.reversible ? qsTr("reversible") : qsTr("not reversible")) }
+                }
+                AttestedText { visible: !!approvalCard.a.project_instruction; sectionName: "approvalInstruction"
+                               label: qsTr("PROJECT INSTRUCTION · attested, sent with this request")
+                               body: approvalCard.a.project_instruction || "" }
+                Repeater {
+                    model: approvalCard.a.project_files || []
+                    AttestedText { sectionName: "approvalExcerpt"
+                                   label: modelData.chunk_index >= 0
+                                          ? qsTr("PROJECT FILE EXCERPT · %1 · part %2 · %3").arg(modelData.name).arg(modelData.chunk_index + 1).arg(modelData.classification)
+                                          : qsTr("PROJECT FILE EXCERPTS")
+                                   body: modelData.text }
+                }
+                // Review action details: what Core attached to the exact request.
+                Item {
+                    width: parent.width; height: 36
+                    Text { id: detailsToggle; objectName: "approvalDetailsToggle"; anchors.verticalCenter: parent.verticalCenter
+                           property bool open: false
+                           text: (open ? qsTr("Hide action details") : qsTr("Review action details")) + "  ›"; color: Theme.accent; font: Theme.uiLabel
+                           activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: qsTr("Review action details")
+                           Keys.onReturnPressed: open = !open; Keys.onSpacePressed: open = !open
+                           MouseArea { anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.PointingHandCursor; onClicked: detailsToggle.open = !detailsToggle.open } }
+                }
+                Column {
+                    visible: detailsToggle.open; width: parent.width
+                    Field { k: qsTr("Why"); v: approvalCard.a.reason || qsTr("Not reported") }
+                    Field { visible: !!approvalCard.a.outbound_preview; k: qsTr("Outbound"); v: approvalCard.a.outbound_preview || "" }
+                    Field { k: qsTr("Expires"); v: approvalCard.a.expires_at || qsTr("Not reported") }
+                    Field { k: qsTr("Request"); v: (approvalCard.a.request_id || qsTr("Not reported")) + "\n" + (approvalCard.a.fingerprint || "") ; vColor: Theme.textLabel }
+                }
+                Text { visible: !!approvalCard.a.hold; width: parent.width; wrapMode: Text.Wrap; color: Theme.warning; renderType: Theme.textRender
+                       font: Theme.cardBody; lineHeightMode: Text.FixedHeight; lineHeight: 22; text: approvalCard.a.hold || "" }
+                Flow {
+                    width: parent.width; spacing: 10
+                    ActionButton { objectName: "approvalApprove"; label: qsTr("Approve action"); primary: true; accent: Theme.warning; height: 44
+                        width: cards.narrow ? parent.width : implicitWidth + 12; enabled: approvalCard.current && approvalCard.a.actionable === true
+                        onClicked: bridge.approveRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
+                    ActionButton { objectName: "approvalDeny"; label: qsTr("Reject"); height: 44
+                        // Rejecting executes nothing, so it stays available while JARVIS is frozen.
+                        width: cards.narrow ? parent.width : implicitWidth + 24; enabled: approvalCard.current && approvalCard.a.rejectable === true
+                        onClicked: bridge.rejectRequest(approvalCard.a.request_id, approvalCard.a.fingerprint) }
+                }
+                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
+                       text: qsTr("Approve authorizes the displayed request only. It is not a completion claim.") }
+            }
+        }
 
-    // -- the decision receipt -----------------------------------------------------
-    Surface {
-        id: decisionCard
-        objectName: "safetyCard_decision"
-        readonly property var d: cards.s.decision || ({})
-        visible: !!d.state
-        tone: d.state === "recorded" ? Theme.success : d.state === "rejected" ? Theme.accentSoft
-            : d.state === "submitting" ? Theme.accent : Theme.warning
-        height: visible ? decisionBody.height + 28 : 0
-        StateIcon { x: 20; y: 14; width: 32; height: 32; tone: decisionCard.tone
-                    icon: decisionCard.d.state === "recorded" ? "check" : decisionCard.d.state === "submitting" ? "more" : decisionCard.d.state === "rejected" ? "minus" : "exclamation" }
-        Column {
-            id: decisionBody
-            x: 68; y: 14; width: parent.width - 88; spacing: 4
-            Text { objectName: "safetyDecisionLabel"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiValue
-                   text: decisionCard.d.label || "" }
-            Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
-                   text: [decisionCard.d.action, decisionCard.d.destination ? "→ " + decisionCard.d.destination : "", decisionCard.d.time].filter(function(x) { return !!x }).join("  ·  ")
-                         + (decisionCard.d.state === "recorded" ? "\n" + qsTr("Execution and its outcome are reported separately.") : "")
-                         // Why a decision was not recorded; a recorded one's execution report belongs to the outcome.
-                         + (decisionCard.d.message && decisionCard.d.state !== "recorded" ? "\n" + decisionCard.d.message : "") }
+        // -- the decision receipt -----------------------------------------------------
+        Surface {
+            id: decisionCard
+            objectName: "safetyCard_decision"
+            readonly property var d: cards.s.decision || ({})
+            readonly property bool shown: !!d.state
+            visible: shown
+            y: approvalCard.current ? approvalCard.height + 16 : 0
+            tone: d.state === "recorded" ? Theme.success : d.state === "rejected" ? Theme.accentSoft
+                : d.state === "submitting" ? Theme.accent : Theme.warning
+            height: visible ? decisionBody.height + 28 : 0
+            StateIcon { x: 20; y: 14; width: 32; height: 32; tone: decisionCard.tone
+                        icon: decisionCard.d.state === "recorded" ? "check" : decisionCard.d.state === "submitting" ? "more" : decisionCard.d.state === "rejected" ? "minus" : "exclamation" }
+            Column {
+                id: decisionBody
+                x: 68; y: 14; width: parent.width - 88; spacing: 4
+                Text { objectName: "safetyDecisionLabel"; width: parent.width; wrapMode: Text.Wrap; color: Theme.text; font: Theme.uiValue
+                       text: decisionCard.d.label || "" }
+                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
+                       text: [decisionCard.d.action, decisionCard.d.destination ? "→ " + decisionCard.d.destination : "", decisionCard.d.time].filter(function(x) { return !!x }).join("  ·  ")
+                             + (decisionCard.d.state === "recorded" ? "\n" + qsTr("Execution and its outcome are reported separately.") : "")
+                             // Why a decision was not recorded; a recorded one's execution report belongs to the outcome.
+                             + (decisionCard.d.message && decisionCard.d.state !== "recorded" ? "\n" + decisionCard.d.message : "") }
+            }
         }
     }
 
