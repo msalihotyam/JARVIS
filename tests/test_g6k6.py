@@ -5,8 +5,9 @@
 * CommandPreset: no filler for features that do not exist; the load rings are
   drawn to their measured share, and say so when nothing can be read.
 * Tasks / Memory / Automations / History: honest empty states and words.
-* SummaryPeek: never covers the composer; the Focus count is the first active
-  project's records in use; a row either goes somewhere or does not look like it.
+* SummaryPeek: never covers the composer; Focus shows the Focus tile's selected
+  scope - its label and its records in use (K6B, Salih 2026-10-10), else the
+  honest empty state; a row either goes somewhere or does not look like it.
 * Greeting: follows the time of day by a clock a test fixes.
 * Command palette: the choice stays visible, a query without matches says so,
   a click on the panel is not an outside click, closing returns the keyboard.
@@ -274,29 +275,129 @@ class PeekTests(K6Case):
                     self.close_peek(root)
         self.assertEqual(0, self.execute_calls())
 
-    def test_the_focus_count_is_the_first_project_s_records_in_use(self) -> None:
+    def focus_values(self, root):
+        return [i.property("text") for i in sorted(self.named(root, "summaryPeekMetricValue"), key=lambda i: self.box(i)[0])]
+
+    def test_the_focus_count_is_the_selected_scope_s_records_in_use(self) -> None:
         store = SQLiteMemoryStore(self.database)
         first, second = store.create_project("Birinci"), store.create_project("İkinci")
-        items = [store.save_explicit_user_memory_item(first.id, "fact", "internal", f"kayıt {n}") for n in range(3)]
-        store.retire_memory_item(first.id, items[0].id)
-        for n in range(4):
-            store.save_explicit_user_memory_item(second.id, "fact", "internal", f"öteki {n}")
+        for n in range(3):
+            store.save_explicit_user_memory_item(first.id, "fact", "internal", f"kayıt {n}")
+        items = [store.save_explicit_user_memory_item(second.id, "fact", "internal", f"öteki {n}") for n in range(3)]
+        store.retire_memory_item(second.id, items[0].id)
+        talk = store.create_conversation(second.id, title="İkinci sohbet")
+        bridge = self.bridge()
+        bridge.openConversation(talk.id)
+        root = self.window(bridge)
+        self.assertEqual(first.id, bridge.projects[0])              # the first project is not the selected scope
+        # The Memory page last showed the first project, retired records included.
+        bridge.refreshMemory(first.id, True)
+        self.assertEqual(3, len(bridge.memoryItems))
+        self.open_peek(root, "Focus")
+        settled(500, lambda: self.assertEqual(["2", "2"], self.focus_values(root)))  # two active projects; two records in use in "İkinci"
+        shown = self.shown_texts(root)
+        self.assertIn("Items in İkinci", shown)
+        self.assertNotIn("Items in Birinci", shown)
+        self.assertIn("İkinci", shown)                              # the scope's label
+        self.assertIn("öteki 1", shown)
+        self.assertIn("öteki 2", shown)
+        self.assertNotIn("öteki 0", shown)                          # retired
+        self.assertFalse([t for t in shown if t.startswith("kayıt")], shown)
+        self.assertEqual(2, len(self.named(root, "summaryPeekRow")))
+        self.assertFalse(self.named(root, "summaryPeekEmpty"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_the_no_project_scope_shows_the_empty_state(self) -> None:
+        store = SQLiteMemoryStore(self.database)
+        project = store.create_project("Birinci")
+        store.save_explicit_user_memory_item(project.id, "fact", "internal", "kayıt")
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual(first.id, bridge.projects[0])
-        # The Memory page last showed the other project, retired records included.
-        bridge.refreshMemory(second.id, True)
-        self.assertEqual(4, len(bridge.memoryItems))
+        self.assertTrue(bridge.conversationProject["global"])
+        bridge.refreshMemory(project.id, True)                      # a listing of a project is loaded
+        settled(500, lambda: self.assertEqual(1, len(bridge.memoryItems)))
         self.open_peek(root, "Focus")
-        values = [i.property("text") for i in self.named(root, "summaryPeekMetricValue")]
-        self.assertEqual(["2", "2"], values)           # two active projects; two records in use in "Birinci"
-        self.assertIn("Items in Birinci", self.shown_texts(root))
-        self.assertIn("2 memory items", self.shown_texts(root))
+        settled(500, lambda: self.assertEqual(["1", "—"], self.focus_values(root)))
+        shown = self.shown_texts(root)
+        self.assertIn("Memory items", shown)
+        self.assertFalse([t for t in shown if t.startswith("Items in")], shown)
+        self.assertNotIn("kayıt", shown)
+        self.assertFalse(self.named(root, "summaryPeekRow"))
+        self.assertTrue(self.named(root, "summaryPeekEmpty"))
+        self.assertIn("No active focus context yet.", shown)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_a_project_scope_without_records_shows_the_empty_state(self) -> None:
+        store = SQLiteMemoryStore(self.database)
+        first, empty = store.create_project("Birinci"), store.create_project("Boş")
+        store.save_explicit_user_memory_item(first.id, "fact", "internal", "kayıt")
+        talk = store.create_conversation(empty.id, title="Boş sohbet")
+        bridge = self.bridge()
+        bridge.openConversation(talk.id)
+        root = self.window(bridge)
+        bridge.refreshMemory(first.id, True)                        # another project's listing is loaded
+        settled(500, lambda: self.assertEqual(1, len(bridge.memoryItems)))
+        self.open_peek(root, "Focus")
+        settled(500, lambda: self.assertEqual(["2", "0"], self.focus_values(root)))
+        shown = self.shown_texts(root)
+        self.assertIn("Items in Boş", shown)
+        self.assertNotIn("kayıt", shown)
+        self.assertFalse(self.named(root, "summaryPeekRow"))
+        self.assertTrue(self.named(root, "summaryPeekEmpty"))
+        self.assertIn("No active focus context yet.", shown)
+        self.assertEqual(0, self.execute_calls())
+
+    def test_an_archived_project_scope_reads_no_figure_not_a_false_zero(self) -> None:
+        store = SQLiteMemoryStore(self.database)
+        first, old = store.create_project("Birinci"), store.create_project("Eski")
+        store.save_explicit_user_memory_item(first.id, "fact", "internal", "kayıt")
+        store.save_explicit_user_memory_item(old.id, "fact", "internal", "eski kayıt")
+        talk = store.create_conversation(old.id, title="Eski sohbet")
+        store.set_project_active(old.id, False)
+        bridge = self.bridge()
+        bridge.openConversation(talk.id)
+        root = self.window(bridge)
+        self.assertTrue(bridge.conversationProject["archived"])
+        self.open_peek(root, "Focus")
+        settled(500, lambda: self.assertEqual(["1", "—"], self.focus_values(root)))
+        shown = self.shown_texts(root)
+        self.assertIn("Items in Eski", shown)
+        self.assertNotIn("kayıt", shown)
+        self.assertFalse(self.named(root, "summaryPeekRow"))
+        self.assertTrue(self.named(root, "summaryPeekEmpty"))
+        self.assertEqual(0, self.execute_calls())
+
+    def test_a_scope_change_updates_the_open_peek(self) -> None:
+        store = SQLiteMemoryStore(self.database)
+        first, second = store.create_project("Birinci"), store.create_project("İkinci")
+        store.save_explicit_user_memory_item(first.id, "fact", "internal", "kayıt")
+        for n in range(2):
+            store.save_explicit_user_memory_item(second.id, "fact", "internal", f"öteki {n}")
+        one, two = store.create_conversation(first.id, title="Bir"), store.create_conversation(second.id, title="İki")
+        bridge = self.bridge()
+        bridge.openConversation(one.id)
+        root = self.window(bridge)
+        self.open_peek(root, "Focus")
+        settled(500, lambda: self.assertIn("Items in Birinci", self.shown_texts(root)))
+        self.assertIn("kayıt", self.shown_texts(root))
+        bridge.openConversation(two.id)
+        settled(500, lambda: (
+            self.assertIn("Items in İkinci", self.shown_texts(root)),
+            self.assertEqual(["2", "2"], self.focus_values(root)),
+        ))
+        shown = self.shown_texts(root)
+        self.assertIn("öteki 0", shown)
+        self.assertNotIn("kayıt", shown)
+        self.assertNotIn("Items in Birinci", shown)
+        self.assertEqual(0, self.execute_calls())
 
     def test_rows_go_somewhere_or_do_not_look_like_it(self) -> None:
         store = SQLiteMemoryStore(self.database)
         project = store.create_project("Evim")
+        store.save_explicit_user_memory_item(project.id, "fact", "internal", "kayıt")
+        talk = store.create_conversation(project.id, title="Ev sohbeti")
         bridge = self.bridge()
+        bridge.openConversation(talk.id)
         root = self.window(bridge)
         self.sessions(bridge, 2)
         for key, page in (("Plan", "automations"), ("Tasks", "tasks"), ("Focus", "projects")):

@@ -51,21 +51,21 @@ ContextPanel {
     readonly property var rows: spec ? spec.rows.slice(0, maxRows) : []
     readonly property int listHeight: rows.length ? rows.length * rowHeight : emptyHeight
 
-    // A memory project is listed by id; the window shows its name (ids stay internal).
-    function projectName(id) {
-        var hit = bridge.projectRecords.filter(function(p) { return p.id === id })[0]
-        return hit ? hit.name : id
-    }
-    // K6: the Focus count is the first active project's records IN USE. The
-    // listing holds whatever the Memory page loaded last (another project, or
-    // replaced / retired records too), so the peek reloads the default one on
-    // open and counts only what belongs to it.
-    readonly property string firstProject: bridge.projects.length ? bridge.projects[0] : ""
-    readonly property int firstProjectItems: bridge.memoryItems.filter(function(m) { return m.project_id === peek.firstProject && !!m.active }).length
+    // K6B (Salih 2026-10-10): Focus shows the Focus tile's SELECTED scope - its
+    // label and its records IN USE. The listing holds whatever the Memory page
+    // loaded last (another project, or replaced / retired records too), so the
+    // peek reloads the scope's project when it shows Focus and keeps only what
+    // belongs to it. The no-project scope has no records of its own; an archived
+    // project's are not listed (refreshMemory loads active projects only), so it reads "—", never a false 0.
+    readonly property string focusScope: rail && !rail.global && !rail.scope.archived ? rail.scope.id : ""
+    readonly property var focusItems: peek.focusScope ? bridge.memoryItems.filter(function(m) { return m.project_id === peek.focusScope && !!m.active }) : []
+    function loadFocus() { if (peek.open && peek.key === "Focus" && peek.focusScope) bridge.refreshMemory(peek.focusScope, false) }
+    onKeyChanged: loadFocus()
+    onFocusScopeChanged: loadFocus()
     onOpenChanged: {
         if (!open) return
         bottomLimit = composerTop()
-        if (key === "Focus") bridge.refreshMemory("", false)
+        loadFocus()
     }
 
     readonly property var spec: {
@@ -94,14 +94,14 @@ ContextPanel {
                      action: { label: qsTr("Open Tasks"), note: qsTr("Go to the full tasks page"), page: "tasks" } }
         }
         case "Focus":
-            return { title: qsTr("Focus"), subtitle: qsTr("Active projects in memory"), icon: "focus", tone: "#b7801e",
+            return { title: qsTr("Focus"), subtitle: r.scope.name || "", icon: "focus", tone: "#b7801e",
                      metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
-                               { value: peek.firstProjectItems,
-                                 label: bridge.projects.length ? qsTr("Items in %1").arg(peek.projectName(peek.firstProject)) : qsTr("Memory items"), tone: Theme.textLabel }],
-                     rows: bridge.projects.map(function(p, i) {
-                         return { title: peek.projectName(p), sub: i === 0 ? qsTr("%1 memory items").arg(peek.firstProjectItems) : qsTr("Active project"),
-                                  pill: "", meta: "", dot: "quiet", project: p } }),
-                     empty: qsTr("No active focus context yet."), emptyNote: qsTr("Projects appear here once memory holds one."),
+                               { value: peek.focusScope ? peek.focusItems.length : "—",
+                                 label: r.global ? qsTr("Memory items") : qsTr("Items in %1").arg(r.scope.name), tone: Theme.textLabel }],
+                     rows: peek.focusItems.map(function(m) {
+                         return { title: m.text || "", sub: i18n.word("memory_kind", m.kind || ""),
+                                  pill: "", meta: "", dot: "quiet", project: peek.focusScope } }),
+                     empty: qsTr("No active focus context yet."), emptyNote: "",
                      action: { label: qsTr("Open Memory"), note: qsTr("Projects and reference data"), page: "memory" } }
         case "Plan":
             return { title: qsTr("Plan"), subtitle: qsTr("Scheduled work and next runs"), icon: "plan", tone: "#7040c4",
@@ -128,9 +128,12 @@ ContextPanel {
             }
             Column {
                 anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - 53
                 spacing: 2
                 Text { text: peek.spec ? peek.spec.title : ""; color: "#fafeff"; font: Theme.titleLarge }
-                Text { text: peek.spec ? peek.spec.subtitle : ""; color: "#a9bfdc"; font: Theme.body }
+                // K6B: the Focus subtitle is the scope's own name - any length, so it elides with its tip.
+                Text { width: parent.width; elide: Text.ElideRight; text: peek.spec ? peek.spec.subtitle : ""; color: "#a9bfdc"; font: Theme.body
+                       HoverTip { text: parent.text; active: parent.truncated } }
             }
         }
     }

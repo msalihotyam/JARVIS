@@ -1982,15 +1982,23 @@ class SweepDefectTests(SweepCase):
         self.assertEqual((True, bridge.conversationTitle), (tip.property("active"), tip.property("text")))
         QMetaObject.invokeMethod(self.popup_named(root, "conversationSwitcherContext"), "close")
         pump(400)
-        # The Focus peek names its projects, never their ids; every elided line in it has a tip.
+        # The Focus peek names its selected scope, never its id; every elided line in it has a tip.
         self.press(root, "railFocus")
         peek = self.item(root, "summaryPeek")
         shown = [t.property("text") for t in self.descendants(peek) if t.isVisible() and isinstance(t.property("text"), str)]
         import re
         self.assertFalse([t for t in shown if re.search("p-[0-9a-f]{16,}", t)], shown)
-        first = next(p["name"] for p in bridge.projectRecords if p["id"] == bridge.projects[0])
-        self.assertIn(f"Items in {first}", shown)
-        self.assertIn(first, shown)
+        scope = bridge.conversationProject["name"]                      # K6B: the selected scope, not the first project
+        self.assertEqual(LONG_PROJECT, scope)
+        self.assertIn(f"Items in {scope}", shown)
+        self.assertIn(scope, shown)
+        # The long scope name in the header elides inside the peek, with its tip.
+        subtitle = next(t for t in self.descendants(peek) if t.isVisible() and t.property("text") == scope)
+        self.assertLessEqual(subtitle.mapToScene(QPointF(subtitle.width(), 0)).x(),
+                             self.item(root, "summaryPeekClose").mapToScene(QPointF(0, 0)).x())  # never under the close button
+        self.assertTrue(subtitle.property("truncated"))
+        tip = [c for c in subtitle.childItems() if "HoverTip" in c.metaObject().className()][0]
+        self.assertEqual((True, scope), (tip.property("active"), tip.property("text")))
         self.no_clipped_text(root, peek, "Focus peek")
         self.assertEqual(0, self.execute_calls())
 
