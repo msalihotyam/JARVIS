@@ -31,6 +31,9 @@ Depo ve git güvenliği:
 - Açık yetki olmadan asla push yapma; yetki bir sonraki push'a taşınmaz.
   Neden: `main`'in push'u her seferinde Salih'in kararıdır. Bir lane `main`'i
   hiç push etmez; istisna yalnız `ci/*` dalları (runbook → "Push").
+  Tek `main` push yolu konveyor betiğinin iki anahtarlı kapısıdır
+  (orkestratör onay dosyası + deterministik kontroller, bkz.
+  `JARVIS_RUNBOOK.md` "Konveyor"); karar Salih, 2026-10-09.
 - Kuyruk (unattended) çalışmalarda commit yalnız lane'in worktree dalına
   gider, canonical `main`'e asla. Neden: entegrasyonu orkestratör yapar.
 - reset / restore / clean / stash ile iş silme veya saklama yok; silmeden
