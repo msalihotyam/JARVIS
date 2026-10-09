@@ -406,11 +406,13 @@ Window {
     Shortcut { sequence: "Ctrl+Shift+F"; onActivated: bridge.setFocusMode(!bridge.focusMode) }
     Shortcut { sequence: "Ctrl+E"; onActivated: bridge.setEditMode(!bridge.editMode) }
     Shortcut { sequence: "Ctrl+M"; onActivated: root.toggleNav() }
+    // The page shortcuts also work while a menu is open (MenuSurface holds them there).
+    readonly property var menuShortcuts: [pageHome, pageTasks, pageAutomations, pageMemory, pageHistory, pageProjects]
     // Ctrl+1..4 belong to the background audition while it is enabled.
-    Shortcut { sequence: "Ctrl+1"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("home") }
-    Shortcut { sequence: "Ctrl+2"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("tasks") }
-    Shortcut { sequence: "Ctrl+3"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("automations") }
-    Shortcut { sequence: "Ctrl+4"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("memory") }
+    Shortcut { id: pageHome; sequence: "Ctrl+1"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("home") }
+    Shortcut { id: pageTasks; sequence: "Ctrl+2"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("tasks") }
+    Shortcut { id: pageAutomations; sequence: "Ctrl+3"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("automations") }
+    Shortcut { id: pageMemory; sequence: "Ctrl+4"; enabled: !root.backgroundAudition; onActivated: bridge.setPage("memory") }
     Shortcut { sequence: "Ctrl+0"; enabled: root.backgroundAudition; onActivated: root.audition(0) }
     Shortcut { sequence: "Ctrl+1"; enabled: root.backgroundAudition; onActivated: root.audition(1) }
     Shortcut { sequence: "Ctrl+2"; enabled: root.backgroundAudition; onActivated: root.audition(2) }
@@ -428,8 +430,8 @@ Window {
         // Shown at once, gone at once after a hold (K2: no exit without an entry).
         Timer { id: auditionFade; interval: 1150; onTriggered: auditionLabel.opacity = 0 }
     }
-    Shortcut { sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
-    Shortcut { sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }
+    Shortcut { id: pageHistory; sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
+    Shortcut { id: pageProjects; sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }
     Shortcut { sequence: "Escape"; onActivated: {
         if (attachmentPreview.open) attachmentPreview.close()
         else if (palette.open) palette.hide()

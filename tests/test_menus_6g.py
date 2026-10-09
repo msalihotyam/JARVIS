@@ -185,6 +185,41 @@ class MenuKeyTests(MenuCase):
         self.assertTrue(self.item(root, "navigationTrigger").hasActiveFocus())
         self.assertEqual(0, self.execute_calls())
 
+    def test_page_shortcuts_work_while_a_menu_is_open_and_close_it(self) -> None:
+        # G6K4FIX2: an open popup blocks the window's shortcuts (Qt); the menu holds the page ones.
+        self.seed_two()
+        bridge = self.bridge()
+        root = self.window(bridge)
+        # A composer chip's menu (the focus stays in the draft): Ctrl+2 goes to Tasks; the menu
+        # leaves with the home page it belongs to.
+        self.tap(root, self.item(root, "permissionModeControl"))
+        mode = self.popup_named(root, "permissionModeMenu")
+        self.assertTrue(settle(lambda: self.is_open(mode)))
+        self.assertFalse(mode.property("takesFocus"))
+        self.key(root, Qt.Key_2, Qt.ControlModifier)
+        self.assertTrue(wait_until(lambda: bridge.page == "tasks", 400))
+        self.assertTrue(wait_until(lambda: not any(m.property("visible") for m in root.findChildren(QObject, "permissionModeMenu")), 400))
+        self.key(root, Qt.Key_1, Qt.ControlModifier)
+        self.assertTrue(wait_until(lambda: bridge.page == "home", 400))
+        # A sidebar row's conversation menu (the window's, it outlives the page): Ctrl+5 goes to History and closes it.
+        self.menu(root, self.row(root, "sidebarConversation", "Genel 0"))
+        context = self.context(root)
+        self.assertTrue(settle(lambda: self.is_open(context)))
+        self.key(root, Qt.Key_5, Qt.ControlModifier)
+        self.assertTrue(wait_until(lambda: bridge.page == "history", 400))
+        self.assertTrue(wait_until(lambda: not context.property("visible"), 400))
+        # The nav menu (Ctrl+M, the focus in it): Ctrl+3 goes to Automations and closes it.
+        self.key(root, Qt.Key_M, Qt.ControlModifier)
+        nav = self.popup_named(root, "navMenu")
+        self.assertTrue(settle(lambda: self.is_open(nav)))
+        self.key(root, Qt.Key_3, Qt.ControlModifier)
+        self.assertTrue(wait_until(lambda: bridge.page == "automations", 400))
+        self.assertTrue(wait_until(lambda: not nav.property("visible") and not root.property("navOpen"), 400))
+        # Closed again, the window's own shortcut is the only one: Ctrl+1 goes home.
+        self.key(root, Qt.Key_1, Qt.ControlModifier)
+        self.assertTrue(wait_until(lambda: bridge.page == "home", 400))
+        self.assertEqual(0, self.execute_calls())
+
     def test_a_press_outside_closes_and_the_trigger_toggles(self) -> None:
         self.seed_two()
         bridge = self.bridge()

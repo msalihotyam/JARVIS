@@ -47,6 +47,20 @@ Popup {
         Keys.onEscapePressed: surface.escapeClose()
         Keys.onUpPressed: surface.step(-1)
         Keys.onDownPressed: surface.step(1)
+        // The window's page shortcuts pass through an open menu (G6K4FIX2). Qt
+        // blocks every window Shortcut outside a popup that closes on Escape, so
+        // while open the menu holds the window's `menuShortcuts` itself (inside
+        // the popup, where the window's own are blocked while it shows): one closes
+        // the menu and fires. The target is read first: close() releases this mirror.
+        Instantiator {
+            model: surface.visible && body.Window.window ? body.Window.window.menuShortcuts || [] : []
+            delegate: Shortcut {
+                required property var modelData
+                sequence: modelData.sequence
+                enabled: modelData.enabled
+                onActivated: { var target = modelData; surface.close(); target.activated() }
+            }
+        }
     }
 
     enter: Theme.ambient ? menuIn : null

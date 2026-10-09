@@ -15,7 +15,7 @@ import unittest
 
 import tests.test_ui as ui
 from tests.test_ui import _APP, StreamingModel, UiTestCase, ambient_on, find, pump  # noqa: F401 - _APP: the application
-from tests.helpers import wait_until
+from tests.helpers import settled, wait_until
 from tests.test_intent import proposal, task_proposal
 
 from PySide6.QtCore import QMetaObject, QPointF  # noqa: E402
@@ -211,22 +211,42 @@ class ApprovalReceiptTests(FeedCase):
     def test_the_receipt_crossfades_over_the_request(self) -> None:
         bridge, root = self.pending()
         approval, receipt, slot = (self.item(root, n) for n in ("safetyCard_approval", "safetyCard_decision", "safetyDecisionSlot"))
+        feed = self.item(root, "conversationFeed")
         tall = slot.height()
-        self.reject(bridge)
-        pump(40)
+        # G6K4FIX2: the mid-crossfade state is read at its own animation frame, not after a fixed
+        # pump that a loaded machine overshoots past the 160 ms crossfade.
+        frames = []
+
+        def frame():
+            if not frames and 0.0 < approval.property("opacity") < 1.0:
+                frames.append(dict(
+                    shown=approval.isVisible() and receipt.isVisible(), opacity=approval.property("opacity"),
+                    receipt_y=receipt.y(), approve=find(approval, "approvalApprove").property("enabled"),
+                    deny=find(approval, "approvalDeny").property("enabled"),
+                    heading=find(approval, "safetyHeading_approval").property("text"),
+                    receipt_height=receipt.height(), slot_height=slot.height(), card=feed.property("approvalCardShown")))
+        root.afterAnimating.connect(frame)
+        try:
+            self.reject(bridge)
+
+            def ended():
+                self.assertFalse(approval.isVisible())
+                self.assertAlmostEqual(receipt.height(), slot.height(), delta=0.5)
+            settled(400, ended)
+        finally:
+            root.afterAnimating.disconnect(frame)
         # Mid-crossfade: the request, as shown and with its buttons off, fades out under the receipt.
-        self.assertTrue(approval.isVisible() and receipt.isVisible())
-        self.assertLess(approval.property("opacity"), 1.0)
-        self.assertEqual(0.0, receipt.y())
-        self.assertFalse(find(approval, "approvalApprove").property("enabled"))
-        self.assertFalse(find(approval, "approvalDeny").property("enabled"))
-        self.assertEqual("Approval required", find(approval, "safetyHeading_approval").property("text"))
-        self.assertLess(receipt.height(), slot.height())
-        self.assertLess(slot.height(), tall + 1)
-        self.assertFalse(self.item(root, "conversationFeed").property("approvalCardShown"))
-        pump(400)
-        self.assertFalse(approval.isVisible())
-        self.assertAlmostEqual(receipt.height(), slot.height(), delta=0.5)
+        self.assertTrue(frames, "no frame showed the crossfade")
+        mid = frames[0]
+        self.assertTrue(mid["shown"])
+        self.assertLess(mid["opacity"], 1.0)
+        self.assertEqual(0.0, mid["receipt_y"])
+        self.assertFalse(mid["approve"])
+        self.assertFalse(mid["deny"])
+        self.assertEqual("Approval required", mid["heading"])
+        self.assertLess(mid["receipt_height"], mid["slot_height"])
+        self.assertLess(mid["slot_height"], tall + 1)
+        self.assertFalse(mid["card"])
 
     @ambient_on          # it turns ambient effects off after a crossfade
     def test_a_request_after_ambient_effects_are_turned_off_is_shown_opaque(self) -> None:
