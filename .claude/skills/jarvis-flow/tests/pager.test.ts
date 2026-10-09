@@ -30,6 +30,8 @@ test('pure: topic names, the fixed curl argument list and the quoted config', { 
   const cfg = curlConfig('abc', 'say "hi"\\ now\nline2')
   expect(cfg).toContain('url = "https://ntfy.sh/abc"')
   expect(cfg).toContain('data-binary = "say \\"hi\\"\\\\ now\\nline2"')
+  expect(cfg).not.toContain('Priority')
+  expect(curlConfig('abc', 'x', true)).toContain('header = "Priority: 2"')
   expect(isBadStatus('STOP')).toBe(true)
   expect(isBadStatus('BLOCKED')).toBe(true)
   expect(isBadStatus('FAIL')).toBe(true)

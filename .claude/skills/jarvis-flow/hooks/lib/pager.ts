@@ -25,10 +25,12 @@ function quoted(text: string): string {
   return '"' + text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n') + '"'
 }
 
-export function curlConfig(topic: string, text: string): string {
+// quiet = information only (ntfy priority 2: no sound/vibration); default pages stay normal
+export function curlConfig(topic: string, text: string, quiet = false): string {
   return [
     'url = ' + quoted('https://ntfy.sh/' + topic),
     'header = ' + quoted('Title: JARVIS'),
+    ...(quiet ? ['header = ' + quoted('Priority: 2')] : []),
     'header = ' + quoted('Content-Type: text/plain; charset=utf-8'),
     'data-binary = ' + quoted(text),
     '',

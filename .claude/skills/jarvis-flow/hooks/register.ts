@@ -787,7 +787,7 @@ async function appendRow($: any, path: string, row: unknown): Promise<boolean> {
 
 // ---- wave 2: pager
 
-async function push($: any, why: PushWhy, text: string): Promise<'sent' | 'limited' | 'notopic' | 'failed'> {
+async function push($: any, why: PushWhy, text: string, quiet = false): Promise<'sent' | 'limited' | 'notopic' | 'failed'> {
   if (pushing) return 'limited'
   pushing = true
   try {
@@ -803,7 +803,7 @@ async function push($: any, why: PushWhy, text: string): Promise<'sent' | 'limit
     }
     lastPush = now
     // topic and text go in on stdin as a curl config; nothing secret is in argv, a file or a toast
-    const out = await $.process.run(curlArgv(await $.env.get('SystemRoot')), { stdin: curlConfig(topic, text), timeoutMs: 15000 })
+    const out = await $.process.run(curlArgv(await $.env.get('SystemRoot')), { stdin: curlConfig(topic, text, quiet), timeoutMs: 15000 })
     if (out.exitCode === 0) return 'sent'
     if (!curlToasted) {
       curlToasted = true
@@ -1192,7 +1192,9 @@ export function register(on: any) {
           }
           await appendRow($, root + SLICE_PATH, row)
           const word = statusWord(e.answer)
-          if (isBadStatus(word)) await push($, 'status', pushText('status', rec.lane, endMs, 'STATUS: ' + word))
+          // bad statuses go to the conveyor attention list (orchestrator first); Salih only gets an
+          // information push so he can wake the orchestrator early if he is free; it rings by day and is silent 02:00-08:00 (local)
+          if (isBadStatus(word)) await push($, 'status', pushText('status', rec.lane, endMs, 'STATUS: ' + word + ' (bilgi; orkestratör bakacak)'), [2, 3, 4, 5, 6, 7].includes(new Date(endMs).getHours()))
         } catch (err: any) {
           $.ui.toast('jarvis-flow: defter yazılamadı: ' + String(err && err.message ? err.message : err))
         }
