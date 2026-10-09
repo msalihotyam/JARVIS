@@ -61,11 +61,65 @@ class FakeClaude:
         return next(a for a in reversed(self.agents) if a.get("name") == name)
 
 
+MAIN = "1234567" + "a" * 33  # local main (the approved sha)
+ORIGIN = "b" * 40  # origin/main, its parent
+SCHEMA = "X = 1\nSCHEMA_VERSION = 10\n"
+
+
+class FakeGit:
+    """Fake git/gh: a verified main one commit ahead of origin/main, CI green on ci/p2b."""
+
+    def __init__(self):
+        self.calls = []
+        self.main, self.origin = MAIN, ORIGIN
+        self.fail = {}  # args prefix tuple -> (rc, output) answered instead
+        self.diff = "jarvis/core.py\nscripts/conveyor.py\n"
+        self.memory = {ORIGIN: SCHEMA, MAIN: SCHEMA}
+        self.contains = "  origin/ci/p2b\n  origin/feature\n"
+        self.runs = [{"headSha": MAIN, "status": "completed", "conclusion": "success",
+                      "workflowName": "tests", "url": "https://github.com/x/y/actions/runs/1"}]
+        self.raise_on = None
+
+    def __call__(self, args, timeout=120):
+        self.calls.append(args)
+        a = tuple(args)
+        if self.raise_on and a[:len(self.raise_on)] == self.raise_on:
+            raise TimeoutError("slow")
+        for k, v in self.fail.items():
+            if a[:len(k)] == k:
+                return v
+        if a == ("git", "rev-parse", "--verify", "refs/heads/main"):
+            return 0, self.main + "\n"
+        if a == ("git", "fetch", "origin", "main"):
+            return 0, ""
+        if a == ("git", "rev-parse", "--verify", "refs/remotes/origin/main"):
+            return 0, self.origin + "\n"
+        if a == ("git", "merge-base", "--is-ancestor", self.origin, self.main):
+            return 0, ""
+        if a == ("git", "diff", "--name-only", f"{self.origin}..{self.main}"):
+            return 0, self.diff
+        if a[:2] == ("git", "show") and a[2].endswith(":jarvis/memory.py"):
+            text = self.memory.get(a[2].split(":")[0])
+            return (0, text) if text is not None else (128, "fatal: no such path")
+        if a == ("git", "branch", "-r", "--contains", self.main):
+            return 0, self.contains
+        if a[:3] == ("gh", "run", "list"):
+            return 0, json.dumps(self.runs)
+        if a[:2] == ("git", "push"):
+            return 0, "ok"
+        return 1, "unexpected"
+
+    def pushes(self):
+        return [c for c in self.calls if c[:2] == ["git", "push"]]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.fake = FakeClaude()
+        self.git = FakeGit()
+        self.free = 100e9
         self.t = float(int(time.time()))
         self.pushes = []
         self.key = ""  # reader off by default; never the real key lookup (env/registry)
@@ -73,8 +127,14 @@ class Base(unittest.TestCase):
         self.reply = (500, None)
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
                           send=lambda text: self.pushes.append(text) or "sent",
-                          post=self.fake_post, key=lambda: self.key)
+                          post=self.fake_post, key=lambda: self.key,
+                          cmd=self.git, disk=self.fake_disk)
         self.base = self.root / "build" / "conveyor"
+
+    def fake_disk(self, path):
+        if isinstance(self.free, Exception):
+            raise self.free
+        return mock.Mock(free=self.free)
 
     def fake_post(self, key, body):
         self.posts.append(body)
@@ -122,6 +182,9 @@ class Base(unittest.TestCase):
                 p.write_text(f"TASK {s['id']}\nbody\n", encoding="utf-8")
             out.append(s)
         (self.base / "backlog.json").write_text(json.dumps({"slices": out}), encoding="utf-8")
+
+    def attn_ex_dry(self):
+        return [i for i in self.attn() if i != conveyor.DRY_ID]
 
     def view(self):
         return {r["id"]: r["state"] for r in self.status()["backlog"] if "id" in r}
@@ -239,7 +302,8 @@ class TestInbox(Base):
         self.c.pass_once()
         s = self.status()
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
-                                  "usage_hold", "lanes", "backlog", "attention"})
+                                  "usage_hold", "disk_hold", "disk_free_gb", "lanes", "backlog",
+                                  "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -1185,7 +1249,7 @@ class TestCleanup(Base):
         self.assertEqual(len(self.cli("rm")), conveyor.CLEANUP_PER_PASS + 1)
 
     def test_ledger_prefers_scripts_copy(self):
-        c = Conveyor(self.root, self.fake, now=lambda: self.t)
+        c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk)
         mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
               "    Path(out).write_text('{}')\n"
         (self.root / "scripts").mkdir()
@@ -1196,6 +1260,236 @@ class TestCleanup(Base):
         (self.root / "scripts" / "usage_ledger.py").unlink()
         c.usage_ledger()
         self.assertEqual(self.ledger.read_text(), "build")
+
+
+class TestPushGate(Base):
+    def approve(self, name=f"push-{MAIN}-p2b"):
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text("integration report read, ok\n", encoding="utf-8")
+        return d / name
+
+    def assert_blocked(self, name, why):
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [])
+        self.assertTrue((self.root / "build" / "approvals" / name).is_file())
+        (ev,) = [e for e in self.events() if e["event"] == "push_blocked"]
+        self.assertEqual(ev["approval"], name)
+        self.assertIn(why, ev["reason"])
+        self.assertIn(name, self.attn())
+        self.assertFalse([e for e in self.events() if e["event"] == "push"])
+
+    def test_happy_path_pushes_exactly_main_and_moves_approval(self):
+        f = self.approve()
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
+        self.assertFalse(any("--force" in a or "-f" == a for c in self.git.calls for a in c))
+        self.assertIn(["gh", "run", "list", "--branch", "ci/p2b", "--limit", "50", "--json",
+                       "headSha,conclusion,status,workflowName,url"], self.git.calls)
+        self.assertFalse(f.exists())
+        self.assertTrue((f.parent / "done" / f.name).is_file())
+        (ev,) = [e for e in self.events() if e["event"] == "push"]
+        self.assertEqual(ev["sha"], MAIN)
+        self.assertEqual(ev["ci_run"], "https://github.com/x/y/actions/runs/1")
+        self.assertEqual(self.pushes, ["main 1234567 GitHub'a gönderildi"])
+        self.assertEqual(self.attn_ex_dry(), [])
+        self.c.pass_once()  # moved: never pushed twice
+        self.assertEqual(len(self.git.pushes()), 1)
+
+    def test_short_sha_and_ci_branch_by_contains(self):
+        self.approve("push-1234567")
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
+        self.assertIn(["git", "branch", "-r", "--contains", MAIN], self.git.calls)
+
+    def test_ntfy_respects_page_gap(self):
+        self.c.pager_flag("last_push", self.t - 60)
+        self.approve()
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertEqual(self.pushes, [])  # held for the gap
+        self.t += conveyor.PAGE_GAP_S
+        self.c.pass_once()
+        self.assertEqual(self.pushes, ["main 1234567 GitHub'a gönderildi"])
+
+    def test_no_approval_no_git(self):
+        self.c.pass_once()
+        self.assertEqual(self.git.calls, [])
+        d = self.root / "build" / "approvals"
+        (d / "done").mkdir(parents=True)
+        (d / "done" / f"push-{MAIN}").write_text("old")
+        (d / f"notes-{MAIN}").write_text("x")
+        self.c.pass_once()
+        self.assertEqual(self.git.calls, [])
+
+    def test_bad_approval_name(self):
+        self.approve("push-xyz1234")
+        self.assert_blocked("push-xyz1234", "approval name")
+        self.assertEqual(self.git.calls, [])
+
+    def test_local_main_mismatch(self):
+        self.approve()
+        self.git.main = "c" * 40
+        self.assert_blocked(f"push-{MAIN}-p2b", "local main")
+
+    def test_local_main_unreadable(self):
+        self.approve()
+        self.git.fail[("git", "rev-parse", "--verify", "refs/heads/main")] = (128, "fatal")
+        self.assert_blocked(f"push-{MAIN}-p2b", "local main")
+
+    def test_fetch_fails(self):
+        self.approve()
+        self.git.fail[("git", "fetch")] = (1, "network")
+        self.assert_blocked(f"push-{MAIN}-p2b", "git fetch")
+
+    def test_origin_already_there(self):
+        self.approve()
+        self.git.origin = MAIN
+        self.assert_blocked(f"push-{MAIN}-p2b", "already on origin/main")
+
+    def test_not_fast_forward(self):
+        self.approve()
+        self.git.fail[("git", "merge-base")] = (1, "")
+        self.assert_blocked(f"push-{MAIN}-p2b", "not a fast-forward")
+
+    def test_uv_lock_blocks(self):
+        for diff in ("uv.lock\n", "jarvis/a.py\nsub/uv.lock\n"):
+            with self.subTest(diff=diff):
+                self.tearDown()
+                self.setUp()
+                self.approve()
+                self.git.diff = diff
+                self.assert_blocked(f"push-{MAIN}-p2b", "uv.lock")
+
+    def test_schema_version_changed_blocks(self):
+        for rev, text in ((MAIN, "SCHEMA_VERSION = 11\n"), (MAIN, None), (ORIGIN, "X = 1\n"),
+                          (MAIN, SCHEMA + "SCHEMA_VERSION = 11\n")):
+            with self.subTest(rev=rev, text=text):
+                self.tearDown()
+                self.setUp()
+                self.approve()
+                self.git.memory[rev] = text
+                self.assert_blocked(f"push-{MAIN}-p2b", "SCHEMA_VERSION = 10")
+
+    def test_ci_not_success_or_other_sha_blocks(self):
+        run = self.git.runs[0]
+        for change in ({"conclusion": "failure"}, {"status": "in_progress", "conclusion": ""},
+                       {"headSha": "d" * 40}, {"workflowName": "other"}):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                self.approve()
+                self.git.runs = [{**run, **change}]
+                self.assert_blocked(f"push-{MAIN}-p2b", "CI tests on ci/p2b is not success")
+
+    def test_newest_run_failed_after_older_success(self):
+        self.approve()
+        self.git.runs = [{**self.git.runs[0], "conclusion": "failure"}, self.git.runs[0]]
+        self.assert_blocked(f"push-{MAIN}-p2b", "is not success")
+
+    def test_gh_fails_or_garbage(self):
+        for ans in ((1, "auth"), (0, "not json"), (0, "{}")):
+            with self.subTest(ans=ans):
+                self.tearDown()
+                self.setUp()
+                self.approve()
+                self.git.fail[("gh",)] = ans
+                self.assert_blocked(f"push-{MAIN}-p2b", "gh run list ci/p2b")
+
+    def test_ci_branch_not_unique(self):
+        for contains in ("  origin/feature\n", "  origin/ci/a\n  origin/ci/b\n"):
+            with self.subTest(contains=contains):
+                self.tearDown()
+                self.setUp()
+                self.approve("push-1234567")
+                self.git.contains = contains
+                self.assert_blocked("push-1234567", "name the approval push-<sha>-<ci>")
+
+    def test_check_exception_blocks(self):
+        self.approve()
+        self.git.raise_on = ("git", "fetch")
+        self.assert_blocked(f"push-{MAIN}-p2b", "check error: TimeoutError")
+
+    def test_push_failure_blocks(self):
+        f = self.approve()
+        self.git.fail[("git", "push")] = (1, "rejected")
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertTrue(f.is_file())
+        (ev,) = [e for e in self.events() if e["event"] == "push_blocked"]
+        self.assertIn("git push rc=1", ev["reason"])
+        self.assertFalse([e for e in self.events() if e["event"] == "push"])
+
+    def test_retry_at_most_once_per_10_min(self):
+        f = self.approve()
+        self.git.fail[("git", "fetch")] = (1, "network")
+        self.c.pass_once()
+        n = len(self.git.calls)
+        self.t += conveyor.PUSH_RETRY_S - 1
+        self.c.pass_once()
+        self.assertEqual(len(self.git.calls), n)
+        self.assertIn(f.name, self.attn())
+        since = self.status()["attention"][0]["since"]
+        self.t += 1
+        self.git.fail.clear()
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertEqual(self.attn_ex_dry(), [])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "push_blocked"]), 1)
+        self.assertTrue(since)
+
+    def test_blocked_item_acked_and_gone_with_approval(self):
+        f = self.approve()
+        self.git.main = "c" * 40
+        self.c.pass_once()
+        (self.base / "ack").mkdir()
+        (self.base / "ack" / f.name).touch()
+        self.c.pass_once()
+        self.assertEqual(self.attn_ex_dry(), [])
+        f.unlink()
+        self.c.pass_once()
+        self.assertEqual(json.loads((self.base / "push.json").read_text()), {})
+
+
+class TestDiskGuard(Base):
+    def test_low_disk_holds_dispatch_and_releases(self):
+        self.free = 5e9
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        st = self.status()
+        self.assertTrue(st["disk_hold"])
+        self.assertEqual(st["disk_free_gb"], 5.0)
+        self.assertEqual(self.attn(), [conveyor.DISK_ID])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "disk_hold"]), 1)
+        self.free = 10e9
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertFalse(self.status()["disk_hold"])
+        self.assertEqual(self.attn(), [])
+
+    def test_new_episode_new_item(self):
+        self.free = 5e9
+        self.c.pass_once()
+        (self.base / "ack").mkdir()
+        (self.base / "ack" / conveyor.DISK_ID).touch()
+        self.c.pass_once()
+        self.assertEqual(self.attn_ex_dry(), [])
+        self.free = 50e9
+        self.c.pass_once()
+        self.free = 5e9
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.attn_ex_dry(), [conveyor.DISK_ID])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "disk_hold"]), 2)
+
+    def test_unreadable_disk_holds(self):
+        self.free = OSError("gone")
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertTrue(self.status()["disk_hold"])
 
 
 class TestLock(Base):

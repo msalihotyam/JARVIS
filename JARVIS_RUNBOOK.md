@@ -580,8 +580,8 @@ empty, or when the range is not a plain `A..B`. The result file records whether
 Salih approved the design on 2026-10-09. `scripts/conveyor.py` (stdlib only,
 tests `tests/test_conveyor.py`) keeps development flowing while the PC is on.
 It runs under a Windows Task Scheduler task, one pass every 60 s (`--once` for
-one pass). It runs no git command and deletes no file itself (lane sessions:
-see Cleanup below); its only model call is
+one pass). Its only git/gh calls are the push gate below, and it deletes no
+file itself (lane sessions: see Cleanup below); its only model call is
 the optional report reader below. One instance at a time
 (`build/conveyor/conveyor.lock`, stale after 5 min). Runtime folder
 `build/conveyor/` (gitignored): `inbox/`, `backlog.json`, `lanes.json`,
@@ -621,6 +621,35 @@ the optional report reader below. One instance at a time
   in `attention`). An idle or finished session never blocks a new lane of the same name.
 - **PAUSE.** `build/conveyor/PAUSE` present: nothing new starts (no dispatch,
   no re-dispatch); tracking, report collection and respawn go on.
+- **Disk guard.** Free space on the repo drive under 10 GB (`MIN_FREE_GB`,
+  `shutil.disk_usage`; unreadable counts as low) holds like PAUSE: no dispatch,
+  no re-dispatch. `status.json` shows `disk_hold` and `disk_free_gb`; one
+  `disk-low` attention item (and one `disk_hold` event) per episode; at 10 GB
+  or more dispatch resumes and the episode ends.
+- **Auto-push of main (two keys).** Salih (2026-10-09 21:32) delegated the
+  main push: "push it when you judge it right". Lanes still never push main;
+  only the conveyor does, and no model is the authority. Key 1: the
+  orchestrator, after reading the integration report, writes
+  `build/approvals/push-<sha>` or `push-<sha>-<ci>` (content free text, only
+  the name counts; `<sha>` 7-40 hex). Key 2: every pass, for each approval,
+  all checks must hold: (1) `<sha>` matches `git rev-parse` of local `main`
+  in the canonical checkout; (2) after `git fetch origin main`, origin/main is
+  an ancestor of `<sha>` and not equal to it (fast-forward only); (3) on the
+  CI branch the newest run of every required workflow (`tests`) with
+  `headSha` exactly `<sha>` is completed with conclusion success (`gh run
+  list --branch`); the CI branch is `ci/<ci>` from the approval name, else
+  the single `origin/ci/*` that `git branch -r --contains <sha>` lists (none
+  or several: blocked, name the approval with `-<ci>`); (4) `git diff
+  --name-only origin/main..<sha>` has no `uv.lock`; (5) the line
+  `SCHEMA_VERSION = 10` is in `jarvis/memory.py` at both origin/main and
+  `<sha>`. Then exactly `git push origin <sha>:refs/heads/main` (never
+  `--force`, no other ref), a `push` event with the sha and CI run url, the
+  approval moved to `build/approvals/done/` (never deleted) and an ntfy "main
+  <sha7> GitHub'a gönderildi" through the pager (10 min gap). A failed check
+  or push: a `push_blocked` event with the reason and an attention item (id =
+  the approval file name; ack `build/conveyor/ack/<name>`), nothing pushed,
+  re-checked at most once per 10 min (`build/conveyor/push.json`). Removing
+  the approval withdraws it.
 - **Usage guard.** `claude` has no plan-usage command, so the newest
   `build/ledger/slices.jsonl` row (jarvis-flow slice ledger, `seven_day`) is
   read; at 85% or more of the weekly limit no new lane starts (a row older than
@@ -740,6 +769,11 @@ the suite on GitHub Actions, `.github/workflows/tests.yml`; helper
 `scripts\ci.ps1 [-Name x]`). Pushing `main` or any other branch still needs
 Salih's explicit authorization every time. The workflow runs only on `ci/**`
 pushes and manual dispatch, with read-only permissions and no secrets.
+
+**Delegated exception (Salih 2026-10-09): `main` via the conveyor.** Verified
+`main` is pushed only by `scripts/conveyor.py` under two keys (an orchestrator
+approval file plus deterministic checks), see "Konveyor" → "Auto-push of
+main". No lane and no Claude session pushes `main` itself.
 
 ## Release (Windows package)
 

@@ -1,11 +1,14 @@
 """JARVIS Konveyor v1 - dispatches inbox prompts and backlog slices as `claude --bg` lanes.
 
-Stdlib only. No git, deletes no file itself; finished lane sessions it started are
-removed with `claude rm` after a grace period. Runtime state lives in build/conveyor/
-(gitignored). One pass every 60 s; `--once` runs one pass. The one model call is
-the optional, advisory report reader (Claude Haiku over the Anthropic API, key
-from JARVIS_READER_API_KEY, monthly cap): it only adds a "reading" to status.json
-and events and may page; it never approves or triggers anything.
+Stdlib only. Deletes no file itself; finished lane sessions it started are
+removed with `claude rm` after a grace period. Its only git/gh calls are the push
+gate: main is pushed to origin (fast-forward only) when the orchestrator's approval
+file build/approvals/push-<sha>[-<ci>] exists AND every deterministic check passes.
+Runtime state lives in build/conveyor/ (gitignored). One pass every 60 s; `--once`
+runs one pass. The one model call is the optional, advisory report reader (Claude
+Haiku over the Anthropic API, key from JARVIS_READER_API_KEY, monthly cap): it only
+adds a "reading" to status.json and events and may page; it never approves or
+triggers anything.
 See JARVIS_RUNBOOK.md "Konveyor".
 """
 import calendar
@@ -64,7 +67,14 @@ READER_SYSTEM = (
     "unclear report); needs_salih (only a human decision or action can unblock it: approval, "
     "credentials, scope or risk decision). summary: Turkish, at most 140 characters. "
     "next: the single next step, at most 140 characters.")
-STUCK_NOTE = "(no report: the conveyor marked this lane STUCK - re-dispatched twice, no progress)"
+PUSH_RETRY_S = 600  # a blocked approval is re-checked at most once per 10 min
+APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
+REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
+SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read schema 10
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
+DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
+STUCK_NOTE ="(no report: the conveyor marked this lane STUCK - re-dispatched twice, no progress)"
 
 HEADER_RE = re.compile(
     r"^@jarvis lane=([A-Za-z0-9_-]+) model=([A-Za-z0-9._\[\]-]+) "
@@ -97,6 +107,19 @@ def real_runner(args, timeout=120):
                        stdin=subprocess.DEVNULL,
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
+    return p.returncode, out.decode("utf-8", "replace")
+
+
+def real_cmd(args, timeout=120):
+    """Run git or gh (args[0]) in the canonical checkout; return (returncode, output)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}  # never wait on a prompt
+    p = subprocess.run([shutil.which(args[0]) or args[0], *args[1:]], cwd=ROOT,
+                       capture_output=True, stdin=subprocess.DEVNULL, env=env,
+                       timeout=timeout, creationflags=flags)
+    out = p.stdout or b""  # stdout only on success: a stderr warning must not break gh's JSON
+    if p.returncode != 0:
+        out += p.stderr or b""
     return p.returncode, out.decode("utf-8", "replace")
 
 
@@ -254,7 +277,7 @@ def validate_slice(s):
 
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
-                 post=anthropic_post, key=reader_key):
+                 post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage):
         self.root = Path(root)
         self.base = self.root / "build" / "conveyor"
         self.reports = self.root / "build" / "reports"
@@ -263,6 +286,11 @@ class Conveyor:
         self.send = send
         self.post = post
         self.key = key
+        self.cmd = cmd
+        self.disk = disk
+        self.approvals = self.root / "build" / "approvals"
+        self.push_file = self.base / "push.json"
+        self.free_gb = None
         self.inbox = self.base / "inbox"
         self.inbox.mkdir(parents=True, exist_ok=True)
         self.lock = self.base / "conveyor.lock"
@@ -398,10 +426,12 @@ class Conveyor:
             self.error(f"agents: {e}")
             agents = None
         self.usage = self.usage_pct()
+        self.free_gb = self.disk_free_gb()
         if agents is not None:
             self.track(lanes, agents)
             self.dispatch(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
+        self.push_gate()
         items = self.attention(lanes)
         if agents is not None:
             self.cleanup(lanes, agents, {i for i, _, _ in items})
@@ -641,11 +671,28 @@ class Conveyor:
         names |= {n for n in self.running(lanes) if not lanes[n].get("idle")}
         return names
 
+    def disk_free_gb(self):
+        """Free GB on the repo drive; None (treated as low: fail closed) when unreadable."""
+        try:
+            return self.disk(self.root).free / 1e9
+        except OSError:
+            return None
+
+    def disk_hold(self):
+        return self.free_gb is None or self.free_gb < MIN_FREE_GB
+
     def hold(self):
-        """PAUSE flag or usage guard: nothing new starts."""
-        return (self.base / "PAUSE").exists() or (self.usage is not None and self.usage >= USAGE_LIMIT)
+        """PAUSE flag, usage guard or low disk: nothing new starts."""
+        return ((self.base / "PAUSE").exists() or self.disk_hold()
+                or (self.usage is not None and self.usage >= USAGE_LIMIT))
 
     def dispatch(self, lanes, agents):
+        if self.disk_hold():
+            if not self.pager_flag("disk_low"):
+                self.pager_flag("disk_low", self.now())  # the low-disk episode's attention since
+                self.event("disk_hold", free_gb=self.free_gb and round(self.free_gb, 1))
+        elif self.pager_flag("disk_low"):
+            self.pager_flag("disk_low", False)
         if self.hold():
             return
         busy = self.busy_names(lanes, agents)
@@ -815,6 +862,12 @@ class Conveyor:
         dry = self.pager_flag("dry")
         if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
             items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
+        low = self.pager_flag("disk_low")
+        if low:
+            items.append((DISK_ID, f"disk {self.free_gb and round(self.free_gb, 1)} GB boş "
+                                   f"(< {MIN_FREE_GB}): lane başlatılmıyor", low))
+        for name, st in self.load_json(self.push_file, {}).items():
+            items.append((name, f"push blocked: {st['reason']}", st["since"]))
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop_done(self, item_id, since):
@@ -838,6 +891,8 @@ class Conveyor:
             "last_error": self.last_error,
             "usage_pct": self.usage,
             "usage_hold": self.usage is not None and self.usage >= USAGE_LIMIT,
+            "disk_hold": self.disk_hold(),
+            "disk_free_gb": self.free_gb and round(self.free_gb, 1),
             "lanes": [{"name": n, "id": ln["id"], "model": ln.get("model"),
                        "effort": ln.get("effort"), "state": ln.get("state"),
                        "status": ln.get("status"), "report": ln.get("report"),
@@ -868,6 +923,112 @@ class Conveyor:
                 spec.loader.exec_module(mod)
                 mod.main(out=self.root / "build" / "ledger" / "usage.json")
                 return
+
+    # ---- push gate: verified main to GitHub under two keys ---------------
+    def push_gate(self):
+        """For each build/approvals/push-<sha>[-<ci>] (key 1, the orchestrator's) whose
+        checks all pass (key 2, push_checks): `git push origin <sha>:refs/heads/main`,
+        never --force, then move the approval to done/. A blocked approval is an
+        attention item and is re-checked at most once per PUSH_RETRY_S."""
+        state = self.load_json(self.push_file, {})
+        files = sorted(f for f in self.approvals.glob("push-*") if f.is_file())
+        for f in files:
+            st = state.get(f.name, {})
+            if self.now() - st.get("tried", 0) < PUSH_RETRY_S:
+                continue
+            st["tried"] = self.now()
+            sha = url = None
+            try:
+                why, sha, url = self.push_checks(f.name)
+                if why is None:
+                    rc, out = self.cmd(["git", "push", "origin", f"{sha}:refs/heads/main"])
+                    if rc != 0:
+                        why = f"git push rc={rc}: {out.strip()[-200:]}"
+            except Exception as e:  # a git/gh timeout etc.: blocked, never pushed
+                why = f"check error: {type(e).__name__}"
+            if why:
+                st.setdefault("since", self.now())
+                st["reason"] = why
+                state[f.name] = st
+                self.event("push_blocked", approval=f.name, reason=why)
+                continue
+            state.pop(f.name, None)
+            self.event("push", sha=sha, ci_run=url, approval=f.name)
+            self.page(f"main {sha[:7]} GitHub'a gönderildi")
+            done = self.approvals / "done"
+            dest = done / f.name
+            try:
+                done.mkdir(exist_ok=True)
+                if dest.exists():  # never overwrite an earlier record
+                    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
+                    dest = done / f"{f.name}.{ts}"
+                os.replace(f, dest)
+            except OSError as e:  # the next check finds sha == origin/main and blocks
+                self.error(f"push: move {f.name}: {e}")
+        names = {f.name for f in files}
+        state = {k: v for k, v in state.items() if k in names}  # approval gone: item gone
+        if state or self.push_file.exists():
+            self.push_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def push_checks(self, name):
+        """(None, full sha, CI run url) when every check passes, else (reason, sha, None)."""
+        m = APPROVAL_RE.fullmatch(name)
+        if not m:
+            return "approval name is not push-<sha>[-<ci>]", None, None
+        want, ci = m.groups()
+        rc, sha = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
+        sha = sha.strip()
+        if rc != 0 or not SHA_RE.fullmatch(sha) or not sha.startswith(want):
+            return f"local main {sha[:12]} is not {want}", want, None
+        rc, _ = self.cmd(["git", "fetch", "origin", "main"])
+        if rc != 0:
+            return f"git fetch rc={rc}", sha, None
+        rc, om = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
+        om = om.strip()
+        if rc != 0 or not SHA_RE.fullmatch(om):
+            return "origin/main unknown", sha, None
+        if om == sha:
+            return "already on origin/main", sha, None
+        rc, _ = self.cmd(["git", "merge-base", "--is-ancestor", om, sha])
+        if rc != 0:
+            return f"not a fast-forward of origin/main {om[:7]}", sha, None
+        rc, out = self.cmd(["git", "diff", "--name-only", f"{om}..{sha}"])
+        if rc != 0:
+            return f"git diff rc={rc}", sha, None
+        if any(p.strip().rsplit("/", 1)[-1] == "uv.lock" for p in out.splitlines()):
+            return "uv.lock changed", sha, None
+        for rev in (om, sha):
+            rc, out = self.cmd(["git", "show", f"{rev}:jarvis/memory.py"])
+            lines = [x.rstrip() for x in out.splitlines() if x.lstrip().startswith("SCHEMA_VERSION")]
+            if rc != 0 or lines != [SCHEMA_LINE]:
+                return f"'{SCHEMA_LINE}' not in jarvis/memory.py at {rev[:7]}", sha, None
+        # the CI branch: ci/<ci> from the approval name, else the one origin/ci/* containing sha
+        if ci:
+            branch = f"ci/{ci}"
+        else:
+            rc, out = self.cmd(["git", "branch", "-r", "--contains", sha])
+            cands = [b.strip()[len("origin/"):] for b in out.splitlines()
+                     if b.strip().startswith("origin/ci/")]
+            if rc != 0 or len(cands) != 1:
+                return (f"{len(cands)} origin/ci/* branches contain {sha[:7]}: "
+                        "name the approval push-<sha>-<ci>"), sha, None
+            branch = cands[0]
+        rc, out = self.cmd(["gh", "run", "list", "--branch", branch, "--limit", "50",
+                            "--json", "headSha,conclusion,status,workflowName,url"])
+        try:
+            runs = json.loads(out) if rc == 0 else None
+        except ValueError:
+            runs = None
+        if not isinstance(runs, list):
+            return f"gh run list {branch} rc={rc}", sha, None
+        urls = []
+        for wf in REQUIRED_WORKFLOWS:  # the newest run of the workflow for exactly this sha
+            mine = [r for r in runs if isinstance(r, dict)
+                    and r.get("workflowName") == wf and r.get("headSha") == sha]
+            if not mine or mine[0].get("status") != "completed" or mine[0].get("conclusion") != "success":
+                return f"CI {wf} on {branch} is not success for {sha[:7]}", sha, None
+            urls.append(str(mine[0].get("url")))
+        return None, sha, " ".join(urls)
 
     # ---- cleanup of finished lane sessions -----------------------------
     def collected_ts(self, ln):
