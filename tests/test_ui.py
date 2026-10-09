@@ -906,7 +906,7 @@ class PresentationTests(UiTestCase):
         return root
 
     def test_distinct_anchored_contexts_toggle_escape_outside_and_selection(self):
-        from PySide6.QtCore import QPoint
+        from PySide6.QtCore import QPoint, QPointF
         bridge = self.bridge()
         root = self.window(bridge)
         for trigger, state, surface in (("settingsOrb", "settingsOpen", "settingsSurface"),
@@ -917,7 +917,8 @@ class PresentationTests(UiTestCase):
                     self.assertTrue(root.property(state)),
                     self.assertEqual(1, sum(bool(root.property(key)) for key in ("settingsOpen", "modelOpen", "navOpen"))),
                 ))
-                panel = self.item(root, surface)
+                # In the window's coordinates (K4: the nav menu is a popup surface, not a panel child).
+                panel = self.item(root, surface).mapToScene(QPointF(0, 0))
                 if trigger == "settingsOrb":
                     self.assertLess(panel.x(), 80)
                 else:
@@ -976,13 +977,14 @@ class PresentationTests(UiTestCase):
                     self.assertGreater(composer.width(), 360)
                     for trigger, surface in (("settingsOrb", "settingsSurface"), ("modelTrigger", "modelSurface"), ("navigationTrigger", "navSurface")):
                         self.click(root, trigger)
-                        panel = self.item(root, surface)
-                        settle(lambda: panel.x() >= 0 and panel.y() >= 80 and panel.x() + panel.width() <= width
-                               and panel.y() + panel.height() <= height)
-                        self.assertGreaterEqual(panel.x(), 0)
-                        self.assertGreaterEqual(panel.y(), 80)
-                        self.assertLessEqual(panel.x() + panel.width(), width)
-                        self.assertLessEqual(panel.y() + panel.height(), height)
+                        body = self.item(root, surface)
+                        at = lambda: body.mapToScene(QPointF(0, 0))  # noqa: E731 - K4: window coordinates (the nav menu is a popup)
+                        settle(lambda: at().x() >= 0 and at().y() >= 80 and at().x() + body.width() <= width
+                               and at().y() + body.height() <= height)
+                        self.assertGreaterEqual(at().x(), 0)
+                        self.assertGreaterEqual(at().y(), 80)
+                        self.assertLessEqual(at().x() + body.width(), width)
+                        self.assertLessEqual(at().y() + body.height(), height)
                         QTest.keyClick(root, Qt.Key_Escape)
                         pump(220)
 
@@ -6091,7 +6093,7 @@ class FinalPolishTests(SurfaceCase):
         pump(400)
         menu = root.findChild(QObject, "composerEditMenu")
         self.assertTrue(menu.property("visible"))
-        self.assertTrue(0.85 <= self.alpha(menu.property("background")) <= 0.90)   # the edit menu is the lighter glass
+        self.assertEqual(1.0, self.alpha(menu.property("background")))   # K4 (Salih 2026-10-05): every menu is opaque
         self.assertGreaterEqual(root.findChild(QObject, "editCopy").property("implicitHeight"), 34)
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
@@ -7686,7 +7688,7 @@ class PrePolishTests(SurfaceCase):
 
 class ContextMenuPolishTests(SurfaceCase):
     """The final UX pass: the edit menu opens at the pointer, carries no shortcut
-    hints, is a lighter glass, confirms a copy; messages get a read-only menu."""
+    hints, is opaque (K4: it was a lighter glass), confirms a copy; messages get a read-only menu."""
 
     def menu(self, root, name):
         from PySide6.QtCore import QObject
@@ -7774,7 +7776,7 @@ class ContextMenuPolishTests(SurfaceCase):
         for hint in ("Ctrl", "⌘", "+Z", "+X", "+C", "+V", "+A"):
             self.assertFalse([t for t in labels if hint in t], hint)
         alpha = QColor(QQmlProperty.read(menu.property("background"), "color")).alphaF()
-        self.assertTrue(0.85 <= alpha <= 0.90, alpha)                            # glass, still readable
+        self.assertEqual(1.0, alpha)                            # K4 (Salih 2026-10-05): opaque, as every menu
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
 

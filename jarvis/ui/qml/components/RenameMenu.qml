@@ -4,8 +4,9 @@ import "../theme"
 
 // Right-click a task or a session: "Rename". The name is the person's own label
 // and always wins over the automatic one; the id underneath never changes. An
-// empty name or a cancel leaves the current name as it is.
-Menu {
+// empty name or a cancel leaves the current name as it is. K4: the one menu
+// surface and row, at the pointer; Esc returns focus to the row.
+MenuSurface {
     id: menu
     objectName: "renameMenu"
     property string targetId: ""
@@ -13,29 +14,17 @@ Menu {
     function openFor(item, position, id, title) {
         if (!id) return
         targetId = id; current = title || ""; origin = item
-        popup(item, position)
+        popupAt(item, position, { flip: true })
     }
 
+    width: 200
     padding: 6
-    implicitWidth: 200
-    background: Rectangle {
-        implicitWidth: 200
-        radius: 8
-        color: Theme.glassMenuVeil
-        border.width: 1
-        border.color: Theme.glassOverlayEdge
-    }
-    MenuItem {
-        id: action
+    MenuRow {
         objectName: "renameAction"
-        text: qsTr("Rename")
-        implicitHeight: 34
-        leftPadding: 12; rightPadding: 12
-        contentItem: Text { text: action.text; color: Theme.text; renderType: Theme.textRender
-                            verticalAlignment: Text.AlignVCenter; font: Theme.body }
-        background: Rectangle { radius: 6; color: action.highlighted ? Theme.alpha("#36aaff", 0.12) : "transparent"
-                                border.width: action.highlighted ? 1 : 0; border.color: Theme.alpha("#49bdfa", 0.4) }
-        onTriggered: menu.dialog.openFor(menu.targetId, menu.current)
+        width: menu.availableWidth
+        icon: "pencil"
+        label: qsTr("Rename")
+        onTriggered: { menu.close(); menu.dialog.openFor(menu.targetId, menu.current) }
     }
 
     // Gate 6E: on the shared dialog shell (accent tone). Focus starts in the

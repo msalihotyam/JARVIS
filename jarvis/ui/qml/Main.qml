@@ -283,7 +283,7 @@ Window {
         text: qsTr("Focus mode · %1 to leave").arg("Ctrl+Shift+F"); tint: Theme.accent
     }
 
-    NavMenu { id: nav; anchorPoint: Qt.point(topBar.navAnchor.x - panelWidth, topBar.navAnchor.y) }
+    NavMenu { id: nav; anchorPoint: Qt.point(topBar.navAnchor.x - panelWidth, topBar.navAnchor.y); trigger: topBar.navTrigger }
     // MAIN / DARK decide approvals in the conversation card; only the Command
     // preset (V2) keeps its own authorization surfaces.
     Loader { anchors.fill: parent; z: 450; active: root.presentation === "command" && !root.inlineApproval
@@ -303,13 +303,18 @@ Window {
         property bool open: false
         anchors.fill: parent; z: 520
         visible: open
+        // K4 (the dialog style): focus starts on the safe choice and returns to the opener on close.
+        property Item opener: null
+        onVisibleChanged: if (visible) { opener = Window.activeFocusItem; keepFrozen.forceActiveFocus() }
+                          else if (opener) { var back = opener; opener = null; back.forceActiveFocus() }
         Connections { target: bridge; function onStateChanged() { if (bridge.executionEnabled) resumeConfirm.open = false } }
-        MouseArea { anchors.fill: parent; onClicked: resumeConfirm.open = false }
+        Rectangle { objectName: "resumeConfirmScrim"; anchors.fill: parent; color: Qt.rgba(0, 0, 0, Theme.scrimOpacity)
+                    MouseArea { anchors.fill: parent; onClicked: resumeConfirm.open = false } }
         Rectangle {
             width: Math.min(330, root.width - 32); height: reBody.height + 36
             x: Math.max(16, Math.min(topBar.killAnchor.x - width + 40, root.width - width - 16))
             y: topBar.killAnchor.y
-            radius: 12; color: Theme.glassMenu; border.width: 1; border.color: Theme.alpha(Theme.danger, 0.55)
+            radius: Theme.popupRadius; color: Theme.menuSurface; border.width: 1; border.color: Theme.alpha(Theme.danger, 0.55)
             MouseArea { anchors.fill: parent }
             Column {
                 id: reBody
@@ -322,7 +327,7 @@ Window {
                              : qsTr("New work can start again, and a task Freeze paused continues from where it stopped. Nothing failed, cancelled or with an unknown outcome is repeated. This is not an approval.") }
                 Row {
                     width: parent.width; spacing: 8
-                    ActionButton { objectName: "keepFrozen"; label: qsTr("Keep frozen"); height: 40; width: (parent.width - 8) / 2; onClicked: resumeConfirm.open = false }
+                    ActionButton { id: keepFrozen; objectName: "keepFrozen"; label: qsTr("Keep frozen"); height: 40; width: (parent.width - 8) / 2; onClicked: resumeConfirm.open = false }
                     ActionButton { objectName: "resumeJarvis"; label: qsTr("Resume JARVIS"); primary: true; height: 40; width: (parent.width - 8) / 2
                         onClicked: { resumeConfirm.open = false; bridge.resumeJarvis() } }
                 }

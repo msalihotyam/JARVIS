@@ -84,11 +84,11 @@ Popup {
         opacity = 1; scale = 1                 // an exit motion never leaves the next open faded
         var back = opener
         opener = null
-        if (back) back.forceActiveFocus()
+        if (back && back.visible) back.forceActiveFocus()     // an opener gone meanwhile (a deleted conversation's "…") takes none
     }
 
     background: Rectangle {
-        radius: 12
+        radius: Theme.popupRadius               // K4: the one menu + dialog corner
         color: Theme.surfaceRaised
         border.width: 1; border.color: Theme.alpha(dialog.tone, 0.7)
     }

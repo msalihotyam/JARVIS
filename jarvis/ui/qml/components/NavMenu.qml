@@ -1,37 +1,45 @@
 import QtQuick
 import "../theme"
 
-ContextPanel {
+// The navigation menu (Ctrl+M or the top bar's grid). K4: the one menu surface
+// and row - icon, page name, its Ctrl+N shortcut; the current page marked.
+// `open` is the window's state (one context at a time); the surface follows
+// it and reports its own closing (Esc, a press outside) back.
+Item {
     id: nav
-    heading: qsTr("NAVIGATE")
-    surfaceName: "navSurface"
-    panelWidth: 300; panelHeight: 372
+    property bool open: false
+    property point anchorPoint: Qt.point(24, 88)
+    property Item trigger: null
+    readonly property real panelWidth: 300
     function go(page) { bridge.setPage(page); nav.open = false }
-    Column {
-        width: parent.width; spacing: 4
-        Repeater {
-            model: [
-                { page: "home", label: qsTr("Command Center"), key: "1", icon: "home" },
-                { page: "tasks", label: qsTr("Tasks"), key: "2", icon: "tasks" },
-                { page: "automations", label: qsTr("Automations"), key: "3", icon: "automations" },
-                { page: "memory", label: qsTr("Memory"), key: "4", icon: "memory" },
-                { page: "history", label: qsTr("History"), key: "5", icon: "history" },
-                { page: "projects", label: qsTr("Projects"), key: "6", icon: "project" }
-            ]
-            Rectangle {
-                id: entry
-                objectName: "navigate_" + modelData.page
-                width: parent.width; height: 42; radius: 6
-                readonly property bool current: bridge.page === modelData.page
-                color: current ? Theme.alpha(Theme.accent, 0.10) : hover.containsMouse ? Theme.alpha(Theme.text, 0.04) : "transparent"
-                border.width: 1; border.color: current || activeFocus ? Theme.borderStrong : "transparent"
-                activeFocusOnTab: true; Accessible.role: Accessible.Button; Accessible.name: modelData.label
-                Keys.onReturnPressed: nav.go(modelData.page)
-                Keys.onSpacePressed: nav.go(modelData.page)
-                Icon { x: 11; anchors.verticalCenter: parent.verticalCenter; name: modelData.icon; size: 18; tint: Theme.accent }
-                Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: entry.current ? Theme.text : Theme.textLabel; font: Theme.body }
-                Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+" + modelData.key; color: Theme.textDim; font: Theme.caption }
-                MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: nav.go(modelData.page) }
+    onOpenChanged: if (!open) surface.close()
+                   else surface.popupAt(nav, Qt.point(anchorPoint.x, Math.max(80, anchorPoint.y)), { trigger: trigger })
+
+    MenuSurface {
+        id: surface
+        objectName: "navMenu"
+        surfaceName: "navSurface"
+        width: nav.panelWidth
+        onAboutToHide: nav.open = false              // at once, not after the exit motion
+        Column {
+            width: surface.availableWidth
+            spacing: 2
+            Text { text: qsTr("NAVIGATE"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; topPadding: 4; bottomPadding: 6 }
+            Repeater {
+                model: [
+                    { page: "home", label: qsTr("Command Center"), key: "1", icon: "home" },
+                    { page: "tasks", label: qsTr("Tasks"), key: "2", icon: "tasks" },
+                    { page: "automations", label: qsTr("Automations"), key: "3", icon: "automations" },
+                    { page: "memory", label: qsTr("Memory"), key: "4", icon: "memory" },
+                    { page: "history", label: qsTr("History"), key: "5", icon: "history" },
+                    { page: "projects", label: qsTr("Projects"), key: "6", icon: "project" }
+                ]
+                MenuRow {
+                    objectName: "navigate_" + modelData.page
+                    icon: modelData.icon; label: modelData.label; shortcut: "Ctrl+" + modelData.key
+                    current: bridge.page === modelData.page
+                    onTriggered: nav.go(modelData.page)
+                }
             }
         }
     }

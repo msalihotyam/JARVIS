@@ -121,7 +121,8 @@ Item {
         Rectangle {
             id: menuButton
             objectName: "chatHeaderMenu"
-            readonly property bool open: !!header.conversationMenu && header.conversationMenu.open && header.conversationMenu.rowId === ""
+            // M1 (K4): open only when THIS "…" opened it - not when the open conversation's own sidebar row did.
+            readonly property bool open: !!header.conversationMenu && header.conversationMenu.open && header.conversationMenu.opener === menuButton
             visible: bridge.conversationId !== ""
             width: 34; height: 34; radius: Theme.radiusSmall
             color: open ? Theme.alpha(Theme.accent, 0.14) : menuArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
@@ -158,46 +159,47 @@ Item {
         if (!conversationMenu) return
         if (menuButton.open) { conversationMenu.dismiss(); return }
         conversationMenu.openFor("", "", menuButton, Qt.point(menuButton.width - 300, menuButton.height + 6),
-                                 title, Qt.point(0, title.height + 10))
+                                 title, Qt.point(0, title.height + 10), undefined, undefined, menuButton)
     }
 
     // -- the Command preset's scope menu (Q2) -------------------------------------
-    function toggleScope() { if (scopeList.visible) scopeList.close(); else scopeList.open() }
-    ConversationMenu.ScopeMenu {
+    function toggleScope() { if (scopeList.visible) scopeList.close(); else scopeList.popupAt(chip, Qt.point(0, chip.height + 8), { trigger: chip }) }
+    MenuSurface {
         id: scopeList
         objectName: "chatHeaderScopeMenu"
         property var choices: []
-        restY: chip.y + chip.height + 8; x: 0
         width: 320
         onAboutToShow: choices = bridge.projectChoices()
-        contentItem: Column {
+        Column {
+            width: scopeList.availableWidth
             spacing: 2
             Text { text: qsTr("PROJECTS"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; bottomPadding: 4 }
             Repeater {
                 model: scopeList.choices
                 delegate: ConversationMenu.ScopeChoice { objectName: "scopeMenuProject"; width: scopeList.availableWidth; label: modelData.name
                                                          current: modelData.id === header.owner.id
-                                                         onChosen: { scopeList.close(); bridge.openProjectScope(modelData.id) } }
+                                                         onTriggered: { scopeList.close(); bridge.openProjectScope(modelData.id) } }
             }
             ConversationMenu.Divider { width: scopeList.availableWidth }
             ConversationMenu.ScopeChoice { objectName: "scopeMenuGlobal"; width: scopeList.availableWidth
                                            label: qsTr("Global"); current: !!header.owner.global
-                                           onChosen: { scopeList.close(); bridge.openProjectScope("") } }
+                                           onTriggered: { scopeList.close(); bridge.openProjectScope("") } }
             ConversationMenu.Divider { width: scopeList.availableWidth }
             ConversationMenu.ScopeChoice { objectName: "scopeMenuAll"; width: scopeList.availableWidth; action: true
-                                           label: qsTr("All projects"); onChosen: { scopeList.close(); bridge.showProject("") } }
+                                           label: qsTr("All projects"); onTriggered: { scopeList.close(); bridge.showProject("") } }
             ConversationMenu.Divider { width: scopeList.availableWidth }
             Text { text: qsTr("CONVERSATIONS"); color: Theme.textMuted; font: Theme.label; leftPadding: 12; bottomPadding: 4 }
             ListView {
                 objectName: "scopeMenuConversations"
                 width: scopeList.availableWidth; height: Math.min(contentHeight, 6 * (Theme.menuRowHeight + 2) - 2)
                 clip: true; spacing: 2
+                keyNavigationEnabled: false             // Up / Down are the menu's (MenuSurface)
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { }
                 model: bridge.scopeConversations
                 delegate: ConversationMenu.ScopeChoice { objectName: "scopeMenuConversation"; width: ListView.view.width
                                                          label: modelData.title || qsTr("New Chat"); muted: !modelData.title; current: modelData.active
-                                                         onChosen: { scopeList.close(); bridge.openConversation(modelData.id) } }
+                                                         onTriggered: { scopeList.close(); bridge.openConversation(modelData.id) } }
             }
         }
     }

@@ -34,11 +34,15 @@ Item {
     readonly property var stackHidden: bridge.panels.filter(function(p) { return !p.visible })
     readonly property int stackVisible: bridge.panels.length - stackHidden.length
 
+    // The control that opened the popover: its own click toggles it, and Esc returns focus there.
+    property Item trigger: null
     function place(anchor) {
         var p = anchor.mapToItem(menus, 0, 0)
         anchorRect = Qt.rect(p.x, p.y, anchor.width, anchor.height)
+        trigger = anchor
     }
     function openCard(region, card, anchor, canUp, canDown) {
+        if (mode === "card" && trigger === anchor) { close(); return }      // its own "…" again: a toggle
         menus.region = region; menus.card = card; menus.canUp = canUp; menus.canDown = canDown
         place(anchor); mode = "card"
     }
@@ -47,57 +51,35 @@ Item {
         place(anchor); mode = which
     }
     function close() { mode = "" }
-    onModeChanged: if (open) fadeIn.restart()
+    // It opens once its content (the Loader) is in, so focus can enter its first row.
+    onModeChanged: if (!open) surface.close()
     Connections { target: bridge; function onPrefsChanged() { if (!bridge.editMode) menus.close() } }
 
-    // Outside click closes the popover; it does not reach what lies beneath.
-    MouseArea { anchors.fill: parent; onClicked: menus.close(); onWheel: function(wheel) { wheel.accepted = true } }
-
-    Rectangle {
+    // K4: the one menu surface (a press outside closes it).
+    MenuSurface {
         id: surface
-        objectName: "layoutPopover"
+        objectName: "layoutMenu"
+        surfaceName: "layoutPopover"
+        trigger: menus.trigger; opener: menus.trigger
+        parent: menus.trigger || menus
         width: menus.mode === "card" ? 208 : 300
-        height: body.height + 16
         // Left-rail anchors open rightwards, right-side anchors leftwards;
         // below the control when there is room, above it otherwise.
-        readonly property bool leftward: menus.anchorRect.x + menus.anchorRect.width / 2 > menus.width / 2
-        readonly property real wantX: leftward ? menus.anchorRect.x + menus.anchorRect.width - width : menus.anchorRect.x
-        readonly property real below: menus.anchorRect.y + menus.anchorRect.height + 6
-        x: Math.max(8, Math.min(wantX, menus.width - width - 8))
-        y: Math.max(8, below + height + 8 <= menus.height ? below : menus.anchorRect.y - height - 6)
-        radius: 12
-        color: Theme.glassMenu
-        border.width: 1; border.color: Theme.glassEdgeStrong
-        MouseArea { anchors.fill: parent }        // clicks inside never close it
-        NumberAnimation { id: fadeIn; target: surface; property: "opacity"; from: 0; to: 1; duration: Theme.dur(140); easing.type: Easing.OutCubic }
-
-        Column {
-            id: body
-            x: 8; y: 8; width: parent.width - 16
-            Loader { width: parent.width; sourceComponent: menus.mode === "card" ? cardMenu : menus.mode === "cards" ? inventory : menus.mode === "reset" ? resetConfirm : null }
+        readonly property point spot: {
+            var r = menus.anchorRect, w = width, h = implicitHeight
+            var wantX = r.x + r.width / 2 > menus.width / 2 ? r.x + r.width - w : r.x
+            var below = r.y + r.height + 6
+            var px = Math.max(8, Math.min(wantX, menus.width - w - 8))
+            var py = Math.max(8, below + h + 8 <= menus.height ? below : r.y - h - 6)
+            return parent ? parent.mapFromItem(menus, px, py) : Qt.point(px, py)
         }
-    }
-
-    // -- one menu row: icon, label; disabled at a boundary --------------------
-    component MenuRow: Rectangle {
-        id: row
-        property string icon: ""
-        property string label: ""
-        signal triggered()
-        width: parent ? parent.width : 0; height: 40; radius: 8
-        color: area.containsMouse && enabled ? Theme.alpha(Theme.accent, 0.12) : "transparent"
-        opacity: enabled ? 1 : 0.4
-        activeFocusOnTab: enabled
-        Accessible.role: Accessible.MenuItem
-        Accessible.name: label
-        Keys.onReturnPressed: if (enabled) triggered()
-        Keys.onSpacePressed: if (enabled) triggered()
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-        Rectangle { anchors.fill: parent; radius: parent.radius; color: "transparent"; border.color: Theme.accent; visible: row.activeFocus }
-        Icon { x: 14; anchors.verticalCenter: parent.verticalCenter; name: row.icon; size: 16; tint: Theme.accent }
-        Text { x: 42; anchors.verticalCenter: parent.verticalCenter; text: row.label; color: Theme.text; font: Theme.uiLabel }
-        MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; cursorShape: row.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: if (row.enabled) row.triggered() }
+        x: spot.x; restY: spot.y
+        onClosed: if (!visible) menus.close()
+        Column {
+            width: surface.availableWidth
+            Loader { width: parent.width; sourceComponent: menus.mode === "card" ? cardMenu : menus.mode === "cards" ? inventory : menus.mode === "reset" ? resetConfirm : null
+                     onLoaded: if (menus.mode !== "" && !surface.visible) surface.open() }
+        }
     }
 
     Component {

@@ -130,33 +130,26 @@ Item {
                             Accessible.role: Accessible.Button
                             Accessible.name: qsTr("Attach a file or an image to this group")
                             MouseArea { id: attachArea; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor; onClicked: groupMenu.popup(attachToggle, 0, attachToggle.height + 4) }
-                            Menu {
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: groupMenu.visible ? groupMenu.close()
+                                                   : groupMenu.popupAt(attachToggle, Qt.point(0, attachToggle.height + 4), { trigger: attachToggle }) }
+                            // K4: the one menu surface and row.
+                            MenuSurface {
                                 id: groupMenu
                                 objectName: "contextGroupMenu_" + card.groupId
                                 property bool attachable: false
                                 onAboutToShow: attachable = bridge.clipboardAttachable()
-                                padding: 6
-                                // The same foreground material and row grammar as the edit menu.
-                                background: Rectangle { implicitWidth: 220; radius: 8; color: Theme.menuSurface
-                                                        border.width: 1; border.color: Theme.glassOverlayEdge
-                                                        Rectangle { z: -1; anchors.fill: parent; anchors.topMargin: 3; anchors.leftMargin: 1; anchors.rightMargin: -1
-                                                                    anchors.bottomMargin: -3; radius: parent.radius + 1; color: "#000000"; opacity: 0.3 } }
-                                component GroupItem: MenuItem {
-                                    id: gi
-                                    implicitHeight: 34; leftPadding: 12; rightPadding: 12
-                                    contentItem: Text { text: gi.text; color: gi.enabled ? Theme.text : Theme.textDim
-                                                        font: Theme.body; verticalAlignment: Text.AlignVCenter }
-                                    background: Rectangle { radius: 6; color: gi.highlighted && gi.enabled ? Theme.alpha("#36aaff", 0.12) : "transparent"
-                                                            border.width: gi.highlighted && gi.enabled ? 1 : 0; border.color: Theme.alpha("#49bdfa", 0.4) }
+                                width: 220; padding: 6
+                                Column {
+                                    width: groupMenu.availableWidth
+                                    MenuRow { objectName: "groupAddFile_" + card.groupId; label: qsTr("Add file")
+                                              onTriggered: { groupMenu.close(); strip.pickRequested("file", card.groupId) } }
+                                    MenuRow { objectName: "groupAddImage_" + card.groupId; label: qsTr("Add image")
+                                              onTriggered: { groupMenu.close(); strip.pickRequested("image", card.groupId) } }
+                                    MenuRow { objectName: "groupPaste_" + card.groupId; label: qsTr("Paste from clipboard")
+                                              available: groupMenu.attachable
+                                              onTriggered: { groupMenu.close(); bridge.attachClipboardToGroup(card.groupId) } }
                                 }
-                                GroupItem { objectName: "groupAddFile_" + card.groupId; text: qsTr("Add file")
-                                            onTriggered: strip.pickRequested("file", card.groupId) }
-                                GroupItem { objectName: "groupAddImage_" + card.groupId; text: qsTr("Add image")
-                                            onTriggered: strip.pickRequested("image", card.groupId) }
-                                GroupItem { objectName: "groupPaste_" + card.groupId; text: qsTr("Paste from clipboard")
-                                            enabled: groupMenu.attachable
-                                            onTriggered: bridge.attachClipboardToGroup(card.groupId) }
                             }
                         }
                         Icon {

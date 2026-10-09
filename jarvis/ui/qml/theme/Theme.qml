@@ -261,6 +261,13 @@ QtObject {
     readonly property int menuRowHeight: 36
     readonly property real scrimOpacity: 0.56
     readonly property int tipDelay: 500
+    // Gate 6G K4: the one menu + dialog style. Every popup menu (MenuSurface)
+    // and every dialog has this corner; a menu row's (MenuRow) states are these.
+    readonly property int popupRadius: 10
+    readonly property color menuRowHover: alpha(text, 0.07)
+    readonly property color menuRowPressed: alpha(text, 0.12)
+    readonly property color menuRowCurrent: alpha(accent, 0.14)
+    readonly property real menuRowDisabled: 0.45
 
     // -- stage 1: glow (0-120 ms) --------------------------------------
     property color glow: space ? "#3d8bff" : "#2a5fb0"

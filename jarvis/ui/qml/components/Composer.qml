@@ -152,41 +152,30 @@ Item {
                    color: Theme.text; renderType: Theme.textRender; font: Theme.composerChip } }
         MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: modeMenu.visible ? modeMenu.close() : modeMenu.open() }
-        Popup {
+        // K4: the one menu surface and row. A mouse-only chip: the draft keeps the focus.
+        MenuSurface {
             id: modeMenu
             objectName: "permissionModeMenu"
-            y: -height - 8; x: 0
+            trigger: permissionChip; takesFocus: false
+            restY: -height - 8; x: 0
             width: 360; padding: 10
-            background: Rectangle { radius: 10; color: Theme.menuSurface; border.width: 1; border.color: Theme.glassOverlayEdge
-                // An open menu OWNS the wheel: the conversation behind it stays put.
-                WheelHandler { } }
-            contentItem: Column {
+            Column {
+                width: modeMenu.availableWidth
                 spacing: 4
                 Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
                        font: Theme.label }
                 Repeater {
                     model: composer.permissionModes
-                    delegate: Rectangle {
-                        id: modeOption
+                    delegate: MenuRow {
                         objectName: "permissionMode_" + modelData.id
                         // The drawn check is not text: the selected state is told to assistive tech here.
-                        Accessible.role: Accessible.RadioButton; Accessible.name: modelData.name; Accessible.checked: selected
-                        width: 340; height: modeText.height + 16; radius: 8
-                        readonly property bool selected: bridge.permissionMode === modelData.id
-                        color: selected ? Theme.alpha(Theme.accent, 0.16) : optionArea.containsMouse ? Theme.alpha(Theme.text, 0.06) : "transparent"
-                        border.width: selected ? 1 : 0; border.color: Theme.alpha(Theme.accent, 0.5)
-                        Column { id: modeText; x: 10; y: 8; width: parent.width - 20; spacing: 2
-                            Row { spacing: 8
-                                Text { text: modelData.name; color: Theme.text; font: Theme.captionStrong }
-                                Icon { visible: modeOption.selected; anchors.verticalCenter: parent.verticalCenter
-                                       name: "check"; size: 12; tint: Theme.text } }
-                            Text { width: parent.width; wrapMode: Text.Wrap; text: modelData.detail; color: Theme.textMuted
-                                   font: Theme.caption } }
-                        MouseArea { id: optionArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                                    onClicked: { bridge.setPermissionMode(modelData.id); modeMenu.close() } }
+                        Accessible.role: Accessible.RadioButton
+                        label: modelData.name; detail: modelData.detail
+                        current: bridge.permissionMode === modelData.id; checked: current
+                        onTriggered: { bridge.setPermissionMode(modelData.id); modeMenu.close() }
                     }
                 }
-                Text { width: 340; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
+                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
                        text: qsTr("Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.") }
             }
         }
@@ -212,28 +201,24 @@ Item {
                font: Qt.font({ family: Theme.ui, pixelSize: 16 }) }
         MouseArea { id: attachArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: attachMenu.visible ? attachMenu.close() : attachMenu.open() }
-        Popup {
+        MenuSurface {
             id: attachMenu
             objectName: "attachMenu"
-            y: -height - 8; x: 0
-            width: 240; padding: 8
-            background: Rectangle { radius: 10; color: Theme.menuSurface; border.width: 1; border.color: Theme.glassOverlayEdge
-                WheelHandler { } }
-            contentItem: Column {
+            trigger: attachChip; takesFocus: false
+            restY: -height - 8; x: 0
+            width: 240
+            Column {
+                width: attachMenu.availableWidth
                 spacing: 2
                 Repeater {
                     model: [{ id: "file", label: qsTr("Add file") }, { id: "image", label: qsTr("Add image") }]
-                    delegate: Rectangle {
+                    delegate: MenuRow {
                         objectName: "attach_" + modelData.id
-                        width: 224; height: 34; radius: 6
-                        color: pickArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
-                        Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: modelData.label; color: Theme.text
-                               font: Theme.body }
-                        MouseArea { id: pickArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                                    onClicked: { attachMenu.close(); composer.pick(modelData.id) } }
+                        label: modelData.label
+                        onTriggered: { attachMenu.close(); composer.pick(modelData.id) }
                     }
                 }
-                Text { width: 224; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
+                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
                        text: qsTr("Only the item you choose is read. JARVIS gets no access to your files.") }
             }
         }

@@ -37,6 +37,7 @@ Item {
     readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
     readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
     readonly property point navAnchor:Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
+    readonly property Item navTrigger: navigationTrigger        // K4: the nav menu's opener and toggle
     // Degradation, in the required order: decorative linework goes first,
     // then secondary metadata, then micro spacing - never hit targets and
     // never the authoritative controls.

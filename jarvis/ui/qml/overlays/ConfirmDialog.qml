@@ -28,13 +28,23 @@ Item {
     // (ambient effects on or off) and disarms the moment it closes.
     property bool armed: false
     Timer { id: armTimer; interval: Theme.confirmGuardMs; onTriggered: dialog.armed = true }
-    onOpenChanged: { armTimer.stop(); armed = false; if (open) armTimer.start() }
-    Rectangle { id: dim; anchors.fill: parent; color: "#000000"; opacity: dialog.open ? 0.5 : 0
+    // K4 (the one dialog style): Theme.scrimOpacity, Theme.popupRadius; focus starts on
+    // the safe choice and returns to the opener when it closes (Esc included).
+    property Item opener: null
+    onOpenChanged: {
+        armTimer.stop(); armed = false
+        if (open) { armTimer.start(); if (!opener) opener = Window.activeFocusItem; focusSafe() }
+        else if (opener) { var back = opener; opener = null; back.forceActiveFocus() }
+    }
+    onVisibleChanged: focusSafe()
+    function focusSafe() { if (open && visible) cancelButton.forceActiveFocus() }
+    Rectangle { id: dim; anchors.fill: parent; color: "#000000"; opacity: dialog.open ? Theme.scrimOpacity : 0
         Behavior on opacity { enabled: !dialog.danger; NumberAnimation { duration: Theme.pageMs } }
         MouseArea { anchors.fill: parent; enabled: dialog.open } }
     GlassPanel {
         raised: true
         anchors.centerIn: parent
+        radius: Theme.popupRadius
         width: 460; height: column.height + 52
         border.color: dialog.danger ? Theme.danger : Theme.accent
         opacity: dialog.open ? 1 : 0; scale: dialog.open ? 1 : 1 - 2 * Theme.travel / Math.max(1, width, height)   // the edges travel at most Theme.travel
@@ -51,7 +61,7 @@ Item {
             }
             Text { text: dialog.message; color: Theme.text; width: parent.width; wrapMode: Text.Wrap; font: Theme.body }
             Row { spacing: 10; anchors.right: parent.right
-                ActionButton { objectName: "confirmCancel"; label: dialog.cancelLabel; onClicked: dialog.open = false }
+                ActionButton { id: cancelButton; objectName: "confirmCancel"; label: dialog.cancelLabel; onClicked: dialog.open = false }
                 ActionButton { objectName: "confirmAccept"; label: dialog.confirmLabel; primary: true; danger: dialog.danger
                                enabled: !dialog.danger || dialog.armed; onClicked: { dialog.open = false; if (dialog.onConfirm) dialog.onConfirm() } }
             }
