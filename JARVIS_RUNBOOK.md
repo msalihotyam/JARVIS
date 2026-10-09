@@ -580,10 +580,11 @@ empty, or when the range is not a plain `A..B`. The result file records whether
 Salih approved the design on 2026-10-09. `scripts/conveyor.py` (stdlib only,
 tests `tests/test_conveyor.py`) keeps development flowing while the PC is on.
 It runs under a Windows Task Scheduler task, one pass every 60 s (`--once` for
-one pass). It makes no model call, runs no git command and deletes no file;
-one instance at a time (`build/conveyor/conveyor.lock`, stale after 5 min).
-Runtime folder `build/conveyor/` (gitignored): `inbox/`, `backlog.json`,
-`lanes.json`, `status.json`, `events.jsonl`, `pager.json`.
+one pass). It runs no git command and deletes no file; its only model call is
+the optional report reader below. One instance at a time
+(`build/conveyor/conveyor.lock`, stale after 5 min). Runtime folder
+`build/conveyor/` (gitignored): `inbox/`, `backlog.json`, `lanes.json`,
+`status.json`, `events.jsonl`, `pager.json`, `ack/`.
 
 - **Dispatch.** Each lane is a fresh `claude --bg --name <lane> --model <m>
   --effort <e> --settings build/conveyor/lanes.settings.json <prompt>`; at most
@@ -629,6 +630,31 @@ Runtime folder `build/conveyor/` (gitignored): `inbox/`, `backlog.json`,
   running dry (no lane running, no inbox file waiting and nothing to dispatch;
   once per episode). At most one push per 10 min; pages inside the gap, or after
   a failed send, are held and sent together.
+- **Report reader (advisory, optional).** Salih approved it on 2026-10-09
+  (monthly API credit). When a lane finishes by report or is marked `STUCK`,
+  its report (only the report text, at most 12,000 chars, head + tail; a
+  `STUCK` lane without a report sends a fixed note) goes with a fixed
+  instruction to Claude Haiku 4.5 (`claude-haiku-4-5-20251001`, Anthropic
+  Messages API, stdlib, 20 s timeout). The strict-JSON answer `{kind, summary,
+  next}` (kind `pass`/`blocked`/`stalled`/`needs_orchestrator`/`needs_salih`)
+  is stored as `reading` on the lane in `status.json` plus a `reader` event;
+  invalid output becomes `needs_orchestrator` "reader: invalid output".
+  `status.json` `attention` lists lanes whose reading is not `pass` and not
+  acknowledged; the orchestrator acks by creating or touching
+  `build/conveyor/ack/<lane>` (existence only, never deleted; an ack older than
+  the lane's start does not count, so a reused lane name needs a fresh touch). Only `needs_salih` pages (same ntfy path and 10 min gap).
+  The reader is never the authority: it cannot approve integration, push,
+  patch apply or any git action, and never changes the `STATUS:` handling,
+  dependencies or slots above. Key: `JARVIS_READER_API_KEY` (user env var; on
+  Windows read from `HKCU\Environment` at call time, so no conveyor restart is
+  needed): `setx JARVIS_READER_API_KEY <key>`. Never name it
+  `ANTHROPIC_API_KEY` (that would switch Claude Code lanes to API billing); it
+  is never logged or written anywhere. No key: the reader is off (one
+  `reader_disabled` event per day). Every call is recorded in
+  `build/ledger/api.jsonl` (tokens, model, lane, `est_usd`); at $20
+  (`READER_MONTHLY_USD`) estimated for the current month, calls stop until the
+  next month. Network error, timeout, non-200 or the cap: no reading, a
+  `reader_error` event with the HTTP status only, the conveyor goes on.
 - **Switch-over.** The scheduled task runs `scripts/conveyor.py` from the
   canonical checkout (v0 was `build/conveyor/conveyor.py`); it reads the same
   `build/conveyor/` state, and still runs the optional runtime

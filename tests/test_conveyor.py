@@ -1,7 +1,9 @@
 """Konveyor v1 (scripts/conveyor.py) with a fake claude runner; no network, no model calls."""
+import contextlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -60,9 +62,19 @@ class Base(unittest.TestCase):
         self.fake = FakeClaude()
         self.t = float(int(time.time()))
         self.pushes = []
+        self.key = ""  # reader off by default; never the real key lookup (env/registry)
+        self.posts = []
+        self.reply = (500, None)
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
-                          send=lambda text: self.pushes.append(text) or "sent")
+                          send=lambda text: self.pushes.append(text) or "sent",
+                          post=self.fake_post, key=lambda: self.key)
         self.base = self.root / "build" / "conveyor"
+
+    def fake_post(self, key, body):
+        self.posts.append(body)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -217,7 +229,7 @@ class TestInbox(Base):
         self.c.pass_once()
         s = self.status()
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
-                                  "usage_hold", "lanes", "backlog"})
+                                  "usage_hold", "lanes", "backlog", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -431,6 +443,25 @@ class TestRedispatch(Base):
         self.assertTrue(any("STUCK" in p for p in self.pushes))
         self.assertEqual(self.fake.bg_names(), ["A", "A", "A"])
 
+    def test_stuck_lane_read_with_fixed_note(self):
+        self.key = "k"
+        self.reply = (200, {"content": [{"type": "text", "text": json.dumps(
+            {"kind": "stalled", "summary": "ilerlemiyor", "next": "bak"})}], "usage": {}})
+        self.setup_respawned()
+        for _ in range(2):
+            self.t += 601
+            self.c.pass_once()
+            new = self.fake.agents[-1]
+            del new["pid"]
+            self.c.pass_once()
+            new.update(pid=9, status="idle")
+        self.t += 601
+        self.c.pass_once()
+        (body,) = self.posts
+        self.assertEqual(body["messages"][0]["content"], conveyor.STUCK_NOTE)
+        self.assertEqual(self.lanes()["A"]["status"], "STUCK")
+        self.assertEqual(self.status()["attention"], ["A"])
+
     def test_pause_holds_redispatch(self):
         self.setup_respawned()
         (self.base / "PAUSE").write_text("")
@@ -571,6 +602,253 @@ class TestUsageGuard(Base):
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "B"])
         self.assertIsNone(self.status()["usage_pct"])
+
+
+KEY = "sk-ant-SECRET-reader-key-42"
+
+
+def answer(obj, tin=1000, tout=50):
+    text = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+    return 200, {"content": [{"type": "text", "text": text}],
+                 "usage": {"input_tokens": tin, "output_tokens": tout}}
+
+
+class TestReader(Base):
+    def setUp(self):
+        super().setUp()
+        self.key = KEY
+        self.reply = answer({"kind": "pass", "summary": "testler yeşil", "next": "entegre et"})
+
+    def report(self, name, status, where="wt", mtime=None, extra=""):
+        # self.t moves ahead of the wall clock here: date reports after the lane start
+        return super().report(name, status, where, self.t + 1 if mtime is None else mtime, extra)
+
+    def finish_a(self, status="PASS", extra=""):
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        rep = self.report("A", status, extra=extra)
+        self.c.pass_once()
+        return rep
+
+    def lane_a(self):
+        return next(x for x in self.status()["lanes"] if x["name"] == "A")
+
+    def all_files_text(self):
+        return {p: p.read_bytes().decode("utf-8", "replace") for p in self.root.rglob("*") if p.is_file()}
+
+    def test_valid_reading_recorded(self):
+        rep = self.finish_a()
+        (body,) = self.posts
+        self.assertEqual((body["model"], body["max_tokens"], body["temperature"]),
+                         ("claude-haiku-4-5-20251001", 300, 0))
+        self.assertEqual(body["system"], conveyor.READER_SYSTEM)
+        self.assertEqual(body["messages"], [{"role": "user", "content": rep.read_text(encoding="utf-8")}])
+        r = self.lane_a()["reading"]
+        self.assertEqual((r["kind"], r["summary"], r["next"]), ("pass", "testler yeşil", "entegre et"))
+        self.assertTrue(r["at"])
+        ev = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual([(e["lane"], e["reading"]) for e in ev],
+                         [("A", {"kind": "pass", "summary": "testler yeşil", "next": "entegre et"})])
+        self.assertEqual(self.status()["attention"], [])
+        (row,) = [json.loads(x) for x in (self.root / "build" / "ledger" / "api.jsonl").read_text().splitlines()]
+        self.assertEqual({k: row[k] for k in ("model", "lane", "input_tokens", "output_tokens")},
+                         {"model": "claude-haiku-4-5-20251001", "lane": "A",
+                          "input_tokens": 1000, "output_tokens": 50})
+        self.assertAlmostEqual(row["est_usd"], 0.00125)
+        self.c.pass_once()
+        self.assertEqual(len(self.posts), 1)  # one reading per finish
+
+    def test_invalid_output_needs_orchestrator(self):
+        self.reply = answer("```json\n{\"kind\": \"pass\"}\n```")
+        self.finish_a()
+        r = self.lane_a()["reading"]
+        self.assertEqual((r["kind"], r["summary"]), ("needs_orchestrator", "reader: invalid output"))
+        self.assertEqual(self.status()["attention"], ["A"])
+        self.assertEqual(self.lanes()["A"]["status"], "PASS")
+
+    def test_parse_reading_is_strict(self):
+        ok = {"kind": "blocked", "summary": "s", "next": "n"}
+        self.assertEqual(conveyor.parse_reading(answer(ok)[1]), ok)
+        for bad in [{**ok, "kind": "approve_push"}, {**ok, "extra": 1}, {"kind": "pass", "summary": "s"},
+                    {**ok, "summary": "x" * 141}, {**ok, "next": ""}, {**ok, "summary": 5}, [ok], "nope"]:
+            self.assertIsNone(conveyor.parse_reading(answer(bad)[1]), bad)
+        for resp in [None, {}, {"content": "x"}, {"content": [{"type": "text"}]}]:
+            self.assertIsNone(conveyor.parse_reading(resp), resp)
+
+    def test_http_error_and_exception_fail_closed(self):
+        self.reply = (529, None)
+        self.finish_a()
+        self.assertIsNone(self.lane_a()["reading"])
+        self.assertEqual(self.lanes()["A"]["status"], "PASS")
+        err = [e for e in self.events() if e["event"] == "reader_error"]
+        self.assertEqual([(e["lane"], e["status"]) for e in err], [("A", 529)])
+        self.assertFalse((self.root / "build" / "ledger" / "api.jsonl").exists())
+        self.reply = TimeoutError("boom")
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.report("B", "PASS")
+        self.assertTrue(self.c.pass_once())
+        self.assertEqual([e["status"] for e in self.events() if e["event"] == "reader_error"],
+                         [529, "TimeoutError"])
+        self.assertEqual(self.lanes()["B"]["status"], "PASS")
+
+    def test_anthropic_post_request_and_errors(self):
+        with mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=TimeoutError()) as op:
+            self.assertEqual(conveyor.anthropic_post(KEY, {"x": 1}), ("TimeoutError", None))
+        req = op.call_args[0][0]
+        self.assertEqual(req.full_url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(req.get_header("X-api-key"), KEY)
+        self.assertEqual(req.get_header("Anthropic-version"), "2023-06-01")
+        self.assertEqual(op.call_args[1]["timeout"], 20)
+        self.assertEqual(json.loads(req.data), {"x": 1})
+        http = conveyor.urllib.error.HTTPError(conveyor.READER_URL, 401, "no", {}, None)
+        with mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=http):
+            self.assertEqual(conveyor.anthropic_post(KEY, {}), (401, None))
+
+    def test_no_key_disabled_once_per_day(self):
+        self.key = ""
+        self.finish_a()
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.report("B", "PASS")
+        self.c.pass_once()
+        self.assertEqual(self.posts, [])
+        self.assertEqual([e["event"] for e in self.events()].count("reader_disabled"), 1)
+        self.t += 86400
+        self.drop("c.md", HDR.format("C"))
+        self.c.pass_once()
+        self.report("C", "PASS")
+        self.c.pass_once()
+        self.assertEqual([e["event"] for e in self.events()].count("reader_disabled"), 2)
+        self.assertIsNone(self.lane_a()["reading"])
+
+    def test_budget_cap_stops_calls(self):
+        led = self.root / "build" / "ledger"
+        led.mkdir(parents=True)
+        month, last = conveyor.iso(self.t)[:7], conveyor.iso(self.t - 40 * 86400)
+        rows = [{"ts": f"{month}-01T00:00:00", "est_usd": 12}, {"ts": last, "est_usd": 100},
+                {"ts": f"{month}-02T00:00:00", "est_usd": 7.99}]
+        (led / "api.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows) + "junk\n")
+        self.finish_a()
+        self.assertEqual(len(self.posts), 1)  # 19.99 this month: still under the cap
+        with open(led / "api.jsonl", "a") as f:
+            f.write(json.dumps({"ts": f"{month}-03T00:00:00", "est_usd": 0.01}) + "\n")
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.report("B", "PASS")
+        self.c.pass_once()
+        self.assertEqual(len(self.posts), 1)
+        err = [e for e in self.events() if e["event"] == "reader_error"]
+        self.assertEqual([(e["lane"], e["status"]) for e in err], [("B", "budget")])
+
+    def test_report_truncated_head_and_tail(self):
+        self.finish_a(extra="H" * 20000 + "T" * 20000 + "\n")
+        content = self.posts[0]["messages"][0]["content"]
+        self.assertLessEqual(len(content), conveyor.READER_MAX_CHARS + 40)
+        self.assertTrue(content.startswith("```\nSTATUS: PASS\nHHH"))
+        self.assertTrue(content.endswith("TTT\n```\n"))
+
+    def test_key_never_written(self):
+        self.reply = answer({"kind": "needs_salih", "summary": "onay gerek", "next": "Salih onaylasın"})
+        self.finish_a()
+        for i, reply in enumerate([(401, None), RuntimeError("bad key " + KEY), answer("garbage")]):
+            self.reply = reply
+            n = "BCD"[i]
+            self.drop(f"{n}.md", HDR.format(n))
+            self.c.pass_once()
+            self.report(n, "BLOCKED")
+            self.t += 700
+            self.c.pass_once()
+        self.assertEqual(len(self.posts), 4)
+        for body in self.posts:
+            self.assertNotIn(KEY, json.dumps(body))
+        files = self.all_files_text()
+        self.assertIn(self.base / "events.jsonl", files)
+        self.assertIn(self.root / "build" / "ledger" / "api.jsonl", files)
+        for p, text in files.items():
+            self.assertNotIn(KEY, text, p)
+        self.assertNotIn(KEY, " ".join(self.pushes))
+
+    def test_needs_salih_pages_others_do_not(self):
+        self.reply = answer({"kind": "blocked", "summary": "engel_bir", "next": "n"})
+        self.finish_a()
+        self.reply = answer({"kind": "needs_orchestrator", "summary": "engel_iki", "next": "n"})
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.report("B", "PASS")
+        self.t += 700
+        self.c.pass_once()
+        self.reply = answer({"kind": "needs_salih", "summary": "Salih karar vermeli", "next": "n"})
+        self.drop("c.md", HDR.format("C"))
+        self.c.pass_once()
+        self.report("C", "PASS")
+        self.t += 700
+        self.c.pass_once()
+        pushed = "\n".join(self.pushes)
+        self.assertIn("C: Salih karar vermeli", pushed)
+        self.assertNotIn("engel_bir", pushed)
+        self.assertNotIn("engel_iki", pushed)
+        self.assertEqual(self.status()["attention"], ["A", "B", "C"])
+
+    def test_needs_salih_page_respects_gap(self):
+        self.c.page("earlier")
+        self.c.flush_pages()
+        self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
+        self.finish_a()
+        self.assertEqual(self.pushes, ["earlier"])  # held inside PAGE_GAP_S
+        self.t += conveyor.PAGE_GAP_S
+        self.c.pass_once()
+        self.assertIn("A: karar", self.pushes[-1])
+
+    def test_reading_never_changes_status_or_deps(self):
+        self.reply = answer({"kind": "pass", "summary": "iyi", "next": "n"})
+        self.finish_a(status="BLOCKED")
+        self.assertEqual(self.lanes()["A"]["status"], "BLOCKED")
+        self.assertIn("A: STATUS BLOCKED", "\n".join(self.pushes))
+        self.reply = answer({"kind": "needs_salih", "summary": "dur", "next": "n"})
+        self.backlog({"id": "X"}, {"id": "Y", "depends_on": ["X"]})
+        self.c.pass_once()
+        self.report("X", "PASS")
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["X"]["status"], "PASS")
+        self.assertEqual(self.fake.bg_names(), ["A", "X", "Y"])  # reading did not hold Y
+
+    def test_ack_clears_attention_only_for_this_run(self):
+        ack = self.base / "ack"
+        ack.mkdir()
+        (ack / "A").write_text("")
+        os.utime(ack / "A", (self.t - 3600, self.t - 3600))  # an ack from an earlier A
+        self.reply = answer({"kind": "blocked", "summary": "s", "next": "n"})
+        self.finish_a()
+        self.assertEqual(self.status()["attention"], ["A"])
+        os.utime(ack / "A", (self.t + 5, self.t + 5))
+        self.c.pass_once()
+        self.assertEqual(self.status()["attention"], [])
+        self.assertTrue((ack / "A").exists())
+
+    def test_reader_key_env_then_registry(self):
+        with mock.patch.dict(os.environ, {"JARVIS_READER_API_KEY": " k1 "}):
+            self.assertEqual(conveyor.reader_key(), "k1")
+
+        class Reg:
+            HKEY_CURRENT_USER = 1
+
+            @staticmethod
+            def OpenKey(root, path):
+                assert (root, path) == (1, "Environment")
+                return contextlib.nullcontext("h")
+
+            @staticmethod
+            def QueryValueEx(h, name):
+                assert name == "JARVIS_READER_API_KEY"
+                return "k2", 1
+
+        env = {k: v for k, v in os.environ.items() if k != "JARVIS_READER_API_KEY"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(conveyor.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": Reg}):
+            self.assertEqual(conveyor.reader_key(), "k2")
+            Reg.QueryValueEx = staticmethod(mock.Mock(side_effect=FileNotFoundError()))
+            self.assertEqual(conveyor.reader_key(), "")
 
 
 class TestLock(Base):
