@@ -51,6 +51,7 @@ READER_EFFORT = "low"
 READER_USD_PER_TOKEN = (0.10 / 1e6, 0.50 / 1e6)  # Haiku 5.5 input, output (prompts <= 100K tokens)
 READER_MONTHLY_USD = 20
 READER_MAX_CHARS = 12000
+READER_TIMEOUT_S = 60
 READER_KINDS = {"pass", "blocked", "stalled", "needs_orchestrator", "needs_salih"}
 READER_SYSTEM = (
     "You read the final report of one JARVIS development lane and classify it for the "
@@ -133,7 +134,7 @@ def anthropic_post(key, body):
     req = urllib.request.Request(READER_URL, data=json.dumps(body).encode("utf-8"), headers={
         "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:  # nosec B310 - fixed https URL
+        with urllib.request.urlopen(req, timeout=READER_TIMEOUT_S) as r:  # nosec B310 - fixed https URL
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:  # the API's JSON error body (type/message) explains the status
@@ -144,13 +145,32 @@ def anthropic_post(key, body):
         return type(e).__name__, None
 
 
+def single_object(text):
+    """The one JSON object in text (bare, in one code fence, or amid prose), else None."""
+    fences = re.findall(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if len(fences) == 1:
+        text = fences[0]
+    try:
+        return json.loads(text)  # bare JSON stays strict: a list or string is not wrapped prose
+    except ValueError:
+        pass
+    dec, objs, i = json.JSONDecoder(), [], 0
+    while (i := text.find("{", i)) >= 0:
+        try:
+            obj, i = dec.raw_decode(text, i)
+            objs.append(obj)
+        except ValueError:
+            i += 1
+    return objs[0] if len(objs) == 1 else None
+
+
 def parse_reading(resp):
     """Strict {kind, summary, next} from a Messages API response, else None."""
     try:
         text = "".join(b["text"] for b in resp["content"] if b.get("type") == "text")
-        r = json.loads(text)
-    except (TypeError, KeyError, AttributeError, ValueError):
+    except (TypeError, KeyError, AttributeError):
         return None
+    r = single_object(text)
     if not isinstance(r, dict) or set(r) != {"kind", "summary", "next"} or r["kind"] not in READER_KINDS:
         return None
     if not all(isinstance(r[k], str) and 0 < len(r[k]) <= 140 for k in ("summary", "next")):
@@ -186,6 +206,23 @@ def files_overlap(a, b):
 def utc_ts(s):
     """Epoch of an ISO UTC time such as 2026-10-09T10:24:35.107Z."""
     return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+
+
+def mtime_or_0(p):
+    try:
+        return p.stat().st_mtime
+    except OSError:  # removed between listing and stat: sorts first, the read skips it
+        return 0.0
+
+
+def where_raised(e):
+    """(filename of the OSError or None, 'conveyor.py:LINE' of the innermost frame here)."""
+    here, at, tb = Path(__file__).name, None, e.__traceback__
+    while tb:
+        if Path(tb.tb_frame.f_code.co_filename).name == here:
+            at = f"{here}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    return getattr(e, "filename", None), at
 
 
 def report_status(path):
@@ -613,7 +650,7 @@ class Conveyor:
             return
         busy = self.busy_names(lanes, agents)
         started = False
-        files = sorted(self.inbox.glob("*.md"), key=lambda p: p.stat().st_mtime)
+        files = sorted(self.inbox.glob("*.md"), key=mtime_or_0)
         for f in files:
             try:
                 text = f.read_text(encoding="utf-8")
@@ -943,7 +980,8 @@ class Conveyor:
                     self.usage_ledger()
             except Exception as e:
                 try:
-                    self.error(f"pass: {e!r}")
+                    fn, at = where_raised(e)
+                    self.error(f"pass: {e!r}", file=fn and str(fn), at=at)
                 except Exception:
                     pass
             try:

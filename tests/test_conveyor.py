@@ -738,6 +738,48 @@ class TestReader(Base):
         self.assertEqual([m["role"] for m in body["messages"]], ["user"])
         self.assertNotEqual(body["messages"][-1]["role"], "assistant")  # Haiku 5.5: prefill is a 400
 
+    def test_fenced_json_accepted(self):
+        self.reply = answer("```json\n" + json.dumps({"kind": "pass", "summary": "s", "next": "n"}) + "\n```")
+        self.finish_a()
+        self.assertEqual(self.lane_a()["reading"]["kind"], "pass")
+
+    def test_prose_wrapped_single_object_accepted(self):
+        self.reply = answer('Here: {"kind": "blocked", "summary": "s {x}", "next": "n"} done.')
+        self.finish_a()
+        self.assertEqual(self.lane_a()["reading"]["kind"], "blocked")
+
+    def test_two_objects_or_bad_fields_need_orchestrator(self):
+        ok = '{"kind": "pass", "summary": "s", "next": "n"}'
+        for text in (ok + " " + ok, '{"kind": "nope", "summary": "s", "next": "n"}',
+                     '{"kind": "pass", "summary": "' + "x" * 141 + '", "next": "n"}',
+                     '{"kind": "pass", "summary": "s", "next": "n", "extra": 1}'):
+            with self.subTest(text=text[:40]):
+                self.setUp()
+                self.reply = answer(text)
+                self.finish_a()
+                self.assertEqual(self.lane_a()["reading"]["summary"], "reader: invalid output")
+
+    def test_pass_error_logs_filename_and_location(self):
+        def boom():
+            raise FileNotFoundError(2, "No such file", "C:/x/gone.md")
+        self.c.pass_once = boom
+        self.c.loop(once=True)
+        (e,) = [x for x in self.events() if x["event"] == "error"]
+        self.assertEqual(e["file"], "C:/x/gone.md")
+        self.assertRegex(e["at"], r"^conveyor\.py:\d+$")  # innermost conveyor frame (loop's call)
+
+    def test_inbox_file_vanishing_before_stat_is_skipped(self):
+        self.drop("a.md", HDR.format("A"))
+        real = Path.glob
+        ghost = self.base / "inbox" / "ghost.md"
+
+        def glob(path, pat):
+            out = list(real(path, pat))
+            return [ghost] + out if path == self.base / "inbox" and pat == "*.md" else out
+        with mock.patch.object(Path, "glob", glob):
+            self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 1)
+
     def test_invalid_output_needs_orchestrator(self):
         self.reply = answer("```json\n{\"kind\": \"pass\"}\n```")
         self.finish_a()
@@ -795,7 +837,8 @@ class TestReader(Base):
         self.assertEqual(req.full_url, "https://api.anthropic.com/v1/messages")
         self.assertEqual(req.get_header("X-api-key"), KEY)
         self.assertEqual(req.get_header("Anthropic-version"), "2023-06-01")
-        self.assertEqual(op.call_args[1]["timeout"], 20)
+        self.assertEqual(op.call_args[1]["timeout"], 60)
+        self.assertEqual(conveyor.READER_TIMEOUT_S, 60)
         self.assertEqual(json.loads(req.data), {"x": 1})
         http = conveyor.urllib.error.HTTPError(conveyor.READER_URL, 401, "no", {}, None)
         with mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=http):
