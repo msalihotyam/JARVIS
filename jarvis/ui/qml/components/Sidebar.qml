@@ -85,7 +85,7 @@ Rectangle {
         property bool menuButton: false
         readonly property bool menuHere: !!sidebar.conversationMenu && sidebar.conversationMenu.open && sidebar.conversationMenu.opener === row
         readonly property bool showMenu: menuButton && !dragging && (hovered || activeFocus || menuHere)
-        property bool available: !bridge.busy
+        property bool available: !bridge.navigationLocked          // R1: a recorded run leaves rows open
         readonly property bool hovered: area.containsMouse || gripArea.containsMouse || menuArea.containsMouse
         signal activated()
         signal contextRequested(point position)
@@ -454,7 +454,9 @@ Rectangle {
                                            label: projectMenu.pinned ? qsTr("Unpin") : qsTr("Pin")
                                            onTriggered: { var id = projectMenu.project.id, on = !projectMenu.pinned; projectMenu.close()
                                                           bridge.setProjectPinned(id, on) } }
+            // R1: not the project of the conversation JARVIS is working for.
             ConversationMenu.ScopeChoice { objectName: "sidebarProjectArchiveItem"; icon: "archive"; label: qsTr("Archive")
+                                           available: bridge.runningProjectId !== projectMenu.project.id
                                            onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.archiveProject(id) } }
         }
     }
@@ -581,7 +583,7 @@ Rectangle {
                             // toggles the tree (never busy-gated: nothing runs).
                             // A tree row has no day heading: today's time, else its day (K3).
                             meta: isProject ? (modelData.open ? "" : sidebar.count(modelData.count)) : i18n.when(modelData.updated_at, sidebar.today, "short")
-                            available: isProject || !bridge.busy
+                            available: isProject || !bridge.navigationLocked
                             menuButton: !isProject
                             current: !isProject && !!modelData.active
                             Accessible.description: isProject ? (modelData.open ? qsTr("Expanded") : qsTr("Collapsed"))

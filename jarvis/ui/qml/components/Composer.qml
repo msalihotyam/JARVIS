@@ -226,7 +226,7 @@ Item {
         objectName: "composerSend"
         anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
         width: 44; height: 44
-        readonly property bool stopping: bridge.busy
+        readonly property bool stopping: bridge.openRunning
         enabled: stopping || composer.canSend
         opacity: enabled ? 1 : 0.42
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
@@ -330,7 +330,7 @@ Item {
                 id: attachChip
                 objectName: "attachControl"
                 width: 32; height: 32
-                enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
+                enabled: !bridge.openRunning && !bridge.configRefused && !composer.readOnly
                 opacity: enabled ? 1 : 0.5
                 Accessible.role: Accessible.Button
                 Accessible.name: qsTr("Attach a file or an image")
@@ -420,10 +420,35 @@ Item {
         Text {
             id: working
             objectName: "composerWorking"
-            visible: bridge.busy
+            visible: bridge.openRunning
             anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, rightChips.x - x - 8)); elide: Text.ElideRight
             text: qsTr("JARVIS is working…"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
+        }
+        // R1: JARVIS works for ANOTHER conversation. Send stays off (one run at a time), the
+        // draft stays, and a mouse-first link opens the conversation it works for.
+        Row {
+            id: elsewhere
+            objectName: "composerElsewhere"
+            visible: bridge.busy && !bridge.openRunning
+            anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+            spacing: 10
+            Text { objectName: "composerElsewhereReason"; anchors.verticalCenter: parent.verticalCenter
+                   width: Math.max(0, Math.min(implicitWidth, rightChips.x - elsewhere.x - goRunning.width - 18)); elide: Text.ElideRight
+                   text: qsTr("JARVIS is working in another conversation"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption }
+            Text {
+                id: goRunning
+                objectName: "composerElsewhereOpen"
+                anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Go to that conversation")
+                color: goArea.containsMouse ? Theme.text : Theme.accent; renderType: Theme.textRender; font: Theme.caption
+                Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+                Accessible.role: Accessible.Link
+                Accessible.name: text
+                Accessible.onPressAction: bridge.openRunningConversation()
+                MouseArea { id: goArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor; onClicked: bridge.openRunningConversation() }
+            }
         }
         Row {
             id: rightChips

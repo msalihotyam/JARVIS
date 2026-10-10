@@ -19,7 +19,7 @@ JarvisDialog {
     titleName: "deleteTitle"
     initialFocus: cancelButton
     confirmItem: confirmButton
-    confirmEnabled: !bridge.busy
+    confirmEnabled: !bridge.navigationLocked && bridge.runningConversationId !== targetId     // R1: running-only
     // The conversation this dialog was opened for; the confirm carries it.
     property string targetId: ""
     readonly property var preview: bridge.deletePreview

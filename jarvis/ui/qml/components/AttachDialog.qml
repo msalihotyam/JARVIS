@@ -18,7 +18,7 @@ JarvisDialog {
     title: qsTr("Attach this conversation to a project")
     initialFocus: projects.count > 0 ? projects.itemAt(0) : newName
     confirmItem: confirmButton
-    confirmEnabled: !bridge.busy
+    confirmEnabled: !bridge.openRunning               // R1: it attaches the open conversation
     enterGuard: [newName]
     property var choices: []
     property string chosenId: ""

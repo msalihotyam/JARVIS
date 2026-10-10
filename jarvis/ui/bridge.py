@@ -13,6 +13,7 @@ selection and cancellation it is handed.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import threading
@@ -229,6 +230,10 @@ class Bridge(QObject):
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
         # -- state --
         self._busy = False
+        # Gate 6G R1: the run record of the conversation-bound "task" run in flight (bridge memory only,
+        # never persisted): origin conversation, request / session / task identity, the attachment
+        # snapshots its request references and its latest preview. None for any other run (a sweep).
+        self._run_record: dict[str, Any] | None = None
         self._executing = False    # the current / last task run is an approved execution
         # The running request began while frozen: it can start no work (Core
         # refuses anything authoritative), so nothing is on its way to a safe point.
@@ -360,6 +365,14 @@ class Bridge(QObject):
             # time is drawn from it, so showing a clock never reads ``_clock``.
             self._work_started_at = time.time()
             self._started_frozen = self._config.get("execution_enabled") is False
+            # Only a run delivered through ``_delivered`` (a captured origin) is recorded; only it
+            # lets the person open other conversations while it runs.
+            origin = getattr(on_done, "origin", None)
+            self._run_record = None if origin is None else {
+                "origin": origin.id, "project": self._owner_of(origin.store, origin.id).get("id") or "",
+                "request_id": self._request_id, "session_id": self._session_id,
+                "task_id": str(self._task.get("task_id") or ""), "snapshots": getattr(on_done, "snapshots", frozenset()),
+                "preview": "", "stream_ts": 0.0, "discard": False}
             self._refresh_core_state()
         if self.sync:
             self._on_finished(kind, sequence, _guarded(fn))
@@ -383,9 +396,11 @@ class Bridge(QObject):
             # dropped whole. Nothing stale ever reaches the screen.
             if kind == "task" and self._sequence.get(kind) == sequence:
                 self._busy = False
+                self._end_run()
             return
         if kind == "task":
             self._busy = False
+            self._end_run()
             if self._work_started is not None:
                 self._work_ms = max(0, round((self._clock() - self._work_started) * 1000))
         handler(result)
@@ -399,6 +414,22 @@ class Bridge(QObject):
                 # Lifecycle, not conversation: the live feed and the attention strip say it.
                 self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS frozen"), ()), "system")
         self._refresh_core_state()
+
+    def _end_run(self) -> None:
+        """The run record clears exactly once: finished, failed or cancelled. Snapshots it kept
+        through a discard (another conversation opened, a new session) go now, unless the open
+        screen's draft holds the same file."""
+        record, self._run_record = self._run_record, None
+        if record is None or not record["discard"]:
+            return
+        for path in record["snapshots"] - self._draft_snapshots():
+            with contextlib.suppress(OSError):
+                Path(path).unlink(missing_ok=True)
+
+    def _draft_snapshots(self) -> frozenset[str]:
+        """The snapshot files the open screen's draft references."""
+        items = [*self._attachments, *(item for group in self._groups for item in group["attachments"])]
+        return frozenset(item["path"] for item in items if type(item.get("path")) is str)
 
     # -- feed ---------------------------------------------------------------
 
@@ -629,8 +660,9 @@ class Bridge(QObject):
             if open_id == seen_id and (open_record is None or (was_live and not live)):
                 # N2: deleted, or archived since it was opened, by any path (incl. a change
                 # in the store): never stay on it. An archived one opened read-only stays.
-                # While a run is busy it is left when the run ends (_on_finished).
-                if not self._busy:
+                # While a run without a record (a sweep) is busy it is left when the run
+                # ends (_on_finished); a recorded run leaves navigation open (R1).
+                if not self.navigationLocked:
                     self._open_seen = ("", False)
                     self._leave_open_conversation(*self._open_scope())
                     return
@@ -773,11 +805,11 @@ class Bridge(QObject):
     @Slot(str, str, result=bool)
     def renameConversation(self, conversation_id: str, title: str) -> bool:
         """Commit a rename of EXACTLY ``conversation_id`` (the one captured
-        when the edit started, never whichever is open now). Refused while a
-        run is busy. Empty after normalizing: no call, the old name stays."""
+        when the edit started, never whichever is open now). Refused while it
+        runs (R1). Empty after normalizing: no call, the old name stays."""
         self._rename_notice = ""
         normalized = self._normalized_title(title)
-        if self._busy:
+        if self._runs_in(str(conversation_id)):
             self._rename_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
         elif not str(conversation_id):
             self._rename_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This conversation is not saved yet."))
@@ -794,13 +826,20 @@ class Bridge(QObject):
         return ok
 
     def _activate(self, opened: PersistedConversation) -> None:
-        """Open ``opened``: its history on screen, a fresh Core session for it."""
+        """Open ``opened``: its history on screen, a fresh Core session for it -
+        or, back on the conversation a recorded run is working for (R1), that
+        run's session and its live stream."""
         self._conversation_store = opened
-        self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
+        record = self._run_record if self.openRunning else None
+        self._session_id = record["session_id"] if record is not None else ""
+        self._task, self._ticket, self._approval, self._clarification = {}, None, {}, {}
         self._decision = {}
         self._discard_snapshots()
         self._last_outcome = "idle"
         self._end_stream()
+        if record is not None and record["preview"]:
+            self._stream_text, self._stream_ts = record["preview"], record["stream_ts"]
+            self.streamChanged.emit()
         self._restore_feed(opened.state)
         self._refresh_conversations()
         self.approvalChanged.emit()
@@ -809,7 +848,7 @@ class Bridge(QObject):
     @Slot(result=bool)
     def newConversation(self) -> bool:
         """Start a new Global conversation and open it."""
-        if self._busy:
+        if self.navigationLocked:
             return False
         store = self._conversation_db()
         if store is None:
@@ -831,7 +870,7 @@ class Bridge(QObject):
         return self._open_conversation(str(conversation_id), expand=True)
 
     def _open_conversation(self, conversation_id: str, expand: bool) -> bool:
-        if self._busy:
+        if self.navigationLocked:
             return False
         if conversation_id == self._conversation_store.id:
             return True
@@ -1004,7 +1043,22 @@ class Bridge(QObject):
 
     @Slot(str)
     def archiveProject(self, project_id: str) -> None:
+        if self._busy and self._run_record is not None and self._run_in_project(str(project_id)):
+            # R1: the conversation JARVIS is working for belongs to this project (fail closed).
+            self._project_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
+            self.projectsChanged.emit()
+            return
         self._run("project", lambda: self.backend.project_lifecycle("archive", str(project_id)), self._project_answer)
+
+    def _run_in_project(self, project_id: str) -> bool:
+        """The recorded run's conversation belongs to ``project_id`` - read now; a
+        failed read says yes (fail closed)."""
+        store = self._conversation_db()
+        try:
+            record = store.load_conversation(self._run_record["origin"]) if store is not None else None
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            return True
+        return (record.project_id if record is not None else self._run_record["project"]) == project_id
 
     @Slot(str)
     def unarchiveProject(self, project_id: str) -> None:
@@ -1015,7 +1069,7 @@ class Bridge(QObject):
         """A new conversation OWNED by ``project_id``, opened. The store's own
         creation path decides: an unknown or archived owner is refused inside
         its write transaction and nothing is created. The owner is fixed."""
-        if self._busy:
+        if self.navigationLocked:
             return False
         store = self._conversation_db()
         if store is None:
@@ -1178,7 +1232,7 @@ class Bridge(QObject):
         Opening a conversation decides nothing: Core binds the session to its
         conversation's owner (ARCHITECTURE 4.22)."""
         project_id = str(project_id)
-        if self._busy:
+        if self.navigationLocked:
             return False
         if project_id and project_id not in {choice["id"] for choice in self.projectChoices()}:
             return False
@@ -1437,7 +1491,7 @@ class Bridge(QObject):
         previewed. Afterwards the conversation is re-opened, so the next task
         starts a fresh Core session."""
         held = self._attach_preview
-        if self._busy or not held or held.get("blocked"):
+        if not held or held.get("blocked") or self._runs_in(held["conversation_id"]):
             return False
         if held["request"] != self._attach_target(project_id, new_name):
             self.previewAttach(project_id, new_name)
@@ -1504,7 +1558,7 @@ class Bridge(QObject):
         it was last read (by any path) -> the full refresh, which leaves it."""
         seen_id, was_live = self._open_seen
         store = self._conversation_db()
-        if self._busy or store is None or not seen_id or seen_id != self._conversation_store.id:
+        if self.navigationLocked or store is None or not seen_id or seen_id != self._conversation_store.id:
             return
         try:
             record = store.load_conversation(seen_id)
@@ -1544,7 +1598,7 @@ class Bridge(QObject):
         return self._lifecycle_notice == ""
 
     def _lifecycle_refused(self, conversation_id: str) -> bool:
-        if self._busy:
+        if self._runs_in(conversation_id):
             self._lifecycle_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
         elif not conversation_id:
             self._lifecycle_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This conversation is not saved yet."))
@@ -1589,7 +1643,7 @@ class Bridge(QObject):
         refreshes the preview and is never retried."""
         conversation_id = str(conversation_id)
         held = self._delete_preview
-        if self._busy or not held or held.get("blocked") or held.get("conversation_id") != conversation_id:
+        if self._runs_in(conversation_id) or not held or held.get("blocked") or held.get("conversation_id") != conversation_id:
             return False
         payload = self.backend.conversation_delete(conversation_id, confirm=conversation_id,
                                                    expected_next_seq=held["expected_next_seq"],
@@ -1623,32 +1677,46 @@ class Bridge(QObject):
         from. Without a session the envelope belongs to ``origin``. A linked
         conversation that cannot be loaded - deleted (Gate 6D-b) or corrupt -
         owns it all the same: it is dropped, never handed to the open
-        conversation or to any other owner."""
+        conversation or to any other owner. R1: the owner is re-read at
+        delivery on EVERY path, before anything is linked or written."""
         run = payload.get("run") if isinstance(payload, dict) and isinstance(payload.get("run"), dict) else payload
         session = run.get("session") if isinstance(run, dict) else None
         session_id = session.get("id") if isinstance(session, dict) else None
         store = origin.store
-        if not isinstance(session_id, str) or not session_id or store is None:
+        if store is None:
             return origin
+        if not isinstance(session_id, str) or not session_id:
+            return origin if self._still_there(store, origin.id) else None
         linked = self._session_conversation(session_id)
         if linked is None:
+            if not self._still_there(store, origin.id):
+                return None
             try:
                 store.link_session_conversation(session_id, origin.id)
             except Exception:  # noqa: BLE001 - an unlinkable session stays with its origin
                 pass
             return origin
         if linked == self._conversation_store.id:
-            return self._conversation_store
+            return self._conversation_store if self._still_there(store, linked) else None
         try:
             return PersistedConversation(store, linked, store.load_conversation_state(linked))
         except Exception:  # noqa: BLE001 - deleted or unreadable: dropped by the caller
             return None
 
-    def _delivered(self, handler: Callable[[Any], None]) -> Callable[[Any], None]:
+    @staticmethod
+    def _still_there(store: Any, conversation_id: str | None) -> bool:
+        """The conversation exists and is not deleted (an unreadable store says no)."""
+        try:
+            return bool(conversation_id) and store.load_conversation(conversation_id) is not None
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            return False
+
+    def _delivered(self, handler: Callable[[Any], None], snapshots: frozenset[str] = frozenset()) -> Callable[[Any], None]:
         """``handler`` for the conversation open NOW; anything that turns out to
         belong to another conversation is remembered there instead, and
         anything whose conversation cannot be loaded is dropped: the only trace
-        is a transient window notice, saved nowhere."""
+        is a transient window notice, saved nowhere. ``snapshots``: the
+        attachment files the request references (kept by its run record)."""
         origin = self._conversation_store
 
         def deliver(payload: Any) -> None:
@@ -1662,6 +1730,7 @@ class Bridge(QObject):
                 return
             self._remember_elsewhere(payload, owner)
 
+        deliver.origin, deliver.snapshots = origin, snapshots    # read by ``_run``: the run record
         return deliver
 
     def _remember_elsewhere(self, payload: Any, owner: PersistedConversation) -> None:
@@ -1712,7 +1781,9 @@ class Bridge(QObject):
         # of this application is still running toward its next safe point.
         if self._config_refused() or (self._config.get("execution_enabled") is False and not self._busy):
             state = "disabled"
-        elif self._busy:
+        elif self.openRunning:
+            # R1: "running" is this screen's run; a recorded run working for another
+            # conversation leaves this one its own state (``busy`` stays global).
             state = "running"
         elif self._ticket is not None:
             state = "awaiting_approval"
@@ -1835,13 +1906,21 @@ class Bridge(QObject):
         return lambda text: emitter.preview.emit(request_id, text)
 
     def _on_preview(self, request_id: str, text: str) -> None:
-        # Only the request that is still running may show text.
+        # Only the request that is still running may show text, and only on its
+        # own conversation's screen; elsewhere it waits in the run record (R1).
         if request_id != self._request_id or not self._busy or not isinstance(text, str):
+            return
+        record = self._run_record
+        if record is not None:
+            if not record["preview"]:
+                record["stream_ts"] = time.time()
+            record["preview"] = redact_text(text)
+        if self._first_visible is None and text.strip():
+            self._first_visible = self._clock()       # the run's telemetry, wherever it is shown
+        if not self.openRunning:
             return
         if not self._stream_text:
             self._stream_ts = time.time()
-            if self._first_visible is None and text.strip():
-                self._first_visible = self._clock()
         self._stream_text = redact_text(text)
         self.streamChanged.emit()
 
@@ -1938,7 +2017,51 @@ class Bridge(QObject):
 
     @Property(bool, notify=stateChanged)
     def busy(self) -> bool:
+        """A run is active (the global gate: one run at a time)."""
         return self._busy
+
+    # -- Gate 6G R1: switching conversations while a recorded run continues ----
+
+    @Property(bool, notify=stateChanged)
+    def openRunning(self) -> bool:
+        """A run is active AND it is this screen's: the open conversation is the
+        run record's origin - or the run has no record (a sweep), which pins the
+        screen it started on. What the screen shows of a run follows this."""
+        record = self._run_record
+        return self._busy and (record is None or record["origin"] == self._conversation_store.id)
+
+    @Property(bool, notify=stateChanged)
+    def navigationLocked(self) -> bool:
+        """A run without a record (the manual sweep) is active: nothing opens, as before R1."""
+        return self._busy and self._run_record is None
+
+    @Property(str, notify=stateChanged)
+    def runningConversationId(self) -> str:
+        """The conversation the recorded run in flight works for ("" when none)."""
+        return str(self._run_record["origin"] or "") if self._busy and self._run_record is not None else ""
+
+    @Property(str, notify=stateChanged)
+    def runningProjectId(self) -> str:
+        """That conversation's project ("" = Global, or no recorded run)."""
+        return self._run_record["project"] if self._busy and self._run_record is not None else ""
+
+    def _runs_in(self, conversation_id: str | None) -> bool:
+        """The ONE running-only refusal: ``conversation_id`` is the conversation a
+        recorded run works for - or a run without a record is active, which
+        keeps every refusal it had before R1."""
+        return self.navigationLocked or (self._busy and self._run_record is not None
+                                         and self._run_record["origin"] == conversation_id)
+
+    @Slot(result=bool)
+    def openRunningConversation(self) -> bool:
+        """The composer's link on another conversation: open the one JARVIS works for."""
+        record = self._run_record
+        if not self._busy or record is None or not record["origin"]:
+            return False
+        opened = self.openConversation(record["origin"])
+        if opened:
+            self.setPage("home")
+        return opened
 
     @Property(str, notify=stateChanged)
     def coreState(self) -> str:
@@ -1947,9 +2070,9 @@ class Bridge(QObject):
     @Property(float, notify=stateChanged)
     def workStartedAt(self) -> float:
         """When the request being worked on started, in epoch milliseconds; 0 when
-        nothing is running. Display only - the live turn's running time. The ONE
+        nothing is running here. Display only - the live turn's running time. The ONE
         measured duration of a finished answer is its telemetry (``_measured``)."""
-        return self._work_started_at * 1000 if self._busy else 0.0
+        return self._work_started_at * 1000 if self.openRunning else 0.0
 
     @Property(bool, notify=stateChanged)
     def executing(self) -> bool:
@@ -2011,11 +2134,11 @@ class Bridge(QObject):
     @Property("QVariantMap", notify=stateChanged)
     def progress(self) -> dict:
         """The header's four lifecycle stages, projected in present.task_progress."""
-        return task_progress(self._task, self._core_state, self._busy)
+        return task_progress(self._task, self._core_state, self.openRunning)
 
     @Property(bool, notify=stateChanged)
     def taskLive(self) -> bool:
-        return bool(self._session_id) and (self._busy or (
+        return bool(self._session_id) and (self.openRunning or (
             bool(self._task.get("status")) and self._task.get("status") not in TERMINAL_STATUSES))
 
     # -- local telemetry: a gauge, never a capability ---------------------------
@@ -2232,13 +2355,16 @@ class Bridge(QObject):
         owner = self._conversation_store.id or ""     # its owner scopes the request ("" = unsaved Global)
         self._end_stream()
         relay = self._preview_relay(request_id)
+        # The files this request references: its run record keeps them until the run has finished (R1).
+        snapshots = frozenset(item["path"] for item in (*attachments, *(a for g in groups for a in g["attachments"]))
+                              if type(item.get("path")) is str)
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
                                              conversation=conversation, context_groups=groups,
                                              context_attachments=attachments, response_mode=mode,
                                              on_reply_preview=relay, conversation_id=owner, **route),
-            self._delivered(lambda payload: self._apply_text(payload, text)),
+            self._delivered(lambda payload: self._apply_text(payload, text), snapshots),
         )
         return True
 
@@ -2280,10 +2406,13 @@ class Bridge(QObject):
 
     @Slot(result=bool)
     def cancelText(self) -> bool:
-        """Stop the running understanding call for the CURRENT request only."""
-        if not self._busy or not self._request_id:
+        """Stop the running understanding call for the CURRENT request only -
+        from its own conversation's screen, by the run record's request (R1)."""
+        record = self._run_record
+        request_id = record["request_id"] if record is not None else self._request_id
+        if not self.openRunning or not request_id:
             return False
-        return self.backend.cancel_text(self._request_id)
+        return self.backend.cancel_text(request_id)
 
     # -- slots: approval / task ------------------------------------------
 
@@ -2294,6 +2423,8 @@ class Bridge(QObject):
         ticket = self._ticket
         if ticket is None or self._busy or not self._approval.get("complete"):
             return False
+        if self._session_conversation(ticket.session_id) != self._conversation_store.id:
+            return False            # R1: never a ticket of a conversation other than the open one
         if request_id is not None and (str(request_id), str(fingerprint)) != (ticket.request_id, ticket.fingerprint):
             return False
         shown = self._approval
@@ -2359,10 +2490,17 @@ class Bridge(QObject):
 
     @Slot()
     def cancelTask(self) -> None:
-        """Cancel through Core; while running the id is storage's, not ours."""
-        session_id = self._session_id
-        task_id = (self.backend.active_task_id(session_id) if self._busy and session_id
-                   else self._task.get("task_id"))
+        """Cancel through Core; while running the id is storage's, not ours. On the
+        screen of a recorded run (R1) that is the RUN's session - the screen's may
+        have been reset by leaving and returning - with its cached task as fallback."""
+        record = self._run_record if self.openRunning else None
+        if record is not None:
+            session_id = record["session_id"]
+            task_id = (self.backend.active_task_id(session_id) if session_id else None) or record["task_id"]
+        else:
+            session_id = self._session_id
+            task_id = (self.backend.active_task_id(session_id) if self.openRunning and session_id
+                       else self._task.get("task_id"))
         if not session_id or not task_id:
             self._tell("system", QT_TRANSLATE_NOOP("Bridge", "No cancellable task is registered yet."))
             return
@@ -2371,13 +2509,23 @@ class Bridge(QObject):
         self._run("cancel", lambda: self.backend.cancel(session_id, task_id), self._delivered(self._apply_run))
 
     def _discard_snapshots(self) -> None:
-        """Throw away every attachment snapshot JARVIS copied for this session."""
+        """Throw away every attachment snapshot JARVIS copied for this session -
+        except those the recorded run in flight still references: a provider
+        reads them later (and skips a missing one), so they go when it ends (R1)."""
         self.clearContext()
-        discard_snapshots(self._snapshots)
+        record = self._run_record if self._busy else None
+        if record is None or not record["snapshots"]:
+            discard_snapshots(self._snapshots)
+            return
+        record["discard"] = True
+        for path in self._snapshots.glob("*"):
+            if str(path) not in record["snapshots"]:
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
     @Slot()
     def newSession(self) -> None:
-        if self._busy:
+        if self._runs_in(self._conversation_store.id):
             return
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
         self._decision = {}
@@ -2394,8 +2542,17 @@ class Bridge(QObject):
 
     @Slot(str)
     def useSession(self, session_id: str) -> None:
-        if session_id and not self._busy and self._open_owner_of(str(session_id)):
-            self._session_id, self._task, self._ticket, self._approval, self._decision = str(session_id), {}, None, {}, {}
+        session_id = str(session_id)
+        if not session_id:
+            return
+        # The owner is resolved ONCE, before anything changes. While a run is active (R1, FAIL
+        # CLOSED) it is refused for a run without a record, an unlinked session or a failed lookup
+        # (both None) and the running conversation's own session: each would rebind that conversation.
+        owner = self._session_conversation(session_id)
+        if self._busy and (self._run_record is None or owner is None or owner == self._run_record["origin"]):
+            return
+        if owner is None or self.openConversation(owner):
+            self._session_id, self._task, self._ticket, self._approval, self._decision = session_id, {}, None, {}, {}
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), (session_id,)), "system")
             self.approvalChanged.emit()
             self._refresh_core_state()
@@ -3412,6 +3569,7 @@ class Bridge(QObject):
         """The orderly quit. The window accepts its close from here on."""
         self._quitting = True
         self._discard_snapshots()
+        discard_snapshots(self._snapshots)     # quitting keeps none, a running request's included (R1)
         self.trayChanged.emit()
         self.quitRequested.emit()
 
@@ -3699,7 +3857,7 @@ class Bridge(QObject):
         for name in layout["order"]:
             panel = layout["panels"][name]
             contextual = name in CONTEXTUAL_PANELS
-            has_content = (name != "workflow") or bool(self._task) or self._busy or self._ticket is not None
+            has_content = (name != "workflow") or bool(self._task) or self.openRunning or self._ticket is not None
             shown = panel["visible"] and (panel["pinned"] or has_content or self._edit_mode)
             if self._focus_mode and not panel["pinned"]:
                 shown = False
