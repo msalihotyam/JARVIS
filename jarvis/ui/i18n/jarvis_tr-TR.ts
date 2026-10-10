@@ -543,6 +543,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Başka bir sohbete ait yanıt o sohbete kaydedildi</translation>
     </message>
     <message>
+        <source>This task&apos;s session no longer belongs to this conversation; nothing was sent.</source>
+        <translation>Bu görevin oturumu artık bu sohbete ait değil; hiçbir şey gönderilmedi.</translation>
+    </message>
+    <message>
         <source>Approval required: %1 -&gt; %2</source>
         <translation>Onay gerekli: %1 -&gt; %2</translation>
     </message>
@@ -708,6 +712,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>JARVIS durumu doğrulanmadı</translation>
     </message>
     <message>
+        <source>JARVIS resumed - the paused task was not continued: another run is in progress</source>
+        <translation>JARVIS devam ettirildi - duraklatılan görev sürdürülmedi: başka bir çalışma sürüyor</translation>
+    </message>
+    <message>
+        <source>JARVIS resumed - more than one task is paused, so none was continued</source>
+        <translation>JARVIS devam ettirildi - birden fazla görev duraklatılmış, bu yüzden hiçbiri sürdürülmedi</translation>
+    </message>
+    <message>
         <source>JARVIS resumed - continuing the paused task</source>
         <translation>JARVIS devam ettirildi - duraklatılan görev sürdürülüyor</translation>
     </message>
@@ -722,6 +734,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>JARVIS resumed</source>
         <translation>JARVIS sürdürüldü</translation>
+    </message>
+    <message>
+        <source>JARVIS resumed - the paused task could not be continued</source>
+        <translation>JARVIS devam ettirildi - duraklatılan görev sürdürülemedi</translation>
     </message>
     <message>
         <source>JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: the operation may keep running until it returns, and anything already sent to its destination is not stopped or undone.</source>

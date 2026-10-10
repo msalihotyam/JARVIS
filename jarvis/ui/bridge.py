@@ -136,6 +136,82 @@ def reported_cache_tokens(*reports: Any) -> int | None:
     return sum(values) if values else None
 
 
+# Gate 6G R2: the screen slots a conversation's waiting state lives in - live for the open one,
+# parked (bridge memory only) for another. ``_decision`` is not one: every activation resets it.
+_SLOTS = ("session_id", "task", "ticket", "approval", "clarification", "last_outcome")
+
+
+def _empty_slots() -> dict[str, Any]:
+    return {"session_id": "", "task": {}, "ticket": None, "approval": {}, "clarification": {}, "last_outcome": "idle"}
+
+
+def _waiting(slots: dict) -> bool:
+    """The person is needed (Q2): an approval card (an incomplete one too), a clarification, or a
+    task Core reports awaiting clarification (a bare run keeps that only in the task)."""
+    return bool(slots["approval"] or slots["clarification"] or slots["task"].get("status") == "awaiting_clarification")
+
+
+def _parks(slots: dict) -> bool:
+    """OD1: kept for a conversation that is not open only while it needs the person or Resume."""
+    return _waiting(slots) or task_outcome(slots["task"]).get("kind") == "paused"
+
+
+def _run_facts(task: dict, payload: Any, intent: Any = None) -> dict[str, str]:
+    """What a task envelope cannot say about its own task: the capability and the destination,
+    from the resolved intent, else from the task block its OWN conversation already holds."""
+    resolved = task_status(payload, intent) if intent is not None else {}
+    return {key: resolved.get(key) or task.get(key, "") for key in ("capability", "destination")}
+
+
+def _project_run(prior: dict, payload: Any, intent: Any = None) -> dict[str, Any]:
+    """One conversation's slots after a task envelope (a run, a decision, a cancel, a resume, a
+    clarify), from that conversation's own prior slots only. A run envelope answers any
+    clarification that was waiting (OD6)."""
+    slots = {**prior, "clarification": {}}
+    if isinstance(payload, dict):
+        session_id = (payload.get("session") or {}).get("id") if isinstance(payload.get("session"), dict) else None
+        if isinstance(session_id, str):
+            slots["session_id"] = session_id
+        if isinstance(payload.get("task"), dict) and isinstance(payload["task"].get("id"), str):
+            slots["task"] = task_status(payload, intent)
+    slots["ticket"] = approval_ticket(payload)
+    # Shown whenever Core sent a request - incomplete ones included, so a
+    # request missing its binding reads as unavailable, never as absent.
+    slots["approval"] = approval_card(payload)
+    slots["last_outcome"] = outcome_kind(payload, facts=_run_facts(prior["task"], payload, intent))
+    return slots
+
+
+def _project_text(prior: dict, payload: Any, text: str) -> dict[str, Any]:
+    """The slots after an understanding envelope for ``text`` (what the person sent)."""
+    intent = payload.get("intent") if isinstance(payload, dict) else None
+    if not isinstance(intent, dict):
+        intent = None
+    status = str((intent or {}).get("status") or "")
+    if status == "structured":
+        return _project_run(prior, payload.get("run"), intent)
+    clarification: dict[str, Any] = {}
+    if status == "clarification_required" and intent is not None:
+        choices = [c for c in (intent.get("choices") or []) if isinstance(c, dict)
+                   and isinstance(c.get("label"), str) and isinstance(c.get("destination"), str)]
+        clarification = {"request_id": str(intent.get("request_id") or ""), "previous_text": text,
+                         "question": str(intent.get("question") or ""), "choices": choices}
+    return {**prior, "ticket": None, "approval": {}, "clarification": clarification,
+            "task": task_status(None, intent), "last_outcome": outcome_kind(None, status)}
+
+
+def _kept_refusal(slots: dict, payload: Any, ticket: ApprovalTicket | None, shown: dict | None) -> dict[str, Any]:
+    """Core refused a decision with ``execution_disabled`` before touching the request, which is
+    still pending exactly as it was: the decided ticket and card stay. Not when the task moved
+    on - an approval Core carried out until Freeze paused it is no request any more (R2)."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = str(error.get("code") or "") if isinstance(error, dict) else ""
+    if (code == "execution_disabled" and ticket is not None and slots["ticket"] is None
+            and slots["task"].get("status") in ("awaiting_approval", "awaiting_cost_override")):
+        return {**slots, "ticket": ticket, "approval": dict(shown or {})}
+    return slots
+
+
 def _guarded(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
@@ -236,6 +312,13 @@ class Bridge(QObject):
         # never persisted): origin conversation, request / session / task identity, the attachment
         # snapshots its request references and its latest preview. None for any other run (a sweep).
         self._run_record: dict[str, Any] | None = None
+        # Gate 6G R2: per conversation id, the waiting state (``_SLOTS``) of a conversation that is
+        # not open - restored only on that conversation (bridge memory only, never persisted, so
+        # a restart shows none: Q5) - and the needsYouIds last announced.
+        self._parked: dict[str, dict[str, Any]] = {}
+        self._needs_you_seen: list[str] = []
+        self._restored_session = ""                  # the session the open screen got back from its parked state
+        self._deliveries: dict[str, int] = {}        # per conversation: envelopes delivered so far (newest wins)
         self._executing = False    # the current / last task run is an approved execution
         # The running request began while frozen: it can start no work (Core
         # refuses anything authoritative), so nothing is on its way to a safe point.
@@ -354,6 +437,9 @@ class Bridge(QObject):
         # The sidebar's pins and groups follow the lists and the project names.
         for signal in (self.conversationChanged, self.projectsChanged):
             signal.connect(self.sidebarChanged)
+        # R2: every change of the live slots or of the run says so through one of these.
+        for signal in (self.approvalChanged, self.stateChanged):
+            signal.connect(self._needs_you_check)
 
     # -- worker --------------------------------------------------------------
 
@@ -373,10 +459,12 @@ class Bridge(QObject):
             # Only a run delivered through ``_delivered`` (a captured origin) is recorded; only it
             # lets the person open other conversations while it runs.
             origin = getattr(on_done, "origin", None)
+            # R2: a run for a conversation that is not open (background Resume) names its own identity.
+            session_id, task_id = getattr(on_done, "identity", None) or (self._session_id, str(self._task.get("task_id") or ""))
             self._run_record = None if origin is None else {
                 "origin": origin.id, "project": self._owner_of(origin.store, origin.id).get("id") or "",
-                "request_id": self._request_id, "session_id": self._session_id,
-                "task_id": str(self._task.get("task_id") or ""), "snapshots": getattr(on_done, "snapshots", frozenset()),
+                "request_id": self._request_id, "session_id": session_id,
+                "task_id": task_id, "snapshots": getattr(on_done, "snapshots", frozenset()),
                 "preview": "", "stream_ts": 0.0, "discard": False}
             self._refresh_core_state()
         if self.sync:
@@ -699,6 +787,7 @@ class Bridge(QObject):
         if listed:
             self.prefs.prune_sidebar({r.id for r in everything if r.archived_at is None},
                                      {r.project_id for r in everything if r.project_id})
+            self._prune_parked()
         self._pin_records = {r.id: r for r in everything if r.archived_at is None and r.id in self.prefs.sidebar["pins"]}
         if any(r.project_id for r in self._pin_records.values()):
             try:
@@ -830,17 +919,26 @@ class Bridge(QObject):
         self.renameNoticeChanged.emit()
         return ok
 
-    def _activate(self, opened: PersistedConversation) -> None:
+    def _activate(self, opened: PersistedConversation, park: bool = True) -> None:
         """Open ``opened``: its history on screen, a fresh Core session for it -
         or, back on the conversation a recorded run is working for (R1), that
-        run's session and its live stream."""
+        run's session and its live stream. R2: the conversation left keeps
+        what waits for the person or Resume (``park``: not when it is left
+        because it was deleted or archived), and ``opened`` gets back what it
+        kept, once proven still its own."""
+        if park and opened.id != self._conversation_store.id:     # re-opening the same one (attach) starts fresh
+            self._park(self._conversation_store.id, self._live_slots())
+        else:
+            self._parked.pop(self._conversation_store.id, None)
         self._conversation_store = opened
         record = self._run_record if self.openRunning else None
-        self._session_id = record["session_id"] if record is not None else ""
-        self._task, self._ticket, self._approval, self._clarification = {}, None, {}, {}
+        restored = self._unpark(opened)
+        self._set_live(restored or _empty_slots())
+        self._restored_session = restored["session_id"] if restored else ""
+        if record is not None:
+            self._session_id = record["session_id"]
         self._decision = {}
         self._discard_snapshots()
-        self._last_outcome = "idle"
         self._end_stream()
         if record is not None and record["preview"]:
             self._stream_text, self._stream_ts = record["preview"], record["stream_ts"]
@@ -884,6 +982,8 @@ class Bridge(QObject):
             return False
         opened = self._load_conversation(store, conversation_id)
         if opened is None:
+            if self._parked.pop(conversation_id, None) is not None:   # R2: unreadable keeps nothing
+                self._needs_you_check()
             return False
         self._activate(opened)
         if expand:
@@ -1693,6 +1793,7 @@ class Bridge(QObject):
         # Re-opened WITH its verified stored state, so the feed and the next
         # request's history keep the earlier messages.
         opened = self._load_conversation(store, conversation_id)
+        self._parked.pop(conversation_id, None)       # R2: moved to a project, it starts a fresh session
         if opened is None:
             self._leave_open_conversation(*self._open_scope())
         else:
@@ -1765,7 +1866,7 @@ class Bridge(QObject):
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
                         (type(error).__name__,)), "error")
             opened = PersistedConversation(None, None)
-        self._activate(opened)
+        self._activate(opened, park=False)
         self.refreshProjects()
         self.setPage("home")
 
@@ -1892,26 +1993,43 @@ class Bridge(QObject):
         except Exception:  # noqa: BLE001 - storage boundary; fail closed
             return False
 
-    def _delivered(self, handler: Callable[[Any], None], snapshots: frozenset[str] = frozenset()) -> Callable[[Any], None]:
+    def _delivered(self, handler: Callable[[Any], None], snapshots: frozenset[str] = frozenset(),
+                   project: Callable[[dict, Any], dict] = _project_run, origin: PersistedConversation | None = None,
+                   identity: tuple[str, str] | None = None) -> Callable[[Any], None]:
         """``handler`` for the conversation open NOW; anything that turns out to
         belong to another conversation is remembered there instead, and
         anything whose conversation cannot be loaded is dropped: the only trace
         is a transient window notice, saved nowhere. ``snapshots``: the
-        attachment files the request references (kept by its run record)."""
-        origin = self._conversation_store
+        attachment files the request references (kept by its run record).
+        R2: ``project`` is the slot projection ``handler`` applies, so another
+        conversation's parked state follows its newest envelope - from that
+        conversation's own parked state, else from the origin's slots as they
+        were at launch, never from the screen open at delivery. ``origin``
+        and ``identity`` name a run started for a conversation that is not
+        open (a background Resume, whose own state is parked)."""
+        captured = None if origin is not None else dict(self._live_slots())
+        origin = origin or self._conversation_store
+        launched = self._deliveries.get(origin.id or "", 0)     # captured is stale once a newer envelope landed
 
         def deliver(payload: Any) -> None:
             owner = self._payload_owner(payload, origin)
             if owner is None:
                 self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A reply for a conversation that was deleted or cannot "
                                                                   "be read was dropped; it was saved nowhere."), ()), "system")
+                self._prune_parked()
                 return
+            fresh = owner.id == origin.id and self._deliveries.get(owner.id or "", 0) == launched
+            self._deliveries[owner.id or ""] = self._deliveries.get(owner.id or "", 0) + 1
             if owner.id == self._conversation_store.id:
                 handler(payload)
                 return
+            prior = self._parked.get(owner.id) or (captured if captured and fresh else _empty_slots())
             self._remember_elsewhere(payload, owner)
+            self._park_delivered(owner, project(prior, payload))
 
         deliver.origin, deliver.snapshots = origin, snapshots    # read by ``_run``: the run record
+        if identity is not None:
+            deliver.identity = identity
         return deliver
 
     def _remember_elsewhere(self, payload: Any, owner: PersistedConversation) -> None:
@@ -1933,6 +2051,104 @@ class Bridge(QObject):
                     self._say(entry.pop("kind"), entry.pop("text"), owner=owner, task_id=task_id,
                               run_status=run_status, **entry)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A reply for another conversation was saved there"), ()), "system")
+
+    # -- Gate 6G R2: parked waiting state, per conversation (bridge memory only) --
+
+    def _live_slots(self) -> dict[str, Any]:
+        return {"session_id": self._session_id, "task": self._task, "ticket": self._ticket, "approval": self._approval,
+                "clarification": self._clarification, "last_outcome": self._last_outcome}
+
+    def _set_live(self, slots: dict) -> None:
+        (self._session_id, self._task, self._ticket, self._approval, self._clarification,
+         self._last_outcome) = (slots[key] for key in _SLOTS)
+
+    def _park(self, conversation_id: str | None, slots: dict) -> None:
+        """``slots`` become the parked state of ``conversation_id`` (not open) while they qualify
+        (OD1) and are provably its own; otherwise it keeps none. Nothing is parked without a
+        conversation store."""
+        store = self._conversation_db()
+        if (conversation_id and store is not None and _parks(slots)
+                and self._parked_valid(store, conversation_id, slots)):
+            self._parked[conversation_id] = {key: slots[key] for key in _SLOTS}
+        else:
+            self._parked.pop(conversation_id, None)
+        self._needs_you_check()
+
+    def _park_delivered(self, owner: PersistedConversation, slots: dict) -> None:
+        """An envelope for ``owner`` (not open) replaces its parked state; a ticket only ever stays
+        when its session is ``owner``'s own."""
+        ticket = slots["ticket"]
+        if ticket is not None and self._session_conversation(ticket.session_id) != owner.id:
+            slots = {**slots, "ticket": None}
+        if slots["task"].get("task_id"):
+            slots = {**slots, "task": {**slots["task"], "title": owner.title(slots["task"]["task_id"])}}
+        self._park(owner.id, slots)
+
+    def _parked_valid(self, store: Any, conversation_id: str, slots: dict) -> bool:
+        """Still ``conversation_id``'s own: it exists, reads and is not archived, and every session
+        the slots name is linked to it (a failed lookup, no link or another owner: no). Never relinks."""
+        try:
+            record = store.load_conversation(conversation_id)
+            store.load_conversation_state(conversation_id)
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            return False
+        if record is None or record.archived_at is not None:
+            return False
+        ticket = slots["ticket"]
+        sessions = {slots["session_id"], str(slots["task"].get("session_id") or ""),
+                    str(slots["approval"].get("session_id") or ""), ticket.session_id if ticket is not None else ""} - {""}
+        return all(self._session_conversation(session) == conversation_id for session in sessions)
+
+    def _unpark(self, opened: PersistedConversation) -> dict[str, Any] | None:
+        """``opened``'s parked state, taken once and only when still its own."""
+        slots = self._parked.pop(opened.id, None) if opened.id else None
+        if slots is None or opened.store is None or not self._parked_valid(opened.store, opened.id, slots):
+            return None
+        return slots
+
+    def _prune_parked(self) -> None:
+        """Deleted, archived, unreadable or relinked: dropped, never restored anywhere, nothing written."""
+        store = self._conversation_db()
+        gone = [cid for cid, slots in self._parked.items() if store is None or not self._parked_valid(store, cid, slots)]
+        for cid in gone:
+            del self._parked[cid]
+        if gone:
+            self._needs_you_check()
+
+    def _needs_you(self) -> list[str]:
+        ids = {cid for cid, slots in self._parked.items() if _waiting(slots)}
+        if self._conversation_store.id and _waiting(self._live_slots()):
+            ids.add(self._conversation_store.id)
+        if self._busy and self._run_record is not None:
+            ids.discard(self._run_record["origin"])     # OD5: its waiting request is being answered
+        return sorted(ids)
+
+    def _needs_you_check(self) -> None:
+        ids = self._needs_you()
+        if ids != self._needs_you_seen:
+            self._needs_you_seen = ids
+            self.sidebarChanged.emit()
+
+    @Property("QVariantList", notify=sidebarChanged)
+    def needsYouIds(self) -> list:
+        """Q2: the conversations where an approval or a clarification waits for the person - a
+        parked one, or the open one's - minus the one a run is answering now (OD5). Truth only:
+        the sidebar draws it (R3); never persisted."""
+        return list(self._needs_you())
+
+    def _linked_here(self, session_id: str) -> bool:
+        """``session_id`` belongs to the OPEN conversation (a failed lookup: no)."""
+        return self._session_conversation(session_id) == self._conversation_store.id
+
+    def _restored_unlinked(self) -> bool:
+        """The screen acts with the session it got back from its parked state, and that session
+        is no longer linked to it (relinked, unlinked, a failed lookup): refuse, never relink."""
+        session = self._session_id
+        return bool(session) and session == self._restored_session and not self._linked_here(session)
+
+    def _refuse_unlinked(self) -> None:
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "This task's session no longer belongs to this conversation; "
+                                                          "nothing was sent."), ()), "error")
 
     def _tell(self, kind: str, source: str, *args: Any) -> None:
         """Say a JARVIS-owned notice (a ``Bridge`` catalog source)."""
@@ -1996,8 +2212,8 @@ class Bridge(QObject):
         # the same task (an approval carried out, say) from the task block this
         # window already holds. The presentation boundary needs them to decide
         # what this task's RESULT may be (present._grounded).
-        resolved = task_status(payload, intent) if intent is not None else {}
-        facts = {key: resolved.get(key) or self._task.get(key, "") for key in ("capability", "destination")}
+        prior = self._live_slots()
+        facts = _run_facts(self._task, payload, intent)
         task_id = str((payload.get("task") or {}).get("id") or "") if isinstance(payload, dict) and isinstance(payload.get("task"), dict) else ""
         run_status = str(payload.get("run_status") or "") if isinstance(payload, dict) else ""
         # A completed result shown for the first time carries what the run took; a
@@ -2010,21 +2226,11 @@ class Bridge(QObject):
                 if measured:
                     entry["telemetry"] = measured
             self._say(entry.pop("kind"), entry.pop("text"), task_id=task_id, run_status=run_status, **entry)
-        if isinstance(payload, dict):
-            session_id = (payload.get("session") or {}).get("id") if isinstance(payload.get("session"), dict) else None
-            if isinstance(session_id, str):
-                self._session_id = session_id
-            if isinstance(payload.get("task"), dict) and isinstance(payload["task"].get("id"), str):
-                self._task = task_status(payload, intent)
+        self._set_live(_project_run(prior, payload, intent))
         if self._task.get("task_id"):
             if request:
                 self._conversation_store.name_auto((self._task["task_id"], self._session_id), task_title(request))
             self._task["title"] = self._conversation_store.title(self._task["task_id"])
-        self._ticket = approval_ticket(payload)
-        # Shown whenever Core sent a request - incomplete ones included, so a
-        # request missing its binding reads as unavailable, never as absent.
-        self._approval = approval_card(payload)
-        self._last_outcome = outcome_kind(payload, facts=facts)
         if self._ticket is not None:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Approval required: %1 -> %2"),
                         (self._approval.get("action"), self._approval.get("destination"))), "approval")
@@ -2169,16 +2375,9 @@ class Bridge(QObject):
         if status == "structured":
             self._apply_run(payload.get("run"), intent, request=request or text)
             return
-        self._ticket, self._approval = None, {}
-        if status == "clarification_required" and isinstance(intent, dict):
-            choices = [c for c in (intent.get("choices") or []) if isinstance(c, dict)
-                       and isinstance(c.get("label"), str) and isinstance(c.get("destination"), str)]
-            self._clarification = {
-                "request_id": str(intent.get("request_id") or ""),
-                "previous_text": text,
-                "question": str(intent.get("question") or ""),
-                "choices": choices,
-            }
+        self._set_live(_project_text(self._live_slots(), payload, text))
+        if status == "clarification_required":
+            pass                                # the clarification card asks
         elif status == "scheduled":
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Scheduled job %1"), ((payload.get("job") or {}).get("label"),)), "scheduled")
             self._run("jobs", lambda: self.backend.jobs(False), self._set_jobs)
@@ -2189,8 +2388,6 @@ class Bridge(QObject):
                         (len((intent or {}).get("sources") or []),)), "system")
         else:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Intent %1"), (status,)), "error" if status != "scheduled" else "system")
-        self._task = task_status(None, intent) if status != "structured" else self._task
-        self._last_outcome = outcome_kind(None, status)
         self.approvalChanged.emit()
         self.dataChanged.emit()
 
@@ -2510,6 +2707,10 @@ class Bridge(QObject):
         if self._ticket is not None:
             self._tell("system", QT_TRANSLATE_NOOP("Bridge", "Answer the pending approval first (Approve, Deny or Cancel)."))
             return False
+        clarifying = self._task.get("status") == "awaiting_clarification" and self._session_id and self._task.get("task_id")
+        if clarifying and self._restored_unlinked():
+            self._refuse_unlinked()          # R2: before anything changes or is written; the draft stays
+            return False
         self._clarification, self._decision = {}, {}
         self.approvalChanged.emit()
         conversation = self._conversation_state()   # before this turn: what came earlier
@@ -2526,7 +2727,7 @@ class Bridge(QObject):
         session_id = self._session_id or None
         request_id = str(uuid4())
         self._request_id = request_id
-        if self._task.get("status") == "awaiting_clarification" and session_id and self._task.get("task_id"):
+        if clarifying:
             task_id = self._task["task_id"]
             self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._delivered(self._apply_run))
             return True
@@ -2545,7 +2746,8 @@ class Bridge(QObject):
                                              conversation=conversation, context_groups=groups,
                                              context_attachments=attachments, response_mode=mode,
                                              on_reply_preview=relay, conversation_id=owner, **route),
-            self._delivered(lambda payload: self._apply_text(payload, text), snapshots),
+            self._delivered(lambda payload: self._apply_text(payload, text), snapshots,
+                            project=lambda prior, payload: _project_text(prior, payload, text)),
         )
         return True
 
@@ -2556,6 +2758,9 @@ class Bridge(QObject):
         if self._busy or not clarification:
             return
         if not any(choice.get("label") == label for choice in clarification["choices"]):
+            return
+        if self._restored_unlinked():
+            self._refuse_unlinked()          # R2: a sessionless intent clarification stays allowed
             return
         previous = clarification["previous_text"]
         self._clarification = {}
@@ -2576,7 +2781,8 @@ class Bridge(QObject):
             lambda: self.backend.submit_text(label, session_id, previous_text=previous, request_id=request_id,
                                              response_language=language, conversation=conversation,
                                              on_reply_preview=relay, conversation_id=owner, **route),
-            self._delivered(lambda payload: self._apply_text(payload, label, request=previous)),
+            self._delivered(lambda payload: self._apply_text(payload, label, request=previous),
+                            project=lambda prior, payload: _project_text(prior, payload, label)),
         )
 
     @Slot()
@@ -2604,7 +2810,7 @@ class Bridge(QObject):
         ticket = self._ticket
         if ticket is None or self._busy or not self._approval.get("complete"):
             return False
-        if self._session_conversation(ticket.session_id) != self._conversation_store.id:
+        if not self._linked_here(ticket.session_id):
             return False            # R1: never a ticket of a conversation other than the open one
         if request_id is not None and (str(request_id), str(fingerprint)) != (ticket.request_id, ticket.fingerprint):
             return False
@@ -2616,8 +2822,10 @@ class Bridge(QObject):
                           "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
         call = self.backend.approve if verb == "approve" else self.backend.reject
-        self._run("task", lambda: call(ticket), self._delivered(lambda payload: self._apply_decision(payload, verb, ticket, shown)),
-                  executing=verb == "approve")
+        self._run("task", lambda: call(ticket), self._delivered(
+            lambda payload: self._apply_decision(payload, verb, ticket, shown),
+            project=lambda prior, payload: _kept_refusal(_project_run(prior, payload), payload, ticket, shown)),
+            executing=verb == "approve")
         return True
 
     def _apply_decision(self, payload: Any, verb: str, ticket: ApprovalTicket | None = None,
@@ -2642,10 +2850,11 @@ class Bridge(QObject):
                           "message": str(error.get("message") or "") if isinstance(error, dict) else "",
                           "ts": time.time()}
         self._apply_run(payload)
-        if code == "execution_disabled" and ticket is not None and self._ticket is None:
+        kept = _kept_refusal(self._live_slots(), payload, ticket, shown)
+        if kept["ticket"] is not self._ticket:
             # Core refused the decision before touching the request, which is
             # still pending exactly as it was: keep showing it.
-            self._ticket, self._approval = ticket, dict(shown or {})
+            self._ticket, self._approval = kept["ticket"], kept["approval"]
             self.approvalChanged.emit()
 
     @Slot()
@@ -2680,6 +2889,9 @@ class Bridge(QObject):
             task_id = (self.backend.active_task_id(session_id) if session_id else None) or record["task_id"]
         else:
             session_id = self._session_id
+            if self._restored_unlinked():
+                self._refuse_unlinked()      # R2: only this conversation's own task, before any call
+                return
             task_id = (self.backend.active_task_id(session_id) if self.openRunning and session_id
                        else self._task.get("task_id"))
         if not session_id or not task_id:
@@ -2709,7 +2921,7 @@ class Bridge(QObject):
         if self._runs_in(self._conversation_store.id):
             return
         self._session_id, self._task, self._ticket, self._approval, self._clarification = "", {}, None, {}, {}
-        self._decision = {}
+        self._decision, self._restored_session = {}, ""
         self._discard_snapshots()       # a new session keeps none of the old drafts' files
         self._last_outcome = "idle"
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New session: the next message starts a fresh session."), ()), "system")
@@ -2734,6 +2946,7 @@ class Bridge(QObject):
             return
         if owner is None or self.openConversation(owner):
             self._session_id, self._task, self._ticket, self._approval, self._decision = session_id, {}, None, {}, {}
+            self._clarification, self._restored_session = {}, ""   # R2 (OD6): no waiting slot outlives a session choice
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Using session %1."), (session_id,)), "system")
             self.approvalChanged.emit()
             self._refresh_core_state()
@@ -3659,11 +3872,59 @@ class Bridge(QObject):
         Freeze paused continues from its persisted stage, nothing else starts."""
         if not self._set_gate(True):
             return
-        paused = task_outcome(self._task).get("kind") == "paused"
-        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - continuing the paused task")
-                    if paused else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed"), ()), "system")
-        if paused and self._session_id:
-            self.resumeTask(self._session_id, self._task["task_id"])
+        # R2 (Q4): from ANY screen - the open screen's paused task first, else the ONE parked
+        # one (OD3); none while a run is busy (OD4: nothing is queued for later) or when the
+        # choice is not unique. "Continuing" is said only for a run that is started.
+        here = task_outcome(self._task).get("kind") == "paused"
+        parked = [cid for cid, slots in self._parked.items() if task_outcome(slots["task"]).get("kind") == "paused"]
+        start = None
+        if self._busy:
+            # The run in flight may itself be the paused task's continuation: that one is not "another".
+            running = self._run_record["origin"] if self._run_record is not None else None
+            waiting = (here and running != self._conversation_store.id) or any(cid != running for cid in parked)
+            source = (QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - the paused task was not continued: another run is in progress")
+                      if waiting else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed"))
+        elif not here and len(parked) > 1:
+            source = QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - more than one task is paused, so none was continued")
+        elif here or parked:
+            start = self._paused_continuation(self._conversation_store.id if here else parked[0], here)
+            source = (QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - continuing the paused task") if start
+                      else QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed - the paused task could not be continued"))
+        else:
+            source = QT_TRANSLATE_NOOP("Bridge", "JARVIS resumed")
+        self._note(("Bridge", source, ()), "system")
+        if start is not None:
+            start()
+
+    def _paused_continuation(self, conversation_id: str | None, here: bool) -> Callable[[], None] | None:
+        """The start of a paused task's continuation for its OWN conversation, or ``None`` when it
+        is not provably that conversation's (identity, existence, readability, archive, session
+        link - never relinked); then its carried state is dropped. A parked one continues without
+        opening its conversation or touching the open screen: a recorded run whose origin it is."""
+        slots = self._live_slots() if here else self._parked[conversation_id]
+        session_id, task_id = slots["session_id"], str(slots["task"].get("task_id") or "")
+        store = self._conversation_db()
+        origin: PersistedConversation | None = self._conversation_store if here else None
+        valid = bool(session_id and task_id)
+        if valid and store is not None:
+            if not here:
+                origin = self._load_conversation(store, conversation_id)
+            valid = origin is not None and self._parked_valid(store, conversation_id, slots)
+        if not valid or origin is None:
+            if here:
+                self._set_live(_empty_slots())
+                self.approvalChanged.emit()
+                self._refresh_core_state()
+            else:
+                self._parked.pop(conversation_id, None)
+                self._needs_you_check()
+            return None
+        if here:
+            return lambda: self._run("task", lambda: self.backend.resume(session_id, task_id),
+                                     self._delivered(self._apply_run), executing=True)
+        return lambda: self._run("task", lambda: self.backend.resume(session_id, task_id),
+                                 self._delivered(self._apply_run, origin=origin, identity=(session_id, task_id)),
+                                 executing=True)
 
     @Slot(bool)
     def setExecutionEnabled(self, enabled: bool) -> None:
