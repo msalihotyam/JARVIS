@@ -121,9 +121,12 @@ class CommandPresetTests(K6Case):
                    and i.property("compact") is True and quick.isAncestorOf(i)]
         self.assertEqual(4, len(buttons))
         self.assertTrue(all(b.property("enabled") for b in buttons))
-        bridge._telemetry_timer.stop()          # the machine's own readings would replace the fixed ones
-        bridge._telemetry = {"available": True, "cpu": 43, "ram": None, "disk": 89}
-        bridge.telemetryChanged.emit()
+        # The page reads only this fixed source: the live machine sampler (the 5 s timer, and the
+        # first-read single shot still pending under load) would otherwise replace the fixed readings.
+        bridge._telemetry_timer.stop()
+        reading = {"available": True, "cpu": 43, "ram": None, "disk": 89}
+        bridge._sampler = type("FixedSampler", (), {"sample": staticmethod(lambda: dict(reading))})()
+        bridge._sample_telemetry()
         settled(200, lambda: (
             self.assertTrue(self.item(root, "presetGauges").isVisible()),
             self.assertAlmostEqual(0.43, self.item(root, "presetGauge_cpu").property("share"), places=3),
@@ -136,8 +139,9 @@ class CommandPresetTests(K6Case):
             self.assertNotIn("0%", self.shown_texts(root)),
             self.assertFalse(self.item(root, "presetGaugesEmpty").isVisible()),
         ))
-        bridge._telemetry = {"available": False}
-        bridge.telemetryChanged.emit()
+        reading.clear()
+        reading["available"] = False
+        bridge._sample_telemetry()
         settled(200, lambda: (
             self.assertFalse(self.item(root, "presetGauges").isVisible()),
             self.assertTrue(self.item(root, "presetGaugesEmpty").isVisible()),
