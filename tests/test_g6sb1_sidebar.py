@@ -418,7 +418,8 @@ class HeaderTests(SidebarV2Case):
         settled(300, lambda: (
             self.assertTrue(self.item(root, "chatHeaderScope").isVisible()),
             self.assertEqual("Tez", self.item(root, "chatHeaderScopeName").property("text")),
-            self.assertGreater(self.item(root, "chatHeaderTitle").x(), self.rect(self.item(root, "chatHeaderScope")).width()),
+            # Gate 6G F9 H2: the project's line sits ABOVE the title (was: beside it, title to its right).
+            self.assertGreaterEqual(self.rect(self.item(root, "chatHeaderTitle")).top(), self.rect(self.item(root, "chatHeaderScope")).bottom()),
         ))
         self.assertEqual(0, self.execute_calls())
 

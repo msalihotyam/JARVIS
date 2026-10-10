@@ -130,10 +130,12 @@ class CountTests(WindowCase):
 
     def attach_identity_is(self, root, prefix: str) -> None:
         pump(200)                                       # the previous dialog's exit motion ends first
-        self.steady(root, "chatHeaderAttach")
-        self.click(root, "chatHeaderAttach")
+        self.steady(root, "chatHeaderMenu")                # Gate 6G F9 H1: the menu's "Projeye bağla…"
+        self.click(root, "chatHeaderMenu")
         pump(300)
-        item = [i for i in self.all_items(root, "attachProject") if i.property("label") == "Evim"][0]
+        self.click(root, "conversationAttachItem")
+        pump(300)
+        item =[i for i in self.all_items(root, "attachProject") if i.property("label") == "Evim"][0]
         self.press(root, item)
         identity = self.item(root, "attachIdentity").property("text")
         self.assertTrue(identity.startswith(prefix), identity)
@@ -684,7 +686,10 @@ class ScopeLayoutTests(ScopeGroupCase):
                             self.assertEqual({"en-US": "ARCHIVED", "tr-TR": "ARŞİV"}[language], badge.property("text"))
                             self.assertEqual(name.property("text") + suffix, self.item(root, "chatHeaderScopeTip").property("text"))
                         elif key != "global":                                        # V7: a no-project chat has no chip tip
-                            self.assertEqual(name.property("text"), self.item(root, "chatHeaderScopeTip").property("text"))
+                            # Gate 6G F9 H2: a whole name's tip says where the link leads; a cut one has the name.
+                            whole = {"en-US": "Open the project page", "tr-TR": "Proje sayfasını aç"}[language]
+                            self.assertEqual(name.property("text") if name.property("truncated") else whole,
+                                             self.item(root, "chatHeaderScopeTip").property("text"))
                         for row, _ in rows:                                          # the row's tip has its name whole
                             tip = [c for c in row.childItems() if c.objectName() == "sidebarRowTip"][0]
                             self.assertEqual(bridge.conversationTitle, tip.property("text"))
@@ -878,8 +883,10 @@ class DialogAdoptionCase(ScopeGroupCase):
     def open_attach(self, bridge, root):
         bridge.setPage("home")
         pump(300)
-        self.steady(root, "chatHeaderAttach")
-        self.click(root, "chatHeaderAttach")
+        self.steady(root, "chatHeaderMenu")                # Gate 6G F9 H1: the menu's "Projeye bağla…"
+        self.click(root, "chatHeaderMenu")
+        pump(300)
+        self.click(root, "conversationAttachItem")
         pump(100)
         return attach_dialog(root)
 
@@ -1030,7 +1037,7 @@ class DialogKeyboardTests(DialogAdoptionCase):
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)       # still Global
         self.assertEqual([], [p for p in store.list_projects() if p.name == "Mutfak"])
         self.close(dialog)
-        self.assertTrue(self.item(root, "chatHeaderAttach").hasActiveFocus())          # back to its opener
+        self.assertTrue(self.item(root, "chatHeaderMenu").hasActiveFocus())            # back to its opener (F9: the menu's "…")
         self.assertEqual(0, self.execute_calls())
 
 

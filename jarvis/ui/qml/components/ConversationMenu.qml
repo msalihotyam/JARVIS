@@ -17,6 +17,11 @@ import "../theme"
 // It holds the scope menus' shared parts (a row, a reason, a divider), which
 // the Command preset's scope menu uses too. K4: both are a MenuSurface with
 // MenuRow rows, the window's one menu style; only the clicked opener shows open.
+// Gate 6G F9 (H1, H3): "Projeye bağla…" lives here only - Global
+// conversations only, the window's one attach dialog (6C: one-way, preview,
+// explicit confirm, the store's guards). A row's item opens that row's
+// conversation first: the dialog previews and attaches the open one. Order:
+// pin, rename, attach | archive | delete permanently last, in danger.
 Item {
     id: menu
     objectName: "conversationMenu"
@@ -44,6 +49,8 @@ Item {
     property var rowOwnerGlobal: undefined
     // The item the menu was opened from (a row's "⋯" shows while its menu is open).
     property Item opener: null
+    // The window's attach dialog (6C), handed over by the chat header (H1).
+    property QtObject attachDialog: null           // a guarded object property: null once the dialog is gone
     readonly property string targetId: rowId || bridge.conversationId
     readonly property string shown: (rowId ? rowTitle : bridge.conversationTitle) || qsTr("New Chat")
     readonly property bool archived: !rowId && bridge.conversationArchived
@@ -68,6 +75,11 @@ Item {
     readonly property string deleteReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : bridge.busy ? qsTr("Wait for the current run to finish.")
         : !deleteAllowed ? qsTr("Archive it first") : ""
+    // Attaching (6C, F9 H1): a Global conversation only, never an archived one.
+    readonly property bool attachShown: ownerGlobal && !archived
+    readonly property bool attachAllowed: targetId !== "" && !bridge.busy && !!attachDialog && (rowId !== "" || bridge.canAttach)
+    readonly property string attachReason: targetId === "" ? qsTr("This conversation is not saved yet.")
+        : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
     // Pinning (F6): the target's place in SABİTLENDİ (-1 = not pinned).
     readonly property int pinIndex: { var pins = bridge.pinnedConversations
                                       for (var i = 0; i < pins.length; ++i) if (pins[i].id === targetId) return i
@@ -132,11 +144,19 @@ Item {
                                          menu.editOn = bridge.conversationId; context.close()
                                          bridge.clearRenameNotice(); editor.popupAt(menu.editAt[0], menu.editAt[1], { opener: menu.opener }) } }
             Reason { width: parent.width; objectName: "conversationRenameReason"; visible: !menu.renameAllowed; text: menu.renameReason }
+            ScopeChoice { objectName: "conversationAttachItem"; icon: "folder"; visible: menu.attachShown
+                          label: qsTr("Attach to a project…"); available: menu.attachAllowed
+                          onTriggered: { var id = menu.targetId, back = menu.opener; context.close()
+                                         if (bridge.openConversation(id) && bridge.canAttach) {
+                                             menu.attachDialog.opener = back; menu.attachDialog.openDialog() } } }
+            Reason { width: parent.width; objectName: "conversationAttachReason"; visible: menu.attachShown && !menu.attachAllowed && text !== ""
+                     text: menu.attachReason }
+            Divider { width: parent.width; objectName: "conversationMenuDivider" }
             ScopeChoice { objectName: "conversationArchiveItem"; icon: "archive"
                           label: qsTr("Archive"); available: menu.archiveAllowed
                           onTriggered: { var id = menu.targetId; if (bridge.archiveConversation(id)) context.close() } }
             Reason { width: parent.width; objectName: "conversationArchiveReason"; visible: !menu.archiveAllowed; text: menu.archiveReason }
-            Divider { width: parent.width }
+            Divider { width: parent.width; objectName: "conversationMenuDivider" }
             ScopeChoice { objectName: "conversationDeleteItem"; icon: "trash"; destructive: true
                           label: qsTr("Delete permanently…"); available: menu.deleteAllowed
                           onTriggered: { var id = menu.targetId; context.close(); deleteDialog.opener = menu.opener; deleteDialog.openFor(id) } }

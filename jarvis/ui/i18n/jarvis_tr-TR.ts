@@ -851,12 +851,12 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>ARŞİV</translation>
     </message>
     <message>
-        <source>New Chat</source>
-        <translation>Yeni Sohbet</translation>
+        <source>Open the project page</source>
+        <translation>Proje sayfasını aç</translation>
     </message>
     <message>
-        <source>Attach to a project…</source>
-        <translation>Projeye bağla…</translation>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
     </message>
     <message>
         <source>Conversation actions</source>
@@ -1412,6 +1412,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Rename</source>
         <translation>Yeniden adlandır</translation>
+    </message>
+    <message>
+        <source>Attach to a project…</source>
+        <translation>Projeye bağla…</translation>
     </message>
     <message>
         <source>Archive</source>

@@ -331,9 +331,17 @@ class MovedArchivedConversationTests(IntentTestCase):
 
 class AttachWindowTests(ProjectsUiCase):
     def open_dialog(self, root) -> None:
-        self.steady(root, "chatHeaderAttach")
-        self.click(root, "chatHeaderAttach")
+        # Gate 6G F9 H1: the entry is the conversation menu's "Projeye bağla…" (header "…").
+        self.steady(root, "chatHeaderMenu")
+        self.click(root, "chatHeaderMenu")
         pump(300)
+        self.click(root, "conversationAttachItem")
+        pump(300)
+
+    def offered(self, root) -> bool:
+        """F9 H1: the open conversation's menu offers "Projeye bağla…", enabled."""
+        menu = self.item(root, "conversationMenu")
+        return bool(menu.property("attachShown") and menu.property("attachAllowed"))
 
     def choose(self, root, name: str) -> None:
         item = [i for i in self.all_items(root, "attachProject") if i.property("label") == name][0]
@@ -353,11 +361,11 @@ class AttachWindowTests(ProjectsUiCase):
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertTrue(bridge.canAttach)
-        self.assertTrue(self.item(root, "chatHeaderAttach").isVisible())             # Global only (L3)
+        self.assertTrue(self.offered(root))                                         # Global only (L3; F9: the menu)
         bridge.openConversation(owned.id)
         settled(200, lambda: (
             self.assertFalse(bridge.canAttach),
-            self.assertFalse(self.item(root, "chatHeaderAttach").isVisible()),
+            self.assertFalse(self.offered(root)),
         ))
         bridge.openProjectScope("")
         pump(200)
@@ -368,14 +376,14 @@ class AttachWindowTests(ProjectsUiCase):
         self.assertNotEqual(archived, bridge.conversationId)
         settled(100, lambda: (
             self.assertTrue(bridge.canAttach),
-            self.assertTrue(self.item(root, "chatHeaderAttach").isVisible()),
+            self.assertTrue(self.offered(root)),
         ))
         # The archived one, opened read-only, cannot attach.
         self.assertTrue(bridge.openConversation(archived))
         self.assertEqual((archived, True), (bridge.conversationId, bridge.conversationReadOnly))
         settled(200, lambda: (
             self.assertFalse(bridge.canAttach),
-            self.assertFalse(self.item(root, "chatHeaderAttach").isVisible()),
+            self.assertFalse(self.offered(root)),
         ))
 
     def test_e_preview_changed_refresh_and_confirm(self) -> None:
@@ -491,7 +499,7 @@ class AttachCatalogTests(UiTestCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Projeye bağla", tx("AttachDialog", "Attach to project"))
-        self.assertEqual("Projeye bağla…", tx("ChatHeader", "Attach to a project…"))
+        self.assertEqual("Projeye bağla…", tx("ConversationMenu", "Attach to a project…"))   # Gate 6G F9 H1: the menu's entry
 
 
 class PreviewResultTests(StoreCase):

@@ -4,12 +4,15 @@ import QtQuick.Controls.Basic
 import "../theme"
 
 // Gate 6F (L3): the chat header row above the conversation. Left: the scope
-// chip (globe or folder + the owner's name; ARŞİV when archived) > the open
-// conversation's title ("Yeni Sohbet" when it has none). Right: "Projeye
-// bağla" - only for a writable Global conversation, the same attach dialog
-// and rules (6C) - and "…", the ONE conversation menu (ConversationMenu.qml)
-// on the open conversation: the same actions, reasons and dialogs. Names
-// elide at the end with their tip. It selects, grants and approves nothing.
+// (folder + the owner's name; ARŞİV when archived) and the open
+// conversation's title ("Yeni Sohbet" when it has none). Right: "…", the ONE
+// conversation menu (ConversationMenu.qml) on the open conversation: the same
+// actions, reasons and dialogs. Names elide at the end with their tip. It
+// selects, grants and approves nothing.
+// Gate 6G F9: H1 "Projeye bağla" left the header - it is a ConversationMenu
+// item now (Global only, the same dialog and 6C rules); the header hands the
+// window's attach dialog to that menu. H2 the project's name is a faint line
+// ABOVE the title and a link to that project's page (bridge.showProject).
 // In the Command preset (Q2) the chip is a button: it opens the scope menu
 // (projects, Genel, the two actions, then the scope's conversations) - the
 // TopBar's former selector and switcher menus, moved.
@@ -26,6 +29,8 @@ Item {
     readonly property bool archived: !!owner.archived
     readonly property color tint: archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
     readonly property bool scoped: !owner.global || scopeMenu
+    // F9 H2: outside the Command preset the scope is a faint link line above the title.
+    readonly property bool link: !scopeMenu
     height: big ? 52 : 44
 
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: Theme.alpha(Theme.glassEdge, 0.25) }
@@ -43,7 +48,10 @@ Item {
     Text { id: titleSeven; visible: false; font: title.font; textFormat: Text.PlainText; text: title.text.slice(0, 7) + "…" }
     readonly property real nameFloor: Math.min(scopeName.implicitWidth, Math.ceil(nameSeven.implicitWidth) + 1)
     readonly property real titleFloor: Math.min(title.implicitWidth, Math.ceil(titleSeven.implicitWidth) + 1)
-    readonly property real chipMax: actions.x - 12 - titleFloor - 26
+    readonly property real chipMax: link ? actions.x - 12 : actions.x - 12 - titleFloor - 26
+    // F9 H1: the menu's "Projeye bağla" opens the window's one attach dialog.
+    // Set once, never a Binding: a Binding's restore on teardown writes into the shared menu.
+    Component.onCompleted: if (conversationMenu && attachDialog) conversationMenu.attachDialog = attachDialog
 
     // -- the scope chip -------------------------------------------------------
     Rectangle {
@@ -51,47 +59,61 @@ Item {
         objectName: "chatHeaderScope"
         visible: header.scoped
         readonly property string fullName: (header.owner.name || "") + (header.archived ? " · " + qsTr("archived") : "")
-        readonly property bool pillFits: !header.archived || 34 + archivedPill.width + 6 + header.nameFloor + 12 <= header.chipMax
-        readonly property real lead: 10 + 18 + 6 + (header.archived ? (pillFits ? archivedPill.width + 6 : 12) : 0)
-        readonly property real natural: lead + scopeName.implicitWidth + 12
-        x: 0; anchors.verticalCenter: parent.verticalCenter
-        width: Math.min(natural, Math.max(Math.round(header.width * 0.32), lead + header.nameFloor + 12))
-        height: Theme.pillHeight; radius: height / 2
-        color: Theme.alpha(header.tint, header.scopeMenu && (chipArea.containsMouse || scopeList.visible) ? 0.16 : 0.08)
+        readonly property real pad: header.link ? 0 : 10
+        readonly property real iconSize: header.link ? 14 : 18
+        readonly property real iconEnd: pad + iconSize + 6
+        readonly property bool pillFits: !header.archived || iconEnd + archivedPill.width + 6 + header.nameFloor + 12 <= header.chipMax
+        readonly property real lead: iconEnd + (header.archived ? (pillFits ? archivedPill.width + 6 : 12) : 0)
+        readonly property real natural: lead + scopeName.implicitWidth + pad
+        x: 0
+        // H2: the link tops the name + title block; the preset's chip is centred in the row.
+        y: header.link ? Math.max(0, Math.round((header.height - height - 2 - title.height) / 2))
+                       : Math.round((header.height - height) / 2)
+        width: header.link ? Math.min(natural, Math.max(0, header.chipMax))
+                           : Math.min(natural, Math.max(Math.round(header.width * 0.32), lead + header.nameFloor + 12))
+        height: header.link ? scopeName.implicitHeight : Theme.pillHeight
+        radius: header.link ? 0 : height / 2
+        color: header.link ? "transparent" : Theme.alpha(header.tint, header.scopeMenu && (chipArea.containsMouse || scopeList.visible) ? 0.16 : 0.08)
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-        border.width: 1; border.color: Theme.alpha(header.tint, 0.4)
+        border.width: header.link ? 0 : 1; border.color: Theme.alpha(header.tint, 0.4)
         activeFocusOnTab: header.scopeMenu
-        Accessible.role: header.scopeMenu ? Accessible.ButtonMenu : Accessible.StaticText
+        Accessible.role: header.scopeMenu ? Accessible.ButtonMenu : Accessible.Link
         Accessible.name: fullName
-        Accessible.onPressAction: if (header.scopeMenu) header.toggleScope()
+        Accessible.onPressAction: header.pickScope()
         Keys.onPressed: function (event) {
             if (header.scopeMenu && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space || event.key === Qt.Key_Down)) {
                 event.accepted = true; header.toggleScope()
             }
         }
-        SummaryIcon { x: 10; anchors.verticalCenter: parent.verticalCenter; icon: header.owner.global ? "global" : "project"; tint: header.tint }
+        SummaryIcon { x: chip.pad; anchors.verticalCenter: parent.verticalCenter; icon: header.owner.global ? "global" : "project"
+                      size: chip.iconSize; tint: header.link ? scopeName.color : header.tint }
         Pill { id: archivedPill; objectName: "chatHeaderScopeArchived"; visible: header.archived && chip.pillFits; dot: false; implicitHeight: 18
-               x: 34; anchors.verticalCenter: parent.verticalCenter; text: qsTr("ARCHIVED"); tint: Theme.warning }
-        Rectangle { visible: header.archived && !chip.pillFits; x: 34; anchors.verticalCenter: parent.verticalCenter
+               x: chip.iconEnd; anchors.verticalCenter: parent.verticalCenter; text: qsTr("ARCHIVED"); tint: Theme.warning }
+        Rectangle { visible: header.archived && !chip.pillFits; x: chip.iconEnd; anchors.verticalCenter: parent.verticalCenter
                     width: 6; height: 6; radius: 3; color: Theme.warning }
         Text {
             id: scopeName
             objectName: "chatHeaderScopeName"
             x: chip.lead; anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, Math.min(implicitWidth, chip.width - x - 12))
+            width: Math.max(0, Math.min(implicitWidth, chip.width - x - (header.link ? 0 : 12)))
             text: header.owner.name || ""; textFormat: Text.PlainText; elide: Text.ElideRight
-            color: header.archived ? Theme.textLabel : Theme.text; font: Theme.captionStrong
+            // H2: the link reads secondary (faint) and lights on hover; the preset's chip as before.
+            color: header.link ? (chipArea.containsMouse ? Theme.accent : Theme.textMuted)
+                               : header.archived ? Theme.textLabel : Theme.text
+            font: header.link ? Theme.caption : Theme.captionStrong
         }
         Rectangle { visible: chip.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: chip.radius + 3
                     color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
-        MouseArea { id: chipArea; anchors.fill: parent; enabled: header.scopeMenu; hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor; onClicked: header.toggleScope() }
-        HoverTip { objectName: "chatHeaderScopeTip"; text: chip.fullName; active: scopeName.truncated || header.archived }
+        MouseArea { id: chipArea; objectName: "chatHeaderScopeLink"; anchors.fill: parent; enabled: header.scoped; hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor; onClicked: header.pickScope() }
+        // The whole name when it is cut (or archived); else, on the link, where it leads.
+        HoverTip { objectName: "chatHeaderScopeTip"; active: header.link || scopeName.truncated || header.archived
+                   text: header.link && !scopeName.truncated && !header.archived ? qsTr("Open the project page") : chip.fullName }
     }
     // The separator: a drawn chevron (no font glyph).
     Shape {
         id: separator
-        visible: header.scoped
+        visible: header.scoped && !header.link
         x: chip.width + 10; anchors.verticalCenter: parent.verticalCenter
         width: 6; height: 10
         preferredRendererType: Shape.CurveRenderer
@@ -102,7 +124,8 @@ Item {
     Text {
         id: title
         objectName: "chatHeaderTitle"
-        x: header.scoped ? separator.x + separator.width + 10 : 0; anchors.verticalCenter: parent.verticalCenter
+        x: separator.visible ? separator.x + separator.width + 10 : 0
+        y: header.link && header.scoped ? chip.y + chip.height + 2 : Math.round((header.height - height) / 2)
         width: Math.max(0, Math.min(implicitWidth, actions.x - 12 - x))
         text: bridge.conversationTitle || qsTr("New Chat"); textFormat: Text.PlainText; elide: Text.ElideRight
         color: bridge.conversationTitle ? Theme.text : Theme.textLabel; font: Theme.subtitle
@@ -114,15 +137,6 @@ Item {
         id: actions
         anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
         spacing: 8
-        ActionButton {
-            id: attachButton
-            objectName: "chatHeaderAttach"
-            visible: bridge.canAttach
-            anchors.verticalCenter: parent.verticalCenter
-            height: 32; compact: true
-            label: qsTr("Attach to a project…")
-            onClicked: if (header.attachDialog) { header.attachDialog.opener = attachButton; header.attachDialog.openDialog() }
-        }
         Rectangle {
             id: menuButton
             objectName: "chatHeaderMenu"
@@ -165,6 +179,12 @@ Item {
         if (menuButton.open) { conversationMenu.dismiss(); return }
         conversationMenu.openFor("", "", menuButton, Qt.point(menuButton.width - 300, menuButton.height + 6),
                                  title, Qt.point(0, title.height + 10), undefined, undefined, menuButton)
+    }
+
+    // H2: the link opens its project's page ("Genel" has no line here); the preset's chip its menu.
+    function pickScope() {
+        if (scopeMenu) toggleScope()
+        else if (!owner.global && owner.id) bridge.showProject(owner.id)
     }
 
     // -- the Command preset's scope menu (Q2) -------------------------------------
