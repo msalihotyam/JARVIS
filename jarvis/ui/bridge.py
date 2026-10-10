@@ -372,6 +372,7 @@ class Bridge(QObject):
         # ({} = Global). Context only: nothing here is authority.
         self._conversation_owner: dict[str, Any] = {}
         self._scope_facts: dict[str, Any] = {}                       # the sidebar's Focus / Memory tiles; presentation only
+        self._work_panel: dict[str, Any] = {}                        # G6W3: the project chat's work panel; presentation only
         # The Projects page: every project (names shown, ids internal), the
         # one whose detail is open, its conversations and its jobs, and the
         # last answer Core gave to a lifecycle request (shown as returned).
@@ -767,6 +768,7 @@ class Bridge(QObject):
             ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
         self._conversation_owner = self._owner_of(store, open_id)
         self._scope_facts = self._read_scope_facts(store, self._conversation_owner.get("id") or None)
+        self._work_panel = self._read_work_panel(store, self._conversation_owner.get("id") or "")
         scope_owner = self._conversation_owner.get("id") or None
         scope = [r for r in everything if r.project_id == scope_owner and r.archived_at is None]
         self._scope_conversations = [
@@ -1026,6 +1028,59 @@ class Bridge(QObject):
     def conversationArchived(self) -> bool:
         """The open conversation itself is archived (read-only until unarchived)."""
         return self._conversation_archived
+
+    # -- G6W3: the work panel of a PROJECT chat (W1/W3), read only -------------
+    #
+    # What this chat works with, as stored: the owner project's current
+    # instruction, its active files, its linked folder's NAME (never the path;
+    # the path stays in the project page's Klasör dialog) and the capabilities
+    # of the task results this conversation recorded. {} for a plain chat (W1:
+    # no panel there). Nothing here reaches a model payload.
+
+    workPanelChanged = Signal()
+
+    def _read_work_panel(self, store: Any, project_id: str) -> dict[str, Any]:
+        if store is None or not project_id:
+            return {}
+        panel: dict[str, Any] = {"instruction": "", "instruction_chars": 0, "files": [], "folder": ""}
+        try:
+            current = store.load_project_instruction(project_id)
+            text = current.text if current is not None else ""
+            if text.strip():
+                panel["instruction"], panel["instruction_chars"] = " ".join(text.split())[:300], len(text)
+            panel["files"] = [str(f["display_name"]) for f in store.list_project_files(project_id)
+                              if f.get("lifecycle") == project_files.ACTIVE]
+            link = self._folder_result("show", project_id).get("folder")
+            panel["folder"] = Path(link["path"]).name if link else ""
+        except Exception:  # noqa: BLE001 - a label only: what was read stays
+            pass
+        return panel
+
+    @Property("QVariantMap", notify=conversationChanged)
+    def workPanel(self) -> dict:
+        """{} in a plain chat; in a project chat: instruction (a short preview,
+        "" = none), instruction_chars, files (active names), folder (the linked
+        folder's name only, "" = none)."""
+        return dict(self._work_panel)
+
+    @Property("QVariantList", notify=feedChanged)
+    def workPanelCapabilities(self) -> list:
+        """The capabilities of the task results the open conversation recorded
+        (raw turns and compacted digests), first use first. Read with the feed
+        (a switch restores it before the owner is known), so the panel, never
+        shown in a plain chat, is what decides whether it is seen."""
+        state = self._conversation_store.state
+        seen = [c.capability for c in state.compacted] + [t.capability for t in state.turns]
+        return list(dict.fromkeys(c for c in seen if c))
+
+    @Property(bool, notify=workPanelChanged)
+    def workPanelCollapsed(self) -> bool:
+        return self.prefs.work_panel_collapsed
+
+    @Slot(bool)
+    def setWorkPanelCollapsed(self, collapsed: bool) -> None:
+        if self.prefs.set_work_panel_collapsed(bool(collapsed)):
+            self.workPanelChanged.emit()
 
     @Property("QVariantList", notify=projectsChanged)
     def projectRecords(self) -> list:

@@ -724,3 +724,36 @@ class UiPreferences:
         except OSError:
             pass
         return True
+
+    # -- G6W3: the project chat's work panel, collapsed or not -------------------
+    #
+    # A fifth sibling file (``<prefs>.work-panel.json``) for the same rollback
+    # reason; a bad file reads as open (the default).
+
+    @property
+    def work_panel_path(self) -> Path:
+        return self.path.with_suffix(".work-panel.json")
+
+    @property
+    def work_panel_collapsed(self) -> bool:
+        if not hasattr(self, "_work_panel"):
+            try:
+                raw = json.loads(self.work_panel_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw = None
+            valid = isinstance(raw, dict) and set(raw) == {"version", "collapsed"} and raw["version"] == 1 \
+                and type(raw["collapsed"]) is bool
+            self._work_panel = raw["collapsed"] if valid else False
+        return self._work_panel
+
+    def set_work_panel_collapsed(self, collapsed: bool) -> bool:
+        """Keep the state when different; then save."""
+        if self.work_panel_collapsed == bool(collapsed):
+            return False
+        self._work_panel = bool(collapsed)
+        try:
+            self.work_panel_path.parent.mkdir(parents=True, exist_ok=True)
+            self.work_panel_path.write_text(json.dumps({"version": 1, "collapsed": self._work_panel}), encoding="utf-8")
+        except OSError:
+            pass
+        return True

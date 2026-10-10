@@ -82,7 +82,8 @@ Item {
     Item {
         id: flowArea
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: attention.top
-                  topMargin: Math.max(page.fade, chatHeader.y + chatHeader.height + 8); leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
+                  topMargin: Math.max(page.fade, chatHeader.y + chatHeader.height + 8); leftMargin: page.inset + (page.roomy ? 12 : 4)
+                  rightMargin: page.inset + (page.roomy ? 4 : 0) + (workPanel.visible ? workPanel.width + 12 : 0); bottomMargin: 10 }
         FeedView {
             id: conversation
             objectName: "conversationFeed"
@@ -117,6 +118,15 @@ Item {
                    font: Theme.greetingSupport(welcome.tier)
                    lineHeightMode: Text.FixedHeight; lineHeight: Theme.greetingSupportLine(welcome.tier) }
         }
+    }
+    // G6W3 (W1): the work panel, beside the stream - in a PROJECT chat only,
+    // never in a plain one.
+    WorkPanel {
+        id: workPanel
+        visible: !bridge.conversationProject.global
+        openWidth: Math.round(Math.min(260, page.width * 0.3))
+        x: page.width - width - page.inset; y: flowArea.y
+        maxHeight: Math.max(40, attention.y - y - 10)
     }
     // The one attention strip, immediately above the choices and the composer.
     AttentionStrip {

@@ -5137,4 +5137,39 @@ DOĞRULANMADI</translation>
         <translation>Tanınmayan (%1)</translation>
     </message>
 </context>
+<context>
+    <name>WorkPanel</name>
+    <message>
+        <source>Show what this chat works with</source>
+        <translation>Bu sohbetin neyle çalıştığını göster</translation>
+    </message>
+    <message>
+        <source>Hide this panel</source>
+        <translation>Bu paneli gizle</translation>
+    </message>
+    <message>
+        <source>IN THIS CHAT</source>
+        <translation>BU SOHBETTE</translation>
+    </message>
+    <message>
+        <source>Project instruction</source>
+        <translation>Proje talimatı</translation>
+    </message>
+    <message>
+        <source>Project files</source>
+        <translation>Proje dosyaları</translation>
+    </message>
+    <message>
+        <source>Linked folder</source>
+        <translation>Bağlı klasör</translation>
+    </message>
+    <message>
+        <source>Used in this chat</source>
+        <translation>Bu sohbette kullanılan</translation>
+    </message>
+    <message>
+        <source>This project has no instruction, active files or linked folder yet, and this chat has used no capability.</source>
+        <translation>Bu projenin henüz talimatı, etkin dosyası veya bağlı klasörü yok; bu sohbet de henüz bir yetkinlik kullanmadı.</translation>
+    </message>
+</context>
 </TS>
