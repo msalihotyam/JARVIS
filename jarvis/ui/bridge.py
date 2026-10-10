@@ -63,6 +63,7 @@ from jarvis.ui.preferences import (
     PROFILES,
     THEMES,
     UiPreferences,
+    FREEZE_KEYS,
     STATUS_INDICATORS,
     validate_preferences,
 )
@@ -3514,6 +3515,18 @@ class Bridge(QObject):
     def setStatusIndicator(self, skin: str) -> None:
         if skin in STATUS_INDICATORS:
             self.prefs.data["status_indicator"] = skin
+            self.prefs.save()
+            self.prefsChanged.emit()
+
+    @Property(int, notify=prefsChanged)
+    def freezeKeySkin(self) -> int:
+        """Skin of the Freeze control (1-4). Presentation only; never authority."""
+        return self.prefs.data["freeze_key"]
+
+    @Slot(int)
+    def setFreezeKeySkin(self, skin: int) -> None:
+        if skin in FREEZE_KEYS:
+            self.prefs.data["freeze_key"] = skin
             self.prefs.save()
             self.prefsChanged.emit()
 

@@ -73,6 +73,13 @@ ContextPanel {
                 Text { text: qsTr("Status indicator"); width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font: Theme.body }
                 Segmented { accent: Theme.materialBlue; objectName: "statusIndicatorChoice"; value: bridge.statusIndicator; options: [{value:"orb",label:qsTr("Canonical Orb")},{value:"hud",label:qsTr("HUD Orb")}]; onPicked: function(v) { bridge.setStatusIndicator(v) } }
             }
+            // Four skins do not fit beside the 190 px label: the choice sits under it.
+            Column { width: parent.width; spacing: 8
+                Text { text: qsTr("Freeze key"); color: Theme.textLabel; font: Theme.body }
+                Segmented { accent: Theme.materialBlue; objectName: "freezeKeyChoice"; segmentPrefix: "freezeKey_"; value: String(bridge.freezeKeySkin)
+                    options: [{value:"1",label:qsTr("Classic")},{value:"2",label:qsTr("Key")},{value:"3",label:qsTr("Toggle")},{value:"4",label:qsTr("Knife switch")}]
+                    onPicked: function(v) { bridge.setFreezeKeySkin(Number(v)) } }
+            }
             Rectangle { width: parent.width; height: 1; color: Theme.border }
             Label { text: qsTr("THIS PACKAGE’S LAYOUT") }
             Segmented { accent: Theme.materialBlue; value: bridge.profile; options: [{value:"normal",label:qsTr("Normal")},{value:"focus",label:qsTr("Focus")},{value:"monitoring",label:qsTr("Monitoring")}]; onPicked: function(v) { bridge.setProfile(v) } }

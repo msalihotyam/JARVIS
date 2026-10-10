@@ -49,6 +49,9 @@ EXCEPTIONS = (
      "the live activity dots: a rhythm only while work really runs, not a transition"),
     ("components/FeedView.qml", 420,
      "the live activity dots: a rhythm only while work really runs, not a transition"),
+    ("components/FreezeKeySwitch.qml", None,
+     "the freeze switch lever (6G S2, Salih 2026-10-06): a toggle snaps (~80 ms + tiny settle), "
+     "a knife switch swings slower and weighted; each move follows a real execution-state change"),
 )
 # Loops allowed to run forever, each a rhythm of a real state or the ambient atmosphere.
 INFINITE = {

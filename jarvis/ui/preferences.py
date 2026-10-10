@@ -30,6 +30,9 @@ PREFERENCES_VERSION = 5
 THEMES = ("space", "dark", "command")
 #: Execution-status lamp skins: the canonical glass orb and the HUD variant.
 STATUS_INDICATORS = ("orb", "hud")
+#: Freeze control skins (Gate 6G S2): 1 classic key, 2 redesigned key,
+#: 3 chrome toggle, 4 knife switch. Presentation only.
+FREEZE_KEYS = (1, 2, 3, 4)
 PROFILES = ("normal", "focus", "monitoring")
 PAGES = ("home", "tasks", "automations", "memory", "history")
 #: Pages earlier documents may name that no longer exist (Settings became a
@@ -137,6 +140,7 @@ def canonical_preferences() -> dict[str, Any]:
         "theme": "space",
         "ambient_effects": True,
         "status_indicator": "orb",
+        "freeze_key": 1,
         "profile": "normal",
         "page": "home",
         # An application preference, not layout: Reset layout never touches it.
@@ -213,11 +217,11 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     defaults = canonical_preferences()
     # Preserve only a complete, valid v1 document. Validation below still
     # rejects malformed old fields; migration never writes product config.
-    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator", "language", "chat"} == set(defaults) - {"packages", "status_indicator", "rail", "language", "chat"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 1 and set(candidate) - {"status_indicator", "language", "chat", "freeze_key"} == set(defaults) - {"packages", "status_indicator", "rail", "language", "chat", "freeze_key"}:
         candidate = {**candidate, "version": 3, "packages": defaults["packages"]}
     # Version 2 -> 3: the conversation-first grid replaced every layout; the
     # person's other choices are kept.
-    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) - {"language", "chat"} == set(defaults) - {"rail", "language", "chat"}:
+    if isinstance(candidate, dict) and candidate.get("version") == 2 and set(candidate) - {"language", "chat", "freeze_key"} == set(defaults) - {"rail", "language", "chat", "freeze_key"}:
         kept = {key: candidate[key] for key in ("theme", "ambient_effects", "status_indicator", "page")}
         candidate = {**defaults, **kept, "version": 3}
         candidate.pop("rail")
@@ -241,6 +245,9 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     if (isinstance(candidate, dict) and isinstance(candidate.get("chat"), dict)
             and not {"claude_lane", "claude_lane_model"} & set(candidate["chat"])):
         candidate = {**candidate, "chat": {**candidate["chat"], "claude_lane": "", "claude_lane_model": ""}}
+    # A document from before freeze-key skins keeps every choice and the classic key.
+    if isinstance(candidate, dict) and "version" in candidate and "freeze_key" not in candidate:
+        candidate = {**candidate, "freeze_key": defaults["freeze_key"]}
     # A complete document from before the status lamp existed keeps every
     # choice and gains the default lamp.
     if isinstance(candidate, dict) and set(candidate) == set(defaults) - {"status_indicator"}:
@@ -252,6 +259,8 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     if candidate["theme"] not in THEMES or type(candidate["ambient_effects"]) is not bool:
         return defaults
     if candidate["status_indicator"] not in STATUS_INDICATORS:
+        return defaults
+    if type(candidate["freeze_key"]) is not int or candidate["freeze_key"] not in FREEZE_KEYS:
         return defaults
     if candidate["page"] in _RETIRED_PAGES:
         candidate = {**candidate, "page": _RETIRED_PAGES[candidate["page"]]}
@@ -293,6 +302,7 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
         "theme": candidate["theme"],
         "ambient_effects": candidate["ambient_effects"],
         "status_indicator": candidate["status_indicator"],
+        "freeze_key": candidate["freeze_key"],
         "profile": candidate["profile"],
         "page": candidate["page"],
         "language": candidate["language"],

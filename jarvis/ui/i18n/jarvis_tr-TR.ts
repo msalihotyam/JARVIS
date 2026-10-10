@@ -3710,6 +3710,26 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>HUD küre</translation>
     </message>
     <message>
+        <source>Freeze key</source>
+        <translation>Dondurma tuşu</translation>
+    </message>
+    <message>
+        <source>Classic</source>
+        <translation>Klasik</translation>
+    </message>
+    <message>
+        <source>Key</source>
+        <translation>Tuş</translation>
+    </message>
+    <message>
+        <source>Toggle</source>
+        <translation>Şalter</translation>
+    </message>
+    <message>
+        <source>Knife switch</source>
+        <translation>Bıçaklı şalter</translation>
+    </message>
+    <message>
         <source>THIS PACKAGE’S LAYOUT</source>
         <translation>BU PAKETİN DÜZENİ</translation>
     </message>

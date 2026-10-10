@@ -424,13 +424,18 @@ Item {
         // an action rather than a state.
         Item {
             id: killSlot
-            width: Theme.stripKill; height: Theme.stripHeight
+            // The slot widens to a wider skin (6G S2); a tall skin hangs down
+            // so its top stays 6 px under the window edge.
+            width: Math.max(Theme.stripKill, killControl.width); height: Theme.stripHeight
             y: controls.mid - height / 2
             PowerControl {
                 id: killControl
                 objectName: "killSwitchControl"
                 anchors.centerIn: parent
+                anchors.verticalCenterOffset: Math.max(0, height / 2 - controls.anchors.topMargin - controls.mid + 6)
                 diameter: Theme.stripKill
+                skin: bridge.freezeKeySkin
+                executionState: bridge.executionState
                 enabled: !bridge.configRefused
                 // Latched only when the store confirmed execution is off.
                 engaged: bridge.executionState === "frozen"
@@ -438,8 +443,10 @@ Item {
             }
             // Its meaning, in words: Freeze / Resume JARVIS - not close, not quit, not cancel.
             // A micro-label under the control; it does not move the strip.
+            // Only the classic key carries it (6G S2: the other skins show it themselves).
             Text {
                 objectName: "killSwitchLabel"
+                visible: killControl.skin === 1
                 anchors { horizontalCenter: killControl.horizontalCenter; top: killControl.bottom; topMargin: 5 }
                 horizontalAlignment: Text.AlignHCenter
                 text: ({ frozen: qsTr("FROZEN"), freeze_requested: qsTr("FREEZING"), resuming: qsTr("RESUMING"), unconfirmed: qsTr("STATE\nUNCONFIRMED"), refused: qsTr("FROZEN") })[bridge.executionState] || qsTr("FREEZE")
