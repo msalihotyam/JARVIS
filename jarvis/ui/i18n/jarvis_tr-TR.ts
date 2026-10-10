@@ -4546,6 +4546,52 @@ DOĞRULANMADI</translation>
     </message>
 </context>
 <context>
+    <name>UsagePopover</name>
+    <message>
+        <source>5-hour session</source>
+        <translation>5 saatlik oturum</translation>
+    </message>
+    <message>
+        <source>Weekly</source>
+        <translation>Haftalık</translation>
+    </message>
+    <message>
+        <source>Plan usage limits · %1</source>
+        <translation>Plan kullanım limitleri · %1</translation>
+    </message>
+    <message>
+        <source>Resets %1</source>
+        <translation>Sıfırlanma: %1</translation>
+    </message>
+    <message>
+        <source>%1%</source>
+        <translation>%%1</translation>
+    </message>
+    <message>
+        <source>This provider reported no usage limits.</source>
+        <translation>Bu sağlayıcı kullanım limiti bildirmedi.</translation>
+    </message>
+    <message>
+        <source>Values as the provider reported them; nothing unreported is estimated.</source>
+        <translation>Sağlayıcının bildirdiği değerler; bildirilmeyen değer tahmin edilmez.</translation>
+    </message>
+</context>
+<context>
+    <name>UsageRing</name>
+    <message>
+        <source>%1%</source>
+        <translation>%%1</translation>
+    </message>
+    <message>
+        <source>5-hour usage %1% · details</source>
+        <translation>5 saatlik kullanım %%1 · ayrıntılar</translation>
+    </message>
+    <message>
+        <source>Usage not reported · details</source>
+        <translation>Kullanım bildirilmedi · ayrıntılar</translation>
+    </message>
+</context>
+<context>
     <name>Wording</name>
     <message>
         <source>yesterday</source>

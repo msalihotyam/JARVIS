@@ -54,6 +54,8 @@ EXCEPTIONS = (
      "a knife switch swings slower and weighted; each move follows a real execution-state change"),
     ("components/Composer.qml", 1200,
      "the stop key's turning ring (M2): a rhythm only while a run is active, not a transition"),
+    ("components/UsageRing.qml", 9000,
+     "the usage ring's slow halo turn (U2 'subtle animated halo'): ambient atmosphere, not a transition"),
 )
 # Loops allowed to run forever, each a rhythm of a real state or the ambient atmosphere.
 INFINITE = {
@@ -65,6 +67,8 @@ INFINITE = {
     "components/Composer.qml": "the stop key's turning ring while a run is active",
     # S1 (6G mechanical status lamp): one drive while JARVIS runs; it winds down and stops when frozen.
     "components/MechanicalLamp.qml": "the mechanical lamp's drive while JARVIS is not frozen",
+    # U2 ("subtle animated halo", roadmap §3.7): the usage ring's dashed halo turns once per 9 s.
+    "components/UsageRing.qml": "the usage ring's halo turn",
 }
 ANIMATION = re.compile(r"\b(\w+(?:Animation|Animator))\s*(?:on [\w.]+\s*)?\{")
 DURATION = re.compile(r"\bduration:\s*([^;}\n]+?)\s*(?=[;}\n])")
