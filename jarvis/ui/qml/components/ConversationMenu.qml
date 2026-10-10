@@ -108,6 +108,7 @@ Item {
         rowOwnerGlobal = ownerGlobal
         opener = anchor
         editAt = editAnchor ? [editAnchor, editPoint] : [anchor, point]
+        menuColumn.forceLayout()                                    // G6MENUFIX: placed by the rows just shown, not the last open's
         context.popupAt(anchor, point, { trigger: trigger })
     }
     property var editAt: []
@@ -121,6 +122,7 @@ Item {
         width: 300
         onAboutToShow: bridge.previewDeleteConversation("")
         Column {
+            id: menuColumn
             width: context.availableWidth
             spacing: 2
             // Which conversation these act on.

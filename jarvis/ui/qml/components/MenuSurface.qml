@@ -14,7 +14,8 @@ import "../theme"
 // - Pointer: a press outside closes it - except a press on its `trigger`, so
 //   the trigger's own click toggles it rather than closing and reopening it.
 // - Place: popupAt() sets it at a point of an item, kept 8 px inside the
-//   window (`flip`: a pointer menu opens to the other side where the window ends).
+//   window (`flip`: a pointer menu opens to the other side where the window ends);
+//   placed again by the same rule whenever its size changes while open (G6MENUFIX).
 // - Motion: opacity and Theme.travel over panelIn in, panelOut out; none at
 //   all with ambient effects off (K2).
 Popup {
@@ -77,6 +78,12 @@ Popup {
     // G6F1: re-bind y, never assign it: an assignment broke `y: restY`, and only
     // menuIn (ambient on) wrote y again, so motion-free the next open kept the last place.
     onClosed: { opacity = 1; y = Qt.binding(() => restY) }
+    // G6MENUFIX: a row shown or hidden after popupAt (its layout runs at the next
+    // polish) changes the size: place it again. menuIn ends on the restY it started
+    // with, so the open menu takes the current one.
+    onImplicitHeightChanged: if (visible) place()
+    onWidthChanged: if (visible) place()
+    onOpened: y = Qt.binding(() => restY)
     onAboutToShow: if (!opener) opener = body.Window.activeFocusItem
     onVisibleChanged: if (visible && takesFocus) {
         var first = initialFocus || rows()[0]
@@ -90,15 +97,21 @@ Popup {
         trigger = how.trigger || null
         opener = how.opener || trigger || anchor
         parent = trigger || home
-        var win = anchor.Window.window
+        placed = { win: anchor.Window.window, at: anchor.mapToItem(null, point.x, point.y), flip: !!how.flip }
+        place()
+        open()
+    }
+    // The last popupAt's window point: where place() keeps it.
+    property var placed: null
+    function place() {
+        if (!placed) return
+        var win = placed.win, at = placed.at, flip = placed.flip
         var w = width, h = implicitHeight
         var ww = win ? win.width : 1920, wh = win ? win.height : 1080
-        var at = anchor.mapToItem(null, point.x, point.y)
-        var sx = how.flip && at.x + w > ww - 8 ? at.x - w : at.x
-        var sy = how.flip && at.y + h > wh - 8 ? at.y - h : at.y
+        var sx = flip && at.x + w > ww - 8 ? at.x - w : at.x
+        var sy = flip && at.y + h > wh - 8 ? at.y - h : at.y
         var p = parent.mapFromItem(null, Math.max(8, Math.min(sx, ww - w - 8)), Math.max(8, Math.min(sy, wh - h - 8)))
         x = p.x; restY = p.y
-        open()
     }
     function escapeClose() {
         var back = opener
