@@ -37,7 +37,6 @@ from jarvis.app import (
 )
 from jarvis.connectors import claude_code
 from jarvis.connectors.claude_code import ClaudeCodeConnector
-from jarvis.connectors.local_files import LocalFileReadConnector, LocalFileWriteConnector
 from jarvis.connectors.project_folder import (
     PROJECT_FOLDER_CAPABILITY,
     PROJECT_FOLDER_CONNECTOR,
