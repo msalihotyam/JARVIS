@@ -3635,3 +3635,37 @@ kullanıcıya gösterilir.
   Kalan risk (Salih 2026-10-10 kabul): son yargıdan sonra klasör taşınabilir
   veya OneDrive yer tutucusuna dönüşebilir; mevcut klasörü bağlamakla aynıdır.
   Sohbetten oluşturma (K3, Core kartı) G6H3'tedir.
+- **K3 sohbet onay kartı (G6H3):** sohbetten erişilen ilk yerel yazımdır;
+  izinlidir çünkü yazımın her şeyini JARVIS hesaplar ve LOCAL_WRITE zorunlu
+  onaydır (file_write serbest metinden yine erişilemez). E1: model yalnız
+  `project_folder_create` önerebilir, hedef yalnız "" veya "desktop";
+  `submit_text` yeteneği klasörsüz, aktif bir projenin sohbeti dışında
+  katalogdan çıkarır (Global, CLI, bağlı/arşivli proje yok) ve başka hedef,
+  okuma penceresi veya alan taşıyan belgeyi görevden önce reddeder. E2:
+  `connectors/project_folder.py` (MEDIUM, LOCAL_WRITE, geri alınamaz, her
+  modda onay); app ile aynı depo nesnesi ve `project_folder_result`'ın
+  korunan kökleri. E3: yolu app BİR kez `propose_folder` ile saklanan addan
+  hesaplar ve yalnız connector'a özel `task.context["project_folder"]`'a
+  koyar; tasdik `{project_id, path, location}` çerçevesini bağlar ve her
+  tasdikte proje aktif+klasörsüz, yol sözcüksel geçerli ve öneri ŞİMDİ aynı
+  değilse yolsuz "Klasör önerisi değişti; yeniden isteyin." ile reddeder.
+  Son tasdikten sonra yalnız o yol `create_and_link` ile oluşturulur. E4:
+  hibe satırı `anthropic/claude-code` (katalog için); kart, etkinlik notu,
+  karar makbuzu, görev paneli ve akış satırı hedefi "Bu bilgisayar"
+  gösterir (yalnız görüntü; sonuç kartı bir hedef bildirirse o da). E5:
+  değişen öneri görevi FAILED bitirir, kendiliğinden yeni kart yok. Arşiv
+  (Salih 2026-10-10 kabul, "6H3 A"; core.py değişmedi): kart ile onay
+  arasında arşivlenen projenin görevi Core'un `_inactive_project_refusal`'ında
+  BEKLER (FAILED değil); proje onay süresi içinde arşivden çıkarsa eski
+  kartın onayı, connector'ın kendi yeniden tasdikinden sonra yalnız kartın
+  gösterdiği yolu oluşturabilir; öneri bu arada değiştiyse görev yine FAILED
+  biter. E6: yol olay, karar kaydı, konuşma, model yükü ve günlüğe girmez;
+  Core isteği olay günlüğüne yazdığı için yol isteğin önizlemesinde de
+  yoktur, iki pencere kartı onu görevden okur. Sonuç (karar bekliyor): CLI
+  `jarvis approve` bir K3 isteğini yolu göstermeden onaylayabilir (cli.py bu
+  dilimin dışında). E7: "Masaüstünde
+  oluştur" isteği Core'dan reddeder, sonra (donuk değilse) aynı proje ve
+  oturum için öbür konumda yeni istek açar (model çağrısı yok, istek başına
+  bir kez); "Var olan klasörü seç…" önce bağlar, sonra isteği reddeder;
+  ikisi de onaylamaz ve ikisi de hem ana onay kartında (`SafetyCards.qml`)
+  hem Command kartında (`ApprovalCard.qml`) vardır.

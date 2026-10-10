@@ -179,6 +179,15 @@ NL_CAPABILITIES: Mapping[str, CapabilityHint] = {
         },
         schedulable=True,
     ),
+    # Gate 6H H3 (K3): offered only in the chat of an active project without a
+    # folder (``JarvisApp.submit_text`` removes it otherwise). JARVIS computes
+    # the path; the person approves it on a card. Never schedulable.
+    "project_folder_create": CapabilityHint(
+        None, "create",
+        "Set up this project's folder on this computer when the user asks for a "
+        "project folder. JARVIS chooses the exact path and the user approves it.",
+        {"target": "\"desktop\" only when the user asks for the Desktop, otherwise \"\""},
+    ),
     "gmail_thread_list": CapabilityHint(
         "gmail", "read", "List the most recent mail threads.", {"limit": _LIMIT}
     ),

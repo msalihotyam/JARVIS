@@ -31,6 +31,7 @@ from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
 )
+from jarvis.connectors.project_folder import ProjectFolderCreateConnector
 from jarvis.contracts import (
     ActionScope,
     AttestationError,
@@ -767,6 +768,7 @@ class DestinationPolicyTests(unittest.TestCase):
                 self.assertFalse(is_github_destination(value))
 
     def test_the_four_production_tuples_are_unchanged(self) -> None:  # 23
+        # The four original tuples are unchanged; the fifth is the Gate 6H K3 grant.
         self.assertEqual(
             frozenset(
                 {
@@ -782,6 +784,11 @@ class DestinationPolicyTests(unittest.TestCase):
                     DestinationGrant(
                         "local-file-write", "file_write", CLAUDE_CODE_DESTINATION
                     ),
+                    DestinationGrant(
+                        "project-folder-create",
+                        "project_folder_create",
+                        CLAUDE_CODE_DESTINATION,
+                    ),
                 }
             ),
             CONNECTOR_DESTINATION_POLICY,
@@ -793,6 +800,7 @@ class DestinationPolicyTests(unittest.TestCase):
                 ClaudeCodeConnector,
                 LocalFileReadConnector,
                 LocalFileWriteConnector,
+                ProjectFolderCreateConnector,
             )
             for capability in kind.manifest.capabilities
         }

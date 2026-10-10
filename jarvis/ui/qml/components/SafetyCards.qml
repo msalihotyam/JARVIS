@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Dialogs
 import "../theme"
 
 // The conversation's safety cards, at the end of the stream on the JARVIS
@@ -202,6 +203,37 @@ Column {
                     Field { visible: !!approvalCard.a.effect; k: qsTr("Consequence")
                             v: cards.effectWord(approvalCard.a.effect || "") + " · " + (approvalCard.a.reversible ? qsTr("reversible") : qsTr("not reversible")) }
                 }
+                // Gate 6H H3 (K3, mockup v16): the same two controls as ApprovalCard.qml.
+                // Neither approves: the switch asks for the other location (Core
+                // rejects this request first and shows a new card with its path).
+                Flow {
+                    objectName: "k3FolderControls"
+                    visible: approvalCard.a.connector === "project-folder-create"
+                    width: parent.width; spacing: 12
+                    Item {
+                        id: k3Desktop
+                        objectName: "k3OnDesktop"
+                        readonly property bool checked: approvalCard.a.folder_location === "desktop"
+                        function flip() { bridge.switchProjectFolderLocation(approvalCard.a.request_id, approvalCard.a.fingerprint) }
+                        enabled: approvalCard.current && approvalCard.a.actionable === true
+                        opacity: enabled ? 1 : 0.45
+                        width: k3Box.width + 8 + k3Label.implicitWidth; height: 36
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.CheckBox; Accessible.name: k3Label.text; Accessible.checked: checked
+                        Accessible.onToggleAction: flip()
+                        Keys.onSpacePressed: flip()
+                        Rectangle { id: k3Box; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
+                                    color: k3Desktop.checked ? Theme.alpha(Theme.warning, 0.25) : "transparent"
+                                    border.width: k3Desktop.activeFocus ? 2 : 1
+                                    border.color: k3Desktop.checked || k3Desktop.activeFocus ? Theme.warning : Theme.borderStrong
+                                    Icon { anchors.centerIn: parent; visible: k3Desktop.checked; name: "check"; size: 12; tint: Theme.warning } }
+                        Text { id: k3Label; x: k3Box.width + 8; anchors.verticalCenter: parent.verticalCenter; renderType: Theme.textRender
+                               text: qsTr("Create on the Desktop"); color: Theme.textLabel; font: Theme.uiLabel }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: k3Desktop.flip() }
+                    }
+                    ActionButton { objectName: "k3PickExisting"; label: qsTr("Choose an existing folder…"); height: 36
+                                   enabled: approvalCard.current && approvalCard.a.rejectable === true; onClicked: approvalCard.pickExisting() }
+                }
                 AttestedText { visible: !!approvalCard.a.project_instruction; sectionName: "approvalInstruction"
                                label: qsTr("PROJECT INSTRUCTION · attested, sent with this request")
                                body: approvalCard.a.project_instruction || "" }
@@ -244,6 +276,32 @@ Column {
                 }
                 Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.metadata
                        text: qsTr("Approve authorizes the displayed request only. It is not a completion claim.") }
+            }
+            FolderDialog {
+                id: k3Picker
+                property string projectId: ""
+                property string requestId: ""
+                property string fingerprint: ""
+                objectName: "k3FolderPicker"
+                onAccepted: approvalCard.linkPicked(bridge.folderPath(selectedFolder))
+            }
+
+            // Gate 6H H3 (K3): "Var olan klasörü seç…" - the picker is bound to the
+            // request's project, request id and fingerprint as they were at the click.
+            // The link comes first; only a successful link rejects the request.
+            function bindPicker() {
+                k3Picker.projectId = approvalCard.a.folder_project || ""
+                k3Picker.requestId = approvalCard.a.request_id || ""
+                k3Picker.fingerprint = approvalCard.a.fingerprint || ""
+                return k3Picker.projectId !== ""
+            }
+            function pickExisting() {
+                if (bindPicker())
+                    k3Picker.open()
+            }
+            function linkPicked(path) {
+                if (k3Picker.projectId !== "" && bridge.linkProjectFolder(k3Picker.projectId, path))
+                    bridge.rejectRequest(k3Picker.requestId, k3Picker.fingerprint)
             }
         }
 

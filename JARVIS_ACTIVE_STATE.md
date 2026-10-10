@@ -30,7 +30,20 @@ tests motion-free by default, condition waits, split sweeps, duration-balanced
 CI shards; 58c2f75) and MA1 (jarvis-flow wave 2 + jarvis-codex review bridge +
 rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
 
-## Open blockers: none.
+## Open blockers
+
+**G6H3 (6H H3 K3 chat approval card, T2) green, 2026-10-11 (G6H3C):**
+committed on lane branch `worktree-G6H3` (base fea0ead); integrated on local main by INT26, not pushed.
+K3: a folderless active project's chat proposes its folder through a Core
+approval card; JARVIS computes the path, the card shows it ("Bu
+bilgisayar"), every mode asks. Salih "6H3 A": archived = held by Core,
+accepted. Composition pins re-pointed additively (`tests/test_app.py`
+registry names + `project-folder-create`; `tests/test_github_phase1.py`
+policy + the K3 DestinationGrant). Full suite on the frozen tree 5369 OK
+(skipped=2), 662 s. Open for Salih: CLI `jarvis approve` can approve a K3
+request without showing its path (cli.py out of scope; recorded in
+ARCHITECTURE). Report:
+`build/reports/G6H3C.md`.
 
 **G6H1 (6H H1 folder link, T2) green, 2026-10-10 (G6H1B):** committed on lane
 branch `worktree-G6H1` (base e3b2015), integrated on local main (INT16, not pushed); lane commit f417e57; additive

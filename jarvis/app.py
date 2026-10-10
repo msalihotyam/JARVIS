@@ -18,7 +18,7 @@ import json
 import math
 import re
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Iterable, Mapping
 from uuid import uuid4
@@ -35,6 +35,13 @@ from jarvis.connectors.gmail_cli import GmailCliConnector
 from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
+)
+from jarvis.connectors.project_folder import (
+    PROJECT_FOLDER_CAPABILITY,
+    PROJECT_FOLDER_CONNECTOR,
+    PROJECT_FOLDER_CONTEXT_KEY,
+    PROJECT_FOLDER_TARGETS,
+    ProjectFolderCreateConnector,
 )
 from jarvis import project_files
 from jarvis import project_folders
@@ -3382,6 +3389,16 @@ _FROZEN_UNDERSTOOD_MESSAGE = (
     "task or job was created and nothing was queued. Resume JARVIS and send "
     "it again to run it."
 )
+#: K3: the proposal could not be computed. Path-free: the cause is never said.
+_NO_FOLDER_PROPOSAL = "JARVIS could not propose a folder for this project. Nothing was created."
+
+
+def _project_folder_document(document: Any) -> bool:
+    """K3 (E1): exactly objective, capability and a scope whose target is
+    "" or "desktop" - no read window, no other field."""
+    scope = document.get("scope") if isinstance(document, dict) else None
+    return (set(document or ()) == {"objective", "capability", "scope"} and isinstance(scope, dict)
+            and set(scope) == {"action", "target", "destination"} and scope["target"] in PROJECT_FOLDER_TARGETS)
 
 
 def _instruction_chars(instruction: str | None) -> int:
@@ -3635,6 +3652,11 @@ class JarvisApp:
             now,
             conversation_scoped=scoped,
         )
+        # Gate 6H H3 (K3): a project folder is offered only to the chat of an
+        # active project that has none - never Global, the CLI or a linked one.
+        if catalog.entry(PROJECT_FOLDER_CAPABILITY) is not None and not (scoped and self._folderless(owner)):
+            catalog = replace(catalog, entries=tuple(
+                entry for entry in catalog.entries if entry.capability != PROJECT_FOLDER_CAPABILITY))
         # Gate 4: the scoped project's current instruction, read from the
         # store NOW (never from conversation text or model output), delivered
         # iff eligible for this call's own classification. Guidance only.
@@ -3738,6 +3760,15 @@ class JarvisApp:
         # Only the user's CURRENT turn may choose among several configured
         # destinations - never the model, and never an earlier turn.
         resolution = resolve_proposal(proposal, catalog, now, text)
+        # K3 (E1): the model chooses only "" or "desktop"; a path, a read window
+        # or any other field is refused before a task can exist.
+        if (resolution.status is IntentStatus.STRUCTURED and resolution.capability == PROJECT_FOLDER_CAPABILITY
+                and not _project_folder_document(resolution.task_document)):
+            return refused(
+                IntentStatus.MALFORMED_MODEL_OUTPUT,
+                "The project folder proposal was refused: it may only say whether the folder goes on the "
+                "Desktop. Nothing was executed.",
+            )
         if resolution.status in (IntentStatus.STRUCTURED, IntentStatus.SCHEDULED) and not self.core.execution_allowed():
             # THE barrier: understood, but nothing is created, queued or started.
             return respond(
@@ -3757,6 +3788,11 @@ class JarvisApp:
                 )
             if scoped:
                 task.project_id = owner
+            if task.capability == PROJECT_FOLDER_CAPABILITY:
+                # K3 (E3): JARVIS computes the path ONCE, from the stored
+                # project name; it travels only in the connector's context.
+                if not self._propose_project_folder(task):
+                    return refused(IntentStatus.UNSUPPORTED, _NO_FOLDER_PROPOSAL)
             # From here on the ordinary lifecycle owns everything. No grant
             # is passed: a natural-language request cannot approve itself.
             run = self.core.run(task, session_id)
@@ -3853,6 +3889,78 @@ class JarvisApp:
             if other is None or other.project_id != owner:
                 return None, "The session belongs to a conversation of another project scope."
         return owner, None
+
+    # -- Gate 6H H3 (K3): the project folder from chat ------------------------
+
+    def _folderless(self, project_id: str | None) -> bool:
+        """An active project with no current folder link (a failed read: no)."""
+        try:
+            project = None if project_id is None else self.memory.load_project(project_id)
+            return project is not None and project.active and self.memory.load_project_folder(project_id) is None
+        except Exception:  # noqa: BLE001 - storage boundary; offer nothing
+            return False
+
+    def _propose_project_folder(self, task: Task) -> bool:
+        """E3: put JARVIS's own proposal for ``task.project_id`` into the
+        connector's context. Any failure is ``False``: nothing about it is
+        kept, logged or chained (the cause may name the path)."""
+        try:
+            connector = self.core.registry.get(PROJECT_FOLDER_CONNECTOR)
+            if not isinstance(connector, ProjectFolderCreateConnector):
+                return False
+            task.context[PROJECT_FOLDER_CONTEXT_KEY] = connector.proposal(
+                task.project_id, PROJECT_FOLDER_TARGETS[task.scope.target])
+        except Exception:  # noqa: BLE001 - path-free refusal, nothing logged
+            return False
+        return True
+
+    def project_folder_switch(
+        self, session_id: str, task_id: str, request_id: str, fingerprint: str
+    ) -> CommandResult:
+        """E7 "Masaüstünde oluştur": the pending K3 request moves to the other
+        location. Deterministic, no model call. Refused unless the request is
+        still pending, of the K3 connector, and its session's conversation is
+        owned by the task's project. It is REJECTED through Core first; only
+        then (and not while frozen) does a new task for the other location of
+        the SAME project and session start, from the rejected task's own
+        stored fields - never from what the window shows - with a new card."""
+        command = "project-folder-switch"
+        if not self.core.execution_allowed():
+            return self._failure(command, ErrorCode.EXECUTION_DISABLED,
+                                 "JARVIS is frozen; the folder request was not changed.", EXIT_POLICY)
+        try:
+            request = self.memory.load_pending_approval(task_id, session_id)
+            task = self.memory.load_task(task_id)
+            linked = self.memory.conversation_for_session(session_id)
+            conversation = None if linked is None else self.memory.load_conversation(linked)
+        except Exception:  # noqa: BLE001 - storage boundary
+            request = task = conversation = None
+        if (request is None or (request.id, request.fingerprint) != (request_id, fingerprint)
+                or request.scope.connector != PROJECT_FOLDER_CONNECTOR
+                or task is None or task.capability != PROJECT_FOLDER_CAPABILITY
+                or task.scope.target not in PROJECT_FOLDER_TARGETS
+                or conversation is None or task.project_id is None or conversation.project_id != task.project_id):
+            return self._failure(command, ErrorCode.INVALID_GRANT,
+                                 "This folder request is no longer pending here; nothing was changed.", EXIT_POLICY)
+        rejected = self.reject(session_id, task_id, request_id, fingerprint)
+        if rejected.payload.get("run_status") != "rejected":
+            return rejected
+        # After a successful rejection a refusal still reports the rejection's
+        # own envelope (the card is gone), with why no new request followed.
+        if not self.core.execution_allowed():
+            return CommandResult({**rejected.payload, "notice": "JARVIS is frozen; no new folder request was made."},
+                                 rejected.exit_code)
+        other = "" if task.scope.target == "desktop" else "desktop"
+        fresh = Task(
+            objective=task.objective,
+            capability=PROJECT_FOLDER_CAPABILITY,
+            scope=ActionScope(action=task.scope.action, target=other, destination=task.scope.destination,
+                              data_classification=task.scope.data_classification),
+        )
+        fresh.project_id = task.project_id
+        if not self._propose_project_folder(fresh):
+            return CommandResult({**rejected.payload, "notice": _NO_FOLDER_PROPOSAL}, rejected.exit_code)
+        return self._present(command, self.core.run(fresh, session_id))
 
     def _research(
         self, query: str, text: str, request_id: str, response_language: str,
@@ -4467,7 +4575,12 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     # configured no GitHub account composes with no GitHub connector, no
     # GitHub grant and no expected identity, and therefore cannot reach a
     # repository even if a task names one.
-    connectors: tuple[BaseConnector, ...] = (connector, local_reader, local_writer)
+    # Gate 6H H3 (K3): ONE store, shared by the app and the project folder
+    # connector, which gets the same protected roots project_folder_result
+    # uses. It adds no root and no working directory to any connector.
+    memory = SQLiteMemoryStore(settings.memory_database)
+    project_folder = ProjectFolderCreateConnector(memory, _folder_protected(memory, settings))
+    connectors: tuple[BaseConnector, ...] = (connector, local_reader, local_writer, project_folder)
     github_identity, github_policy = github_authority(settings)
     if github_identity is not None:
         connectors += (GitHubCliConnector(github_identity),)
@@ -4492,6 +4605,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     configured = github_policy | gmail_policy | browser_policy | desktop_policy
     return create_app(
         settings=settings,
+        memory=memory,
         connectors=connectors,
         destination_policy=(
             CONNECTOR_DESTINATION_POLICY | configured if configured else None

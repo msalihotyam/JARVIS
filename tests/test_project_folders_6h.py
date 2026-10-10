@@ -1318,7 +1318,7 @@ class SourceAuditTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1] / "jarvis"
         sources = {str(p.relative_to(root)).replace("\\", "/"): p.read_text(encoding="utf-8", errors="replace")
                    for p in root.rglob("*") if p.is_file() and p.suffix in (".py", ".qml", ".js")}
-        allowed = {"memory.py", "app.py", "project_folders.py"}
+        allowed = {"memory.py", "app.py", "project_folders.py", "connectors/project_folder.py"}
         for needle in ("project_folder_links", "link_explicit_user_project_folder", "load_project_folder",
                        "project_folders"):
             with self.subTest(needle):

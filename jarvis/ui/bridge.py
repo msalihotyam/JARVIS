@@ -48,6 +48,8 @@ from jarvis.context_items import (
 )
 from jarvis import conversation_search, project_files
 from jarvis.app import project_folder_result
+from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR
+from jarvis.destinations import CLAUDE_CODE_DESTINATION
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
@@ -161,6 +163,20 @@ def _run_facts(task: dict, payload: Any, intent: Any = None) -> dict[str, str]:
     from the resolved intent, else from the task block its OWN conversation already holds."""
     resolved = task_status(payload, intent) if intent is not None else {}
     return {key: resolved.get(key) or task.get(key, "") for key in ("capability", "destination")}
+
+
+def _here(facts: dict) -> dict:
+    """6H H3 (E4): a K3 task's destination reads "This computer" wherever it is
+    shown - the grant row's name is a label here and names no endpoint. Display
+    only: the stored task, turn and request keep the grant row's destination."""
+    if facts.get("capability") == PROJECT_FOLDER_CAPABILITY and facts.get("destination"):
+        return {**facts, "destination": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This computer"))}
+    return facts
+
+
+#: 6H H3: the app's E7 notices (app.project_folder_switch), as Bridge catalog sources.
+_K3_NOTICES = (QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen; no new folder request was made."),
+               QT_TRANSLATE_NOOP("Bridge", "JARVIS could not propose a folder for this project. Nothing was created."))
 
 
 def _project_run(prior: dict, payload: Any, intent: Any = None) -> dict[str, Any]:
@@ -384,6 +400,8 @@ class Bridge(QObject):
         self._instruction_lines: dict[str, str] = {}                # project id -> its card's instruction line; presentation only
         self._project_folder: dict[str, str] = {}                   # the open project's current 6H folder link
         self._project_folder_notice = ""                            # the last 6H link/unlink refusal, in plain words
+        self._k3_folder: dict[str, str] = {}                        # 6H H3: the shown K3 request's exact folder (display)
+        self._k3_switched: set[str] = set()                         # 6H H3: K3 request ids already switched once
         self._open_project = ""
         # G6SB3F: the picker's "New project…" in flight - (the new chat's id, the project ids before it).
         self._new_project_chat: tuple[str, frozenset] | None = None
@@ -2391,7 +2409,7 @@ class Bridge(QObject):
             row["text"] = render(entry["msg"])
             if clock:
                 row["time"] = QLocale().toString(QDateTime.fromSecsSinceEpoch(int(entry["ts"])).time(), QLocale.FormatType.ShortFormat)
-            out.append(row)
+            out.append(_here(row))
         return out
 
     # -- core state ----------------------------------------------------------
@@ -2456,7 +2474,7 @@ class Bridge(QObject):
             self._task["title"] = self._conversation_store.title(self._task["task_id"])
         if self._ticket is not None:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Approval required: %1 -> %2"),
-                        (self._approval.get("action"), self._approval.get("destination"))), "approval")
+                        (self._approval.get("action"), self._k3_card(dict(self._approval)).get("destination"))), "approval")
         elif self._last_outcome == "unknown":
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "OUTCOME UNKNOWN for task %1"), (self._task.get("task_id"),)), "unknown")
         elif self._last_outcome == "unmet" and self._task:
@@ -2730,7 +2748,7 @@ class Bridge(QObject):
 
     @Property("QVariantMap", notify=stateChanged)
     def task(self) -> dict:
-        return dict(self._task)
+        return _here(dict(self._task))
 
     @Property("QVariantMap", notify=stateChanged)
     def progress(self) -> dict:
@@ -2884,7 +2902,7 @@ class Bridge(QObject):
 
     @Property("QVariantMap", notify=approvalChanged)
     def approval(self) -> dict:
-        return dict(self._approval)
+        return self._k3_card(dict(self._approval))
 
     @Property(bool, notify=approvalChanged)
     def approvalPending(self) -> bool:
@@ -3033,6 +3051,8 @@ class Bridge(QObject):
         ticket = self._ticket
         if ticket is None or self._busy or not self._approval.get("complete"):
             return False
+        if verb == "approve" and not self._k3_card(dict(self._approval)).get("complete"):
+            return False            # 6H H3: a K3 card is approvable only with its exact path shown
         if not self._linked_here(ticket.session_id):
             return False            # R1: never a ticket of a conversation other than the open one
         if request_id is not None and (str(request_id), str(fingerprint)) != (ticket.request_id, ticket.fingerprint):
@@ -3041,7 +3061,7 @@ class Bridge(QObject):
         self._ticket, self._approval = None, {}
         # Labels are kept as catalog sources and rendered by ``safety``.
         self._decision = {"state": "submitting", "verb": verb, "label": QT_TRANSLATE_NOOP("Bridge", "Submitting decision…"),
-                          "action": shown.get("action", ""), "destination": shown.get("destination", ""),
+                          "action": shown.get("action", ""), "destination": self._k3_card(dict(shown)).get("destination", ""),
                           "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
         call = self.backend.approve if verb == "approve" else self.backend.reject
@@ -3100,6 +3120,63 @@ class Bridge(QObject):
     def rejectRequest(self, request_id: str, fingerprint: str) -> bool:
         """Reject exactly the displayed request. Nothing else is cancelled or disabled."""
         return self._decide("reject", request_id, fingerprint)
+
+    # -- Gate 6H H3 (K3): the project folder approval card --------------------
+
+    def _k3_card(self, approval: dict) -> dict:
+        """Display only, for a K3 request: the destination reads "This computer"
+        (never the grant row's) and the target is the exact path the request
+        binds, read from its task (Core logs the request, so the path is not
+        in it). Without that path the card is not approvable."""
+        if approval.get("connector") != PROJECT_FOLDER_CONNECTOR:
+            return approval
+        key = str(approval.get("request_id") or "")
+        if self._k3_folder.get("request_id") != key:
+            found = self.backend.project_folder_request(
+                str(approval.get("session_id") or ""), str(approval.get("task_id") or ""), key)
+            # Only a found path is kept: a failed read is asked again next time.
+            self._k3_folder = {"request_id": key, **found} if found.get("path") else {}
+            folder = found
+        else:
+            folder = self._k3_folder
+        here = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "This computer"))
+        # The grant row's destination is a label here: it names no endpoint.
+        shown = {key: str(approval.get(key) or "").replace(CLAUDE_CODE_DESTINATION, here)
+                 for key in ("outbound_preview", "attestation")}
+        return {**approval, **shown, "destination": here,
+                "target": folder.get("path", ""), "folder_location": folder.get("location", ""),
+                "folder_project": folder.get("project_id", ""),
+                "complete": bool(approval.get("complete") and folder.get("path"))}
+
+    @Slot(str, str, result=bool)
+    def switchProjectFolderLocation(self, request_id: str, fingerprint: str) -> bool:
+        """E7 "Masaüstünde oluştur" for the K3 request ON SCREEN: once per request
+        id, never while frozen or busy. The app rejects it through Core and only
+        then asks for the other location (a new card); it never approves."""
+        ticket = self._ticket
+        if (ticket is None or self._busy or not self.executionEnabled or str(request_id) in self._k3_switched
+                or (str(request_id), str(fingerprint)) != (ticket.request_id, ticket.fingerprint)
+                or self._approval.get("connector") != PROJECT_FOLDER_CONNECTOR or not self._linked_here(ticket.session_id)):
+            return False
+        self._k3_switched.add(ticket.request_id)
+
+        def kept(prior: dict, payload: Any) -> dict:
+            # A refusal changed nothing: that conversation keeps its card.
+            return _project_run(prior, payload) if isinstance(payload, dict) and payload.get("run_status") else prior
+
+        self._run("task", lambda: self.backend.project_folder_switch(ticket), self._delivered(self._k3_switched_to, project=kept))
+        return True
+
+    def _k3_switched_to(self, payload: Any) -> None:
+        if isinstance(payload, dict) and payload.get("run_status"):
+            self._apply_run(payload)          # the new request's card (or what Core did with the rejection)
+            if payload.get("notice"):
+                # The app's two E7 notices, in the interface language (catalog sources).
+                notice = str(payload["notice"])
+                self._note(("Bridge", notice, ()) if notice in _K3_NOTICES else notice, "error")
+        else:
+            self._note(self._error_message(payload) or ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Decision not recorded"), ()),
+                       "error")
 
     @Slot()
     def cancelTask(self) -> None:
@@ -4300,7 +4377,7 @@ class Bridge(QObject):
         if self._dev_safety:
             return self._dev_safety_projection(self._dev_safety)
         execution = self.executionState
-        approval = dict(self._approval)
+        approval = self._k3_card(dict(self._approval))
         if approval:
             # The connector's outbound sentence, rendered in the interface language
             # when JARVIS knows it (present.OUTBOUND_TEXT) and as written otherwise.
@@ -4316,7 +4393,7 @@ class Bridge(QObject):
                                 if not approval.get("complete") or self._ticket is None
                                 else tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."))
                                 if not self.executionEnabled else "")
-        outcome = task_outcome(self._task, self._last_outcome == "unmet")
+        outcome = _here(task_outcome(self._task, self._last_outcome == "unmet"))
         items: list[dict[str, Any]] = []
         if execution in ("frozen", "freeze_requested", "resuming", "refused", "unconfirmed"):
             items.append({"key": "execution", "level": 1, "tone": "danger", "label": tx("Bridge", {

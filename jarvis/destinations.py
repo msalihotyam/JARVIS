@@ -144,6 +144,10 @@ CONNECTOR_DESTINATION_POLICY: frozenset[DestinationGrant] = frozenset(
         DestinationGrant("claude-code-plan", "code_planning", CLAUDE_CODE_DESTINATION),
         DestinationGrant("local-file-read", "file_read", CLAUDE_CODE_DESTINATION),
         DestinationGrant("local-file-write", "file_write", CLAUDE_CODE_DESTINATION),
+        # Gate 6H H3 (K3): the same precedent as the two local file rows - the
+        # catalog needs a granted destination. The connector transmits nothing;
+        # the approval card shows it as "Bu bilgisayar" (display only).
+        DestinationGrant("project-folder-create", "project_folder_create", CLAUDE_CODE_DESTINATION),
     }
 )
 

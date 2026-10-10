@@ -893,7 +893,7 @@ class CompositionRootTests(unittest.TestCase):
         connector = app.core.registry.get("claude-code-plan")
         startup_directory = Path.cwd().resolve()
         self.assertEqual(
-            ("claude-code-plan", "local-file-read", "local-file-write"),
+            ("claude-code-plan", "local-file-read", "local-file-write", "project-folder-create"),
             app.core.registry.list_names(),
         )
         self.assertEqual((startup_directory,), connector.allowed_roots)

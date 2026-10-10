@@ -76,6 +76,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Hedef</translation>
     </message>
     <message>
+        <source>Create on the Desktop</source>
+        <translation>Masaüstünde oluştur</translation>
+    </message>
+    <message>
+        <source>Choose an existing folder…</source>
+        <translation>Var olan klasörü seç…</translation>
+    </message>
+    <message>
         <source>OUTBOUND PREVIEW</source>
         <translation>GİDEN VERİ ÖNİZLEMESİ</translation>
     </message>
@@ -447,7 +455,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <name>Bridge</name>
     <message>
         <source>JARVIS frozen</source>
-        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing). The token fields a provider reports that together are what one call used. Claude counts cache reads and writes apart from ``input_tokens``; Codex counts its cached input INSIDE ``input_tokens`` and its reasoning INSIDE ``output_tokens``, so those two are never added again. Of those, the ones a cache serves at a fraction of the normal input price. Reported at face value alongside the total - never estimated, never implied for a provider (Codex) that folds its cached share INSIDE input_tokens.</extracomment>
         <translation>JARVIS donduruldu</translation>
     </message>
     <message>
@@ -737,6 +744,20 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Approval recorded</source>
         <translation>Onay kaydedildi</translation>
+    </message>
+    <message>
+        <source>This computer</source>
+        <extracomment>DEV FIXTURE only (JARVIS_UI_DEV_FIXTURE=1): display-only safety cards for visual review. They never create a ticket, a task or a decision. What a pasted image is called on the draft (the clipboard names nothing). The token fields a provider reports that together are what one call used. Claude counts cache reads and writes apart from ``input_tokens``; Codex counts its cached input INSIDE ``input_tokens`` and its reasoning INSIDE ``output_tokens``, so those two are never added again. Of those, the ones a cache serves at a fraction of the normal input price. Reported at face value alongside the total - never estimated, never implied for a provider (Codex) that folds its cached share INSIDE input_tokens.</extracomment>
+        <translation>Bu bilgisayar</translation>
+    </message>
+    <message>
+        <source>JARVIS is frozen; no new folder request was made.</source>
+        <extracomment>6H H3: the app&apos;s E7 notices (app.project_folder_switch), as Bridge catalog sources.</extracomment>
+        <translation>JARVIS donduruldu; yeni klasör isteği oluşturulmadı.</translation>
+    </message>
+    <message>
+        <source>JARVIS could not propose a folder for this project. Nothing was created.</source>
+        <translation>JARVIS bu proje için bir klasör öneremedi. Hiçbir şey oluşturulmadı.</translation>
     </message>
     <message>
         <source>No cancellable task is registered yet.</source>
@@ -3523,6 +3544,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
 </context>
 <context>
     <name>SafetyCards</name>
+    <message>
+        <source>Create on the Desktop</source>
+        <translation>Masaüstünde oluştur</translation>
+    </message>
+    <message>
+        <source>Choose an existing folder…</source>
+        <translation>Var olan klasörü seç…</translation>
+    </message>
     <message>
         <source>data leaves this computer</source>
         <translation>veri bu bilgisayardan çıkar</translation>

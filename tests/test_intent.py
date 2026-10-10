@@ -738,7 +738,7 @@ class AdapterTests(unittest.TestCase):
         from jarvis.gmail import GMAIL_CAPABILITIES
 
         known = set(GMAIL_CAPABILITIES) | set(GITHUB_CAPABILITIES) | set(BROWSER_CAPABILITIES)
-        known |= set(DESKTOP_CAPABILITIES) | {"code_analysis", "code_planning", "file_read"}
+        known |= set(DESKTOP_CAPABILITIES) | {"code_analysis", "code_planning", "file_read", "project_folder_create"}
         self.assertTrue(set(NL_CAPABILITIES) <= known, set(NL_CAPABILITIES) - known)
         # Nothing element-bound (a ref, a digest, a tab id from an earlier
         # read) and no local write: free text cannot honestly produce those.

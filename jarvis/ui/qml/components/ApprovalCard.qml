@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Dialogs
 import "../theme"
 
 // The exact backend snapshot is display-only. Actions still call the
@@ -83,6 +84,37 @@ GlassPanel {
                     }
                 }
             }
+            // Gate 6H H3 (K3, mockup v16): a project folder request's two controls.
+            // Neither approves: the switch asks for the other location (Core
+            // rejects this request first and shows a new card with its path).
+            Row {
+                objectName: "k3FolderControls"
+                visible: !card.fixture && card.snapshot.connector === "project-folder-create"
+                spacing: 12
+                Item {
+                    id: k3Desktop
+                    objectName: "k3OnDesktop"
+                    readonly property bool checked: card.snapshot.folder_location === "desktop"
+                    function flip() { bridge.switchProjectFolderLocation(card.snapshot.request_id, card.snapshot.fingerprint) }
+                    enabled: card.actionable && bridge.executionEnabled
+                    opacity: enabled ? 1 : 0.45
+                    width: k3Box.width + 8 + k3Label.implicitWidth; height: 36
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.CheckBox; Accessible.name: k3Label.text; Accessible.checked: checked
+                    Accessible.onToggleAction: flip()
+                    Keys.onSpacePressed: flip()
+                    Rectangle { id: k3Box; anchors.verticalCenter: parent.verticalCenter; width: 16; height: 16; radius: 4
+                                color: k3Desktop.checked ? Theme.alpha(Theme.warning, 0.25) : "transparent"
+                                border.width: k3Desktop.activeFocus ? 2 : 1
+                                border.color: k3Desktop.checked || k3Desktop.activeFocus ? Theme.warning : Theme.borderStrong
+                                Icon { anchors.centerIn: parent; visible: k3Desktop.checked; name: "check"; size: 12; tint: Theme.warning } }
+                    Text { id: k3Label; x: k3Box.width + 8; anchors.verticalCenter: parent.verticalCenter
+                           text: qsTr("Create on the Desktop"); color: Theme.textLabel; font: Theme.caption }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: k3Desktop.flip() }
+                }
+                ActionButton { objectName: "k3PickExisting"; label: qsTr("Choose an existing folder…"); compact: true
+                               enabled: card.actionable; onClicked: card.pickExisting() }
+            }
             Text { visible: !!card.snapshot.outbound_preview; text: qsTr("OUTBOUND PREVIEW"); color: Theme.textMuted; font: Theme.label }
             Rectangle { visible: !!card.snapshot.outbound_preview; width: parent.width; height: visible ? Math.min(160, outbound.contentHeight + 28) : 0; radius: 7; color: Theme.surfaceDeep; border.width: 1; border.color: Theme.border
                 Flickable { anchors.fill: parent; anchors.margins: 12; contentHeight: outbound.contentHeight; clip: true
@@ -135,5 +167,31 @@ GlassPanel {
             ActionButton { objectName: "approvalApprove"; label: qsTr("Approve"); primary: true; enabled: card.actionable; onClicked: bridge.approve() }
         }
         IconButton { visible: card.fixture; icon: "close"; tip: qsTr("Close visual fixture"); onClicked: card.dismissFixture() }
+    }
+    FolderDialog {
+        id: k3Picker
+        property string projectId: ""
+        property string requestId: ""
+        property string fingerprint: ""
+        objectName: "k3FolderPicker"
+        onAccepted: card.linkPicked(bridge.folderPath(selectedFolder))
+    }
+
+    // Gate 6H H3 (K3): "Var olan klasörü seç…" - the picker is bound to the
+    // request's project, request id and fingerprint as they were at the click.
+    // The link comes first; only a successful link rejects the request.
+    function bindPicker() {
+        k3Picker.projectId = card.snapshot.folder_project || ""
+        k3Picker.requestId = card.snapshot.request_id || ""
+        k3Picker.fingerprint = card.snapshot.fingerprint || ""
+        return k3Picker.projectId !== ""
+    }
+    function pickExisting() {
+        if (bindPicker())
+            k3Picker.open()
+    }
+    function linkPicked(path) {
+        if (k3Picker.projectId !== "" && bridge.linkProjectFolder(k3Picker.projectId, path))
+            bridge.rejectRequest(k3Picker.requestId, k3Picker.fingerprint)
     }
 }

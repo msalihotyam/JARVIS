@@ -36,6 +36,7 @@ from jarvis.connectors.local_files import (
     LocalFileReadConnector,
     LocalFileWriteConnector,
 )
+from jarvis.connectors.project_folder import ProjectFolderCreateConnector
 from jarvis.contracts import (
     ActionScope,
     AttestationError,
@@ -218,6 +219,7 @@ class ValidityIsNotAuthorizationTests(unittest.TestCase):
                 ClaudeCodeConnector,
                 LocalFileReadConnector,
                 LocalFileWriteConnector,
+                ProjectFolderCreateConnector,
             )
             for capability in kind.manifest.capabilities
         }

@@ -57,6 +57,11 @@ from jarvis.cli import _config_change, _config_reset_change
 from jarvis.antigravity import antigravity_state
 from jarvis.codex import CodexIntentAdapter, codex_state, remember_codex_state
 from jarvis.connectors.claude_code import AUTH_NOT_LOGGED_IN_EVIDENCE, ClaudeCodeConnector
+from jarvis.connectors.project_folder import (
+    PROJECT_FOLDER_CAPABILITY,
+    PROJECT_FOLDER_CONNECTOR,
+    PROJECT_FOLDER_CONTEXT_KEY,
+)
 from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
 from jarvis.model_retirement import codex_retirement
 from jarvis.contracts import BillingClass, ErrorCode
@@ -444,6 +449,32 @@ class Backend:
         """6H K1: create exactly the shown folder and link it, through the app's audited path."""
         return self._call("project-folder-create", lambda s: project_folder_result(
             self._memory(s), s, "create", project_id, path=path, on_desktop=on_desktop))
+
+    # -- Gate 6H H3 (K3): the chat approval card's project folder ------------
+
+    def project_folder_request(self, session_id: str, task_id: str, request_id: str) -> dict:
+        """The exact folder a PENDING K3 request binds, for the LOCAL card only:
+        read from the persisted task the request's frame is built from (Core
+        logs the request itself, so the path is never in it). ``{}`` otherwise."""
+        loaded = self.store.load()
+        if not loaded.usable:
+            return {}
+        try:
+            memory = self._memory(loaded.settings)
+            request = memory.load_pending_approval(str(task_id), str(session_id))
+            task = memory.load_task(str(task_id))
+            folder = task.context.get(PROJECT_FOLDER_CONTEXT_KEY) if task is not None and type(task.context) is dict else None
+            if (request is None or request.id != request_id or request.scope.connector != PROJECT_FOLDER_CONNECTOR
+                    or task.capability != PROJECT_FOLDER_CAPABILITY or type(folder) is not dict):
+                return {}
+            return {"path": str(folder["path"]), "location": str(folder["location"]), "project_id": str(task.project_id or "")}
+        except Exception:  # noqa: BLE001 - nothing to show is not a path to show
+            return {}
+
+    def project_folder_switch(self, ticket: ApprovalTicket) -> dict:
+        """E7 "Masaüstünde oluştur": the app rejects the request and makes the other location's."""
+        return self._call("project-folder-switch", lambda s: self._app(s).project_folder_switch(
+            ticket.session_id, ticket.task_id, ticket.request_id, ticket.fingerprint))
 
     def project_lifecycle(self, action: str, project_id: str, name: str | None = None) -> dict:
         """rename / archive / unarchive through the existing app path."""
