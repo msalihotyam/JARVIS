@@ -32,16 +32,24 @@ ContextPanel {
     readonly property int metricsHeight: 76
     readonly property int rowHeight: 52
     readonly property int emptyHeight: 112
-    // K6: the peek never covers the composer - it ends above the composer's top
-    // (measured when it opens and when the window resizes; nothing can be typed while it is
-    // open). Closing keeps the last value, so the surface does not change size as it fades out.
-    onHeightChanged: if (open) bottomLimit = composerTop()
+    // K6 / G6CM1FIX: the peek never covers the composer's INPUT bar - it may come down to 4 px
+    // above the bar's top (the C1 chip row lifts the bar; ContextPanel keeps 16 px above
+    // bottomLimit, hence + 12). Where the rows do not fit, ContextPanel moves the peek up
+    // rather than below its tile. Measured when it opens and when the window resizes; nothing
+    // can be typed while it is open. Closing keeps the last value, so the surface does not
+    // change size as it fades out.
+    onHeightChanged: if (open) bottomLimit = composerTop() + 12
     function composerTop() {
         var stack = [peek.Window.contentItem]
         while (stack.length) {
             var node = stack.pop()
             if (!node || !node.visible) continue
-            if (node.objectName === "canonicalComposer") return Math.min(peek.height, node.mapToItem(peek, 0, 0).y)
+            if (node.objectName === "canonicalComposer") {
+                var top = node
+                for (var c = 0; c < node.children.length; c++)
+                    if (node.children[c].objectName === "composerBar") top = node.children[c]
+                return Math.min(peek.height, top.mapToItem(peek, 0, 0).y)
+            }
             for (var i = 0; i < node.children.length; i++) stack.push(node.children[i])
         }
         return peek.height
@@ -64,7 +72,7 @@ ContextPanel {
     onFocusScopeChanged: loadFocus()
     onOpenChanged: {
         if (!open) return
-        bottomLimit = composerTop()
+        bottomLimit = composerTop() + 12
         loadFocus()
     }
 
