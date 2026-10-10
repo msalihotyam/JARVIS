@@ -46,9 +46,14 @@ CRASH_PAGE = 3
 # Pace governor (Salih 2026-10-10): pace only via how many lanes run, never via model/effort.
 # build/conveyor/pace.json, re-read every pass; the orchestrator may edit it by hand.
 PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
-                 "reset_alert_pct": 95, "full_burn_limit_pct": 98}
+                 "reset_alert_pct": 95, "full_burn_limit_pct": 98,
+                 "max_lanes": MAX_LANES, "min_free_mem_gb": 3.0}
+MAX_LANES_CAP = 6  # pace.json max_lanes is clamped to 1..MAX_LANES_CAP
+MAX_COMMIT_PCT = 90  # memory guard: no new lane above this commit charge
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
-PACE_BANDS = ((2, 3), (7, 2), (12, 1))  # usage <= pace_line + margin -> max lanes; above all: 0
+PACE_BANDS = ((2, None), (7, 2), (12, 1))  # usage <= pace_line + margin -> max lanes (None:
+# pace.json max_lanes); above all: 0
+INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
 RESET_DROP = 40  # usage falling this many points between two readings = the quota was reset
 PACE_BAD_ID = "pace-invalid"  # attention ids (and ack files)
 RESET_ALERT_ID = "quota-reset-alert"
@@ -158,6 +163,25 @@ def real_runner(args, timeout=120):
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
     return p.returncode, out.decode("utf-8", "replace")
+
+
+def real_mem():
+    """(free physical GB, commit charge %) via GlobalMemoryStatusEx; None when unreadable."""
+    import ctypes
+
+    class MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                   [(n, ctypes.c_ulonglong) for n in (
+                       "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                       "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+    try:
+        m = MemStatus(dwLength=ctypes.sizeof(MemStatus))
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+        # commit limit / available commit = ullTotalPageFile / ullAvailPageFile
+        return m.ullAvailPhys / 1e9, 100 * (1 - m.ullAvailPageFile / m.ullTotalPageFile)
+    except (AttributeError, OSError, ZeroDivisionError):  # no windll off Windows
+        return None
 
 
 def real_cmd(args, timeout=120):
@@ -344,7 +368,7 @@ def validate_slice(s):
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
-                 projects=None):
+                 projects=None, mem=real_mem):
         self.root = Path(root)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
@@ -358,6 +382,10 @@ class Conveyor:
         self.key = key
         self.cmd = cmd
         self.disk = disk
+        self.mem = mem
+        self.memory = None  # (free GB, commit %) this pass, None unknown
+        self.mem_hold = False
+        self.mem_unknown_logged = False
         self.approvals = self.root / "build" / "approvals"
         self.push_file = self.base / "push.json"
         self.free_gb = None
@@ -511,6 +539,10 @@ class Conveyor:
             self.error(f"agents: {e}")
             agents = None
         self.usage = self.usage_pct()
+        self.memory = self.mem()
+        if self.memory is None and not self.mem_unknown_logged:
+            self.mem_unknown_logged = True
+            self.event("memory_unknown")  # unknown memory never holds
         self.govern()
         self.free_gb = self.disk_free_gb()
         if agents is not None:
@@ -750,6 +782,11 @@ class Conveyor:
         return [n for n, ln in lanes.items()
                 if not ln.get("finished") and ln.get("state") not in ("missing",)]
 
+    def int_blocked(self, name, lanes):
+        """An integration lane waits while another one runs (they share the main checkout
+        and run the full suite), whatever max_lanes allows."""
+        return bool(INT_RE.match(name)) and any(INT_RE.match(n) for n in self.running(lanes))
+
     def start(self, name, model, effort, text):
         """`claude --bg` one lane; returns its short id or None."""
         rc, out = self.run(["--bg", "--name", name, "--model", model,
@@ -811,8 +848,9 @@ class Conveyor:
         return self.free_gb is None or self.free_gb < MIN_FREE_GB
 
     def hold(self):
-        """PAUSE flag, usage guard or low disk: nothing new starts."""
-        return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold
+        """PAUSE flag, usage guard, low disk or low memory: nothing new starts."""
+        return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
+            or self.mem_hold
 
     # ---- pace governor ------------------------------------------------
     def load_pace(self):
@@ -826,13 +864,16 @@ class Conveyor:
             p = {**PACE_DEFAULTS, **json.loads(f.read_text(encoding="utf-8"))}
             if p["mode"] not in ("full_burn", "paced"):
                 raise ValueError(f"mode {p['mode']!r}")
-            for k in ("days", "reset_alert_pct", "full_burn_limit_pct"):
-                if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or p[k] <= 0:
+            for k in ("days", "reset_alert_pct", "full_burn_limit_pct", "min_free_mem_gb",
+                      "max_lanes"):
+                if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
+                        (p[k] <= 0 and k != "max_lanes"):
                     raise ValueError(f"{k} {p[k]!r}")
+            p["max_lanes"] = min(MAX_LANES_CAP, max(1, int(p["max_lanes"])))
             if p["mode"] == "paced":
                 datetime.fromisoformat(p["window_start"]).timestamp()  # TypeError when null
             return p, None
-        except (OSError, ValueError, TypeError) as e:
+        except (OSError, ValueError, TypeError, OverflowError) as e:
             return {**PACE_DEFAULTS, "mode": "paced", "window_start": iso(self.now())}, \
                 f"{type(e).__name__}: {e}"[:200]
 
@@ -855,9 +896,9 @@ class Conveyor:
             self.pager_flag("pace_invalid", [err, self.now()])
         elif not err and cur:
             self.pager_flag("pace_invalid", False)
-        line = None
+        line, top = None, p["max_lanes"]
         if p["mode"] == "full_burn":
-            limit, n, band = p["full_burn_limit_pct"], MAX_LANES, "full_burn"
+            limit, n, band = p["full_burn_limit_pct"], top, "full_burn"
             if u is not None and u >= p["reset_alert_pct"] and not self.pager_flag("reset_alert"):
                 self.page(f"Haftalık kota %{round(u)}: sıfırlama hakkını şimdi kullanabilirsin")
                 self.pager_flag("reset_alert", [round(u), self.now()])
@@ -867,19 +908,24 @@ class Conveyor:
             line = 100 * max(0.0, self.now() - start) / 86400 / p["days"]
             limit, n, band = PACED_LIMIT, 0, "over"
             if u is None:
-                n, band = MAX_LANES, "unknown"  # as before the governor: no reading, no hold
+                n, band = min(MAX_LANES, top), "unknown"  # no reading: no hold, at most 3
             else:
                 for margin, lanes in PACE_BANDS:
                     if u <= line + margin:
-                        n, band = lanes, f"<=pace+{margin}"
+                        n, band = min(lanes or top, top), f"<=pace+{margin}"
                         break
         self.usage_hold = u is not None and u >= limit
         self.max_lanes = 0 if self.usage_hold else n
+        m = self.memory
+        self.mem_hold = m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > MAX_COMMIT_PCT)
+        if self.mem_hold:
+            band = "memory hold"  # running lanes untouched; nothing new starts (hold())
         self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
                      "pace_line": line if line is None else round(line, 1),
                      "max_lanes": self.max_lanes, "band": band, "limit_pct": limit, "error": err}
         # the first full_burn pass is the pre-governor state: no event for it
-        if (self.pager_flag("pace_band") or ["full_burn", "full_burn", MAX_LANES])                 != [p["mode"], band, self.max_lanes]:
+        if (self.pager_flag("pace_band") or ["full_burn", "full_burn", MAX_LANES]) \
+                != [p["mode"], band, self.max_lanes]:
             self.pager_flag("pace_band", [p["mode"], band, self.max_lanes])
             self.event("pace", **self.pace)
 
@@ -910,8 +956,8 @@ class Conveyor:
             name = hdr["lane"]
             if len(self.running(lanes)) >= self.max_lanes:
                 return
-            if name in busy:
-                continue  # same-name lane still working; wait
+            if name in busy or self.int_blocked(name, lanes):
+                continue  # same-name lane still working, or another integration lane; wait
             sid = self.start(name, hdr["model"], hdr["effort"], text)
             if not sid:
                 continue
@@ -985,6 +1031,8 @@ class Conveyor:
                 view[sid] = "overlap"
             elif sid in busy:
                 view[sid] = "same_name_busy"
+            elif self.int_blocked(sid, lanes):
+                view[sid] = "int_busy"
             elif why := self.slice_lint(s):
                 view[sid] = "held: " + why  # the lint would drop its header
             else:
@@ -1147,6 +1195,9 @@ class Conveyor:
             "pace": self.pace,
             "disk_hold": self.disk_hold(),
             "disk_free_gb": self.free_gb and round(self.free_gb, 1),
+            "memory_hold": self.mem_hold,
+            "memory": self.memory and {"free_gb": round(self.memory[0], 1),
+                                       "commit_pct": round(self.memory[1], 1)},
             "lanes": [{"name": n, "id": ln["id"], "model": ln.get("model"),
                        "effort": ln.get("effort"), "state": ln.get("state"),
                        "status": ln.get("status"), "report": ln.get("report"),

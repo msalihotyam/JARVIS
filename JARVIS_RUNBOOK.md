@@ -648,6 +648,19 @@ the optional report reader below. One instance at a time
   no re-dispatch. `status.json` shows `disk_hold` and `disk_free_gb`; one
   `disk-low` attention item (and one `disk_hold` event) per episode; at 10 GB
   or more dispatch resumes and the episode ends.
+- **Memory guard (CONV5).** Free physical memory under `min_free_mem_gb`
+  (pace.json, default 3.0) or a commit charge above 90% (`MAX_COMMIT_PCT`;
+  `GlobalMemoryStatusEx` via ctypes, stdlib only) holds like PAUSE: no
+  dispatch, no re-dispatch; running lanes are untouched. `status.json` shows
+  `memory_hold` and `memory` (`free_gb`, `commit_pct`) and `pace.band` reads
+  `memory hold` (a band change, so a `pace` event). Unreadable memory never
+  holds: `memory` is null and one `memory_unknown` event is logged per
+  conveyor process.
+- **One integration lane at a time (CONV5).** A lane whose name starts with
+  `INT` not followed by a letter (`INT7`, `int-x`; not `INTERACT1`) is not
+  dispatched while another such lane is running, whatever `max_lanes` allows
+  (they share the main checkout and run the full suite). An inbox prompt
+  waits in the inbox; a backlog slice shows `int_busy`.
 - **Auto-push of main (two keys).** Salih (2026-10-09 21:32) delegated the
   main push: "push it when you judge it right". Lanes still never push main;
   only the conveyor does, and no model is the authority. Key 1: the
@@ -681,17 +694,23 @@ the optional report reader below. One instance at a time
   lanes run in parallel. `build/conveyor/pace.json`, re-read every pass (the
   orchestrator may edit it by hand at any time; written with the defaults if
   missing): `{"mode": "full_burn" | "paced", "window_start": ISO|null,
-  "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98}`.
-  - `full_burn` (until Salih uses his one manual quota reset): up to 3 lanes;
-    no new lane at `usage_pct >= full_burn_limit_pct`. At
+  "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98, "max_lanes": 3,
+  "min_free_mem_gb": 3.0}`. `max_lanes` (Salih 2026-10-10 03:26: more
+  parallel lanes until the manual reset when the laptop can take it) is a
+  number clamped to 1..6 (`MAX_LANES_CAP`); a non-number makes pace.json
+  invalid. `min_free_mem_gb` feeds the memory guard.
+  - `full_burn` (until Salih uses his one manual quota reset): up to
+    `max_lanes` lanes; no new lane at `usage_pct >= full_burn_limit_pct`. At
     `usage_pct >= reset_alert_pct` Salih is paged once ("Haftalık kota %<n>:
     sıfırlama hakkını şimdi kullanabilirsin") and attention item
     `quota-reset-alert` is added.
   - `paced`: `pace_line = 100 * elapsed_since(window_start) / days`.
-    Effective max lanes: 3 when `usage_pct <= pace_line + 2`, 2 when
-    `<= pace_line + 7`, 1 when `<= pace_line + 12`, else 0 (no new dispatch;
+    Effective max lanes: `max_lanes` when `usage_pct <= pace_line + 2`, 2 when
+    `<= pace_line + 7`, 1 when `<= pace_line + 12` (never above `max_lanes`),
+    else 0 (no new dispatch;
     running lanes are never touched). No new lane at `usage_pct >= 97`.
-    Integration lanes count like any lane. Unknown usage: 3 lanes.
+    Integration lanes count like any lane (and at most one runs, see above).
+    Unknown usage: `min(3, max_lanes)` lanes.
   - Reset detection: `usage_pct` dropping 40 or more points between two
     readings (manual or weekly reset) switches pace.json to `paced` with
     `window_start` = now, logs a `quota_reset` event and adds attention item

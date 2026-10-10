@@ -121,6 +121,7 @@ class Base(unittest.TestCase):
         self.fake = FakeClaude()
         self.git = FakeGit()
         self.free = 100e9
+        self.memory = (64.0, 20.0)  # (free GB, commit %): never the real machine's memory
         self.t = float(int(time.time()))
         self.pushes = []
         self.key = ""  # reader off by default; never the real key lookup (env/registry)
@@ -129,7 +130,8 @@ class Base(unittest.TestCase):
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
                           send=lambda text: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
-                          cmd=self.git, disk=self.fake_disk, projects=self.root / "projects")
+                          cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                          mem=lambda: self.memory)
         self.base = self.root / "build" / "conveyor"
 
     def fake_disk(self, path):
@@ -423,7 +425,8 @@ class TestInbox(Base):
         self.c.pass_once()
         s = self.status()
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
-                                  "usage_hold", "pace", "disk_hold", "disk_free_gb", "lanes",
+                                  "usage_hold", "pace", "disk_hold", "disk_free_gb",
+                                  "memory_hold", "memory", "lanes",
                                   "backlog", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
@@ -1131,6 +1134,146 @@ class TestPaceGovernor(TestUsageGuard):
             self.assertIn(conveyor.PACE_BAD_ID, self.attn())
             self.assertEqual((self.base / "pace.json").read_text(encoding="utf-8"), bad)  # left as is
 
+    def lanes_for_8(self, pct):
+        """Effective max lanes for one reading, eight prompts waiting."""
+        self.ledger(pct)
+        for n in "ABCDEFGH":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        return len(self.fake.bg_calls())
+
+    def test_max_lanes_clamp(self):
+        for raw, want in ((0, 1), (-4, 1), (1, 1), (5, 5), (6, 6), (7, 6), (40, 6), (4.9, 4)):
+            self.fresh()
+            self.pace(max_lanes=raw)
+            self.assertEqual(self.lanes_for_8(10), want, raw)
+            self.assertEqual(self.status()["pace"]["max_lanes"], want)
+            self.assertIsNone(self.status()["pace"]["error"])
+
+    def test_max_lanes_not_a_number_is_invalid(self):
+        for bad in ('"5"', "true", "null"):
+            self.fresh()
+            (self.base / "pace.json").write_text('{"max_lanes": ' + bad + "}", encoding="utf-8")
+            self.c.pass_once()
+            self.assertTrue(self.status()["pace"]["error"], bad)
+            self.assertIn(conveyor.PACE_BAD_ID, self.attn())
+
+    def test_full_burn_uses_max_lanes(self):
+        self.pace(max_lanes=5)
+        self.assertEqual(self.lanes_for_8(90), 5)
+        self.assertEqual(self.status()["pace"]["band"], "full_burn")
+
+    def test_max_lanes_reread_every_pass(self):
+        self.pace(max_lanes=2)
+        self.assertEqual(self.lanes_for_8(10), 2)
+        self.pace(max_lanes=4)
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 4)
+
+    def test_paced_bands_with_max_lanes_5(self):
+        for pct, want in ((52, 5), (52.1, 2), (57, 2), (57.1, 1), (62, 1), (62.1, 0)):
+            self.fresh()
+            self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=5)
+            self.assertEqual(self.lanes_for_8(pct), want, pct)
+            self.assertEqual(self.status()["pace"]["max_lanes"], want)
+
+    def test_paced_lower_bands_capped_by_max_lanes_1(self):
+        for pct, want in ((52, 1), (55, 1), (60, 1), (62.1, 0)):
+            self.fresh()
+            self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=1)
+            self.assertEqual(self.lanes_for_8(pct), want, pct)
+
+    def test_paced_unknown_usage_at_most_3(self):
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=6)
+        for n in "ABCDEFGH":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 3)
+        self.assertEqual(self.status()["pace"]["band"], "unknown")
+
+
+class TestMemoryGuard(Base):
+    def test_low_free_memory_holds_and_releases(self):
+        self.memory = (2.9, 50.0)
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        st = self.status()
+        self.assertTrue(st["memory_hold"])
+        self.assertEqual(st["memory"], {"free_gb": 2.9, "commit_pct": 50.0})
+        self.assertEqual(st["pace"]["band"], "memory hold")
+        self.memory = (3.0, 50.0)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertFalse(self.status()["memory_hold"])
+        self.assertEqual(self.status()["pace"]["band"], "full_burn")
+
+    def test_high_commit_charge_holds(self):
+        self.memory = (32.0, 90.1)
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertTrue(self.status()["memory_hold"])
+        self.memory = (32.0, 90.0)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+
+    def test_min_free_mem_read_from_pace_json(self):
+        (self.base / "pace.json").write_text(json.dumps({"min_free_mem_gb": 8}), encoding="utf-8")
+        self.memory = (7.5, 10.0)
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+
+    def test_running_lanes_untouched(self):
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.memory = (1.0, 99.0)
+        self.drop("b.md", HDR.format("B") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("stop", "rm")])
+        self.assertEqual(self.c.running(self.lanes()), ["A"])
+
+    def test_unknown_memory_no_hold_logged_once(self):
+        self.memory = None
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertFalse(self.status()["memory_hold"])
+        self.assertIsNone(self.status()["memory"])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "memory_unknown"]), 1)
+
+    def test_real_mem_shape(self):
+        m = conveyor.real_mem()  # read-only stdlib call; None off Windows
+        if m is not None:
+            self.assertGreater(m[0], 0)
+            self.assertTrue(0 <= m[1] <= 100)
+
+
+class TestOneIntegrationLane(Base):
+    def test_second_inbox_int_waits(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        for n in ("INT7", "int8", "INTERACT1", "B"):
+            self.drop(f"{n}.md", HDR.format(n) + "x")
+        self.c.pass_once()
+        self.assertEqual(sorted(self.fake.bg_names()), ["B", "INT7", "INTERACT1"])
+        self.assertTrue((self.base / "inbox" / "int8.md").exists())
+        self.report("INT7", "PASS")
+        self.t += 60
+        self.c.pass_once()
+        self.assertIn("int8", self.fake.bg_names())
+
+    def test_backlog_int_waits_for_running_int(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.drop("i.md", HDR.format("INT1") + "x")
+        self.c.pass_once()
+        self.backlog({"id": "INT-2"}, {"id": "S"})
+        self.c.pass_once()
+        self.assertEqual(sorted(self.fake.bg_names()), ["INT1", "S"])
+        self.assertEqual(self.view()["INT-2"], "int_busy")
+
 
 KEY = "sk-ant-SECRET-reader-key-42"
 
@@ -1706,7 +1849,7 @@ class TestCleanup(Base):
 
     def test_ledger_prefers_scripts_copy(self):
         c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk,
-                     projects=self.root / "projects")
+                     projects=self.root / "projects", mem=lambda: self.memory)
         mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
               "    Path(out).write_text('{}')\n"
         (self.root / "scripts").mkdir()
