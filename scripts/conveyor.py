@@ -743,6 +743,7 @@ class Conveyor:
             self.stop_finished(lanes, agents, {i for i, _, _ in items})
             self.cleanup(lanes, agents, {i for i, _, _ in items})
             self.save_lanes(lanes)
+            items = self.attention(lanes)  # a lane cleanup just preserved shows at once
         self.write_status(lanes, items)
         self.backstop(items)
         self.flush_pages()
@@ -1037,7 +1038,7 @@ class Conveyor:
 
     def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False):
         old = lanes.get(name)  # a same-name earlier lane: its sessions stay known for cleanup
-        prev = [*old.get("prev_ids", []), old["id"]] if old and "cleanup" not in old else []
+        prev = [*old.get("prev_ids", []), old["id"]] if old and "cleanup" not in old and "preserved" not in old else []
         lanes[name] = {"id": sid, "prev_ids": prev, "model": model, "effort": effort, "base": base,
                        "started_at": iso(self.now()), "started_ts": self.now(),
                        "updated_at": iso(self.now()), "state": "working",
@@ -1523,6 +1524,11 @@ class Conveyor:
                 why.append(ln["auto_fix"])
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
+        for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
+            if "preserved" in ln:
+                pv = ln["preserved"]
+                items.append((f"preserved:{n}", f"lane worktree kept (not removed): {pv['reason']}",
+                              pv["ts"]))
         dry = self.pager_flag("dry")
         if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
             items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
@@ -1591,6 +1597,8 @@ class Conveyor:
                        "started_at": ln.get("started_at"), "updated_at": ln.get("updated_at"),
                        "reading": ln.get("reading")}
                       for n, ln in lanes.items()],
+            "preserved": [{"lane": n, **ln["preserved"]} for n, ln in lanes.items()
+                          if "preserved" in ln],
             "backlog": self.backlog_view,
             "breaker": "open" if self.breaker else "closed",
             "band": self.band,
@@ -2005,7 +2013,8 @@ class Conveyor:
         for name, ln in lanes.items():
             if done >= CLEANUP_PER_PASS:
                 return
-            if not ln.get("finished") or "cleanup" in ln or name in attention_ids:
+            if (not ln.get("finished") or "cleanup" in ln or "preserved" in ln
+                    or name in attention_ids):
                 continue
             t = self.collected_ts(ln)
             if t is None or self.now() - t < CLEANUP_S:
@@ -2042,6 +2051,13 @@ class Conveyor:
                     self.event("cleanup_skip", lane=name, reason=doubt)
                 continue
             done += 1
+            for a in sess:
+                kept = self.unintegrated(a)
+                if kept:
+                    self.preserve(ln, name, *kept)
+                    break
+            if "preserved" in ln:
+                continue
             steps = []
             for a in sess:
                 for cmd in (["stop"] if "pid" in a else []) + ["rm"]:
@@ -2060,6 +2076,57 @@ class Conveyor:
             self.event("cleanup", lane=name, result=ln["cleanup"]["result"], steps=steps)
             if not ok:
                 self.error(f"cleanup {name}: {steps[-1]['cmd']} rc={steps[-1]['rc']}", lane=name)
+                if steps[-1]["cmd"] == "rm" and self.worktree_of(sess[-1]):
+                    # refused although the branch is integrated (`claude rm --discard-unpushed`
+                    # would also drop uncommitted changes: never passed): keep, do not retry
+                    self.preserve(ln, name, f"claude rm refused: {steps[-1]['output'][-150:]}",
+                                  None, None)
+
+    def worktree_of(self, a):
+        """The session's lane worktree path under <root>/.claude/worktrees, else None
+        (a session in the canonical checkout has no worktree to lose)."""
+        cwd = a.get("cwd")
+        if not cwd:
+            return None
+        wt = Path(os.path.normcase(os.path.abspath(cwd)))
+        home = Path(os.path.normcase(os.path.abspath(self.root / ".claude" / "worktrees")))
+        return wt if home in wt.parents else None
+
+    def unintegrated(self, a):
+        """(reason, branch, first unintegrated sha) when the session's worktree branch is not
+        provably all on local main (read-only git in the canonical checkout), else None.
+        Fail closed: any git error, unknown branch or '+' line in `git cherry` is a reason."""
+        wt = self.worktree_of(a)
+        if wt is None:
+            return None
+        try:
+            rc, out = self.cmd(["git", "worktree", "list", "--porcelain"])
+            if rc != 0:
+                return f"git worktree list rc={rc}", None, None
+            branch, cur = None, None
+            for line in out.splitlines():
+                if line.startswith("worktree "):
+                    cur = Path(os.path.normcase(os.path.abspath(line[9:].strip())))
+                elif line.startswith("branch refs/heads/") and cur == wt:
+                    branch = line[len("branch refs/heads/"):].strip()
+            if not branch:
+                return "worktree branch unknown", None, None
+            rc, out = self.cmd(["git", "cherry", "main", branch])
+        except Exception as e:  # a timeout etc.
+            return f"git failed: {type(e).__name__}", None, None
+        if rc != 0:
+            return f"git cherry main {branch} rc={rc}", branch, None
+        for line in out.splitlines():
+            if line.startswith("+"):
+                sha = line[1:].strip()
+                return f"{branch} has commits not on main (first {sha[:7]})", branch, sha
+        return None
+
+    def preserve(self, ln, name, reason, branch, sha):
+        """Mark the lane preserved (the orchestrator removes the mark by hand): never rm'd again."""
+        ln["preserved"] = {"ts": self.now(), "at": iso(self.now()), "reason": reason,
+                           "branch": branch, "first_unintegrated_sha": sha}
+        self.event("preserved", lane=name, reason=reason, branch=branch, sha=sha)
 
     def loop(self, once=False):
         if not self.acquire_lock():

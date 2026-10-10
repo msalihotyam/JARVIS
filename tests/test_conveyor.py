@@ -466,7 +466,7 @@ class TestInbox(Base):
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
                                   "memory_hold", "memory", "presence", "lanes",
-                                  "backlog", "breaker", "band", "attention"})
+                                  "preserved", "backlog", "breaker", "band", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -2259,6 +2259,106 @@ class TestCleanup(Base):
         (self.root / "scripts" / "usage_ledger.py").unlink()
         c.usage_ledger()
         self.assertEqual(self.ledger.read_text(), "build")
+
+
+class TestPreserved(Base):
+    """CONV11: a lane whose branch is not provably on main is preserved, never rm-retried."""
+
+    fake_ledger = TestCleanup.fake_ledger
+    finished = TestCleanup.finished
+    cli = TestCleanup.cli
+
+    def setUp(self):
+        super().setUp()
+        self.ledger_runs, self.ledger_error, self.ledger_skip = 0, None, set()
+        self.c.usage_ledger = self.fake_ledger
+        self.ledger = self.root / "build" / "ledger" / "usage.json"
+        self.c.stop_finished = lambda *a: None
+        self.git_fail = None
+        self.c.cmd = self.run_git
+        self.g("init", "-q", "-b", "main")
+        (self.root / "f.txt").write_text("base\n")
+        self.g("add", "f.txt")
+        self.g("commit", "-q", "-m", "base")
+        self.wt = self.root / ".claude" / "worktrees" / "A"
+        self.g("worktree", "add", "-q", "-b", "lane-a", str(self.wt))
+
+    def g(self, *args, cwd=None):
+        p = conveyor.subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", *args],
+            cwd=cwd or self.root, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout.strip()
+
+    def run_git(self, args, timeout=120):
+        if args[:2] not in (["git", "worktree"], ["git", "cherry"]):
+            return self.git(args, timeout)  # the fake main/origin of every other test
+        if self.git_fail:
+            return self.git_fail
+        p = conveyor.subprocess.run(args, cwd=self.root, capture_output=True, text=True)
+        return p.returncode, p.stdout
+
+    def lane_commit(self):
+        (self.wt / "g.txt").write_text("work\n")
+        self.g("add", "g.txt", cwd=self.wt)
+        self.g("commit", "-q", "-m", "work", cwd=self.wt)
+        return self.g("rev-parse", "HEAD", cwd=self.wt)
+
+    def run_cleanup(self):
+        sid = self.finished(agent={"cwd": str(self.wt)})
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        return sid
+
+    def assert_preserved_once(self):
+        for _ in range(3):
+            self.t += 60
+            self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "preserved"]), 1)
+        self.assertEqual([i["id"] for i in self.status()["attention"] if i["id"].startswith("preserved:")],
+                         ["preserved:A"])
+        self.assertEqual([p["lane"] for p in self.status()["preserved"]], ["A"])
+        return self.lanes()["A"]["preserved"]
+
+    def test_integrated_by_cherry_pick_is_removed_once(self):
+        sha = self.lane_commit()
+        self.g("cherry-pick", sha)  # a new sha on main, same patch
+        sid = self.run_cleanup()
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        self.assertNotIn("preserved", self.lanes()["A"])
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), 1)
+
+    def test_unintegrated_commit_is_preserved_without_rm(self):
+        sha = self.lane_commit()
+        self.run_cleanup()
+        pv = self.assert_preserved_once()
+        self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
+        self.assertEqual(self.cli("stop"), [])
+
+    def test_git_failure_is_preserved(self):
+        self.git_fail = (128, "fatal: boom")
+        self.run_cleanup()
+        self.assertIsNone(self.assert_preserved_once()["branch"])
+
+    def test_unknown_branch_is_preserved(self):
+        self.g("worktree", "remove", "--force", str(self.wt))
+        self.run_cleanup()
+        self.assertIn("unknown", self.assert_preserved_once()["reason"])
+
+    def test_rm_refused_for_integrated_branch_is_preserved(self):
+        self.fake.rm_rc = 1
+        sid = self.run_cleanup()
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+        self.assertIn("refused", self.lanes()["A"]["preserved"]["reason"])
+        for _ in range(3):
+            self.t += 60
+            self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), 1)
+        self.assertEqual([i["id"] for i in self.status()["attention"] if i["id"].startswith("preserved:")],
+                         ["preserved:A"])
 
 
 class TestEarlyStop(Base):

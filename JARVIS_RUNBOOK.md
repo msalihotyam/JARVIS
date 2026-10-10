@@ -900,6 +900,18 @@ the optional report reader below. One instance at a time
   `result: error`, `last_error`). At most 5 lanes per pass; one `cleanup`
   event per lane. Sessions not in `lanes.json` (Salih's, the orchestrator's)
   are never touched.
+  **Preserved lanes** (CONV11): before `rm`, a session whose cwd is a lane
+  worktree is checked read-only in the canonical checkout (`git worktree list
+  --porcelain` for its branch, then `git cherry main <branch>`). Only `-`
+  lines (every commit has an equivalent patch on main, e.g. integrated by
+  cherry-pick) lets `claude rm` run, once. Any `+` line, unknown branch, git
+  error, or an `rm` that still refuses (`exists on no remote ...`) marks the
+  lane `preserved` in `lanes.json` (reason, branch, first unintegrated sha),
+  lists it under `preserved` in `status.json`, raises one attention item
+  `preserved:<lane>` and the conveyor never touches it again (no `rm` retry,
+  no deletion); the orchestrator removes the `preserved` key by hand. The CLI
+  force options (`--discard-unpushed`, `--force-remove-worktree`) are never
+  passed: the first also drops uncommitted changes.
 - **Early stop** (CONV8, memory): such a lane's live sessions are `claude stop`ped (never `rm`) as soon as its report is collected and it is not in attention (same doubt checks on a fresh listing; once per lane, `early_stop` event; a failure is logged, never fatal); `rm` still waits for the 2 h + ledger rule above.
 - **Switch-over.** The scheduled task runs `scripts/conveyor.py` from the
   canonical checkout (v0 was `build/conveyor/conveyor.py`); it reads the same
