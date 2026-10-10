@@ -269,7 +269,10 @@ class CatalogTests(UiTestCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("SOHBETLER", tx("HistoryPage", "CONVERSATIONS"))
-        self.assertEqual("SOHBETLER", tx("ProjectsPage", "CONVERSATIONS"))
+        # G6PJ2 (6G P3): the project page heads its lists SABİTLENEN / SON SOHBETLER (the old source comes back).
+        self.assertEqual("CONVERSATIONS", tx("ProjectsPage", "CONVERSATIONS"))
+        self.assertEqual("SON SOHBETLER", tx("ProjectPage", "RECENT CONVERSATIONS"))
+        self.assertEqual("SABİTLENEN", tx("ProjectPage", "PINNED"))
         # Sidebar v2 L3: no SOHBETLER heading in the sidebar (the source comes back); SABİTLENENLER heads its list.
         self.assertEqual("CONVERSATIONS", tx("Sidebar", "CONVERSATIONS"))
         self.assertEqual("SABİTLENENLER", tx("Sidebar", "PINNED"))
@@ -1228,7 +1231,9 @@ class ListLayoutTests(ListCase):
                 self.apart([name, self.item(root, "projectStatePill"), self.item(root, "projectRename"),
                             self.item(root, "projectArchive")])
                 self.assertGreaterEqual(self.painted(name), 6)
-                self.assertEqual("+ Yeni sohbet", self.item(root, "projectNewConversation").property("label"))
+                # G6PJ2 (6G P3): the "+ Yeni sohbet" button became the page composer's start key (an
+                # icon); its tip still names the project.
+                self.assertEqual("send", self.item(root, "projectNewConversation").property("icon"))
                 self.assertEqual(f"{LONG_PROJECT} içinde yeni sohbet", self.item(root, "projectNewConversationTip").property("text"))
                 for row in self.visible(root, "projectConversationRow") + self.visible(root, "projectArchivedConversationRow"):
                     self.apart([row.childItems()[0], *self.under(row, "listRowBadge"), *self.under(row, "listRowMeta"),
@@ -1294,16 +1299,18 @@ class ListStateTests(ListCase):
         QTest.keyClick(root, Qt.Key_Return)
         pump(300)
         self.assertEqual(focused, bridge.openProject["name"])
-        tabs = self.item(root, "projectTabs")
-        tabs.forceActiveFocus()
+        # G6PJ2 (6G P3): the Conversations / Instruction / Files tabs became the right column's
+        # rows: Tab reaches one (its ring), Return opens its dialog, Esc puts it away.
+        row = self.item(root, "projectInstructionRow")
+        row.forceActiveFocus()
         pump(60)
-        self.assertTrue(self.under(tabs, "segmentedFocusRing"))
+        self.assertTrue(self.under(row, "sideRowFocusRing"))
         page = self.item(root, "projectsPage")
-        QTest.keyClick(root, Qt.Key_Right)
+        QTest.keyClick(root, Qt.Key_Return)
         pump(60)
         self.assertEqual("instruction", page.property("section"))
-        QTest.keyClick(root, Qt.Key_Left)
-        pump(60)
+        QTest.keyClick(root, Qt.Key_Escape)
+        settle(lambda: page.property("section") == "conversations")          # after the dialog's exit motion
         self.assertEqual("conversations", page.property("section"))
         self.assertEqual(0, self.execute_calls())
 
@@ -1367,10 +1374,11 @@ class ListStateTests(ListCase):
         ))
         bridge.showProject(garden)
         pump(300)
-        for name, text in (("projectConversationsEmpty", "Bu projede henüz sohbet yok."),
-                           ("projectJobsEmpty", "Bu proje için zamanlanmış iş yok.")):
+        for name, text in (("projectConversationsEmpty", "Bu projede henüz sohbet yok."),):
             line = self.item(root, name)
             self.assertEqual((True, text, 0.0), (line.isVisible(), line.property("text"), line.x()))
+        # G6PJ2 (6G P3): no Scheduled section or line before V2.5 (was "Bu proje için zamanlanmış iş yok.").
+        self.assertEqual([], self.all_items(root, "projectJobsEmpty") + self.all_items(root, "projectJobsHeading"))
         self.assertTrue(self.item(root, "projectNewConversation").isEnabled())
 
     def test_ah_q6_the_rename_field_shows_only_after_rename(self) -> None:

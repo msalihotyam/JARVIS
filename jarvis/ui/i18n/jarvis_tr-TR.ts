@@ -3249,6 +3249,57 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>ProjectPage</name>
+    <message>
+        <source>Instructions</source>
+        <translation>Talimatlar</translation>
+    </message>
+    <message>
+        <source>View</source>
+        <translation>Görüntüle</translation>
+    </message>
+    <message>
+        <source>No instruction yet. Write the context every conversation in this project should carry.</source>
+        <translation>Henüz talimat yok. Bu projedeki her sohbete eşlik edecek bağlamı buraya yaz.</translation>
+    </message>
+    <message>
+        <source>Files</source>
+        <translation>Dosyalar</translation>
+    </message>
+    <message>
+        <source>Manage</source>
+        <translation>Yönet</translation>
+    </message>
+    <message>
+        <source>No active file</source>
+        <translation>Aktif dosya yok</translation>
+    </message>
+    <message>
+        <source>1 active file</source>
+        <translation>1 aktif dosya</translation>
+    </message>
+    <message>
+        <source>%1 active files</source>
+        <translation>%1 aktif dosya</translation>
+    </message>
+    <message>
+        <source>Folder</source>
+        <translation>Klasör</translation>
+    </message>
+    <message>
+        <source>PINNED</source>
+        <translation>SABİTLENEN</translation>
+    </message>
+    <message>
+        <source>RECENT CONVERSATIONS</source>
+        <translation>SON SOHBETLER</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Kapat</translation>
+    </message>
+</context>
+<context>
     <name>ProjectsPage</name>
     <message>
         <source>Projects</source>
@@ -3335,6 +3386,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Arşivlenmiş proje yok.</translation>
     </message>
     <message>
+        <source>Unpin</source>
+        <translation>Sabitlemeyi kaldır</translation>
+    </message>
+    <message>
+        <source>Pin</source>
+        <translation>Sabitle</translation>
+    </message>
+    <message>
         <source>All projects</source>
         <translation>Tüm projeler</translation>
     </message>
@@ -3345,22 +3404,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Archive</source>
         <translation>Arşivle</translation>
-    </message>
-    <message>
-        <source>Conversations</source>
-        <translation>Sohbetler</translation>
-    </message>
-    <message>
-        <source>Instruction</source>
-        <translation>Talimat</translation>
-    </message>
-    <message>
-        <source>Files</source>
-        <translation>Dosyalar</translation>
-    </message>
-    <message>
-        <source>CONVERSATIONS</source>
-        <translation>SOHBETLER</translation>
     </message>
     <message>
         <source>New conversation in %1</source>
@@ -3391,32 +3434,8 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Önce projeyi arşivden çıkarın</translation>
     </message>
     <message>
-        <source>SCHEDULED JOBS · among the first %1 jobs created; this project may have more</source>
-        <translation>ZAMANLANMIŞ İŞLER · oluşturulan ilk %1 iş arasından; bu projenin daha fazla işi olabilir</translation>
-    </message>
-    <message>
-        <source>SCHEDULED JOBS</source>
-        <translation>ZAMANLANMIŞ İŞLER</translation>
-    </message>
-    <message>
-        <source>(unreadable definition)</source>
-        <translation>(okunamayan tanım)</translation>
-    </message>
-    <message>
         <source>archived</source>
         <translation>arşivlendi</translation>
-    </message>
-    <message>
-        <source>enabled</source>
-        <translation>etkin</translation>
-    </message>
-    <message>
-        <source>disabled</source>
-        <translation>devre dışı</translation>
-    </message>
-    <message>
-        <source>No scheduled job for this project.</source>
-        <translation>Bu proje için zamanlanmış iş yok.</translation>
     </message>
     <message>
         <source>Order: JARVIS safety rules and Core decisions, then your current message, then this instruction, then retrieved memory. The instruction guides the model; it never grants a permission or approves anything.</source>
@@ -3441,10 +3460,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>ARCHIVED</source>
         <translation>ARŞİV</translation>
-    </message>
-    <message>
-        <source>+ New conversation</source>
-        <translation>+ Yeni sohbet</translation>
     </message>
     <message>
         <source>Archived project: the instruction is read-only.</source>

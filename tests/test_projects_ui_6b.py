@@ -39,7 +39,7 @@ class InstructionTests(ProjectsUiCase):
             store.set_project_active(project.id, False)
         bridge.showProject(project.id)
         pump(300)
-        self.click(root, "projectTab_instruction")
+        self.click(root, "projectInstructionRow")              # G6PJ2 (6G P3): was the instruction tab; a row opens its dialog
         pump(200)
         return store, project, bridge, root
 
@@ -133,7 +133,7 @@ class FileTests(ProjectsUiCase):
         root = self.window(bridge)
         bridge.showProject(project.id)
         pump(300)
-        self.click(root, "projectTab_files")
+        self.click(root, "projectFilesRow")                    # G6PJ2 (6G P3): was the files tab; a row opens its dialog
         pump(200)
         return store, project, bridge, root
 

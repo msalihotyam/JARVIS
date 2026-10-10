@@ -294,6 +294,7 @@ class Bridge(QObject):
         self._project_records: list[dict] = []
         self._project_counts: dict[str, tuple[int, int]] = {}      # project id -> (conversations, archived); presentation only
         self._instruction_lines: dict[str, str] = {}                # project id -> its card's instruction line; presentation only
+        self._project_folder: dict[str, str] = {}                   # the open project's current 6H folder link (read only)
         self._open_project = ""
         self._project_conversations: list[dict] = []
         self._project_jobs: list[dict] = []
@@ -950,6 +951,13 @@ class Bridge(QObject):
         return [{**row, "title": render(row["title"]) if isinstance(row["title"], tuple) else row["title"],
                  "active": row["id"] == self._conversation_store.id} for row in self._project_archived_conversations]
 
+    @Property("QVariantMap", notify=projectsChanged)
+    def projectFolder(self) -> dict:
+        """Gate 6G P3, read only: the open project's CURRENT folder link (6H H1)
+        as the store keeps it - {path, linked_at} - or {} when none. Context for
+        the local user, never authority; nothing here links, unlinks or creates."""
+        return dict(self._project_folder)
+
     @Property("QVariantList", notify=projectsChanged)
     def projectJobs(self) -> list:
         return list(self._project_jobs)
@@ -997,11 +1005,18 @@ class Bridge(QObject):
     def _load_project_detail(self) -> None:
         self._project_conversations, self._project_jobs, self._project_jobs_bounded = [], [], False
         self._project_archived_conversations = []
+        self._project_folder = {}
         self._load_project_instruction()
         self._load_project_files()
         if not self._open_project:
             return
         store = self._conversation_db()
+        try:
+            link = store.load_project_folder(self._open_project) if store is not None else None
+        except Exception:  # noqa: BLE001 - a label only; an unreadable link is not shown
+            link = None
+        if link is not None:
+            self._project_folder = {"path": link.path, "linked_at": link.linked_at}
         try:
             records = (store.list_conversations(project_id=self._open_project, include_archived=True)
                        if store is not None else [])

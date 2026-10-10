@@ -277,7 +277,8 @@ class ArchivedTests(ProjectsUiCase):
             self.assertTrue(self.item(root, "projectArchivedBanner").isVisible()),
             self.assertEqual(["Tez hatırlatma"], [job["label"] for job in bridge.projectJobs]),
             self.assertFalse(bridge.projectJobsBounded),
-            self.assertEqual("SCHEDULED JOBS", self.item(root, "projectJobsHeading").property("text")),
+            # G6PJ2 (6G P3): the project page has no Scheduled section before V2.5 (was the SCHEDULED JOBS heading).
+            self.assertEqual([], self.all_items(root, "projectJobsHeading")),
             self.assertFalse(self.item(root, "projectNewConversation").isEnabled()),
         ))
 
@@ -293,7 +294,8 @@ class ArchivedTests(ProjectsUiCase):
         settled(400, lambda: (
             self.assertTrue(bridge.projectJobsBounded),
             self.assertEqual([], bridge.projectJobs),                    # the store's first 20 omit it
-            self.assertIn("first 20", self.item(root, "projectJobsHeading").property("text")),
+            # G6PJ2 (6G P3): no job listing on the project page, so nothing claims all (was the "first 20" heading).
+            self.assertEqual([], self.all_items(root, "projectJobsHeading") + self.all_items(root, "projectJobList")),
         ))
 
 
