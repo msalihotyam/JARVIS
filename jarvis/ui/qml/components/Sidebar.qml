@@ -489,7 +489,8 @@ Rectangle {
                     var at = -1
                     for (var i = 0; i < sidebar.treeRows.length; ++i) if (sidebar.treeRows[i].active) at = i
                     if (height <= 0) return
-                    if (at < 0) { contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height)); return }
+                    contentY = Math.min(Math.round(contentY / sidebar.step) * sidebar.step, Math.max(0, contentHeight - height))
+                    if (at < 0) return
                     var top = at * sidebar.step, bottom = top + sidebar.step - 2
                     if (top < contentY) contentY = top
                     else if (bottom > contentY + height) contentY = Math.min(Math.max(0, contentHeight - height), Math.max(0, (at + 1 - Math.round((height + 2) / sidebar.step)) * sidebar.step))
