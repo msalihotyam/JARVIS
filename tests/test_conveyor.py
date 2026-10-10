@@ -26,14 +26,20 @@ class FakeClaude:
     def __init__(self):
         self.agents = []
         self.calls = []
+        self.cwds = []
         self.n = 0
         self.fail_agents = False
         self.rm_rc = 0
 
-    def __call__(self, args, timeout=120):
+    def __call__(self, args, timeout=120, cwd=None):
         self.calls.append(args)
+        self.cwds.append(cwd)
         if args[0] == "agents":
             return (1, "boom") if self.fail_agents else (0, json.dumps(self.agents))
+        if args[:2] == ["--bg", "--resume"]:  # continues that session under the same id
+            a = next(a for a in self.agents if a["sessionId"] == args[2])
+            a.update(pid=500 + len(self.calls), state="working", status="busy")
+            return 0, f"backgrounded · {a['id']} · x\n"
         if args[0] == "--bg":
             self.n += 1
             sid = f"{self.n:08x}"
@@ -149,6 +155,7 @@ class Base(unittest.TestCase):
         self.memory = (64.0, 20.0)  # (free GB, commit %): never the real machine's memory
         self.idle = 0.0  # user idle seconds: never the real machine's input
         self.procs = FakeProcs()  # never the real machine's processes
+        self.net = False  # API host reachable: never the real network
         self.t = float(int(time.time()))
         self.pushes = []
         self.key = ""  # reader off by default; never the real key lookup (env/registry)
@@ -158,7 +165,8 @@ class Base(unittest.TestCase):
                           send=lambda text: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
-                          mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs)
+                          mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                          net=lambda: self.net)
         self.base = self.root / "build" / "conveyor"
         self.hour = 12  # local hour for the night rule: never the real clock's
         hour = mock.patch.object(conveyor, "local_hour", lambda t: self.hour)
@@ -843,6 +851,130 @@ class TestRedispatch(Base):
         self.t += 700
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A"])
+
+
+class TestBlockedLane(Base):
+    """CONV9: G6R1, INT18, G6R1B sat 'blocked' after a network loss (2026-10-10)."""
+
+    def setUp(self):
+        super().setUp()
+        self.drop("a.md", HDR.format("A") + "do things\n")
+        self.c.pass_once()
+        self.a = self.fake.agent("A")
+        self.wt = self.root / ".claude" / "worktrees" / "a"
+        self.wt.mkdir(parents=True)
+        old = self.wt / "x.py"
+        old.write_text("x")
+        os.utime(old, (self.t - 9000, self.t - 9000))
+        self.block()
+        self.c.pass_once()  # first seen blocked: the episode starts now
+
+    def block(self):
+        self.a.update(state="blocked", status="idle", cwd=str(self.wt))
+
+    def resumes(self):
+        return [c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]
+
+    def nudges(self):
+        return [e for e in self.events() if e["event"] == "nudge"]
+
+    def test_under_nudge_time_nothing(self):
+        self.net = True
+        self.t += 599
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+        self.assertNotIn(["stop", self.a["id"]], self.fake.calls)
+
+    def test_nudge_after_10_min_with_network(self):
+        self.net = True
+        self.t += 600
+        self.c.pass_once()
+        sid = self.a["sessionId"]
+        self.assertEqual(self.resumes(), [[
+            "--bg", "--resume", sid, "--name", "A", "--model", "opus", "--effort", "high",
+            "--settings", str(self.root / conveyor.SETTINGS), conveyor.NUDGE]])
+        stop = self.fake.calls.index(["stop", self.a["id"]])
+        self.assertLess(stop, self.fake.calls.index(self.resumes()[0]))  # stopped first
+        self.assertEqual(self.fake.cwds[self.fake.calls.index(self.resumes()[0])], str(self.wt))
+        (ev,) = self.nudges()
+        self.assertEqual((ev["lane"], ev["id"], ev["n"]), ("A", self.a["id"], 1))
+        self.assertEqual([s["rc"] for s in ev["steps"]], [0, 0])
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["id"], ln["nudges"]), (self.a["id"], 1))
+        self.t += 3600  # resumed and busy: nothing more
+        self.c.pass_once()
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertNotIn("blocked_since", self.lanes()["A"])
+
+    def test_network_down_no_nudge(self):
+        self.t += 1200
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+        self.net = True  # back: the nudge goes out on the next pass
+        self.c.pass_once()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_at_most_two_nudges_15_min_apart(self):
+        self.net = True
+        for dt in (600, 600, 300, 900, 900):  # 10, 20, 25, 40, 55 min blocked
+            self.t += dt
+            self.c.pass_once()
+            self.block()  # the resumed turn hit the error again before the next pass
+        self.assertEqual([e["n"] for e in self.nudges()], [1, 2])
+        self.assertEqual(len(self.resumes()), 2)
+        times = [e["ts"] for e in self.nudges()]
+        self.assertEqual(times, [conveyor.iso(self.t - 2700), conveyor.iso(self.t - 1800)])
+
+    def test_report_present_no_nudge(self):
+        self.net = True
+        self.report("A", "PASS", mtime=self.t)
+        self.t += 3000
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+        self.assertTrue(self.lanes()["A"]["finished"])
+        self.assertNotIn("A", self.attn())
+
+    def test_attention_once_after_45_min_not_paged_at_night(self):
+        self.hour = 3
+        self.t += conveyor.BLOCKED_ATTENTION_S - 1
+        self.c.pass_once()
+        self.assertNotIn("A", self.attn())
+        self.t += 1
+        self.c.pass_once()
+        (item,) = [x for x in self.status()["attention"] if x["id"] == "A"]
+        self.assertTrue(item["reason"].startswith("lane blocked, needs orchestrator: "))
+        self.assertEqual(item["since"], conveyor.iso(self.t))
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertEqual(len([e for e in self.events() if e["event"] == "blocked_attention"]), 1)
+        self.assertIn("A", self.attn())
+        self.assertEqual(self.pushes, [])  # night: the orchestrator's item, no phone page
+        self.assertEqual(self.resumes(), [])  # the network stayed down
+        ack = self.base / "ack"
+        ack.mkdir()
+        (ack / "A").write_text("")
+        os.utime(ack / "A", (self.t, self.t))
+        self.c.pass_once()
+        self.assertNotIn("A", self.attn())
+
+    def test_worktree_activity_defers_attention(self):
+        self.t += conveyor.BLOCKED_ATTENTION_S
+        f = self.wt / "new.py"
+        f.write_text("work")
+        os.utime(f, (self.t - 60, self.t - 60))
+        self.c.pass_once()
+        self.assertNotIn("A", self.attn())
+
+    def test_pace_override_is_clamped(self):
+        self.net = True
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "blocked_nudge_min": 1}))
+        self.t += 299
+        self.c.pass_once()
+        self.assertEqual(self.resumes(), [])
+        self.t += 1  # 1 min is clamped to 5
+        self.c.pass_once()
+        self.assertEqual(len(self.resumes()), 1)
 
 
 class TestPager(Base):

@@ -643,6 +643,17 @@ the optional report reader below. One instance at a time
   re-dispatched from its saved prompt with a short "continue from where you
   stopped" preface; after 2 re-dispatches it is finished as `STUCK` (slot freed,
   in `attention`). An idle or finished session never blocks a new lane of the same name.
+- **Blocked lane (CONV9).** A live lane session whose turn ended on an API error
+  (network loss; G6R1, INT18, G6R1B on 2026-10-10) shows state `blocked` and never
+  continues by itself. After 10 min blocked (pace.json `blocked_nudge_min`, clamped
+  5..30) and only when `api.anthropic.com:443` accepts a TCP connect, the conveyor
+  nudges it: `claude stop <id>` (conversation kept), then `claude --bg --resume
+  <sessionId> --name/--model/--effort/--settings ...` "Continue the task from where you
+  stopped. ..." in the session's cwd (`--bg` help: with `--resume` it "continues that
+  session in the background under the same ID"); at most 2 per lane, 15 min apart, a
+  `nudge` event each; never for a lane with a report. 45 min blocked with no new file
+  in its worktree: attention item `<lane>` "lane blocked, needs orchestrator" (one
+  `blocked_attention` event; night quiet as in Autopilot) to drop or requeue it.
 - **PAUSE.** `build/conveyor/PAUSE` present: nothing new starts (no dispatch,
   no re-dispatch); tracking, report collection and respawn go on.
 - **Disk guard.** Free space on the repo drive under 10 GB (`MIN_FREE_GB`,

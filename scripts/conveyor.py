@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -41,6 +42,16 @@ FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
 MAX_REDISPATCH = 2  # then the lane is finished as STUCK (slot freed, in attention)
 DEAD_S = 300  # a dispatched session gone or with no message this long after dispatch is DEAD
+# CONV9: a live session in state "blocked" (its turn ended on an API error while the network was
+# down; G6R1, INT18, G6R1B on 2026-10-10) never continues by itself. Nudge = `claude stop` then
+# `claude --bg --resume <sessionId> NUDGE` (the CLI's own way to continue a session in the background).
+NUDGE_MIN_RANGE = (5, 30)  # pace.json blocked_nudge_min clamp (default 10): blocked this long -> nudge
+MAX_NUDGES = 2  # per lane
+NUDGE_GAP_S = 900
+BLOCKED_ATTENTION_S = 2700  # blocked this long with no worktree activity -> attention item
+NUDGE = ("Continue the task from where you stopped. Nobody can answer questions; follow the "
+         "UNATTENDED rules in your prompt.")
+API_HOST = "api.anthropic.com"  # the network probe: a TCP connect to 443, nothing is sent
 PAGE_GAP_S = 600
 ATTENTION_PAGE_S = 1800  # an attention item unacked this long pages Salih (orchestrator did not react)
 DRY_ID = "backlog-dry"  # attention id (and ack file) of the "backlog ran dry" episode
@@ -53,7 +64,7 @@ PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
                  "reset_alert_pct": 95, "full_burn_limit_pct": 98, "min_free_mem_gb": 3.0,
                  "max_commit_pct": 90,
                  "lanes_present": MAX_LANES, "lanes_away": 5, "away_after_min": 10,
-                 "power_switch": False, "power_switch_cmd": []}
+                 "power_switch": False, "power_switch_cmd": [], "blocked_nudge_min": 10}
 MAX_LANES_CAP = 6  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
 # Presence modes (CONV6, LaptopControl v1.3 plan Phase A): user idle time picks present/away.
 PRESENT_IDLE_S = 60  # idle under this: present (away: idle >= pace.json away_after_min)
@@ -208,11 +219,11 @@ def claude_exe():
     return shutil.which("claude") or str(Path.home() / ".local/bin/claude.exe")
 
 
-def real_runner(args, timeout=120):
-    """Run claude with args; return (returncode, combined output)."""
+def real_runner(args, timeout=120, cwd=None):
+    """Run claude with args (in cwd, default the repo root); return (returncode, combined output)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     # stdin=DEVNULL: under pythonw claude otherwise blocks reading stdin
-    p = subprocess.run([claude_exe(), *args], cwd=ROOT, capture_output=True,
+    p = subprocess.run([claude_exe(), *args], cwd=cwd or ROOT, capture_output=True,
                        stdin=subprocess.DEVNULL,
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
@@ -236,6 +247,15 @@ def real_mem():
         return m.ullAvailPhys / 1e9, 100 * (1 - m.ullAvailPageFile / m.ullTotalPageFile)
     except (AttributeError, OSError, ZeroDivisionError):  # no windll off Windows
         return None
+
+
+def real_net():
+    """True when a TCP connection to API_HOST:443 opens within 5 s (nothing is sent)."""
+    try:
+        socket.create_connection((API_HOST, 443), timeout=5).close()
+        return True
+    except OSError:
+        return False
 
 
 def real_idle():
@@ -522,7 +542,7 @@ def validate_slice(s):
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
-                 projects=None, mem=real_mem, idle=real_idle, procs=None):
+                 projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net):
         self.root = Path(root)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
@@ -546,6 +566,8 @@ class Conveyor:
         self.presence = "present"  # never persisted: a restart starts present
         self.presence_pending = None  # (state, since) of a change not yet held PRESENCE_HOLD_S
         self.procs = procs if procs is not None else real_procs()
+        self.net = net
+        self.nudge_s = PACE_DEFAULTS["blocked_nudge_min"] * 60  # from pace.json every pass
         self.approvals = self.root / "build" / "approvals"
         self.push_file = self.base / "push.json"
         self.free_gb = None
@@ -859,6 +881,55 @@ class Conveyor:
                     self.read_report(name, ln, None)
                 else:
                     self.redispatch(name, ln)
+                continue
+            self.unblock(name, ln, a)
+
+    def unblock(self, name, ln, a):
+        """A live lane session in state "blocked" (CONV9): nudge it once blocked nudge_s while
+        the API host is reachable (at most MAX_NUDGES, NUDGE_GAP_S apart); blocked
+        BLOCKED_ATTENTION_S with no activity in its worktree: an attention item, once per
+        episode. Leaving the blocked state ends the episode (the nudge count stays)."""
+        if ln.get("state") != "blocked" or a.get("status") == "busy":
+            ln.pop("blocked_since", None)
+            ln.pop("blocked_attention", None)
+            return
+        now = self.now()
+        since = ln.setdefault("blocked_since", now)
+        if (ln.get("nudges", 0) < MAX_NUDGES and now - since >= self.nudge_s
+                and now - ln.get("nudged_ts", 0) >= NUDGE_GAP_S and self.net()):
+            self.nudge(name, ln, a)
+        elif (now - since >= BLOCKED_ATTENTION_S and "blocked_attention" not in ln
+                and not self.active_since(name, now - BLOCKED_ATTENTION_S, a.get("cwd"))):
+            ln["blocked_attention"] = now
+            self.event("blocked_attention", lane=name, id=ln["id"], since=iso(since),
+                       nudges=ln.get("nudges", 0))
+
+    def nudge(self, name, ln, a):
+        """`claude stop` the blocked session (its conversation is kept), then `claude --bg
+        --resume <sessionId>` it with NUDGE in its own cwd, same model, effort and settings.
+        Counted even when it fails; one `nudge` event with each step."""
+        ln["nudges"] = ln.get("nudges", 0) + 1
+        ln["nudged_ts"] = self.now()
+        sid, steps = str(a.get("sessionId") or ""), []
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
+            self.event("nudge", lane=name, id=ln["id"], n=ln["nudges"], steps=[{"error": "no session id"}])
+            return
+        cwd = a.get("cwd") if a.get("cwd") and Path(a["cwd"]).is_dir() else str(self.root)
+        resume = ["--bg", "--resume", sid, "--name", name, "--model", ln["model"], "--effort",
+                  ln["effort"], "--settings", str(self.root / SETTINGS), NUDGE]
+        for args, kw in ((["stop", ln["id"]], {}), (resume, {"cwd": cwd})):
+            try:
+                rc, out = self.run(args, **kw)
+            except Exception as e:  # e.g. a timeout: logged, the lane goes on
+                rc, out = type(e).__name__, ""
+            steps.append({"cmd": args[0], "rc": rc, "output": out[-300:]})
+            if rc != 0:
+                break
+        m = BG_ID_RE.search(out) if rc == 0 else None
+        if m and m.group(1) != ln["id"]:  # the CLI started a copy: follow it
+            ln.setdefault("prev_ids", []).append(ln["id"])
+            ln["id"] = m.group(1)
+        self.event("nudge", lane=name, id=ln["id"], n=ln["nudges"], steps=steps)
 
     def dead_reason(self, ln, a):
         """Why a lane's session is dead DEAD_S after its dispatch, else None. Signals (the
@@ -1035,13 +1106,14 @@ class Conveyor:
                 raise ValueError(f"mode {p['mode']!r}")
             lane_keys = [k for k in ("max_lanes", "lanes_present", "lanes_away") if k in p]
             for k in ("days", "reset_alert_pct", "full_burn_limit_pct", "min_free_mem_gb",
-                      "max_commit_pct", "away_after_min", *lane_keys):
+                      "max_commit_pct", "away_after_min", "blocked_nudge_min", *lane_keys):
                 if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
                         (p[k] <= 0 and k not in lane_keys):
                     raise ValueError(f"{k} {p[k]!r}")
             for k in lane_keys:
                 p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
             p["max_commit_pct"] = min(COMMIT_PCT_RANGE[1], max(COMMIT_PCT_RANGE[0], p["max_commit_pct"]))
+            p["blocked_nudge_min"] = min(NUDGE_MIN_RANGE[1], max(NUDGE_MIN_RANGE[0], p["blocked_nudge_min"]))
             cmd = p["power_switch_cmd"]
             if not isinstance(p["power_switch"], bool) or not isinstance(cmd, list) or \
                     not all(isinstance(a, str) and a for a in cmd) or (p["power_switch"] and not cmd):
@@ -1073,6 +1145,7 @@ class Conveyor:
             self.pager_flag("pace_invalid", [err, self.now()])
         elif not err and cur:
             self.pager_flag("pace_invalid", False)
+        self.nudge_s = p["blocked_nudge_min"] * 60
         if self.sense_presence(p["away_after_min"]):
             self.power_switch(p)
         line, top = None, p.get("max_lanes") or p[f"lanes_{self.presence}"]
@@ -1424,9 +1497,15 @@ class Conveyor:
 
     def attention(self, lanes):
         """Unacked items for the orchestrator as (id, reason, since): a lane with a bad
-        STATUS or STUCK, a non-pass reading, and the backlog running dry."""
+        STATUS or STUCK, a running lane blocked too long, a non-pass reading, and the backlog
+        running dry."""
         items = []
         for n, ln in lanes.items():
+            if not ln.get("finished") and ln.get("blocked_attention"):  # CONV9, see unblock()
+                items.append((n, f"lane blocked, needs orchestrator: blocked since "
+                                 f"{iso(ln['blocked_since'])}, {ln.get('nudges', 0)} nudge(s); "
+                                 "drop or requeue it", ln["blocked_attention"]))
+                continue
             if "finished_ts" not in ln:  # running, a quiet v0 lane, or read before this version
                 continue
             why = []
