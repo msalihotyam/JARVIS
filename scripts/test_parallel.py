@@ -295,6 +295,8 @@ def worker_env(index: int, bases: list[Path]) -> dict[str, str]:
     for key in ("TEMP", "TMP", "TMPDIR"):
         env[key] = str(base)
     env["PYTHONUNBUFFERED"] = "1"
+    # TUICRASH: a native crash (0xC0000005) prints the Python stack it hit, not just an exit code.
+    env["PYTHONFAULTHANDLER"] = "1"
     return env
 
 

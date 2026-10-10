@@ -185,12 +185,41 @@ def ambient_on(test):
     return test
 
 
+def release_bridges(made: list[Bridge]) -> None:
+    """Stop and delete each bridge NOW, on this (the GUI) thread; a deleted one stays deleted."""
+    import shiboken6
+
+    for bridge in made:
+        if shiboken6.isValid(bridge):
+            bridge.shutdown()
+            shiboken6.delete(bridge)
+
+
 class UiTestCase(unittest.TestCase):
     ambient = False
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
+        # TUICRASH: every Bridge this test makes - self.bridge() or a direct Bridge(...) - is
+        # shut down and deleted at cleanup, on the GUI thread, after the engine teardowns
+        # (registered later, so they run first). Left to Python, a Bridge (a reference cycle:
+        # its catalog holds its bound methods) is freed by the cyclic gc on whichever thread
+        # allocates next - a later test's catalog probe or pool worker - and ~QTimer off the
+        # GUI thread cannot unregister its running timer ("Timers cannot be stopped from
+        # another thread"): the next WM_TIMER goes to freed memory (0xC0000005 in
+        # QCoreApplication::notifyInternal2).
+        from unittest.mock import patch
+        made: list[Bridge] = []
+        construct = Bridge.__init__
+
+        def tracked(bridge, *args, **kwargs):
+            construct(bridge, *args, **kwargs)
+            made.append(bridge)
+        tracking = patch.object(Bridge, "__init__", tracked)
+        tracking.start()
+        self.addCleanup(release_bridges, made)
+        self.addCleanup(tracking.stop)
         self.root = Path(self.temp.name)
         self.database = self.root / "jarvis.db"
         self.store = ConfigStore(self.root / "config.json")
@@ -205,7 +234,6 @@ class UiTestCase(unittest.TestCase):
         self.engine = None
         # Every bridge checks its providers at start: the Claude route answers from
         # here, never from a real `claude auth status` (a test may patch it again).
-        from unittest.mock import patch
         from jarvis.connectors.claude_code import ClaudeCodeConnector
         from jarvis.contracts import BillingClass
         route = patch.object(ClaudeCodeConnector, "billing_route",
