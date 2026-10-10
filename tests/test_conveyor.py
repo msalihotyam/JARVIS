@@ -423,8 +423,8 @@ class TestInbox(Base):
         self.c.pass_once()
         s = self.status()
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
-                                  "usage_hold", "disk_hold", "disk_free_gb", "lanes", "backlog",
-                                  "attention"})
+                                  "usage_hold", "pace", "disk_hold", "disk_free_gb", "lanes",
+                                  "backlog", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -944,6 +944,9 @@ class TestPager(Base):
         self.assertIn("A: STATUS STOP", self.pushes[-1])
 
 
+RESET_ALERT = "Haftalık kota %{}: sıfırlama hakkını şimdi kullanabilirsin"
+
+
 class TestUsageGuard(Base):
     def ledger(self, pct, age=0):
         d = self.root / "build" / "ledger"
@@ -953,21 +956,21 @@ class TestUsageGuard(Base):
             "garbage\n" + json.dumps({"end": end, "seven_day": {"start": 1, "end": pct}}) + "\n")
 
     def test_over_limit_holds_new_lanes(self):
-        self.ledger(85)
+        self.ledger(98)  # full_burn (pace.json default): full_burn_limit_pct
         self.drop("a.md", HDR.format("A"))
         self.c.pass_once()
         self.assertEqual(self.fake.bg_calls(), [])
         self.assertTrue(self.status()["usage_hold"])
-        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.pushes, [RESET_ALERT.format(98)])  # the hold itself never pages
 
     def test_old_high_row_still_holds(self):
-        self.ledger(95, age=7 * 3600)  # no new rows while held: the reading must not expire in hours
+        self.ledger(98, age=7 * 3600)  # no new rows while held: the reading must not expire in hours
         self.drop("a.md", HDR.format("A"))
         self.c.pass_once()
         self.assertEqual(self.fake.bg_calls(), [])
 
     def test_under_limit_or_stale_dispatches(self):
-        self.ledger(84)
+        self.ledger(97)
         self.drop("a.md", HDR.format("A"))
         self.c.pass_once()
         self.ledger(99, age=conveyor.USAGE_FRESH_S + 1)
@@ -975,6 +978,158 @@ class TestUsageGuard(Base):
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "B"])
         self.assertIsNone(self.status()["usage_pct"])
+
+
+class TestPaceGovernor(TestUsageGuard):
+    """pace.json modes, pace bands, the reset alert and reset detection, on a fixed clock."""
+
+    def fresh(self):
+        self.tearDown()
+        self.setUp()
+
+    def pace(self, **kw):
+        cfg = {**conveyor.PACE_DEFAULTS, **kw}
+        (self.base / "pace.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    def pace_file(self):
+        return json.loads((self.base / "pace.json").read_text(encoding="utf-8"))
+
+    def paced(self, days_ago=3.5):  # 3.5 of 7 days elapsed: pace_line exactly 50
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - days_ago * 86400))
+
+    def lanes_for(self, pct):
+        """Effective max lanes for one reading, three prompts waiting."""
+        self.ledger(pct)
+        for n in "XYZ":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        return len(self.fake.bg_calls())
+
+    def test_missing_written_with_full_burn_defaults(self):
+        self.c.pass_once()
+        self.assertEqual(self.pace_file(), conveyor.PACE_DEFAULTS)
+        self.assertEqual(self.status()["pace"]["mode"], "full_burn")
+
+    def test_full_burn_limit(self):
+        self.assertEqual(self.lanes_for(97.9), 3)
+        self.assertFalse(self.status()["usage_hold"])
+        self.fresh()
+        self.assertEqual(self.lanes_for(98), 0)
+        self.assertEqual((self.status()["pace"]["limit_pct"], self.status()["pace"]["max_lanes"]), (98, 0))
+
+    def test_full_burn_limit_is_read_from_pace_json(self):
+        self.pace(full_burn_limit_pct=90)
+        self.assertEqual(self.lanes_for(90), 0)
+
+    def test_paced_limit_97(self):
+        self.paced(days_ago=7)  # pace_line 100: every band allows 3, only the limit holds
+        self.assertEqual(self.lanes_for(96.9), 3)
+        self.fresh()
+        self.paced(days_ago=7)
+        self.assertEqual(self.lanes_for(97), 0)
+        self.assertTrue(self.status()["usage_hold"])
+        self.assertEqual(self.status()["pace"]["limit_pct"], 97)
+
+    def test_pace_bands_at_boundaries(self):
+        for pct, want in ((52, 3), (52.1, 2), (57, 2), (57.1, 1), (62, 1), (62.1, 0)):
+            self.fresh()
+            self.paced()
+            self.assertEqual(self.lanes_for(pct), want, pct)
+            p = self.status()["pace"]
+            self.assertEqual((p["mode"], p["pace_line"], p["usage_pct"], p["max_lanes"]),
+                             ("paced", 50.0, pct, want))
+            self.assertFalse(self.status()["usage_hold"])  # band 0 holds dispatch, not via the limit
+        self.assertEqual(p["band"], "over")
+
+    def test_band_zero_leaves_running_lanes(self):
+        self.paced()
+        self.assertEqual(self.lanes_for(40), 3)
+        self.ledger(70)
+        self.drop("w.md", HDR.format("W"))
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 3)
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("stop", "rm")])
+        self.assertEqual(len(self.c.running(self.lanes())), 3)
+
+    def test_running_lanes_count_against_the_band(self):
+        self.paced()
+        self.assertEqual(self.lanes_for(40), 3)
+        self.ledger(55)  # band 2, three running (integration lanes alike): nothing new
+        self.drop("w.md", HDR.format("W"))
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 3)
+
+    def test_model_and_effort_unchanged(self):
+        self.paced()
+        self.ledger(57)  # band 2
+        self.drop("a.md", "@jarvis lane=A model=sonnet effort=xhigh base=main\nx\n")
+        self.backlog({"id": "S", "model": "haiku", "effort": "medium"})
+        self.c.pass_once()
+        got = {c[2]: (c[c.index("--model") + 1], c[c.index("--effort") + 1])
+               for c in self.fake.bg_calls()}
+        self.assertEqual(got, {"A": ("sonnet", "xhigh"), "S": ("haiku", "medium")})
+
+    def test_reset_alert_once(self):
+        self.ledger(94.9)
+        self.c.pass_once()
+        self.ledger(95)
+        self.c.pass_once()
+        self.t += conveyor.PAGE_GAP_S
+        self.ledger(96)
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [RESET_ALERT.format(95)])
+        self.assertIn(conveyor.RESET_ALERT_ID, self.attn())
+
+    def test_no_reset_alert_in_paced_mode(self):
+        self.paced(days_ago=7)
+        self.ledger(96)
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+        self.assertNotIn(conveyor.RESET_ALERT_ID, self.attn())
+
+    def test_reset_detection_switches_to_paced(self):
+        self.ledger(96)
+        self.c.pass_once()
+        self.t += 3600
+        self.ledger(56)  # a 40-point drop: the reset was used
+        self.c.pass_once()
+        self.assertEqual(self.pace_file(), {**conveyor.PACE_DEFAULTS, "mode": "paced",
+                                            "window_start": conveyor.iso(self.t)})
+        (ev,) = [e for e in self.events() if e["event"] == "quota_reset"]
+        self.assertEqual((ev["before"], ev["after"]), (96, 56))
+        attn = {a["id"]: a["reason"] for a in self.status()["attention"]}
+        self.assertEqual(attn[conveyor.RESET_DONE_ID], "kota sıfırlandı, tempo modu açık")
+        self.assertNotIn(conveyor.RESET_ALERT_ID, attn)  # paced: the alert episode is over
+        self.assertEqual(self.status()["pace"]["max_lanes"], 0)  # 56 > pace_line 0 + 12
+
+    def test_smaller_drop_is_no_reset(self):
+        self.ledger(96)
+        self.c.pass_once()
+        self.ledger(56.1)
+        self.c.pass_once()
+        self.assertEqual(self.pace_file()["mode"], "full_burn")
+        self.assertNotIn(conveyor.RESET_DONE_ID, self.attn())
+
+    def test_hand_edit_is_reread_every_pass(self):
+        self.ledger(60)
+        self.c.pass_once()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 3)
+        self.paced()
+        self.c.pass_once()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 1)
+
+    def test_invalid_pace_is_paced_from_now(self):
+        for bad in ("{not json", json.dumps({"mode": "warp"}), json.dumps({"mode": "paced"}),
+                    json.dumps({"days": 0}), json.dumps([1])):
+            self.fresh()
+            (self.base / "pace.json").write_text(bad, encoding="utf-8")
+            self.assertEqual(self.lanes_for(12.1), 0, bad)  # pace_line 0: above 0 + 12
+            p = self.status()["pace"]
+            self.assertEqual((p["mode"], p["window_start"], p["pace_line"]),
+                             ("paced", conveyor.iso(self.t), 0.0))
+            self.assertTrue(p["error"])
+            self.assertIn(conveyor.PACE_BAD_ID, self.attn())
+            self.assertEqual((self.base / "pace.json").read_text(encoding="utf-8"), bad)  # left as is
 
 
 KEY = "sk-ant-SECRET-reader-key-42"

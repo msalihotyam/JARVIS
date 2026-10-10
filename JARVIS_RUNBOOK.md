@@ -674,8 +674,41 @@ the optional report reader below. One instance at a time
   the approval withdraws it.
 - **Usage guard.** `claude` has no plan-usage command, so the newest
   `build/ledger/slices.jsonl` row (jarvis-flow slice ledger, `seven_day`) is
-  read; at 85% or more of the weekly limit no new lane starts (a row older than
-  7 days is ignored). `status.json` shows `usage_pct` and `usage_hold`.
+  read (a row older than 7 days is ignored). The limit comes from the pace
+  governor below. `status.json` shows `usage_pct`, `usage_hold` and `pace`.
+- **Pace governor (Salih 2026-10-10).** Quality is fixed by the routing table
+  below and never changed dynamically; pace is controlled only by how many
+  lanes run in parallel. `build/conveyor/pace.json`, re-read every pass (the
+  orchestrator may edit it by hand at any time; written with the defaults if
+  missing): `{"mode": "full_burn" | "paced", "window_start": ISO|null,
+  "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98}`.
+  - `full_burn` (until Salih uses his one manual quota reset): up to 3 lanes;
+    no new lane at `usage_pct >= full_burn_limit_pct`. At
+    `usage_pct >= reset_alert_pct` Salih is paged once ("Haftalık kota %<n>:
+    sıfırlama hakkını şimdi kullanabilirsin") and attention item
+    `quota-reset-alert` is added.
+  - `paced`: `pace_line = 100 * elapsed_since(window_start) / days`.
+    Effective max lanes: 3 when `usage_pct <= pace_line + 2`, 2 when
+    `<= pace_line + 7`, 1 when `<= pace_line + 12`, else 0 (no new dispatch;
+    running lanes are never touched). No new lane at `usage_pct >= 97`.
+    Integration lanes count like any lane. Unknown usage: 3 lanes.
+  - Reset detection: `usage_pct` dropping 40 or more points between two
+    readings (manual or weekly reset) switches pace.json to `paced` with
+    `window_start` = now, logs a `quota_reset` event and adds attention item
+    `quota-reset` ("kota sıfırlandı, tempo modu açık").
+  - An invalid pace.json is read as `paced` from now (the cautious side), left
+    unchanged on disk, and is attention item `pace-invalid` until fixed.
+  - The decision (`mode`, `usage_pct`, `pace_line`, `max_lanes`, `band`,
+    `limit_pct`, `error`) is `status.json` `pace`; a change of band is a
+    `pace` event. A slice's model and effort are never altered.
+- **Model routing table (Salih 2026-10-10).** Static; the header of every
+  prompt and backlog slice follows it:
+  - 6G product slices: Opus, effort medium.
+  - T2 / security / R1 / R2 / 6H / architecture: Opus, effort high.
+  - Integration lanes: Sonnet, effort medium.
+  - Mechanical lanes (test re-pointing, catalog, one-line fixes): Sonnet,
+    effort medium.
+  - Pace only via the number of parallel lanes (pace governor above).
 - **Attention and pager (ntfy).** Salih's rule (2026-10-09): lane events go to
   the orchestrator, not to Salih. A lane report `STATUS: BLOCKED/STOP/FAIL`, a
   `STUCK` lane, a non-`pass` reading (below) and the backlog running dry (no
