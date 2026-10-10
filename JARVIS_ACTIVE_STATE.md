@@ -40,10 +40,11 @@ bilgisayar"), every mode asks. Salih "6H3 A": archived = held by Core,
 accepted. Composition pins re-pointed additively (`tests/test_app.py`
 registry names + `project-folder-create`; `tests/test_github_phase1.py`
 policy + the K3 DestinationGrant). Full suite on the frozen tree 5369 OK
-(skipped=2), 662 s. Open for Salih: CLI `jarvis approve` can approve a K3
-request without showing its path (cli.py out of scope; recorded in
-ARCHITECTURE). Report:
-`build/reports/G6H3C.md`.
+(skipped=2), 662 s. Report: `build/reports/G6H3C.md`.
+CLI follow-up (G6H3CLI, Salih 2026-10-11 "A"): `jarvis approve` refuses a K3
+request (only the app card shows the path); reject allowed; app.py unchanged.
+On lane branch `worktree-G6H3CLI` (base aa6cdb6), not integrated; full suite
+5385 OK (skipped=2), 668 s. Report: `build/reports/G6H3CLI.md`.
 
 **G6H1 (6H H1 folder link, T2) green, 2026-10-10 (G6H1B):** committed on lane
 branch `worktree-G6H1` (base e3b2015), integrated on local main (INT16, not pushed); lane commit f417e57; additive

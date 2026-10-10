@@ -3661,9 +3661,15 @@ kullanıcıya gösterilir.
   gösterdiği yolu oluşturabilir; öneri bu arada değiştiyse görev yine FAILED
   biter. E6: yol olay, karar kaydı, konuşma, model yükü ve günlüğe girmez;
   Core isteği olay günlüğüne yazdığı için yol isteğin önizlemesinde de
-  yoktur, iki pencere kartı onu görevden okur. Sonuç (karar bekliyor): CLI
-  `jarvis approve` bir K3 isteğini yolu göstermeden onaylayabilir (cli.py bu
-  dilimin dışında). E7: "Masaüstünde
+  yoktur, iki pencere kartı onu görevden okur. CLI (Salih 2026-10-11, "A";
+  G6H3CLI): `jarvis approve` K3 isteğini onaylamaz; türü kalıcı bekleyen
+  isteğin connector'ından okunur (argümandan değil), uygulama kurulmadan
+  "Bu klasör onayı yalnız JARVIS uygulamasındaki karttan verilebilir;
+  klasörün yeri orada gösterilir." ile sıfır olmayan çıkış verir; hibe,
+  klasör ve durum değişmez, `--remember-for-session` fark etmez. Okunamayan
+  istek task_not_found ile reddedilir; `jarvis reject` serbesttir. Koruma
+  yalnız CLI sınırındadır (app.py değişmedi: pencere de `app.approve`'u
+  çağırır). E7: "Masaüstünde
   oluştur" isteği Core'dan reddeder, sonra (donuk değilse) aynı proje ve
   oturum için öbür konumda yeni istek açar (model çağrısı yok, istek başına
   bir kez); "Var olan klasörü seç…" önce bağlar, sonra isteği reddeder;

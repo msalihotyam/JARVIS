@@ -14,6 +14,7 @@ from typing import Any, Callable
 from jarvis.app import (
     EXIT_INTERNAL,
     EXIT_INVALID_INPUT,
+    EXIT_NOT_FOUND,
     EXIT_POLICY,
     MAX_TASK_JSON_BYTES,
     CommandResult,
@@ -48,6 +49,7 @@ from jarvis.app import (
     task_resolve_result,
     tasks_result,
 )
+from jarvis.connectors.project_folder import PROJECT_FOLDER_CONNECTOR
 from jarvis.contracts import (
     AttemptRecovery,
     DataClassification,
@@ -919,6 +921,50 @@ def _dispatch_chain_command(
     )
 
 
+K3_CLI_REFUSAL = (
+    "Bu klasör onayı yalnız JARVIS uygulamasındaki karttan verilebilir; "
+    "klasörün yeri orada gösterilir."
+)
+
+
+def _k3_approve_refusal(
+    settings: Settings, args: argparse.Namespace
+) -> CommandResult | None:
+    """Gate 6H H3 (Salih 2026-10-11, "A"): the CLI never approves a K3
+    project folder request, because only the app's card shows the path.
+
+    The kind comes from the persisted pending request (its connector), never
+    from the arguments. No request: ``None``, and ``app.approve`` answers as
+    before. A request that cannot be read or whose connector is not a name
+    is refused (fail closed). Rejecting stays allowed."""
+    try:
+        request = SQLiteMemoryStore(settings.memory_database).load_pending_approval(
+            args.task_id, args.session_id
+        )
+        if request is None:
+            return None
+        connector = request.scope.connector
+    except Exception:  # noqa: BLE001 - unreadable: refuse, never guess
+        connector = None
+    if type(connector) is not str:
+        return failure_result(
+            "approve",
+            settings.permission_mode,
+            ErrorCode.TASK_NOT_FOUND,
+            "No pending approval request exists for this task and session.",
+            EXIT_NOT_FOUND,
+        )
+    if connector == PROJECT_FOLDER_CONNECTOR:
+        return failure_result(
+            "approve",
+            settings.permission_mode,
+            ErrorCode.INVALID_GRANT,
+            K3_CLI_REFUSAL,
+            EXIT_POLICY,
+        )
+    return None
+
+
 def _dispatch(app: JarvisApp, command: str, args: argparse.Namespace) -> CommandResult:
     if command == "scheduler":
         if getattr(args, "scheduler_action", None) != "run":
@@ -1095,6 +1141,14 @@ def main(
             )
         print(chain_result.render())
         return chain_result.exit_code
+
+    if command == "approve":
+        # Before any application is built: a refused K3 approval reaches no
+        # Core, connector or grant at all.
+        k3_refusal = _k3_approve_refusal(effective, args)
+        if k3_refusal is not None:
+            print(k3_refusal.render())
+            return k3_refusal.exit_code
 
     result: CommandResult
     try:
