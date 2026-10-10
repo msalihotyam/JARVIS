@@ -135,6 +135,6 @@ Item {
     Composer { id: composer; objectName: "canonicalComposer"
         maxHeight: Math.min(180, Math.round(page.height * 0.25))
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: 12 }
+                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: 4 }
     }
 }
