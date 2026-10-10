@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QMetaObject, QObject, Q_ARG
+from PySide6.QtCore import QMetaObject, QObject
 
 from tests.test_intent import proposal, task_proposal
 from tests.test_ui import UiTestCase, pump, tiny_png
