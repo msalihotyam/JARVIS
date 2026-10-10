@@ -249,8 +249,11 @@ class UntitledNameTests(WindowCase):
         bridge.setPage("projects")
         pump(400)
         heading = lambda name: self.item(root, name).property("text")  # noqa: E731
-        self.assertEqual("ARŞİVLENMİŞ PROJELER", heading("projectsArchivedHeading"))
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", heading("projectArchivedConversationsHeading"))
+        # G6PJ1B (6G P2): the ARCHIVED PROJECTS heading became the card grid's Arşiv tab.
+        bridge.showProject("")
+        pump(300)
+        self.assertEqual(["Arşiv"], [t.property("text") for t in self.item(root, "projectsTab_archived").childItems() if t.property("text")])
         bridge.setPage("history")
         pump(400)
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", heading("historyArchivedHeading"))
@@ -271,9 +274,10 @@ class CatalogTests(UiTestCase):
         self.assertEqual("CONVERSATIONS", tx("Sidebar", "CONVERSATIONS"))
         self.assertEqual("SABİTLENENLER", tx("Sidebar", "PINNED"))
         self.assertEqual("ARŞİVLENMİŞ SOHBETLER", tx("ProjectsPage", "ARCHIVED CONVERSATIONS"))
-        self.assertEqual("ARŞİVLENMİŞ PROJELER", tx("ProjectsPage", "ARCHIVED PROJECTS"))
+        self.assertEqual("Arşiv", tx("ProjectsPage", "Archived"))              # G6PJ1B: was the ARCHIVED PROJECTS heading
         self.assertEqual("Bu projede henüz sohbet yok.", tx("ProjectsPage", "No conversation in this project yet."))
-        self.assertEqual("Sohbetlerini görmek için bir proje seçin.", tx("ProjectsPage", "Choose a project to see its conversations."))
+        self.assertEqual("Henüz proje yok. Oluşturmak için Yeni proje'ye basın.",       # G6PJ1B: was "Choose a project..."
+                         tx("ProjectsPage", "No project yet. Use New project to create one."))
         self.assertEqual("Salt okunur: bu sohbet arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.",
                          tx("Composer", "Read-only: this conversation belongs to the archived project %1. Unarchive the project to continue it."))
         self.assertEqual("Yeni sohbet", tx("Bridge", "New conversation"))      # the activity note
@@ -1277,17 +1281,19 @@ class ListStateTests(ListCase):
         QTest.keyClick(root, Qt.Key_Return)
         pump(300)
         self.assertEqual((target, "home"), (bridge.conversationId, bridge.page))
-        # Projects: Tab from Create reaches the project rows; Return opens one; the tabs take arrows.
+        # Projects: Tab from "New project" reaches the project cards (G6PJ1B, 6G P2: were the rows after
+        # Create); Return opens one; the tabs take arrows.
         bridge.showProject("")
         bridge.setPage("projects")
         pump(400)
-        self.item(root, "projectCreate").forceActiveFocus()
+        self.item(root, "projectsNew").forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Tab)
         pump(60)
-        self.assertEqual("projectRow", root.activeFocusItem().objectName())
+        self.assertEqual("projectCard", root.activeFocusItem().objectName())
+        focused = self.under(root.activeFocusItem(), "projectCardName")[0].property("text")
         QTest.keyClick(root, Qt.Key_Return)
         pump(300)
-        self.assertEqual(bridge.projectRecords[0]["id"], bridge.openProject["id"])
+        self.assertEqual(focused, bridge.openProject["name"])
         tabs = self.item(root, "projectTabs")
         tabs.forceActiveFocus()
         pump(60)
@@ -1314,10 +1320,16 @@ class ListStateTests(ListCase):
             if not row.property("current"):
                 self.assertEqual([], self.under(row, "listRowBadge"))
                 self.assertNotEqual(label, row.childItems()[0].property("color"))
+        # G6PJ1B (6G P2): the archived project is a card on the Arşiv tab - a pill and a readable,
+        # quieter name (was a list row's badge and textLabel name).
+        self.projects(bridge, root, "")
+        live_name = self.visible(root, "projectCardName")[0].property("color")
+        self.item(root, "projectsPage").setProperty("tab", "archived")
+        pump(150)
+        thesis = next(c for c in self.visible(root, "projectCard") if self.under(c, "projectCardName")[0].property("text") == "Tez 2025")
+        self.assertIn("ARŞİVDE", self.shown_texts(self.under(thesis, "projectCardArchived")[0]))
+        self.assertNotEqual(live_name, self.under(thesis, "projectCardName")[0].property("color"))
         self.projects(bridge, root, self.project.id)
-        thesis = next(r for r in self.visible(root, "projectRow") if r.property("title") == "Tez 2025")
-        self.assertEqual("ARŞİV", self.under(thesis, "listRowBadge")[0].property("text"))
-        self.assertEqual(label, self.under(thesis, "projectRowName")[0].property("color"))
         self.assertIn("ETKİN", self.shown_texts(self.item(root, "projectStatePill")))
         for row in self.visible(root, "projectArchivedConversationRow"):
             self.assertEqual("ARŞİV", self.under(row, "listRowBadge")[0].property("text"))
@@ -1331,10 +1343,11 @@ class ListStateTests(ListCase):
         self.tr(bridge)
         bridge.setPage("projects")
         pump(400)
+        # G6PJ1B (6G P2): the line names the "Yeni proje" button and sits at the top of the card grid.
         empty = self.item(root, "projectsEmpty")
         self.assertTrue(empty.isVisible())
-        self.assertEqual("Henüz proje yok. Soldaki alana bir ad yazıp Oluştur'a basın.", empty.property("text"))
-        self.assertEqual((0.0, 0.0), (empty.x(), empty.y()))
+        self.assertEqual("Henüz proje yok. Oluşturmak için Yeni proje'ye basın.", empty.property("text"))
+        self.assertEqual((0.0, self.item(root, "projectGrid").y()), (empty.x(), empty.y()))
         bridge.setPage("history")
         pump(400)
         self.assertEqual(["Henüz kalıcı oturum yok."], [i.property("text") for i in self.visible(root, "historySessionsEmpty")])
@@ -1348,8 +1361,9 @@ class ListStateTests(ListCase):
         garden = bridge.projectRecords[0]["id"]
         bridge.showProject("")
         bridge.setPage("projects")
-        settled(300, lambda: (
-            self.assertEqual("Sohbetlerini görmek için bir proje seçin.", self.item(root, "projectsEmpty").property("text")),
+        settled(300, lambda: (                                  # G6PJ1B: the grid shows the card, no "choose" line
+            self.assertFalse(self.item(root, "projectsEmpty").isVisible()),
+            self.assertEqual(["Bahçe"], [c.property("text") for c in self.visible(root, "projectCardName")]),
         ))
         bridge.showProject(garden)
         pump(300)

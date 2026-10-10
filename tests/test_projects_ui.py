@@ -136,18 +136,22 @@ class ListTests(ProjectsUiCase):
         bridge.renameProject(records["Tez"]["id"], "Tez 2025")
         pump(60)
         bridge.archiveProject(records["Tez"]["id"])
+        # G6PJ1B (6G P2): the list's ACTIVE / ARCHIVED sections became the card grid's tabs.
+        page = self.item(root, "projectsPage")
         settled(200, lambda: (
             self.assertEqual({"Evim": True, "Tez 2025": False}, {r["name"]: r["active"] for r in bridge.projectRecords}),
-            self.assertTrue(self.item(root, "projectsArchivedHeading").isVisible()),
+            self.assertEqual(["Evim"], self.texts(root, "projectCardName")),               # active on "Projelerin"
         ))
-        names = self.texts(root, "projectRowName")
-        self.assertEqual(["Evim", "Tez 2025"], names)                           # active first, then archived
+        page.setProperty("tab", "archived")
+        settled(200, lambda: self.assertEqual(["Tez 2025"], self.texts(root, "projectCardName")))
+        names = self.texts(root, "projectCardName")
         self.assertFalse(any(text.startswith("p-") for text in names))
-        self.assertEqual(1, len([u for u in self.all_items(root, "projectUnarchive") if u.isVisible()]))
+        self.assertEqual(1, len([u for u in self.all_items(root, "projectCardArchived") if u.isVisible()]))
         bridge.unarchiveProject(records["Tez"]["id"])
         settled(200, lambda: (
             self.assertTrue(all(r["active"] for r in bridge.projectRecords)),
-            self.assertFalse(self.item(root, "projectsArchivedHeading").isVisible()),
+            self.assertEqual([], self.texts(root, "projectCardName")),                     # the archive tab is empty
+            self.assertTrue(self.item(root, "projectsEmpty").isVisible()),
         ))
 
 

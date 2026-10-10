@@ -287,6 +287,7 @@ class Bridge(QObject):
         # last answer Core gave to a lifecycle request (shown as returned).
         self._project_records: list[dict] = []
         self._project_counts: dict[str, tuple[int, int]] = {}      # project id -> (conversations, archived); presentation only
+        self._instruction_lines: dict[str, str] = {}                # project id -> its card's instruction line; presentation only
         self._open_project = ""
         self._project_conversations: list[dict] = []
         self._project_jobs: list[dict] = []
@@ -883,9 +884,11 @@ class Bridge(QObject):
 
     @Property("QVariantList", notify=projectsChanged)
     def projectRecords(self) -> list:
-        """Every project with its conversation counts (live, archived) - read-only presentation keys."""
+        """Every project with its conversation counts (live, archived) and its
+        instruction's first non-blank line ("" = none or cleared) - read-only presentation keys."""
         return [{**record, "conversation_count": self._project_counts.get(record["id"], (0, 0))[0],
-                 "archived_count": self._project_counts.get(record["id"], (0, 0))[1]} for record in self._project_records]
+                 "archived_count": self._project_counts.get(record["id"], (0, 0))[1],
+                 "instruction_line": self._instruction_lines.get(record["id"], "")} for record in self._project_records]
 
     @Property(dict, notify=projectsChanged)
     def openProject(self) -> dict:
@@ -930,9 +933,26 @@ class Bridge(QObject):
         self._project_records = self.backend.project_records()
         if self._open_project and not any(r["id"] == self._open_project for r in self._project_records):
             self._open_project = ""
+        self._instruction_lines = self._read_instruction_lines()
         self._load_project_detail()
         self._refresh_conversations()           # the open one's owner and scope facts; N2 if it is gone
         self.projectsChanged.emit()
+
+    def _read_instruction_lines(self) -> dict[str, str]:
+        """Gate 6G P2, read only: each project card's line - the first non-blank
+        line of the project's CURRENT stored instruction ("" when none or cleared)."""
+        store = self._conversation_db()
+        lines: dict[str, str] = {}
+        if store is None:
+            return lines
+        for record in self._project_records:
+            try:
+                current = store.load_project_instruction(record["id"])
+            except Exception:  # noqa: BLE001 - a label only
+                continue
+            text = current.text if current is not None else ""
+            lines[record["id"]] = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        return lines
 
     def _load_project_detail(self) -> None:
         self._project_conversations, self._project_jobs, self._project_jobs_bounded = [], [], False

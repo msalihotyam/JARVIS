@@ -3,6 +3,7 @@ import QtQuick.Controls.Basic
 import QtQuick.Dialogs
 import "../theme"
 import "../components"
+import "../overlays"
 
 // Projects (V2.0): the window's view of the project model. Names are shown;
 // ids stay internal. Every change goes through the existing explicit-user
@@ -13,8 +14,6 @@ SecondaryPage {
     objectName: "projectsPage"
     title: qsTr("Projects")
     headerRight: [ ActionButton { label: qsTr("Refresh"); onClicked: bridge.refreshProjects() } ]
-    readonly property var active: bridge.projectRecords.filter(function(p) { return p.active })
-    readonly property var archived: bridge.projectRecords.filter(function(p) { return !p.active })
     readonly property var current: bridge.openProject
     // Gate 6B: the open detail section and the editor's / panel's chosen
     // classifications ("" = not chosen: nothing is preselected).
@@ -77,17 +76,26 @@ SecondaryPage {
         implicitWidth: control ? control.width : 0; implicitHeight: control ? control.height : 0
         HoverTip { target: reasoned.control; text: reasoned.reason; active: !!reasoned.control && !reasoned.control.enabled }
     }
-    component ProjectRow: ListRow {
-        id: projectRow
-        property var project: ({})
-        objectName: "projectRow"
-        titleName: "projectRowName"
-        title: project.name || ""; current: page.current.id === project.id; muted: !project.active
-        badge: project.active ? "" : qsTr("ARCHIVED"); badgeTint: Theme.warning
-        onActivated: bridge.showProject(projectRow.project.id)
-        ActionButton { objectName: "projectUnarchive"; compact: true; visible: !projectRow.project.active; label: qsTr("Unarchive")
-                       onClicked: bridge.unarchiveProject(projectRow.project.id) }
+    // Gate 6G P2: the card grid's tab, name search and sort. Last activity is the
+    // project's newest live conversation, else its creation (never invented).
+    property string tab: "mine"             // "mine" | "archived"
+    property string query: ""
+    property string sort: "activity"        // "activity" (default) | "name"
+    function activityAt(p) {
+        var rows = bridge.sidebarConversations[p.id] || []
+        var at = rows.length ? Date.parse(rows[0].updated_at) : NaN
+        return isNaN(at) || at < Date.parse(p.created_at) ? p.created_at || "" : rows[0].updated_at
     }
+    readonly property var cards: {
+        var q = query.trim().toLowerCase(), mine = tab === "mine"
+        var out = bridge.projectRecords.filter(function (p) {
+            return (p.active === true) === mine && (q === "" || String(p.name).toLowerCase().indexOf(q) >= 0)
+        }).map(function (p) { return { project: p, at: page.activityAt(p) } })
+        out.sort(sort === "name" ? function (a, b) { return String(a.project.name).localeCompare(String(b.project.name)) }
+                                 : function (a, b) { return (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) })
+        return out
+    }
+    function openCard(id, section) { page.section = section; bridge.showProject(id) }
     // Gate 6E: the open project's detail fades in when another project opens;
     // Q6: the rename field shows only after "Rename" (Enter saves, Esc or
     // Cancel puts it away; the same bridge call as before).
@@ -100,69 +108,95 @@ SecondaryPage {
         renameField.selectAll(); renameField.forceActiveFocus()
     }
     function stopRename() { renaming = false; renameButton.forceActiveFocus() }
-    // Gate 6F (Q9): the sidebar's PROJELER "+" lands here, on the create field.
-    function focusCreate() { newName.forceActiveFocus() }
+    // Gate 6F (Q9): the sidebar's PROJELER "+" lands here; Gate 6G P1: on the new-project popup.
+    function focusCreate() { newProjectDialog.openDialog() }
     function saveRename() {
         bridge.renameProject(current.id, renameField.text)
         if (bridge.projectNotice === "") stopRename()
     }
 
-    Row {
+    Item {
         anchors.fill: parent
-        spacing: Theme.gap
 
-        // -- the list: active projects, then the always-visible Archived section --
-        Column {
-            width: parent.width * 0.38 - Theme.gap / 2; height: parent.height; spacing: 8
-            Row {
-                width: parent.width; spacing: 8
-                Field { id: newName; objectName: "projectNewName"; width: parent.width - createButton.width - 8; height: 36
-                        placeholderText: qsTr("New project name"); onAccepted: createButton.clicked() }
-                ActionButton { id: createButton; objectName: "projectCreate"; label: qsTr("Create"); primary: true; height: 36; width: 100
-                               onClicked: { bridge.createProject(newName.text); if (bridge.projectNotice === "") newName.text = "" } }
+        // -- Gate 6G P2: the card grid (no project open) --------------------------
+        Item {
+            id: gridPane
+            objectName: "projectGridPane"
+            visible: !page.current.id
+            anchors.fill: parent
+            // Tabs at the left; search, sort and "New project" at the right (the search gives way first).
+            Item {
+                id: toolbar
+                width: parent.width; height: 36
+                Segmented { id: tabs; objectName: "projectsTabs"; segmentPrefix: "projectsTab_"; anchors.verticalCenter: parent.verticalCenter
+                            options: [{ value: "mine", label: qsTr("Your projects") }, { value: "archived", label: qsTr("Archived") }]
+                            value: page.tab; onPicked: function (value) { page.tab = value } }
+                Row {
+                    id: tools
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+                    Field { id: search; objectName: "projectsSearch"; height: 34; placeholderText: qsTr("Search projects")
+                            width: Math.max(120, Math.min(240, toolbar.width - tabs.width - sortChoice.width - newProject.width - 3 * 8 - 24))
+                            onTextChanged: page.query = text }
+                    Segmented { id: sortChoice; objectName: "projectsSort"; segmentPrefix: "projectsSort_"; anchors.verticalCenter: parent.verticalCenter
+                                options: [{ value: "activity", label: qsTr("Last activity") }, { value: "name", label: qsTr("Name") }]
+                                value: page.sort; onPicked: function (value) { page.sort = value } }
+                    ActionButton { id: newProject; objectName: "projectsNew"; label: qsTr("New project"); primary: true; height: 34
+                                   onClicked: newProjectDialog.openDialog() }
+                }
             }
-            Text { objectName: "projectNotice"; visible: bridge.projectNotice !== ""; width: parent.width; wrapMode: Text.Wrap
-                   textFormat: Text.PlainText; text: bridge.projectNotice; color: Theme.warning; font: Theme.pageRow }
-            Flickable {
-                id: listColumn
-                width: parent.width; height: parent.height - y; clip: true
-                contentHeight: lists.height; boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { policy: listColumn.contentHeight > listColumn.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
-                Column {
-                    id: lists; width: parent.width - (listColumn.contentHeight > listColumn.height ? 12 : 0); spacing: 6
-                    Text { text: qsTr("ACTIVE"); color: Theme.textLabel; font: Theme.pageSection }
-                    Text { visible: page.active.length === 0; text: qsTr("No active project yet."); color: Theme.textLabel; font: Theme.pageMeta }
-                    Repeater { model: page.active; ProjectRow { project: modelData } }
-                    Item { width: 1; height: 8; visible: page.archived.length > 0 }
-                    Text { objectName: "projectsArchivedHeading"; visible: page.archived.length > 0; text: qsTr("ARCHIVED PROJECTS"); color: Theme.textLabel; font: Theme.pageSection }
-                    Repeater { model: page.archived; ProjectRow { project: modelData } }
+            Text { id: notice; objectName: "projectNotice"; visible: bridge.projectNotice !== ""; y: toolbar.height + 10; width: parent.width
+                   wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.projectNotice; color: Theme.warning; font: Theme.pageRow }
+            // Gate 6E (D23): compact lines at the top, never floating mid-void.
+            Text { objectName: "projectsEmpty"; visible: page.cards.length === 0; y: grid.y; width: parent.width; wrapMode: Text.Wrap
+                   text: bridge.projectRecords.length === 0 ? qsTr("No project yet. Use New project to create one.")
+                         : page.query.trim() !== "" ? qsTr("No project matches your search.")
+                         : page.tab === "archived" ? qsTr("No archived project.") : qsTr("No active project yet.")
+                   color: Theme.textLabel; font: Theme.pageRow }
+            GridView {
+                id: grid
+                objectName: "projectGrid"
+                y: (notice.visible ? notice.y + notice.height : toolbar.height) + 14
+                width: parent.width; height: parent.height - y
+                // As many columns of at least 280 px as fit; the cards share the width exactly.
+                readonly property int columns: Math.max(1, Math.floor((width + Theme.gap) / (280 + Theme.gap)))
+                cellWidth: Math.floor((width + Theme.gap) / columns); cellHeight: 128 + Theme.gap
+                clip: true; boundsBehavior: Flickable.StopAtBounds
+                model: page.cards
+                ScrollBar.vertical: ScrollBar { policy: grid.contentHeight > grid.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
+                delegate: Item {
+                    width: grid.cellWidth; height: grid.cellHeight
+                    ProjectCard {
+                        width: parent.width - Theme.gap; height: 128
+                        project: modelData.project; lastActivity: page.when(modelData.at)
+                        // Locals: opening rebuilds the model, and this delegate's context with it.
+                        onOpened: { var id = project.id; page.openCard(id, "conversations") }
+                        onMenuRequested: function (anchor) { projectMenu.openFor(project, anchor) }
+                    }
                 }
             }
         }
 
         // -- the detail of the open project ---------------------------------------
         Item {
-            width: parent.width * 0.62 - Theme.gap / 2; height: parent.height
-            // Gate 6E (D23): compact lines at the top, never floating mid-void.
-            Text { objectName: "projectsEmpty"; visible: !page.current.id; width: parent.width; wrapMode: Text.Wrap
-                   text: bridge.projectRecords.length === 0 ? qsTr("No project yet. Type a name in the field on the left and press Create.")
-                                                           : qsTr("Choose a project to see its conversations.")
-                   color: Theme.textLabel; font: Theme.pageRow }
+            anchors.fill: parent
             Column {
                 id: detail
                 objectName: "projectDetail"
                 visible: !!page.current.id
                 anchors.fill: parent; spacing: 10
                 NumberAnimation { id: detailFade; target: detail; property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
-                // The name (elided; its tip has it whole), its state pill, the actions.
+                // Back to the grid, the name (elided; its tip has it whole), its state pill, the actions.
                 Item {
                     width: parent.width; height: 36
+                    IconButton { id: backButton; objectName: "projectsBack"; anchors.verticalCenter: parent.verticalCenter
+                                 icon: "back"; tip: qsTr("All projects"); onClicked: bridge.showProject("") }
                     Text { id: detailName; objectName: "projectDetailName"; anchors.verticalCenter: parent.verticalCenter
-                           width: Math.max(0, Math.min(implicitWidth, parent.width - statePill.width - 12 - detailActions.width - 16))
+                           x: backButton.width + 8
+                           width: Math.max(0, Math.min(implicitWidth, parent.width - x - statePill.width - 12 - detailActions.width - 16))
                            text: page.current.name || ""; textFormat: Text.PlainText
                            elide: Text.ElideRight; color: Theme.text; font: Theme.titleLarge }
                     HoverTip { objectName: "projectDetailNameTip"; target: detailName; text: detailName.text; active: detailName.truncated }
-                    Pill { id: statePill; objectName: "projectStatePill"; x: detailName.width + 12; anchors.verticalCenter: parent.verticalCenter
+                    Pill { id: statePill; objectName: "projectStatePill"; x: detailName.x + detailName.width + 12; anchors.verticalCenter: parent.verticalCenter
                            font: Theme.pageSection; implicitHeight: 24
                            text: page.current.active === false ? qsTr("archived") : qsTr("active")
                            tint: page.current.active === false ? Theme.warning : Theme.success }
@@ -461,6 +495,33 @@ SecondaryPage {
     }
 
     ConversationDeleteDialog { id: deleteDialog }
+    NewProjectDialog { id: newProjectDialog }
+
+    // Gate 6G P2: the card's menu (K4). Edit opens the project on its
+    // instruction (rename is beside it); archive is the reversible step.
+    // Projects have no delete path (6D-b), so there is no delete here.
+    MenuSurface {
+        id: projectMenu
+        objectName: "projectCardMenuSurface"
+        width: 240
+        property var project: ({})
+        function openFor(p, anchor) {
+            project = p
+            popupAt(anchor, Qt.point(anchor.width - width, anchor.height + 4), { trigger: anchor, flip: true })
+        }
+        Column {
+            width: projectMenu.availableWidth
+            spacing: 2
+            MenuRow { objectName: "projectMenuEdit"; icon: "pencil"; label: qsTr("Edit"); visible: projectMenu.project.active === true
+                      onTriggered: { var id = projectMenu.project.id; projectMenu.close(); page.openCard(id, "instruction") } }
+            Item { width: parent.width; height: 9; visible: projectMenu.project.active === true
+                   Rectangle { y: 4; x: 8; width: parent.width - 16; height: 1; color: Theme.border } }
+            MenuRow { objectName: "projectMenuArchive"; icon: "archive"; label: qsTr("Archive"); visible: projectMenu.project.active === true
+                      onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.archiveProject(id) } }
+            MenuRow { objectName: "projectMenuUnarchive"; icon: "archive"; label: qsTr("Unarchive"); visible: projectMenu.project.active === false
+                      onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.unarchiveProject(id) } }
+        }
+    }
 
     FileDialog {
         id: filePicker

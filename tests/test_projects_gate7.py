@@ -218,7 +218,7 @@ class ArchiveControlsTests(ProjectsUiCase):
         self.assertTrue(self.item(root, "projectArchivedBanner").isVisible())
         self.assertEqual([], self.visible(root, "projectArchive"))
         self.assertEqual(1, len(self.visible(root, "projectDetailUnarchive")))
-        self.assertEqual(1, len(self.visible(root, "projectUnarchive")))
+        # G6PJ1B (6G P2): the list row's Unarchive moved to the card menu: asserted in the last block.
         self.assertFalse(self.item(root, "projectNewConversation").isEnabled())
         # The open conversation is read-only, its composer off, the selector hides it.
         bridge.setPage("home")
@@ -244,15 +244,20 @@ class ArchiveControlsTests(ProjectsUiCase):
         self.assertFalse(self.item(root, "readOnlyBanner").isVisible())
         self.assertTrue(self.item(root, "composerInput").isEnabled())
         self.assertEqual(["Evim"], self.selector_labels(root))
-        # The list row's Unarchive button.
+        # The card menu's Unarchive (G6PJ1B, 6G P2: was the list row's button), on the Arşiv tab.
         bridge.setPage("projects")
         pump(400)
         self.click_visible(root, "projectArchive")
         self.assertFalse(store.load_project(project.id).active)
-        self.click_visible(root, "projectUnarchive")
+        self.click_visible(root, "projectsBack")
+        self.click_visible(root, "projectsTab_archived")
+        self.click_visible(root, "projectCardMenu")
+        self.assertEqual(1, len(self.visible(root, "projectMenuUnarchive")))
+        self.click_visible(root, "projectMenuUnarchive")
         self.assertTrue(store.load_project(project.id).active)
-        self.assertEqual([], self.visible(root, "projectUnarchive"))
-        self.assertFalse(self.item(root, "projectsArchivedHeading").isVisible())
+        self.assertEqual([], self.visible(root, "projectMenuUnarchive"))
+        self.assertEqual([], self.visible(root, "projectCard"))                       # the archive tab is empty
+        self.assertTrue(self.item(root, "projectsEmpty").isVisible())
         self.assertEqual(0, self.execute_calls())
 
 

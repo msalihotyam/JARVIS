@@ -2486,6 +2486,61 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>NewProjectDialog</name>
+    <message>
+        <source>New project</source>
+        <translation>Yeni proje</translation>
+    </message>
+    <message>
+        <source>The new project could not be identified, so no instruction was saved. Open it from the Projects page to add one.</source>
+        <translation>Yeni proje belirlenemedi, bu yüzden talimat kaydedilmedi. Talimat eklemek için projeyi Projeler sayfasından açın.</translation>
+    </message>
+    <message>
+        <source>Project name</source>
+        <translation>Proje adı</translation>
+    </message>
+    <message>
+        <source>e.g. Kitchen renovation</source>
+        <translation>Örn. Mutfak yenileme</translation>
+    </message>
+    <message>
+        <source>What do you want to do?</source>
+        <translation>Ne yapmak istiyorsun?</translation>
+    </message>
+    <message>
+        <source>optional</source>
+        <translation>isteğe bağlı</translation>
+    </message>
+    <message>
+        <source>Goal, scope, what to watch for… This text becomes the project&apos;s instruction.</source>
+        <translation>Amaç, kapsam, dikkat edilecekler… Bu metin projenin talimatı olur.</translation>
+    </message>
+    <message>
+        <source>Classification:</source>
+        <translation>Sınıflandırma:</translation>
+    </message>
+    <message>
+        <source>%1 / %2</source>
+        <translation>%1 / %2</translation>
+    </message>
+    <message>
+        <source>The instruction can be at most %1 characters.</source>
+        <translation>Talimat en fazla %1 karakter olabilir.</translation>
+    </message>
+    <message>
+        <source>Choose PUBLIC or INTERNAL for the instruction.</source>
+        <translation>Talimat için PUBLIC ya da INTERNAL seçin.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Create project</source>
+        <translation>Proje oluştur</translation>
+    </message>
+</context>
+<context>
     <name>PanelColumn</name>
     <message>
         <source>just now</source>
@@ -3105,6 +3160,21 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>ProjectCard</name>
+    <message>
+        <source>In archive</source>
+        <translation>Arşivde</translation>
+    </message>
+    <message>
+        <source>No instruction</source>
+        <translation>Talimat yok</translation>
+    </message>
+    <message>
+        <source>Project actions</source>
+        <translation>Proje işlemleri</translation>
+    </message>
+</context>
+<context>
     <name>ProjectsPage</name>
     <message>
         <source>Projects</source>
@@ -3143,28 +3213,8 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Arşivden çıkar</translation>
     </message>
     <message>
-        <source>New project name</source>
-        <translation>Yeni proje adı</translation>
-    </message>
-    <message>
-        <source>Create</source>
-        <translation>Oluştur</translation>
-    </message>
-    <message>
-        <source>ACTIVE</source>
-        <translation>ETKİN</translation>
-    </message>
-    <message>
         <source>No active project yet.</source>
         <translation>Henüz etkin proje yok.</translation>
-    </message>
-    <message>
-        <source>ARCHIVED PROJECTS</source>
-        <translation>ARŞİVLENMİŞ PROJELER</translation>
-    </message>
-    <message>
-        <source>Choose a project to see its conversations.</source>
-        <translation>Sohbetlerini görmek için bir proje seçin.</translation>
     </message>
     <message>
         <source>Archived: this project is read-only. Its conversations are kept and can be read, but nothing new runs in it until you unarchive it.</source>
@@ -3173,6 +3223,46 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>New name</source>
         <translation>Yeni ad</translation>
+    </message>
+    <message>
+        <source>Your projects</source>
+        <translation>Projelerin</translation>
+    </message>
+    <message>
+        <source>Archived</source>
+        <translation>Arşiv</translation>
+    </message>
+    <message>
+        <source>Search projects</source>
+        <translation>Projelerde ara</translation>
+    </message>
+    <message>
+        <source>Last activity</source>
+        <translation>Son etkinlik</translation>
+    </message>
+    <message>
+        <source>Name</source>
+        <translation>Ad</translation>
+    </message>
+    <message>
+        <source>New project</source>
+        <translation>Yeni proje</translation>
+    </message>
+    <message>
+        <source>No project yet. Use New project to create one.</source>
+        <translation>Henüz proje yok. Oluşturmak için Yeni proje&apos;ye basın.</translation>
+    </message>
+    <message>
+        <source>No project matches your search.</source>
+        <translation>Aramanızla eşleşen proje yok.</translation>
+    </message>
+    <message>
+        <source>No archived project.</source>
+        <translation>Arşivlenmiş proje yok.</translation>
+    </message>
+    <message>
+        <source>All projects</source>
+        <translation>Tüm projeler</translation>
     </message>
     <message>
         <source>Rename</source>
@@ -3279,10 +3369,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>ARŞİV</translation>
     </message>
     <message>
-        <source>No project yet. Type a name in the field on the left and press Create.</source>
-        <translation>Henüz proje yok. Soldaki alana bir ad yazıp Oluştur&apos;a basın.</translation>
-    </message>
-    <message>
         <source>+ New conversation</source>
         <translation>+ Yeni sohbet</translation>
     </message>
@@ -3333,6 +3419,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>No file in this project yet.</source>
         <translation>Bu projede henüz dosya yok.</translation>
+    </message>
+    <message>
+        <source>Edit</source>
+        <translation>Düzenle</translation>
     </message>
     <message>
         <source>Text and code (%1)</source>

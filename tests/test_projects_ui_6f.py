@@ -1196,10 +1196,11 @@ class SidebarNavTests(SidebarNavCase):
             ))
             bridge.setPage("home")
             pump(400)
-        # Q9 moved: the Projects page's own create field ("Yeni proje") is where a project is made.
+        # Q9 moved: the Projects page's own "Yeni proje" is where a project is made (G6PJ1B, 6G P1:
+        # a button that opens the new-project popup, was a create field).
         self.tap(root, self.item(root, "sidebarProjectsLink"), then=lambda: (
             self.assertEqual("projects", bridge.page),
-            self.assertTrue(self.item(root, "projectNewName").isVisible()),
+            self.assertTrue(self.item(root, "projectsNew").isVisible()),
         ))
         bridge.setPage("home")
         pump(400)
