@@ -64,7 +64,7 @@ Item {
     // 6G S1: the status slot sizes per skin - the mechanical lamp 120 px, the orbs their instrument size.
     readonly property bool mechanical: bridge.statusIndicator === "mechanical"
     readonly property real statusSlot: mechanical ? 120 : Theme.stripStatus
-    readonly property real stripFixed: statusSlot + Theme.stripKill + 38 + 13 + 106 + 5 * stripGap
+    readonly property real stripFixed: statusSlot + Theme.stripKill + 38 + 38 + 13 + 106 + 6 * stripGap   // R3U: + the bell
     readonly property real stripRoom: width - Math.round(width * Theme.macroStripRight)
                                       - (ticker0 + tickerNeed + 10)
     readonly property real selectorMax: stripRoom - stripFixed
@@ -384,6 +384,10 @@ Item {
         height: Theme.stripHeight
         spacing: bar.stripGap
         readonly property real mid: Theme.stripHeight / 2
+
+        // R3U: what finished unseen or waits for the person, across conversations. First in
+        // the right-anchored strip, so nothing to its right moves (the lamp keeps its overlap).
+        UnreadBell { objectName: "unreadBell"; y: controls.mid - height / 2 }
 
         // 6G U1: the selected provider's BRAND only - socket and name, nothing
         // else (no model, no usage) and no action: the model and effort chips and

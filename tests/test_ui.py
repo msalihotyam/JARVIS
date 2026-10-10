@@ -1498,9 +1498,9 @@ class CommandHeaderTests(UiTestCase):
         for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
             root.resize(width, height)
             pump(600)
-            core, strip, chip, lamp, kill, nav = self.boxes(
+            core, strip, chip, lamp, kill, bell, nav = self.boxes(
                 root, "jarvisCore", "commandStrip", "brandCard", "statusOrb",
-                "killSwitchControl", "navigationTrigger")
+                "killSwitchControl", "unreadBell", "navigationTrigger")
             with self.subTest(size=(width, height)):
                 # The core is the dominant header element and keeps its centre
                 # (the selector is +24 px wide by design; the core still dwarfs it).
@@ -1515,7 +1515,7 @@ class CommandHeaderTests(UiTestCase):
                 self.assertLessEqual(strip[2], width)
                 self.assertGreaterEqual(strip[0], core[2] - 1)
                 # Required order, with separate hit targets throughout.
-                order = [chip, lamp, kill, nav]
+                order = [bell, chip, lamp, kill, nav]                 # R3U: the bell first
                 for left, right in zip(order, order[1:]):
                     self.assertLessEqual(left[2], right[0] + 1)
                 # Degradation never shrinks a control or the card; U1's brand-only
@@ -1528,6 +1528,7 @@ class CommandHeaderTests(UiTestCase):
                 self.assertGreaterEqual(lamp[2] - lamp[0], 56)
                 self.assertGreaterEqual(kill[2] - kill[0], 44)
                 self.assertGreaterEqual(nav[2] - nav[0], 34)
+                self.assertGreaterEqual(bell[2] - bell[0], 34)
                 # The core-side status group is present whenever it fits, and
                 # is what gives way when it does not - not the controls.
                 group = self.item(root, "coreStatusGroup")

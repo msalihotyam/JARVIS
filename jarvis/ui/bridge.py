@@ -2377,6 +2377,40 @@ class Bridge(QObject):
         until opened (green); the open one never. Bridge memory only."""
         return sorted(self._finished_unseen - {self._conversation_store.id})
 
+    @Slot(str, result=bool)
+    def markConversationUnread(self, conversation_id: str) -> bool:
+        """R3U: back to R3's green "finished, not seen" until it is opened again - a listed
+        (non-archived) conversation that is not the open one. Bridge memory only, like R3's own
+        green: no conversation, no preference and no schema changes."""
+        cid = str(conversation_id)
+        listed = any(row["id"] == cid for listed_rows in self._sidebar_lists.values() for row in listed_rows)
+        if not cid or cid == self._conversation_store.id or not listed:
+            return False
+        if cid not in self._finished_unseen:
+            self._finished_unseen.add(cid)
+            self.sidebarChanged.emit()
+        return True
+
+    @Property("QVariantList", notify=sidebarChanged)
+    def unreadBell(self) -> list:
+        """R3U: the top bar bell's entries, newest first - every listed conversation that waits
+        for the person (needsYouIds, amber wins) or finished unseen (green), each once, never the
+        open one: id, title ("" = untitled), project ("" = Global) and state."""
+        waiting = set(self._needs_you())
+        wanted = (waiting | self._finished_unseen) - {self._conversation_store.id}
+        names = {**self._pin_projects, **{r["id"]: r for r in self._project_records}}
+        out = []
+        for owner, listed_rows in self._sidebar_lists.items():
+            for row in listed_rows:
+                cid = row["id"]
+                if cid not in wanted:
+                    continue
+                title = row["title"]
+                out.append({"id": cid, "title": render(title) if isinstance(title, tuple) else title,
+                            "project": str(names.get(owner, {}).get("name") or owner),
+                            "state": "needsYou" if cid in waiting else "finished", "updated_at": row["updated_at"]})
+        return sorted(out, key=lambda entry: entry["updated_at"], reverse=True)
+
     def _linked_here(self, session_id: str) -> bool:
         """``session_id`` belongs to the OPEN conversation (a failed lookup: no)."""
         return self._session_conversation(session_id) == self._conversation_store.id

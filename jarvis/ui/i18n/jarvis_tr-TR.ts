@@ -1555,6 +1555,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Aşağı taşı</translation>
     </message>
     <message>
+        <source>Mark as unread</source>
+        <translation>Okunmadı olarak işaretle</translation>
+    </message>
+    <message>
         <source>Rename</source>
         <translation>Yeniden adlandır</translation>
     </message>
@@ -4812,6 +4816,33 @@ DOĞRULANMADI</translation>
     <message>
         <source>JARVIS is still running in the background.</source>
         <translation>JARVIS arka planda çalışmaya devam ediyor.</translation>
+    </message>
+</context>
+<context>
+    <name>UnreadBell</name>
+    <message>
+        <source>Waiting: %1</source>
+        <translation>Bekleyen: %1</translation>
+    </message>
+    <message>
+        <source>Nothing waiting</source>
+        <translation>Bekleyen bir şey yok</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>Waiting for you</source>
+        <translation>Seni bekliyor</translation>
+    </message>
+    <message>
+        <source>Finished</source>
+        <translation>Bitti</translation>
     </message>
 </context>
 <context>

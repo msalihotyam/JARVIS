@@ -169,8 +169,10 @@ class H3MenuStyleTests(HeaderMenuCase):
 
     def test_h3_the_reference_items_left_out_are_absent(self) -> None:
         source = (QML / "ConversationMenu.qml").read_text(encoding="utf-8")
-        for gone in ("Change project", "Remove from project", "Open in new window", "Mark as unread"):
+        for gone in ("Change project", "Remove from project", "Open in new window"):
             self.assertNotIn(gone, source)
+        # R3U (Salih 2026-10-10) brought "Mark as unread" in, for a sidebar row only (tests/test_g6r3u_unread_bell.py).
+        self.assertIn("Mark as unread", source)
 
     def test_h3_the_new_strings_are_turkish(self) -> None:
         from jarvis.ui.i18n import localization, tx

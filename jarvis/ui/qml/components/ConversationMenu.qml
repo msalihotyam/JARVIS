@@ -144,6 +144,10 @@ Item {
             ScopeChoice { objectName: "conversationPinDownItem"; icon: "arrow-down"; available: !menu.runBlocked
                           visible: menu.pinned && menu.pinIndex < bridge.pinnedConversations.length - 1
                           label: qsTr("Move down"); onTriggered: { var id = menu.targetId, to = menu.pinIndex + 1; context.close(); bridge.movePin(id, to) } }
+            // R3U: a sidebar row (never the open conversation) back to R3's green until opened again.
+            ScopeChoice { objectName: "conversationMarkUnreadItem"; icon: "dot"; label: qsTr("Mark as unread")
+                          visible: menu.rowId !== "" && bridge.finishedUnseenIds.indexOf(menu.rowId) < 0
+                          onTriggered: { var id = menu.rowId; context.close(); bridge.markConversationUnread(id) } }
             ScopeChoice { objectName: "conversationRenameItem"; icon: "pencil"
                           label: qsTr("Rename"); available: menu.renameAllowed
                           onTriggered: { menu.editId = menu.targetId; menu.editTitle = menu.rowId ? menu.rowTitle : bridge.conversationTitle
