@@ -51,6 +51,7 @@ CRASH_PAGE = 3
 # "max_lanes" is not a default: when present it overrides lanes_present / lanes_away (CONV6).
 PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
                  "reset_alert_pct": 95, "full_burn_limit_pct": 98, "min_free_mem_gb": 3.0,
+                 "max_commit_pct": 90,
                  "lanes_present": MAX_LANES, "lanes_away": 5, "away_after_min": 10,
                  "power_switch": False, "power_switch_cmd": []}
 MAX_LANES_CAP = 6  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
@@ -62,7 +63,7 @@ PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
 POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
 POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
 SESSION_EXE = "claude.exe"  # a lane's session pid is touched only when it is this image
-MAX_COMMIT_PCT = 90  # memory guard: no new lane above this commit charge
+COMMIT_PCT_RANGE = (80, 97)  # pace.json max_commit_pct (memory guard: no new lane above it) clamp
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
 PACE_BANDS = ((2, None), (7, 2), (12, 1))  # usage <= pace_line + margin -> max lanes (None:
 # pace.json max_lanes); above all: 0
@@ -717,6 +718,7 @@ class Conveyor:
         self.push_gate()
         items = self.attention(lanes)
         if agents is not None:
+            self.stop_finished(lanes, agents, {i for i, _, _ in items})
             self.cleanup(lanes, agents, {i for i, _, _ in items})
             self.save_lanes(lanes)
         self.write_status(lanes, items)
@@ -1033,12 +1035,13 @@ class Conveyor:
                 raise ValueError(f"mode {p['mode']!r}")
             lane_keys = [k for k in ("max_lanes", "lanes_present", "lanes_away") if k in p]
             for k in ("days", "reset_alert_pct", "full_burn_limit_pct", "min_free_mem_gb",
-                      "away_after_min", *lane_keys):
+                      "max_commit_pct", "away_after_min", *lane_keys):
                 if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
                         (p[k] <= 0 and k not in lane_keys):
                     raise ValueError(f"{k} {p[k]!r}")
             for k in lane_keys:
                 p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
+            p["max_commit_pct"] = min(COMMIT_PCT_RANGE[1], max(COMMIT_PCT_RANGE[0], p["max_commit_pct"]))
             cmd = p["power_switch_cmd"]
             if not isinstance(p["power_switch"], bool) or not isinstance(cmd, list) or \
                     not all(isinstance(a, str) and a for a in cmd) or (p["power_switch"] and not cmd):
@@ -1093,7 +1096,7 @@ class Conveyor:
         self.usage_hold = u is not None and u >= limit
         self.max_lanes = 0 if self.usage_hold else n
         m = self.memory
-        self.mem_hold = m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > MAX_COMMIT_PCT)
+        self.mem_hold = m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > p["max_commit_pct"])
         if self.mem_hold:
             band = "memory hold"  # running lanes untouched; nothing new starts (hold())
         self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
@@ -1871,6 +1874,44 @@ class Conveyor:
                       or a.get("state") not in CLEAN_STATES or a.get("status") == "busy"
                       or not str(a.get("sessionId") or "").startswith(a["id"])), None)
         return sess, doubt
+
+    def stop_finished(self, lanes, agents, attention_ids):
+        """`claude stop` (never rm) the live sessions of lanes this conveyor started whose
+        report was collected and that are not in attention: an idle finished session holds
+        memory until cleanup's rm. Once per lane (ln["stopped"]); a doubt (busy, foreign,
+        unknown state) leaves it; a stop failure is an event, never fatal."""
+        done, fresh = 0, False
+        for name, ln in lanes.items():
+            if done >= CLEANUP_PER_PASS:
+                return
+            if (not ln.get("finished") or "stopped" in ln or "cleanup" in ln
+                    or name in attention_ids or ln.get("status") == "STUCK"
+                    or self.collected_ts(ln) is None):
+                continue
+            ids = ln.get("prev_ids", []) + [ln["id"]]
+            sess, doubt = self.lane_sessions(name, ids, agents)
+            if doubt or not any("pid" in a for a in sess):
+                continue  # rm cleanup still judges it later
+            if not fresh:  # the pass may be minutes old: act only on a fresh listing
+                try:
+                    agents, fresh = self.agents(), True
+                except Exception as e:
+                    self.event("early_stop_skip", reason=f"agents: {type(e).__name__}")
+                    return
+                sess, doubt = self.lane_sessions(name, ids, agents)
+            live = [a for a in sess if "pid" in a]
+            if doubt or not live:
+                continue
+            done += 1
+            steps = []
+            for a in live:
+                try:
+                    rc, out = self.run(["stop", a["id"]])
+                except Exception as e:
+                    rc, out = type(e).__name__, ""
+                steps.append({"id": a["id"], "rc": rc, "output": out[-300:]})
+            ln["stopped"] = {"at": iso(self.now()), "ok": all(s["rc"] == 0 for s in steps)}
+            self.event("early_stop", lane=name, steps=steps)
 
     def cleanup(self, lanes, agents, attention_ids):
         """Stop (if alive) and `claude rm` the sessions of lanes this conveyor started

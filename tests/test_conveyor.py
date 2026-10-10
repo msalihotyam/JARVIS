@@ -1256,6 +1256,17 @@ class TestMemoryGuard(Base):
         self.c.pass_once()
         self.assertEqual(self.fake.bg_calls(), [])
 
+    def test_max_commit_pct_read_from_pace_json_and_clamped(self):
+        for pct, mem, hold in ((95, 94.0, False), (95, 95.5, True), (70, 85.0, True),
+                               (70, 80.0, False), (99, 97.5, True), (99, 96.9, False)):
+            with self.subTest(pct=pct, mem=mem):
+                (self.base / "pace.json").write_text(json.dumps({"max_commit_pct": pct}), encoding="utf-8")
+                self.memory = (32.0, mem)
+                self.c.memory = self.c.mem()
+                self.c.govern()
+                self.assertEqual(self.c.mem_hold, hold)
+        self.assertEqual(conveyor.PACE_DEFAULTS["max_commit_pct"], 90)
+
     def test_running_lanes_untouched(self):
         self.drop("a.md", HDR.format("A") + "x")
         self.c.pass_once()
@@ -1928,6 +1939,7 @@ class TestCleanup(Base):
         self.ledger_skip = set()  # session ids the fake ledger does not count
         self.c.usage_ledger = self.fake_ledger
         self.ledger = self.root / "build" / "ledger" / "usage.json"
+        self.c.stop_finished = lambda *a: None  # these cover the rm path with a live session (TestEarlyStop)
 
     def fake_ledger(self):
         self.ledger_runs += 1
@@ -2115,6 +2127,83 @@ class TestCleanup(Base):
         (self.root / "scripts" / "usage_ledger.py").unlink()
         c.usage_ledger()
         self.assertEqual(self.ledger.read_text(), "build")
+
+
+class TestEarlyStop(Base):
+    """A finished lane's live session is `claude stop`ped at once (memory); rm stays at CLEANUP_S."""
+
+    fake_ledger, finished, cli = TestCleanup.fake_ledger, TestCleanup.finished, TestCleanup.cli
+
+    def setUp(self):  # as TestCleanup, early stop left on
+        super().setUp()
+        self.ledger_runs, self.ledger_error, self.ledger_skip = 0, None, set()
+        self.c.usage_ledger = self.fake_ledger
+        self.ledger = self.root / "build" / "ledger" / "usage.json"
+
+    def test_finished_stopped_once_then_rm_path_unchanged(self):
+        sid = self.finished()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
+        self.assertTrue(self.lanes()["A"]["stopped"]["ok"])
+        for _ in range(3):
+            self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "early_stop"]), 1)
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid], ["rm", sid]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+
+    def test_busy_attention_foreign_never_stopped(self):
+        self.fake.agents.append(  # not started by the conveyor: same lane name, alive, idle
+            {"id": "ffff0001", "name": "A", "kind": "background", "state": "done", "status": "idle",
+             "pid": 1, "sessionId": "ffff0001-x"})
+        self.finished(agent={"status": "busy"})
+        self.finished("B", "BLOCKED")  # in attention
+        self.finished("C", agent={"state": "working"})
+        for _ in range(3):
+            self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.assertNotIn("stopped", self.lanes()["A"])
+        self.fake.agent("A").update(status="idle")  # no longer busy: stopped now, foreign one never
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop"), [["stop", self.lanes()["A"]["id"]]])
+        self.assertIn("pid", next(a for a in self.fake.agents if a["id"] == "ffff0001"))
+
+    def test_fresh_listing_busy_not_stopped(self):
+        run = self.c.run
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.fake.agent("A").update(state="done", status="idle")
+        self.report("A", "PASS")
+        calls = []
+
+        def reattached(args, timeout=120):  # Salih attaches between the pass's listing and the stop
+            out = run(args, timeout)
+            if args[0] == "agents":
+                calls.append(args)
+                if len(calls) == 2:
+                    return 0, json.dumps([{**a, "status": "busy"} for a in self.fake.agents])
+            return out
+        self.c.run = reattached
+        self.c.pass_once()
+        self.assertTrue(self.lanes()["A"]["finished"])
+        self.assertEqual(self.cli("stop"), [])
+        self.assertNotIn("stopped", self.lanes()["A"])
+
+    def test_stop_failure_logged_not_fatal_not_retried(self):
+        run = self.c.run
+
+        def timeout(args, timeout=120):
+            if args[0] == "stop":
+                raise conveyor.subprocess.TimeoutExpired(args, timeout)
+            return run(args, timeout)
+        self.c.run = timeout
+        self.finished()
+        self.c.pass_once()
+        self.assertFalse(self.lanes()["A"]["stopped"]["ok"])
+        (ev,) = [e for e in self.events() if e["event"] == "early_stop"]
+        self.assertEqual(ev["steps"][0]["rc"], "TimeoutExpired")
+        self.assertEqual(self.c.last_error, None)
 
 
 class TestPushGate(Base):

@@ -651,7 +651,7 @@ the optional report reader below. One instance at a time
   `disk-low` attention item (and one `disk_hold` event) per episode; at 10 GB
   or more dispatch resumes and the episode ends.
 - **Memory guard (CONV5).** Free physical memory under `min_free_mem_gb`
-  (pace.json, default 3.0) or a commit charge above 90% (`MAX_COMMIT_PCT`;
+  (pace.json, default 3.0) or a commit charge above `max_commit_pct` (pace.json, default 90, clamped 80..97;
   `GlobalMemoryStatusEx` via ctypes, stdlib only) holds like PAUSE: no
   dispatch, no re-dispatch; running lanes are untouched. `status.json` shows
   `memory_hold` and `memory` (`free_gb`, `commit_pct`) and `pace.band` reads
@@ -754,7 +754,7 @@ the optional report reader below. One instance at a time
   orchestrator may edit it by hand at any time; written with the defaults if
   missing): `{"mode": "full_burn" | "paced", "window_start": ISO|null,
   "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98,
-  "min_free_mem_gb": 3.0, "lanes_present": 3, "lanes_away": 5,
+  "min_free_mem_gb": 3.0, "max_commit_pct": 90, "lanes_present": 3, "lanes_away": 5,
   "away_after_min": 10, "power_switch": false, "power_switch_cmd": []}`.
   `max_lanes` below is the presence lane count (`lanes_present` /
   `lanes_away`, see "Presence modes"); a hand-set `"max_lanes"` key (Salih
@@ -889,6 +889,7 @@ the optional report reader below. One instance at a time
   `result: error`, `last_error`). At most 5 lanes per pass; one `cleanup`
   event per lane. Sessions not in `lanes.json` (Salih's, the orchestrator's)
   are never touched.
+- **Early stop** (CONV8, memory): such a lane's live sessions are `claude stop`ped (never `rm`) as soon as its report is collected and it is not in attention (same doubt checks on a fresh listing; once per lane, `early_stop` event; a failure is logged, never fatal); `rm` still waits for the 2 h + ledger rule above.
 - **Switch-over.** The scheduled task runs `scripts/conveyor.py` from the
   canonical checkout (v0 was `build/conveyor/conveyor.py`); it reads the same
   `build/conveyor/` state. Every 30 min it runs the usage ledger
