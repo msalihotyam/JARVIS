@@ -75,7 +75,7 @@ Bunlar karar değil, planlama tahminidir; dilim = bir commit'lik iş. V2.0 kalem
 | 6G başlık + menü (F9) | H1–H3, M1 + menü hatası, N2, K4 | 2 |
 | 6G besteleyici + model/kullanım | M2, C1, U1–U3 | 2–3 |
 | 6G Projects UX | P1 açılır pencere, P2 kartlar, P3 iç sayfa, W1/W3 panel | 3–4 |
-| 6G alıntılama v2 + uzun yapıştırma | Q1–Q7, LP1–LP4 | 2–3 |
+| 6G alıntılama v2 + uzun yapıştırma (G6Q1, G6LP: `main`de gönderildi) | Q1, Q2', Q3', Q5, Q8, Q9, Q10, Q11, LP1–LP4 | 2–3 |
 | 6G dondurma kaplaması 2 | kaplama ayarı + kaplama 2 | 1 |
 | 6G kalite K3/K5/K6 | dürüst göstergeler, akış, sayfalar | 3 |
 | 6G toplam | | 23–29 |
@@ -1099,21 +1099,21 @@ Kaynak: Salih kararları 2026-10-05/06 (G0 ile buraya taşındı; çalışma not
 - **P3:** proje iç sayfası: ad başlığı, "Bu projede yeni sohbet" besteleyicisi, Sabitlenen + Son sohbetler listesi; sağ sütun satırları kipler açar: Talimatlar (Düzenle — mevcut editör), Dosyalar/Bağlam (mevcut dosya paneli), Klasör (6H). Hafıza satırı V2.1'de, Zamanlanmış satırı V2.5'te gelir — öncesinde sahte/boş gösterilmez.
 - **W1/W3 çalışma paneli (ilk sürüm 6G):** düz/projesiz sohbette hiç görünmez; yalnız PROJE sohbetlerinde, yalnız gerçek veri: kullanılan proje talimatı, kullanılan proje dosyaları, bağlı klasör (6H sonrası), bu sohbette gerçekten kullanılan connector/yetenekler. Daraltılabilir; V2.4'e kadar Progress/Outputs bölümü yok. (W2 tam sürüm V2.4'te.)
 
-**Alıntılama v2 — kart akışı (Salih kararı, 2026-10-06; 6G sohbet alanı dilimi; pano 13 "Alıntılama", Güncel plan artifact v12)**
+**Alıntılama v2 — kart akışı (Salih kararı, 2026-10-06; 6G sohbet alanı dilimi; pano 13 "Alıntılama", Güncel plan artifact v12). Gönderildi: G6Q1 (+ G6Q1T tr-TR kataloğu) `main`de.**
 Salih kararı (2026-10-06): chip/açılır-liste öğeleri (Q3/Q4/Q7) ve Q2'deki İptal/Kaydet satırı YERİNE kart akışı. Nihai küme:
 - **Q1:** alıntılanabilir bir mesajda metin seçmek seçimde TEK yüzen "Alıntıla" düğmesi gösterir (bugün "Quote selection"); bütün mesaj için üstüne gelince "Alıntıla" eylemi kalır. (değişmedi)
 - **Q2' (alıntı açılır penceresi):** üstte sönük alıntı önizlemesi (solda çubuk, en çok 2 satır), TEK yorum satırı, sağında ataç + ekle simgesi; Enter ekler, Esc kapatır; resim küçük görselleri girişin altında. İptal/Kaydet satırı yok.
-- **Q3' (besteleyici kartları):** alıntı başına BİR kart: harf + yorum (yorum yoksa ilk alıntı satırı, sönük); kartlar sarılır ve YUKARI doğru büyür; 2+ alıntıda "Birlikte / Ayrı yanıt" anahtarı.
+- **Q3' (besteleyici kartları):** alıntı başına BİR kart: harf + yorum (yorum yoksa ilk alıntı satırı, sönük), varsa görsel küçük resmi, üzerine gelince X; karta tıklamak ayrıntı penceresini açar; kartlar sarılır ve YUKARI doğru büyür; 2+ alıntıda "Birlikte / Ayrı yanıt" anahtarı.
 - **Q5 (işaretler):** değişmedi — kaynak mesajda her alıntılanmış aralığın sonunda harf işareti + ince noktalı alt çizgi (yalnız taslak; mesaj gönderilince ya da alıntı kaldırılınca temizlenir).
-- **Q8 (gönderilen mesaj):** alıntı başına alıntı parçası, yorum ve görseller; en sonda ortak mesaj.
-- **Q9:** karta ya da işarete tıklamak ayrıntı penceresi açar; düzenleme ve silme burada (eski Q6 düzenleme kipi buna katıldı).
-- **Q10:** tür etiketi "Yorum" / "Alıntı".
+- **Q8 (gönderilen mesaj):** alıntı başına harf, sönük alıntı parçası (solda çubuk; uzunsa daraltılır, "Devamını göster / Daha az"), altında normal metin yorum ve görselleri; en sonda ortak mesaj.
+- **Q9:** karta ya da işarete tıklamak ayrıntı penceresi açar (başlık türe göre, X; solda çubuklu tam alıntı metni, altında yorum, alıntının görselleri/dosyaları küçük resim + önizleme); düzenleme (kalem) ve "Alıntıyı sil" burada (eski Q6 düzenleme kipi buna katıldı).
+- **Q10:** tür etiketi: yorumlu kart "Yorum" (kart yorumu gösterir), yorumsuz kart "Alıntı" (kart alıntı metnini sönük, çubuklu, kısaltılmış gösterir); ayrıntı penceresinin başlığı türü izler.
 - **Q11:** alıntı seçimi tam sözcüklere oturur (yarım seçilen sözcük bütün alınır).
 - Eski Q2 (İptal/Kaydet satırı), Q3 (tek "N alıntı" çipi), Q4 + Q7 (çip üstü ayrıntı listesi) ve Q6 yerine geçildi; geçersizdir.
 - JARVIS model yükü harfli, etiketli gruplarını korur (alıntı / yorum / görseller / ortak mesaj ayrı parçalar). Claude Code'un düz metin biçimi incelendi, BENİMSENMEDİ.
 - Korunanlar: harfler A, B, C (mevcut grup etiketleri, arka uç etiket değişikliği yok); yorum = mevcut grup notu; görseller = mevcut grup ekleri; alıntılar yalnız bağlamdır, asla yetki değildir; gönderilen mesaj harfli dosyaları tutar; fare öncelikli.
 
-**Uzun yapıştırma (Salih 2026-10-06; 6G sohbet alanı dilimi, alıntılama v2'nin yanında)**
+**Uzun yapıştırma (Salih 2026-10-06; 6G sohbet alanı dilimi, alıntılama v2'nin yanında). Gönderildi: G6LP `main`de.**
 - **LP1:** besteleyiciye çok uzun metin yapıştırmak girişi doldurmaz: varsayılan olarak girişin üstünde bir "yapıştırılmış metin" kartı olur (.txt eki gibi): ilk satırlar soluk önizleme, "YAPIŞTIRILDI" etiketi, sağ altta kalem düğmesi. Birden çok uzun yapıştırma = birden çok kart. Yazmak asla tetiklemez, yalnız yapıştırma.
 - **LP2:** kalem kartı girişin içinde (imleçte) normal metne çevirir; kart kaybolur.
 - **LP3:** eşik (varsayılan, ayarlanabilir, tek sabit): >= 2.000 karakter YA DA >= 30 satır. Daha kısalar bugünkü gibi.

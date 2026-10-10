@@ -24,8 +24,9 @@ Depo ve git güvenliği:
 
 - `uv.lock`'a asla dokunma; stage/commit etme. Neden: izlenmez, yerelde
   `.git/info/exclude` ile dışlıdır.
-- `dev/dashboard/*` stage edilmez. Neden: dashboard emekli, WIP'i stash'te
-  park edilmiş.
+- `dev/dashboard/*` stage edilmez. Neden: dashboard emekli (yerine konveyor:
+  `scripts/conveyor.py`, `build/conveyor/`; durum panosu: pano artifact'ı),
+  WIP'i stash'te park edilmiş.
 - Stage'i yalnız açık yollarla yap. Neden: başka şeylerin yanlışlıkla commit'e
   girmesini önler.
 - Açık yetki olmadan asla push yapma; yetki bir sonraki push'a taşınmaz.
