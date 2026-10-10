@@ -6,7 +6,9 @@ import "../theme"
 // (JARVIS's own snapshot, aspect kept); a file shows its type and size. A
 // click opens the internal preview; the close icon, when offered, removes it from the
 // draft. `nested` (inside a group or a sent message) is a small tonal step
-// from its parent rather than another framed card. Presentation only -
+// from its parent rather than another framed card. A long paste (LP1) is the
+// same card read as pasted text: "PASTED", its first lines faint and, in the
+// draft, a pencil that turns it back into text. Presentation only -
 // nothing here reads a path or grants anything.
 Item {
     id: card
@@ -14,15 +16,20 @@ Item {
     property bool removable: false
     property bool compact: false
     property bool nested: false
+    // In the draft a pasted-text card offers its pencil (LP2); a sent one does not.
+    property bool editable: false
+    // LP1: a long paste - the same card, read as pasted text rather than as a file.
+    readonly property bool pasted: file.pasted === true
     readonly property bool image: file.kind === "image"
     readonly property string name: String(file.name || "")
     readonly property string ext: { var m = name.match(/\.([A-Za-z0-9]{1,5})$/); return m ? m[1].toUpperCase() : "" }
     readonly property int thumb: compact ? 40 : 52
     objectName: "attachment_" + file.id
     signal opened()
+    signal edited()
     activeFocusOnTab: true
     Accessible.role: Accessible.Button
-    Accessible.name: name
+    Accessible.name: pasted ? qsTr("Pasted text") : name
     Keys.onReturnPressed: card.opened()
     Keys.onSpacePressed: card.opened()
 
@@ -33,7 +40,7 @@ Item {
         return qsTr("%1 MB").arg((n / (1024 * 1024)).toFixed(1))
     }
 
-    width: Math.min(270, body.width + 18 + thumb + 10 + (removable ? 22 : 0))
+    width: pasted ? (compact ? 200 : 240) : Math.min(270, body.width + 18 + thumb + 10 + (removable ? 22 : 0))
     height: thumb + 12
     // Arrival: a short fade, no travel (none at all with ambient effects off).
     opacity: 0
@@ -55,6 +62,7 @@ Item {
     // What it is: the image itself, or a type tile for a file.
     Rectangle {
         id: tile
+        visible: !card.pasted
         x: 6; y: 6; width: card.thumb; height: card.thumb; radius: 6
         color: card.image ? "#06111e" : Theme.alpha("#36aaff", 0.10)
         border.width: 1; border.color: Theme.alpha("#49bdfa", card.image ? 0.25 : 0.32)
@@ -83,6 +91,7 @@ Item {
     }
     Column {
         id: body
+        visible: !card.pasted
         x: tile.x + tile.width + 10
         anchors.verticalCenter: parent.verticalCenter
         // Wide enough for the longer of the two lines, capped so cards stay compact.
@@ -96,6 +105,20 @@ Item {
                width: parent.width; elide: Text.ElideRight; color: Theme.textMuted
                text: (card.image ? qsTr("Image") : (card.ext || qsTr("File"))) + " · " + card.human(card.file.bytes)
                font: Theme.caption }
+    }
+    // LP1: a long paste - its label and its first lines, faint.
+    Column {
+        objectName: "pasteBody_" + card.file.id
+        visible: card.pasted
+        x: 10; y: 6; width: card.width - 20 - (card.removable ? 14 : 0)
+        spacing: 2
+        Text { objectName: "pasteLabel_" + card.file.id; renderType: Theme.textRender
+               text: qsTr("PASTED"); color: Theme.textMuted; font: Theme.label }
+        Text { objectName: "pasteExcerpt_" + card.file.id; renderType: Theme.textRender
+               width: parent.width - (card.editable ? 18 : 0)
+               text: card.pasted ? String(card.file.text || "").split("\n").slice(0, 3).join("\n").slice(0, 400) : ""
+               textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: card.compact ? 1 : 2; elide: Text.ElideRight
+               color: Theme.text; opacity: 0.55; font: Theme.caption }
     }
     MouseArea {
         objectName: "attachmentOpen_" + card.file.id
@@ -113,5 +136,14 @@ Item {
         Accessible.name: qsTr("Remove this attachment")
         MouseArea { id: removeArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor; onClicked: bridge.removeAttachment(card.file.id) }
+    }
+    // LP2: the pencil, bottom-right - the text goes back into the draft at the caret.
+    IconButton {
+        objectName: "pasteEdit_" + card.file.id
+        visible: card.pasted && card.editable
+        anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4
+        width: 24; height: 24; icon: "pencil"
+        tip: qsTr("Turn back into text")
+        onClicked: card.edited()
     }
 }

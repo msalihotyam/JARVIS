@@ -14,7 +14,7 @@ import "../theme"
 // Enter sends, Shift+Enter breaks a line.
 //
 // Above the bar sit the draft's context items - quoted messages, quoted
-// selections and the files the person attached with "+". They are separate
+// selections, the files the person attached with "+" and long pastes. They are separate
 // from the text being written and stay separate all the way to the provider.
 // Only supported controls appear; no voice, web or menu control is faked.
 //
@@ -43,7 +43,7 @@ Item {
     readonly property bool keepsTextFocus: true
     readonly property alias inputHeight: input.implicitHeight
     // Clear the draft only when the application really accepted it.
-    function submit() { if (canSend && bridge.submitText(input.text)) input.text = "" }
+    function submit() { if (canSend && bridge.submitText(input.text)) { input.text = ""; pastes = ({}) } }
 
     readonly property var permissionModes: [
         { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
@@ -55,8 +55,34 @@ Item {
     ]
     function modeInfo(id) { for (var i = 0; i < permissionModes.length; i++) if (permissionModes[i].id === id) return permissionModes[i]; return null }
     // Paste, for the keyboard and the menu alike: the bridge decides once whether
-    // the clipboard holds attachments; only when it does not is it ordinary text.
-    function paste() { if (bridge.attachClipboard() < 0) input.paste() }
+    // the clipboard holds attachments; only when it does not is it text. A long
+    // text (LP1) becomes a pasted-text card above the bar instead of filling the
+    // draft; a shorter one - or one the bridge cannot attach - is ordinary text.
+    // Only a paste does this: typing never turns into a card.
+    function paste() {
+        if (bridge.attachClipboard() >= 0) return
+        var raw = bridge.clipboardText()
+        var id = isLongPaste(raw) ? bridge.attachPastedText(raw) : ""
+        if (id) pastes[id] = raw
+        else input.paste()
+    }
+    // LP3: the one tunable threshold - either bound is enough. A final line break
+    // does not start another line.
+    readonly property var longPaste: ({ chars: 2000, lines: 30 })
+    function isLongPaste(text) {
+        return text.length >= longPaste.chars || text.replace(/\n$/, "").split("\n").length >= longPaste.lines
+    }
+    // LP2: each card's text exactly as it was pasted (the card itself holds the
+    // bounded, redacted copy that is sent), by attachment id, for its pencil.
+    property var pastes: ({})
+    // The pencil: the card's text goes back into the draft at the caret; the card goes.
+    function unpaste(file) {
+        var raw = pastes[file.id] !== undefined ? pastes[file.id] : String(file.text || "")
+        delete pastes[file.id]
+        bridge.removeAttachment(file.id)
+        input.insert(input.cursorPosition, raw)
+        input.forceActiveFocus()
+    }
     // Pick files for the message itself, or - with a group id - for that group only.
     function pick(kind, groupId) { picker.imagesOnly = kind === "image"; picker.group = groupId || ""; picker.open() }
     FileDialog {
@@ -104,6 +130,7 @@ Item {
         objectName: "composerContext"
         anchors { left: parent.left; right: parent.right; top: readOnlyBanner.bottom; topMargin: readOnlyBanner.visible ? 6 : 0 }
         onPickRequested: function(kind, groupId) { composer.pick(kind, groupId) }
+        onUnpasteRequested: function(file) { composer.unpaste(file) }
     }
 
     Rectangle {

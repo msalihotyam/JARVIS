@@ -96,6 +96,7 @@ DEV_SAFETY_SCENARIOS = ("", "approval", "approval_incomplete", "unknown", "faile
 
 #: What a pasted image is called on the draft (the clipboard names nothing).
 CLIPBOARD_IMAGE_NAME = "pasted-image.png"
+PASTED_TEXT_NAME = "pasted-text.txt"
 
 
 class _Emitter(QObject):
@@ -3142,6 +3143,28 @@ class Bridge(QObject):
         """The same decision, with the result owned by ONE group. Only called
         from that group's own explicit control - JARVIS never guesses an owner."""
         return self._paste_attachments(str(group_id))
+
+    @Slot(result=str)
+    def clipboardText(self) -> str:
+        """The clipboard's plain text, so the composer can measure a paste (LP3). Reads only."""
+        data = self.clipboard_data()
+        return str(data.text()) if data is not None and data.hasText() else ""
+
+    @Slot(str, result=str)
+    def attachPastedText(self, text: str) -> str:
+        """LP1/LP4: a long paste, kept as a text attachment of the message itself
+        and marked ``pasted`` - context beside the typed request, never part of it
+        and never authority. Its id, or "" when nothing was attached (the provider
+        takes no text files, the draft is full, it is too large): the composer then
+        pastes it as ordinary text, exactly as before."""
+        if not self.attachmentSupport.get("text", False):
+            return ""
+        try:
+            item = attach_bytes(str(text).encode("utf-8"), PASTED_TEXT_NAME, self._snapshots, self._new_id("att-"))
+        except AttachmentRefused:
+            return ""
+        item["pasted"] = True
+        return item["id"] if self._store_attachment(item, self._attachments) else ""
 
     def _attach_clipboard_image(self, image: Any, owner: list) -> bool:
         from PySide6.QtCore import QBuffer, QByteArray

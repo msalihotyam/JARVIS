@@ -9,7 +9,7 @@ import "../theme"
 // opens a new one and, the composer being anchored at its bottom, the card area
 // grows UPWARD; nothing scrolls sideways. With two or more quotes the answer
 // mode sits at the end of the cards. Then the files that belong to the message
-// as a whole.
+// as a whole - a long paste among them, as its pasted-text card (LP1).
 //
 // A click on a card opens its detail (QuoteDetail: the whole quote, edit,
 // delete); on hover the paperclip adds a file, an image or the clipboard to
@@ -28,6 +28,8 @@ Item {
     readonly property var globals: bridge.globalAttachments || []
     readonly property int cardWidth: 248
     signal pickRequested(string kind, string groupId)
+    // LP2: a pasted-text card's pencil - the composer puts the text back into the draft.
+    signal unpasteRequested(var file)
     visible: groups.length > 0 || globals.length > 0
     height: visible ? body.height + 10 : 0
 
@@ -245,7 +247,9 @@ Item {
             Flow {
                 width: parent.width; spacing: 6
                 Repeater { model: strip.globals
-                           AttachmentCard { file: modelData; removable: true; onOpened: bridge.previewAttachment(modelData) } }
+                           AttachmentCard { file: modelData; removable: true; editable: true
+                                            onOpened: bridge.previewAttachment(modelData)
+                                            onEdited: strip.unpasteRequested(modelData) } }
             }
         }
     }

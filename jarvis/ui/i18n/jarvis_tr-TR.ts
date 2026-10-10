@@ -290,6 +290,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>AttachmentCard</name>
     <message>
+        <source>Pasted text</source>
+        <translation>Yapıştırılan metin</translation>
+    </message>
+    <message>
         <source>%1 B</source>
         <translation>%1 B</translation>
     </message>
@@ -310,8 +314,16 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Dosya</translation>
     </message>
     <message>
+        <source>PASTED</source>
+        <translation>YAPIŞTIRILDI</translation>
+    </message>
+    <message>
         <source>Remove this attachment</source>
         <translation>Bu eki kaldır</translation>
+    </message>
+    <message>
+        <source>Turn back into text</source>
+        <translation>Metne geri çevir</translation>
     </message>
 </context>
 <context>
