@@ -1231,9 +1231,12 @@ class ListLayoutTests(ListCase):
                 self.apart([name, self.item(root, "projectStatePill"), self.item(root, "projectRename"),
                             self.item(root, "projectArchive")])
                 self.assertGreaterEqual(self.painted(name), 6)
-                # G6PJ2 (6G P3): the "+ Yeni sohbet" button became the page composer's start key (an
-                # icon); its tip still names the project.
-                self.assertEqual("send", self.item(root, "projectNewConversation").property("icon"))
+                # G6PJ2 (6G P3): the "+ Yeni sohbet" button became the page composer's start key; G6SB3F
+                # (C1): that composer is the shared one, its start key the composer's drawn send key;
+                # its tip still names the project.
+                start = self.item(root, "projectNewConversation")
+                self.assertIn(start, self.under(self.item(root, "projectComposer"), "projectNewConversation"))
+                self.assertEqual(1, len(self.under(start, "composerSendFace")))
                 self.assertEqual(f"{LONG_PROJECT} içinde yeni sohbet", self.item(root, "projectNewConversationTip").property("text"))
                 for row in self.visible(root, "projectConversationRow") + self.visible(root, "projectArchivedConversationRow"):
                     self.apart([row.childItems()[0], *self.under(row, "listRowBadge"), *self.under(row, "listRowMeta"),

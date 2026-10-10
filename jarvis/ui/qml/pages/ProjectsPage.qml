@@ -116,7 +116,14 @@ SecondaryPage {
         }
     }
 
-    NewProjectDialog { id: newProjectDialog }
+    NewProjectDialog {
+        id: newProjectDialog
+        // G6SB3F: closed with no project created (cancel, a refusal, a create still
+        // in flight): a New chat that asked for it keeps its choice. On success the
+        // dialog's showProject(id) hands the new project to that chat instead.
+        onAboutToHide: if (waiting || failure !== "" || !sent.name) bridge.dropNewProjectChat()
+    }
+    Component.onDestruction: if (bridge) bridge.dropNewProjectChat()     // the page left with the dialog open
 
     // Gate 6G P2: the card's menu (K4). Pin keeps an active project's card (and
     // its sidebar row) on top; Edit opens the project on its instruction

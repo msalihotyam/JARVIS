@@ -3218,37 +3218,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
-    <name>ProjectPicker</name>
-    <message>
-        <source>Choose project</source>
-        <translation>Proje seç</translation>
-    </message>
-    <message>
-        <source>Without a project the conversation stays outside projects</source>
-        <translation>Proje seçmezsen sohbet projelerin dışında kalır</translation>
-    </message>
-    <message>
-        <source>The conversation starts in this project</source>
-        <translation>Sohbet bu projede başlar</translation>
-    </message>
-    <message>
-        <source>Search projects</source>
-        <translation>Projelerde ara</translation>
-    </message>
-    <message>
-        <source>No project</source>
-        <translation>Proje yok</translation>
-    </message>
-    <message>
-        <source>No project matches</source>
-        <translation>Eşleşen proje yok</translation>
-    </message>
-    <message>
-        <source>New project…</source>
-        <translation>Yeni proje…</translation>
-    </message>
-</context>
-<context>
     <name>ProjectPage</name>
     <message>
         <source>Instructions</source>
@@ -3297,6 +3266,37 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Close</source>
         <translation>Kapat</translation>
+    </message>
+</context>
+<context>
+    <name>ProjectPicker</name>
+    <message>
+        <source>Choose project</source>
+        <translation>Proje seç</translation>
+    </message>
+    <message>
+        <source>Without a project the conversation stays outside projects</source>
+        <translation>Proje seçmezsen sohbet projelerin dışında kalır</translation>
+    </message>
+    <message>
+        <source>The conversation starts in this project</source>
+        <translation>Sohbet bu projede başlar</translation>
+    </message>
+    <message>
+        <source>Search projects</source>
+        <translation>Projelerde ara</translation>
+    </message>
+    <message>
+        <source>No project</source>
+        <translation>Proje yok</translation>
+    </message>
+    <message>
+        <source>No project matches</source>
+        <translation>Eşleşen proje yok</translation>
+    </message>
+    <message>
+        <source>New project…</source>
+        <translation>Yeni proje…</translation>
     </message>
 </context>
 <context>

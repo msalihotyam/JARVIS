@@ -22,6 +22,9 @@ import "../theme"
 // permission mode on the left, the Model and Effort chips on the right. While
 // JARVIS runs the send key is the stop key (the same cancel) and a quiet
 // "JARVIS is working…" line stands in the row - no progress is invented.
+// G6SB3F: this one composer - and so this row - serves every surface: the
+// chat, the New chat screen (which adds the V4 project picker to the row's
+// left group) and a project's page (P3), which starts a new conversation.
 Item {
     id: composer
     property int minHeight: 52
@@ -38,12 +41,25 @@ Item {
     // the person writes, so an empty draft sends nothing.
     property bool canSend: !blocked && input.text.trim() !== ""
     property alias text: input.text
+    // G6SB3F - what a host surface sets. `conversationBound` false: the draft
+    // is not the open conversation's (P3 starts a new one), so the open
+    // conversation's run, stop key and read-only banner are not shown here.
+    property bool conversationBound: true
+    property bool projectPicker: false          // V4: the picker in the row's left group
+    property string placeholder: ""             // "" = the conversation's own invitation
+    property string inputName: "composerInput"
+    property string sendName: "composerSend"
+    property string sendTip: ""                 // the send key's hover tip ("" = none)
+    // The send: the open conversation's submit by default; a host may route the
+    // draft elsewhere (true = accepted: the draft clears, then `submitted`).
+    property var sendHandler: function (text) { return bridge.submitText(text) }
+    signal submitted()
     // A press anywhere else releases the draft's focus (jarvis.ui.app); inside
     // the composer - the draft, its chips and actions - it stays.
     readonly property bool keepsTextFocus: true
     readonly property alias inputHeight: input.implicitHeight
     // Clear the draft only when the application really accepted it.
-    function submit() { if (canSend && bridge.submitText(input.text)) { input.text = ""; pastes = ({}) } }
+    function submit() { if (canSend && sendHandler(input.text)) { input.text = ""; pastes = ({}); submitted() } }
 
     readonly property var permissionModes: [
         { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
@@ -115,7 +131,7 @@ Item {
         id: readOnlyBanner
         objectName: "readOnlyBanner"
         anchors { left: parent.left; right: parent.right; top: parent.top }
-        visible: composer.readOnly
+        visible: composer.readOnly && composer.conversationBound
         height: visible ? readOnlyText.height + 18 : 0
         radius: 8; color: Theme.alpha(Theme.warning, 0.10); border.width: 1; border.color: Theme.alpha(Theme.warning, 0.5)
         Text { id: readOnlyText; objectName: "readOnlyReason"; x: 12; y: 9; width: parent.width - 24; wrapMode: Text.Wrap
@@ -173,11 +189,12 @@ Item {
         interactive: contentHeight > height + 1
         TextArea.flickable: TextArea {
             id: input
-            objectName: "composerInput"
+            objectName: composer.inputName
             padding: 0
             wrapMode: TextArea.Wrap
             verticalAlignment: TextEdit.AlignVCenter
-            placeholderText: composer.readOnly ? qsTr("Read-only: the project is archived")
+            placeholderText: composer.placeholder !== "" ? composer.placeholder
+                            : composer.readOnly ? qsTr("Read-only: the project is archived")
                             : bridge.approvalPending ? qsTr("Answer the pending approval first")
                             : bridge.configRefused ? qsTr("Configuration refused - repair it with: %1").arg("jarvis config reset --all")
                             : (bridge.task.status === "awaiting_clarification" ? qsTr("Answer JARVIS's question…") : qsTr("Message JARVIS…"))
@@ -223,10 +240,10 @@ Item {
     // amber square inside a turning ring - and cancels the running call.
     Item {
         id: sendButton
-        objectName: "composerSend"
+        objectName: composer.sendName
         anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
         width: 44; height: 44
-        readonly property bool stopping: bridge.openRunning
+        readonly property bool stopping: composer.conversationBound && bridge.openRunning
         enabled: stopping || composer.canSend
         opacity: enabled ? 1 : 0.42
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
@@ -310,6 +327,8 @@ Item {
             border.width: 1; border.color: "#6fd8f5" }
         MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sendButton.act() }
     }
+    // A sibling, so it also tells why a disabled key is off.
+    HoverTip { objectName: composer.sendName + "Tip"; target: sendButton; text: composer.sendTip }
     }
 
     // C1: the row under the bar - "+" and the permission mode on the left, the
@@ -416,11 +435,12 @@ Item {
                     }
                 }
             }
+            ProjectPicker { visible: composer.projectPicker; anchors.verticalCenter: parent.verticalCenter }
         }
         Text {
             id: working
             objectName: "composerWorking"
-            visible: bridge.openRunning
+            visible: sendButton.stopping
             anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, rightChips.x - x - 8)); elide: Text.ElideRight
             text: qsTr("JARVIS is working…"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
@@ -430,7 +450,7 @@ Item {
         Row {
             id: elsewhere
             objectName: "composerElsewhere"
-            visible: bridge.busy && !bridge.openRunning
+            visible: bridge.busy && !sendButton.stopping
             anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
             spacing: 10
             Text { objectName: "composerElsewhereReason"; anchors.verticalCenter: parent.verticalCenter

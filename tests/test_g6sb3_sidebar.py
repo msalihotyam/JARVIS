@@ -9,7 +9,7 @@ DRAG  Projects in the sidebar: manual order by a mouse drag with a drop line,
       kept in the window preferences (a sibling file, like the pins); a new
       project goes on top; pinned projects keep their place on top; project
       conversations keep no manual order.
-V4    The New chat screen's project picker under the composer ("Proje seç ⌄":
+V4    The New chat screen's project picker, in the composer's row (G6SB3F) ("Proje seç ⌄":
       search, "Proje yok", the projects, "Yeni proje…" = the existing dialog).
       Default: the current project (its page or its conversation), else none.
       The first message fixes the owner; the 6C one-way bind is unchanged.
@@ -230,8 +230,10 @@ class PickerTests(G6SB3Case):
         first = bridge.conversationId
         self.assertIsNone(self.owner(store, bridge))
         self.assertEqual("Choose project", self.item(root, "projectPickerLabel").property("text"))
-        # Under the composer.
-        self.assertGreaterEqual(self.rect(picker).top(), self.rect(self.item(root, "canonicalComposer")).bottom() - 0.5)
+        # G6SB3F (V4 + C1): in the composer's under-row, after the mode chip (was: under the composer).
+        row = self.item(root, "composerChipRow")
+        self.assertIn(picker, [i for i in self.descendants(row) if i.objectName() == "projectPicker"])
+        self.assertGreaterEqual(self.rect(picker).left(), self.rect(self.item(root, "permissionModeControl")).right())
         menu = self.picker_menu(root)
         none = self.popup_items(menu, "projectPickerNone")[0]
         self.assertEqual("No project", none.property("label"))

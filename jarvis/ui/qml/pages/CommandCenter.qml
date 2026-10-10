@@ -140,15 +140,10 @@ Item {
     // to the smaller of 180 px and a quarter of the surface.
     Composer { id: composer; objectName: "canonicalComposer"
         maxHeight: Math.min(180, Math.round(page.height * 0.25))
+        // V4: the New chat screen (an empty, writable conversation) picks its project
+        // in the composer's row (G6SB3F); the first message fixes the owner and it goes.
+        projectPicker: page.empty && !bridge.conversationReadOnly
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: picker.visible ? picker.height + 10 : 4 }
-    }
-    // V4: the New chat screen (an empty, writable conversation) picks its project
-    // under the composer; the first message fixes the owner and the picker goes.
-    ProjectPicker {
-        id: picker
-        visible: page.empty && !bridge.conversationReadOnly
-        anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                  leftMargin: page.inset + 4; rightMargin: page.inset; bottomMargin: 6 }
+                  leftMargin: page.inset; rightMargin: page.inset; bottomMargin: 4 }
     }
 }

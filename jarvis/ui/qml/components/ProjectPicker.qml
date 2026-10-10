@@ -2,8 +2,8 @@ import QtQuick
 import QtQuick.Controls.Basic
 import "../theme"
 
-// Gate 6G Sidebar v2 V4: the New chat screen's project picker, under the
-// composer. Its chip ("Proje seç ⌄", or the chosen project's name) opens a K4
+// Gate 6G Sidebar v2 V4: the New chat screen's project picker, in the
+// composer's C1 row after the mode chip (G6SB3F). Its chip ("Proje seç ⌄", or the chosen project's name) opens a K4
 // menu: a search field, "Proje yok", the active projects the search matches,
 // "Yeni proje…" (the existing new-project dialog). A choice is the owner of
 // the open, still empty conversation (bridge.setNewChatProject); the first
@@ -20,7 +20,7 @@ Item {
         return bridge.projectRecords.filter(function (p) { return p.active && p.name.toLocaleLowerCase().indexOf(needle) >= 0 })
                                     .sort(function (a, b) { return order.indexOf(a.id) - order.indexOf(b.id) })
     }
-    implicitHeight: 32
+    implicitWidth: chip.width; implicitHeight: 32
 
     function choose(id) { menu.close(); bridge.setNewChatProject(id) }
     function toggle() {
@@ -33,8 +33,9 @@ Item {
         id: chip
         objectName: "projectPickerChip"
         width: chipRow.width + 20; height: 32; radius: Theme.radiusSmall
-        color: chipArea.containsMouse || menu.visible ? Theme.alpha(Theme.text, 0.06) : "transparent"
-        border.width: 1; border.color: menu.visible ? Theme.glassEdgeStrong : Theme.glassEdge
+        // The row's chip look (as "+" and the mode chip).
+        color: chipArea.containsMouse || menu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+        border.width: 1; border.color: menu.visible ? Theme.glassEdgeStrong : Theme.borderStrong
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.ComboBox
@@ -48,8 +49,8 @@ Item {
             Icon { anchors.verticalCenter: parent.verticalCenter; name: "folder"; size: 14
                    tint: picker.none ? Theme.textLabel : Theme.accent }
             Text { id: chipLabel; objectName: "projectPickerLabel"; anchors.verticalCenter: parent.verticalCenter
-                   width: Math.min(implicitWidth, 220); elide: Text.ElideRight; textFormat: Text.PlainText
-                   text: picker.none ? qsTr("Choose project") : picker.owner.name || ""; color: Theme.text; font: Theme.caption }
+                   width: Math.min(implicitWidth, 180); elide: Text.ElideRight; textFormat: Text.PlainText
+                   text: picker.none ? qsTr("Choose project") : picker.owner.name || ""; color: Theme.text; renderType: Theme.textRender; font: Theme.composerChip }
             Icon { anchors.verticalCenter: parent.verticalCenter; name: "chevron-down"; size: 12; tint: Theme.textMuted }
         }
         Rectangle { visible: chip.activeFocus; anchors.fill: parent; anchors.margins: 1; radius: parent.radius
@@ -57,13 +58,12 @@ Item {
         MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: picker.toggle() }
     }
-    Text {
+    // G6SB3F: in the composer's row the hint is the chip's hover tip.
+    HoverTip {
         objectName: "projectPickerHint"
-        x: chip.width + 10; anchors.verticalCenter: parent.verticalCenter
-        width: Math.max(0, picker.width - x); elide: Text.ElideRight; textFormat: Text.PlainText
+        target: chip; active: !menu.visible
         text: picker.none ? qsTr("Without a project the conversation stays outside projects")
                           : qsTr("The conversation starts in this project")
-        color: Theme.textDim; font: Theme.caption
     }
 
     MenuSurface {

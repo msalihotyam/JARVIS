@@ -83,15 +83,11 @@ Item {
     }
     // "Bu projede yeni sohbet": a new conversation OWNED by this project (the
     // store's own creation path decides), opened; typed text is its first message.
-    readonly property bool sendBlocked: bridge.busy || bridge.approvalPending || bridge.configRefused
-    readonly property bool canStart: live && (composerInput.text.trim() === "" || !sendBlocked)
-    function start() {
-        if (!canStart) return
-        var b = bridge, text = composerInput.text
-        if (!b.newProjectConversation(project.id)) return
-        if (text.trim() !== "" && !b.submitText(text)) return          // refused: the draft stays here
-        composerInput.text = ""
-        b.setPage("home")
+    // The composer's send (G6SB3F): true = accepted, the draft clears and home opens.
+    function start(text) {
+        var b = bridge
+        if (!live || !b.newProjectConversation(project.id)) return false
+        return text.trim() === "" || b.submitText(text)                  // refused: the draft stays here
     }
 
     component Field: TextField {
@@ -304,44 +300,20 @@ Item {
         Column {
             id: conversations
             width: mainColumn.width - (mainColumn.contentHeight > mainColumn.height ? 12 : 0); spacing: 10
-            // "Bu projede yeni sohbet": the text box and its start key.
-            Rectangle {
+            // "Bu projede yeni sohbet": the one composer with its C1 row (G6SB3F).
+            // Empty, its send key only opens a new conversation in this project.
+            Composer {
                 objectName: "projectComposer"
-                width: parent.width; height: Math.max(56, Math.min(160, composerInput.implicitHeight + 20))
-                radius: Theme.radiusSmall
-                color: Theme.surfaceDeep; opacity: projectPage.live ? 1 : 0.6
-                border.width: 1; border.color: composerInput.activeFocus ? Theme.commandEdge : Theme.border
-                Flickable {
-                    id: composerFlick
-                    anchors { left: parent.left; leftMargin: 14; right: startButton.left; rightMargin: 8; top: parent.top; topMargin: 10; bottom: parent.bottom; bottomMargin: 10 }
-                    clip: true; contentHeight: composerInput.implicitHeight; boundsBehavior: Flickable.StopAtBounds
-                    TextArea.flickable: TextArea {
-                        id: composerInput
-                        objectName: "projectComposerInput"
-                        enabled: projectPage.live
-                        wrapMode: TextArea.Wrap; selectByMouse: true; padding: 0
-                        color: Theme.text; font: Theme.body; placeholderTextColor: Theme.textDim
-                        placeholderText: projectPage.live ? qsTranslate("ProjectsPage", "New conversation in %1").arg(projectPage.project.name || "")
-                                                          : qsTranslate("ProjectsPage", "Unarchive the project first")
-                        background: null
-                        // Enter starts; Shift+Enter is a new line.
-                        Keys.onReturnPressed: function (event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else projectPage.start() }
-                        Keys.onEnterPressed: function (event) { if (event.modifiers & Qt.ShiftModifier) event.accepted = false; else projectPage.start() }
-                    }
-                }
-                IconButton {
-                    id: startButton
-                    objectName: "projectNewConversation"
-                    anchors { right: parent.right; rightMargin: 10; bottom: parent.bottom; bottomMargin: 10 }
-                    width: 36; height: 36; framed: true; icon: "send"
-                    enabled: projectPage.canStart
-                    // Its tip is the named sibling below (the button's own stays empty: one tip).
-                    readonly property string reason: projectPage.live ? qsTranslate("ProjectsPage", "New conversation in %1").arg(projectPage.project.name || "")
-                                                                      : qsTranslate("ProjectsPage", "Unarchive the project first")
-                    Accessible.name: reason
-                    onClicked: projectPage.start()
-                }
-                HoverTip { objectName: "projectNewConversationTip"; target: startButton; text: startButton.reason }
+                width: parent.width
+                readonly property string reason: projectPage.live ? qsTranslate("ProjectsPage", "New conversation in %1").arg(projectPage.project.name || "")
+                                                                  : qsTranslate("ProjectsPage", "Unarchive the project first")
+                conversationBound: false
+                readOnly: !projectPage.live
+                canSend: projectPage.live && (text.trim() === "" || !blocked)
+                placeholder: reason; sendTip: reason
+                inputName: "projectComposerInput"; sendName: "projectNewConversation"
+                sendHandler: function (text) { return projectPage.start(text) }
+                onSubmitted: bridge.setPage("home")
             }
             Text { objectName: "projectConversationNotice"; visible: text !== "" && !deleteDialog.visible; width: parent.width
                    wrapMode: Text.Wrap; textFormat: Text.PlainText; text: bridge.conversationNotice; color: Theme.warning; font: Theme.pageMeta }

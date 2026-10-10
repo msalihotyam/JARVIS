@@ -297,6 +297,8 @@ class Bridge(QObject):
         self._instruction_lines: dict[str, str] = {}                # project id -> its card's instruction line; presentation only
         self._project_folder: dict[str, str] = {}                   # the open project's current 6H folder link (read only)
         self._open_project = ""
+        # G6SB3F: the picker's "New project…" in flight - (the new chat's id, the project ids before it).
+        self._new_project_chat: tuple[str, frozenset] | None = None
         self._project_conversations: list[dict] = []
         self._project_jobs: list[dict] = []
         self._project_jobs_bounded = False
@@ -1043,6 +1045,16 @@ class Bridge(QObject):
     @Slot(str)
     def showProject(self, project_id: str) -> None:
         """Open a project's detail on the Projects page ("" = the list)."""
+        pending = self._new_project_chat
+        if project_id and pending is not None:
+            # G6SB3F: the new-project dialog opens the project it created; asked from
+            # the picker, that project becomes the still-empty new chat's instead.
+            self._new_project_chat = None
+            chat, before = pending
+            if (str(project_id) not in before and self._conversation_store.id == chat
+                    and self.setNewChatProject(str(project_id))):
+                self.setPage("home")
+                return
         self._open_project = str(project_id)
         self._project_notice = self._project_instruction_notice = self._project_file_notice = ""
         self.setPage("projects")
@@ -1335,8 +1347,16 @@ class Bridge(QObject):
 
     @Slot()
     def requestNewProject(self) -> None:
-        """V4 "Yeni proje…": the window opens the existing new-project dialog."""
+        """V4 "Yeni proje…": the window opens the existing new-project dialog. The
+        project it creates is chosen for the open new chat (G6SB3F, in showProject);
+        a dialog closed without one drops the request (dropNewProjectChat)."""
+        self._new_project_chat = (self._conversation_store.id, frozenset(r["id"] for r in self._project_records))
         self.newProjectDialogRequested.emit()
+
+    @Slot()
+    def dropNewProjectChat(self) -> None:
+        """G6SB3F: the new-project dialog closed without creating: the new chat stays as it was."""
+        self._new_project_chat = None
 
     # -- Gate 6F F6: pinned conversations and collapsible date groups ---------
     #
