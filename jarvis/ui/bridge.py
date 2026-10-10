@@ -317,6 +317,9 @@ class Bridge(QObject):
         # a restart shows none: Q5) - and the needsYouIds last announced.
         self._parked: dict[str, dict[str, Any]] = {}
         self._needs_you_seen: list[str] = []
+        # Gate 6G R3 (D1): conversations a recorded run finished for while another one was open,
+        # until opened (bridge memory only, never persisted: a restart shows none).
+        self._finished_unseen: set[str] = set()
         self._restored_session = ""                  # the session the open screen got back from its parked state
         self._deliveries: dict[str, int] = {}        # per conversation: envelopes delivered so far (newest wins)
         self._executing = False    # the current / last task run is an approved execution
@@ -495,6 +498,10 @@ class Bridge(QObject):
             return
         if kind == "task":
             self._busy = False
+            origin = self._run_record["origin"] if self._run_record is not None else None
+            if origin and origin != self._conversation_store.id:      # R3 (D1): finished while away
+                self._finished_unseen.add(origin)
+                self.sidebarChanged.emit()
             self._end_run()
             if self._work_started is not None:
                 self._work_ms = max(0, round((self._clock() - self._work_started) * 1000))
@@ -934,6 +941,7 @@ class Bridge(QObject):
         else:
             self._parked.pop(self._conversation_store.id, None)
         self._conversation_store = opened
+        self._finished_unseen.discard(opened.id)                  # R3 (D1/D2): green clears on open
         record = self._run_record if self.openRunning else None
         restored = self._unpark(opened)
         self._set_live(restored or _empty_slots())
@@ -2338,6 +2346,18 @@ class Bridge(QObject):
         parked one, or the open one's - minus the one a run is answering now (OD5). Truth only:
         the sidebar draws it (R3); never persisted."""
         return list(self._needs_you())
+
+    @Property("QVariantList", notify=stateChanged)
+    def runningIds(self) -> list:
+        """R3 (D1): the conversation the recorded run in flight works for (purple); none for a
+        run without a record. Truth only, never persisted."""
+        return [self.runningConversationId] if self.runningConversationId else []
+
+    @Property("QVariantList", notify=sidebarChanged)
+    def finishedUnseenIds(self) -> list:
+        """R3 (D1/D2): conversations a recorded run finished for while another one was open,
+        until opened (green); the open one never. Bridge memory only."""
+        return sorted(self._finished_unseen - {self._conversation_store.id})
 
     def _linked_here(self, session_id: str) -> bool:
         """``session_id`` belongs to the OPEN conversation (a failed lookup: no)."""

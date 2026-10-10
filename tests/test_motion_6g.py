@@ -56,6 +56,10 @@ EXCEPTIONS = (
      "the stop key's turning ring (M2): a rhythm only while a run is active, not a transition"),
     ("components/UsageRing.qml", 9000,
      "the usage ring's slow halo turn (U2 'subtle animated halo'): ambient atmosphere, not a transition"),
+    ("components/StatusDot.qml", 700,
+     "a sidebar row's violet blink (6G R3 D1): a rhythm only while that conversation's run really runs"),
+    ("components/StatusDot.qml", 1800,
+     "a finished row's slow green pulse (6G R3 D2): a rhythm only until that conversation is opened"),
 )
 # Loops allowed to run forever, each a rhythm of a real state or the ambient atmosphere.
 INFINITE = {
@@ -69,6 +73,8 @@ INFINITE = {
     "components/MechanicalLamp.qml": "the mechanical lamp's drive while JARVIS is not frozen",
     # U2 ("subtle animated halo", roadmap §3.7): the usage ring's dashed halo turns once per 9 s.
     "components/UsageRing.qml": "the usage ring's halo turn",
+    # R3 (D1/D2): the running row's blink and the finished-unseen row's pulse, each only while that state holds.
+    "components/StatusDot.qml": "a row's running blink and finished pulse",
 }
 ANIMATION = re.compile(r"\b(\w+(?:Animation|Animator))\s*(?:on [\w.]+\s*)?\{")
 DURATION = re.compile(r"\bduration:\s*([^;}\n]+?)\s*(?=[;}\n])")

@@ -4126,6 +4126,21 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>StatusDot</name>
+    <message>
+        <source>Running</source>
+        <translation>Çalışıyor</translation>
+    </message>
+    <message>
+        <source>Waiting for you</source>
+        <translation>Seni bekliyor</translation>
+    </message>
+    <message>
+        <source>Finished</source>
+        <translation>Bitti</translation>
+    </message>
+</context>
+<context>
     <name>SummaryPeek</name>
     <message>
         <source>Current request</source>

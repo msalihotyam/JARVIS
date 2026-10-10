@@ -88,6 +88,16 @@ Rectangle {
         readonly property bool menuHere: !!sidebar.conversationMenu && sidebar.conversationMenu.open && sidebar.conversationMenu.opener === row
         readonly property bool showMenu: menuButton && !dragging && (hovered || activeFocus || menuHere)
         property bool available: !bridge.navigationLocked          // R1: a recorded run leaves rows open
+        // R3 (D1/D2): a conversation row starts with its status dot (`dotted`); `gutter` keeps the
+        // room for it (a project row too, so the tree's names stay flush, T4). Amber wins over
+        // violet, both over green; the bridge never reports the open one as finished.
+        property bool dotted: false
+        property bool gutter: dotted
+        readonly property int inset: gutter ? 12 : 0
+        readonly property string status: !dotted || itemId === "" ? ""
+                                         : bridge.needsYouIds.indexOf(itemId) >= 0 ? "needsYou"
+                                         : bridge.runningIds.indexOf(itemId) >= 0 ? "running"
+                                         : bridge.finishedUnseenIds.indexOf(itemId) >= 0 ? "finished" : ""
         readonly property bool hovered: area.containsMouse || gripArea.containsMouse || menuArea.containsMouse
         signal activated()
         signal contextRequested(point position)
@@ -102,7 +112,7 @@ Rectangle {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
-        Accessible.name: meta !== "" ? title + ", " + meta : title
+        Accessible.name: [title, statusDot.words, meta].filter(function (part) { return part !== "" }).join(", ")
         Accessible.onPressAction: if (available) activated()
         Accessible.description: available ? "" : busyReason.text
         Keys.onShortcutOverride: function (event) {
@@ -128,10 +138,14 @@ Rectangle {
                 return
             }
         }
+        // D2: a finished row's soft green tint, pulsing slowly with the dot (static with ambient off).
+        Rectangle { objectName: "sidebarRowGlow"; visible: row.status === "finished"; anchors.fill: parent; radius: row.radius
+                    color: Theme.alpha(Theme.success, 0.12); border.width: 1; border.color: Theme.alpha(Theme.success, 0.40)
+                    opacity: statusDot.glow }
         Text {
             id: nameText
             objectName: row.titleName
-            x: row.pinned || row.lead !== "" ? 28 : 10
+            x: (row.pinned || row.lead !== "" ? 28 : 10) + row.inset
             anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, metaText.x - 8 - x,
                                         row.showMenu ? rowMenu.x - 8 - x : implicitWidth))
@@ -146,12 +160,12 @@ Rectangle {
                color: Theme.textMuted; font: Theme.captionFigures }
         // The lead glyph, or on a pinned row's hover the grip (two columns of three dots).
         Icon { objectName: "sidebarRowLead"; visible: row.lead !== "" && !(row.pinned && (row.hovered || row.dragging))
-               x: 8; anchors.verticalCenter: parent.verticalCenter; size: 14; name: row.lead
+               x: 8 + row.inset; anchors.verticalCenter: parent.verticalCenter; size: 14; name: row.lead
                tint: row.current ? Theme.accent : row.lead === "folder" ? Theme.alpha(Theme.accent, 0.75) : Theme.textLabel }
         Grid {
             objectName: "sidebarPinGrip"
             visible: row.pinned && (row.hovered || row.dragging)
-            x: 9; anchors.verticalCenter: parent.verticalCenter; columns: 2; spacing: 3
+            x: 9 + row.inset; anchors.verticalCenter: parent.verticalCenter; columns: 2; spacing: 3
             Repeater { model: 6; Rectangle { width: 3; height: 3; radius: 1.5; color: gripArea.containsMouse || row.dragging ? Theme.text : Theme.textLabel } }
         }
         Rectangle { objectName: "sidebarRowEdge"; x: 0; y: 8; width: 2; height: row.height - 16; radius: 1; color: Theme.accent
@@ -185,7 +199,7 @@ Rectangle {
             id: gripArea
             objectName: "sidebarPinGripArea"
             visible: row.pinned
-            width: 26; height: parent.height
+            width: 26 + row.inset; height: parent.height
             hoverEnabled: true; preventStealing: true
             cursorShape: row.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor
             property real startY: 0
@@ -198,6 +212,8 @@ Rectangle {
             onReleased: if (row.dragging) row.dragEnded(); else if (row.available) row.activated()
             onCanceled: if (row.dragging) row.dragEnded()
         }
+        StatusDot { id: statusDot; objectName: "sidebarStatusDot"; visible: row.dotted
+                    x: 8; anchors.verticalCenter: parent.verticalCenter; status: row.status }
         Rectangle {
             id: rowMenu
             objectName: "sidebarRowMenuButton"
@@ -217,7 +233,7 @@ Rectangle {
         }
         // A pinned row's whole title is in its info card (V10): its tip only says why it is busy.
         HoverTip { objectName: "sidebarRowTip"; text: !row.available ? busyReason.text : row.tip || row.title
-                   active: !row.dragging && !menuArea.containsMouse
+                   active: !row.dragging && !menuArea.containsMouse && !statusDot.hovered
                            && (!row.available || !row.pinned && (row.tip !== "" || nameText.truncated)) }
     }
     // A collapsible heading (SABİTLENENLER, Bugün / Dün / Daha eski): a click,
@@ -653,6 +669,7 @@ Rectangle {
                             // A tree row has no day heading: today's time, else its day (K3).
                             meta: isProject ? (modelData.open ? "" : sidebar.count(modelData.count)) : i18n.when(modelData.updated_at, sidebar.today, "short")
                             available: isProject || !bridge.navigationLocked
+                            dotted: !isProject; gutter: true
                             menuButton: !isProject
                             draggable: isProject && !modelData.pinned
                             dragging: isProject && projectList.dragId === modelData.id
@@ -761,7 +778,7 @@ Rectangle {
                                         id: pinRow
                                         objectName: "sidebarPinnedConversation"
                                         titleName: "sidebarPinnedTitle"
-                                        itemId: modelData.id; pinned: true; menuButton: true
+                                        itemId: modelData.id; pinned: true; menuButton: true; dotted: true
                                         lead: modelData.project_id !== "" ? "folder" : "chat"
                                         title: modelData.title || qsTr("New Chat"); muted: !modelData.title
                                         current: !!modelData.active
@@ -850,7 +867,7 @@ Rectangle {
                                 model: modelData.shown
                                 NavRow {
                                     id: conversationRow
-                                    objectName: "sidebarConversation"; menuButton: true
+                                    objectName: "sidebarConversation"; menuButton: true; dotted: true
                                     titleName: "sidebarConversationTitle"; metaName: "sidebarConversationTime"
                                     itemId: modelData.id
                                     title: modelData.title || qsTr("New Chat"); muted: !modelData.title
