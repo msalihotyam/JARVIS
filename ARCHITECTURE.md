@@ -3576,3 +3576,45 @@ kendisi karar vermez.
 - **İş listesi dürüstlüğü:** projenin işleri mevcut sınırlı listeden süzülür;
   liste deponun oluşturma sırasına göre İLK N kaydıdır, bu yüzden dolduğunda
   "ilk N iş arasından; daha fazlası olabilir" denir, asla "tümü" denmez.
+
+### 4.26 6H proje klasör bağı (V2 Projects Gate 6H H1, yalnız arka uç, uygulandı)
+
+Bir proje, yerel kullanıcının seçtiği mevcut bir klasöre BAĞLANABİLİR. Bağ
+BAĞLAMDIR, asla yetki değildir (Salih K2): yalnız saklanır ve yerel
+kullanıcıya gösterilir.
+
+- **Yetki değildir:** bağ izinli kök, çalışma dizini, connector cwd'si,
+  görev/oturum/konuşma alanı, tasdikli blok, model yükü, olay veya günlük
+  olmaz; Core, contracts, intent ve connector'lar onu okumaz. Bağlı klasöre
+  her okuma/yazma yine Core politikası ve onayından geçer; bağlamak hiçbir
+  yeteneği genişletmez (testler: bağlı/bağsız aynı ret, aynı tasdik, aynı
+  yük ve önizleme, kaynak denetimi). Yol yalnız `project_folder_result`
+  sonucunda yer alır.
+- **Depo:** ek uyumluluk tablosu `project_folder_links` (id `pfl-`+uuid4 hex,
+  project_id, path, origin, linked_at, unlinked_at) + kısmi tekil
+  `idx_project_folder_links_current` (proje başına en çok bir güncel bağ).
+  Şema 10'da kalır, ALTER yok, DELETE yok. Tek yazım sınırı
+  `link_explicit_user_project_folder` (tek üretim çağıranı app); proje var
+  ve aktif olmalı, güncel bağı olmamalı; aynı klasör, içindeki veya onu
+  içeren bir klasör başka projenin güncel bağıysa ret - hepsi TEK `BEGIN
+  IMMEDIATE` işleminde. Bozuk satır gösterilmez (`None`).
+- **Yol kuralları (`jarvis/project_folders.py`, sırayla):** (a) ham dilbilgisi,
+  normalleştirmeden önce: dize, boş değil, en çok 512 karakter, kontrol/bidi
+  yok, yalnız `X:\...` (göreli, `C:foo`, `\foo`, UNC, `\\?\`, `\\.\`,
+  `\??\`, `/` yok), ham dize kendi `normpath`'ine eşit, bileşende `<>:"|?*`,
+  aygıt adı (uzantılı da), sonda nokta/boşluk ve 8.3 adı yok; (b) sürücü kökü,
+  profil kökü veya onu içeren klasör, Windows, Program Files*, ProgramData ve çağıranın verdiği
+  korunan kökler (veri klasörü, `~\.jarvis`, kurulum, yedekler) altı değil;
+  (c) yalnız sabit sürücü; (d) sürücü kökünden yaprağa no-follow `lstat`,
+  hiçbir reparse noktası yok, yaprak mevcut bir klasör; (e) klasör adıyla BİR
+  kez açılır ve tanıtıcıdan `GetFinalPathNameByHandleW` ile kanıtlanır (SUBST,
+  sonradan takılan junction, yönlendirme reddedilir). Saklanan yol kanıtlanan
+  yoldur.
+- **Öneri:** Masaüstü veya varsayılan `Belgeler\JARVIS Projeleri\<ad>` yalnız
+  `SHGetKnownFolderPath` ile (OneDrive'a duyarlı; `Path.home()` tahmini asla);
+  ad saklanan proje adından temizlenir; çakışmada `(2)`..`(99)`. Öneri yalnız
+  okur, hiçbir şey oluşturmaz.
+- **Bağı kaldırma klasörü asla silmez:** yalnız `unlinked_at` damgalanır;
+  hiçbir dosya sistemi çağrısı yoktur.
+- **Ertelenen:** klasör oluşturma (K1 açılır pencere, K3 onay kartı) G6H1b /
+  G6H3'tedir (Salih Q5/Q2); arayüz G6H2'dedir.

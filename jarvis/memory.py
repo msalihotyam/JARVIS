@@ -173,6 +173,7 @@ from jarvis.lifecycle import is_terminal
 from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 from jarvis import project_files
+from jarvis import project_folders
 
 
 SCHEMA_VERSION = 10
@@ -723,6 +724,16 @@ CREATE TABLE IF NOT EXISTS project_file_chunks (
     text_sha256 TEXT NOT NULL,
     PRIMARY KEY (file_id, chunk_index)
 );
+CREATE TABLE IF NOT EXISTS project_folder_links (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    path TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    unlinked_at TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_folder_links_current
+    ON project_folder_links(project_id) WHERE unlinked_at IS NULL;
 """
 
 def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
@@ -750,6 +761,8 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "project_files",
         "idx_project_files_active_sha",
         "project_file_chunks",
+        "project_folder_links",
+        "idx_project_folder_links_current",
     }
 )
 
@@ -5084,6 +5097,86 @@ class SQLiteMemoryStore:
         read-only until the project is unarchived."""
         if cls._owner_archived(connection, conversation_id):
             raise ValueError(f"Conversation belongs to an archived project: {conversation_id}")
+
+    # ------------------------------------------------------------------
+    # Project folder link (Gate 6H H1): CONTEXT, never authority. One current
+    # link per project, INSERT-only plus the ``unlinked_at`` stamp; no DELETE.
+    # The path is for the local user only and touches no filesystem here.
+    # ------------------------------------------------------------------
+
+    def link_explicit_user_project_folder(
+        self, project_id: str, path: str, origin: str
+    ) -> project_folders.ProjectFolderLink:
+        """THE explicit-user write boundary for a project folder link, reached
+        only from the app's local-user result with a path
+        ``project_folders.validate_folder`` already proved. The lexical rules
+        are re-run here (never the filesystem); eligibility, the current link
+        and overlap with another project's current link are checked and the
+        row inserted in ONE ``BEGIN IMMEDIATE`` transaction. Every refusal
+        writes nothing."""
+        validate_project_id(project_id)
+        if origin not in project_folders.LINK_ORIGINS:
+            raise ValueError(f"Unknown folder link origin: {origin}")
+        project_folders.check_lexical(path, protected=(self.database_path.parent,))
+        record = project_folders.ProjectFolderLink(
+            id="pfl-" + uuid4().hex, project_id=project_id, path=path, origin=origin, linked_at=utc_now()
+        )
+        with self._connection(write=True) as connection:
+            self._project_row_for_files(connection, project_id, need_active=True)
+            for row in connection.execute(
+                "SELECT project_id, path FROM project_folder_links WHERE unlinked_at IS NULL"
+            ).fetchall():
+                if row["project_id"] == project_id:
+                    raise ValueError("The project already has a linked folder; unlink it first.")
+                if project_folders.folders_overlap(path, str(row["path"])):
+                    raise ValueError("That folder, or one inside or around it, is linked to another project.")
+            connection.execute(
+                "INSERT INTO project_folder_links (id, project_id, path, origin, linked_at, unlinked_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (record.id, project_id, path, origin, record.linked_at),
+            )
+        return record
+
+    def unlink_project_folder(self, project_id: str) -> None:
+        """Stamp ``unlinked_at`` on the current link. The folder itself is
+        never touched: no filesystem call of any kind."""
+        validate_project_id(project_id)
+        with self._connection(write=True) as connection:
+            self._project_row_for_files(connection, project_id, need_active=True)
+            if connection.execute(
+                "UPDATE project_folder_links SET unlinked_at = ? WHERE project_id = ? AND unlinked_at IS NULL",
+                (utc_now(), project_id),
+            ).rowcount != 1:
+                raise ValueError(f"No folder is linked to this project: {project_id}")
+
+    def load_project_folder(self, project_id: str) -> project_folders.ProjectFolderLink | None:
+        """The current link, or ``None``. A malformed row fails closed as
+        ``None`` and is never shown."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id, project_id, path, origin, linked_at FROM project_folder_links "
+                "WHERE project_id = ? AND unlinked_at IS NULL",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            if (
+                type(row["id"]) is not str
+                or not project_folders.LINK_ID.fullmatch(row["id"])
+                or row["origin"] not in project_folders.LINK_ORIGINS
+                or type(row["linked_at"]) is not str
+            ):
+                return None
+            return project_folders.ProjectFolderLink(
+                id=row["id"],
+                project_id=validate_project_id(row["project_id"]),
+                path=project_folders.check_lexical(row["path"], protected=(self.database_path.parent,)),
+                origin=row["origin"],
+                linked_at=row["linked_at"],
+            )
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------
     # Conversations (V2 Projects foundation; the additive compatibility layer)

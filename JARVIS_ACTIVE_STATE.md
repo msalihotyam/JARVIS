@@ -32,6 +32,15 @@ rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
 
 ## Open blockers: none.
 
+**G6H1 (6H H1 folder link, T2) green, 2026-10-10 (G6H1B):** committed on lane
+branch `worktree-G6H1` (base e3b2015), integrated on local main (INT16, not pushed); lane commit f417e57; additive
+`project_folder_links` store, `jarvis/project_folders.py` path safety,
+`project_folder_result` app boundary; context only, no Core change. Targeted
+(9 modules) 573 OK; full suite on a quiet machine 5107/0/0 with the known
+native `test_ui` crash group (0xC0000005, 32 ids) green under rule D (3 split
+groups and the crash-point tests alone all pass; TUICRASH ff1b4fd on main
+fixes the crash). Next: conveyor push gate.
+
 ## Do not reopen
 
 - V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).

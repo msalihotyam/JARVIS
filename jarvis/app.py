@@ -37,6 +37,7 @@ from jarvis.connectors.local_files import (
     LocalFileWriteConnector,
 )
 from jarvis import project_files
+from jarvis import project_folders
 from jarvis.contracts import (
     PROJECT_INSTRUCTION_KEY,
     project_instruction_block,
@@ -1681,6 +1682,65 @@ def project_file_result(
             stored = memory.purge_project_file(project_id, file_id, confirm=confirm)
             return CommandResult({"command": command, "file": stored}, EXIT_OK)
         raise ValueError(f"Unknown project file action: {action}")
+    except ValueError as exc:
+        return failure_result(
+            command,
+            settings.permission_mode,
+            ErrorCode.INVALID_TASK,
+            str(exc),
+            EXIT_INVALID_INPUT,
+        )
+
+
+def project_folder_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    action: str,
+    project_id: str,
+    *,
+    path: str | None = None,
+    on_desktop: bool = False,
+) -> CommandResult:
+    """``show`` / ``propose`` / ``link`` / ``unlink`` one project's folder
+    (Gate 6H H1). ``link`` is THE audited production caller of the store's
+    explicit-user folder boundary: the path is the person's own pick. The
+    link is CONTEXT for the LOCAL USER only - this result is the one place
+    the path appears; no root, working directory, task, event or model
+    payload ever gets it. Nothing here creates, moves or deletes a folder."""
+    command = f"project-folder-{action}"
+    home = Path.home()
+    own = (
+        memory.database_path.parent,
+        settings.memory_database.parent,
+        home / ".jarvis",
+        home / "Apps" / "JARVIS",
+        home / "JARVIS-backups",
+    )
+    # JARVIS's own folders as spelled AND as resolved, so an 8.3, SUBST or
+    # junction spelling of them cannot hide them from the proven pick.
+    protected = own + tuple(path.resolve() for path in own)
+    try:
+        validate_project_id(project_id)
+        if action == "link":
+            proven = project_folders.validate_folder(path, protected=protected)
+            link = memory.link_explicit_user_project_folder(project_id, proven, "picked")
+            return CommandResult({"command": command, "project_id": project_id, "folder": link.to_dict()}, EXIT_OK)
+        if action == "unlink":
+            memory.unlink_project_folder(project_id)
+            return CommandResult({"command": command, "project_id": project_id, "folder": None}, EXIT_OK)
+        project = memory.load_project(project_id)
+        if project is None:
+            raise ValueError(f"Unknown project: {project_id}")
+        if action == "show":
+            link = memory.load_project_folder(project_id)
+            shown = None if link is None else link.to_dict()
+            return CommandResult({"command": command, "project_id": project_id, "folder": shown}, EXIT_OK)
+        if action == "propose":
+            if not project.active:
+                raise ValueError(f"Project is archived: {project_id}")
+            proposed = project_folders.propose_folder(project.name, on_desktop, protected=protected)
+            return CommandResult({"command": command, "project_id": project_id, "path": proposed}, EXIT_OK)
+        raise ValueError(f"Unknown project folder action: {action}")
     except ValueError as exc:
         return failure_result(
             command,

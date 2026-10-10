@@ -403,7 +403,8 @@ class SchemaTests(StoreCase):
         self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual([(10,)], self.rows("SELECT version FROM schema_version"))
         self.assertEqual(list(range(1, 11)), [r[0] for r in self.rows("SELECT version FROM schema_migrations ORDER BY version")])
-        self.assertEqual({"conversation_deletions"}, COMPATIBILITY_SCHEMA_OBJECTS - self.BEFORE_6DB)
+        self.assertEqual({"conversation_deletions", "project_folder_links", "idx_project_folder_links_current"},
+                         COMPATIBILITY_SCHEMA_OBJECTS - self.BEFORE_6DB)
         self.assertLessEqual(self.BEFORE_6DB, COMPATIBILITY_SCHEMA_OBJECTS)
         self.assertEqual(["id", "project_id", "title", "state_json", "integrity", "origin", "created_at", "updated_at",
                           "archived_at"], [r[1] for r in self.rows("PRAGMA table_info(conversations)")])   # never ALTERed

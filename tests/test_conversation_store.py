@@ -530,7 +530,7 @@ print(json.dumps({"schema": store.schema_version(), "projects": projects,
 """
 
     V2_PROJECT_TABLES = ("conversations", "conversation_sessions", "conversation_moves", "project_instructions",
-                         "project_files", "project_file_chunks")
+                         "project_files", "project_file_chunks", "project_folder_links")
 
     def test_the_rollback_release_leaves_gate_1_to_6_project_data_byte_identical(self) -> None:
         # A V2 database holding every Gate 1-6 table: a moved conversation, an
@@ -550,8 +550,12 @@ print(json.dumps({"schema": store.schema_version(), "projects": projects,
         gone = self.add_file(memory, live.id, "gone.md", "beta " * 40)
         memory.set_project_file_active(live.id, gone["id"], False)
         memory.purge_project_file(live.id, gone["id"], confirm=gone["id"])
+        memory.link_explicit_user_project_folder(live.id, os.path.realpath(self.root) + "-unlinked", "picked")
+        memory.unlink_project_folder(live.id)
+        memory.link_explicit_user_project_folder(live.id, os.path.realpath(self.root) + "-current", "picked")
         memory.set_project_active(old.id, False)
         before = {name: rows(self.database, f"SELECT * FROM {name} ORDER BY rowid") for name in self.V2_PROJECT_TABLES}
+        self.assertEqual(2, len(before["project_folder_links"]))
         self.assertEqual([(moved.id, live.id, 2)], [r[:3] for r in before["conversation_moves"]])
         self.assertEqual(3, len(before["project_instructions"]))
         self.assertEqual(2, len(before["project_files"]))
