@@ -95,7 +95,7 @@ Item {
             id: scopeName
             objectName: "chatHeaderScopeName"
             x: chip.lead; anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, Math.min(implicitWidth, chip.width - x - (header.link ? 0 : 12)))
+            width: Math.max(0, Math.min(implicitWidth, chip.width - x - chip.pad))
             text: header.owner.name || ""; textFormat: Text.PlainText; elide: Text.ElideRight
             // H2: the link reads secondary (faint) and lights on hover; the preset's chip as before.
             color: header.link ? (chipArea.containsMouse ? Theme.accent : Theme.textMuted)
