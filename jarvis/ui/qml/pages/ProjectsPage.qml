@@ -15,6 +15,8 @@ SecondaryPage {
     title: qsTr("Projects")
     headerRight: [ ActionButton { label: qsTr("Refresh"); onClicked: bridge.refreshProjects() } ]
     readonly property var current: bridge.openProject
+    // R1: a running-only refusal - JARVIS works for this conversation (or a sweep runs).
+    function runsIn(id) { return bridge.navigationLocked || bridge.runningConversationId === id }
     // Gate 6B: the open detail section and the editor's / panel's chosen
     // classifications ("" = not chosen: nothing is preselected).
     property string section: "conversations"
@@ -206,6 +208,7 @@ SecondaryPage {
                         ActionButton { id: renameButton; objectName: "projectRename"; compact: true; label: qsTr("Rename")
                                        visible: page.current.active === true && !page.renaming; onClicked: page.startRename() }
                         ActionButton { objectName: "projectArchive"; compact: true; visible: page.current.active === true; label: qsTr("Archive"); danger: true
+                                       enabled: bridge.runningProjectId !== page.current.id     // R1: not while it runs there
                                        onClicked: bridge.archiveProject(page.current.id) }
                         ActionButton { objectName: "projectDetailUnarchive"; compact: true; visible: page.current.active === false; label: qsTr("Unarchive")
                                        onClicked: bridge.unarchiveProject(page.current.id) }
@@ -285,7 +288,7 @@ SecondaryPage {
                                         // the reversible first step, so the delete is offered at once.
                                         ActionButton { objectName: "projectConversationDelete"; compact: true; danger: true
                                                        visible: conversationRow.row.deletable === true
-                                                       label: qsTr("Delete permanently…"); enabled: !bridge.busy
+                                                       label: qsTr("Delete permanently…"); enabled: !page.runsIn(conversationRow.row.id)
                                                        onClicked: deleteDialog.openFor(conversationRow.row.id) }
                                     }
                                 }
@@ -322,11 +325,11 @@ SecondaryPage {
                                     Reasoned {
                                         reason: page.current.active === true ? "" : qsTr("Unarchive the project first")
                                         ActionButton { objectName: "projectConversationUnarchive"; compact: true; label: qsTr("Unarchive")
-                                                       enabled: page.current.active === true && !bridge.busy
+                                                       enabled: page.current.active === true && !page.runsIn(archivedRow.row.id)
                                                        onClicked: { var b = bridge, id = archivedRow.row.id; b.unarchiveConversation(id) } }
                                     }
                                     ActionButton { objectName: "projectArchivedConversationDelete"; compact: true; danger: true
-                                                   label: qsTr("Delete permanently…"); enabled: !bridge.busy; onClicked: deleteDialog.openFor(archivedRow.row.id) }
+                                                   label: qsTr("Delete permanently…"); enabled: !page.runsIn(archivedRow.row.id); onClicked: deleteDialog.openFor(archivedRow.row.id) }
                                 }
                             }
                             Text { objectName: "projectJobsHeading"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textLabel; font: Theme.pageSection
@@ -517,6 +520,7 @@ SecondaryPage {
             Item { width: parent.width; height: 9; visible: projectMenu.project.active === true
                    Rectangle { y: 4; x: 8; width: parent.width - 16; height: 1; color: Theme.border } }
             MenuRow { objectName: "projectMenuArchive"; icon: "archive"; label: qsTr("Archive"); visible: projectMenu.project.active === true
+                      available: bridge.runningProjectId !== projectMenu.project.id
                       onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.archiveProject(id) } }
             MenuRow { objectName: "projectMenuUnarchive"; icon: "archive"; label: qsTr("Unarchive"); visible: projectMenu.project.active === false
                       onTriggered: { var id = projectMenu.project.id; projectMenu.close(); bridge.unarchiveProject(id) } }

@@ -1183,6 +1183,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>JARVIS çalışıyor…</translation>
     </message>
     <message>
+        <source>JARVIS is working in another conversation</source>
+        <translation>JARVIS başka bir sohbette çalışıyor</translation>
+    </message>
+    <message>
+        <source>Go to that conversation</source>
+        <translation>O sohbete git</translation>
+    </message>
+    <message>
         <source>Attach a file or an image</source>
         <translation>Dosya veya görsel ekle</translation>
     </message>

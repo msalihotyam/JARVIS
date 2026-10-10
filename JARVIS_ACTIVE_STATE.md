@@ -41,6 +41,13 @@ native `test_ui` crash group (0xC0000005, 32 ids) green under rule D (3 split
 groups and the crash-point tests alone all pass; TUICRASH ff1b4fd on main
 fixes the crash). Next: conveyor push gate.
 
+**G6R1C (6G R1 background run, T2) green, 2026-10-10:** on lane branch
+`worktree-6g-r1b` (base 0e2e746), not integrated; bridge run record (memory
+only), navigation lifted for recorded runs, running-only refusals, preview
+gate, delivery-time ownership, composer "başka bir sohbette" link. Targeted
+154 OK; full suite 5191/0/0 (514.7 s). R2 (parked approvals, freeze/resume)
+open. Next: integrate on "entegre et".
+
 ## Do not reopen
 
 - V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).

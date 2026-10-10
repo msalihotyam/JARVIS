@@ -26,8 +26,9 @@ Item {
     id: menu
     objectName: "conversationMenu"
 
-    // One row of the scope menus (K4: a MenuRow), disabled while a run is busy.
-    component ScopeChoice: MenuRow { enabled: !bridge.busy && available }
+    // One row of the scope menus (K4: a MenuRow), disabled while a run without a
+    // record (a sweep) is busy; a recorded run leaves navigation open (R1).
+    component ScopeChoice: MenuRow { enabled: !bridge.navigationLocked && available }
     // A disabled item's reason, under it; and a menu's section divider.
     component Reason: Text {
         leftPadding: 12; rightPadding: 12; bottomPadding: 4
@@ -59,35 +60,38 @@ Item {
     readonly property bool ownerGlobal: rowId && rowOwnerGlobal !== undefined ? !!rowOwnerGlobal
                                                                           : !!(bridge.conversationProject || {}).global
     readonly property bool open: context.visible
-    readonly property bool renameAllowed: targetId !== "" && !archived && !ownerArchived && !bridge.busy
+    // R1: JARVIS is working for this conversation (or for none it could leave: a sweep).
+    function runsIn(id) { return bridge.navigationLocked || (id !== "" && bridge.runningConversationId === id) }
+    readonly property bool runBlocked: runsIn(targetId)
+    readonly property bool renameAllowed: targetId !== "" && !archived && !ownerArchived && !runBlocked
     readonly property string renameReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : archived ? qsTr("This conversation is archived: unarchive it to rename it.")
         : ownerArchived ? qsTr("The project is archived: unarchive it to rename this conversation.")
-        : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+        : runBlocked ? qsTr("Wait for the current run to finish.") : ""
     // Archive (reversible), then the permanent delete - offered only on an
     // archived conversation, under an archived project or (F7) on a Global one.
     readonly property bool archiveAllowed: renameAllowed
     readonly property string archiveReason: targetId === "" ? qsTr("This conversation is not saved yet.")
         : archived ? qsTr("This conversation is already archived.")
         : ownerArchived ? qsTr("The project is archived: its conversations are already read-only.")
-        : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
-    readonly property bool deleteAllowed: targetId !== "" && !bridge.busy && (archived || ownerArchived || ownerGlobal)
+        : runBlocked ? qsTr("Wait for the current run to finish.") : ""
+    readonly property bool deleteAllowed: targetId !== "" && !runBlocked && (archived || ownerArchived || ownerGlobal)
     readonly property string deleteReason: targetId === "" ? qsTr("This conversation is not saved yet.")
-        : bridge.busy ? qsTr("Wait for the current run to finish.")
+        : runBlocked ? qsTr("Wait for the current run to finish.")
         : !deleteAllowed ? qsTr("Archive it first") : ""
     // Attaching (6C, F9 H1): a Global conversation only, never an archived one.
     readonly property bool attachShown: ownerGlobal && !archived
-    readonly property bool attachAllowed: targetId !== "" && !bridge.busy && !!attachDialog && (rowId !== "" || bridge.canAttach)
+    readonly property bool attachAllowed: targetId !== "" && !runBlocked && !!attachDialog && (rowId !== "" || bridge.canAttach)
     readonly property string attachReason: targetId === "" ? qsTr("This conversation is not saved yet.")
-        : bridge.busy ? qsTr("Wait for the current run to finish.") : ""
+        : runBlocked ? qsTr("Wait for the current run to finish.") : ""
     // Pinning (F6): the target's place in SABİTLENDİ (-1 = not pinned).
     readonly property int pinIndex: { var pins = bridge.pinnedConversations
                                       for (var i = 0; i < pins.length; ++i) if (pins[i].id === targetId) return i
                                       return -1 }
     readonly property bool pinned: pinIndex >= 0
-    readonly property bool pinAllowed: targetId !== "" && !bridge.busy && (pinned || (!archived && bridge.pinnedConversations.length < bridge.pinLimit))
+    readonly property bool pinAllowed: targetId !== "" && !runBlocked && (pinned || (!archived && bridge.pinnedConversations.length < bridge.pinLimit))
     readonly property string pinReason: targetId === "" ? qsTr("This conversation is not saved yet.")
-        : bridge.busy ? qsTr("Wait for the current run to finish.")
+        : runBlocked ? qsTr("Wait for the current run to finish.")
         : archived ? qsTr("This conversation is archived: unarchive it to pin it.")
         : !pinAllowed ? qsTr("At most %1 conversations can be pinned: unpin one first.").arg(bridge.pinLimit) : ""
     // An edit is bound to the conversation it STARTED on, and is reverted
@@ -135,9 +139,9 @@ Item {
                           onTriggered: { var id = menu.targetId; context.close()
                                          if (menu.pinned) bridge.unpinConversation(id); else bridge.pinConversation(id) } }
             Reason { width: parent.width; objectName: "conversationPinReason"; visible: !menu.pinAllowed; text: menu.pinReason }
-            ScopeChoice { objectName: "conversationPinUpItem"; icon: "arrow-up"; visible: menu.pinIndex > 0
+            ScopeChoice { objectName: "conversationPinUpItem"; icon: "arrow-up"; visible: menu.pinIndex > 0; available: !menu.runBlocked
                           label: qsTr("Move up"); onTriggered: { var id = menu.targetId, to = menu.pinIndex - 1; context.close(); bridge.movePin(id, to) } }
-            ScopeChoice { objectName: "conversationPinDownItem"; icon: "arrow-down"
+            ScopeChoice { objectName: "conversationPinDownItem"; icon: "arrow-down"; available: !menu.runBlocked
                           visible: menu.pinned && menu.pinIndex < bridge.pinnedConversations.length - 1
                           label: qsTr("Move down"); onTriggered: { var id = menu.targetId, to = menu.pinIndex + 1; context.close(); bridge.movePin(id, to) } }
             ScopeChoice { objectName: "conversationRenameItem"; icon: "pencil"
@@ -180,7 +184,7 @@ Item {
         onAboutToShow: { renameField.text = menu.editTitle }
         onOpened: renameField.selectAll()
         function commit() {
-            if (!bridge.busy && bridge.renameConversation(menu.editId, renameField.text)) editor.close()
+            if (!menu.runsIn(menu.editId) && bridge.renameConversation(menu.editId, renameField.text)) editor.close()
         }
         Connections {
             target: bridge
@@ -214,7 +218,7 @@ Item {
                     ActionButton { objectName: "conversationRenameCancel"; label: qsTr("Cancel"); height: 32
                                    onClicked: editor.close() }
                     ActionButton { objectName: "conversationRenameSave"; label: qsTr("Save"); primary: true; height: 32
-                                   enabled: !bridge.busy; onClicked: editor.commit() }
+                                   enabled: !menu.runsIn(menu.editId); onClicked: editor.commit() }
                 }
             }
         }

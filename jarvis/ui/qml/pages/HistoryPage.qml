@@ -13,6 +13,8 @@ SecondaryPage {
 
     RenameMenu { id: renameMenu }
     ConversationDeleteDialog { id: deleteDialog }
+    // R1: a running-only refusal - JARVIS works for this conversation (or a sweep runs).
+    function runsIn(id) { return bridge.navigationLocked || bridge.runningConversationId === id }
 
     // 40 / 60 below 1420 px (the conversations get the room), 50 / 50 wide.
     readonly property real split: page.Window.width > 0 && page.Window.width < 1420 ? 0.4 : 0.5
@@ -98,10 +100,10 @@ SecondaryPage {
                         badge: qsTr("ARCHIVED"); badgeTint: Theme.warning
                         meta: qsTr("archived %1").arg(page.when(row.archived_at))
                         onActivated: { var b = bridge, id = row.id; b.openConversation(id); b.setPage("home") }
-                        ActionButton { objectName: "historyUnarchive"; compact: true; label: qsTr("Unarchive"); enabled: !bridge.busy
+                        ActionButton { objectName: "historyUnarchive"; compact: true; label: qsTr("Unarchive"); enabled: !page.runsIn(row.id)
                                        onClicked: { var b = bridge, id = row.id; b.unarchiveConversation(id) } }
                         ActionButton { objectName: "historyDelete"; compact: true; danger: true; label: qsTr("Delete permanently…")
-                                       enabled: !bridge.busy; onClicked: deleteDialog.openFor(row.id) }
+                                       enabled: !page.runsIn(row.id); onClicked: deleteDialog.openFor(row.id) }
                     }
                 }
                 Text { text: qsTr("DURABLE SESSIONS (most recent %1)").arg(20); color: Theme.textLabel; font: Theme.pageSection }

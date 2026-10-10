@@ -40,7 +40,7 @@ Item {
     // K3: the feed's "live" badge only while an approved execution runs or its
     // newest event is under five minutes old - never as decoration.
     readonly property int liveWindowSec: 300
-    readonly property bool liveNow: (bridge.busy && bridge.executing)
+    readonly property bool liveNow: (bridge.openRunning && bridge.executing)
                                     || (bridge.activity.length > 0 && column.nowSec - bridge.activity[0].ts < column.liveWindowSec)
 
     // Every shown panel gets its minimum first; the remainder is split by
@@ -179,7 +179,7 @@ Item {
                             spacing: 8
                             visible: !bridge.editMode && modelData.id === "workflow"
                             ActionButton { label: qsTr("Cancel"); danger: true; compact: true; visible: bridge.taskLive; enabled: bridge.taskLive; onClicked: bridge.cancelTask() }
-                            ActionButton { label: qsTr("New session"); compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.busy; onClicked: bridge.newSession() }
+                            ActionButton { label: qsTr("New session"); compact: true; visible: !!bridge.sessionId && !bridge.taskLive; enabled: !bridge.openRunning; onClicked: bridge.newSession() }
                             Text { objectName: "workflowCounter"; visible: !!bridge.task.task_id; text: column.stagesDone() + "/4"; color: column.highlight; anchors.verticalCenter: parent.verticalCenter; font: Theme.counter }
                         }
                         Text { id: pinned; visible: !bridge.editMode && modelData.pinned && modelData.id !== "workflow"; text: qsTr("PINNED"); color: Theme.textDim; font: Theme.label }
