@@ -376,19 +376,19 @@ class SidebarShellTests(SidebarShellCase):
     def test_i_home_only_from_the_clock_line_and_the_right_column_keeps_its_place(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
-        # The right column at c49e856 (L5): (x, y, width) per size.
-        column = {(1100, 700): (858, 150, 221), (1280, 760): (998, 150, 257), (1920, 1080): (1497, 205, 386)}
+        # The right column at c49e856 (L5): (x, width) per size; G6SB2B (6G Sidebar v2 L1): its top
+        # is the one shared top line, 104 at every size (was 150 / 150 / 205).
+        column = {(1100, 700): (858, 104, 221), (1280, 760): (998, 104, 257), (1920, 1080): (1497, 104, 386)}
         for width, height in SIZES:
             self.resize_still(root, width, height, 700)
             with self.subTest(size=(width, height)):
                 stack = self.box(root, "panelColumn")
                 self.assertEqual(column[(width, height)], (round(stack.x()), round(stack.y()), round(stack.width())))
                 side = self.box(root, "sidebar")
-                # Where the clock card started (Q7: the TopBar keeps its height): 84 / 84 / 134
-                # (F4: the scope group left the bar, so nothing pushes it lower).
-                clock_line = max(84, round(height * 0.1980) + 76 - 12 - 144)
-                self.assertEqual({(1100, 700): 84, (1280, 760): 84, (1920, 1080): 134}[(width, height)], clock_line)
-                self.assertAlmostEqual(clock_line, side.top(), delta=0.5)
+                # G6SB2B (L1): the sidebar starts on the same shared top line, under the brand and
+                # the controls (was the clock-card line 84 / 84 / 134).
+                top_line = 104
+                self.assertAlmostEqual(top_line, side.top(), delta=0.5)
                 for name in ("brandWordmark", "brandTagline", "settingsOrb", "jarvisCore", "commandStrip"):
                     self.apart(side, self.box(root, name), name)
                 self.assertAlmostEqual(height - 64, side.bottom(), delta=0.5)
@@ -1126,8 +1126,18 @@ class SidebarNavTests(SidebarNavCase):
         settled(300, lambda: (
             self.assertNotEqual(second.id, bridge.conversationId),
             self.assertNotIn("Eski sohbet", self.tree_titles(root) + self.titles(root)),           # V9
+            # G6SB2B (V9 strict, Salih 2026-10-10): its pin is not in the sidebar either (was: the row
+            # is the pin); the pin itself stays.
+            self.assertNotIn("Eski ikinci", [i.property("title") for i in self.shown(root, "sidebarPinnedConversation")]),
         ))
-        self.tap(root, self.row(root, "sidebarPinnedConversation", "Eski ikinci"), Qt.RightButton, then=lambda: (
+        self.assertIn(second.id, [p["id"] for p in bridge.pinnedConversations])
+        # The same row menu, for that conversation, as a row opens it (the pin row's own arguments).
+        side = self.item(root, "sidebar")
+        _, undefined = QQmlExpression(QQmlEngine.contextForObject(side), side,
+                                               f"sidebar.conversationMenu.openFor('{second.id}', 'Eski ikinci', sidebar,"
+                                               " Qt.point(sidebar.width, 0), null, null, true, false), true").evaluate()
+        self.assertFalse(undefined)
+        settled(350, lambda: (
             self.assertFalse(self.item(root, "conversationRenameItem").isEnabled()),
             self.assertIn("archived", self.item(root, "conversationRenameReason").property("text")),
             self.assertFalse(self.item(root, "conversationArchiveItem").isEnabled()),
@@ -2503,13 +2513,17 @@ class PinTests(F6Case):
         self.assertIsNotNone(store.load_conversation(convs[3].id).archived_at)
         self.assertNotIn("Sohbet 3", self.pinned(root))
         self.assertNotIn(convs[3].id, json.loads(self.sidebar_file().read_text(encoding="utf-8"))["pins"])
-        # A pin under a project archived afterwards stays; its menu offers the delete (the project is archived).
+        # G6SB2B (V9 strict, Salih 2026-10-10): a pin under a project archived afterwards is hidden from the
+        # sidebar, the pin itself stays; opened from elsewhere, its menu offers the delete (the project is archived).
         store.set_project_active(tez.id, False)
         bridge.refreshProjects()
         settled(300, lambda: (
-            self.assertIn("Tez sohbeti", self.pinned(root)),
+            self.assertNotIn("Tez sohbeti", self.pinned(root)),
         ))
-        self.menu(root, self.pin_row(root, "Tez sohbeti"))
+        self.assertIn(owned.id, [p["id"] for p in bridge.pinnedConversations])
+        self.assertTrue(bridge.openConversation(owned.id))
+        pump(200)
+        self.menu(root, self.item(root, "chatHeaderMenu"), Qt.LeftButton)
         self.assertTrue(self.item(root, "conversationDeleteItem").property("enabled"))
         self.assertFalse(self.item(root, "conversationArchiveItem").property("enabled"))
         self.close_menu(root)
@@ -2835,7 +2849,7 @@ class PinFitTests(F6Case):
         for n in range(3):
             store.create_conversation(title=f"Genel {n}")
         store.create_conversation(tez.id, title="Tez 0")
-        store.create_conversation(tez.id, title="Tez 1")              # Sidebar v2: a second one, hidden by the collapse
+        store.create_conversation(tez.id, title="Tez 1")              # Sidebar v2: a second one ("Tez 0" is hidden by the collapse)
         bridge = self.bridge()
         root = self.window(bridge)
         self.fixed_today(root, now)
@@ -2864,12 +2878,14 @@ class PinFitTests(F6Case):
                         self.assertEqual(["Genel 0", "Genel 2"], self.pinned(root))
                         self.drag(root, self.pin_row(root, "Genel 2"), self.gap_y(root, 0))               # drag
                         self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
-                        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 0"),
+                        # G6SB2B: the newest ("Tez 1", the tree's first row) - with the L4 row the tree shows
+                        # two rows at 1100x700, so "Tez 0" is a scroll away there (was "Tez 0").
+                        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 1"),
                                  until=lambda: bridge.conversationProject["name"] == "Tez")
                         # A tree toggle re-shares the height (T3): the list comes to rest before the next click.
                         self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (               # a project's tree
                             self.assertIn(tez.id, bridge.sidebarTree["closed"]),
-                            self.assertEqual(["Tez 0"], self.tree_titles(root)),                            # the open one stays
+                            self.assertEqual(["Tez 1"], self.tree_titles(root)),                            # the open one stays
                         ))
                         self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
                             self.assertNotIn(tez.id, bridge.sidebarTree["closed"]),

@@ -1296,7 +1296,9 @@ class MacroGeometryTests(UiTestCase):
                 "core centre X": 100 * (core[0] + core[2]) / 2 / width,
                 "core centre Y": 100 * (core[1] + core[3]) / 2 / height,
             }
-            for key, target in self.REFERENCE.items():
+            # G6SB2B (L1): "shell top Y" 15.56 and "panel start Y" 18.98 -> the 104 px top line.
+            reference = {**self.REFERENCE, "shell top Y": 100 * 104 / height, "panel start Y": 100 * 104 / height}
+            for key, target in reference.items():
                 tolerance = 1.0 if key.startswith("core centre") else 1.5
                 with self.subTest(size=(width, height), boundary=key):
                     self.assertAlmostEqual(target, measured[key], delta=tolerance,
@@ -2810,8 +2812,9 @@ class TypographyTests(UiTestCase):
         stack = self.item(root, "panelColumn")
         a = work.mapToScene(QPointF(0, 0))
         b = stack.mapToScene(QPointF(0, 0))
-        self.assertEqual((370.0, 168.0, 1107.0), (round(a.x(), 1), round(a.y(), 1), round(work.width(), 1)))   # Gate 6F: after the sidebar
-        self.assertEqual((1497.0, 205.0, 386.0), (round(b.x(), 1), round(b.y(), 1), round(stack.width(), 1)))
+        # G6SB2B (6G Sidebar v2 L1): both start on the one shared top line, 104 (was 168 / 205).
+        self.assertEqual((370.0, 104.0, 1107.0), (round(a.x(), 1), round(a.y(), 1), round(work.width(), 1)))   # Gate 6F: after the sidebar
+        self.assertEqual((1497.0, 104.0, 386.0), (round(b.x(), 1), round(b.y(), 1), round(stack.width(), 1)))
         self.assertEqual(0, self.execute_calls())
 
 
@@ -2934,6 +2937,8 @@ class LayoutEditorTests(UiTestCase):
         root = self.window(bridge)
         rail_menu, stack_menu, toolbar = (self.item(root, n) for n in ("railMenuMemory", "stackMenu_system", "layoutToolbar"))
         self.assertEqual([False] * 3, [i.isVisible() for i in (rail_menu, stack_menu, toolbar)])
+        # G6SB2B (6G E2): the one edit-mode entry sits in the Settings header (was the top bar).
+        self.click(root, "settingsOrb", then=lambda: self.assertTrue(self.item(root, "editLayoutTrigger").isVisible()))
         self.click(root, "editLayoutTrigger", then=lambda: (
             self.assertTrue(bridge.editMode),
             self.assertTrue(all(i.isVisible() for i in (rail_menu, stack_menu, toolbar))),

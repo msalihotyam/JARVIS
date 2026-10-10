@@ -16,6 +16,12 @@ Item {
     objectName: "canonicalWorkspace"
     property int lift: 37       // the material band: fully present at the panel line
     property int fade: 48       // where the text begins, below the band
+    // L1: the title + "⋯" can sit at the panel top while the messages still
+    // begin at `fade` (below the core art); by default the header is at `fade`.
+    property int headerTop: fade
+    // ...and ends short of the core's machine ring when that reaches into its
+    // row (page x; -1 = the full width).
+    property real headerRight: -1
     property Item conversationMenu: null
     property var attachDialog: null
     readonly property bool roomy: width >= 700
@@ -69,14 +75,14 @@ Item {
     // -- the chat header (Gate 6F, L3), then the stream, below the fade ---------
     ChatHeader {
         id: chatHeader
-        x: page.inset + (page.roomy ? 8 : 4); y: page.fade
-        width: page.width - 2 * x
+        x: page.inset + (page.roomy ? 8 : 4); y: page.headerTop
+        width: page.headerRight >= 0 ? Math.max(0, Math.min(page.width - 2 * x, page.headerRight - x)) : page.width - 2 * x
         conversationMenu: page.conversationMenu; attachDialog: page.attachDialog
     }
     Item {
         id: flowArea
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: attention.top
-                  topMargin: page.fade + chatHeader.height + 8; leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
+                  topMargin: Math.max(page.fade, chatHeader.y + chatHeader.height + 8); leftMargin: page.inset + (page.roomy ? 12 : 4); rightMargin: page.inset + (page.roomy ? 4 : 0); bottomMargin: 10 }
         FeedView {
             id: conversation
             objectName: "conversationFeed"

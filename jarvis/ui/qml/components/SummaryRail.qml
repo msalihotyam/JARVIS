@@ -169,11 +169,13 @@ Item {
 
     // The grid: two per row; an odd last tile takes the whole row (3 / 2 / 1).
     // A tile has three rows: the title, the value, the line.
+    // V6 tiles mode (`column`): one per row, the tiles share the height given.
+    property bool column: false
     readonly property int gap: big ? 8 : 6
-    readonly property real cardHeight: big ? 86 : 74
-    readonly property int rows: Math.ceil(count / 2)
-    readonly property real cell: (width - gap) / 2
-    implicitHeight: rows > 0 ? rows * cardHeight + (rows - 1) * gap : 0
+    readonly property real cardHeight: column ? Math.max(big ? 86 : 74, (height - (count - 1) * gap) / Math.max(1, count)) : big ? 86 : 74
+    readonly property int rows: column ? count : Math.ceil(count / 2)
+    readonly property real cell: column ? width : (width - gap) / 2
+    implicitHeight: rows > 0 ? rows * (big ? 86 : 74) + (rows - 1) * gap : 0
     height: implicitHeight
     readonly property color activeFill: Qt.tint(Theme.bg1, Theme.alpha(Theme.accentDeep, 0.34))
 
@@ -188,9 +190,9 @@ Item {
             readonly property bool active: rail.activeKey === modelData.key
             readonly property bool hovered: hit.containsMouse
             readonly property bool alert: !!modelData.alert
-            readonly property bool whole: index === rail.count - 1 && rail.count % 2 === 1
+            readonly property bool whole: rail.column || index === rail.count - 1 && rail.count % 2 === 1
             x: whole ? 0 : (index % 2) * (rail.cell + rail.gap)
-            y: Math.floor(index / 2) * (rail.cardHeight + rail.gap)
+            y: Math.floor(index / (rail.column ? 1 : 2)) * (rail.cardHeight + rail.gap)
             width: whole ? rail.width : rail.cell
             height: rail.cardHeight
             radius: 10

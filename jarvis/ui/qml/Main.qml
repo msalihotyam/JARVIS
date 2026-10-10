@@ -67,6 +67,96 @@ Window {
         bridge.noteHiddenToTray()
     }
 
+    // -- Gate 6G Sidebar v2 slice 2 ---------------------------------------------
+    // L1: on home the left column, the conversation and the right column share
+    // ONE top line just under the brand and the controls (both fixed-size, so
+    // the line is too); other pages keep their own geometry.
+    readonly property bool homeCanonical: root.presentation !== "command" && root.homePage
+    readonly property int topLine: 104
+    // V5 / V6 / E1': remembered in the sidebar-layout preferences.
+    readonly property var sideLayout: bridge.sidebarLayout
+    readonly property string hideMode: sideLayout.hide_mode
+    readonly property bool sideTiles: sideLayout.tiles
+    // E1': the default width is the widest; a drag in edit mode only narrows
+    // (240 / 340 of the default on the left, 300 / 386 on the right - the px
+    // at 1920, scaled with the existing width rules at other sizes).
+    function clampWidth(v, lo, hi) { return Math.round(Math.max(lo, Math.min(hi, v))) }
+    function storedWidth(px, max, lo, hi) { return clampWidth(px / Math.max(1, max) * hi, lo, hi) }
+    readonly property int leftMax: Theme.sidebarWidth(root.width)
+    readonly property int leftMin: Math.round(leftMax * 240 / 340)
+    property real leftDrag: -1
+    readonly property int leftChosen: leftDrag >= 0 ? leftDrag : clampWidth(sideLayout.left / 340 * leftMax, leftMin, leftMax)
+    // V6: tiles mode is half of the DEFAULT left width, whatever was chosen.
+    readonly property int leftWidth: sideTiles ? Math.round(leftMax / 2) : leftChosen
+    function saveWidths() {
+        bridge.setSidebarWidths(storedWidth(root.leftChosen, root.leftMax, 240, 340),
+                                storedWidth(content.rightWidth, content.rightMax, 300, 386))
+        root.leftDrag = -1; content.rightDrag = -1
+    }
+    // V5: while hidden, hovering the floating row shows the sidebar over the
+    // content; it goes after a short grace once the pointer has left both.
+    // A hide click on the floating row does not open it at once: the pointer
+    // must leave the row first.
+    property bool sideOverlay: false
+    property bool overlayArmed: true
+    function setHideMode(mode) {
+        root.sideOverlay = false
+        root.overlayArmed = mode === "" || !barHover.hovered
+        bridge.setSidebarHideMode(mode)
+    }
+    Timer {
+        id: overlayGrace
+        interval: 350
+        onTriggered: {
+            if (sharedConversationMenu.open || layoutMenus.open) restart()
+            else root.sideOverlay = sideHover.hovered || (barHover.hovered && root.overlayArmed)
+        }
+    }
+
+    // L4: Geri / İleri over the views (a page; on home its conversation, on
+    // Projects its project), newest last. A view that is gone is dropped.
+    QtObject {
+        id: history
+        objectName: "navHistory"
+        property var entries: []
+        property int index: -1
+        readonly property bool canBack: index > 0 && !bridge.busy
+        readonly property bool canForward: index < entries.length - 1 && !bridge.busy
+        function current() {
+            var page = bridge.page
+            return { page: page, conversation: page === "home" ? bridge.conversationId : "",
+                     project: page === "projects" ? (bridge.openProject.id || "") : "" }
+        }
+        function same(a, b) { return !!a && a.page === b.page && a.conversation === b.conversation && a.project === b.project }
+        function record() {
+            var view = current()
+            if (same(entries[index], view)) return
+            var list = entries.slice(0, index + 1)
+            list.push(view)
+            if (list.length > 50) list.shift()
+            entries = list; index = list.length - 1
+        }
+        function go(step) {
+            var at = index + step
+            if (at < 0 || at >= entries.length || bridge.busy) return
+            var view = entries[at], ok = true
+            if (view.page === "home") {
+                if (view.conversation !== "" && view.conversation !== bridge.conversationId) ok = bridge.openConversation(view.conversation)
+                if (ok) bridge.setPage("home")
+            } else if (view.page === "projects") bridge.showProject(view.project)
+            else bridge.setPage(view.page)
+            if (ok) { index = at; return }
+            var list = entries.slice(); list.splice(at, 1)
+            entries = list; index = Math.min(at < index ? index - 1 : index, list.length - 1)
+        }
+    }
+    Connections {
+        target: bridge
+        function onPrefsChanged() { Qt.callLater(history.record) }
+        function onConversationChanged() { Qt.callLater(history.record) }
+        function onProjectsChanged() { Qt.callLater(history.record) }
+    }
+
     function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; closePeek() }
     function closePeek() { peekSwitch.stop(); peek.open = false }
     // One summary peek at a time: the same card again closes it. Another card
@@ -102,6 +192,7 @@ Window {
         Theme.name = bridge.theme
         Theme.ambient = bridge.ambientEffects
         bridge.start()
+        Qt.callLater(history.record)
     }
     Connections {
         target: bridge
@@ -144,7 +235,9 @@ Window {
         modelOpen: modelPanel.open
         onMenuRequested: root.toggleNav()
         onLifecycleRequested: root.toggleLifecycle()
-        onEditRequested: bridge.setEditMode(!bridge.editMode)
+        panelsRaised: root.homeCanonical
+        // Under the chat header, above the first message (L1).
+        progressTop: root.homeCanonical && content.headerOnTop ? content.workTop + 8 + 52 + 6 : -1
         onMinimizeRequested: bridge.minimizeWindow(root)
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
@@ -175,11 +268,19 @@ Window {
                   bottomMargin: command ? (wide ? Math.round(root.height * 0.046) : 40) : Theme.centralBottom(root.height) }
         Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
         readonly property bool showColumn: root.presentation !== "command" && root.homePage && !(bridge.focusMode && panelColumn.shown.length === 0)
-        readonly property real columnWidth: showColumn ? Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth)) : 0
+        // E1': the stored fraction is the widest the column gets; the edit-mode drag narrows it.
+        readonly property int rightMax: Math.round(width * (bridge.focusMode ? Math.min(bridge.columnWidth, 0.26) : bridge.columnWidth))
+        readonly property int rightMin: Math.round(rightMax * 300 / 386)
+        property real rightDrag: -1
+        readonly property int rightWidth: rightDrag >= 0 ? rightDrag : root.clampWidth(root.sideLayout.right / 386 * rightMax, rightMin, rightMax)
+        readonly property real columnWidth: showColumn ? rightWidth : 0
         // Gate 6F: on home the work surface starts after the sidebar; the right
         // column and every other page keep the rail line (L5, Q11). Measured
         // from this item's live x, so the rail's reflow never slides it under the sidebar.
-        readonly property real homeInset: command || !root.homePage ? 0 : sidebar.x + Theme.sidebarWidth(root.width) + columnGap - x
+        // V5: "grow" starts it at the window's left inset, under the floating row;
+        // "keep" leaves the sidebar's space empty.
+        readonly property real homeInset: command || !root.homePage ? 0
+                                          : root.hideMode === "grow" ? sidebar.x - x : sidebar.x + root.leftWidth + columnGap - x
         readonly property int columnGap: command ? 16 : Theme.columnGap(root.width)
         // F-ee: the column and its gap, animated as ONE value that both the work
         // surface and the column read, so no frame of a reflow (a window resize,
@@ -191,7 +292,20 @@ Window {
         readonly property real liveSpan: Math.min(columnSpan, Math.max(0, width - homeInset))
         // The conversation shell alone rises into the header environment;
         // the right stack and every other page keep the panel line.
-        readonly property int lift: command || !root.homePage ? 0 : Theme.shellLift(root.height)
+        // L1: on home every column starts at the top line ("grow": under the floating row).
+        readonly property int workTop: root.topLine + (root.hideMode === "grow" ? floatBar.height + 8 : 0)
+        readonly property int lift: command || !root.homePage ? 0 : anchors.topMargin - workTop
+        // The first message starts below the core art; the header sits at the panel
+        // top, the progress band (TopBar) between them.
+        // The header stops short of the core's machine ring (0.74 D, JarvisCore L5) when that
+        // reaches its row; where that leaves it under 420 px (below the 1920 target) it goes
+        // under the core instead, with the messages after it.
+        readonly property real coreRing: topBar.coreDiameter * 0.37
+        readonly property bool coreInRow: topBar.coreCy + coreRing > workTop + 8
+        readonly property real headerRoom: topBar.coreCx - coreRing - 12 - x - workspace.x
+        readonly property bool headerOnTop: !coreInRow || headerRoom - 24 >= 420
+        readonly property int belowCore: Math.max(8, topBar.coreCy + topBar.coreDiameter / 2 - workTop + 8)
+        readonly property int feedTop: headerOnTop ? Math.max(belowCore, 8 + 52 + 6 + 50 + 8) : belowCore
 
         // Workspace: the page, with a restrained crossfade + slide on change.
         Item {
@@ -218,7 +332,8 @@ Window {
             }
         }
         Component { id: homePage; Loader { sourceComponent: bridge.theme === "command" ? commandPackage : canonicalPackage } }
-        Component { id: canonicalPackage; CommandCenter { lift: content.lift; fade: Theme.shellFade(root.height)
+        Component { id: canonicalPackage; CommandCenter { lift: content.feedTop - 8; fade: content.feedTop; headerTop: content.headerOnTop ? 8 : content.belowCore
+                                                          headerRight: content.headerOnTop && content.coreInRow ? content.headerRoom : -1
                                                           conversationMenu: sharedConversationMenu; attachDialog: sharedAttachDialog } }
         Component { id: commandPackage; CommandPreset { fixtureApproval: bridge.devFixture && root.devApprovalVisible; onDismissFixture: root.devApprovalVisible = false
             conversationMenu: sharedConversationMenu; attachDialog: sharedAttachDialog
@@ -231,25 +346,35 @@ Window {
         Component { id: historyPage; HistoryPage {} }
         Component { id: projectsPage; ProjectsPage {} }
 
-        // Column width grip (Edit Mode): direct while dragging, snapped on release.
+        // E1': the right column's inner edge (Edit Mode): it only narrows, with a
+        // live px label; the width is remembered on release.
         Rectangle {
+            objectName: "rightWidthGrip"
             visible: bridge.editMode && content.showColumn
             x: workspace.x + workspace.width + content.columnGap / 2 - 3; width: 6; height: 60
             anchors.verticalCenter: parent.verticalCenter
-            radius: 3; color: Theme.accent; opacity: widthGrip.pressed ? 1 : 0.6
+            radius: 3; color: Theme.accent; opacity: rightGrip.pressed ? 1 : 0.6
             MouseArea {
-                id: widthGrip
+                id: rightGrip
                 anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.SizeHorCursor
                 property real startX: 0; property real startWidth: 0
-                onPressed: function(mouse) { startX = mouse.x; startWidth = bridge.columnWidth }
-                onPositionChanged: function(mouse) { if (pressed) bridge.setColumnWidth(startWidth - (mouse.x - startX) / content.width) }
+                onPressed: function(mouse) { startX = mapToItem(null, mouse.x, 0).x; startWidth = content.rightWidth }
+                onPositionChanged: function(mouse) {
+                    if (pressed) content.rightDrag = root.clampWidth(startWidth - (mapToItem(null, mouse.x, 0).x - startX), content.rightMin, content.rightMax)
+                }
+                onReleased: root.saveWidths()
+                onCanceled: root.saveWidths()
             }
+            Pill { objectName: "rightWidthLabel"; visible: rightGrip.pressed; dot: false; tint: Theme.accent
+                   anchors { right: parent.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                   text: qsTr("%1 px").arg(content.rightWidth) }
         }
 
         PanelColumn {
             id: panelColumn
             objectName: "panelColumn"
             anchors { right: parent.right; top: parent.top; bottom: parent.bottom
+                      topMargin: root.homeCanonical ? root.topLine - content.anchors.topMargin : 0
                       bottomMargin: content.command ? 0 : Theme.stackInset(root.height) }
             width: Math.max(0, content.liveSpan - content.columnGap)
             visible: content.showColumn
@@ -265,7 +390,18 @@ Window {
     Item {
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: 24 }
         height: 30
-        Row { anchors { left: parent.left; leftMargin: Theme.margin; verticalCenter: parent.verticalCenter } spacing: 12
+        // K1: the tiles-mode toggle (V6) under the left column; the slogan moves right of it.
+        IconButton {
+            id: tilesToggle
+            objectName: "sidebarTilesToggle"
+            visible: root.homeCanonical
+            x: sidebar.x; anchors.verticalCenter: parent.verticalCenter; width: 28; height: 28
+            icon: "tiles"; active: root.sideTiles
+            tip: root.sideTiles ? qsTr("Show the lists") : qsTr("Tiles view")
+            onClicked: bridge.setSidebarTiles(!root.sideTiles)
+        }
+        Row { anchors { left: parent.left; leftMargin: tilesToggle.visible ? tilesToggle.x + tilesToggle.width + 12 : Theme.margin
+                        verticalCenter: parent.verticalCenter } spacing: 12
             Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("INTELLIGENCE AMPLIFIES POTENTIAL"); color: Theme.textDim; font: Theme.hudLabel }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 120; height: 1; color: Theme.hud; opacity: Theme.hudOpacity * 0.7 }
             Rectangle { anchors.verticalCenter: parent.verticalCenter; width: 4; height: 4; radius: 2; color: Theme.hud; opacity: Theme.hudOpacity * 1.4 }
@@ -353,11 +489,17 @@ Window {
     Sidebar {
         id: sidebar
         z: 420
-        visible: root.presentation !== "command" && root.homePage
+        visible: root.homeCanonical && (root.hideMode === "" || root.sideOverlay)
         x: 10
-        y: Math.max(84, Math.round(root.height * 0.1980) + 76 - 12 - 144)
-        width: Theme.sidebarWidth(root.width)
+        y: root.topLine
+        width: root.leftWidth
         height: root.height - y - 64
+        tiles: root.sideTiles
+        canBack: history.canBack; canForward: history.canForward; hideMode: root.hideMode
+        onBackRequested: history.go(-1)
+        onForwardRequested: history.go(1)
+        onHideRequested: function (mode) { root.setHideMode(mode) }
+        HoverHandler { id: sideHover; onHoveredChanged: if (!hovered) overlayGrace.restart() }
         now: clock.now
         activeKey: peekSwitch.running ? peekSwitch.key : peek.open ? peek.key : ""
         onPicked: function(key, cardY, cardHeight) { root.togglePeek(key, cardY) }
@@ -366,6 +508,80 @@ Window {
         conversationMenu: sharedConversationMenu
         // Q9: the Projects page, its create field focused.
         onNewProjectRequested: { bridge.showProject(""); if (pageLoader.item && pageLoader.item.focusCreate) pageLoader.item.focusCreate() }
+    }
+    // V5 / L4: while the sidebar is hidden its row floats at the same spot;
+    // hovering it shows the sidebar over the content.
+    Rectangle {
+        id: floatBar
+        objectName: "sidebarFloatBar"
+        z: 419
+        visible: root.homeCanonical && root.hideMode !== ""
+        x: sidebar.x; y: root.topLine
+        width: floatRow.implicitWidth + 2 * sidebar.pad; height: floatRow.height + 2 * sidebar.pad
+        radius: 12; color: Theme.glassSecondaryShell; border.width: 1; border.color: Theme.glassEdge
+        Sidebar.NavButtons {
+            id: floatRow
+            x: sidebar.pad; y: sidebar.pad; width: implicitWidth
+            canBack: history.canBack; canForward: history.canForward; hideMode: root.hideMode
+            onBackRequested: history.go(-1)
+            onForwardRequested: history.go(1)
+            onHideRequested: function (mode) { root.setHideMode(mode) }
+        }
+        HoverHandler {
+            id: barHover
+            onHoveredChanged: {
+                if (hovered && root.overlayArmed) root.sideOverlay = true
+                if (!hovered) { root.overlayArmed = true; overlayGrace.restart() }
+            }
+        }
+    }
+    // E1': the left column's inner edge (Edit Mode), like the right one.
+    Rectangle {
+        objectName: "leftWidthGrip"
+        z: 425
+        visible: bridge.editMode && sidebar.visible && root.hideMode === "" && !root.sideTiles
+        x: sidebar.x + sidebar.width - 3; y: sidebar.y + sidebar.height / 2 - 30; width: 6; height: 60
+        radius: 3; color: Theme.accent; opacity: leftGrip.pressed ? 1 : 0.6
+        MouseArea {
+            id: leftGrip
+            anchors.fill: parent; anchors.margins: -8; cursorShape: Qt.SizeHorCursor
+            property real startX: 0; property real startWidth: 0
+            onPressed: function(mouse) { startX = mapToItem(null, mouse.x, 0).x; startWidth = root.leftWidth }
+            onPositionChanged: function(mouse) {
+                if (pressed) root.leftDrag = root.clampWidth(startWidth + mapToItem(null, mouse.x, 0).x - startX, root.leftMin, root.leftMax)
+            }
+            onReleased: root.saveWidths()
+            onCanceled: root.saveWidths()
+        }
+        Pill { objectName: "leftWidthLabel"; visible: leftGrip.pressed; dot: false; tint: Theme.accent
+               anchors { left: parent.right; leftMargin: 10; verticalCenter: parent.verticalCenter }
+               text: qsTr("%1 px").arg(root.leftWidth) }
+    }
+    // E2: while edit mode is on, "Düzenleme modu · Bitti" beside the brand ends it.
+    Rectangle {
+        objectName: "editModePill"
+        z: 501
+        visible: bridge.editMode
+        x: topBar.brandRight + 24; y: 30
+        width: pillRow.width + 24; height: 30; radius: 15
+        color: Theme.alpha(Theme.accent, 0.12); border.width: 1; border.color: Theme.alpha(Theme.accent, 0.55)
+        Row {
+            id: pillRow
+            x: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+            Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Edit mode"); color: Theme.text; font: Theme.caption }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "·"; color: Theme.textMuted; font: Theme.caption }
+            Text {
+                objectName: "editModeDone"
+                anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Done"); font: Theme.captionStrong
+                color: doneArea.containsMouse ? Theme.text : Theme.accent
+                Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+                Accessible.role: Accessible.Button; Accessible.name: qsTr("Done editing")
+                Accessible.onPressAction: bridge.setEditMode(false)
+                MouseArea { id: doneArea; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor; onClicked: bridge.setEditMode(false) }
+            }
+        }
     }
     // The one conversation menu (rename / archive / delete): the chat
     // header's "…" opens it on the open conversation, a sidebar row on that

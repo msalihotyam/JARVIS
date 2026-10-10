@@ -14,6 +14,17 @@ ContextPanel {
     heading: qsTr("GENERAL SETTINGS")
     surfaceName: "settingsSurface"
     panelWidth: 460; panelHeight: 671
+    // E2: the one edit-mode entry, in this panel's header immediately left of
+    // its X (the content starts 20 px under the 34 px heading). Turning edit
+    // mode on closes the panel; the "Düzenleme modu · Bitti" pill ends it.
+    IconButton {
+        objectName: "editLayoutTrigger"
+        x: parent.width - 34 - 6 - width; y: -20 - 34
+        icon: "sliders"; framed: true
+        tip: bridge.editMode ? qsTr("Done editing") : qsTr("Edit workspace layout")
+        active: bridge.editMode
+        onClicked: { var on = !bridge.editMode; bridge.setEditMode(on); if (on) settings.open = false }
+    }
     Flickable {
         anchors.fill: parent; clip: true; contentHeight: sections.height
         boundsBehavior: Flickable.StopAtBounds
@@ -84,7 +95,6 @@ ContextPanel {
             Label { text: qsTr("THIS PACKAGE’S LAYOUT") }
             Segmented { accent: Theme.materialBlue; value: bridge.profile; options: [{value:"normal",label:qsTr("Normal")},{value:"focus",label:qsTr("Focus")},{value:"monitoring",label:qsTr("Monitoring")}]; onPicked: function(v) { bridge.setProfile(v) } }
             Row { spacing: 10
-                ActionButton { accent: Theme.materialBlue; label: qsTr("Edit panels"); compact: true; onClicked: { bridge.setEditMode(true); settings.open = false } }
                 ActionButton { accent: Theme.materialBlue; label: qsTr("Reset this layout"); compact: true; onClicked: bridge.resetLayout() }
             }
             Text { width: parent.width; wrapMode: Text.Wrap; text: qsTr("Each package keeps its own layout. %1 temporarily focuses the workspace without replacing it.").arg("Ctrl+Shift+F"); color: Theme.textMuted; font: Theme.caption }

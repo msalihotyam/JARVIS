@@ -1276,6 +1276,35 @@ class Bridge(QObject):
     def setProjectPinned(self, project_id: str, pinned: bool) -> None:
         self._tree_saved(self.prefs.set_tree_member("pinned_projects", str(project_id), bool(pinned)))
 
+    # -- Gate 6G Sidebar v2 slice 2: hide mode (V5), tiles mode (V6), widths (E1')
+    #
+    # Window preferences only (UiPreferences' sidebar-layout file); the widths
+    # are px at the 1920 layout, scaled by the window.
+
+    sidebarLayoutChanged = Signal()
+
+    @Property("QVariantMap", notify=sidebarLayoutChanged)
+    def sidebarLayout(self) -> dict:
+        """hide_mode ("" / "grow" / "keep"), tiles, left and right (px at 1920)."""
+        layout = self.prefs.sidebar_layout
+        return {key: layout[key] for key in ("hide_mode", "tiles", "left", "right")}
+
+    def _layout_saved(self, changes: dict) -> None:
+        if self.prefs.set_sidebar_layout(changes):
+            self.sidebarLayoutChanged.emit()
+
+    @Slot(str)
+    def setSidebarHideMode(self, mode: str) -> None:
+        self._layout_saved({"hide_mode": str(mode)})
+
+    @Slot(bool)
+    def setSidebarTiles(self, tiles: bool) -> None:
+        self._layout_saved({"tiles": bool(tiles)})
+
+    @Slot(int, int)
+    def setSidebarWidths(self, left: int, right: int) -> None:
+        self._layout_saved({"left": int(left), "right": int(right)})
+
     def _sidebar_saved(self, changed: bool) -> bool:
         if changed:
             self.prefs.save_sidebar()

@@ -20,6 +20,8 @@ import "../theme"
 // states are window preferences (bridge.sidebarGroups, bridge.sidebarTree);
 // the open conversation stays in view in a collapsed section. It selects,
 // grants and approves nothing.
+// Slice 2: the L4 row on top (Geri / İleri, the two hide toggles) and V6
+// tiles mode (`tiles`: the lists hide, the tiles stack in one column).
 Rectangle {
     id: sidebar
     objectName: "sidebar"
@@ -31,10 +33,19 @@ Rectangle {
     readonly property int pad: big ? 14 : 10
     readonly property alias rail: summaryRail
     readonly property alias nav: navigation
+    // Slice 2: V6 tiles mode (the lists hide, the tiles stack in one column)
+    // and the L4 row's state; Main owns the history and the hide mode.
+    property bool tiles: false
+    property bool canBack: false
+    property bool canForward: false
+    property string hideMode: ""
     signal picked(string key, real cardY, real cardHeight)
     signal menuRequested(string card, Item anchor, bool canUp, bool canDown)
     signal approvalRequested()
     signal newProjectRequested()
+    signal backRequested()
+    signal forwardRequested()
+    signal hideRequested(string mode)
 
     radius: 12
     color: Theme.glassSecondaryShell
@@ -272,6 +283,36 @@ Rectangle {
                     capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
                     startX: 3.5; startY: 2; PathLine { x: 7; y: 5 } PathLine { x: 3.5; y: 8 } }
     }
+    // L4: Geri / İleri (navigation history; disabled when not possible) on the
+    // left, the two hide toggles (V5 A "grow", B "keep") on the right. The same
+    // row floats over the content while the sidebar is hidden (Main.qml).
+    component NavButtons: Item {
+        id: navButtons
+        property bool canBack: false
+        property bool canForward: false
+        property string hideMode: ""
+        signal backRequested()
+        signal forwardRequested()
+        signal hideRequested(string mode)
+        implicitWidth: 2 * 58 + 16; height: 28
+        Row {
+            spacing: 2
+            IconButton { objectName: "navBack"; icon: "back"; width: 28; height: 28; enabled: navButtons.canBack
+                         tip: qsTr("Back"); onClicked: navButtons.backRequested() }
+            IconButton { objectName: "navForward"; icon: "forward"; width: 28; height: 28; enabled: navButtons.canForward
+                         tip: qsTr("Forward"); onClicked: navButtons.forwardRequested() }
+        }
+        Row {
+            anchors.right: parent.right; spacing: 2
+            Repeater {
+                model: [{ mode: "grow", tip: qsTr("Hide, widen the chat") }, { mode: "keep", tip: qsTr("Hide, keep the space") }]
+                IconButton { objectName: "sidebarHide_" + modelData.mode; icon: "sidebar-" + modelData.mode; width: 28; height: 28
+                             active: navButtons.hideMode === modelData.mode
+                             tip: active ? qsTr("Show the sidebar") : modelData.tip
+                             onClicked: navButtons.hideRequested(active ? "" : modelData.mode) }
+            }
+        }
+    }
 
     // -- the navigation's data and metrics ------------------------------------
     Text { id: busyReason; visible: false; text: qsTr("Wait for the current run to finish.") }
@@ -298,8 +339,17 @@ Rectangle {
     readonly property real yesterday: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime()
     // F6: the pins (every owner) and which sections are open; a pinned
     // conversation is not repeated in its date group or its project's tree.
-    readonly property var pins: bridge.pinnedConversations
+    // V9 strict: an archived project's pins are not here either (the Projects
+    // page's Arşiv tab keeps them); the pin itself stays.
+    readonly property var pins: bridge.pinnedConversations.filter(function (c) { return !c.project_archived })
     readonly property var pinnedIds: { var out = {}; for (var p = 0; p < pins.length; ++p) out[pins[p].id] = true; return out }
+    // A drop at `at` among the shown pins, as an index of the whole pin list
+    // (hidden ones keep their place relative to the shown).
+    function pinIndex(id, at) {
+        var all = bridge.pinnedConversations.map(function (c) { return c.id }).filter(function (c) { return c !== id })
+        var shown = pins.map(function (c) { return c.id }).filter(function (c) { return c !== id })
+        return at < shown.length ? all.indexOf(shown[at]) : shown.length > 0 ? all.indexOf(shown[shown.length - 1]) + 1 : 0
+    }
     readonly property var openGroups: bridge.sidebarGroups
     function shownRows(items, open) { return open ? items : items.filter(function (c) { return !!c.active }) }
     // V1: the plain (no-project) conversations, whatever is open; P1 hides them
@@ -409,11 +459,23 @@ Rectangle {
         }
     }
 
-    // The navigation region: everything above the tiles.
+    NavButtons {
+        id: navRow
+        objectName: "sidebarNavRow"
+        x: sidebar.pad; y: sidebar.pad
+        width: sidebar.width - 2 * sidebar.pad
+        canBack: sidebar.canBack; canForward: sidebar.canForward; hideMode: sidebar.hideMode
+        onBackRequested: sidebar.backRequested()
+        onForwardRequested: sidebar.forwardRequested()
+        onHideRequested: function (mode) { sidebar.hideRequested(mode) }
+    }
+
+    // The navigation region: everything between the L4 row and the tiles.
     Item {
         id: navigation
         objectName: "sidebarNav"
-        x: sidebar.pad; y: sidebar.pad
+        visible: !sidebar.tiles
+        x: sidebar.pad; y: navRow.y + navRow.height + 6
         width: sidebar.width - 2 * sidebar.pad
         height: Math.max(0, (summaryRail.height > 0 ? summaryRail.y - 8 : clock.y - 6) - y)
 
@@ -603,7 +665,7 @@ Rectangle {
                         function drop() {
                             var id = dragId, start = from, to = dropAt
                             dragId = ""; from = -1; dropAt = -1; edge = 0
-                            if (id !== "" && to >= 0 && to !== start && to !== start + 1) bridge.movePin(id, to > start ? to - 1 : to)
+                            if (id !== "" && to >= 0 && to !== start && to !== start + 1) bridge.movePin(id, sidebar.pinIndex(id, to > start ? to - 1 : to))
                         }
                         GroupHead {
                             objectName: "sidebarPinnedHead"; labelName: "sidebarPinnedLabel"; key: "pinned"
@@ -727,7 +789,10 @@ Rectangle {
     SummaryRail {
         id: summaryRail
         x: sidebar.pad; width: sidebar.width - 2 * sidebar.pad
-        y: clock.y - 6 - height
+        // V6: in tiles mode the tiles take the whole height between the rows.
+        column: sidebar.tiles
+        y: sidebar.tiles ? navRow.y + navRow.height + 8 : clock.y - 6 - height
+        height: sidebar.tiles ? Math.max(0, clock.y - 6 - y) : implicitHeight
         visible: count > 0
         big: sidebar.big
         activeKey: sidebar.activeKey

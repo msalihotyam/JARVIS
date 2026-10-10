@@ -368,6 +368,32 @@ def validate_tree(candidate: Any) -> dict[str, Any]:
             "closed": list(candidate["closed"]), "pinned_projects": list(candidate["pinned_projects"])}
 
 
+SIDEBAR_LAYOUT_VERSION = 1
+HIDE_MODES = ("", "grow", "keep")
+# E1': px at the 1920 layout; the default is the widest, a drag only narrows.
+LEFT_WIDTH, RIGHT_WIDTH = (240, 340), (300, 386)
+
+
+def canonical_sidebar_layout() -> dict[str, Any]:
+    """Gate 6G Sidebar v2 slice 2: the hide mode (V5: "" docked, "grow" the chat
+    widens, "keep" the space stays), tiles mode (V6) and the column widths (E1')."""
+    return {"version": SIDEBAR_LAYOUT_VERSION, "hide_mode": "", "tiles": False,
+            "left": LEFT_WIDTH[1], "right": RIGHT_WIDTH[1]}
+
+
+def validate_sidebar_layout(candidate: Any) -> dict[str, Any]:
+    """The layout document, or the canonical one when ANY part is malformed."""
+    defaults = canonical_sidebar_layout()
+    if not isinstance(candidate, dict) or set(candidate) != set(defaults) or candidate["version"] != SIDEBAR_LAYOUT_VERSION:
+        return defaults
+    if candidate["hide_mode"] not in HIDE_MODES or type(candidate["tiles"]) is not bool:
+        return defaults
+    for key, (low, high) in (("left", LEFT_WIDTH), ("right", RIGHT_WIDTH)):
+        if type(candidate[key]) is not int or not low <= candidate[key] <= high:
+            return defaults
+    return dict(candidate)
+
+
 def default_preferences_path() -> Path:
     return Path.home() / ".jarvis" / "ui-preferences.json"
 
@@ -601,4 +627,38 @@ class UiPreferences:
             ids.insert(0, project_id)
         else:
             ids.remove(project_id)
+        return True
+
+    # -- Gate 6G Sidebar v2 slice 2: hide mode, tiles mode, column widths -------
+    #
+    # A third sibling file (``<prefs>.sidebar-layout.json``): ``column_width``
+    # and its 0.22 floor stay as they are, so a schema-10 release still reads
+    # the main document whole (rollback). A bad file reads as the defaults and
+    # never touches the main document.
+
+    @property
+    def sidebar_layout_path(self) -> Path:
+        return self.path.with_suffix(".sidebar-layout.json")
+
+    @property
+    def sidebar_layout(self) -> dict[str, Any]:
+        if not hasattr(self, "_sidebar_layout"):
+            try:
+                raw = json.loads(self.sidebar_layout_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw = None
+            self._sidebar_layout = validate_sidebar_layout(raw)
+        return self._sidebar_layout
+
+    def set_sidebar_layout(self, changes: dict[str, Any]) -> bool:
+        """Apply ``changes`` when the result is valid and different; then save."""
+        candidate = {**self.sidebar_layout, **changes}
+        if candidate == self.sidebar_layout or validate_sidebar_layout(candidate) != candidate:
+            return False
+        self._sidebar_layout = candidate
+        try:
+            self.sidebar_layout_path.parent.mkdir(parents=True, exist_ok=True)
+            self.sidebar_layout_path.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+        except OSError:
+            pass
         return True

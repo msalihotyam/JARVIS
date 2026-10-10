@@ -19,11 +19,16 @@ Item {
     // lifecycle indicator starts after it.
     property real sideRight: 0
     property real viewportHeight: 1080
+    // L1 (6G Sidebar v2): on home the three columns rise to one top line under
+    // the brand and the controls, so the old panel line is not drawn there and
+    // the progress band moves below the chat header (`progressTop`, -1 = its own place).
+    property bool panelsRaised: false
+    property real progressTop: -1
+    readonly property real brandRight: Math.max(wordmark.x + wordmark.width, tagline.x + tagline.width)
     // The rail's own left inset, proportional like the rail itself.
     readonly property real railInset: Theme.px(bar.width * 0.0163, 20, 34)
     signal menuRequested()
     signal lifecycleRequested()      // the red control: Freeze / Resume JARVIS
-    signal editRequested()
     signal minimizeRequested()
     signal restoreRequested()
     signal closeRequested()
@@ -114,7 +119,7 @@ Item {
         Rectangle { anchors.centerIn: parent; width: 13; height: 13; radius: 6.5; color: Theme.hud; opacity: 0.25 } }
     // The boundary the panels start from: one restrained full-width line.
     Rectangle {
-        visible: !Theme.command
+        visible: !Theme.command && !bar.panelsRaised
         x: 0; y: bar.height - 1; width: bar.width; height: 1
         color: Theme.hud; opacity: Theme.hudOpacity * 0.7
     }
@@ -319,7 +324,7 @@ Item {
         visible: bridge.progress.active === true && stages.length === 4 && width >= 240
         width: Math.max(0, Math.min(360, endX - startX)); height: 50
         x: endX - width
-        y: bar.coreCy + Math.round(bar.viewportHeight * 0.03) - 6
+        y: bar.progressTop >= 0 ? bar.progressTop : bar.coreCy + Math.round(bar.viewportHeight * 0.03) - 6
         readonly property real pitch: width / 4
         Repeater {
             model: 3
@@ -478,24 +483,6 @@ Item {
             IconButton { icon: "minimize"; tip: qsTr("Minimize"); width: 34; height: 34; onClicked: bar.minimizeRequested() }
             IconButton { icon: bar.fullscreen ? "restore" : "maximize"; tip: bar.fullscreen ? qsTr("Windowed") : qsTr("Full screen"); width: 34; height: 34; onClicked: bar.restoreRequested() }
             IconButton { objectName: "windowCloseControl"; icon: "close"; tip: bridge.trayAvailable ? qsTr("Hide to tray - JARVIS keeps running") : qsTr("Close"); width: 34; height: 34; onClicked: bar.closeRequested() }
-        }
-    }
-
-    // The tiny icon-only layout-edit control: a sliders glyph in a framed square.
-    IconButton {
-        anchors { right: parent.right; top: parent.top
-                  rightMargin: Math.round(bar.width * Theme.macroStripRight) + 8
-                  topMargin: Math.round(bar.viewportHeight * 0.1130) }
-        objectName: "editLayoutTrigger"
-        tip: bridge.editMode ? qsTr("Done editing") : qsTr("Edit workspace layout")
-        active: bridge.editMode
-        framed: true
-        width: 34; height: 34
-        onClicked: bar.editRequested()
-        Item { anchors.centerIn: parent; width: 16; height: 12
-            property color c: bridge.editMode ? Theme.accent : Theme.accent
-            Rectangle { x: 0; y: 2; width: 16; height: 1.2; color: parent.c }   Rectangle { x: 9; y: 0; width: 5; height: 5; radius: 2.5; color: Theme.bg0; border.width: 1.2; border.color: parent.c }
-            Rectangle { x: 0; y: 10; width: 16; height: 1.2; color: parent.c }  Rectangle { x: 3; y: 8; width: 5; height: 5; radius: 2.5; color: Theme.bg0; border.width: 1.2; border.color: parent.c }
         }
     }
 }

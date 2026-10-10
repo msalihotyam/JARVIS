@@ -1965,6 +1965,18 @@ yok</translation>
         <translation>Arşivle</translation>
     </message>
     <message>
+        <source>%1 px</source>
+        <translation>%1 px</translation>
+    </message>
+    <message>
+        <source>Show the lists</source>
+        <translation>Listeleri göster</translation>
+    </message>
+    <message>
+        <source>Tiles view</source>
+        <translation>Kutucuk görünümü</translation>
+    </message>
+    <message>
         <source>INTELLIGENCE AMPLIFIES POTENTIAL</source>
         <translation>ZEKÂ POTANSİYELİ BÜYÜTÜR</translation>
     </message>
@@ -1995,6 +2007,18 @@ yok</translation>
     <message>
         <source>Resume JARVIS</source>
         <translation>JARVIS&apos;i Sürdür</translation>
+    </message>
+    <message>
+        <source>Edit mode</source>
+        <translation>Düzenleme modu</translation>
+    </message>
+    <message>
+        <source>Done</source>
+        <translation>Bitti</translation>
+    </message>
+    <message>
+        <source>Done editing</source>
+        <translation>Düzenlemeyi bitir</translation>
     </message>
     <message>
         <source>DEV REFERENCE OVERLAY %1 %</source>
@@ -3673,6 +3697,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>GENEL AYARLAR</translation>
     </message>
     <message>
+        <source>Done editing</source>
+        <translation>Düzenlemeyi bitir</translation>
+    </message>
+    <message>
+        <source>Edit workspace layout</source>
+        <translation>Çalışma alanı düzenini düzenle</translation>
+    </message>
+    <message>
         <source>LANGUAGE</source>
         <translation>DİL</translation>
     </message>
@@ -3765,10 +3797,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>İzleme</translation>
     </message>
     <message>
-        <source>Edit panels</source>
-        <translation>Panelleri düzenle</translation>
-    </message>
-    <message>
         <source>Reset this layout</source>
         <translation>Bu düzeni sıfırla</translation>
     </message>
@@ -3846,6 +3874,26 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Back</source>
+        <translation>Geri</translation>
+    </message>
+    <message>
+        <source>Forward</source>
+        <translation>İleri</translation>
+    </message>
+    <message>
+        <source>Hide, widen the chat</source>
+        <translation>Gizle, sohbet genişlesin</translation>
+    </message>
+    <message>
+        <source>Hide, keep the space</source>
+        <translation>Gizle, yer boş kalsın</translation>
+    </message>
+    <message>
+        <source>Show the sidebar</source>
+        <translation>Kenar çubuğunu göster</translation>
     </message>
     <message>
         <source>Open project page</source>
@@ -4479,14 +4527,6 @@ DOĞRULANMADI</translation>
     <message>
         <source>Close</source>
         <translation>Kapat</translation>
-    </message>
-    <message>
-        <source>Done editing</source>
-        <translation>Düzenlemeyi bitir</translation>
-    </message>
-    <message>
-        <source>Edit workspace layout</source>
-        <translation>Çalışma alanı düzenini düzenle</translation>
     </message>
 </context>
 <context>
