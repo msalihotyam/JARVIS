@@ -2014,6 +2014,25 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>MechanicalLamp</name>
+    <message>
+        <source>JARVIS status: ready</source>
+        <translation>JARVIS durumu: hazır</translation>
+    </message>
+    <message>
+        <source>JARVIS status: running an operation</source>
+        <translation>JARVIS durumu: bir işlem çalışıyor</translation>
+    </message>
+    <message>
+        <source>JARVIS status: freeze requested</source>
+        <translation>JARVIS durumu: dondurma istendi</translation>
+    </message>
+    <message>
+        <source>JARVIS status: frozen</source>
+        <translation>JARVIS durumu: donduruldu</translation>
+    </message>
+</context>
+<context>
     <name>MemoryPage</name>
     <message>
         <source>Memory</source>

@@ -63,6 +63,8 @@ INFINITE = {
     "components/Background.qml": "the starfield twinkle",
     # M2 ("existing STOP control ... amber square + spinning ring"): only while a run is active.
     "components/Composer.qml": "the stop key's turning ring while a run is active",
+    # S1 (6G mechanical status lamp): one drive while JARVIS runs; it winds down and stops when frozen.
+    "components/MechanicalLamp.qml": "the mechanical lamp's drive while JARVIS is not frozen",
 }
 ANIMATION = re.compile(r"\b(\w+(?:Animation|Animator))\s*(?:on [\w.]+\s*)?\{")
 DURATION = re.compile(r"\bduration:\s*([^;}\n]+?)\s*(?=[;}\n])")
