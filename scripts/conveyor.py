@@ -35,7 +35,7 @@ MAX_LANES = 3
 STALE_LOCK_S = 300
 PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
-CLEANUP_S = 7200  # a finished lane's session is removed this long after its report was collected
+CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
 CLEAN_STATES = {"done", "blocked", "failed"}  # session states cleanup acts on; anything else: leave
 FINISHED = {"done", "idle"}
@@ -1942,15 +1942,18 @@ class Conveyor:
             return False
         return gen >= after and all(s in known for s in sids)
 
-    def lane_sessions(self, name, ids, agents):
+    def lane_sessions(self, name, ids, agents, stopped=()):
         """(listed sessions of these lane ids, doubt or None). A doubt is any row that is not
         this lane's finished background session: other kind or name, unknown state, busy,
-        or no session id of its own."""
+        or no session id of its own. State "stopped" is fine only for ids in `stopped`
+        (sessions this conveyor's early stop stopped itself)."""
         by_id = {a.get("id"): a for a in agents}
         sess = [by_id[i] for i in ids if i in by_id]
         doubt = next((f"{a.get('id')}: kind/name/state/session not as expected" for a in sess
                       if a.get("kind") != "background" or a.get("name") != name
-                      or a.get("state") not in CLEAN_STATES or a.get("status") == "busy"
+                      or (a.get("state") not in CLEAN_STATES
+                          and not (a.get("state") == "stopped" and a.get("id") in stopped))
+                      or a.get("status") == "busy"
                       or not str(a.get("sessionId") or "").startswith(a["id"])), None)
         return sess, doubt
 
@@ -1990,6 +1993,7 @@ class Conveyor:
                     rc, out = type(e).__name__, ""
                 steps.append({"id": a["id"], "rc": rc, "output": out[-300:]})
             ln["stopped"] = {"at": iso(self.now()), "ok": all(s["rc"] == 0 for s in steps)}
+            ln["early_stopped"] = [s["id"] for s in steps if s["rc"] == 0]
             self.event("early_stop", lane=name, steps=steps)
 
     def cleanup(self, lanes, agents, attention_ids):
@@ -2007,7 +2011,8 @@ class Conveyor:
             if t is None or self.now() - t < CLEANUP_S:
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
-            sess, doubt = self.lane_sessions(name, ids, agents)
+            es = ln.get("early_stopped", [])
+            sess, doubt = self.lane_sessions(name, ids, agents, es)
             if not sess and not doubt:
                 continue  # nothing listed to remove
             sids = [a["sessionId"] for a in sess] if doubt is None else []
@@ -2024,7 +2029,7 @@ class Conveyor:
                     doubt = "usage ledger has not counted the session since"
             if doubt is None:  # the pass may be minutes old: act only on a fresh listing
                 try:
-                    sess, doubt = self.lane_sessions(name, ids, self.agents())
+                    sess, doubt = self.lane_sessions(name, ids, self.agents(), es)
                 except Exception as e:
                     sess, doubt = [], f"agents: {type(e).__name__}"
                 if not sess and not doubt:

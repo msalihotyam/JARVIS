@@ -2285,6 +2285,49 @@ class TestEarlyStop(Base):
         self.assertEqual(self.cli("stop", "rm"), [["stop", sid], ["rm", sid]])
         self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
 
+    def stopped_state(self, sid):
+        self.fake.agent("A").update(state="stopped")  # what claude reports after the stop
+        self.assertEqual(self.lanes()["A"]["early_stopped"], [sid])
+
+    def test_early_stopped_by_us_removed_after_cleanup_s(self):
+        sid = self.finished()
+        self.stopped_state(sid)
+        self.t += conveyor.CLEANUP_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [])
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid], ["rm", sid]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+
+    def test_stopped_not_by_us_is_doubt(self):
+        sid = self.finished()
+        self.lanes_edit(lambda d: d["A"].pop("early_stopped"))
+        self.fake.agent("A").update(state="stopped")
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [])
+        self.assertEqual([e["reason"] for e in self.events() if e["event"] == "cleanup_skip"],
+                         [f"{sid}: kind/name/state/session not as expected"])
+
+    def test_early_stopped_in_attention_or_uncounted_kept(self):
+        sid = self.finished()
+        self.stopped_state(sid)
+        self.ledger_skip.add(self.fake.agent("A")["sessionId"])
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("rm"), [])
+        b = self.finished("B", "BLOCKED")  # in attention until acked
+        self.fake.agent("B").update(state="stopped")
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertNotIn(["rm", b], self.fake.calls)
+
+    def lanes_edit(self, fn):
+        d = self.lanes()
+        fn(d)
+        (self.base / "lanes.json").write_text(json.dumps(d))
+
     def test_busy_attention_foreign_never_stopped(self):
         self.fake.agents.append(  # not started by the conveyor: same lane name, alive, idle
             {"id": "ffff0001", "name": "A", "kind": "background", "state": "done", "status": "idle",
