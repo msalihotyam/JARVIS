@@ -3490,6 +3490,58 @@ class Bridge(QObject):
                 "meta": f"{brand}  |  {effort}" if effort else brand,
                 "quota": quota}
 
+    @Property("QVariantMap", notify=providersChanged)
+    def usageLimits(self) -> dict:
+        """The usage popover's content for the chosen provider (G6MP1): every
+        window it REPORTED (``rows``, the card's row shape; Claude's per-model
+        weeks carry ``model``), and the details only the old Model panel showed
+        (route status, the chosen Codex model's verified state, plan facts, Web
+        Research, extra paid usage / credits, the last call's tokens).
+        A key no provider reported is absent - never estimated."""
+        provider = self.chatProvider
+        entry = next((p for p in self._providers if p.get("id") == provider), {})
+        found: dict = {"provider": provider}
+        if entry.get("status"):
+            found["status"] = str(entry["status"])
+        if entry.get("plan"):
+            found["plan"] = str(entry["plan"])
+        if type(entry.get("research")) is bool:
+            found["research"] = entry["research"]
+        if provider == "codex":
+            limits = self.codexQuota
+            found["rows"] = self._codex_card_quota()
+            if type(limits.get("has_credits")) is bool:
+                found["credits"] = limits["has_credits"]
+            # Listed is not usable: what a real call this session showed for the chosen model.
+            listed = next((m for m in entry.get("models") or [] if isinstance(m, dict) and m.get("id") == self.codexModel), None)
+            if listed is not None:
+                found["verified"] = {**dict(listed.get("verified") or {}), "model": self.codexModel}
+            usage_vendor = "openai"
+        else:
+            limits = dict(self._claude_limits)
+            windows = limits.get("windows") if isinstance(limits.get("windows"), dict) else {}
+            rows = []
+            for key, label, model in (("five_hour", "five_hour", ""), ("seven_day", "weekly", ""),
+                                      ("seven_day_opus", "weekly_opus", "Opus"), ("seven_day_sonnet", "weekly_sonnet", "Sonnet")):
+                window = windows.get(key)
+                if isinstance(window, dict) and isinstance(window.get("utilization"), (int, float)):
+                    row = {"window": label, "remaining": max(0, 100 - round(window["utilization"] * 100)),
+                           "resets_at": int(window.get("resets_at") or 0)}
+                    rows.append({**row, "model": model} if model else row)
+            found["rows"] = rows
+            if limits.get("using_overage") is True:
+                found["overage"] = "in_use"
+            elif limits.get("overage_status") == "rejected":
+                found["overage"] = "off"
+            usage_vendor = "anthropic"
+        if limits.get("seen_at"):
+            found["seen_at"] = int(limits["seen_at"])
+        usage = self._chat_usage
+        if usage.get("provider") == usage_vendor and isinstance(usage.get("reported"), dict) and usage["reported"]:
+            found["last_call"] = {"reported": dict(usage["reported"]),
+                                  "calls": usage["call_count"] if type(usage.get("call_count")) is int else 1}
+        return found
+
     # -- chat provider: who answers and interprets (never authority) ---------------
 
     @Property(str, notify=prefsChanged)

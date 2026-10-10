@@ -10,7 +10,7 @@ brand-only top card (U1) and the usage ring under every composer (U2/U3).
   like frozen - never "ready".
 * U1: the top card names the provider's brand only: no model, no usage, no action.
 * U2/U3: the usage ring sits right of the Model and Effort chips in each
-  composer and shows only the provider-reported rows (bridge.modelCard.quota).
+  composer and shows only the provider-reported rows (G6MP1: bridge.usageLimits).
 
 No test opens the live DB or makes a live call.
 """
@@ -171,7 +171,12 @@ class BrandCardTests(PlacementCase):
             self.assertIsNone(find(root.contentItem(), gone), gone)
         # Not clickable: a click opens nothing.
         self.click(root, "brandCard")
-        self.assertFalse(any(root.property(key) for key in ("modelOpen", "settingsOpen", "navOpen")))
+        # G6MP1: the Model panel it once opened is retired - nothing opens, no panel exists.
+        self.assertFalse(any(root.property(key) for key in ("settingsOpen", "navOpen")))
+        self.assertIsNone(find(root.contentItem(), "modelSurface"))
+        ring = find(self.item(root, "canonicalComposer"), "usageRing")
+        pop = ring.findChild(QObject, "usagePopover")
+        self.assertFalse(pop.property("visible"))
         bridge.setChatProvider("codex")
         pump(50)
         self.assertEqual("OPENAI", self.item(root, "brandName").property("text"))
@@ -191,7 +196,8 @@ class UsageRingPlacementTests(PlacementCase):
                 self.assertTrue(ring.isVisible())
                 self.assertAlmostEqual(box(row)[2], box(ring)[2], delta=1)       # the row's right end
                 self.assertLessEqual(box(effort)[2], box(ring)[0] + 0.5)          # right of Effort
-                self.assertEqual("Anthropic", ring.property("provider"))
+                limits = ring.property("limits")
+                self.assertEqual("claude", (limits.toVariant() if hasattr(limits, "toVariant") else limits)["provider"])   # G6MP1: bridge.usageLimits
                 self.assertEqual("–", find(ring, "usageRingText").property("text"))   # nothing reported, nothing estimated
 
     def test_popover_rows_are_the_reported_quota_and_open_above(self) -> None:
@@ -202,7 +208,8 @@ class UsageRingPlacementTests(PlacementCase):
         bridge.applyModel("claude-sonnet-5", "high")
         root = self.window(bridge)
         ring = find(self.item(root, "canonicalComposer"), "usageRing")
-        self.assertEqual(bridge.modelCard["quota"], ring.property("rows"))
+        self.assertEqual(bridge.usageLimits["rows"], ring.property("rows"))     # G6MP1: every reported window
+        self.assertEqual(bridge.modelCard["quota"], ring.property("rows"))      # (here the same two as the card)
         self.assertEqual("8%", find(ring, "usageRingText").property("text"))
         center = ring.mapToScene(QPointF(ring.width() / 2, ring.height() / 2)).toPoint()
         from PySide6.QtCore import Qt
@@ -213,7 +220,7 @@ class UsageRingPlacementTests(PlacementCase):
         self.assertTrue(pop.property("visible"))
         body = pop.property("contentItem")
         title = next(n for n in descendants(body) if n.objectName() == "usagePopoverTitle")
-        self.assertEqual("Plan usage limits · Anthropic", title.property("text"))
+        self.assertEqual("Plan usage limits", title.property("text"))           # G6MP1: Claude reported no plan name
         used = {n.objectName(): next(t.property("text") for t in descendants(n) if t.objectName() == "usageRowUsed")
                 for n in descendants(body) if n.objectName().startswith("usageRow_") and n.isVisible()}
         self.assertEqual({"usageRow_five_hour": "8%", "usageRow_weekly": "26%"}, used)

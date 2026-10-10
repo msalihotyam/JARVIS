@@ -33,10 +33,8 @@ Item {
     signal restoreRequested()
     signal closeRequested()
     signal openSettings()
-    signal openModel()
     property bool fullscreen: true
     property bool settingsOpen: false
-    property bool modelOpen: false
     property Item controlLayer: null
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
     // Under the strip, where the 54 px selector's panel always opened (ContextPanel caps it from there).

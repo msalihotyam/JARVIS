@@ -2271,291 +2271,6 @@ yok</translation>
     </message>
 </context>
 <context>
-    <name>ModelPanel</name>
-    <message>
-        <source>MODEL &amp; PROVIDER</source>
-        <translation>MODEL VE SAĞLAYICI</translation>
-    </message>
-    <message>
-        <source>Subscription route verified</source>
-        <translation>Abonelik yolu doğrulandı</translation>
-    </message>
-    <message>
-        <source>CLI default</source>
-        <translation>CLI varsayılanı</translation>
-    </message>
-    <message>
-        <source>Whatever the Claude Code CLI selects</source>
-        <translation>Claude Code CLI ne seçerse</translation>
-    </message>
-    <message>
-        <source>Checking…</source>
-        <translation>Denetleniyor…</translation>
-    </message>
-    <message>
-        <source>ChatGPT subscription sign-in verified%1</source>
-        <translation>ChatGPT abonelik oturumu doğrulandı%1</translation>
-    </message>
-    <message>
-        <source>Not signed in - run: %1</source>
-        <translation>Oturum açılmamış - çalıştırın: %1</translation>
-    </message>
-    <message>
-        <source>Not signed in - run %1 and choose Sign in with Google</source>
-        <translation>Oturum açılmamış - %1 komutunu çalıştırıp Sign in with Google seçin</translation>
-    </message>
-    <message>
-        <source>CLI not installed</source>
-        <translation>CLI yüklü değil</translation>
-    </message>
-    <message>
-        <source>Set up with an API key (metered) - refused</source>
-        <translation>API anahtarıyla (kullanım başına ücretli) kurulmuş - reddedildi</translation>
-    </message>
-    <message>
-        <source>Planned after V1</source>
-        <translation>V1 sonrasına planlandı</translation>
-    </message>
-    <message>
-        <source>Route not established - calls are refused</source>
-        <translation>Yol doğrulanamadı - çağrılar reddediliyor</translation>
-    </message>
-    <message>
-        <source>Status unavailable - chat unavailable for safety</source>
-        <translation>Durum okunamadı - sohbet güvenlik nedeniyle kapalı</translation>
-    </message>
-    <message>
-        <source>Connected - chat unavailable for safety</source>
-        <translation>Bağlı - sohbet güvenlik nedeniyle kapalı</translation>
-    </message>
-    <message>
-        <source>Available</source>
-        <comment>capability</comment>
-        <translation>Var</translation>
-    </message>
-    <message>
-        <source>Unavailable</source>
-        <comment>capability</comment>
-        <translation>Yok</translation>
-    </message>
-    <message>
-        <source>Checking the providers…</source>
-        <translation>Sağlayıcılar denetleniyor…</translation>
-    </message>
-    <message>
-        <source>The provider answers and interprets requests; it never changes what JARVIS may do. Manual choice, no automatic fallback.</source>
-        <translation>Sağlayıcı istekleri yanıtlar ve yorumlar; JARVIS&apos;in neler yapabileceğini asla değiştirmez. Seçim elle yapılır, otomatik geçiş yoktur.</translation>
-    </message>
-    <message>
-        <source>Currently %1</source>
-        <translation>Şu an %1</translation>
-    </message>
-    <message>
-        <source>Default</source>
-        <translation>Varsayılan</translation>
-    </message>
-    <message>
-        <source>This model does not support an effort setting.</source>
-        <translation>Bu model efor ayarını desteklemiyor.</translation>
-    </message>
-    <message>
-        <source>Configured model: %1 · effort: %2</source>
-        <translation>Yapılandırılan model: %1 · efor: %2</translation>
-    </message>
-    <message>
-        <source>Provider</source>
-        <translation>Sağlayıcı</translation>
-    </message>
-    <message>
-        <source>low</source>
-        <translation>düşük</translation>
-    </message>
-    <message>
-        <source>medium</source>
-        <translation>orta</translation>
-    </message>
-    <message>
-        <source>high</source>
-        <translation>yüksek</translation>
-    </message>
-    <message>
-        <source>Show older models</source>
-        <translation>Eski modelleri göster</translation>
-    </message>
-    <message>
-        <source>New version: %1</source>
-        <translation>Yeni sürüm: %1</translation>
-    </message>
-    <message>
-        <source>Model</source>
-        <translation>Model</translation>
-    </message>
-    <message>
-        <source>The CLI did not list its models.</source>
-        <translation>CLI modellerini listelemedi.</translation>
-    </message>
-    <message>
-        <source>Effort</source>
-        <translation>Efor</translation>
-    </message>
-    <message>
-        <source>Usage</source>
-        <translation>Kullanım</translation>
-    </message>
-    <message>
-        <source>Answered the last call</source>
-        <translation>Son çağrıyı yanıtlayan</translation>
-    </message>
-    <message>
-        <source>No Claude call yet</source>
-        <translation>Henüz Claude çağrısı yok</translation>
-    </message>
-    <message>
-        <source>%1 calls, one per group</source>
-        <translation>%1 çağrı, grup başına bir tane</translation>
-    </message>
-    <message>
-        <source>Plan, this session</source>
-        <translation>Plan, bu oturum</translation>
-    </message>
-    <message>
-        <source>%1% left</source>
-        <translation>%%1 kaldı</translation>
-    </message>
-    <message>
-        <source>Not reported yet</source>
-        <translation>Henüz bildirilmedi</translation>
-    </message>
-    <message>
-        <source>Resets %1</source>
-        <translation>Sıfırlanma: %1</translation>
-    </message>
-    <message>
-        <source>Current session (5 h)</source>
-        <translation>Geçerli oturum (5 sa)</translation>
-    </message>
-    <message>
-        <source>Current week (all models)</source>
-        <translation>Bu hafta (tüm modeller)</translation>
-    </message>
-    <message>
-        <source>Current week (Opus)</source>
-        <translation>Bu hafta (Opus)</translation>
-    </message>
-    <message>
-        <source>Current week (Sonnet)</source>
-        <translation>Bu hafta (Sonnet)</translation>
-    </message>
-    <message>
-        <source>Web Research</source>
-        <translation>Web Araştırması</translation>
-    </message>
-    <message>
-        <source>Plan limits: shown after the first Claude call - Claude Code reports them with each answer, and JARVIS makes no call just to check.</source>
-        <translation>Plan limitleri: ilk Claude çağrısından sonra gösterilir - Claude Code bunları her yanıtla bildirir; JARVIS yalnızca kontrol için çağrı yapmaz.</translation>
-    </message>
-    <message>
-        <source>As reported by Claude Code at %1 · extra paid usage: %2</source>
-        <translation>Claude Code&apos;un %1 itibarıyla bildirdiği · ek ücretli kullanım: %2</translation>
-    </message>
-    <message>
-        <source>IN USE</source>
-        <translation>KULLANIMDA</translation>
-    </message>
-    <message>
-        <source>off</source>
-        <translation>kapalı</translation>
-    </message>
-    <message>
-        <source>not reported</source>
-        <translation>bildirilmedi</translation>
-    </message>
-    <message>
-        <source>Last turn: %1 calls, one per group. Tokens summed over all of them:</source>
-        <translation>Son tur: grup başına bir tane olmak üzere %1 çağrı. Token toplamı:</translation>
-    </message>
-    <message>
-        <source>Last call tokens: %1 input · %2 cache read · %3 cache write · %4 output</source>
-        <translation>Son çağrı token: %1 girdi · %2 önbellek okuma · %3 önbellek yazma · %4 çıktı</translation>
-    </message>
-    <message>
-        <source>No model chosen</source>
-        <translation>Model seçilmedi</translation>
-    </message>
-    <message>
-        <source>Choose one of the models Codex lists</source>
-        <translation>Codex&apos;in listelediği modellerden birini seçin</translation>
-    </message>
-    <message>
-        <source>Answered this session</source>
-        <translation>Bu oturumda yanıt verdi</translation>
-    </message>
-    <message>
-        <source>Failed this session: %1</source>
-        <translation>Bu oturumda başarısız: %1</translation>
-    </message>
-    <message>
-        <source>Listed by Codex - not tried yet</source>
-        <translation>Codex listeliyor - henüz denenmedi</translation>
-    </message>
-    <message>
-        <source>Codex listed no model that JARVIS can run with every tool disabled.</source>
-        <translation>Codex, JARVIS&apos;in tüm araçlar kapalıyken çalıştırabileceği bir model listelemedi.</translation>
-    </message>
-    <message>
-        <source>The saved model %1 is not offered now; calls are refused until you choose one.</source>
-        <translation>Kayıtlı model %1 şu an sunulmuyor; bir model seçene kadar çağrılar reddedilir.</translation>
-    </message>
-    <message>
-        <source>Answering model</source>
-        <translation>Yanıtlayan model</translation>
-    </message>
-    <message>
-        <source>none</source>
-        <translation>yok</translation>
-    </message>
-    <message>
-        <source>Codex does not report it - the call requests %1</source>
-        <translation>Codex bunu bildirmiyor - çağrı %1 modelini istiyor</translation>
-    </message>
-    <message>
-        <source>model default</source>
-        <translation>model varsayılanı</translation>
-    </message>
-    <message>
-        <source>5-hour window</source>
-        <translation>5 saatlik pencere</translation>
-    </message>
-    <message>
-        <source>Weekly window</source>
-        <translation>Haftalık pencere</translation>
-    </message>
-    <message>
-        <source>%1-minute window</source>
-        <translation>%1 dakikalık pencere</translation>
-    </message>
-    <message>
-        <source>Plan limits: not reported yet.</source>
-        <translation>Plan limitleri: henüz bildirilmedi.</translation>
-    </message>
-    <message>
-        <source>As reported by Codex at %1 · purchased credits: %2</source>
-        <translation>Codex&apos;in %1 itibarıyla bildirdiği · satın alınmış kredi: %2</translation>
-    </message>
-    <message>
-        <source>present</source>
-        <translation>var</translation>
-    </message>
-    <message>
-        <source>Last call tokens: %1 input · %2 cached · %3 output · %4 reasoning</source>
-        <translation>Son çağrı token: %1 girdi · %2 önbellekten · %3 çıktı · %4 akıl yürütme</translation>
-    </message>
-    <message>
-        <source>Last call: no usage reported yet</source>
-        <translation>Son çağrı: henüz kullanım bildirilmedi</translation>
-    </message>
-</context>
-<context>
     <name>ModelSelector</name>
     <message>
         <source>Model and provider</source>
@@ -5026,20 +4741,156 @@ DOĞRULANMADI</translation>
 <context>
     <name>UsagePopover</name>
     <message>
-        <source>5-hour session</source>
-        <translation>5 saatlik oturum</translation>
-    </message>
-    <message>
-        <source>Weekly</source>
-        <translation>Haftalık</translation>
-    </message>
-    <message>
         <source>Plan usage limits · %1</source>
-        <translation>Plan kullanım limitleri · %1</translation>
+        <translation>Plan kullanım sınırları · %1</translation>
     </message>
     <message>
         <source>Resets %1</source>
         <translation>Sıfırlanma: %1</translation>
+    </message>
+    <message>
+        <source>Session limit</source>
+        <translation>Oturum sınırı</translation>
+    </message>
+    <message>
+        <source>Weekly · all models</source>
+        <translation>Haftalık · tüm modeller</translation>
+    </message>
+    <message>
+        <source>Weekly · %1</source>
+        <translation>Haftalık · %1</translation>
+    </message>
+    <message>
+        <source>Resets in %1 h %2 min</source>
+        <translation>%1 sa %2 dk sonra sıfırlanır</translation>
+    </message>
+    <message>
+        <source>Resets in %1 min</source>
+        <translation>%1 dk sonra sıfırlanır</translation>
+    </message>
+    <message>
+        <source>ChatGPT subscription sign-in verified</source>
+        <translation>ChatGPT abonelik oturumu doğrulandı</translation>
+    </message>
+    <message>
+        <source>Subscription route verified</source>
+        <translation>Abonelik yolu doğrulandı</translation>
+    </message>
+    <message>
+        <source>Not signed in - run: %1</source>
+        <translation>Oturum açılmamış - çalıştırın: %1</translation>
+    </message>
+    <message>
+        <source>CLI not installed</source>
+        <translation>CLI yüklü değil</translation>
+    </message>
+    <message>
+        <source>Set up with an API key (metered) - refused</source>
+        <translation>API anahtarıyla (kullanım başına ücretli) kurulmuş - reddedildi</translation>
+    </message>
+    <message>
+        <source>Route not established - calls are refused</source>
+        <translation>Yol doğrulanamadı - çağrılar reddediliyor</translation>
+    </message>
+    <message>
+        <source>Route</source>
+        <translation>Bağlantı yolu</translation>
+    </message>
+    <message>
+        <source>Model</source>
+        <translation>Model</translation>
+    </message>
+    <message>
+        <source>Answered this session</source>
+        <translation>Bu oturumda yanıt verdi</translation>
+    </message>
+    <message>
+        <source>Failed this session: %1</source>
+        <translation>Bu oturumda başarısız: %1</translation>
+    </message>
+    <message>
+        <source>Listed by Codex - not tried yet</source>
+        <translation>Codex listeliyor - henüz denenmedi</translation>
+    </message>
+    <message>
+        <source>Answered the last call</source>
+        <translation>Son çağrıyı yanıtlayan</translation>
+    </message>
+    <message>
+        <source>Reported</source>
+        <translation>Bildirildi</translation>
+    </message>
+    <message>
+        <source>Extra paid usage</source>
+        <translation>Ek ücretli kullanım</translation>
+    </message>
+    <message>
+        <source>In use</source>
+        <translation>Kullanımda</translation>
+    </message>
+    <message>
+        <source>Off</source>
+        <translation>Kapalı</translation>
+    </message>
+    <message>
+        <source>Purchased credits</source>
+        <translation>Satın alınmış kredi</translation>
+    </message>
+    <message>
+        <source>Present</source>
+        <translation>Var</translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation>Yok</translation>
+    </message>
+    <message>
+        <source>Web Research</source>
+        <translation>Web Araştırması</translation>
+    </message>
+    <message>
+        <source>Available</source>
+        <translation>Kullanılabilir</translation>
+    </message>
+    <message>
+        <source>Unavailable</source>
+        <translation>Kullanılamaz</translation>
+    </message>
+    <message>
+        <source>%1 input</source>
+        <translation>%1 girdi</translation>
+    </message>
+    <message>
+        <source>%1 cache read</source>
+        <translation>%1 önbellek okuma</translation>
+    </message>
+    <message>
+        <source>%1 cache write</source>
+        <translation>%1 önbellek yazma</translation>
+    </message>
+    <message>
+        <source>%1 cached</source>
+        <translation>%1 önbellekten</translation>
+    </message>
+    <message>
+        <source>%1 output</source>
+        <translation>%1 çıktı</translation>
+    </message>
+    <message>
+        <source>%1 reasoning</source>
+        <translation>%1 akıl yürütme</translation>
+    </message>
+    <message>
+        <source>Last turn tokens (%1 calls)</source>
+        <translation>Son tur token (%1 çağrı)</translation>
+    </message>
+    <message>
+        <source>Last call tokens</source>
+        <translation>Son çağrı token</translation>
+    </message>
+    <message>
+        <source>Plan usage limits</source>
+        <translation>Plan kullanım sınırları</translation>
     </message>
     <message>
         <source>%1%</source>
@@ -5048,6 +4899,10 @@ DOĞRULANMADI</translation>
     <message>
         <source>This provider reported no usage limits.</source>
         <translation>Bu sağlayıcı kullanım limiti bildirmedi.</translation>
+    </message>
+    <message>
+        <source>Details</source>
+        <translation>Ayrıntılar</translation>
     </message>
     <message>
         <source>Values as the provider reported them; nothing unreported is estimated.</source>

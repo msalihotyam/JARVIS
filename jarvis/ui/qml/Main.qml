@@ -28,7 +28,6 @@ Window {
     readonly property bool paletteOpen: palette.open
     readonly property bool navOpen: nav.open
     readonly property bool settingsOpen: settings.open
-    readonly property bool modelOpen: modelPanel.open
     readonly property bool peekOpen: peek.open
     readonly property string peekKey: peek.open ? peek.key : ""
     readonly property string presentation: bridge.theme
@@ -157,7 +156,7 @@ Window {
         function onProjectsChanged() { Qt.callLater(history.record) }
     }
 
-    function closeContexts() { settings.open = false; modelPanel.open = false; nav.open = false; closePeek() }
+    function closeContexts() { settings.open = false; nav.open = false; closePeek() }
     function closePeek() { peekSwitch.stop(); peek.open = false }
     // One summary peek at a time: the same card again closes it. Another card
     // is a real switch: the open surface closes with its own transition, then
@@ -171,7 +170,7 @@ Window {
         }
         if (peek.open && peek.key === key) { peek.open = false; return }
         if (palette.open) palette.hide()
-        settings.open = false; modelPanel.open = false; nav.open = false
+        settings.open = false; nav.open = false
         if (peek.open) { peekSwitch.key = key; peekSwitch.cardY = cardY; peek.open = false; peekSwitch.start(); return }
         peek.key = key; peek.cardY = cardY; peek.open = true
     }
@@ -183,10 +182,9 @@ Window {
         onTriggered: { peek.key = key; peek.cardY = cardY; peek.open = true }
     }
     function toggleSettings() { var next = !settings.open; closeContexts(); settings.open = next }
-    function toggleModel() { var next = !modelPanel.open; closeContexts(); modelPanel.open = next }
     function toggleNav() { var next = !nav.open; closeContexts(); nav.open = next }
     onHomePageChanged: closeContexts()
-    onPresentationChanged: { nav.open = false; modelPanel.open = false; closePeek() }
+    onPresentationChanged: { nav.open = false; closePeek() }
 
     Component.onCompleted: {
         Theme.name = bridge.theme
@@ -232,7 +230,6 @@ Window {
         viewportHeight: root.height
         fullscreen: root.fullscreen
         settingsOpen: settings.open
-        modelOpen: modelPanel.open
         onMenuRequested: root.toggleNav()
         onLifecycleRequested: root.toggleLifecycle()
         panelsRaised: root.homeCanonical
@@ -242,7 +239,6 @@ Window {
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
         onOpenSettings: root.toggleSettings()
-        onOpenModel: root.toggleModel()
     }
 
     // The red control: Freeze JARVIS is sent AT ONCE - no confirmation, no
@@ -470,7 +466,6 @@ Window {
             }
         }
     }
-    ModelPanel { id: modelPanel; anchorPoint: topBar.modelAnchor }
     // The internal attachment preview (image lightbox / text view), above every panel.
     AttachmentPreview { id: attachmentPreview }
     Connections { target: bridge; function onPreviewRequested(file) { attachmentPreview.show(file) } }
@@ -655,7 +650,6 @@ Window {
         else if (confirm.open) confirm.open = false
         else if (resumeConfirm.open) resumeConfirm.open = false
         else if (settings.open) settings.open = false
-        else if (modelPanel.open) modelPanel.open = false
         else if (nav.open) nav.open = false
         else if (layoutMenus.open) layoutMenus.close()
         else if (peek.open || peekSwitch.running) root.closePeek()

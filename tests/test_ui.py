@@ -26,7 +26,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 os.environ.pop("ANTHROPIC_BASE_URL", None)
 
-from PySide6.QtCore import QMetaObject, QPointF, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
+from PySide6.QtCore import QMetaObject, QObject, QPointF, Q_ARG, Q_RETURN_ARG, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
 from PySide6.QtQml import QQmlProperty  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402,F401
@@ -66,15 +66,56 @@ from tests.test_intent import (  # noqa: E402
 _APP = QGuiApplication.instance() or QGuiApplication([])
 
 
-def open_model_panel(root, then=None) -> None:
-    """6G U1 (G6TB1B): the top card names only the brand and opens nothing, so
-    the model panel - without an opener of its own until its new home is
-    decided - is opened through Main.toggleModel, the call the card made."""
-    QMetaObject.invokeMethod(root, "toggleModel")
+def shown_named(root, name):
+    """The one visible item of that name in the window (a popup's rows included)."""
+    found = [i for i in visual_items(root) if i.objectName() == name and i.isVisible()]
+    assert len(found) == 1, (name, len(found))
+    return found[0]
+
+
+def tap(root, item) -> None:
+    QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
+
+
+def usage_popover(root):
+    """G6MP1 ("ModelPanel A", Salih 2026-10-10): the retired Model panel's
+    information lives in the usage ring's popover - the ring's in the composer
+    on screen."""
+    ring = shown_named(root, "usageRing")
+    pop = ring.findChild(QObject, "usagePopover")
+    pop.ring = ring          # a child's wrapper dies with its parent's: keep the ring's alive
+    return pop
+
+
+def open_usage_popover(root, then=None) -> None:
+    """A click on the usage ring, the way Salih opens it (a second click closes it)."""
+    tap(root, shown_named(root, "usageRing"))
     if then is not None:
         settled(260, then)
     else:
         pump(260)
+
+
+def usage_detail(root, name: str) -> str | None:
+    """The open popover's "Details" line (``usageDetail<name>``), None when not shown."""
+    found = [i for i in visual_items(root) if i.objectName() == "usageDetail" + name and i.isVisible()]
+    return found[0].property("value") if found else None
+
+
+def choose_model(root, pid: str, model_id: str) -> None:
+    """G6MP1: the composer's Model menu (G6CM1) is the one place a model is chosen -
+    one click on its row (an older version under "More models")."""
+    chip = shown_named(root, "modelMenuChip")
+    menu = chip.findChild(QObject, "modelMenu")
+    tap(root, chip)
+    wait_until(lambda: bool(menu.property("opened")), 600)
+    name = f"modelMenuRow_{pid}_{model_id}"
+    if not [i for i in visual_items(root) if i.objectName() == name and i.isVisible()]:
+        tap(root, shown_named(root, "modelMenuMore"))
+        pump(300)
+    tap(root, shown_named(root, name))
+    wait_until(lambda: not menu.property("visible"), 600)
+    pump(100)
 
 
 def pump(ms: int = 0) -> None:
@@ -950,13 +991,16 @@ class PresentationTests(UiTestCase):
         root = self.window(bridge)
         # 6G U1 (G6TB1B): the top card is brand-only and inert - it is no trigger any more.
         self.click(root, "brandCard")
-        self.assertFalse(any(root.property(key) for key in ("settingsOpen", "modelOpen", "navOpen")))
+        # G6MP1: the Model panel is retired; its information is the usage ring's popover.
+        popover = usage_popover(root)
+        opened = lambda: [bool(root.property(key)) for key in ("settingsOpen", "navOpen")] + [bool(popover.property("visible"))]  # noqa: E731
+        self.assertFalse(any(opened()))
         for trigger, state, surface in (("settingsOrb", "settingsOpen", "settingsSurface"),
                                         ("navigationTrigger", "navOpen", "navSurface")):
             with self.subTest(trigger=trigger):
                 self.click(root, trigger, then=lambda: (
                     self.assertTrue(root.property(state)),
-                    self.assertEqual(1, sum(bool(root.property(key)) for key in ("settingsOpen", "modelOpen", "navOpen"))),
+                    self.assertEqual(1, sum(opened())),
                 ))
                 # In the window's coordinates (K4: the nav menu is a popup surface, not a panel child).
                 panel = self.item(root, surface).mapToScene(QPointF(0, 0))
@@ -979,12 +1023,16 @@ class PresentationTests(UiTestCase):
                     self.assertFalse(root.property(state)),
                 ))
         self.click(root, "settingsOrb")
-        open_model_panel(root, then=lambda: (
+        open_usage_popover(root, then=lambda: (          # the press outside closes settings and is its own
             self.assertFalse(root.property("settingsOpen")),
-            self.assertTrue(root.property("modelOpen")),
+            self.assertFalse(popover.property("visible")),
+        ))
+        open_usage_popover(root, then=lambda: (          # the next click opens the popover: one context at a time
+            self.assertTrue(popover.property("visible")),
+            self.assertEqual(1, sum(opened())),
         ))
         self.click(root, "navigationTrigger", then=lambda: (
-            self.assertFalse(root.property("modelOpen")),
+            self.assertFalse(popover.property("visible")),
         ))
         self.click(root, "navigate_tasks", then=lambda: (
             self.assertEqual("tasks", bridge.page),
@@ -1016,10 +1064,10 @@ class PresentationTests(UiTestCase):
                     self.assertLessEqual(corner().x(), width)
                     self.assertLessEqual(corner().y(), height)
                     self.assertGreater(composer.width(), 360)
-                    # 6G U1: no top-card trigger; the model panel still fits when it is open.
-                    for trigger, surface in (("settingsOrb", "settingsSurface"), (None, "modelSurface"), ("navigationTrigger", "navSurface")):
+                    # G6MP1: the Model panel is retired; the usage popover that holds its information fits.
+                    for trigger, surface in (("settingsOrb", "settingsSurface"), (None, "usageSurface"), ("navigationTrigger", "navSurface")):
                         if trigger is None:
-                            open_model_panel(root)
+                            open_usage_popover(root)
                         else:
                             self.click(root, trigger)
                         body = self.item(root, surface)
@@ -1499,17 +1547,16 @@ class CommandHeaderTests(UiTestCase):
         self.assertFalse(bridge.config["claude_model"])
         self.assertEqual("CLI default", chip.property("currentName"))
         self.assertEqual("ANTHROPIC", self.item(root, "brandName").property("text"))
-        self.assertFalse(root.property("modelOpen"))
-
-        open_model_panel(root, then=lambda: (
-            self.assertTrue(root.property("modelOpen")),
-        ))
-        # The model list is collapsed until it is asked for; a choice is persisted
-        # at once, with no separate Apply step.
-        self.click(root, "claudeModelField")
-        pump(300)
-        self.click(root, "modelRowDefault")
+        # G6MP1: the Model panel is retired; the Model menu is the selector and opens from its chip.
+        menu = chip.findChild(QObject, "modelMenu")
+        self.assertFalse(menu.property("visible"))
+        self.click(root, "modelMenuChip", until=lambda: bool(menu.property("opened")))
+        self.assertTrue(menu.property("opened"))
+        # Nothing listed by the CLI yet: no model row is invented, the CLI default stays.
+        self.assertEqual([], [i for i in visual_items(root) if str(i.objectName()).startswith("modelMenuRow_claude_") and i.isVisible()])
+        tap(root, shown_named(root, "modelMenuCurrent"))
         pump(250)
+        self.assertFalse(menu.property("visible"))
         self.assertFalse(self.store.load().settings.claude_model)
 
         # No free-text model field any more: the models the CLI lists are the choice.
@@ -1519,10 +1566,7 @@ class CommandHeaderTests(UiTestCase):
              "models": [{"id": "opus[1m]", "name": "Opus", "resolved": "claude-opus-5[1m]", "description": "", "efforts": ["low", "medium", "high"]}]},
             {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "not_installed", "models": [], "research": False}])
         pump(300)
-        self.click(root, "claudeModelField")
-        pump(300)
-        QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen")
-        pump(250)
+        choose_model(root, "claude", "opus[1m]")
         self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
         self.assertEqual("Opus 5", chip.property("currentName"))                  # short name, canonical id stored
         self.assertEqual(0, self.execute_calls())
@@ -2400,15 +2444,17 @@ class ConversationSurfaceTests(UiTestCase):
         settled(300, lambda: (
             self.assertFalse(root.property("peekOpen")),
         ))
-        # Only one context at a time: a peek closes the model panel (6G U1: opened without the card).
-        open_model_panel(root)
+        # Only one context at a time: a peek closes the usage popover (G6MP1: the retired
+        # Model panel's information lives there).
+        popover = usage_popover(root)
+        open_usage_popover(root)
         settled(300, lambda: (
-            self.assertTrue(root.property("modelOpen")),
+            self.assertTrue(popover.property("visible")),
         ))
         self.click(root, "railTasks")
         settled(300, lambda: (
             self.assertTrue(root.property("peekOpen")),
-            self.assertFalse(root.property("modelOpen")),
+            self.assertFalse(popover.property("visible")),
         ))
         # The deep action is the existing full page.
         self.click(root, "summaryPeekAction")
@@ -4357,59 +4403,71 @@ class ProviderSelectionTests(UiTestCase):
              "quota": {"groups": self.GOOGLE_GROUPS}},
             {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
-        open_model_panel(root)
+        open_usage_popover(root)          # G6MP1: the retired Model panel's information
         pump(400)
         return root
 
     def test_claude_model_and_effort_are_manual_and_the_answering_model_is_shown_apart(self) -> None:
         bridge = self.bridge(proposal(kind="chat", reply="Merhaba!"))
         root = self.open_panel(bridge)
-        self.assertEqual("No Claude call yet", self.item(root, "actualModelLine").property("value"))
-        self.assertIn("shown after the first Claude call", self.item(root, "quotaLine").property("text"))
-        self.assertEqual("Connected - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
-        self.assertFalse(self.item(root, "providerRow_google").property("selectable"))
-        # Google keeps its connection state, but no quota control sits in this panel
+        self.assertIsNone(usage_detail(root, "Model"))                                  # no Claude call yet: no answering model
+        self.assertTrue(shown_named(root, "usageNone").isVisible())                     # no plan limits before the first call
+        self.assertEqual("Subscription route verified", usage_detail(root, "Route"))
+        # Google is connected but chat is unavailable for safety: the Model menu offers no Google row.
+        self.assertEqual("chat_unavailable", bridge.providers[2]["status"])
+        chip = shown_named(root, "modelMenuChip")
+        tap(root, chip)
+        pump(300)
+        self.assertEqual([], [i for i in visual_items(root) if str(i.objectName()).startswith("modelMenuRow_google")])
+        self.assertTrue(shown_named(root, "modelMenuRow_codex_gpt-5.6-luna").property("available"))
+        tap(root, chip)                                                                 # closed again
+        pump(250)
+        # Google keeps its connection state, but no quota control sits in the window
         # any more, and Google's pools are read by the backend only.
         self.assertEqual([], [i for i in visual_items(root) if str(i.objectName()).startswith(("providerDetails_", "googleQuota_"))])
         self.assertEqual(2, len(bridge.providers[2]["quota"]["groups"]))
         bridge.setChatProvider("google")
         self.assertEqual("claude", bridge.chatProvider)                                   # not selectable in any way
         # No Apply step: a chosen model is persisted at once, for the NEXT call.
-        self.invoke(root, "claudeModel_haiku", "chosen")
-        pump(100)
+        choose_model(root, "claude", "haiku")
         # The row applies the id the alias RESOLVES to (the "haiku" alias was answered by Sonnet live).
         self.assertEqual(("claude-haiku-4-5-20251001", None), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
-        self.assertEqual("Configured model: claude-haiku-4-5-20251001 · effort: Default", self.item(root, "configuredModelLine").property("text"))
+        # The configured model and effort are the composer's chips (no effort level: no Effort chip).
+        self.assertEqual("Haiku 4.5", shown_named(root, "modelMenuChip").property("currentName"))
+        self.assertEqual(("claude-haiku-4-5-20251001", ""), (bridge.modelCard["model"], bridge.modelCard["effort"]))
+        self.assertFalse([i for i in visual_items(root) if i.objectName() == "effortMenuChip" and i.isVisible()])
         self.model.reported, self.model.observed = {}, {}
+        resets = int(time.time()) + 2 * 3600
         def report(task):
             self.model.reported[task.id] = {"model": "claude-haiku-4-5-20251001", "input_tokens": 3, "output_tokens": 41}
             self.model.observed[task.id] = {"rate_limits": {"status": "allowed", "overage_status": "rejected", "using_overage": False,
-                                                            "windows": {"five_hour": {"utilization": 0.25, "resets_at": 1789482600}}}}
+                                                            "windows": {"five_hour": {"utilization": 0.25, "resets_at": resets}}}}
         self.model.on_complete = report
         self.model.provider = "anthropic"
         bridge.submitText("Merhaba")
         pump(300)
-        answered = self.item(root, "actualModelLine")
-        self.assertEqual(("Haiku 4.5", "claude-haiku-4-5-20251001"), (answered.property("value"), answered.property("note")))
-        # The quota bar carries what REMAINS, and the reset the provider named.
-        five_hour = self.item(root, "claudeQuota_five_hour")
-        self.assertEqual((75, "Current session (5 h)", True), (five_hour.property("remaining"), five_hour.property("label"),
-                                                               five_hour.property("visible")))
-        self.assertTrue(five_hour.property("resetText"))
-        self.assertIn("extra paid usage: off", self.item(root, "quotaLine").property("text"))
-        self.assertEqual("Last call tokens: 3 input · — cache read · — cache write · 41 output", self.item(root, "usageLine").property("text"))
-        self.invoke(root, "claudeModel_opus[1m]", "chosen")
-        pump(100)
+        open_usage_popover(root)
+        self.assertEqual("claude-haiku-4-5-20251001", usage_detail(root, "Model"))
+        # The session row carries what is USED (75 % remain), and the reset the provider named.
+        five_hour = shown_named(root, "usageRow_five_hour")
+        self.assertEqual(("25%", "Session limit"), (find(five_hour, "usageRowUsed").property("text"), find(five_hour, "usageRowTitle").property("text")))
+        self.assertTrue(find(five_hour, "usageRowReset").property("text").startswith("Resets in "))
+        self.assertEqual("Off", usage_detail(root, "Overage"))                          # extra paid usage: off
+        self.assertEqual("3 input · 41 output", usage_detail(root, "Tokens"))           # unreported kinds left out, not "—"
+        open_usage_popover(root)                                                        # a second click closes it
+        choose_model(root, "claude", "opus[1m]")
         self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
-        self.assertTrue(self.item(root, "claudeEffort").property("enabled"))
-        QMetaObject.invokeMethod(self.item(root, "claudeEffort"), "picked", Q_ARG(str, "max"))
+        effort = shown_named(root, "effortMenuChip")
+        self.assertTrue(effort.property("enabled"))
+        QMetaObject.invokeMethod(effort, "picked", Q_ARG(str, "max"))
         pump(100)
         self.assertEqual(("claude-opus-5[1m]", "max"), (self.store.load().settings.claude_model, self.store.load().settings.claude_effort))
 
     def test_choosing_codex_persists_routes_calls_there_and_changes_no_authority(self) -> None:
         bridge = self.bridge(task_proposal("code_analysis"))
         root = self.open_panel(bridge)
-        self.invoke(root, "providerRow_codex", "chosen")
+        open_usage_popover(root)                                                        # closed again
+        choose_model(root, "codex", "gpt-5.6-luna")                                    # one click: model AND provider
         self.assertEqual(("codex", "gpt-5.6-luna", "medium"), (bridge.chatProvider, bridge.codexModel, bridge.codexEffort))
         saved = json.loads(self.prefs_path.read_text(encoding="utf-8"))["chat"]
         self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium",
@@ -4419,10 +4477,14 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual("OPENAI", self.item(root, "brandName").property("text"))
         self.assertEqual("5.6 Luna", self.item(root, "modelMenuChip").property("currentName"))
         self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (bridge.modelCard["name"], bridge.modelCard["meta"]))
-        primary = self.item(root, "codexQuota_primary")
-        self.assertEqual((96, "5-hour window"), (primary.property("remaining"), primary.property("label")))
-        self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("note"))
-        self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value"))
+        open_usage_popover(root)
+        primary = shown_named(root, "usageRow_five_hour")
+        self.assertEqual(("4%", "Session limit"), (find(primary, "usageRowUsed").property("text"), find(primary, "usageRowTitle").property("text")))
+        self.assertEqual("Plan usage limits · Plus", shown_named(root, "usagePopoverTitle").property("text"))
+        # Codex does not report the answering model: no such line; the chip names what the call requests.
+        self.assertIsNone(usage_detail(root, "Model"))
+        self.assertEqual("gpt-5.6-luna · Listed by Codex - not tried yet", usage_detail(root, "ModelState"))
+        open_usage_popover(root)
         # Codex interprets the SAME request into the SAME gated task: approval and destination unchanged.
         self.codex.answers = [task_proposal("code_analysis")]
         bridge.submitText("Bu projeyi incele.")
@@ -4471,14 +4533,18 @@ class ProviderSelectionTests(UiTestCase):
                 patch.object(antigravity, "agy_executable", return_value="C:/Users/x/AppData/Local/agy/bin/agy.exe"), \
                 patch.object(subprocess, "Popen", side_effect=popen):
             root = self.window(bridge)
-            for _ in range(5):                                           # open / close the selector five times
-                open_model_panel(root)
+            chip = shown_named(root, "modelMenuChip")
+            menu = chip.findChild(QObject, "modelMenu")
+            for _ in range(5):                                           # open / close the selector (the Model menu) five times
+                tap(root, chip)
                 pump(200)
-                open_model_panel(root)
+                self.assertTrue(menu.property("visible"))
+                tap(root, chip)
                 pump(100)
             google = bridge.providers[2]
             self.assertEqual(("google", "unavailable", False), (google["id"], google["status"], "quota" in google))
-            self.assertEqual("Status unavailable - chat unavailable for safety", self.item(root, "providerRow_google").property("meta"))
+            # Status unavailable - chat unavailable for safety: never offered for selection.
+            self.assertEqual([], [i for i in visual_items(root) if str(i.objectName()).startswith("modelMenuRow_google")])
             self.assertEqual(("available", "available"), (bridge.providers[0]["status"], bridge.providers[1]["status"]))
             with patch.object(antigravity, "agy_executable", return_value=None):
                 bridge.refreshProviders(force=True)
@@ -4499,13 +4565,13 @@ class ProviderSelectionTests(UiTestCase):
         root = self.window(bridge)
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "medium")
-        open_model_panel(root)
+        self.assertEqual("5.6 Sol", shown_named(root, "modelMenuChip").property("currentName"))
+        open_usage_popover(root)
         settled(400, lambda: (
-            self.assertEqual("5.6 Sol", self.item(root, "codexModel_gpt-5.6-sol").property("title")),
-            self.assertIn("Listed by Codex - not tried yet", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
-            self.assertIn("gpt-5.6-sol", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),   # the canonical id stays visible
+            self.assertIn("Listed by Codex - not tried yet", usage_detail(root, "ModelState")),
+            self.assertIn("gpt-5.6-sol", usage_detail(root, "ModelState")),                       # the canonical id stays visible
         ))
-        open_model_panel(root)
+        open_usage_popover(root)
         pump(300)
         # A real failure: named provider, model and reason; no raw output; nothing falls back to Claude.
         self.codex.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.")
@@ -4515,12 +4581,12 @@ class ProviderSelectionTests(UiTestCase):
             self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"]),
             self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes)),
         ))
-        open_model_panel(root)
+        open_usage_popover(root)
         settled(400, lambda: (
-            self.assertIn("Failed this session: ", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
-            self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+            self.assertIn("Failed this session: ", usage_detail(root, "ModelState")),
+            self.assertIn("not available for your plan", usage_detail(root, "ModelState")),
         ))
-        open_model_panel(root)
+        open_usage_popover(root)
         pump(300)
         # The same model answering later is recorded as usable.
         self.codex.error, self.codex.answers = None, [proposal(kind="chat", reply="Merhaba! Ben JARVIS.")]
@@ -4528,9 +4594,9 @@ class ProviderSelectionTests(UiTestCase):
         settled(300, lambda: (
             self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState)),
         ))
-        open_model_panel(root)
+        open_usage_popover(root)
         settled(400, lambda: (
-            self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
+            self.assertIn("Answered this session", usage_detail(root, "ModelState")),
             self.assertEqual(0, len(self.model.calls)),
         ))
 
@@ -4575,13 +4641,19 @@ class ProviderCatalogUiTests(UiTestCase):
         root = self.window(again)                                         # start(): the one launch refresh
         self.assertEqual(["claude", "codex", "google"], sorted(pid for pid, _ in calls))
         calls.clear()
+        # G6MP1: the selector is the composer's Model menu (it refreshes on open); the
+        # route line lives in the usage popover.
+        chip = shown_named(root, "modelMenuChip")
+        menu = chip.findChild(QObject, "modelMenu")
         for _ in range(10):
-            open_model_panel(root)
+            tap(root, chip)
             pump(60)
-            self.assertTrue(root.property("modelOpen"))
-            self.assertEqual("Subscription route verified", self.item(root, "providerRow_claude").property("meta"))
-            open_model_panel(root)
+            self.assertTrue(menu.property("visible"))
+            tap(root, chip)
             pump(40)
+            open_usage_popover(root)
+            self.assertEqual("Subscription route verified", usage_detail(root, "Route"))
+            open_usage_popover(root)
         self.assertEqual([], calls)                                       # within the TTL: zero probe sets
         self.assertEqual(0, self.execute_calls())
 
@@ -4711,18 +4783,10 @@ class ModelMigrationUiTests(UiTestCase):
         bridge = self.bridge()
         self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])
         root = self.window(bridge)
-        open_model_panel(root)
-        pump(300)
-        self.click(root, "claudeModelField")
-        pump(200)
-        QMetaObject.invokeMethod(self.item(root, "claudeModel_claude-fable-5-1[1m]"), "chosen")
-        pump(150)
+        choose_model(root, "claude", "claude-fable-5-1[1m]")                       # G6MP1: the Model menu
         self.assertEqual("claude-fable-5-1[1m]", self.store.load().settings.claude_model)       # [1m] kept
         self.assertEqual(("", "claude-fable-5-1[1m]"), tuple(UiPreferences(self.prefs_path).data["chat"][k] for k in ("claude_lane", "claude_lane_model")))
-        self.click(root, "claudeModelField")
-        pump(200)
-        QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen")
-        pump(150)
+        choose_model(root, "claude", "opus[1m]")
         self.assertEqual("claude-opus-5-5[1m]", self.store.load().settings.claude_model)
         self.assertEqual("opus[1m]", UiPreferences(self.prefs_path).data["chat"]["claude_lane"])
 
@@ -5427,13 +5491,14 @@ class ModelCardTests(SurfaceCase):
         self.assertEqual("ANTHROPIC", self.item(root, "brandName").property("text"))
         self.assertTrue(self.item(root, "usageRing").property("visible"))
         self.assertEqual("8%", self.item(root, "usageRingText").property("text"))
-        open_model_panel(root)
+        open_usage_popover(root)                    # G6MP1: the bars are the usage popover's
         pump(400)
-        bar = self.item(root, "claudeQuota_five_hour")
-        self.assertEqual((92, True), (bar.property("remaining"), bar.property("exact")))
-        fill = self.item(root, "quotaFill")
+        row = shown_named(root, "usageRow_five_hour")
+        self.assertEqual("8%", find(row, "usageRowUsed").property("text"))         # 92 % remain: exactly as reported
+        fill = find(row, "usageRowBar")
         self.assertGreater(fill.width(), 0)
-        self.assertLess(fill.width(), self.item(root, "claudeQuota_five_hour").width())
+        self.assertLess(fill.width(), row.width())
+        self.assertAlmostEqual(0.08, fill.width() / fill.parentItem().width(), places=3)
 
 
 class ContextReferenceTests(SurfaceCase):
@@ -6008,21 +6073,26 @@ class ScrollOwnershipTests(SurfaceCase):
         # Pointer on the conversation: the conversation moves.
         self.wheel(root, feed)
         self.assertLess(feed.property("contentY"), 200)
-        # The model panel is open and the pointer is over it: the conversation stays put.
+        # G6MP1: the usage popover (the retired Model panel's information) is open and
+        # the pointer is over it: the conversation stays put.
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0))
         pump(200)
-        open_model_panel(root)
+        popover = usage_popover(root)
+        open_usage_popover(root)
         pump(400)
-        self.wheel(root, self.item(root, "modelSurface"))
+        self.wheel(root, self.item(root, "usageSurface"))
         self.assertEqual(200.0, feed.property("contentY"))
-        # Even a wheel turn over the dimmed area outside the panel stops there.
+        # A K4 menu surface has no dimmed area (the Model panel's scrim is gone with it):
+        # outside the open popover the wheel is the conversation's, under the pointer.
         self.wheel(root, self.item(root, "conversationFeed"))
-        self.assertEqual(200.0, feed.property("contentY"))
+        self.assertLess(feed.property("contentY"), 200)
+        QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0))
+        pump(200)
         # Closed again, the wheel belongs to the conversation once more: blocking
         # the wheel must not leave the surface holding it afterwards.
-        open_model_panel(root)
+        open_usage_popover(root)
         settled(600, lambda: (
-            self.assertFalse(self.item(root, "modelSurface").isVisible()),
+            self.assertFalse(popover.property("visible")),
         ))
         self.wheel(root, feed)
         self.assertLess(feed.property("contentY"), 200)
@@ -6124,12 +6194,13 @@ class FinalPolishTests(SurfaceCase):
         stack = self.item(root, "panelColumn")
         before = (work.x(), work.y(), work.width(), work.height(), stack.x(), stack.width())
         self.assertEqual((1107.0, 386.0), (work.width(), stack.width()))      # Gate 6F: after the sidebar; the stack unchanged
-        open_model_panel(root)
+        open_usage_popover(root)                                                # G6MP1: the Model panel's information
         pump(300)
-        model = self.item(root, "modelSurface")
+        model = self.item(root, "usageSurface")
         self.assertGreaterEqual(self.alpha(model), 0.94)                        # nothing behind reads through
         self.assertEqual(1, QQmlProperty.read(model, "border.width"))           # one principal edge
-        open_model_panel(root)
+        self.assertEqual(before, (work.x(), work.y(), work.width(), work.height(), stack.x(), stack.width()))
+        open_usage_popover(root)
         pump(300)
         self.click(root, "settingsOrb")
         pump(300)
@@ -6214,26 +6285,28 @@ class FinalPolishTests(SurfaceCase):
     def test_a_low_quota_is_amber_attention_never_red(self) -> None:
         bridge = self.bridge()
         bridge._claude_limits = {"seen_at": 10, "windows": {"five_hour": {"utilization": 0.08, "resets_at": 1789560046},
-                                                            "seven_day": {"utilization": 0.92, "resets_at": 1789814410}}}
+                                                            "seven_day": {"utilization": 0.92, "resets_at": int(time.time()) + 3 * 86400}}}
         bridge.applyModel("claude-sonnet-5", "")
         root = self.window(bridge)
-        open_model_panel(root)
+        open_usage_popover(root)
         pump(400)
-        five = self.item(root, "claudeQuota_five_hour")
-        week = self.item(root, "claudeQuota_seven_day")
-        self.assertEqual("#20c7f6", QColor(self.child(five, "quotaFill").property("color")).name())      # plenty: the accent
-        self.assertEqual("#ffb347", QColor(self.child(week, "quotaFill").property("color")).name())      # 8 % left: amber attention
-        self.assertEqual("#ffb347", QColor(self.child(week, "quotaValue").property("color")).name())
-        self.assertNotIn("#ff5c6c", [QColor(self.child(w, "quotaFill").property("color")).name() for w in (five, week)])
-        self.assertEqual("8% left", self.child(week, "quotaValue").property("text"))
-        self.assertEqual("·  " + week.property("resetText"), self.child(week, "quotaReset").property("text"))   # the reset, quieter, beside it
-        # The plan figure is the dominant value: the instrument numerals, the reset beneath.
-        fact = self.item(root, "claudePlanFactValue")
-        self.assertEqual(("Space Grotesk", 26), (fact.property("font").family(), fact.property("font").pixelSize()))
-        self.assertEqual("92% left", fact.property("text"))
-        self.assertEqual("#e8f4ff", QColor(fact.property("color")).name())
-        # The thin track: 3 px, no glow.
-        self.assertEqual(3, self.child(five, "quotaFill").height())
+        # G6MP1 (Salih 2026-10-10): the usage popover is a figure in ONE accent, never
+        # value-coloured - a 92 % used week is neither amber nor red.
+        five = shown_named(root, "usageRow_five_hour")
+        week = shown_named(root, "usageRow_weekly")
+        self.assertEqual("#20c7f6", QColor(self.child(five, "usageRowBar").property("color")).name())     # plenty: the accent
+        self.assertEqual("#20c7f6", QColor(self.child(week, "usageRowBar").property("color")).name())     # 8 % left: the same accent
+        self.assertNotIn(QColor(self.child(week, "usageRowUsed").property("color")).name(), ("#ffb347", "#ff5c6c"))
+        self.assertNotIn("#ff5c6c", [QColor(self.child(w, "usageRowBar").property("color")).name() for w in (five, week)])
+        self.assertEqual("92%", self.child(week, "usageRowUsed").property("text"))
+        self.assertEqual("8%", self.child(five, "usageRowUsed").property("text"))
+        # The reset, quieter, beside the figure (a past reset is not shown at all).
+        reset = self.child(week, "usageRowReset")
+        self.assertTrue(reset.isVisible())
+        self.assertFalse(self.child(five, "usageRowReset").isVisible())
+        self.assertLess(reset.mapToScene(QPointF(0, 0)).x(), self.child(week, "usageRowUsed").mapToScene(QPointF(0, 0)).x())
+        # The thin track: 5 px, no glow.
+        self.assertEqual(5, self.child(five, "usageRowBar").height())
 
     def test_compact_sizes_keep_the_meaningful_values_whole(self) -> None:
         from PySide6.QtGui import QFontDatabase
@@ -6272,35 +6345,35 @@ class FinalPolishTests(SurfaceCase):
     def test_focus_is_distinct_from_hover_and_selection(self) -> None:
         from PySide6.QtCore import QPointF
         bridge = self.bridge()
+        self.fake_providers(bridge, [{"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
+                                      "models": [{"id": "default", "name": "Default", "resolved": "claude-opus-5", "description": "", "efforts": []},
+                                                 {"id": "sonnet", "name": "Sonnet", "resolved": "claude-sonnet-5", "description": "", "efforts": []}]}])
         root = self.window(bridge)
-        open_model_panel(root)
-        pump(300)
-        field = self.item(root, "claudeModelField")
-        field.forceActiveFocus()
-        pump(100)
-        self.assertTrue(field.property("activeFocus"))
-        QTest.keyClick(root, Qt.Key_Space)
-        pump(300)  # the keyboard opens the list
-        self.assertTrue(field.property("open"))
-        row = self.item(root, "modelRowDefault")
-        self.assertTrue(row.property("selected"))
-        ring = [i for i in row.childItems() if i.metaObject().className().startswith("QQuickRectangle")
-                and QQmlProperty.read(i, "border.width") == 2]
-        self.assertEqual(1, len(ring))
-        self.assertFalse(ring[0].isVisible())                                   # selected alone shows no focus ring
+        # G6MP1: the model list is the composer's Model menu (K4 MenuRow states).
+        chip = shown_named(root, "modelMenuChip")
+        menu = chip.findChild(QObject, "modelMenu")
+        tap(root, chip)
+        wait_until(lambda: bool(menu.property("opened")), 600)
+        row = shown_named(root, "modelMenuRow_claude_default")
+        self.assertTrue(row.property("checked"))
+        self.assertEqual(0, QQmlProperty.read(row, "border.width"))             # selected alone shows no focus edge
         selected_fill = self.alpha(row)
         row.forceActiveFocus()
-        pump(100)
-        self.assertTrue(row.property("activeFocus"))
-        self.assertTrue(ring[0].isVisible())                                    # keyboard focus: the crisp 2 px outline
-        self.assertEqual(selected_fill, self.alpha(row))                        # focus does not repaint the selection
-        centre = row.mapToScene(QPointF(row.width() / 2, row.height() / 2)).toPoint()
-        QTest.mouseMove(root, centre)
         pump(200)
-        self.assertGreater(self.alpha(row), selected_fill)                      # hover: a small tonal lift on top
+        self.assertTrue(row.property("activeFocus"))
+        self.assertEqual(1, QQmlProperty.read(row, "border.width"))             # keyboard focus: the fine edge
+        self.assertTrue(row.property("checked"))                                # focus does not change the selection
+        other = shown_named(root, "modelMenuRow_claude_sonnet")
+        resting = self.alpha(other)
+        QTest.mouseMove(root, other.mapToScene(QPointF(other.width() / 2, other.height() / 2)).toPoint())
+        pump(250)
+        self.assertGreater(self.alpha(other), resting)                          # hover: a small tonal lift
+        self.assertEqual(0, QQmlProperty.read(other, "border.width"))           # hover is not the focus edge
+        self.assertGreaterEqual(self.alpha(row), selected_fill)
+        row.forceActiveFocus()
         QTest.keyClick(root, Qt.Key_Return)
-        pump(300)  # Return chooses and closes the list
-        self.assertFalse(field.property("open"))
+        pump(300)  # Return chooses and closes the menu
+        self.assertFalse(menu.property("visible"))
         self.assertFalse(self.store.load().settings.claude_model)
         self.assertEqual(0, self.execute_calls())
 
@@ -7322,8 +7395,8 @@ class PresentationTypographyTests(SurfaceCase):
             return found
 
         self.assertEqual([], not_native(), "home")
-        open_model_panel(root)
-        self.assertEqual([], not_native(), "model panel")
+        open_usage_popover(root)
+        self.assertEqual([], not_native(), "usage popover")
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
         for page in ("tasks", "history"):
@@ -7629,26 +7702,26 @@ class PrePolishTests(SurfaceCase):
              "quota": {"groups": [{"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]}},
             {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
-        open_model_panel(root)
+        open_usage_popover(root)                    # G6MP1: the retired Model panel's information
         pump(400)
         names = [str(i.objectName()) for i in self.all_items(root)]
         for gone in ("providerDetails_google", "modelField", "claudeAttachmentLine", "codexAttachmentLine"):
             self.assertNotIn(gone, names)
         self.assertFalse(any(n.startswith("googleQuota_") for n in names))
-        self.assertEqual("Available", self.item(root, "claudeResearchStateBadge").property("text"))
-        self.assertEqual("No Claude call yet", self.item(root, "actualModelLine").property("value"))
-        self.assertEqual("Not reported yet", self.item(root, "claudePlanFact").property("value"))
-        # The selector still works from the collapsed list, and the answering model is a fact.
-        self.click(root, "claudeModelField")
-        pump(300)
-        self.invoke(root, "claudeModel_sonnet", "chosen")
-        pump(200)
+        self.assertEqual("Available", usage_detail(root, "Research"))
+        self.assertIsNone(usage_detail(root, "Model"))                          # no Claude call yet
+        self.assertTrue(shown_named(root, "usageNone").isVisible())             # plan: not reported yet
+        open_usage_popover(root)
+        # The selector works from the Model menu, and the answering model is a fact.
+        choose_model(root, "claude", "sonnet")
         self.assertEqual("claude-sonnet-5", self.store.load().settings.claude_model)
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-luna", "low")
+        bridge.providersChanged.emit()              # the card follows the provider the way a refresh delivers it
+        open_usage_popover(root)
         settled(200, lambda: (
-            self.assertEqual("Unavailable", self.item(root, "codexResearchStateBadge").property("text")),
-            self.assertEqual("5.6 Luna", self.item(root, "codexActualModelLine").property("value")),
+            self.assertEqual("Unavailable", usage_detail(root, "Research")),
+            self.assertEqual("5.6 Luna", shown_named(root, "modelMenuChip").property("currentName")),
             # Google's quota is still retrieved - it just has no control here.
             self.assertEqual(1, len(bridge.providers[2]["quota"]["groups"])),
         ))
@@ -8385,7 +8458,8 @@ class TypographySystemTests(SurfaceCase):
 
     def surfaces(self, bridge, root):
         """Walk the app the way the screenshots do: conversation, rail peeks,
-        model panel, settings and the four full pages."""
+        the usage popover (G6MP1: the retired model panel's information),
+        settings and the four full pages."""
         seen = []
         bridge._say("user", "Bu projeyi incele.")
         bridge._say("jarvis", "İyiyim, teşekkürler! Sen nasılsın?", chat=True, telemetry={"elapsed_ms": 4800, "first_ms": 4200, "tokens": 14500})
@@ -8398,9 +8472,9 @@ class TypographySystemTests(SurfaceCase):
             seen += [("peek " + key,) + t for t in self.shown_texts(root)]
             QTest.keyClick(root, Qt.Key_Escape)
             pump(300)
-        for opener in ("modelPanel", "settingsOrb"):        # 6G U1: the model panel has no card opener
-            if opener == "modelPanel":
-                open_model_panel(root)
+        for opener in ("usagePopover", "settingsOrb"):      # G6MP1: the usage ring opens the popover
+            if opener == "usagePopover":
+                open_usage_popover(root)
             else:
                 self.click(root, opener)
             pump(400)

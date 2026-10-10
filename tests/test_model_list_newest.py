@@ -6,6 +6,9 @@ A. The pure rule (jarvis.model_retirement.newest_per_name): Salih's two live
    the selected model, and Codex's declared upgrades first.
 B. The window: the lists, the toggle (off at every launch, never written to
    ui-preferences.json), the "new version" hint and its one explicit click.
+   G6MP1 (Salih 2026-10-10): the Model panel is retired - the lists are the
+   composer's Model menu, the toggle its "More models ›", the hint the newer
+   version's own row there (chosen only by its click).
 C. Nothing else moved: the cache / provider lines stay complete and only the
    bridge and the rule know the rule.
 
@@ -19,14 +22,15 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QObject, QPointF
+from PySide6.QtQml import QQmlProperty
 
 from jarvis.model_retirement import codex_retirement, newest_per_name
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_projects_ui_6e import WindowCase as SixEWindowCase, settle
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.helpers import settled
-from tests.test_ui import UiTestCase, _APP, ambient_on, open_model_panel, pump
+from tests.test_ui import UiTestCase, _APP, ambient_on, open_usage_popover, pump, shown_named, tap
 
 EFFORTS = ["low", "medium", "high"]
 
@@ -138,6 +142,11 @@ class RuleTests(unittest.TestCase):
 
 
 class WindowCase(ProjectsUiCase):
+    """G6MP1 ("ModelPanel A", Salih 2026-10-10): the Model panel is retired; the
+    model selector is the composer's Model menu (G6CM1) - the newest version per
+    name in its list, the older ones under "More models ›" - and the panel's
+    usage information is the usage ring's popover."""
+
     def lines(self, claude=CLAUDE_LIVE, codex=CODEX_LIVE) -> list[dict]:
         return [{"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": "available", "research": True,
                  "models": [dict(m) for m in claude]},
@@ -148,9 +157,17 @@ class WindowCase(ProjectsUiCase):
         self.fake_providers(bridge, self.lines())
         bridge.setChatProvider(provider)
         root = self.window(bridge)
-        open_model_panel(root)
-        pump(400)
+        self.open_menu(root)
         return root
+
+    def open_menu(self, root) -> None:
+        self.chip = shown_named(root, "modelMenuChip")
+        self.menu = self.chip.findChild(QObject, "modelMenu")
+        self.more_menu = self.chip.findChild(QObject, "moreModelsMenu")
+        if not self.menu.property("visible"):
+            tap(root, self.chip)
+        settle(lambda: bool(self.menu.property("opened")))
+        self.assertTrue(self.menu.property("opened"))
 
     def every(self, root):
         found, stack = [], [root.contentItem()]
@@ -160,52 +177,60 @@ class WindowCase(ProjectsUiCase):
             stack.extend(node.childItems())
         return found
 
-    def listed(self, root, prefix: str) -> list[str]:
-        """The rows the panel builds (in catalog order)."""
-        named = [(i.mapToScene(QPointF(0, 0)).y(), str(i.objectName())[len(prefix):]) for i in self.every(root) if str(i.objectName()).startswith(prefix)]
-        return [name for _, name in sorted(named)]
+    def rows_in(self, popup, pid: str) -> list[str]:
+        """The model rows a menu lists for one provider (in list order), the CLI default row aside."""
+        prefix = f"modelMenuRow_{pid}_"
+        found, stack = [], [popup.property("contentItem")]
+        while stack:
+            node = stack.pop()
+            if str(node.objectName()).startswith(prefix) and node.isVisible():
+                found.append((node.mapToScene(QPointF(0, 0)).y(), str(node.objectName())[len(prefix):]))
+            stack.extend(node.childItems())
+        return [name for _, name in sorted(found) if name != "default"]
+
+    def listed(self, root, pid: str) -> list[str]:
+        """The newest list, plus the older ones while "More models" is open."""
+        return self.rows_in(self.menu, pid) + (self.rows_in(self.more_menu, pid) if self.more_menu.property("visible") else [])
+
+    def checked(self, root, pid: str) -> list[str]:
+        prefix = f"modelMenuRow_{pid}_"
+        return [str(i.objectName())[len(prefix):] for i in self.every(root)
+                if str(i.objectName()).startswith(prefix) and i.isVisible() and i.property("checked")]
 
     def shown(self, root, name: str):
-        """The visible one: the Claude and Codex blocks each own a hint and a toggle."""
         found = [i for i in self.every(root) if str(i.objectName()) == name and i.isVisible()]
         self.assertTrue(found, name)
         return found[0]
 
-    def invoke(self, root, name: str) -> None:
-        from PySide6.QtCore import QMetaObject
-        QMetaObject.invokeMethod(self.shown(root, name), "chosen")
-        pump(200)
+    def click_toggle(self, root, then=None) -> None:
+        """"More models ›": the older versions beside the menu (the retired panel's toggle)."""
+        tap(root, self.shown(root, "modelMenuMore"))
+        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
+            settled(260, then)
+        else:
+            pump(260)
 
 
 class WindowTests(WindowCase):
     def test_b_claude_list_shows_the_newest_and_the_toggle_shows_everything(self) -> None:
         bridge = self.bridge()
         root = self.open_panel(bridge)
-        self.assertEqual(["opus", "sonnet", "haiku", "claude-fable-5-1"], self.listed(root, "claudeModel_"))
+        self.assertEqual(["opus", "sonnet", "haiku", "claude-fable-5-1"], self.listed(root, "claude"))
         self.assertFalse(bridge.showOldModels)
         self.click_toggle(root)
-        self.assertTrue(bridge.showOldModels)
-        self.assertEqual(sorted(m["id"] for m in CLAUDE_LIVE if m["id"] != "default"), sorted(self.listed(root, "claudeModel_")))
+        self.assertTrue(self.more_menu.property("visible"))
+        self.assertFalse(bridge.showOldModels)                                   # a side menu, not a stored switch
+        self.assertEqual(sorted(m["id"] for m in CLAUDE_LIVE if m["id"] != "default"), sorted(self.listed(root, "claude")))
         self.click_toggle(root)
-        self.assertEqual(["opus", "sonnet", "haiku", "claude-fable-5-1"], self.listed(root, "claudeModel_"))
-
-    def click_toggle(self, root, then=None) -> None:
-        from PySide6.QtCore import QPointF, Qt
-        from PySide6.QtTest import QTest
-        item = self.shown(root, "showOldModelsToggle")
-        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint())
-        if then is not None:        # THIZ: the caller's assertions; one that holds at once keeps the old wait
-            settled(260, then)
-        else:
-            pump(260)
+        self.assertEqual(["opus", "sonnet", "haiku", "claude-fable-5-1"], self.listed(root, "claude"))
 
     def test_b_codex_list_shows_the_newest(self) -> None:
         bridge = self.bridge()
         root = self.open_panel(bridge, "codex")
         self.assertEqual(["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-terra", "gpt-daybreak-blue-latest"],
-                         self.listed(root, "codexModel_"))
+                         self.listed(root, "codex"))
         self.click_toggle(root)
-        self.assertEqual(sorted(CODEX_LIVE), sorted(self.listed(root, "codexModel_")))
+        self.assertEqual(sorted(CODEX_LIVE), sorted(self.listed(root, "codex")))
 
     def test_b_the_toggle_is_window_only_and_off_at_every_launch(self) -> None:
         bridge = self.bridge()
@@ -213,12 +238,13 @@ class WindowTests(WindowCase):
         bridge.setChatProvider("claude")
         before = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
         self.click_toggle(root, then=lambda: (
-            self.assertTrue(bridge.showOldModels),
+            self.assertTrue(self.more_menu.property("visible")),
         ))
         after = self.prefs_path.read_bytes() if self.prefs_path.exists() else None
         self.assertEqual(before, after)                                              # ui-preferences.json: byte-identical
         if after is not None:
             self.assertNotIn(b"old", after.lower())
+        self.assertFalse(bridge.showOldModels)
         relaunched = self.bridge()
         self.assertFalse(relaunched.showOldModels)
 
@@ -239,20 +265,24 @@ class WindowTests(WindowCase):
         pump(100)
         root = self.open_panel(bridge)
         self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)
-        self.assertIn("claude-opus-4-7", self.listed(root, "claudeModel_"))              # shown although older
-        hint = self.shown(root, "modelNewerHint")
-        self.assertTrue(hint.isVisible())
-        self.assertIn("New version: ", self.shown(root, "modelNewerHintText").property("text"))
-        self.assertIn("Opus", self.shown(root, "modelNewerHintText").property("text"))
+        self.assertEqual("Opus 4.7", self.chip.property("currentName"))
+        self.click_toggle(root)
+        self.assertIn("claude-opus-4-7", self.listed(root, "claude"))                   # shown although older ...
+        self.assertEqual(["claude-opus-4-7"], self.checked(root, "claude"))              # ... and still the selection
+        keeper = self.shown(root, "modelMenuRow_claude_opus")                            # the newer version, offered
+        self.assertEqual("Opus 5.5", keeper.property("label"))
+        self.assertFalse(keeper.property("checked"))
         pump(300)
         self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)    # never automatic
-        self.invoke(root, "modelNewerHint")
+        tap(root, keeper)
+        pump(200)
         settings = self.store.load().settings
         self.assertEqual("claude-opus-5-5", settings.claude_model)
         chat = __import__("json").loads(self.prefs_path.read_text(encoding="utf-8"))["chat"]
         self.assertEqual(("opus", "claude-opus-5-5"), (chat["claude_lane"], chat["claude_lane_model"]))   # the existing lane path
-        self.assertNotIn("claude-opus-4-7", self.listed(root, "claudeModel_"))
-        self.assertFalse([i for i in self.every(root) if str(i.objectName()) == "modelNewerHint" and i.isVisible()])
+        self.open_menu(root)
+        self.click_toggle(root)
+        self.assertEqual(["opus"], self.checked(root, "claude"))                       # the old one is no longer selected
 
     def test_b_a_selected_old_codex_model_stays_and_the_hint_selects_the_keeper_only_on_click(self) -> None:
         bridge = self.bridge()
@@ -260,23 +290,28 @@ class WindowTests(WindowCase):
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "high")
         root = self.window(bridge)
-        open_model_panel(root)
-        pump(400)
-        self.assertIn("gpt-5.6-sol", self.listed(root, "codexModel_"))
-        self.assertIn("6.1 Sol", self.shown(root, "modelNewerHintText").property("text"))
-        self.assertIn("New version: ", self.shown(root, "modelNewerHintText").property("text"))
+        self.open_menu(root)
+        self.click_toggle(root)
+        self.assertIn("gpt-5.6-sol", self.listed(root, "codex"))
+        self.assertEqual(["gpt-5.6-sol"], self.checked(root, "codex"))
+        keeper = self.shown(root, "modelMenuRow_codex_gpt-6.1-sol")
+        self.assertIn("6.1 Sol", keeper.property("label"))
         self.assertEqual("gpt-5.6-sol", bridge.codexModel)
-        self.invoke(root, "modelNewerHint")
+        tap(root, keeper)
+        pump(200)
         self.assertEqual(("gpt-6.1-sol", "high"), (bridge.codexModel, bridge.codexEffort))
-        self.assertNotIn("gpt-5.6-sol", self.listed(root, "codexModel_"))
+        self.open_menu(root)
+        self.assertEqual(["gpt-6.1-sol"], self.checked(root, "codex"))
 
     def test_b_no_hint_when_the_selection_is_current(self) -> None:
         bridge = self.bridge()
         root = self.open_panel(bridge)
-        self.assertFalse([i for i in self.every(root) if str(i.objectName()) == "modelNewerHint" and i.isVisible()])
+        self.click_toggle(root)
+        self.assertEqual([], [n for n in self.rows_in(self.more_menu, "claude") if n in self.checked(root, "claude")])
         bridge.applyModel("claude-opus-5-5", "", "opus")
         pump(100)
-        self.assertFalse([i for i in self.every(root) if str(i.objectName()) == "modelNewerHint" and i.isVisible()])
+        self.assertEqual(["opus"], self.checked(root, "claude"))                       # the selection is in the newest list
+        self.assertEqual([], [n for n in self.rows_in(self.more_menu, "claude") if n in self.checked(root, "claude")])
 
 
 class ScopeTests(unittest.TestCase):
@@ -294,18 +329,20 @@ class CatalogTests(UiTestCase):
         from jarvis.ui.i18n import localization, tx
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual("Eski modelleri göster", tx("ModelPanel", "Show older models"))
-        self.assertEqual("Yeni sürüm: %1", tx("ModelPanel", "New version: %1"))
+        # G6MP1: the retired panel's toggle is the Model menu's "More models", its default tag the menu's.
+        self.assertEqual("Daha fazla model", tx("ModelMenu", "More models"))
+        self.assertEqual("Varsayılan", tx("ModelMenu", "Default"))
 
     def test_e_the_effort_labels_are_turkish_and_nothing_else_moved(self) -> None:
         from jarvis.ui.i18n import localization, tx
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual(["düşük", "orta", "yüksek"], [tx("ModelPanel", w) for w in ("low", "medium", "high")])
-        self.assertEqual("Yeni sürüm: %1", tx("ModelPanel", "New version: %1"))      # the hint's own source is unchanged
+        self.assertEqual(["düşük", "orta", "yüksek"], [tx("EffortMenu", w) for w in ("low", "medium", "high")])
+        self.assertEqual("Daha fazla model", tx("ModelMenu", "More models"))           # the menu's own source is unchanged
 
 
-# -- Gate 6E, slice C6: the model panel (D27, Salih Q8 2026-10-03) --
+# -- Gate 6E, slice C6: the model panel (D27, Salih Q8 2026-10-03); G6MP1: its
+# selector is the composer's Model / Effort menus, its usage the usage popover --
 
 ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 CLAUDE_FIVE = [{"id": "default", "name": "Default", "resolved": "claude-opus-5-5", "efforts": ALL_EFFORTS},
@@ -326,9 +363,8 @@ class PolishTests(WindowCase):
         if size:
             root.resize(*size)
             pump(300)
-        open_model_panel(root)
-        pump(400)
         self.root = root
+        self.open_menu(root)
         return bridge, root
 
     def under(self, item, name) -> list:
@@ -368,27 +404,50 @@ class PolishTests(WindowCase):
         bridge.setLanguage("tr-TR")
         pump(300)
 
-    def label_of(self, segment) -> str:
-        return next(c.property("text") for c in segment.childItems() if isinstance(c.property("text"), str))
+    def effort_label(self, root) -> str:
+        return self.shown(root, "effortMenuChipLabel").property("text")
+
+    def open_effort(self, root):
+        """The Effort chip's popover: one stop per level on its track."""
+        chip = self.shown(root, "effortMenuChip")
+        pop = chip.findChild(QObject, "effortMenu")
+        pop.chip = chip
+        if self.menu.property("visible"):
+            tap(root, self.chip)
+            settle(lambda: not self.menu.property("visible"))
+        tap(root, chip)
+        settle(lambda: bool(pop.property("opened")))
+        return pop
+
+    def press_stop(self, root, index: int, count: int, then=None) -> None:
+        track = self.shown(root, "effortTrack")
+        at = track.mapToScene(QPointF((index + 0.5) * track.width() / count, track.height() / 2)).toPoint()
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, at)
+        if then is not None:
+            settled(260, then)
+        else:
+            pump(260)
 
     @ambient_on          # THIZ: it reads hover colours
     def test_f_the_hint_is_an_action_row_with_hover_focus_and_keys(self) -> None:
         from PySide6.QtCore import Qt
         bridge, root = self.stage(old=True)
-        hint = self.shown(root, "modelNewerHint")
-        text = self.shown(root, "modelNewerHintText")
-        self.assertEqual("↑ New version: Opus 5.5", text.property("text"))
+        # G6MP1: the newer version is the Model menu's row for it, offered beside the old selection.
+        hint = self.shown(root, "modelMenuRow_claude_opus")
+        self.assertEqual("Opus 5.5", hint.property("label"))
         self.assertTrue(hint.property("activeFocusOnTab"))
         # At rest it is text, not a box: nothing is filled. Hover lifts it (eased in).
         self.assertEqual(0.0, hint.property("color").alphaF())
         self.hover(hint)
-        settle(lambda: abs(hint.property("color").alphaF() - 0.05) < 0.003)
-        self.assertAlmostEqual(0.05, hint.property("color").alphaF(), places=2)
-        # Focus: the ring (only then).
-        self.assertFalse(self.under(hint, "modelRowFocusRing"))
+        settle(lambda: hint.property("color").alphaF() > 0.03)
+        self.assertGreater(hint.property("color").alphaF(), 0.03)
+        # Focus: the fine edge (only then).
+        self.assertEqual(0, QQmlProperty.read(hint, "border.width"))
         hint.forceActiveFocus()
         pump(60)
-        self.assertTrue(self.under(hint, "modelRowFocusRing"))
+        self.assertEqual(1, QQmlProperty.read(hint, "border.width"))
         # Return does what a click does: the keeper, and nothing before.
         self.assertEqual("claude-opus-4-7", self.store.load().settings.claude_model)
         self.key(Qt.Key_Return)
@@ -396,11 +455,8 @@ class PolishTests(WindowCase):
         # Space does the same, again from a fresh old selection.
         bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
         pump(100)
-        open_model_panel(root)
-        pump(300)                   # close and reopen: the panel re-reads the selection
-        open_model_panel(root)
-        pump(400)
-        hint = self.shown(root, "modelNewerHint")
+        self.open_menu(root)        # reopened: the menu re-reads the selection
+        hint = self.shown(root, "modelMenuRow_claude_opus")
         hint.forceActiveFocus()
         pump(60)
         self.key(Qt.Key_Space)
@@ -410,47 +466,70 @@ class PolishTests(WindowCase):
     def test_g_the_toggle_has_hover_focus_and_space(self) -> None:
         from PySide6.QtCore import Qt
         bridge, root = self.stage()
-        toggle = self.shown(root, "showOldModelsToggle")
+        toggle = self.shown(root, "modelMenuMore")
         self.assertTrue(toggle.property("activeFocusOnTab"))
         self.assertEqual(0.0, toggle.property("color").alphaF())
         self.hover(toggle)
-        settle(lambda: abs(toggle.property("color").alphaF() - 0.05) < 0.003)
-        self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)
-        self.assertFalse(self.under(toggle, "modelRowFocusRing"))
+        settle(lambda: toggle.property("color").alphaF() > 0.03)
+        self.assertGreater(toggle.property("color").alphaF(), 0.03)
+        self.assertEqual(0, QQmlProperty.read(toggle, "border.width"))
         toggle.forceActiveFocus()
         pump(60)
-        self.assertTrue(self.under(toggle, "modelRowFocusRing"))
-        self.assertFalse(bridge.showOldModels)
+        self.assertEqual(1, QQmlProperty.read(toggle, "border.width"))
+        self.assertFalse(self.more_menu.property("visible"))
         self.key(Qt.Key_Space)
-        self.assertTrue(bridge.showOldModels)
+        self.assertTrue(self.more_menu.property("visible"))
         self.key(Qt.Key_Space)
-        self.assertFalse(bridge.showOldModels)
-        self.key(Qt.Key_Return)                                   # Space only, like a check box
-        self.assertFalse(bridge.showOldModels)
+        settle(lambda: not self.more_menu.property("visible"))
+        self.assertFalse(self.more_menu.property("visible"))
+        self.key(Qt.Key_Return)                                   # a menu row: Return chooses it like Space (K4)
+        self.assertTrue(self.more_menu.property("visible"))
+        self.assertFalse(bridge.showOldModels)                    # nothing stored either way
 
     def test_h_effort_labels_are_turkish_for_the_three_levels_and_the_values_never_change(self) -> None:
         lines = self.lines(claude=CLAUDE_FIVE)
         bridge, root = self.stage(lines=lines)
-        labels = lambda prefix, values: [self.label_of(self.shown(root, prefix + v)) for v in values]  # noqa: E731
-        self.assertEqual(["low", "medium", "high", "xhigh", "max"], labels("claudeEffort_", ALL_EFFORTS))     # English as today
-        self.assertEqual("Default", self.label_of(self.shown(root, "claudeEffort_")))
+
+        def labels():
+            out = []
+            for value in ALL_EFFORTS:
+                bridge.applyModel("", value, "")
+                pump(60)
+                out.append(self.effort_label(root))
+            bridge.applyModel("", "", "")
+            pump(60)
+            return out
+        self.assertEqual(["low", "medium", "high", "xhigh", "max"], labels())        # English as today
+        pop = self.open_effort(root)
+        self.assertEqual("default", self.shown(root, "effortMenuTitle").property("text"))
+        tap(root, pop.chip)
+        settle(lambda: not pop.property("visible"))
         self.tr(bridge)
-        self.assertEqual(["düşük", "orta", "yüksek", "xhigh", "max"], labels("claudeEffort_", ALL_EFFORTS))
-        self.assertEqual("Varsayılan", self.label_of(self.shown(root, "claudeEffort_")))
+        self.assertEqual(["düşük", "orta", "yüksek", "xhigh", "max"], labels())
+        pop = self.open_effort(root)
+        self.assertEqual("varsayılan", self.shown(root, "effortMenuTitle").property("text"))
         # The picked value is the stored one, in every language.
         for value in ("high", "low", "xhigh"):
-            self.press(self.shown(root, "claudeEffort_" + value))
+            self.press_stop(root, ALL_EFFORTS.index(value), len(ALL_EFFORTS))
             self.assertEqual(value, self.store.load().settings.claude_effort)
             self.assertEqual(value, bridge.config["claude_effort"])
 
     def test_h_codex_effort_labels_and_values(self) -> None:
         bridge, root = self.stage("codex")
         self.tr(bridge)
-        self.assertEqual(["düşük", "orta", "yüksek"], [self.label_of(self.shown(root, "codexEffort_" + v)) for v in EFFORTS])
-        self.press(self.shown(root, "codexEffort_high"), then=lambda: (
+        found = []
+        for value in EFFORTS:
+            bridge.setCodexModel("gpt-6.1-sol", value)
+            pump(60)
+            found.append(self.effort_label(root))
+        self.assertEqual(["düşük", "orta", "yüksek"], found)
+        bridge.setCodexModel("gpt-6.1-sol", "medium")
+        pump(60)
+        self.open_effort(root)
+        self.press_stop(root, EFFORTS.index("high"), len(EFFORTS), then=lambda: (
             self.assertEqual("high", bridge.codexEffort),
         ))
-        self.press(self.shown(root, "codexEffort_low"), then=lambda: (
+        self.press_stop(root, EFFORTS.index("low"), len(EFFORTS), then=lambda: (
             self.assertEqual("low", bridge.codexEffort),
         ))
 
@@ -458,61 +537,63 @@ class PolishTests(WindowCase):
         for size in ((1100, 700), (1280, 760), (1920, 1080)):
             with self.subTest(size=size):
                 bridge, root = self.stage(size=size)
-                surface = self.shown(root, "modelSurface")
-                self.assertEqual(min(720, size[1] - surface.y() - 16), surface.height())
-                self.assertLessEqual(surface.y() + surface.height(), size[1] - 16)
-                self.assertLessEqual(surface.height(), 720)
-                scroll = self.shown(root, "modelPanelScroll")
-                self.assertLessEqual(scroll.mapToScene(QPointF(0, scroll.height())).y(), surface.y() + surface.height())
+                tap(root, self.chip)
+                settle(lambda: not self.menu.property("visible"))
+                open_usage_popover(root)                         # G6MP1: the retired panel's information
+                surface = self.shown(root, "usageSurface")
+                top = surface.mapToScene(QPointF(0, 0))
+                self.assertGreaterEqual(top.x(), 0)
+                self.assertGreaterEqual(top.y(), 0)
+                self.assertLessEqual(top.x() + surface.width(), size[0])
+                self.assertLessEqual(top.y() + surface.height(), size[1] - 8)
 
     def test_j_the_fade_shows_only_while_content_is_below(self) -> None:
+        # G6MP1: the popover has no scrolling list, so no fade: every line it holds
+        # is inside its surface at the smallest window.
         bridge, root = self.stage(size=(1100, 700))
-        scroll = self.shown(root, "modelPanelScroll")
-        fade = lambda: [f for f in self.under(root.contentItem(), "modelPanelFade") if f.property("opacity") > 0]  # noqa: E731
-        self.assertEqual(24, self.under(root.contentItem(), "modelPanelFade")[0].height())
-        self.assertGreater(scroll.property("contentHeight"), scroll.height())
-        self.assertTrue(fade())                                                       # at the top, more below
-        end = scroll.property("contentHeight") - scroll.height()
-        scroll.setProperty("contentY", end)
-        settle(lambda: not fade())
-        self.assertFalse(fade())                                                      # at the end, nothing below
-        scroll.setProperty("contentY", end / 2)
-        settle(lambda: bool(fade()))
-        self.assertTrue(fade())
-        scroll.setProperty("contentHeight", scroll.height() - 10)                     # content that fits: no fade at all
-        scroll.setProperty("contentY", 0)
-        settle(lambda: not fade())
-        self.assertFalse(fade())
+        bridge._claude_limits = {"seen_at": int(time.time()), "overage_status": "rejected", "windows": {
+            "five_hour": {"utilization": 0.2, "resets_at": int(time.time()) + 3600},
+            "seven_day": {"utilization": 0.5, "resets_at": int(time.time()) + 86400 * 3},
+            "seven_day_opus": {"utilization": 0.1, "resets_at": int(time.time()) + 86400 * 3}}}
+        bridge.providersChanged.emit()
+        tap(root, self.chip)
+        settle(lambda: not self.menu.property("visible"))
+        open_usage_popover(root)
+        surface = self.shown(root, "usageSurface")
+        bottom = surface.mapToScene(QPointF(0, surface.height())).y()
+        lines = [i for i in self.every(root) if str(i.objectName()).startswith(("usageRow_", "usageDetail", "usageFootnote")) and i.isVisible()]
+        self.assertGreaterEqual(len(lines), 6)
+        for line in lines:
+            self.assertLessEqual(line.mapToScene(QPointF(0, line.height())).y(), bottom + 0.5, line.objectName())
+        self.assertFalse(self.under(root.contentItem(), "modelPanelFade"))
 
     @ambient_on          # THIZ: its subject is motion
     def test_k_motion_follows_the_tokens_and_ambient_off_is_instant(self) -> None:
         bridge, root = self.stage(old=True, size=(1100, 700))
-        scroll = self.shown(root, "modelPanelScroll")
-        fade = self.under(root.contentItem(), "modelPanelFade")[0]
-        end = scroll.property("contentHeight") - scroll.height()
-        scroll.setProperty("contentY", end)
-        settle(lambda: not fade.property("visible"))
-        samples = SixEWindowCase.motion(self, root, fade)
+        tap(root, self.chip)
+        settle(lambda: not self.menu.property("visible"))
+        samples = SixEWindowCase.motion(self, root, self.menu)
         mark, called = len(samples), time.monotonic()
-        scroll.setProperty("contentY", 0)                                             # more below again: fades in over hoverMs
-        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, True, 110)
+        tap(root, self.chip)                                                         # opens over panelIn
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, True, 170)
         mark, called = len(samples), time.monotonic()
-        scroll.setProperty("contentY", end)
-        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, False, 110)
+        tap(root, self.chip)                                                         # closes over panelOut
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, False, 140)
         # Hover lifts follow hoverMs too: the end state is held once reached.
-        hint = self.shown(root, "modelNewerHint")
+        self.open_menu(root)
+        hint = self.shown(root, "modelMenuRow_claude_opus")
         self.hover(hint)
-        settle(lambda: abs(hint.property("color").alphaF() - 0.05) < 0.003)
+        settle(lambda: hint.property("color").alphaF() > 0.03)
         # Ambient effects off: every one of them at once.
         bridge.setAmbientEffects(False)
         pump(100)
-        toggle = self.shown(root, "showOldModelsToggle")
+        toggle = self.shown(root, "modelMenuMore")
         self.assertEqual(0.0, toggle.property("color").alphaF())
         self.hover(toggle)
-        self.assertAlmostEqual(0.05, toggle.property("color").alphaF(), places=2)    # one pump, no animation
-        scroll.setProperty("contentY", 0)
+        self.assertGreater(toggle.property("color").alphaF(), 0.03)                  # one pump, no animation
+        tap(root, self.chip)
         pump(10)
-        self.assertEqual(1.0, fade.property("opacity"))
-        scroll.setProperty("contentY", end)
+        self.assertFalse(self.menu.property("visible"))                             # closed at once
+        tap(root, self.chip)
         pump(10)
-        self.assertEqual((0.0, False), (fade.property("opacity"), fade.property("visible")))
+        self.assertEqual((True, 1.0), (self.menu.property("visible"), self.menu.property("opacity")))

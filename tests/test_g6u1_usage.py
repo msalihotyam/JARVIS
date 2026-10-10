@@ -5,9 +5,10 @@ self-contained components (placement is part B).
   colour whatever the value; nothing reported -> an empty ring and "–"; the
   halo turns only with ambient effects on; a mouse click opens / closes the
   popover; a HoverTip.
-* U3: "Plan usage limits · <provider>", one row per REPORTED window (used %,
-  reset as a human time, bar); a window not reported is not drawn, none
-  reported says so. No context-window block (V2.1).
+* U3: "Plan usage limits · <plan>" (G6MP1: the plan, only when reported, in
+  place of the provider), one row per REPORTED window (used %, reset, bar); a
+  window not reported is not drawn, none reported says so. No context-window
+  block (V2.1). The reshaped popover itself: tests/test_g6mp1.py.
 
 No test opens the live DB or makes a live call.
 """
@@ -19,13 +20,12 @@ from datetime import datetime, timedelta
 from tests.test_ui import _APP, pump  # noqa: F401 - the offscreen platform and the application
 
 import shiboken6  # noqa: E402
-from PySide6.QtCore import QObject, QPointF, Qt, QUrl  # noqa: E402
+from PySide6.QtCore import QDateTime, QLocale, QObject, QPointF, Qt, QUrl  # noqa: E402
 from PySide6.QtQml import QQmlComponent, QQmlEngine  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
 from jarvis.ui import i18n  # noqa: E402
 from jarvis.ui.typography import FONT_DIR  # noqa: E402
-from jarvis.ui.wording import human_date  # noqa: E402
 
 COMPONENTS = FONT_DIR.parent / "components"
 SHEET = b"""
@@ -153,7 +153,7 @@ class PopoverTests(UsageCase):
         super().setUp()
         self.now = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
         self.pop.setProperty("now", self.now.timestamp() * 1000)
-        self.ring.setProperty("provider", "Anthropic")
+        self.ring.setProperty("limits", {"plan": "Max (5x)"})      # G6MP1: the plan, not the provider
         self.five = int((self.now + timedelta(hours=2, minutes=30)).timestamp())
         self.week = int((self.now + timedelta(days=3, hours=-1)).timestamp())
         self.both = [{"window": "five_hour", "remaining": 72, "resets_at": self.five},
@@ -162,12 +162,12 @@ class PopoverTests(UsageCase):
     def test_both_one_and_no_windows_reported(self) -> None:
         self.ring.setProperty("rows", self.both)
         self.open_popover()
-        self.assertEqual("Plan usage limits · Anthropic", self.named("usagePopoverTitle", self.pop.property("contentItem")).property("text"))
+        self.assertEqual("Plan usage limits · Max (5x)", self.named("usagePopoverTitle", self.pop.property("contentItem")).property("text"))
         self.assertEqual({"usageRow_five_hour", "usageRow_weekly"}, self.rows_shown())
         self.assertEqual("28%", self.text_in("usageRow_five_hour", "usageRowUsed").property("text"))
         self.assertEqual("59%", self.text_in("usageRow_weekly", "usageRowUsed").property("text"))
-        self.assertEqual("5-hour session", self.text_in("usageRow_five_hour", "usageRowTitle").property("text"))
-        self.assertEqual("Weekly", self.text_in("usageRow_weekly", "usageRowTitle").property("text"))
+        self.assertEqual("Session limit", self.text_in("usageRow_five_hour", "usageRowTitle").property("text"))
+        self.assertEqual("Weekly · all models", self.text_in("usageRow_weekly", "usageRowTitle").property("text"))
         bar = self.text_in("usageRow_weekly", "usageRowBar")
         self.assertAlmostEqual(0.59, bar.width() / bar.parentItem().width(), places=3)
         none = self.named("usageNone", self.pop.property("contentItem"))
@@ -191,8 +191,10 @@ class PopoverTests(UsageCase):
     def test_reset_times_read_as_human_times_and_a_missing_reset_is_hidden(self) -> None:
         self.ring.setProperty("rows", self.both)
         self.open_popover()
-        self.assertEqual("Resets today 12:30", self.text_in("usageRow_five_hour", "usageRowReset").property("text"))
-        self.assertEqual("Resets " + human_date(self.week, self.now, "en_US", "time"),
+        # G6MP1: under a day a countdown from the popover's clock, later the weekday and time.
+        self.pop.setProperty("now", self.now.timestamp() * 1000)
+        self.assertEqual("Resets in 2 h 30 min", self.text_in("usageRow_five_hour", "usageRowReset").property("text"))
+        self.assertEqual("Resets " + QLocale("en_US").toString(QDateTime.fromSecsSinceEpoch(self.week), "ddd HH:mm"),
                          self.text_in("usageRow_weekly", "usageRowReset").property("text"))
         self.ring.setProperty("rows", [dict(self.both[0], resets_at=0)])
         pump(10)
@@ -203,11 +205,12 @@ class PopoverTests(UsageCase):
         self.ring.setProperty("rows", self.both)
         self.open_popover()
         body = self.pop.property("contentItem")
-        self.assertEqual("Plan kullanım limitleri · Anthropic", self.named("usagePopoverTitle", body).property("text"))
-        self.assertEqual("5 saatlik oturum", self.text_in("usageRow_five_hour", "usageRowTitle").property("text"))
-        self.assertEqual("Haftalık", self.text_in("usageRow_weekly", "usageRowTitle").property("text"))
+        self.pop.setProperty("now", self.now.timestamp() * 1000)
+        self.assertEqual("Plan kullanım sınırları · Max (5x)", self.named("usagePopoverTitle", body).property("text"))
+        self.assertEqual("Oturum sınırı", self.text_in("usageRow_five_hour", "usageRowTitle").property("text"))
+        self.assertEqual("Haftalık · tüm modeller", self.text_in("usageRow_weekly", "usageRowTitle").property("text"))
         self.assertEqual("%28", self.text_in("usageRow_five_hour", "usageRowUsed").property("text"))
-        self.assertEqual("Sıfırlanma: bugün 12:30", self.text_in("usageRow_five_hour", "usageRowReset").property("text"))
+        self.assertEqual("2 sa 30 dk sonra sıfırlanır", self.text_in("usageRow_five_hour", "usageRowReset").property("text"))
         self.assertEqual("%28", self.named("usageRingText").property("text"))
         tip = [c for c in self.ring.childItems() if "HoverTip" in c.metaObject().className()][0]
         self.assertEqual("5 saatlik kullanım %28 · ayrıntılar", tip.property("text"))

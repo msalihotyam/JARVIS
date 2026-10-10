@@ -9,13 +9,14 @@ import "../theme"
 // (a documented K2 rhythm, tests/test_motion_6g.py); with ambient effects off
 // it stands still. A click opens and closes the usage popover (U3).
 //
-// Bridge-independent: `provider` and `rows` (UsagePopover's shape) are plain
-// inputs; `usedPct` (0-100 or null) defaults to the rows' 5-hour window.
+// Bridge-independent: `limits` (bridge.usageLimits' shape) is a plain input;
+// `rows` (UsagePopover's shape) defaults to its rows and `usedPct` (0-100 or
+// null) to the rows' 5-hour window.
 Item {
     id: ring
     objectName: "usageRing"
-    property string provider: ""
-    property var rows: []
+    property var limits: ({})
+    property var rows: limits.rows || []
     property var usedPct: pop.used("five_hour")
 
     readonly property bool reported: typeof usedPct === "number" && isFinite(usedPct)
@@ -90,7 +91,7 @@ Item {
     UsagePopover {
         id: pop
         trigger: ring
-        provider: ring.provider; rows: ring.rows
+        rows: ring.rows; plan: ring.limits.plan || ""; details: ring.limits
         restY: -height - 8; x: ring.width - width
     }
 }
