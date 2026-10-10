@@ -62,6 +62,31 @@ class FakeClaude:
         return next(a for a in reversed(self.agents) if a.get("name") == name)
 
 
+class FakeProcs:
+    """Fake process API: a snapshot {pid: (ppid, exe)}, creation times, recorded priority calls."""
+
+    def __init__(self):
+        self.procs = {}  # pid -> (ppid, exe, created)
+        self.set = []  # (pid, class) calls
+        self.fail = set()  # pids whose set_priority raises
+        self.tree_error = None
+
+    def tree(self):
+        if self.tree_error:
+            raise self.tree_error
+        return {p: (pp, exe) for p, (pp, exe, _) in self.procs.items()}
+
+    def created(self, pid):
+        if pid not in self.procs:
+            raise OSError("gone")
+        return self.procs[pid][2]
+
+    def set_priority(self, pid, cls):
+        if pid in self.fail:
+            raise OSError("denied")
+        self.set.append((pid, cls))
+
+
 MAIN = "1234567" + "a" * 33  # local main (the approved sha)
 ORIGIN = "b" * 40  # origin/main, its parent
 SCHEMA = "X = 1\nSCHEMA_VERSION = 10\n"
@@ -122,6 +147,8 @@ class Base(unittest.TestCase):
         self.git = FakeGit()
         self.free = 100e9
         self.memory = (64.0, 20.0)  # (free GB, commit %): never the real machine's memory
+        self.idle = 0.0  # user idle seconds: never the real machine's input
+        self.procs = FakeProcs()  # never the real machine's processes
         self.t = float(int(time.time()))
         self.pushes = []
         self.key = ""  # reader off by default; never the real key lookup (env/registry)
@@ -131,7 +158,7 @@ class Base(unittest.TestCase):
                           send=lambda text: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
-                          mem=lambda: self.memory)
+                          mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs)
         self.base = self.root / "build" / "conveyor"
 
     def fake_disk(self, path):
@@ -426,7 +453,7 @@ class TestInbox(Base):
         s = self.status()
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
-                                  "memory_hold", "memory", "lanes",
+                                  "memory_hold", "memory", "presence", "lanes",
                                   "backlog", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
@@ -1252,6 +1279,229 @@ class TestMemoryGuard(Base):
             self.assertTrue(0 <= m[1] <= 100)
 
 
+class TestPresence(Base):
+    """CONV6 presence modes: fake idle source, fake process API, fixed clock."""
+
+    def passes(self, n, step=60):
+        for _ in range(n):
+            self.c.pass_once()
+            self.t += step
+
+    def go_away(self):
+        self.idle = 600
+        self.passes(3)  # pending at +0, still held at +60, counts at +120
+        self.assertEqual(self.c.presence, "away")
+
+    def pace(self, **kw):
+        (self.base / "pace.json").write_text(json.dumps(kw), encoding="utf-8")
+
+    def test_thresholds_and_hysteresis(self):
+        self.c.pass_once()
+        self.assertEqual(self.status()["presence"], {"state": "present", "idle_s": 0})
+        self.idle = 599  # under away_after_min 10
+        self.passes(4)
+        self.assertEqual(self.c.presence, "present")
+        self.idle = 600
+        self.passes(2)  # held 60 s: not yet
+        self.assertEqual(self.c.presence, "present")
+        self.c.pass_once()  # held 120 s
+        self.assertEqual(self.status()["presence"]["state"], "away")
+        self.assertEqual(self.status()["pace"]["presence"], "away")
+        self.assertEqual([e["state"] for e in self.events() if e["event"] == "presence"], ["away"])
+        self.t += 60
+        self.idle = 300  # between the thresholds: unchanged
+        self.passes(4)
+        self.assertEqual(self.c.presence, "away")
+        self.idle = 10  # input: pending present
+        self.passes(1)
+        self.idle = 70  # no input for a minute: the pending change is dropped
+        self.passes(1)
+        self.idle = 5
+        self.passes(2)
+        self.assertEqual(self.c.presence, "away")  # only 60 s held since the restart
+        self.passes(1)
+        self.assertEqual(self.c.presence, "present")
+        self.assertEqual([e["state"] for e in self.events() if e["event"] == "presence"],
+                         ["away", "present"])
+
+    def test_away_after_min_from_pace_json(self):
+        self.pace(away_after_min=5)
+        self.idle = 300
+        self.passes(3)
+        self.assertEqual(self.c.presence, "away")
+
+    def test_idle_unavailable_is_present_logged_once(self):
+        for src in (lambda: None, mock.Mock(side_effect=OSError("x"))):
+            self.c.idle = src
+            self.c.presence = "away"
+            self.passes(3)
+            self.assertEqual(self.c.presence, "present")
+            self.assertIsNone(self.status()["presence"]["idle_s"])
+        self.assertEqual([e["event"] for e in self.events()].count("presence_unknown"), 1)
+
+    def test_lanes_per_presence(self):
+        for i in range(7):
+            self.drop(f"{i}.md", HDR.format(f"L{i}"))
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 3)  # lanes_present default
+        self.assertEqual(self.status()["pace"]["max_lanes"], 3)
+        self.go_away()
+        self.assertEqual(len(self.fake.bg_calls()), 5)  # lanes_away default
+        self.assertEqual(self.status()["pace"]["max_lanes"], 5)
+
+    def test_lanes_present_away_from_pace_json_and_max_lanes_override(self):
+        self.pace(lanes_present=2, lanes_away=9)
+        self.c.pass_once()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)
+        self.go_away()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 6)  # clamped to MAX_LANES_CAP
+        self.pace(lanes_present=2, lanes_away=4, max_lanes=1)
+        self.c.pass_once()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 1)  # a hand-set max_lanes wins
+
+    def test_away_still_under_memory_guard_and_paced_bands(self):
+        self.go_away()
+        self.memory = (1.0, 20.0)
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(self.status()["pace"]["band"], "memory hold")
+        self.memory = (64.0, 20.0)
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400))
+        (self.root / "build" / "ledger").mkdir(parents=True)
+        row = {"end": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.t)),
+               "seven_day": {"start": 55, "end": 55}}
+        (self.root / "build" / "ledger" / "slices.jsonl").write_text(json.dumps(row) + "\n")
+        self.c.pass_once()
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)  # band +7 caps away's 5
+
+    def own_tree(self):
+        """L1's session (pid 101) with a child and grandchild; a pid-reuse orphan claiming
+        101 as parent; an unrelated process; another claude session not started here."""
+        self.drop("a.md", HDR.format("L1"))
+        self.c.pass_once()
+        self.procs.procs = {101: (1, "claude.exe", 1000), 500: (101, "bash.exe", 1001),
+                            501: (500, "python.exe", 1002), 502: (101, "node.exe", 999),
+                            900: (7, "vlc.exe", 5), 300: (1, "claude.exe", 10),
+                            301: (300, "bash.exe", 11)}
+        self.fake.agents.append({"id": "ffffffff", "pid": 300, "name": "OTHER", "kind": "background",
+                                 "status": "busy", "state": "working"})
+
+    def test_priority_only_own_tree(self):
+        self.own_tree()
+        self.c.pass_once()
+        below, normal = conveyor.BELOW_NORMAL, conveyor.NORMAL
+        self.assertEqual(sorted(self.procs.set), [(101, below), (500, below), (501, below)])
+        self.c.pass_once()  # same pid, same presence: not re-applied
+        self.assertEqual(len(self.procs.set), 3)
+        self.procs.set = []
+        self.go_away()
+        self.assertEqual(sorted(self.procs.set), [(101, normal), (500, normal), (501, normal)])
+        self.procs.set = []
+        self.idle = 0
+        self.passes(3)
+        self.assertEqual(sorted(self.procs.set), [(101, below), (500, below), (501, below)])
+
+    def test_priority_new_dispatch_and_respawned_pid(self):
+        self.own_tree()
+        self.c.pass_once()
+        self.drop("b.md", HDR.format("L2"))
+        self.c.pass_once()  # dispatched: pid 102 known from the next listing
+        self.procs.procs[102] = (1, "claude.exe", 2000)
+        self.procs.set = []
+        self.c.pass_once()
+        self.assertEqual(self.procs.set, [(102, conveyor.BELOW_NORMAL)])
+        self.fake.agent("L1")["pid"] = 103  # respawned session, new pid
+        self.procs.procs[103] = (1, "claude.exe", 3000)
+        self.procs.set = []
+        self.c.pass_once()
+        self.assertEqual(self.procs.set, [(103, conveyor.BELOW_NORMAL)])
+
+    def test_priority_not_claude_exe_is_untouched(self):
+        self.own_tree()
+        self.procs.procs[101] = (1, "notepad.exe", 1000)  # pid reused by something else
+        self.c.pass_once()
+        self.assertEqual(self.procs.set, [])
+
+    def test_priority_failure_logged_never_fatal_not_retried(self):
+        self.own_tree()
+        self.procs.fail = {500}
+        self.c.pass_once()
+        self.assertEqual(sorted(self.procs.set),
+                         [(101, conveyor.BELOW_NORMAL), (501, conveyor.BELOW_NORMAL)])
+        (ev,) = [e for e in self.events() if e["event"] == "priority"]
+        self.assertEqual(ev["failed"], ["500: OSError"])
+        self.c.pass_once()
+        self.assertEqual(len([e for e in self.events() if e["event"] == "priority"]), 1)
+        self.procs.tree_error = OSError("snapshot")
+        self.go_away()
+        self.assertTrue([e for e in self.events() if e["event"] == "priority_error"])
+        self.assertIsNone(self.status()["last_error"])
+        self.c.procs = None  # off Windows
+        self.idle = 0
+        self.passes(3)
+        self.assertEqual(len([e for e in self.events() if e["event"] == "priority_error"]), 2)
+
+    def lc_calls(self):
+        return [c for c in self.git.calls if c[0] == "LC.exe"]
+
+    def test_power_switch_off_by_default(self):
+        self.c.pass_once()
+        cfg = json.loads((self.base / "pace.json").read_text(encoding="utf-8"))
+        self.assertEqual((cfg["power_switch"], cfg["power_switch_cmd"]), (False, []))
+        self.go_away()
+        self.assertEqual([c for c in self.git.calls if c[0] != "git"], [])
+        self.assertNotIn("power_switch", [e["event"] for e in self.events()])
+
+    def test_power_switch_once_per_change(self):
+        self.pace(power_switch=True, power_switch_cmd=["LC.exe", "--activate", "{plan}"])
+        self.git.fail[("LC.exe",)] = (0, "ok")
+        self.passes(3)
+        self.assertEqual(self.lc_calls(), [])  # starting present is not a change
+        self.go_away()
+        self.passes(3)
+        self.assertEqual(self.lc_calls(), [["LC.exe", "--activate", "JarvisFocus"]])
+        self.idle = 0
+        self.passes(3)
+        self.assertEqual(self.lc_calls()[1:], [["LC.exe", "--activate", "JarvisWatch"]])
+
+    def test_power_switch_failure_attention_no_retry(self):
+        self.pace(power_switch=True, power_switch_cmd=["LC.exe", "--activate", "{plan}"])
+        self.git.fail[("LC.exe",)] = (3, "refused")
+        self.go_away()
+        self.passes(5)
+        self.assertEqual(len(self.lc_calls()), 1)
+        (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.POWER_SWITCH_ID]
+        self.assertIn("away: rc=3", item["reason"])
+        self.git.fail[("LC.exe",)] = (0, "ok")
+        self.idle = 0
+        self.passes(3)
+        self.assertEqual(len(self.lc_calls()), 2)
+        self.assertNotIn(conveyor.POWER_SWITCH_ID, [a["id"] for a in self.status()["attention"]])
+
+    def test_power_switch_missing_exe(self):
+        self.pace(power_switch=True, power_switch_cmd=["missing.exe", "{plan}"])
+        calls = []
+
+        def cmd(args, timeout=120):
+            if args[0] == "missing.exe":
+                calls.append(args)
+                raise FileNotFoundError("missing.exe")
+            return self.git(args, timeout)
+        self.c.cmd = cmd
+        self.go_away()
+        self.passes(3)
+        self.assertEqual(len(calls), 1)
+        (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.POWER_SWITCH_ID]
+        self.assertIn("FileNotFoundError", item["reason"])
+
+    def test_power_switch_without_cmd_is_invalid(self):
+        for cfg in ({"power_switch": True}, {"power_switch": "yes"},
+                    {"power_switch_cmd": "LC.exe"}, {"lanes_away": "5"}, {"away_after_min": 0}):
+            self.pace(**cfg)
+            self.c.pass_once()
+            self.assertIn(conveyor.PACE_BAD_ID, [a["id"] for a in self.status()["attention"]], cfg)
+
 class TestOneIntegrationLane(Base):
     def test_second_inbox_int_waits(self):
         (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
@@ -1849,7 +2099,8 @@ class TestCleanup(Base):
 
     def test_ledger_prefers_scripts_copy(self):
         c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk,
-                     projects=self.root / "projects", mem=lambda: self.memory)
+                     projects=self.root / "projects", mem=lambda: self.memory,
+                     idle=lambda: self.idle, procs=self.procs)
         mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
               "    Path(out).write_text('{}')\n"
         (self.root / "scripts").mkdir()

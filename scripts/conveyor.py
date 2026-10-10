@@ -45,10 +45,20 @@ BACKLOG_BAD_ID = "backlog-invalid"  # attention id of invalid backlog entries (o
 CRASH_PAGE = 3
 # Pace governor (Salih 2026-10-10): pace only via how many lanes run, never via model/effort.
 # build/conveyor/pace.json, re-read every pass; the orchestrator may edit it by hand.
+# "max_lanes" is not a default: when present it overrides lanes_present / lanes_away (CONV6).
 PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
-                 "reset_alert_pct": 95, "full_burn_limit_pct": 98,
-                 "max_lanes": MAX_LANES, "min_free_mem_gb": 3.0}
-MAX_LANES_CAP = 6  # pace.json max_lanes is clamped to 1..MAX_LANES_CAP
+                 "reset_alert_pct": 95, "full_burn_limit_pct": 98, "min_free_mem_gb": 3.0,
+                 "lanes_present": MAX_LANES, "lanes_away": 5, "away_after_min": 10,
+                 "power_switch": False, "power_switch_cmd": []}
+MAX_LANES_CAP = 6  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
+# Presence modes (CONV6, LaptopControl v1.3 plan Phase A): user idle time picks present/away.
+PRESENT_IDLE_S = 60  # idle under this: present (away: idle >= pace.json away_after_min)
+PRESENCE_HOLD_S = 120  # hysteresis: the new state must hold this long before it counts
+BELOW_NORMAL, NORMAL = 0x4000, 0x20  # Windows priority classes of the conveyor's own lanes
+PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
+POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
+POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
+SESSION_EXE = "claude.exe"  # a lane's session pid is touched only when it is this image
 MAX_COMMIT_PCT = 90  # memory guard: no new lane above this commit charge
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
 PACE_BANDS = ((2, None), (7, 2), (12, 1))  # usage <= pace_line + margin -> max lanes (None:
@@ -181,6 +191,95 @@ def real_mem():
         # commit limit / available commit = ullTotalPageFile / ullAvailPageFile
         return m.ullAvailPhys / 1e9, 100 * (1 - m.ullAvailPageFile / m.ullTotalPageFile)
     except (AttributeError, OSError, ZeroDivisionError):  # no windll off Windows
+        return None
+
+
+def real_idle():
+    """Seconds since the last user input of this session (GetLastInputInfo); None when unreadable."""
+    import ctypes
+
+    class LastInput(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+    try:
+        li = LastInput(cbSize=ctypes.sizeof(LastInput))
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)):
+            return None
+        tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+        return ((tick - li.dwTime) & 0xFFFFFFFF) / 1000  # both wrap at 2**32 ms
+    except (AttributeError, OSError):  # no windll off Windows
+        return None
+
+
+class WinProcs:
+    """Read-only process snapshot and SetPriorityClass via kernel32 (ctypes, stdlib only).
+    Every failure raises OSError. Used only on the conveyor's own lanes' process trees."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+        k = self.k = ctypes.WinDLL("kernel32", use_last_error=True)  # OSError off Windows
+        h = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.restype, k.CreateToolhelp32Snapshot.argtypes = h, [wintypes.DWORD] * 2
+        k.OpenProcess.restype, k.OpenProcess.argtypes = h, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.CloseHandle.argtypes = [h]
+        k.SetPriorityClass.argtypes = [h, wintypes.DWORD]
+        k.GetProcessTimes.argtypes = [h] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+
+        class Entry(ctypes.Structure):  # PROCESSENTRY32W
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        self.Entry = Entry
+        k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [h, ctypes.POINTER(Entry)]
+
+    def tree(self):
+        """{pid: (parent pid, lowercase image name)} of every process now."""
+        snap = self.k.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == self.ct.c_void_p(-1).value:
+            raise OSError(self.ct.get_last_error(), "CreateToolhelp32Snapshot")
+        try:
+            e, out = self.Entry(dwSize=self.ct.sizeof(self.Entry)), {}
+            ok = self.k.Process32FirstW(snap, self.ct.byref(e))
+            while ok:
+                out[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+                ok = self.k.Process32NextW(snap, self.ct.byref(e))
+            return out
+        finally:
+            self.k.CloseHandle(snap)
+
+    def _open(self, pid, access):
+        h = self.k.OpenProcess(access, False, pid)
+        if not h:
+            raise OSError(self.ct.get_last_error(), f"OpenProcess {pid}")
+        return h
+
+    def created(self, pid):
+        """Creation time (FILETIME ticks) of pid; OSError when it cannot be read."""
+        h = self._open(pid, 0x1000)  # PROCESS_QUERY_LIMITED_INFORMATION
+        try:
+            t = [self.ct.c_ulonglong() for _ in range(4)]
+            if not self.k.GetProcessTimes(h, *[self.ct.byref(x) for x in t]):
+                raise OSError(self.ct.get_last_error(), f"GetProcessTimes {pid}")
+            return t[0].value
+        finally:
+            self.k.CloseHandle(h)
+
+    def set_priority(self, pid, cls):
+        h = self._open(pid, 0x0200)  # PROCESS_SET_INFORMATION
+        try:
+            if not self.k.SetPriorityClass(h, cls):
+                raise OSError(self.ct.get_last_error(), f"SetPriorityClass {pid}")
+        finally:
+            self.k.CloseHandle(h)
+
+
+def real_procs():
+    try:
+        return WinProcs()
+    except (OSError, AttributeError):  # off Windows: every priority call fails (logged)
         return None
 
 
@@ -368,7 +467,7 @@ def validate_slice(s):
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
-                 projects=None, mem=real_mem):
+                 projects=None, mem=real_mem, idle=real_idle, procs=None):
         self.root = Path(root)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
@@ -386,6 +485,12 @@ class Conveyor:
         self.memory = None  # (free GB, commit %) this pass, None unknown
         self.mem_hold = False
         self.mem_unknown_logged = False
+        self.idle = idle
+        self.idle_s = None  # seconds since the last user input this pass, None unknown
+        self.idle_unknown_logged = False
+        self.presence = "present"  # never persisted: a restart starts present
+        self.presence_pending = None  # (state, since) of a change not yet held PRESENCE_HOLD_S
+        self.procs = procs if procs is not None else real_procs()
         self.approvals = self.root / "build" / "approvals"
         self.push_file = self.base / "push.json"
         self.free_gb = None
@@ -548,6 +653,7 @@ class Conveyor:
         if agents is not None:
             self.track(lanes, agents)
             self.dispatch(lanes, agents)
+            self.prioritize(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
         self.push_gate()
         items = self.attention(lanes)
@@ -864,12 +970,18 @@ class Conveyor:
             p = {**PACE_DEFAULTS, **json.loads(f.read_text(encoding="utf-8"))}
             if p["mode"] not in ("full_burn", "paced"):
                 raise ValueError(f"mode {p['mode']!r}")
+            lane_keys = [k for k in ("max_lanes", "lanes_present", "lanes_away") if k in p]
             for k in ("days", "reset_alert_pct", "full_burn_limit_pct", "min_free_mem_gb",
-                      "max_lanes"):
+                      "away_after_min", *lane_keys):
                 if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
-                        (p[k] <= 0 and k != "max_lanes"):
+                        (p[k] <= 0 and k not in lane_keys):
                     raise ValueError(f"{k} {p[k]!r}")
-            p["max_lanes"] = min(MAX_LANES_CAP, max(1, int(p["max_lanes"])))
+            for k in lane_keys:
+                p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
+            cmd = p["power_switch_cmd"]
+            if not isinstance(p["power_switch"], bool) or not isinstance(cmd, list) or \
+                    not all(isinstance(a, str) and a for a in cmd) or (p["power_switch"] and not cmd):
+                raise ValueError(f"power_switch {p['power_switch']!r} / power_switch_cmd {cmd!r}")
             if p["mode"] == "paced":
                 datetime.fromisoformat(p["window_start"]).timestamp()  # TypeError when null
             return p, None
@@ -886,8 +998,9 @@ class Conveyor:
         if u is not None:
             if isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
+                keep = [*PACE_DEFAULTS, *(["max_lanes"] if "max_lanes" in p else [])]
                 (self.base / "pace.json").write_text(
-                    json.dumps({k: p[k] for k in PACE_DEFAULTS}, indent=2), encoding="utf-8")
+                    json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
                 self.pager_flag("quota_reset", self.now())
             self.pager_flag("last_usage", u)
@@ -896,7 +1009,9 @@ class Conveyor:
             self.pager_flag("pace_invalid", [err, self.now()])
         elif not err and cur:
             self.pager_flag("pace_invalid", False)
-        line, top = None, p["max_lanes"]
+        if self.sense_presence(p["away_after_min"]):
+            self.power_switch(p)
+        line, top = None, p.get("max_lanes") or p[f"lanes_{self.presence}"]
         if p["mode"] == "full_burn":
             limit, n, band = p["full_burn_limit_pct"], top, "full_burn"
             if u is not None and u >= p["reset_alert_pct"] and not self.pager_flag("reset_alert"):
@@ -922,12 +1037,118 @@ class Conveyor:
             band = "memory hold"  # running lanes untouched; nothing new starts (hold())
         self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
                      "pace_line": line if line is None else round(line, 1),
-                     "max_lanes": self.max_lanes, "band": band, "limit_pct": limit, "error": err}
+                     "max_lanes": self.max_lanes, "band": band, "limit_pct": limit, "error": err,
+                     "presence": self.presence}
         # the first full_burn pass is the pre-governor state: no event for it
         if (self.pager_flag("pace_band") or ["full_burn", "full_burn", MAX_LANES]) \
                 != [p["mode"], band, self.max_lanes]:
             self.pager_flag("pace_band", [p["mode"], band, self.max_lanes])
             self.event("pace", **self.pace)
+
+    # ---- presence modes (CONV6) ------------------------------------------
+    def sense_presence(self, away_after_min):
+        """Present/away from user idle time: away at idle >= away_after_min, present at idle
+        under PRESENT_IDLE_S, between them unchanged; a change counts only after the new
+        state held PRESENCE_HOLD_S. Unreadable idle time is present (one presence_unknown
+        event per process). Returns True when the presence changed this pass."""
+        try:
+            self.idle_s = self.idle()
+        except Exception:
+            self.idle_s = None
+        if self.idle_s is None:
+            if not self.idle_unknown_logged:
+                self.idle_unknown_logged = True
+                self.event("presence_unknown")
+            raw = "present"
+        elif self.idle_s >= away_after_min * 60:
+            raw = "away"
+        elif self.idle_s < PRESENT_IDLE_S:
+            raw = "present"
+        else:
+            raw = self.presence
+        if raw == self.presence:
+            self.presence_pending = None
+            return False
+        if not self.presence_pending or self.presence_pending[0] != raw:
+            self.presence_pending = (raw, self.now())
+        if self.now() - self.presence_pending[1] < PRESENCE_HOLD_S:
+            return False
+        was, self.presence, self.presence_pending = self.presence, raw, None
+        self.event("presence", state=raw, was=was,
+                   idle_s=self.idle_s if self.idle_s is None else round(self.idle_s))
+        return True
+
+    def power_switch(self, p):
+        """Phase B hook (off by default): on a presence change run power_switch_cmd ("{plan}" ->
+        JarvisWatch / JarvisFocus) once; a failure is an event and attention item, no retry."""
+        if not p["power_switch"]:
+            return
+        args = [a.replace("{plan}", POWER_PLANS[self.presence]) for a in p["power_switch_cmd"]]
+        try:
+            rc, out = self.cmd(args, timeout=60)
+        except Exception as e:  # missing exe, timeout
+            rc, out = type(e).__name__, str(e)
+        self.event("power_switch", presence=self.presence, rc=rc, output=out[-300:])
+        if rc != 0:
+            self.error(f"power_switch {self.presence}: rc={rc}")
+            self.pager_flag("power_switch_fail", [f"{self.presence}: rc={rc}", self.now()])
+        elif self.pager_flag("power_switch_fail"):
+            self.pager_flag("power_switch_fail", False)
+
+    def own_tree(self, root, snap):
+        """root (a lane session pid that is SESSION_EXE) and its descendants, each created
+        after its parent (a pid-reuse orphan is never taken for a child); [] otherwise."""
+        if snap.get(root, (None, ""))[1] != SESSION_EXE:
+            return []
+        out, todo = [], [root]
+        while todo:
+            pid = todo.pop()
+            out.append(pid)
+            try:
+                born = self.procs.created(pid)
+            except OSError:
+                continue  # exited meanwhile: its children are left alone
+            for c, (pp, _) in snap.items():
+                if pp == pid and c not in out and c not in todo:
+                    try:
+                        if self.procs.created(c) >= born:
+                            todo.append(c)
+                    except OSError:
+                        pass
+        return out
+
+    def prioritize(self, lanes, agents):
+        """Priority class of the conveyor's OWN lanes only (lanes.json ids -> `claude agents`
+        pid -> that process tree): present BELOW_NORMAL, away NORMAL. Applied when a lane's
+        session pid or the presence changed; failures are logged, never fatal, not retried."""
+        want = self.presence
+        todo = []
+        for name in self.running(lanes):
+            ln = lanes[name]
+            a = next((a for a in agents if a.get("id") == ln["id"] and a.get("name") == name
+                      and isinstance(a.get("pid"), int)), None)
+            if a and ln.get("prio") != [a["pid"], want]:
+                todo.append((name, ln, a["pid"]))
+        if not todo:
+            return
+        try:
+            if self.procs is None:
+                raise OSError("process API unavailable")
+            snap = self.procs.tree()
+        except Exception as e:
+            for name, ln, pid in todo:
+                ln["prio"] = [pid, want]
+            self.event("priority_error", lanes=[t[0] for t in todo], error=f"{type(e).__name__}: {e}"[:200])
+            return
+        for name, ln, pid in todo:
+            ln["prio"] = [pid, want]
+            pids, failed = self.own_tree(pid, snap), []
+            for p in pids:
+                try:
+                    self.procs.set_priority(p, PRIORITY[want])
+                except Exception as e:
+                    failed.append(f"{p}: {type(e).__name__}")
+            self.event("priority", lane=name, presence=want, pids=len(pids), failed=failed[:5])
 
     def dispatch(self, lanes, agents):
         if self.disk_hold():
@@ -1173,6 +1394,9 @@ class Conveyor:
         reset = self.pager_flag("quota_reset")
         if reset:
             items.append((RESET_DONE_ID, "kota sıfırlandı, tempo modu açık", reset))
+        fail = self.pager_flag("power_switch_fail")
+        if fail:
+            items.append((POWER_SWITCH_ID, f"güç planı değişmedi ({fail[0]})", fail[1]))
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop(self, items):
@@ -1198,6 +1422,8 @@ class Conveyor:
             "memory_hold": self.mem_hold,
             "memory": self.memory and {"free_gb": round(self.memory[0], 1),
                                        "commit_pct": round(self.memory[1], 1)},
+            "presence": {"state": self.presence,
+                         "idle_s": self.idle_s if self.idle_s is None else round(self.idle_s)},
             "lanes": [{"name": n, "id": ln["id"], "model": ln.get("model"),
                        "effort": ln.get("effort"), "state": ln.get("state"),
                        "status": ln.get("status"), "report": ln.get("report"),

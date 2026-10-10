@@ -694,11 +694,14 @@ the optional report reader below. One instance at a time
   lanes run in parallel. `build/conveyor/pace.json`, re-read every pass (the
   orchestrator may edit it by hand at any time; written with the defaults if
   missing): `{"mode": "full_burn" | "paced", "window_start": ISO|null,
-  "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98, "max_lanes": 3,
-  "min_free_mem_gb": 3.0}`. `max_lanes` (Salih 2026-10-10 03:26: more
-  parallel lanes until the manual reset when the laptop can take it) is a
-  number clamped to 1..6 (`MAX_LANES_CAP`); a non-number makes pace.json
-  invalid. `min_free_mem_gb` feeds the memory guard.
+  "days": 7, "reset_alert_pct": 95, "full_burn_limit_pct": 98,
+  "min_free_mem_gb": 3.0, "lanes_present": 3, "lanes_away": 5,
+  "away_after_min": 10, "power_switch": false, "power_switch_cmd": []}`.
+  `max_lanes` below is the presence lane count (`lanes_present` /
+  `lanes_away`, see "Presence modes"); a hand-set `"max_lanes"` key (Salih
+  2026-10-10 03:26) overrides both. All three are numbers clamped to 1..6
+  (`MAX_LANES_CAP`); a non-number makes pace.json invalid. `min_free_mem_gb`
+  feeds the memory guard.
   - `full_burn` (until Salih uses his one manual quota reset): up to
     `max_lanes` lanes; no new lane at `usage_pct >= full_burn_limit_pct`. At
     `usage_pct >= reset_alert_pct` Salih is paged once ("Haftalık kota %<n>:
@@ -718,8 +721,43 @@ the optional report reader below. One instance at a time
   - An invalid pace.json is read as `paced` from now (the cautious side), left
     unchanged on disk, and is attention item `pace-invalid` until fixed.
   - The decision (`mode`, `usage_pct`, `pace_line`, `max_lanes`, `band`,
-    `limit_pct`, `error`) is `status.json` `pace`; a change of band is a
-    `pace` event. A slice's model and effort are never altered.
+    `limit_pct`, `error`, `presence`) is `status.json` `pace`; a change of
+    band is a `pace` event. A slice's model and effort are never altered.
+- **Presence modes (CONV6; LaptopControl v1.3 plan, Phase A).** The
+  conveyor only reads the user's idle time and sets the priority of its own
+  lanes; it changes no system setting (power plan, service, registry).
+  - Presence: idle seconds from `GetLastInputInfo` (ctypes, stdlib only; the
+    conveyor's own Windows session). `away` at idle >= `away_after_min`
+    (pace.json, default 10); `present` at idle under 1 min; in between
+    unchanged. A change counts only after the new state held 2 min
+    (`PRESENCE_HOLD_S`), so away starts ~12 min after the last input and a
+    single touch does not end it. Unreadable idle time is `present` (one
+    `presence_unknown` event per process). A change is a `presence` event;
+    `status.json` shows `presence` (`state`, `idle_s`) and `pace.presence`.
+    A restart starts `present`.
+  - Lanes: `max_lanes` = `lanes_present` (default 3) or `lanes_away`
+    (default 5), still under the paced bands, the memory and disk guards and
+    one integration lane at a time. Running lanes are never stopped.
+  - Priority, own lanes only: for each running lane in `lanes.json`, its
+    session pid from `claude agents` (same id and name; the process must be
+    `claude.exe`) and that process's descendants (each created after its
+    parent, so a pid-reuse orphan is never taken) get
+    `BELOW_NORMAL_PRIORITY_CLASS` when present, `NORMAL_PRIORITY_CLASS` when
+    away. Applied once per (session pid, presence): on a presence change, to a
+    new dispatch once its pid is listed, and after a respawn; later children
+    inherit it. No other process is touched. One `priority` event per lane
+    (pid count, failures); a failure or an unreadable process list
+    (`priority_error`) is logged, never fatal, not retried for that pid and
+    presence.
+  - Phase B hook, off by default: `"power_switch": true` runs
+    `power_switch_cmd` (list of args, `{plan}` -> `JarvisWatch` when present,
+    `JarvisFocus` when away; e.g. `["<path>\\LaptopControl.exe", "--activate",
+    "{plan}"]`) once per presence change, 60 s timeout. No default command or
+    path ships. A non-zero exit, a missing exe or a timeout is a
+    `power_switch` event plus attention item `power-switch` (ack
+    `build/conveyor/ack/power-switch`), no retry until the next presence
+    change; a later success clears it. `power_switch: true` with an empty
+    `power_switch_cmd` makes pace.json invalid.
 - **Model routing table (Salih 2026-10-10).** Static; the header of every
   prompt and backlog slice follows it:
   - 6G product slices: Opus, effort medium.
