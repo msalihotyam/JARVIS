@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
-from dataclasses import replace
 
 from jarvis.contracts import SideEffect, utc_now
 from jarvis.memory import SQLiteMemoryStore
