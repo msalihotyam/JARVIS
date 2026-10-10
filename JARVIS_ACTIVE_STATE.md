@@ -75,7 +75,12 @@ open. Next: integrate on "entegre et".
   and
   `test_ui.ConversationSurfaceTests.test_conversation_scrolling_keeps_the_reading_position`
   (orchestrator 2026-10-08: scroll-animation timing under load; pass alone;
-  follow-up F-sc makes their waits event-driven). `scripts/test_parallel.py`
+  follow-up F-sc makes their waits event-driven),
+  `test_ui.AuthorityTests.test_background_work_does_not_block_the_gui_thread`
+  (orchestrator 2026-10-10: GUI-thread SQLite commit + WAL checkpoint takes
+  0.03 s alone, 0.57 s only under full-suite disk load; follow-up F-gt (T2,
+  memory.py/bridge save order, V2.1): move the user-turn save and checkpoint
+  off the GUI thread). `scripts/test_parallel.py`
   reruns only `test_ui` ids itself; rule D for the others is applied by hand.
 - Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
 - Push: `main` not authorized; `ci/*` branches are standing-authorized
