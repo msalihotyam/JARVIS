@@ -3542,7 +3542,7 @@ kendisi karar vermez.
   (silinmiş ya da bozuk) zarf BIRAKILIR - açık konuşmaya ya da başka bir sahibe
   asla verilmez; tek iz kalıcı olmayan bir pencere notudur.
 - **Model listesi: model adı başına en yeni sürüm (S5, Salih kararı
-  2026-09-30; YALNIZ GÖSTERİM):** model paneli her model ADI (Sol, Luna, Terra,
+  2026-09-30; YALNIZ GÖSTERİM):** kullanım popover'ı (ModelPanel A, Salih 2026-10-10) her model ADI (Sol, Luna, Terra,
   Astra, Opus, Sonnet, Haiku, Fable ayrı adlardır; uzmanlık adları da ayrı
   anahtardır) için yalnız en yüksek sayısal sürümü gösterir. Saf kural
   `model_retirement.newest_per_name` (G/Ç yok); yalnız köprü çağırır. Takma adlar

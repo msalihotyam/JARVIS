@@ -67,8 +67,11 @@ def main() -> int:
         # MAIN / DARK show approvals in the conversation's safety card (the same
         # display-only fixture Ctrl+Shift+A selects).
         bridge.setDevSafetyScenario("approval")
-    elif args.scene in ("settings", "model", "nav"):
-        QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "model":"toggleModel", "nav":"toggleNav"}[args.scene])
+    elif args.scene == "model":
+        # G6MP1C: the Model panel is retired; this scene opens the usage popover.
+        QTimer.singleShot(300, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "usageRing"), "toggle"))
+    elif args.scene in ("settings", "nav"):
+        QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "nav":"toggleNav"}[args.scene])
     elif args.scene == "models":
         # S5: the provider lines exactly as live discovery listed them (2026-09-30),
         # filtered to the newest version per name; an older Claude model is selected
@@ -91,7 +94,7 @@ def main() -> int:
             {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": "available", "plan": "plus", "research": False,
              "models": codex, "retired": {}}])
         bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
-        QTimer.singleShot(300, lambda: QMetaObject.invokeMethod(window, "toggleModel"))
+        QTimer.singleShot(300, lambda: QMetaObject.invokeMethod(window.findChild(QObject, "usageRing"), "toggle"))
     elif args.scene == "edit":
         bridge.setEditMode(True)
     elif args.scene == "focus":
@@ -225,8 +228,10 @@ def main() -> int:
             bridge._core_state = "running" if name == "running" else "idle"
             bridge.stateChanged.emit()
             bridge.setTheme(name if name in ("space", "dark", "command") else "space")
-            if name in ("settings", "model", "nav"):
-                QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "model":"toggleModel", "nav":"toggleNav"}[name])
+            if name == "model":
+                QMetaObject.invokeMethod(window.findChild(QObject, "usageRing"), "toggle")
+            elif name in ("settings", "nav"):
+                QMetaObject.invokeMethod(window, {"settings":"toggleSettings", "nav":"toggleNav"}[name])
             elif name == "approval":
                 window.setProperty("devApprovalVisible", True)
             elif name == "edit":

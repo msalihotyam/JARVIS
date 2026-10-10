@@ -193,7 +193,7 @@ Item {
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                     Loader {
                         width: bodyViewport.width; height: bodyViewport.contentHeight
-                        sourceComponent: ({ system: column.commandMode ? modelPanel : systemPanel, workflow: workflowPanel, activity: activityPanel, automations: column.commandMode ? memoryPanel : automationsPanel })[modelData.id]
+                        sourceComponent: ({ system: systemPanel, workflow: workflowPanel, activity: activityPanel, automations: column.commandMode ? memoryPanel : automationsPanel })[modelData.id]
                     }
                 }
             }
