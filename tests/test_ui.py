@@ -2118,8 +2118,8 @@ class ConversationSurfaceTests(UiTestCase):
         self.assertEqual(0, self.execute_calls())
 
     def test_conversation_surface_is_conversation_first(self) -> None:
-        """The composer rests at 52 px, centred and nearly the full surface; the
-        text begins below the shell's fade band; JARVIS and system turns sit
+        """The composer's bar rests at 52 px (G6CM1 C1: its chip row sits under
+        it), centred and nearly the full surface; the text begins below the shell's fade band; JARVIS and system turns sit
         on the left, the operator's on the right inside the reserved
         scrollbar strip."""
         bridge = self.bridge(task_proposal("code_analysis", objective="Bu projeyi incele."))
@@ -2133,7 +2133,9 @@ class ConversationSurfaceTests(UiTestCase):
             surface = work[2] - work[0]
             with self.subTest(size=(width, height)):
                 self.assertTrue(self.item(root, "conversationFeed").property("referenceLayout"))
-                self.assertAlmostEqual(52, composer[3] - composer[1], delta=0.5)
+                bar = self.box(root, "composerBar")
+                self.assertAlmostEqual(52, bar[3] - bar[1], delta=0.5)
+                self.assertLessEqual(bar[3], composer[3] - 32)                  # G6CM1 C1: the 32 px row under the bar
                 self.assertGreaterEqual(100 * (composer[2] - composer[0]) / surface, 90)
                 self.assertAlmostEqual(composer[0] - work[0], work[2] - composer[2], delta=2.0)
                 self.assertLessEqual(composer[3], work[3])
@@ -2217,22 +2219,23 @@ class ConversationSurfaceTests(UiTestCase):
         root.resize(1920, 1080)
         pump(600)
         composer = self.item(root, "canonicalComposer")
-        rest = self.box(root, "canonicalComposer")
+        # G6CM1 C1: the BAR grows and caps; the chip row under it keeps its place.
+        rest = self.box(root, "composerBar")
         self.assertAlmostEqual(52, rest[3] - rest[1], delta=0.5)
         composer.setProperty("text", "\n".join(["one line of a draft"] * 3))
         pump(400)
-        grown = self.box(root, "canonicalComposer")
+        grown = self.box(root, "composerBar")
         self.assertGreater(grown[3] - grown[1], 60)
         self.assertAlmostEqual(rest[3], grown[3], delta=0.5, msg="the bottom edge stays anchored; growth is upward")
         composer.setProperty("text", "\n".join(["line"] * 20))
         pump(400)
-        capped = self.box(root, "canonicalComposer")
+        capped = self.box(root, "composerBar")
         cap = min(180, round(self.item(root, "canonicalWorkspace").height() * 0.25))
         self.assertAlmostEqual(cap, capped[3] - capped[1], delta=1)
         self.assertGreater(composer.property("inputHeight"), capped[3] - capped[1], "beyond the cap the draft scrolls inside")
         composer.setProperty("text", "")
         pump(400)
-        back = self.box(root, "canonicalComposer")
+        back = self.box(root, "composerBar")
         self.assertAlmostEqual(52, back[3] - back[1], delta=0.5)
         self.assertEqual(0, self.execute_calls())
 

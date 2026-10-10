@@ -17,13 +17,19 @@ import "../theme"
 // selections and the files the person attached with "+". They are separate
 // from the text being written and stay separate all the way to the provider.
 // Only supported controls appear; no voice, web or menu control is faked.
+//
+// Gate 6G C1/M2/M3 (G6CM1): the row UNDER the bar holds "+" and the
+// permission mode on the left, the Model and Effort chips on the right. While
+// JARVIS runs the send key is the stop key (the same cancel) and a quiet
+// "JARVIS is working…" line stands in the row - no progress is invented.
 Item {
     id: composer
     property int minHeight: 52
     property int maxHeight: 180
     readonly property int vpad: 8
     readonly property int barHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
-    implicitHeight: readOnlyBanner.height + (readOnlyBanner.visible ? 6 : 0) + strip.height + barHeight
+    readonly property int rowGap: 6
+    implicitHeight: readOnlyBanner.height + (readOnlyBanner.visible ? 6 : 0) + strip.height + barHeight + rowGap + underRow.height
     // An archived project's conversation is read-only (V2.0 Gate 6A). Presentation
     // only: Core refuses the work anyway (ARCHITECTURE 4.22).
     property bool readOnly: bridge.conversationReadOnly
@@ -102,7 +108,8 @@ Item {
 
     Rectangle {
         id: bar
-        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        objectName: "composerBar"
+        anchors { left: parent.left; right: parent.right; bottom: underRow.top; bottomMargin: composer.rowGap }
         height: composer.barHeight
         Behavior on height { NumberAnimation { duration: Theme.dur(140); easing.type: Easing.OutCubic } }
         radius: 10
@@ -127,109 +134,13 @@ Item {
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 } height: Math.min(parent.height * 0.5, 26); radius: 9
         gradient: Gradient { GradientStop { position: 0; color: input.activeFocus ? Theme.glassInnerHighlight : Theme.glassReflection } GradientStop { position: 1; color: "transparent" } } }
 
-    // Permission mode: Core's own approval policy (``permission_mode``), shown
-    // and changed here. The label is what the stored configuration holds; a
-    // choice is written through the same config path the CLI uses and Core
-    // applies it on the next action. It never overrides an always-approval
-    // action, UNKNOWN_OUTCOME, the execution journal or Freeze.
-    Item {
-        id: permissionChip
-        objectName: "permissionModeControl"
-        anchors.left: parent.left; anchors.leftMargin: 8; anchors.bottom: parent.bottom; anchors.bottomMargin: 10
-        width: chipRow.width + 18; height: 32
-        readonly property var current: composer.modeInfo(bridge.permissionMode)
-        enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
-        opacity: enabled ? 1 : 0.5
-        Accessible.role: Accessible.Button
-        Accessible.name: qsTr("Permission mode: %1").arg(current ? current.name : qsTr("Unknown"))
-        Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
-                    color: chipArea.containsMouse || modeMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
-                    border.width: 1; border.color: modeMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
-        Row { id: chipRow; anchors.centerIn: parent; spacing: 6
-            Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter
-                        color: bridge.permissionMode === "strict" ? Theme.warning : Theme.accent }
-            Text { objectName: "permissionModeLabel"; text: permissionChip.current ? permissionChip.current.short : qsTr("Unknown")
-                   color: Theme.text; renderType: Theme.textRender; font: Theme.composerChip } }
-        MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: modeMenu.visible ? modeMenu.close() : modeMenu.open() }
-        // K4: the one menu surface and row. A mouse-only chip: the draft keeps the focus.
-        MenuSurface {
-            id: modeMenu
-            objectName: "permissionModeMenu"
-            trigger: permissionChip; takesFocus: false
-            restY: -height - 8; x: 0
-            width: 360; padding: 10
-            Column {
-                width: modeMenu.availableWidth
-                spacing: 4
-                Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
-                       font: Theme.label }
-                Repeater {
-                    model: composer.permissionModes
-                    delegate: MenuRow {
-                        objectName: "permissionMode_" + modelData.id
-                        // The drawn check is not text: the selected state is told to assistive tech here.
-                        Accessible.role: Accessible.RadioButton
-                        label: modelData.name; detail: modelData.detail
-                        current: bridge.permissionMode === modelData.id; checked: current
-                        onTriggered: { bridge.setPermissionMode(modelData.id); modeMenu.close() }
-                    }
-                }
-                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
-                       text: qsTr("Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.") }
-            }
-        }
-    }
-
-    // "+": attach a file or an image the person picks themselves. It grants
-    // JARVIS no filesystem access of any kind - only the exact item chosen in
-    // this dialog is read, once, and copied into the draft.
-    Item {
-        id: attachChip
-        objectName: "attachControl"
-        anchors.left: permissionChip.right; anchors.leftMargin: 6
-        anchors.bottom: parent.bottom; anchors.bottomMargin: 10
-        width: 32; height: 32
-        enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
-        opacity: enabled ? 1 : 0.5
-        Accessible.role: Accessible.Button
-        Accessible.name: qsTr("Attach a file or an image")
-        Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
-                    color: attachArea.containsMouse || attachMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
-                    border.width: 1; border.color: attachMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
-        Text { anchors.centerIn: parent; text: "+"; color: Theme.text; renderType: Theme.textRender
-               font: Qt.font({ family: Theme.ui, pixelSize: 16 }) }
-        MouseArea { id: attachArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: attachMenu.visible ? attachMenu.close() : attachMenu.open() }
-        MenuSurface {
-            id: attachMenu
-            objectName: "attachMenu"
-            trigger: attachChip; takesFocus: false
-            restY: -height - 8; x: 0
-            width: 240
-            Column {
-                width: attachMenu.availableWidth
-                spacing: 2
-                Repeater {
-                    model: [{ id: "file", label: qsTr("Add file") }, { id: "image", label: qsTr("Add image") }]
-                    delegate: MenuRow {
-                        objectName: "attach_" + modelData.id
-                        label: modelData.label
-                        onTriggered: { attachMenu.close(); composer.pick(modelData.id) }
-                    }
-                }
-                Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
-                       text: qsTr("Only the item you choose is read. JARVIS gets no access to your files.") }
-            }
-        }
-    }
 
     // The draft: a wrapping text area inside a flickable, so past the maximum
     // height the text scrolls and the caret stays in view.
     Flickable {
         id: flick
-        anchors { left: attachChip.right; right: bridge.busy ? stopButton.left : sendButton.left; top: parent.top; bottom: parent.bottom
-                  leftMargin: 10; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
+        anchors { left: parent.left; right: sendButton.left; top: parent.top; bottom: parent.bottom
+                  leftMargin: 14; rightMargin: 4; topMargin: composer.vpad; bottomMargin: composer.vpad }
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         interactive: contentHeight > height + 1
@@ -279,71 +190,222 @@ Item {
 
     // Send: a compact technical key - a 34 px chamfered square of deep navy
     // with a thin cool-blue perimeter and a pale-blue line glyph, inside a
-    // 44 px target. Dimmed and inert while nothing can be sent.
+    // 44 px target. Dimmed and inert while nothing can be sent. M2: the
+    // pointer lifts it a step with a soft glow and a fine ring; a press sets
+    // it down. While JARVIS runs it IS the stop key in the same spot - an
+    // amber square inside a turning ring - and cancels the running call.
     Item {
         id: sendButton
         objectName: "composerSend"
         anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
         width: 44; height: 44
-        enabled: composer.canSend
-        opacity: composer.canSend ? 1 : 0.42
+        readonly property bool stopping: bridge.busy
+        enabled: stopping || composer.canSend
+        opacity: enabled ? 1 : 0.42
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
+        function act() { if (stopping) { if (!bridge.cancelText()) bridge.cancelTask() } else composer.submit() }
         Accessible.role: Accessible.Button
-        Accessible.name: qsTr("Send message")
-        Accessible.onPressAction: composer.submit()
-        Keys.onReturnPressed: composer.submit()
-        Keys.onSpacePressed: composer.submit()
+        Accessible.name: stopping ? qsTr("Stop") : qsTr("Send message")
+        Accessible.onPressAction: act()
+        Keys.onReturnPressed: act()
+        Keys.onSpacePressed: act()
         readonly property bool hovered: sendArea.containsMouse
         readonly property bool pressed: sendArea.pressed
-        readonly property color rim: pressed ? "#2f7fb0" : hovered ? "#62c8f2" : "#3596cf"
+        readonly property color tone: stopping ? Theme.warning : "#3596cf"
+        readonly property color rim: stopping ? Theme.warning : pressed ? "#2f7fb0" : hovered ? "#62c8f2" : "#3596cf"
         readonly property color face: pressed ? "#03101d" : hovered ? "#0c2a48" : "#071c33"
-        Shape {
-            anchors.centerIn: parent; width: 34; height: 34
-            preferredRendererType: Shape.CurveRenderer
-            ShapePath {
-                strokeColor: sendButton.rim; strokeWidth: 1; fillColor: sendButton.face
-                joinStyle: ShapePath.MiterJoin
-                startX: 4.5; startY: 0.5
-                PathLine { x: 29.5; y: 0.5 } PathLine { x: 33.5; y: 4.5 } PathLine { x: 33.5; y: 29.5 }
-                PathLine { x: 29.5; y: 33.5 } PathLine { x: 4.5; y: 33.5 } PathLine { x: 0.5; y: 29.5 }
-                PathLine { x: 0.5; y: 4.5 } PathLine { x: 4.5; y: 0.5 }
+        // Hover: a soft glow behind the key.
+        Rectangle { objectName: "composerSendGlow"; anchors.centerIn: parent; width: 42; height: 42; radius: 8
+                    color: Theme.alpha(sendButton.tone, 0.16); opacity: sendButton.hovered && sendButton.enabled ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
+        Item {
+            id: keyFace
+            objectName: "composerSendFace"
+            anchors.fill: parent
+            // Lift under the pointer, set down by a press.
+            transform: Translate { y: sendButton.pressed ? 0 : sendButton.hovered && sendButton.enabled ? -1 : 0
+                                   Behavior on y { NumberAnimation { duration: Theme.hoverMs } } }
+            scale: sendButton.pressed ? 0.95 : 1
+            Behavior on scale { NumberAnimation { duration: Theme.hoverMs } }
+            Shape {
+                anchors.centerIn: parent; width: 34; height: 34
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: sendButton.rim; strokeWidth: 1; fillColor: sendButton.face
+                    joinStyle: ShapePath.MiterJoin
+                    startX: 4.5; startY: 0.5
+                    PathLine { x: 29.5; y: 0.5 } PathLine { x: 33.5; y: 4.5 } PathLine { x: 33.5; y: 29.5 }
+                    PathLine { x: 29.5; y: 33.5 } PathLine { x: 4.5; y: 33.5 } PathLine { x: 0.5; y: 29.5 }
+                    PathLine { x: 0.5; y: 4.5 } PathLine { x: 4.5; y: 0.5 }
+                }
             }
-            Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
-        }
-        // Pressed: a darker inset along the top-left inside the perimeter.
-        Rectangle { visible: sendButton.pressed; anchors.centerIn: parent; anchors.horizontalCenterOffset: 0; width: 30; height: 30; color: "transparent"
-            border.width: 1; border.color: "#66000a14" }
-        // The glyph: an 18 px line send arrow.
-        Shape {
-            anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
-            width: 18; height: 18
-            preferredRendererType: Shape.CurveRenderer
-            ShapePath {
-                strokeColor: sendButton.hovered ? "#d6f1ff" : "#b8e7ff"; strokeWidth: 1.5; fillColor: "transparent"
-                joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
-                startX: 1.5; startY: 1.5
-                PathLine { x: 16.5; y: 9 } PathLine { x: 1.5; y: 16.5 } PathLine { x: 4; y: 9 } PathLine { x: 1.5; y: 1.5 }
-                PathMove { x: 4; y: 9 } PathLine { x: 10; y: 9 }
+            // Hover: a fine ring around the face.
+            Rectangle { objectName: "composerSendRing"; visible: sendButton.hovered && sendButton.enabled && !sendButton.activeFocus
+                        anchors.centerIn: parent; width: 40; height: 40; radius: 6; color: "transparent"
+                        border.width: 1; border.color: Theme.alpha(sendButton.tone, 0.55) }
+            // Pressed: a darker inset along the top-left inside the perimeter.
+            Rectangle { visible: sendButton.pressed; anchors.centerIn: parent; width: 30; height: 30; color: "transparent"
+                border.width: 1; border.color: "#66000a14" }
+            // The glyph: an 18 px line send arrow.
+            Shape {
+                visible: !sendButton.stopping
+                anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
+                width: 18; height: 18
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: sendButton.hovered ? "#d6f1ff" : "#b8e7ff"; strokeWidth: 1.5; fillColor: "transparent"
+                    joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
+                    startX: 1.5; startY: 1.5
+                    PathLine { x: 16.5; y: 9 } PathLine { x: 1.5; y: 16.5 } PathLine { x: 4; y: 9 } PathLine { x: 1.5; y: 1.5 }
+                    PathMove { x: 4; y: 9 } PathLine { x: 10; y: 9 }
+                }
+            }
+            // Stop: the amber square inside a turning ring (still with ambient effects off).
+            Rectangle { objectName: "composerStopSquare"; visible: sendButton.stopping; anchors.centerIn: parent
+                        width: 10; height: 10; radius: 2; color: Theme.warning }
+            Shape {
+                objectName: "composerStopRing"
+                visible: sendButton.stopping
+                anchors.centerIn: parent; width: 24; height: 24
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: Theme.warning; strokeWidth: 1.6; fillColor: "transparent"; capStyle: ShapePath.RoundCap
+                    PathAngleArc { centerX: 12; centerY: 12; radiusX: 11; radiusY: 11; startAngle: -90; sweepAngle: 270 }
+                }
+                RotationAnimation on rotation { from: 0; to: 360; duration: 1200; loops: Animation.Infinite
+                                                running: sendButton.stopping && Theme.ambient }
             }
         }
         // Keyboard focus: a fine explicit outline around the face.
         Rectangle { visible: sendButton.activeFocus; anchors.centerIn: parent; width: 40; height: 40; radius: 4; color: "transparent"
             border.width: 1; border.color: "#6fd8f5" }
-        MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: composer.submit() }
+        MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sendButton.act() }
     }
-    // Cancel the running understanding call from the same spot.
-    Rectangle {
-        id: stopButton
-        anchors.right: sendButton.left; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
-        width: stopRow.width + 24; height: 32; radius: Theme.radiusSmall
-        visible: bridge.busy
-        color: stopArea.containsMouse ? Theme.alpha(Theme.danger, 0.14) : Theme.alpha(Theme.text, 0.04); border.width: 1; border.color: stopArea.containsMouse ? Theme.alpha(Theme.danger, 0.6) : Theme.borderStrong
-        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
-        Row { id: stopRow; anchors.centerIn: parent; spacing: 8
-            Rectangle { width: 8; height: 8; radius: 2; color: Theme.danger; anchors.verticalCenter: parent.verticalCenter }
-            Text { text: qsTr("Stop"); color: Theme.text; font: Theme.captionStrong } }
-        MouseArea { id: stopArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (!bridge.cancelText()) bridge.cancelTask() } }
     }
+
+    // C1: the row under the bar - "+" and the permission mode on the left, the
+    // working line beside them while JARVIS runs; Model and Effort on the right.
+    Item {
+        id: underRow
+        objectName: "composerChipRow"
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        height: 32
+        Row {
+            id: leftChips
+            anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+            spacing: 6
+            // "+": attach a file or an image the person picks themselves. It grants
+            // JARVIS no filesystem access of any kind - only the exact item chosen in
+            // this dialog is read, once, and copied into the draft.
+            Item {
+                id: attachChip
+                objectName: "attachControl"
+                width: 32; height: 32
+                enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
+                opacity: enabled ? 1 : 0.5
+                Accessible.role: Accessible.Button
+                Accessible.name: qsTr("Attach a file or an image")
+                Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
+                            color: attachArea.containsMouse || attachMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+                            border.width: 1; border.color: attachMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
+                Text { anchors.centerIn: parent; text: "+"; color: Theme.text; renderType: Theme.textRender
+                       font: Qt.font({ family: Theme.ui, pixelSize: 16 }) }
+                MouseArea { id: attachArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: attachMenu.visible ? attachMenu.close() : attachMenu.open() }
+                MenuSurface {
+                    id: attachMenu
+                    objectName: "attachMenu"
+                    trigger: attachChip; takesFocus: false
+                    restY: -height - 8; x: 0
+                    width: 240
+                    Column {
+                        width: attachMenu.availableWidth
+                        spacing: 2
+                        Repeater {
+                            model: [{ id: "file", label: qsTr("Add file") }, { id: "image", label: qsTr("Add image") }]
+                            delegate: MenuRow {
+                                objectName: "attach_" + modelData.id
+                                label: modelData.label
+                                onTriggered: { attachMenu.close(); composer.pick(modelData.id) }
+                            }
+                        }
+                        Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
+                               text: qsTr("Only the item you choose is read. JARVIS gets no access to your files.") }
+                    }
+                }
+            }
+
+            // Permission mode: Core's own approval policy (``permission_mode``), shown
+            // and changed here. The label is what the stored configuration holds; a
+            // choice is written through the same config path the CLI uses and Core
+            // applies it on the next action. It never overrides an always-approval
+            // action, UNKNOWN_OUTCOME, the execution journal or Freeze.
+            Item {
+                id: permissionChip
+                objectName: "permissionModeControl"
+                width: chipRow.width + 18; height: 32
+                readonly property var current: composer.modeInfo(bridge.permissionMode)
+                enabled: !bridge.busy && !bridge.configRefused && !composer.readOnly
+                opacity: enabled ? 1 : 0.5
+                Accessible.role: Accessible.Button
+                Accessible.name: qsTr("Permission mode: %1").arg(current ? current.name : qsTr("Unknown"))
+                Rectangle { anchors.fill: parent; radius: Theme.radiusSmall
+                            color: chipArea.containsMouse || modeMenu.visible ? Theme.alpha(Theme.accent, 0.14) : Theme.alpha(Theme.text, 0.04)
+                            border.width: 1; border.color: modeMenu.visible ? Theme.glassEdgeStrong : Theme.borderStrong }
+                Row { id: chipRow; anchors.centerIn: parent; spacing: 6
+                    Rectangle { width: 7; height: 7; radius: 3.5; anchors.verticalCenter: parent.verticalCenter
+                                color: bridge.permissionMode === "strict" ? Theme.warning : Theme.accent }
+                    Text { objectName: "permissionModeLabel"; text: permissionChip.current ? permissionChip.current.short : qsTr("Unknown")
+                           color: Theme.text; renderType: Theme.textRender; font: Theme.composerChip } }
+                MouseArea { id: chipArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: modeMenu.visible ? modeMenu.close() : modeMenu.open() }
+                // K4: the one menu surface and row. A mouse-only chip: the draft keeps the focus.
+                MenuSurface {
+                    id: modeMenu
+                    objectName: "permissionModeMenu"
+                    trigger: permissionChip; takesFocus: false
+                    restY: -height - 8; x: 0
+                    width: 360; padding: 10
+                    Column {
+                        width: modeMenu.availableWidth
+                        spacing: 4
+                        Text { text: qsTr("PERMISSION MODE"); color: Theme.textMuted
+                               font: Theme.label }
+                        Repeater {
+                            model: composer.permissionModes
+                            delegate: MenuRow {
+                                objectName: "permissionMode_" + modelData.id
+                                // The drawn check is not text: the selected state is told to assistive tech here.
+                                Accessible.role: Accessible.RadioButton
+                                label: modelData.name; detail: modelData.detail
+                                current: bridge.permissionMode === modelData.id; checked: current
+                                onTriggered: { bridge.setPermissionMode(modelData.id); modeMenu.close() }
+                            }
+                        }
+                        Text { width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
+                               text: qsTr("Mail, GitHub, browser, desktop, file writes and Claude analysis always ask, in every mode. Freeze is separate and stops everything.") }
+                    }
+                }
+            }
+        }
+        Text {
+            id: working
+            objectName: "composerWorking"
+            visible: bridge.busy
+            anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+            width: Math.max(0, Math.min(implicitWidth, rightChips.x - x - 8)); elide: Text.ElideRight
+            text: qsTr("JARVIS is working…"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
+        }
+        Row {
+            id: rightChips
+            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+            ModelMenu { id: modelMenu }
+            EffortMenu {
+                levels: modelMenu.levels; value: modelMenu.effort; recommended: modelMenu.recommended
+                onPicked: function(level) { modelMenu.setEffort(level) }
+            }
+        }
     }
 }

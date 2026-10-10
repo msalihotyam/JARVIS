@@ -1167,6 +1167,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>E-posta, GitHub, tarayıcı, masaüstü, dosya yazma ve Claude analizi her modda her zaman onay ister. Dondurma ayrıdır ve her şeyi durdurur.</translation>
     </message>
     <message>
+        <source>JARVIS is working…</source>
+        <translation>JARVIS çalışıyor…</translation>
+    </message>
+    <message>
         <source>Attach a file or an image</source>
         <translation>Dosya veya görsel ekle</translation>
     </message>
@@ -1443,6 +1447,45 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Copied</source>
         <translation>Kopyalandı</translation>
+    </message>
+</context>
+<context>
+    <name>EffortMenu</name>
+    <message>
+        <source>low</source>
+        <translation>düşük</translation>
+    </message>
+    <message>
+        <source>medium</source>
+        <translation>orta</translation>
+    </message>
+    <message>
+        <source>high</source>
+        <translation>yüksek</translation>
+    </message>
+    <message>
+        <source>default</source>
+        <translation>varsayılan</translation>
+    </message>
+    <message>
+        <source>Effort %1</source>
+        <translation>Effort %1</translation>
+    </message>
+    <message>
+        <source>Effort</source>
+        <translation>Effort</translation>
+    </message>
+    <message>
+        <source>Faster</source>
+        <translation>Daha hızlı</translation>
+    </message>
+    <message>
+        <source>Smarter</source>
+        <translation>Daha akıllı</translation>
+    </message>
+    <message>
+        <source>Recommended</source>
+        <translation>Önerilen</translation>
     </message>
 </context>
 <context>
@@ -2019,6 +2062,33 @@ yok</translation>
     <message>
         <source>Open Projects</source>
         <translation>Projeleri aç</translation>
+    </message>
+</context>
+<context>
+    <name>ModelMenu</name>
+    <message>
+        <source>CLI default</source>
+        <translation>CLI varsayılanı</translation>
+    </message>
+    <message>
+        <source>No model chosen</source>
+        <translation>Model seçilmedi</translation>
+    </message>
+    <message>
+        <source>Model: %1</source>
+        <translation>Model: %1</translation>
+    </message>
+    <message>
+        <source>Default</source>
+        <translation>Varsayılan</translation>
+    </message>
+    <message>
+        <source>SELECTED</source>
+        <translation>SEÇİLİ</translation>
+    </message>
+    <message>
+        <source>More models</source>
+        <translation>Daha fazla model</translation>
     </message>
 </context>
 <context>
