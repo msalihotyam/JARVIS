@@ -79,7 +79,11 @@ class RowLayoutTests(ComposerCase):
         self.assertLess(mode.right(), row.center().x())                           # left side
         self.assertLess(model.right(), effort.left() + 0.5)                       # Model, then Effort
         self.assertGreater(model.left(), row.center().x())                        # right side
-        self.assertAlmostEqual(effort.right(), row.right(), delta=0.5)
+        # 6G U2 (G6TB1B): the usage ring follows Effort and ends the row (it was Effort).
+        ring = self.rect(self.item(root, "usageRing"))
+        self.assertLessEqual(effort.right(), ring.left() + 0.5)
+        self.assertTrue(row.contains(ring.center()))
+        self.assertAlmostEqual(ring.right(), row.right(), delta=0.5)
         self.assertEqual(0, self.execute_calls())
 
 

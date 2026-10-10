@@ -28,8 +28,9 @@ from jarvis.settings import CLAUDE_MODEL_PATTERN
 
 PREFERENCES_VERSION = 5
 THEMES = ("space", "dark", "command")
-#: Execution-status lamp skins: the canonical glass orb and the HUD variant.
-STATUS_INDICATORS = ("orb", "hud")
+#: Execution-status lamp skins: the canonical glass orb, the HUD variant and
+#: the mechanical lamp (Gate 6G S1, the default; the others stay selectable).
+STATUS_INDICATORS = ("orb", "hud", "mechanical")
 #: Freeze control skins (Gate 6G S2): 1 classic key, 2 redesigned key,
 #: 3 chrome toggle, 4 knife switch. Presentation only.
 FREEZE_KEYS = (1, 2, 3, 4)
@@ -139,7 +140,7 @@ def canonical_preferences() -> dict[str, Any]:
         "version": PREFERENCES_VERSION,
         "theme": "space",
         "ambient_effects": True,
-        "status_indicator": "orb",
+        "status_indicator": "mechanical",
         "freeze_key": 1,
         "profile": "normal",
         "page": "home",

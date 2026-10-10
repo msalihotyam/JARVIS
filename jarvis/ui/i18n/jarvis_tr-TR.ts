@@ -3875,6 +3875,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>HUD küre</translation>
     </message>
     <message>
+        <source>Mechanical</source>
+        <translation>Mekanik</translation>
+    </message>
+    <message>
         <source>Freeze key</source>
         <translation>Dondurma tuşu</translation>
     </message>
@@ -4541,14 +4545,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Sonuç</translation>
     </message>
     <message>
-        <source>No model chosen</source>
-        <translation>Model seçilmedi</translation>
-    </message>
-    <message>
-        <source>CLI default</source>
-        <translation>CLI varsayılanı</translation>
-    </message>
-    <message>
         <source>JARVIS status: unconfirmed</source>
         <translation>JARVIS durumu: doğrulanmadı</translation>
     </message>
@@ -4595,6 +4591,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Running</source>
         <translation>Çalışıyor</translation>
+    </message>
+    <message>
+        <source>Selected provider: %1</source>
+        <translation>Seçili sağlayıcı: %1</translation>
+    </message>
+    <message>
+        <source>Selected provider</source>
+        <translation>Seçili sağlayıcı</translation>
     </message>
     <message>
         <source>FROZEN</source>

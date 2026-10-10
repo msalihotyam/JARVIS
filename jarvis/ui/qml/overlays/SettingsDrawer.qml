@@ -80,9 +80,12 @@ ContextPanel {
                 Text { text: qsTr("Ambient effects"); width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font: Theme.body }
                 Segmented { accent: Theme.materialBlue; value: bridge.ambientEffects ? "on" : "off"; options: [{value:"on",label:qsTr("On")},{value:"off",label:qsTr("Off")}]; onPicked: function(v) { bridge.setAmbientEffects(v === "on") } }
             }
-            Row { width: parent.width; spacing: 18
-                Text { text: qsTr("Status indicator"); width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font: Theme.body }
-                Segmented { accent: Theme.materialBlue; objectName: "statusIndicatorChoice"; value: bridge.statusIndicator; options: [{value:"orb",label:qsTr("Canonical Orb")},{value:"hud",label:qsTr("HUD Orb")}]; onPicked: function(v) { bridge.setStatusIndicator(v) } }
+            // Three skins (6G S1 adds the mechanical lamp): the choice sits under the label, like the freeze key.
+            Column { width: parent.width; spacing: 8
+                Text { text: qsTr("Status indicator"); color: Theme.textLabel; font: Theme.body }
+                Segmented { accent: Theme.materialBlue; objectName: "statusIndicatorChoice"; segmentPrefix: "statusIndicator_"; value: bridge.statusIndicator
+                    options: [{value:"mechanical",label:qsTr("Mechanical")},{value:"orb",label:qsTr("Canonical Orb")},{value:"hud",label:qsTr("HUD Orb")}]
+                    onPicked: function(v) { bridge.setStatusIndicator(v) } }
             }
             // Four skins do not fit beside the 190 px label: the choice sits under it.
             Column { width: parent.width; spacing: 8

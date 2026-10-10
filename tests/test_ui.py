@@ -66,6 +66,17 @@ from tests.test_intent import (  # noqa: E402
 _APP = QGuiApplication.instance() or QGuiApplication([])
 
 
+def open_model_panel(root, then=None) -> None:
+    """6G U1 (G6TB1B): the top card names only the brand and opens nothing, so
+    the model panel - without an opener of its own until its new home is
+    decided - is opened through Main.toggleModel, the call the card made."""
+    QMetaObject.invokeMethod(root, "toggleModel")
+    if then is not None:
+        settled(260, then)
+    else:
+        pump(260)
+
+
 def pump(ms: int = 0) -> None:
     """Turn the GUI loop for ``ms`` while RELEASING the GIL between turns.
 
@@ -937,8 +948,10 @@ class PresentationTests(UiTestCase):
         from PySide6.QtCore import QPoint, QPointF
         bridge = self.bridge()
         root = self.window(bridge)
+        # 6G U1 (G6TB1B): the top card is brand-only and inert - it is no trigger any more.
+        self.click(root, "brandCard")
+        self.assertFalse(any(root.property(key) for key in ("settingsOpen", "modelOpen", "navOpen")))
         for trigger, state, surface in (("settingsOrb", "settingsOpen", "settingsSurface"),
-                                        ("modelTrigger", "modelOpen", "modelSurface"),
                                         ("navigationTrigger", "navOpen", "navSurface")):
             with self.subTest(trigger=trigger):
                 self.click(root, trigger, then=lambda: (
@@ -966,7 +979,7 @@ class PresentationTests(UiTestCase):
                     self.assertFalse(root.property(state)),
                 ))
         self.click(root, "settingsOrb")
-        self.click(root, "modelTrigger", then=lambda: (
+        open_model_panel(root, then=lambda: (
             self.assertFalse(root.property("settingsOpen")),
             self.assertTrue(root.property("modelOpen")),
         ))
@@ -1003,8 +1016,12 @@ class PresentationTests(UiTestCase):
                     self.assertLessEqual(corner().x(), width)
                     self.assertLessEqual(corner().y(), height)
                     self.assertGreater(composer.width(), 360)
-                    for trigger, surface in (("settingsOrb", "settingsSurface"), ("modelTrigger", "modelSurface"), ("navigationTrigger", "navSurface")):
-                        self.click(root, trigger)
+                    # 6G U1: no top-card trigger; the model panel still fits when it is open.
+                    for trigger, surface in (("settingsOrb", "settingsSurface"), (None, "modelSurface"), ("navigationTrigger", "navSurface")):
+                        if trigger is None:
+                            open_model_panel(root)
+                        else:
+                            self.click(root, trigger)
                         body = self.item(root, surface)
                         at = lambda: body.mapToScene(QPointF(0, 0))  # noqa: E731 - K4: window coordinates (the nav menu is a popup)
                         settle(lambda: at().x() >= 0 and at().y() >= 80 and at().x() + body.width() <= width
@@ -1217,7 +1234,10 @@ class StatusIndicatorTests(UiTestCase):
 
     def test_lamp_binds_to_real_execution_state_and_skin_persists(self) -> None:
         bridge = self.bridge()
-        self.assertEqual("orb", bridge.statusIndicator)
+        # 6G S1 (G6TB1B): the mechanical lamp is the default skin; the glass orb, this
+        # test's subject, stays a choice (tests/test_g6tb1_placement.py covers the lamp).
+        self.assertEqual("mechanical", bridge.statusIndicator)
+        bridge.setStatusIndicator("orb")
         root = self.window(bridge)
         lamp = self.item(root, "statusOrb")
         self.assertTrue(lamp.property("lit"))
@@ -1423,12 +1443,15 @@ class CommandHeaderTests(UiTestCase):
 
     def test_header_composition_holds_and_the_core_dominates(self) -> None:
         bridge = self.bridge()
+        # 6G (G6TB1B): the instrument-size orb skin; the mechanical lamp's 120 px slot is
+        # covered in tests/test_g6tb1_placement.py. The card is U1's brand-only card.
+        bridge.setStatusIndicator("orb")
         root = self.window(bridge)
         for width, height in ((1920, 1080), (1536, 864), (1280, 760)):
             root.resize(width, height)
             pump(600)
             core, strip, chip, lamp, kill, nav = self.boxes(
-                root, "jarvisCore", "commandStrip", "modelTrigger", "statusOrb",
+                root, "jarvisCore", "commandStrip", "brandCard", "statusOrb",
                 "killSwitchControl", "navigationTrigger")
             with self.subTest(size=(width, height)):
                 # The core is the dominant header element and keeps its centre
@@ -1447,12 +1470,12 @@ class CommandHeaderTests(UiTestCase):
                 order = [chip, lamp, kill, nav]
                 for left, right in zip(order, order[1:]):
                     self.assertLessEqual(left[2], right[0] + 1)
-                # Degradation never shrinks a control or the selector below a
-                # usable width; at the 1920 contract the selector is 304 px
-                # (the approved +24 px, taken to the left).
-                self.assertGreaterEqual(chip[2] - chip[0], 188)
+                # Degradation never shrinks a control or the card; U1's brand-only
+                # card keeps its own compact width at every size (it was the 304 px selector).
+                card = self.item(root, "brandCard")
+                self.assertAlmostEqual(card.implicitWidth(), chip[2] - chip[0], delta=0.6)
+                self.assertGreater(card.implicitWidth(), 60)
                 if width == 1920:
-                    self.assertAlmostEqual(304, chip[2] - chip[0], delta=0.6)
                     self.assertAlmostEqual(1562, chip[2], delta=1.0, msg="the selector's right edge stays where it was")
                 self.assertGreaterEqual(lamp[2] - lamp[0], 56)
                 self.assertGreaterEqual(kill[2] - kill[0], 44)
@@ -1469,17 +1492,17 @@ class CommandHeaderTests(UiTestCase):
     def test_selector_shows_real_model_state_and_opens_its_own_panel(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
-        chip = self.item(root, "modelTrigger")
+        # 6G U1/M3 (G6TB1B): the model name is the composer's Model chip; the top card
+        # names the brand only, and the model panel opens without it.
+        chip = self.item(root, "modelMenuChip")
         # Nothing configured: the CLI's own default, never an invented name.
         self.assertFalse(bridge.config["claude_model"])
-        self.assertEqual("CLI default", chip.property("modelName"))
-        self.assertIn("ANTHROPIC", chip.property("metadata"))
-        self.assertFalse(chip.property("open"))
+        self.assertEqual("CLI default", chip.property("currentName"))
+        self.assertEqual("ANTHROPIC", self.item(root, "brandName").property("text"))
+        self.assertFalse(root.property("modelOpen"))
 
-        self.click(root, "modelTrigger")
-        settled(300, lambda: (
+        open_model_panel(root, then=lambda: (
             self.assertTrue(root.property("modelOpen")),
-            self.assertTrue(chip.property("open")),
         ))
         # The model list is collapsed until it is asked for; a choice is persisted
         # at once, with no separate Apply step.
@@ -1501,7 +1524,7 @@ class CommandHeaderTests(UiTestCase):
         QMetaObject.invokeMethod(self.item(root, "claudeModel_opus[1m]"), "chosen")
         pump(250)
         self.assertEqual("claude-opus-5[1m]", self.store.load().settings.claude_model)
-        self.assertEqual("Opus 5", chip.property("modelName"))                    # short name, canonical id stored
+        self.assertEqual("Opus 5", chip.property("currentName"))                  # short name, canonical id stored
         self.assertEqual(0, self.execute_calls())
 
 class LeftContextTests(UiTestCase):
@@ -2376,8 +2399,8 @@ class ConversationSurfaceTests(UiTestCase):
         settled(300, lambda: (
             self.assertFalse(root.property("peekOpen")),
         ))
-        # Only one context at a time: a peek closes the model panel.
-        self.click(root, "modelTrigger")
+        # Only one context at a time: a peek closes the model panel (6G U1: opened without the card).
+        open_model_panel(root)
         settled(300, lambda: (
             self.assertTrue(root.property("modelOpen")),
         ))
@@ -2605,7 +2628,7 @@ class GlassMaterialTests(UiTestCase):
             b = it.mapToScene(QPointF(it.width(), it.height()))
             return tuple(round(v, 1) for v in (a.x(), a.y(), b.x(), b.y()))
 
-        before = [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "modelTrigger", "railTasks", "jarvisCore")]
+        before = [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "brandCard", "railTasks", "jarvisCore")]
         # Primary shell ~54 %, secondary shell ~66 %; the composer (interactive) ~89 %.
         self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
         self.assertAlmostEqual(0.66, self.alpha(self.item(root, "railTasks")), delta=0.03)
@@ -2620,7 +2643,7 @@ class GlassMaterialTests(UiTestCase):
         pump(300)
         self.assertGreaterEqual(self.alpha(self.item(root, "canonicalWorkspace"), "fill"), 0.88)
         self.assertGreaterEqual(self.alpha(self.item(root, "railTasks")), 0.88)
-        self.assertEqual(before, [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "modelTrigger", "railTasks", "jarvisCore")])
+        self.assertEqual(before, [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "brandCard", "railTasks", "jarvisCore")])
         bridge.setAmbientEffects(True)
         pump(300)
         self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
@@ -2820,7 +2843,8 @@ class TypographyTests(UiTestCase):
         faces = load_fonts()
         quiet, _, strong, sw = faces["ui"], faces["ui"], faces["uiStrong"], faces["uiStrongWeight"]
         self.assertEqual((quiet, 20), (font("welcomeSupport").family(), font("welcomeSupport").pixelSize()))
-        self.assertEqual((strong, 18, sw), (font("selectorModelText").family(), font("selectorModelText").pixelSize(), font("selectorModelText").weight()))
+        # 6G U1 (G6TB1B): the top card's one text is the brand, a tracked 13 px semibold caption (was the 18 px model name).
+        self.assertEqual((strong, 13, sw), (font("brandName").family(), font("brandName").pixelSize(), font("brandName").weight()))
         self.assertEqual((strong, 16), (font("workflowCounter").family(), font("workflowCounter").pixelSize()))   # a small numeral sits in the interface face
         # Gate 6F (L2 f): the small tile - a 26 px figure, a 13 px semibold title.
         self.assertEqual(("Space Grotesk", 26), (font("railCountTasks").family(), font("railCountTasks").pixelSize()))
@@ -2926,27 +2950,23 @@ class LocalFitTests(UiTestCase):
         for width, height in self.sizes:
             root.resize(width, height)
             pump(450)
-            badge = self.item(root, "selectorBadge")
-            logo = self.item(root, "selectorLogo")
+            # 6G U1 (G6TB1B): the card is the socket and the brand; the model and the
+            # route line (effort) moved to the composer's chips.
+            badge = self.item(root, "brandSocket")
+            logo = self.item(root, "brandLogo")
             if native_fonts:
                 self.assertLessEqual(logo.width(), badge.width() - 6)
             self.assertLessEqual(logo.height(), badge.height() - 6)
-            for name in ("selectorModelText", "selectorMetadataText"):
-                label = self.item(root, name)
-                self.assertTrue(label.isVisible())
-                self.assertGreater(label.width(), 90)
-                if native_fonts and name == "selectorModelText":
-                    self.assertLessEqual(label.property("contentWidth"), label.width(), (width, name, label.property("text")))
-                    self.assertFalse(label.property("truncated"), (width, name, label.property("text")))
-                if name == "selectorMetadataText":
-                    # The route line never drops below the ramp (the typography rescue
-                    # retired the shrink to 9 px): where the real route cannot fit, the
-                    # tracking goes first and what remains is elided, never a hairline.
-                    font = label.property("font")
-                    self.assertGreaterEqual(font.pixelSize(), 12, (width, name))
-                    if native_fonts and label.property("truncated"):
-                        self.assertEqual(0, font.letterSpacing(), (width, name, label.property("text")))
-                self.assertLessEqual(label.parentItem().height(), self.item(root, "modelTrigger").height() - 12)
+            label = self.item(root, "brandName")
+            self.assertTrue(label.isVisible())
+            self.assertEqual("ANTHROPIC", label.property("text"))
+            self.assertGreaterEqual(label.property("font").pixelSize(), 12, width)
+            if native_fonts:
+                self.assertFalse(label.property("truncated"), (width, label.property("text")))
+            card = self.item(root, "brandCard")
+            self.assertLessEqual(label.parentItem().height(), card.height() - 12)
+            self.assertLessEqual(label.mapToItem(card, QPointF(label.width(), 0)).x(), card.width() - 12)
+            self.assertNotIn("MEDIUM", label.property("text"))
         self.assertEqual(0, self.execute_calls())
 
 
@@ -4334,7 +4354,7 @@ class ProviderSelectionTests(UiTestCase):
              "quota": {"groups": self.GOOGLE_GROUPS}},
             {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         return root
 
@@ -4392,8 +4412,10 @@ class ProviderSelectionTests(UiTestCase):
         self.assertEqual({"provider": "codex", "codex_model": "gpt-5.6-luna", "codex_effort": "medium",
                           "claude_lane": "", "claude_lane_model": ""}, saved)
         bridge.setCodexModel("gpt-5.6-luna", "low")
-        trigger = self.item(root, "modelTrigger")                                        # the header names the real choice
-        self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (trigger.property("modelName"), trigger.property("metadata")))
+        # The header names the real brand (6G U1); the model is the composer's Model chip, the card data stays whole.
+        self.assertEqual("OPENAI", self.item(root, "brandName").property("text"))
+        self.assertEqual("5.6 Luna", self.item(root, "modelMenuChip").property("currentName"))
+        self.assertEqual(("5.6 Luna", "OPENAI  |  LOW"), (bridge.modelCard["name"], bridge.modelCard["meta"]))
         primary = self.item(root, "codexQuota_primary")
         self.assertEqual((96, "5-hour window"), (primary.property("remaining"), primary.property("label")))
         self.assertIn("does not report it", self.item(root, "codexActualModelLine").property("note"))
@@ -4447,9 +4469,9 @@ class ProviderSelectionTests(UiTestCase):
                 patch.object(subprocess, "Popen", side_effect=popen):
             root = self.window(bridge)
             for _ in range(5):                                           # open / close the selector five times
-                self.click(root, "modelTrigger")
+                open_model_panel(root)
                 pump(200)
-                self.click(root, "modelTrigger")
+                open_model_panel(root)
                 pump(100)
             google = bridge.providers[2]
             self.assertEqual(("google", "unavailable", False), (google["id"], google["status"], "quota" in google))
@@ -4474,13 +4496,13 @@ class ProviderSelectionTests(UiTestCase):
         root = self.window(bridge)
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "medium")
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         settled(400, lambda: (
             self.assertEqual("5.6 Sol", self.item(root, "codexModel_gpt-5.6-sol").property("title")),
             self.assertIn("Listed by Codex - not tried yet", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
             self.assertIn("gpt-5.6-sol", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),   # the canonical id stays visible
         ))
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         # A real failure: named provider, model and reason; no raw output; nothing falls back to Claude.
         self.codex.error = StructuredError(ErrorCode.CONNECTOR_FAILED, "Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.")
@@ -4490,12 +4512,12 @@ class ProviderSelectionTests(UiTestCase):
             self.assertEqual("UNDERSTANDING FAILED: Codex · gpt-5.6-sol: Codex reported: The model is not available for your plan.", bridge.feed[-1]["text"]),
             self.assertEqual((0, [("gpt-5.6-sol", "medium")]), (len(self.model.calls), self.codex_routes)),
         ))
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         settled(400, lambda: (
             self.assertIn("Failed this session: ", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
             self.assertIn("not available for your plan", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
         ))
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         # The same model answering later is recorded as usable.
         self.codex.error, self.codex.answers = None, [proposal(kind="chat", reply="Merhaba! Ben JARVIS.")]
@@ -4503,7 +4525,7 @@ class ProviderSelectionTests(UiTestCase):
         settled(300, lambda: (
             self.assertEqual(("jarvis", "Merhaba! Ben JARVIS.", "idle"), (self.kinds(bridge)[-1], bridge.feed[-1]["text"], bridge.coreState)),
         ))
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         settled(400, lambda: (
             self.assertIn("Answered this session", self.item(root, "codexModel_gpt-5.6-sol").property("meta")),
             self.assertEqual(0, len(self.model.calls)),
@@ -4551,11 +4573,11 @@ class ProviderCatalogUiTests(UiTestCase):
         self.assertEqual(["claude", "codex", "google"], sorted(pid for pid, _ in calls))
         calls.clear()
         for _ in range(10):
-            self.click(root, "modelTrigger")
+            open_model_panel(root)
             pump(60)
             self.assertTrue(root.property("modelOpen"))
             self.assertEqual("Subscription route verified", self.item(root, "providerRow_claude").property("meta"))
-            self.click(root, "modelTrigger")
+            open_model_panel(root)
             pump(40)
         self.assertEqual([], calls)                                       # within the TTL: zero probe sets
         self.assertEqual(0, self.execute_calls())
@@ -4686,7 +4708,7 @@ class ModelMigrationUiTests(UiTestCase):
         bridge = self.bridge()
         self.fake_providers(bridge, [self.claude_line("claude-opus-5-5[1m]")])
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         self.click(root, "claudeModelField")
         pump(200)
@@ -5396,11 +5418,13 @@ class ModelCardTests(SurfaceCase):
         bridge.applyModel("claude-sonnet-5", "high")
         root = self.window(bridge)
         pump(200)
-        trigger = self.item(root, "modelTrigger")
-        self.assertEqual(("Sonnet 5", "ANTHROPIC  |  HIGH"), (trigger.property("modelName"), trigger.property("metadata")))
-        self.assertTrue(self.item(root, "selectorQuota").property("visible"))
-        self.assertTrue(self.item(root, "selectorQuota_five_hour").property("visible"))
-        self.click(root, "modelTrigger")
+        # 6G U1/U2 (G6TB1B): the top card names the brand only; the summary is the composer's
+        # usage ring (8 % of the 5-hour window used) and the card data stays whole.
+        self.assertEqual(("Sonnet 5", "ANTHROPIC  |  HIGH"), (bridge.modelCard["name"], bridge.modelCard["meta"]))
+        self.assertEqual("ANTHROPIC", self.item(root, "brandName").property("text"))
+        self.assertTrue(self.item(root, "usageRing").property("visible"))
+        self.assertEqual("8%", self.item(root, "usageRingText").property("text"))
+        open_model_panel(root)
         pump(400)
         bar = self.item(root, "claudeQuota_five_hour")
         self.assertEqual((92, True), (bar.property("remaining"), bar.property("exact")))
@@ -5984,7 +6008,7 @@ class ScrollOwnershipTests(SurfaceCase):
         # The model panel is open and the pointer is over it: the conversation stays put.
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 200.0))
         pump(200)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         self.wheel(root, self.item(root, "modelSurface"))
         self.assertEqual(200.0, feed.property("contentY"))
@@ -5993,7 +6017,7 @@ class ScrollOwnershipTests(SurfaceCase):
         self.assertEqual(200.0, feed.property("contentY"))
         # Closed again, the wheel belongs to the conversation once more: blocking
         # the wheel must not leave the surface holding it afterwards.
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         settled(600, lambda: (
             self.assertFalse(self.item(root, "modelSurface").isVisible()),
         ))
@@ -6024,16 +6048,12 @@ class GlassStateTests(SurfaceCase):
     def test_the_card_and_the_composer_darken_by_state_and_never_the_content(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
-        trigger = self.item(root, "modelTrigger")
-        idle = trigger.property("body")
-        self.assertEqual(1.0, self.item(root, "selectorModelText").property("opacity"))
-        trigger.setProperty("open", True)
-        pump(300)
-        active = trigger.property("body")
-        self.assertGreater(active.alphaF(), idle.alphaF())                    # open is the denser surface
-        self.assertEqual(1.0, self.item(root, "selectorModelText").property("opacity"))
-        trigger.setProperty("open", False)
-        pump(300)
+        # 6G U1 (G6TB1B): the top card is brand-only and inert - no open state to darken
+        # into (it was the selector); what it reads stays fully opaque.
+        card = self.item(root, "brandCard")
+        self.assertIsNone(card.property("open"))
+        self.assertEqual(1.0, self.item(root, "brandName").property("opacity"))
+        self.assertEqual(1.0, card.property("opacity"))
         # The composer follows the same progression, and its text stays fully opaque.
         self.item(root, "canonicalComposer")
         text = self.item(root, "composerInput")
@@ -6101,12 +6121,12 @@ class FinalPolishTests(SurfaceCase):
         stack = self.item(root, "panelColumn")
         before = (work.x(), work.y(), work.width(), work.height(), stack.x(), stack.width())
         self.assertEqual((1107.0, 386.0), (work.width(), stack.width()))      # Gate 6F: after the sidebar; the stack unchanged
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         model = self.item(root, "modelSurface")
         self.assertGreaterEqual(self.alpha(model), 0.94)                        # nothing behind reads through
         self.assertEqual(1, QQmlProperty.read(model, "border.width"))           # one principal edge
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         self.click(root, "settingsOrb")
         pump(300)
@@ -6194,7 +6214,7 @@ class FinalPolishTests(SurfaceCase):
                                                             "seven_day": {"utilization": 0.92, "resets_at": 1789814410}}}
         bridge.applyModel("claude-sonnet-5", "")
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         five = self.item(root, "claudeQuota_five_hour")
         week = self.item(root, "claudeQuota_seven_day")
@@ -6250,7 +6270,7 @@ class FinalPolishTests(SurfaceCase):
         from PySide6.QtCore import QPointF
         bridge = self.bridge()
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)
         field = self.item(root, "claudeModelField")
         field.forceActiveFocus()
@@ -7299,7 +7319,7 @@ class PresentationTypographyTests(SurfaceCase):
             return found
 
         self.assertEqual([], not_native(), "home")
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         self.assertEqual([], not_native(), "model panel")
         QTest.keyClick(root, Qt.Key_Escape)
         pump(300)
@@ -7606,7 +7626,7 @@ class PrePolishTests(SurfaceCase):
              "quota": {"groups": [{"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-09-16T01:56:18Z"}]}]}},
             {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [], "research": False}])
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         names = [str(i.objectName()) for i in self.all_items(root)]
         for gone in ("providerDetails_google", "modelField", "claudeAttachmentLine", "codexAttachmentLine"):
@@ -8375,8 +8395,11 @@ class TypographySystemTests(SurfaceCase):
             seen += [("peek " + key,) + t for t in self.shown_texts(root)]
             QTest.keyClick(root, Qt.Key_Escape)
             pump(300)
-        for opener in ("modelTrigger", "settingsOrb"):
-            self.click(root, opener)
+        for opener in ("modelPanel", "settingsOrb"):        # 6G U1: the model panel has no card opener
+            if opener == "modelPanel":
+                open_model_panel(root)
+            else:
+                self.click(root, opener)
             pump(400)
             seen += [(opener,) + t for t in self.shown_texts(root)]
             QTest.keyClick(root, Qt.Key_Escape)

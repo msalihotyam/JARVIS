@@ -459,6 +459,15 @@ Item {
                 levels: modelMenu.levels; value: modelMenu.effort; recommended: modelMenu.recommended
                 onPicked: function(level) { modelMenu.setEffort(level) }
             }
+            // 6G U2/U3: the provider-reported usage, right of Model and Effort; its
+            // popover opens above it. Only reported rows (bridge.modelCard.quota).
+            UsageRing {
+                anchors.verticalCenter: parent.verticalCenter
+                readonly property string providerId: (bridge.modelCard || {}).provider || ""
+                readonly property var known: (bridge.providers || []).filter(function(p) { return p.id === providerId })[0]
+                provider: known && known.vendor ? known.vendor : ({ claude: "Anthropic", codex: "OpenAI" })[providerId] || ""
+                rows: (bridge.modelCard || {}).quota || []
+            }
         }
     }
 }

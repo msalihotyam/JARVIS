@@ -26,7 +26,7 @@ from tests.test_projects_ui import ProjectsUiCase
 from tests.test_projects_ui_6e import WindowCase as SixEWindowCase, settle
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.helpers import settled
-from tests.test_ui import UiTestCase, _APP, ambient_on, pump
+from tests.test_ui import UiTestCase, _APP, ambient_on, open_model_panel, pump
 
 EFFORTS = ["low", "medium", "high"]
 
@@ -148,7 +148,7 @@ class WindowCase(ProjectsUiCase):
         self.fake_providers(bridge, self.lines())
         bridge.setChatProvider(provider)
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         return root
 
@@ -260,7 +260,7 @@ class WindowTests(WindowCase):
         bridge.setChatProvider("codex")
         bridge.setCodexModel("gpt-5.6-sol", "high")
         root = self.window(bridge)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         self.assertIn("gpt-5.6-sol", self.listed(root, "codexModel_"))
         self.assertIn("6.1 Sol", self.shown(root, "modelNewerHintText").property("text"))
@@ -326,7 +326,7 @@ class PolishTests(WindowCase):
         if size:
             root.resize(*size)
             pump(300)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         self.root = root
         return bridge, root
@@ -396,9 +396,9 @@ class PolishTests(WindowCase):
         # Space does the same, again from a fresh old selection.
         bridge.applyModel("claude-opus-4-7", "", "claude-opus-4-7")
         pump(100)
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(300)                   # close and reopen: the panel re-reads the selection
-        self.click(root, "modelTrigger")
+        open_model_panel(root)
         pump(400)
         hint = self.shown(root, "modelNewerHint")
         hint.forceActiveFocus()

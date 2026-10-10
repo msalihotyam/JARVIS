@@ -39,7 +39,8 @@ Item {
     property bool modelOpen: false
     property Item controlLayer: null
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
-    readonly property point modelAnchor: Qt.point(controls.x + modelChip.x, controls.y + modelChip.height + 16)
+    // Under the strip, where the 54 px selector's panel always opened (ContextPanel caps it from there).
+    readonly property point modelAnchor: Qt.point(controls.x + brandCard.x, controls.y + controls.height + 14)
     readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
     readonly property point navAnchor:Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
     readonly property Item navTrigger: navigationTrigger        // K4: the nav menu's opener and toggle
@@ -62,17 +63,23 @@ Item {
     readonly property real stripGap: compact ? 8 : 12
     readonly property real tickerNeed: 88
     readonly property real ticker0: coreEdge + 20
-    readonly property real stripFixed: Theme.stripStatus + Theme.stripKill + 38 + 13 + 106 + 5 * stripGap
+    // 6G S1: the status slot sizes per skin - the mechanical lamp 120 px, the orbs their instrument size.
+    readonly property bool mechanical: bridge.statusIndicator === "mechanical"
+    readonly property real statusSlot: mechanical ? 120 : Theme.stripStatus
+    readonly property real stripFixed: statusSlot + Theme.stripKill + 38 + 13 + 106 + 5 * stripGap
     readonly property real stripRoom: width - Math.round(width * Theme.macroStripRight)
                                       - (ticker0 + tickerNeed + 10)
     readonly property real selectorMax: stripRoom - stripFixed
-    readonly property bool tickerFits: !Theme.command && selectorMax >= 188
-    // The card carries the plan summary on its right when a provider reported
-    // one, so it is allowed that much more width - never at the cost of the
-    // controls, and never past the room the strip really has.
-    readonly property real selectorExtra: ((bridge.modelCard || {}).quota || []).length > 0 ? 150 : 0
-    readonly property real selectorWidth: tickerFits ? Math.min(Theme.chipWidth(width) + selectorExtra, selectorMax)
-                                                     : Theme.chipWidth(width)
+    // 6G U1: the card names only the brand, so it keeps its own compact width.
+    readonly property bool tickerFits: !Theme.command && selectorMax >= brandCard.implicitWidth
+    // What the status instrument says, for every skin: the real execution state, in words.
+    readonly property string statusName: bridge.executionState === "unconfirmed" ? qsTr("JARVIS status: unconfirmed") : bridge.configRefused ? qsTr("JARVIS status: configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS status: frozen") : bridge.executionState === "freeze_requested" ? qsTr("JARVIS status: freeze requested") : (bridge.busy ? qsTr("JARVIS status: running an operation") : qsTr("JARVIS status: ready"))
+    readonly property string statusTip: bridge.executionState === "unconfirmed" ? qsTr("JARVIS state unconfirmed") : bridge.configRefused ? qsTr("Configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS frozen") : bridge.executionState === "freeze_requested" ? qsTr("Freeze requested") : (bridge.busy ? qsTr("Running · operation in progress") : qsTr("Running"))
+    // The mechanical lamp's state (K3): it moves only on a confirmed running state.
+    // Unconfirmed, refused or anything else unknown stands still like frozen - never "ready".
+    readonly property string lampState: bridge.configRefused ? "frozen"
+                                        : bridge.executionState === "running" ? (bridge.busy ? "running" : "ready")
+                                        : bridge.executionState === "freeze_requested" ? "freezing" : "frozen"
 
     // -- header linework ------------------------------------------------------
     // The reference runs one fine cyan line across the header, broken around
@@ -380,46 +387,71 @@ Item {
         spacing: bar.stripGap
         readonly property real mid: Theme.stripHeight / 2
 
-        ModelSelector {
-            id: modelChip
-            objectName: "modelTrigger"
+        // 6G U1: the selected provider's BRAND only - socket and name, nothing
+        // else (no model, no usage) and no action: the model and effort chips and
+        // the usage ring sit under the composer.
+        Item {
+            id: brandCard
+            objectName: "brandCard"
             y: controls.mid - height / 2
-            width: bar.selectorWidth; height: Theme.stripSelectorHeight
-            open: bar.modelOpen
-            // One shape for every provider: the SHORT model name, then
-            // BRAND | EFFORT, then the plan summary - all real reported state
-            // (bridge.modelCard). The canonical model id is unchanged by this.
-            readonly property var card: bridge.modelCard || ({})
-            // Claude with nothing configured really is "whatever the CLI picks";
-            // Codex has no default at all, so there the truth is "no model chosen".
-            modelName: card.name ? card.name : card.provider === "claude" ? qsTr("CLI default") : qsTr("No model chosen")
-            metadata: card.meta || ""
-            quota: card.quota || []
-            onActivated: bar.openModel()
+            implicitWidth: brandRow.width + 28; width: implicitWidth; height: 44
+            readonly property string brand: (bridge.modelCard || {}).brand || ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: qsTr("Selected provider: %1").arg(brand)
+            Rectangle { anchors.fill: parent; radius: 8; color: Theme.glassControlIdle; border.width: 1; border.color: Theme.alpha("#57b6e4", 0.4) }
+            Row {
+                id: brandRow
+                x: 12; anchors.verticalCenter: parent.verticalCenter
+                spacing: 10
+                Rectangle {
+                    objectName: "brandSocket"
+                    width: 24; height: 24; radius: 6; color: "transparent"
+                    border.width: 1; border.color: Theme.alpha("#57b6e4", 0.55)
+                    Text { objectName: "brandLogo"; anchors.centerIn: parent; text: "AI"; color: "#dbeeff"; font: Theme.captionStrong }
+                }
+                Text { objectName: "brandName"; anchors.verticalCenter: parent.verticalCenter
+                       text: brandCard.brand; color: Theme.text; font: Theme.tracked(Theme.captionStrong, 2) }
+            }
+            HoverTip { text: qsTr("Selected provider") }
         }
 
-        // Execution state: the glass lamp, at instrument scale. It indicates
-        // only - the Kill Switch beside it is the control.
+        // Execution state, in the skin the person chose: the glass lamp at
+        // instrument scale, or the mechanical lamp (6G S1), which hangs from 4 px
+        // under the window edge and overlaps the right column's top by design.
+        // It indicates only - the Kill Switch beside it is the control.
         Item {
-            width: Theme.stripStatus; height: Theme.stripHeight
+            objectName: "statusSlot"
+            width: bar.statusSlot; height: Theme.stripHeight
             y: controls.mid - height / 2
+            Loader {
+                objectName: "mechanicalSlot"
+                active: bar.mechanical
+                anchors.horizontalCenter: parent.horizontalCenter
+                y: 4 - controls.anchors.topMargin
+                sourceComponent: MechanicalLamp {
+                    size: 120
+                    executionState: bar.lampState
+                    Accessible.name: bar.statusName
+                    HoverTip { text: bar.statusTip }
+                }
+            }
             StatusOrb {
                 id: statusOrb
                 objectName: "statusOrb"
+                visible: !bar.mechanical
                 anchors.centerIn: parent
                 diameter: Theme.stripStatus
                 // An unconfirmed change never shows the reassuring enabled glow.
                 lit: bridge.executionState === "running"
                 skin: bridge.statusIndicator
                 Accessible.role: Accessible.Indicator
-                Accessible.name: bridge.executionState === "unconfirmed" ? qsTr("JARVIS status: unconfirmed") : bridge.configRefused ? qsTr("JARVIS status: configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS status: frozen") : bridge.executionState === "freeze_requested" ? qsTr("JARVIS status: freeze requested") : (bridge.busy ? qsTr("JARVIS status: running an operation") : qsTr("JARVIS status: ready"))
+                Accessible.name: bar.statusName
                 MouseArea { id: orbHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
                 Rectangle {
                     visible: orbHover.containsMouse
                     anchors.top: parent.bottom; anchors.topMargin: 2; anchors.horizontalCenter: parent.horizontalCenter
                     width: orbTip.width + 16; height: 24; radius: Theme.radiusTiny; color: Theme.surfaceRaised; border.width: 1; border.color: Theme.borderStrong; z: 50
-                    Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font: Theme.caption
-                        text: bridge.executionState === "unconfirmed" ? qsTr("JARVIS state unconfirmed") : bridge.configRefused ? qsTr("Configuration refused") : bridge.executionState === "frozen" ? qsTr("JARVIS frozen") : bridge.executionState === "freeze_requested" ? qsTr("Freeze requested") : (bridge.busy ? qsTr("Running · operation in progress") : qsTr("Running")) }
+                    Text { id: orbTip; anchors.centerIn: parent; color: Theme.text; font: Theme.caption; text: bar.statusTip }
                 }
             }
         }
