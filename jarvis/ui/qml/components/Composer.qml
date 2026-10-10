@@ -261,7 +261,8 @@ Item {
                     PathMove { x: 4; y: 9 } PathLine { x: 10; y: 9 }
                 }
             }
-            // Stop: the amber square inside a turning ring (still with ambient effects off).
+            // Stop: the amber square inside a turning ring (M2). The turn is a documented
+            // K2 rhythm: it loops only while a run is active and is static with ambient off.
             Rectangle { objectName: "composerStopSquare"; visible: sendButton.stopping; anchors.centerIn: parent
                         width: 10; height: 10; radius: 2; color: Theme.warning }
             Shape {
@@ -273,7 +274,7 @@ Item {
                     strokeColor: Theme.warning; strokeWidth: 1.6; fillColor: "transparent"; capStyle: ShapePath.RoundCap
                     PathAngleArc { centerX: 12; centerY: 12; radiusX: 11; radiusY: 11; startAngle: -90; sweepAngle: 270 }
                 }
-                RotationAnimation on rotation { from: 0; to: 360; duration: 1200; loops: Animation.Infinite
+                RotationAnimation on rotation { from: 0; to: 360; duration: Theme.dur(1200); loops: Animation.Infinite
                                                 running: sendButton.stopping && Theme.ambient }
             }
         }

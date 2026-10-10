@@ -52,6 +52,8 @@ EXCEPTIONS = (
     ("components/FreezeKeySwitch.qml", None,
      "the freeze switch lever (6G S2, Salih 2026-10-06): a toggle snaps (~80 ms + tiny settle), "
      "a knife switch swings slower and weighted; each move follows a real execution-state change"),
+    ("components/Composer.qml", 1200,
+     "the stop key's turning ring (M2): a rhythm only while a run is active, not a transition"),
 )
 # Loops allowed to run forever, each a rhythm of a real state or the ambient atmosphere.
 INFINITE = {
@@ -59,6 +61,8 @@ INFINITE = {
     "components/StatusOrb.qml": "the lit orb's breath",
     "components/FeedView.qml": "the live activity dots while work runs",
     "components/Background.qml": "the starfield twinkle",
+    # M2 ("existing STOP control ... amber square + spinning ring"): only while a run is active.
+    "components/Composer.qml": "the stop key's turning ring while a run is active",
 }
 ANIMATION = re.compile(r"\b(\w+(?:Animation|Animator))\s*(?:on [\w.]+\s*)?\{")
 DURATION = re.compile(r"\bduration:\s*([^;}\n]+?)\s*(?=[;}\n])")
