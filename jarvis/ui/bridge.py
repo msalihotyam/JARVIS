@@ -1453,6 +1453,54 @@ class Bridge(QObject):
         """End the current link. The folder itself is never touched."""
         return self._folder_change("unlink", project_id)
 
+    # 6H K1 "Klasör oluştur": the preview answer (the request's generation, the
+    # path or "", a notice) and the combined create answer (the new project's id
+    # or "" when no project was created, linked, the notice).
+    projectFolderPreviewed = Signal(int, str, str)
+    projectFolderCreated = Signal(str, bool, str)
+
+    @Slot(str, bool, int)
+    def previewProjectFolder(self, name: str, on_desktop: bool, generation: int) -> None:
+        """Where the folder WOULD go for this name (reads only), on the worker."""
+        def answer(payload: Any) -> None:
+            message = self._error_message(payload)
+            path = "" if message else str(payload.get("path") or "")
+            self.projectFolderPreviewed.emit(int(generation), path, self._folder_reason(message) if message else "")
+        self._run("project-folder-preview",
+                  lambda: self.backend.project_folder_preview(str(name), bool(on_desktop)), answer)
+
+    @Slot(str, str, bool)
+    def createProjectWithFolder(self, name: str, path: str, on_desktop: bool) -> None:
+        """ONE worker job: create the project, then create and link exactly
+        ``path`` (the shown one) for the id from THAT create's own answer."""
+        def work() -> dict:
+            created = self.backend.project_create(str(name))
+            project = created.get("project") if isinstance(created, dict) else None
+            if not isinstance(project, dict) or not project.get("id"):
+                return {"created": created}
+            return {"created": created, "project_id": str(project["id"]),
+                    "folder": self.backend.project_folder_create(str(project["id"]), str(path), bool(on_desktop))}
+        self._run("project-folder-create", work, self._folder_created)
+
+    def _folder_created(self, result: Any) -> None:
+        result = result if isinstance(result, dict) else {}
+        project_id = str(result.get("project_id") or "")
+        if not project_id:
+            message = self._error_message(result.get("created", result))
+            self._project_notice = message or tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "The project could not be created."))
+            self.refreshProjects()
+            self.projectFolderCreated.emit("", False, self._project_notice)
+            return
+        folder = result.get("folder")
+        message = self._error_message(folder)
+        notice = self._folder_reason(message) if message else ""
+        created = folder.get("created") if message and isinstance(folder, dict) else None
+        if isinstance(created, list) and created:
+            notice += "\n" + "\n".join(str(path) for path in created)
+        self._project_notice, self._project_folder_notice = "", notice
+        self.refreshProjects()
+        self.projectFolderCreated.emit(project_id, not message, notice)
+
     @Slot(result="QVariantList")
     def projectChoices(self) -> list:
         """The selector's projects: active ones only, by name."""

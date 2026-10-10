@@ -619,6 +619,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Proje deposuna ulaşılamıyor.</translation>
     </message>
     <message>
+        <source>The project could not be created.</source>
+        <translation>Proje oluşturulamadı.</translation>
+    </message>
+    <message>
         <source>The choice changed after the preview; check the new preview and confirm again.</source>
         <translation>Seçim önizlemeden sonra değişti; yeni önizlemeyi kontrol edip yeniden onaylayın.</translation>
     </message>
@@ -2335,6 +2339,10 @@ yok</translation>
         <translation>Proje oluşturuldu, ama klasör bağlanmadı: %1</translation>
     </message>
     <message>
+        <source>The project was created, but its folder was not: %1</source>
+        <translation>Proje oluşturuldu, ama klasörü oluşturulamadı: %1</translation>
+    </message>
+    <message>
         <source>Project name</source>
         <translation>Proje adı</translation>
     </message>
@@ -2371,12 +2379,32 @@ yok</translation>
         <translation>Göz at…</translation>
     </message>
     <message>
+        <source>Create a folder</source>
+        <translation>Klasör oluştur</translation>
+    </message>
+    <message>
+        <source>On the Desktop</source>
+        <translation>Masaüstünde</translation>
+    </message>
+    <message>
         <source>No folder. A project can always be created without one.</source>
         <translation>Klasör yok. Proje her zaman klasörsüz de oluşturulabilir.</translation>
     </message>
     <message>
+        <source>Type a name to see where the folder will be created.</source>
+        <translation>Klasörün nerede oluşturulacağını görmek için bir ad yazın.</translation>
+    </message>
+    <message>
+        <source>Finding the folder&apos;s place…</source>
+        <translation>Klasörün yeri belirleniyor…</translation>
+    </message>
+    <message>
         <source>Remove</source>
         <translation>Kaldır</translation>
+    </message>
+    <message>
+        <source>JARVIS creates exactly this folder when you click Create project. </source>
+        <translation>Proje oluştur&apos;a tıkladığında JARVIS tam olarak bu klasörü oluşturur. </translation>
     </message>
     <message>
         <source>JARVIS does not read this folder, write into it or send it to the model: it is context for you only.</source>
@@ -2405,6 +2433,10 @@ yok</translation>
     <message>
         <source>Link folder</source>
         <translation>Klasörü bağla</translation>
+    </message>
+    <message>
+        <source>OK</source>
+        <translation>Tamam</translation>
     </message>
 </context>
 <context>

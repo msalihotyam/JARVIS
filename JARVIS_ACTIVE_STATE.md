@@ -41,6 +41,15 @@ native `test_ui` crash group (0xC0000005, 32 ids) green under rule D (3 split
 groups and the crash-point tests alone all pass; TUICRASH ff1b4fd on main
 fixes the crash). Next: conveyor push gate.
 
+**G6H1K (6H H1b folder creation, K1 popup, T2) green, 2026-10-10:** on lane
+branch `worktree-G6H1K` (base 46a040f, G6H2 present), not integrated;
+"Klasör oluştur" (+ "Masaüstünde") in the new-project popup, D1 path
+recomputed and required equal, creation inside the store's one transaction
+(`project_folders.create_and_link`, origin `created`), held no-follow
+handles with handle-relative `NtCreateFile`, nothing removed, link state read
+back. Independent review: 1 MAJOR + 2 MINOR, all fixed. Targeted (10 modules)
+727 OK; full suite 5315/0/0 (601 s, skipped 2). Next: integrate on "entegre et".
+
 **G6R1C (6G R1 background run, T2) green, 2026-10-10:** on lane branch
 `worktree-6g-r1b` (base 0e2e746), not integrated; bridge run record (memory
 only), navigation lifted for recorded runs, running-only refusals, preview

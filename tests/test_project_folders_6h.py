@@ -1,8 +1,11 @@
-"""V2 Projects Gate 6H H1: the project folder link - context, never authority.
+"""V2 Projects Gate 6H H1/H1b: the project folder link - context, never authority.
 
 S1/S1r schema and rollback, S2 store, S3 concurrency, P1 path refusals,
 P2 known folders, P3 name sanitising, P4 propose, K4 unlink never deletes,
-A1-A4 the link widens no capability and reaches no model.
+A1-A4 the link widens no capability and reaches no model. H1b (K1 folder
+creation): C1 exact path, C2 order, C3 real Windows races, C4 only the
+route's directories, C5 partial failures, C6 device names, C7 concurrency,
+C8 propose probes, C9 rollback (in S1r), C10 A1-A3 with a "created" link.
 
 Temp directories only; no test opens the live DB, creates a folder outside
 its own temp tree, or makes a live model, auth or network call.
@@ -162,14 +165,22 @@ class RollbackTests(unittest.TestCase):
         memory.link_explicit_user_project_folder(live.id, first, "picked")
         memory.unlink_project_folder(live.id)
         memory.link_explicit_user_project_folder(live.id, second, "picked")
+        made = memory.create_project("Made")                                   # C9: "created" rows
+        third, fourth = str(self.root) + "-created-a", str(self.root) + "-created-b"
+        memory.link_explicit_user_project_folder(made.id, third, "created", create=lambda: third)
+        memory.unlink_project_folder(made.id)
+        memory.link_explicit_user_project_folder(made.id, fourth, "created", create=lambda: fourth)
         before, shown = self.links(), memory.load_project_folder(live.id)
-        self.assertEqual(2, len(before))
+        made_shown = memory.load_project_folder(made.id)
+        self.assertEqual(4, len(before))
+        self.assertEqual((fourth, "created"), (made_shown.path, made_shown.origin))
         out = self.old(store_tests.RollbackReleaseCompatibilityTests.OLD_READS_V2_PROJECT_DATA, str(self.database), str(self.old_tree))
         self.assertEqual(10, out["schema"])
         self.old(store_tests.RollbackReleaseCompatibilityTests.OLD_OPERATIONS, str(self.database), session.id, str(self.old_tree))
         reopened = SQLiteMemoryStore(self.database)
         self.assertEqual(before, self.links())
         self.assertEqual(shown, reopened.load_project_folder(live.id))
+        self.assertEqual(made_shown, reopened.load_project_folder(made.id))
         self.assertEqual(10, reopened.schema_version())
         with self.assertRaisesRegex(ValueError, "already has a linked folder"):
             reopened.link_explicit_user_project_folder(live.id, str(self.root) + "-linked-c", "picked")
@@ -223,7 +234,7 @@ class StoreTests(FolderCase):
             ("archived project", "link", archived.id, str(self.folders / "y"), "picked", "archived"),
             ("unknown project", "link", "p-" + "0" * 32, str(self.folders / "y"), "picked", "Unknown project"),
             ("invalid project id", "link", "../x", str(self.folders / "y"), "picked", "project_id"),
-            ("reserved origin", "link", self.p.id, str(self.folders / "y"), "created", "origin"),
+            ("created origin without its create step", "link", self.p.id, str(self.folders / "y"), "created", "origin"),
             ("lexical rule", "link", self.p.id, "relative\\y", "picked", "local drive path"),
             ("under the store's own data folder", "link", self.p.id, str(self.database.parent / "x"), "picked",
              "JARVIS data"),
@@ -247,7 +258,6 @@ class StoreTests(FolderCase):
         for name, (link_id, path, origin, linked_at) in {
             "bad id": ("pf-1", *good[1:]),
             "bad origin": (good[0], good[1], "evil", good[3]),
-            "reserved origin": (good[0], good[1], "created", good[3]),
             "path not text": (good[0], b"D:\\work\\x", *good[2:]),                  # a BLOB keeps its type
             "path fails the lexical rules": (good[0], "D:\\a\\..\\b", *good[2:]),
             "path under the data folder": (good[0], str(self.database.parent / "x"), *good[2:]),
@@ -262,6 +272,14 @@ class StoreTests(FolderCase):
                     connection.commit()
                 self.assertIsNone(self.memory.load_project_folder(project.id))
                 self.assertIsNone(self.app("show", project.id).payload["folder"])
+        # H1b: "created" is a stored origin now and loads like "picked".
+        project = self.memory.create_project("Created origin")
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("INSERT INTO project_folder_links VALUES (?, ?, ?, 'created', ?, NULL)",
+                               ("pfl-" + uuid4().hex, project.id, good[1], good[3]))
+            connection.commit()
+        shown = self.memory.load_project_folder(project.id)
+        self.assertEqual(("created", good[1]), (shown.origin, shown.path))
 
 
 class ConcurrencyTests(FolderCase):
@@ -611,8 +629,22 @@ def outside_folder(case: FolderCase) -> Path:
     return folder
 
 
+class LinkOrigin:
+    """A1-A3 link F through this hook: "picked" via the app, or (C10) a
+    "created" link through the store's create branch."""
+
+    origin = "picked"
+
+    def link_q(self, folder: Path) -> None:
+        if self.origin == "picked":
+            self.assertEqual(EXIT_OK, self.app("link", self.q.id, path=str(folder)).exit_code)
+        else:
+            self.memory.link_explicit_user_project_folder(self.q.id, str(folder), "created", create=lambda: str(folder))
+        self.assertEqual(self.origin, self.memory.load_project_folder(self.q.id).origin)
+
+
 @unittest.skipUnless(WINDOWS, "Windows path rules")
-class LocalFileAuthorityTests(FolderCase):
+class LocalFileAuthorityTests(LinkOrigin, FolderCase):
     def test_a1_read_and_write_into_a_linked_folder_are_refused_exactly_as_unlinked(self) -> None:
         startup = self.folder("startup-root")
         folder = outside_folder(self)
@@ -622,7 +654,7 @@ class LocalFileAuthorityTests(FolderCase):
             connectors=(LocalFileReadConnector(allowed_roots=(Path(startup),), default_working_directory=Path(startup)),
                         LocalFileWriteConnector(allowed_roots=(Path(startup),), default_working_directory=Path(startup))),
         )
-        self.assertEqual(EXIT_OK, self.app("link", self.q.id, path=str(folder)).exit_code)
+        self.link_q(folder)
         target = str(folder / "x.txt")
 
         def run(project_id: str, capability: str, action: str):
@@ -644,7 +676,7 @@ class LocalFileAuthorityTests(FolderCase):
 
 
 @unittest.skipUnless(WINDOWS, "Windows path rules")
-class ClaudeAuthorityTests(FolderCase):
+class ClaudeAuthorityTests(LinkOrigin, FolderCase):
     def setUp(self) -> None:
         super().setUp()
         self.startup = Path(self.folder("startup-root"))
@@ -685,7 +717,7 @@ class ClaudeAuthorityTests(FolderCase):
     def test_a2_a3_attestation_payload_and_preview_identical_and_free_of_the_folder(self) -> None:
         folder = outside_folder(self)
         unlinked = self.run_and_execute(self.p.id)
-        self.assertEqual(EXIT_OK, self.app("link", self.q.id, path=str(folder)).exit_code)
+        self.link_q(folder)
         linked = self.run_and_execute(self.q.id)
         for key in ("allowed_roots", "working_directory", "outbound_digest"):           # A2
             self.assertEqual(unlinked["attestation"][key], linked["attestation"][key], key)
@@ -697,6 +729,588 @@ class ClaudeAuthorityTests(FolderCase):
         rendered = json.dumps(linked, ensure_ascii=False).casefold()
         for secret in (str(folder), str(folder).replace("\\", "\\\\"), str(folder).replace("\\", "/"), folder.name):
             self.assertNotIn(secret.casefold(), rendered)
+
+
+class CreatedLocalFileAuthorityTests(LocalFileAuthorityTests):
+    """C10: A1 with an origin "created" link gives identical results."""
+
+    origin = "created"
+
+
+class CreatedClaudeAuthorityTests(ClaudeAuthorityTests):
+    """C10: A2/A3 with an origin "created" link give identical results."""
+
+    origin = "created"
+
+
+# --------------------------------------------------------------------------
+# H1b: C1-C8 folder creation (K1). Real directories only under a temp tree on
+# this fixed NTFS drive; Desktop and Documents are temp folders.
+# --------------------------------------------------------------------------
+
+
+JP = project_folders.DEFAULT_PARENT_NAME
+REMOVERS = ((os, "rmdir"), (os, "remove"), (os, "unlink"), (os, "rename"), (os, "replace"),
+            (shutil, "rmtree"), (shutil, "move"))
+
+
+def dirs(root: Path) -> set[str]:
+    return {d for d, _, _ in os.walk(root)}
+
+
+@unittest.skipUnless(WINDOWS, "Windows folder creation")
+class CreateCase(FolderCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.desktop = self.folder("Desktop")
+        self.documents = self.folder("Documents")
+        self.known = {"desktop": self.desktop, "documents": self.documents}
+        ids = {value: kind for kind, value in project_folders._KNOWN_FOLDERS.items()}
+        patcher = mock.patch.object(project_folders, "_shell_known_folder", side_effect=lambda i: self.known[ids[i]])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.protected = (self.database.parent,)
+
+    def shown(self, project, on_desktop: bool) -> str:
+        result = self.app("propose", project.id, on_desktop=on_desktop)
+        self.assertEqual(EXIT_OK, result.exit_code, result.payload)
+        return result.payload["path"]
+
+    def create(self, project, path: str, on_desktop: bool):
+        return self.app("create", project.id, path=path, on_desktop=on_desktop)
+
+    def state(self):
+        return tree(self.folders), self.snapshot()
+
+    @contextlib.contextmanager
+    def removes_nothing(self):
+        with contextlib.ExitStack() as stack:
+            for owner, name in REMOVERS:
+                stack.enter_context(mock.patch.object(owner, name, side_effect=AssertionError(f"{name} called")))
+            yield
+
+    def tree_of(self, root: Path):
+        return sorted((str(Path(d).relative_to(root)), tuple(sorted(fs))) for d, _, fs in os.walk(root))
+
+    def run_with(self, project, on_desktop: bool, during):
+        """Create through the app; ``during(creation)`` runs once the folders
+        exist and are held, before the final judgement."""
+        real = project_folders.create_folder
+
+        @contextlib.contextmanager
+        def hooked(path, *, protected):
+            with real(path, protected=protected) as creation:
+                during(creation)
+                yield creation
+
+        path = self.shown(project, on_desktop)
+        with mock.patch.object(project_folders, "create_folder", side_effect=hooked):
+            return path, self.create(project, path, on_desktop)
+
+    def partial(self, result, created: list[str], state: str, exist: bool = True) -> None:
+        self.assertNotEqual(EXIT_OK, result.exit_code)
+        self.assertEqual((created, state), (result.payload["created"], result.payload["link_state"]))
+        message = result.payload["error"]["message"]
+        self.assertIn("klasör silinmedi", message)
+        self.assertIn({"linked": "bağlı.", "not linked": "bağlı değil", "unknown": "bilinmiyor"}[state], message)
+        for path in created if exist else ():
+            self.assertTrue(os.path.isdir(path.split(" (amaçlanan yol")[0]), path)
+
+
+class CreateExactPathTests(CreateCase):
+    def test_c1_success_creates_exactly_the_shown_path(self) -> None:
+        for project, on_desktop, extra in ((self.p, True, []), (self.q, False, [self.documents + "\\" + JP])):
+            with self.subTest(on_desktop=on_desktop):
+                before = dirs(self.folders)
+                path = self.shown(project, on_desktop)
+                result = self.create(project, path, on_desktop)
+                self.assertEqual(EXIT_OK, result.exit_code, result.payload)
+                self.assertEqual(extra + [path], result.payload["created"])
+                self.assertEqual({"path": path, "origin": "created"},
+                                 {k: result.payload["folder"][k] for k in ("path", "origin")})
+                self.assertEqual(set(extra + [path]), dirs(self.folders) - before)
+                link = self.memory.load_project_folder(project.id)
+                self.assertEqual((path, "created"), (link.path, link.origin))
+
+    def test_c1_a_stale_or_different_path_refuses_with_zero_writes(self) -> None:
+        path = self.shown(self.p, True)
+        Path(path).mkdir()                                                      # now propose gives "(2)"
+        for name, sent, on_desktop in (("stale", path, True), ("another flag", path + " (2)", False),
+                                       ("a path propose never gave", self.desktop + "\\Other", True),
+                                       ("not a string", None, True)):
+            with self.subTest(name):
+                before = self.state()
+                result = self.create(self.p, sent, on_desktop)
+                self.assertIn("Klasör yolu değişti; yeni yolu onaylayın.", result.payload["error"]["message"])
+                self.assertEqual(before, self.state())
+
+    def test_c1_a_leaf_collision_before_any_create_writes_nothing(self) -> None:
+        path = self.shown(self.p, True)
+        real = project_folders._create_child
+
+        def racer(parent: int, leaf: str) -> int:
+            os.mkdir(path)                                                      # someone else, just before
+            return real(parent, leaf)
+
+        before = self.snapshot()
+        with mock.patch.object(project_folders, "_create_child", side_effect=racer):
+            result = self.create(self.p, path, True)
+        self.assertIn("already exists", result.payload["error"]["message"])
+        self.assertNotIn("created", result.payload)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual((["Alpha"], []), (os.listdir(self.desktop), os.listdir(path)))
+
+    def test_c1_a_leaf_collision_after_jarvis_projeleri_was_created_is_partial(self) -> None:
+        path = self.shown(self.p, False)
+        real = project_folders._create_child
+
+        def racer(parent: int, leaf: str) -> int:
+            if leaf != JP:
+                os.mkdir(path)
+            return real(parent, leaf)
+
+        before = self.snapshot()
+        with mock.patch.object(project_folders, "_create_child", side_effect=racer), self.removes_nothing():
+            result = self.create(self.p, path, False)
+        self.partial(result, [self.documents + "\\" + JP], "not linked")
+        self.assertEqual(before, self.snapshot())
+
+    def test_preview_reads_only_and_matches_propose(self) -> None:
+        from jarvis.app import project_folder_preview_result
+
+        before = self.state()
+        for name, on_desktop, expected in (("  Mutfak  ", True, self.desktop + "\\Mutfak"),
+                                           ("a/b", False, self.documents + "\\" + JP + "\\a-b")):
+            with self.subTest(name):
+                result = project_folder_preview_result(self.memory, self.settings, name, on_desktop)
+                self.assertEqual(expected, result.payload["path"])
+        for name, value in (("blank", "  "), ("not text", None)):
+            with self.subTest(name):
+                result = project_folder_preview_result(self.memory, self.settings, value, True)
+                self.assertIn("non-blank", result.payload["error"]["message"])
+        self.assertEqual(before, self.state())
+
+
+class CreateOrderTests(CreateCase):
+    def test_c2_ineligible_or_taken_refuses_before_any_create(self) -> None:
+        archived = self.memory.create_project("Archived")
+        self.memory.set_project_active(archived.id, False)
+        self.memory.link_explicit_user_project_folder(self.q.id, self.folder("q-link"), "picked")
+        wide = self.memory.create_project("Wide")
+        self.memory.link_explicit_user_project_folder(wide.id, self.desktop, "picked")   # around the Desktop
+        lone = self.memory.create_project("Lone")
+        self.memory.unlink_project_folder(wide.id)
+        self.memory.link_explicit_user_project_folder(wide.id, self.desktop + "\\Lone", "picked")
+        for name, project_id, path, message in (
+            ("archived", archived.id, self.desktop + "\\Archived", "archived"),
+            ("unknown", "p-" + "0" * 32, self.desktop + "\\Ghost", "Unknown project"),
+            ("current link", self.q.id, self.desktop + "\\Beta", "already has a linked folder"),
+            ("overlapping folder", lone.id, self.desktop + "\\Lone", "linked to another project"),
+        ):
+            with self.subTest(name):
+                before = self.state()
+                with mock.patch.object(project_folders, "create_folder", side_effect=AssertionError("created")) as spy:
+                    with self.assertRaisesRegex(ValueError, message):
+                        project_folders.create_and_link(self.memory, project_id, path, protected=self.protected)
+                    result = self.app("create", project_id, path=path, on_desktop=True)
+                self.assertNotEqual(EXIT_OK, result.exit_code)
+                spy.assert_not_called()
+                self.assertEqual(before, self.state())
+
+
+class CreateRaceTests(CreateCase):
+    """C3: real Windows races; mocks only add to them."""
+
+    def test_c3_i_a_held_parent_cannot_be_renamed_or_replaced(self) -> None:
+        real = project_folders._create_child
+        for project, on_desktop in ((self.p, True), (self.q, False)):
+            with self.subTest(on_desktop=on_desktop):
+                path = self.shown(project, on_desktop)
+                parent = os.path.dirname(path)
+                tried = []
+
+                def racer(handle: int, leaf: str) -> int:
+                    if leaf != JP:                                              # the leaf: its parent is held
+                        with self.assertRaises(PermissionError):
+                            os.rename(parent, parent + "-moved")
+                        with self.assertRaises(PermissionError):
+                            os.rmdir(parent)                                    # so no junction can take its place
+                        tried.append(leaf)
+                    return real(handle, leaf)
+
+                with mock.patch.object(project_folders, "_create_child", side_effect=racer):
+                    result = self.create(project, path, on_desktop)
+                self.assertEqual(EXIT_OK, result.exit_code, result.payload)
+                self.assertEqual(1, len(tried))
+                self.assertTrue(os.path.isdir(path))
+                self.assertFalse(os.path.lexists(parent + "-moved"))
+
+    def test_c3_ii_the_create_is_relative_to_the_held_parent_and_exclusive(self) -> None:
+        from jarvis.connectors import local_files
+
+        real = local_files._WINDOWS_NATIVE["create_file"]
+        calls = []
+
+        def spy(handle, access, attributes, status, size, file_attributes, share, disposition, options, ea, ea_size):
+            attrs = attributes._obj
+            calls.append((attrs.RootDirectory, attrs.ObjectName.contents.Buffer, share, disposition, options))
+            return real(handle, access, attributes, status, size, file_attributes, share, disposition, options, ea, ea_size)
+
+        path = self.shown(self.p, False)
+        with mock.patch.dict(local_files._WINDOWS_NATIVE, {"create_file": spy}):
+            _, creation = project_folders.create_and_link(self.memory, self.p.id, path, protected=self.protected)
+        (documents, _), (parent, _), _ = creation.handles
+        creates = [c for c in calls if c[3] == local_files._FILE_CREATE]
+        self.assertEqual([(documents, JP), (parent, "Alpha")], [c[:2] for c in creates])
+        for _, _, share, _, options in creates:
+            self.assertEqual(0x3, share)                                        # READ | WRITE, never DELETE
+            self.assertEqual(project_folders._FILE_DIRECTORY_FILE, options & project_folders._FILE_DIRECTORY_FILE)
+        self.assertTrue(all("\\" not in c[1] for c in calls))                   # bare names only
+
+    def test_c3_iii_a_folder_turned_into_a_reparse_point_between_scan_and_open_is_refused(self) -> None:
+        elsewhere = Path(self.folder("elsewhere"))
+        (elsewhere / "keep.txt").write_text("keep", encoding="utf-8")
+        target = self.tree_of(elsewhere)
+        path = self.shown(self.p, True)
+        real_open = project_folders._open_held
+        swapped = []
+
+        def swap(name: str):
+            if project_folders.same_folder(name, self.desktop) and not swapped:
+                os.rmdir(self.desktop)
+                junction(elsewhere, Path(self.desktop))
+                swapped.append(name)
+            return real_open(name)
+
+        with mock.patch.object(project_folders, "_open_held", side_effect=swap):
+            with self.assertRaisesRegex(ValueError, "link or junction"):
+                with project_folders.create_folder(path, protected=self.protected):
+                    self.fail("entered")
+        self.assertEqual((1, target), (len(swapped), self.tree_of(elsewhere)))
+        # Any reparse tag, also one that keeps the final path (a cloud placeholder).
+        os.rmdir(self.desktop)
+        os.mkdir(self.desktop)
+        with mock.patch.object(project_folders, "_attribute_tag", return_value=(0x10 | 0x400, 0x9000001A)):
+            with self.assertRaisesRegex(ValueError, "link or junction"):
+                with project_folders.create_folder(path, protected=self.protected):
+                    self.fail("entered")
+        self.assertEqual([], os.listdir(self.desktop))
+
+    def test_c3_iv_a_junction_route_folder_refuses_with_nothing_created_and_no_lookup_through_it(self) -> None:
+        real_open = project_folders._nt_open
+        for name in ("JARVIS Projeleri", "Desktop", "Documents"):
+            with self.subTest(name):
+                base = Path(self.folder("case-" + name))
+                target = base / "target"
+                target.mkdir()
+                (target / "keep.txt").write_text("keep", encoding="utf-8")
+                before = self.tree_of(target)
+                real_desktop, real_documents = base / "Desktop", base / "Documents"
+                real_documents.mkdir()
+                real_desktop.mkdir()
+                if name == "JARVIS Projeleri":
+                    junction(target, real_documents / JP)
+                    self.known.update(desktop=str(real_desktop), documents=str(real_documents))
+                    path = str(real_documents / JP / "Alpha")
+                else:
+                    link = base / (name + "J")
+                    junction(target, link)
+                    self.known.update(desktop=str(real_desktop), documents=str(real_documents))
+                    self.known[name.lower()] = str(link)
+                    path = str(link / JP / "Alpha") if name == "Documents" else str(link / "Alpha")
+                looked = []
+                with mock.patch.object(project_folders, "_nt_open",
+                                       side_effect=lambda *a: looked.append(a[1]) or real_open(*a)):
+                    with self.assertRaisesRegex(ValueError, "link or junction"):
+                        with project_folders.create_folder(path, protected=self.protected):
+                            self.fail("entered")
+                self.assertEqual(before, self.tree_of(target))
+                self.assertEqual([JP] if name == "JARVIS Projeleri" else [], looked)
+
+    def test_c3_v_an_ancestor_renamed_before_the_final_judgement_is_refused(self) -> None:
+        moved = str(self.folders) + "-moved"
+        rename, state = os.rename, {"moved": False}
+        real_final = project_folders._final_path
+
+        def during(creation) -> None:
+            with self.assertRaises(OSError):                                    # NTFS: a descendant is held
+                rename(self.folders, moved)
+            state["moved"] = True                                               # what the handles would say
+
+        def final(handle: int):
+            found = real_final(handle)
+            return found.replace(str(self.folders), moved, 1) if found and state["moved"] else found
+
+        with mock.patch.object(project_folders, "_final_path", side_effect=final), self.removes_nothing():
+            path, result = self.run_with(self.p, True, during)
+        self.partial(result, [path.replace(str(self.folders), moved, 1)], "not linked", exist=False)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIsNone(self.memory.load_project_folder(self.p.id))
+
+    def test_c3_vi_a_held_parent_turning_into_a_reparse_point_is_refused(self) -> None:
+        real_tag = project_folders._attribute_tag
+        for project, on_desktop in ((self.p, True), (self.q, False)):
+            with self.subTest(on_desktop=on_desktop):
+                parent = {}
+
+                def tag(handle: int):
+                    found = real_tag(handle)
+                    return (found[0] | 0x400, 0x9000101A) if found and handle == parent.get("handle") else found
+
+                with mock.patch.object(project_folders, "_attribute_tag", side_effect=tag), self.removes_nothing():
+                    path, result = self.run_with(project, on_desktop,
+                                                 lambda creation: parent.update(handle=creation.handles[-2][0]))
+                made = [path] if on_desktop else [os.path.dirname(path), path]
+                self.partial(result, made, "not linked")
+
+
+class CreateRouteTests(CreateCase):
+    def test_c4_only_the_routes_directories(self) -> None:
+        Path(self.documents, JP).mkdir()
+        for project, on_desktop in ((self.p, True), (self.q, False)):
+            with self.subTest(on_desktop=on_desktop):
+                before = dirs(self.folders)
+                path = self.shown(project, on_desktop)
+                self.assertEqual(EXIT_OK, self.create(project, path, on_desktop).exit_code)
+                self.assertEqual({path}, dirs(self.folders) - before)
+        for name, path, message in (
+            ("elsewhere", str(self.folders / "other" / "x"), "only on the Desktop"),
+            ("JARVIS Projeleri on the Desktop", self.desktop + "\\" + JP + "\\x", "only on the Desktop"),
+            ("Documents itself", self.documents + "\\x", "only on the Desktop"),
+            ("nested under JARVIS Projeleri", self.documents + "\\" + JP + "\\a\\b", "only on the Desktop"),
+            ("a drive root", "C:\\x", "only on the Desktop"),
+        ):
+            with self.subTest(name):
+                before = tree(self.folders)
+                with self.assertRaisesRegex(ValueError, message):
+                    with project_folders.create_folder(path, protected=self.protected):
+                        self.fail("entered")
+                self.assertEqual(before, tree(self.folders))
+
+    def test_c4_a_jarvis_projeleri_file_is_never_replaced(self) -> None:
+        Path(self.documents, JP).write_text("a file", encoding="utf-8")
+        before = tree(self.folders)
+        with self.assertRaisesRegex(ValueError, "not a folder"):
+            with project_folders.create_folder(self.documents + "\\" + JP + "\\Alpha", protected=self.protected):
+                self.fail("entered")
+        self.assertEqual(before, tree(self.folders))
+
+
+class CreatePartialFailureTests(CreateCase):
+    """C5: every failure after a create names exactly what was created, says
+    the READ-BACK link state and removes nothing."""
+
+    def run_case(self, on_desktop: bool = True, **patches):
+        path = self.shown(self.p, on_desktop)
+        with contextlib.ExitStack() as stack:
+            for target, name, value in patches.get("patch", ()):
+                stack.enter_context(mock.patch.object(target, name, **value))
+            stack.enter_context(self.removes_nothing())
+            return path, self.create(self.p, path, on_desktop)
+
+    def test_c5_a_failure_inside_create_folder(self) -> None:
+        real_final = project_folders._final_path
+        path = self.desktop + "\\Alpha"
+        # The leaf's final path cannot be read: its proof fails, and its location is reported as unverified.
+        final = {"side_effect": lambda h: None if (real_final(h) or "").endswith("\\Alpha") else real_final(h)}
+        _, result = self.run_case(patch=((project_folders, "_final_path", final),))
+        self.partial(result, [path + " (amaçlanan yol; konumu doğrulanamadı)"], "not linked")
+
+    def test_c5_a_failure_inside_create_folder_survives_a_failing_rollback(self) -> None:
+        path = self.shown(self.p, False)
+        real_child, real_connect = project_folders._create_child, self.memory._connect
+
+        def racer(parent: int, leaf: str) -> int:
+            if leaf != JP:
+                os.mkdir(path)                                                  # the leaf collides after JP was made
+            return real_child(parent, leaf)
+
+        class NoRollback:
+            def __init__(self, connection) -> None:
+                self._connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def rollback(self) -> None:
+                self._connection.rollback()
+                raise sqlite3.OperationalError("injected rollback failure")    # replaces the FolderCreateError
+
+        with mock.patch.object(project_folders, "_create_child", side_effect=racer), \
+                mock.patch.object(self.memory, "_connect", new=lambda: NoRollback(real_connect())), \
+                self.removes_nothing():
+            result = self.create(self.p, path, False)
+        self.partial(result, [self.documents + "\\" + JP], "not linked")
+
+    def test_c5_a_proof_failure_in_the_final_judgement(self) -> None:
+        real_tag, state = project_folders._attribute_tag, {"after": False}
+
+        def during(creation) -> None:
+            state["after"] = True
+
+        tag = {"side_effect": lambda h: None if state["after"] else real_tag(h)}
+        with mock.patch.object(project_folders, "_attribute_tag", **tag), self.removes_nothing():
+            path, result = self.run_with(self.p, False, during)
+        self.partial(result, [os.path.dirname(path), path], "not linked")
+
+    def insert_fails(self) -> None:
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("CREATE TRIGGER fail_link BEFORE INSERT ON project_folder_links "
+                               "BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END")
+            connection.commit()
+
+    def test_c5_an_insert_failure(self) -> None:
+        self.insert_fails()
+        path, result = self.run_case()
+        self.partial(result, [path], "not linked")
+        self.assertEqual([], self.rows("SELECT * FROM project_folder_links"))
+
+    def test_c5_a_commit_failure(self) -> None:
+        real_connect = self.memory._connect
+
+        class NoCommit:
+            def __init__(self, connection) -> None:
+                self._connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def commit(self) -> None:
+                raise sqlite3.OperationalError("injected commit failure")
+
+        path, result = self.run_case(patch=((self.memory, "_connect", {"new": lambda: NoCommit(real_connect())}),))
+        self.partial(result, [path], "not linked")
+        self.assertEqual([], self.rows("SELECT * FROM project_folder_links"))
+
+    def test_c5_an_error_after_a_successful_commit(self) -> None:
+        real = self.memory.link_explicit_user_project_folder
+
+        def then_fail(*args, **kwargs):
+            real(*args, **kwargs)
+            raise RuntimeError("after the commit")
+
+        path, result = self.run_case(patch=((self.memory, "link_explicit_user_project_folder", {"side_effect": then_fail}),))
+        self.partial(result, [path], "linked")
+        self.assertEqual((path, "created"), (self.memory.load_project_folder(self.p.id).path,
+                                             self.memory.load_project_folder(self.p.id).origin))
+
+    def test_c5_a_failing_read_back_is_unknown(self) -> None:
+        self.insert_fails()
+        path, result = self.run_case(patch=((self.memory, "load_project_folder", {"side_effect": sqlite3.OperationalError("x")}),))
+        self.partial(result, [path], "unknown")
+
+
+class CreateDeviceNameTests(CreateCase):
+    def test_c6_sanitized_device_names_are_created_and_proven(self) -> None:
+        for name, leaf in (("CON", "_CON"), ("com1.txt", "_com1.txt"), ("LPT\u00b9", "_LPT\u00b9")):
+            with self.subTest(name):
+                project = self.memory.create_project(name)
+                path = self.shown(project, True)
+                self.assertEqual(self.desktop + "\\" + leaf, path)
+                result = self.create(project, path, True)
+                self.assertEqual(EXIT_OK, result.exit_code, result.payload)
+                self.assertEqual([path], result.payload["created"])            # read from the handle
+                self.assertTrue(os.path.isdir(path))
+                self.assertEqual(path, project_folders.validate_folder(path, protected=self.protected))
+
+
+class CreateConcurrencyTests(CreateCase):
+    def race(self, jobs) -> list[str]:
+        barrier, outcomes = threading.Barrier(len(jobs)), []
+
+        def run(job) -> None:
+            barrier.wait()                                                      # before the store call
+            try:
+                job()
+                outcomes.append("ok")
+            except ValueError:
+                outcomes.append("refused")
+            except Exception as exc:  # noqa: BLE001 - any other outcome fails the test
+                outcomes.append(repr(exc))
+
+        threads = [threading.Thread(target=run, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        return sorted(outcomes)
+
+    def test_c7_two_stores_create_the_same_folder_exactly_one_wins(self) -> None:
+        path = self.desktop + "\\Shared"
+        stores = (SQLiteMemoryStore(self.database), SQLiteMemoryStore(self.database))
+        jobs = [lambda s=s, i=i: project_folders.create_and_link(s, i, path, protected=self.protected)
+                for s, i in zip(stores, (self.p.id, self.q.id))]
+        self.assertEqual(["ok", "refused"], self.race(jobs))
+        self.assertEqual(["Shared"], os.listdir(self.desktop))
+        self.assertEqual(1, len(self.rows("SELECT * FROM project_folder_links WHERE unlinked_at IS NULL")))
+
+    def test_c7_store_only_nested_paths_exactly_one_wins(self) -> None:
+        outer, inner = str(self.folders / "x" / "a"), str(self.folders / "x" / "a" / "in")
+        stores = (SQLiteMemoryStore(self.database), SQLiteMemoryStore(self.database))
+        called = []
+
+        def controlled(path):
+            return lambda: called.append(path) or path
+
+        jobs = [lambda: stores[0].link_explicit_user_project_folder(self.p.id, outer, "created", create=controlled(outer)),
+                lambda: stores[1].link_explicit_user_project_folder(self.q.id, inner, "created", create=controlled(inner))]
+        self.assertEqual(["ok", "refused"], self.race(jobs))
+        self.assertEqual(1, len(called))                                        # the loser never reached create
+        self.assertEqual(1, len(self.rows("SELECT * FROM project_folder_links WHERE unlinked_at IS NULL")))
+
+
+class ProposeProbeTests(CreateCase):
+    def test_c8_every_lookup_is_relative_to_a_held_handle(self) -> None:
+        Path(self.documents, JP, "Alpha").mkdir(parents=True)
+        held, looked = set(), []
+        real_hold, real_child, real_open = project_folders._hold_folder, project_folders._open_child, project_folders._nt_open
+
+        def hold(*args):
+            handle, proven = real_hold(*args)
+            held.add(handle)
+            return handle, proven
+
+        def child(*args):
+            handle = real_child(*args)
+            held.add(handle)
+            for folder in (self.documents, self.documents + "\\" + JP):        # a held folder cannot be swapped
+                with self.assertRaises(PermissionError):
+                    os.rename(folder, folder + "-moved")
+            return handle
+
+        def nt_open(parent, leaf, *rest):
+            looked.append((parent in held, leaf))
+            return real_open(parent, leaf, *rest)
+
+        lstat = mock.Mock(side_effect=os.lstat)
+        with mock.patch.object(project_folders, "_hold_folder", side_effect=hold), \
+                mock.patch.object(project_folders, "_open_child", side_effect=child), \
+                mock.patch.object(project_folders, "_nt_open", side_effect=nt_open), \
+                mock.patch.object(project_folders.os, "lstat", lstat):
+            self.assertEqual(self.documents + "\\" + JP + "\\Alpha (2)", project_folders.propose_folder("Alpha", False, protected=()))
+        self.assertEqual([(True, JP), (True, "Alpha"), (True, "Alpha (2)")], looked)
+        beneath = [c.args[0] for c in lstat.call_args_list if str(c.args[0]).casefold().startswith(self.documents.casefold() + "\\")]
+        self.assertEqual([], beneath)
+
+    def test_c8_documents_swapped_for_a_junction_after_its_scan_is_not_followed(self) -> None:
+        elsewhere = Path(self.folder("elsewhere"))
+        Path(elsewhere, JP).mkdir()
+        real_open = project_folders._open_held
+        looked = []
+
+        def swap(name: str):
+            if project_folders.same_folder(name, self.documents) and os.path.isdir(self.documents) \
+                    and not os.path.islink(self.documents) and not looked:
+                os.rmdir(self.documents)
+                junction(elsewhere, Path(self.documents))
+                looked.append("swapped")
+            return real_open(name)
+
+        with mock.patch.object(project_folders, "_open_held", side_effect=swap), \
+                mock.patch.object(project_folders, "_nt_open", side_effect=AssertionError("a lookup")):
+            with self.assertRaisesRegex(ValueError, "link or junction"):
+                project_folders.propose_folder("Alpha", False, protected=())
+        self.assertEqual(["swapped"], looked)
 
 
 class SourceAuditTests(unittest.TestCase):
@@ -711,7 +1325,9 @@ class SourceAuditTests(unittest.TestCase):
                 self.assertLessEqual({name for name, text in sources.items() if needle in text}, allowed)
         callers = {name: text.count("link_explicit_user_project_folder(")
                    - text.count("def link_explicit_user_project_folder(") for name, text in sources.items()}
-        self.assertEqual({"app.py": 1}, {name: count for name, count in callers.items() if count})
+        # H1b: create_and_link is the one production caller of the store's create branch.
+        self.assertEqual({"app.py": 1, "project_folders.py": 1}, {name: count for name, count in callers.items() if count})
+        self.assertEqual(1, sources["project_folders.py"].count('"created", create='))
         for writer in ("INSERT INTO project_folder_links", "UPDATE project_folder_links"):
             self.assertEqual(["memory.py"], sorted(name for name, text in sources.items() if writer in text))
         self.assertNotIn("DELETE FROM project_folder_links", sources["memory.py"])

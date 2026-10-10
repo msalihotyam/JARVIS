@@ -44,6 +44,8 @@ from jarvis.app import (
     memory_list_result,
     project_create_result,
     project_file_result,
+    project_folder_preview_result,
+    project_folder_result,
     project_instruction_result,
     project_lifecycle_result,
     sessions_result,
@@ -432,6 +434,16 @@ class Backend:
     def project_create(self, name: str) -> dict:
         """The existing explicit-user create path (opaque id)."""
         return self._call("project-create", lambda s: project_create_result(self._memory(s), s, None, name))
+
+    def project_folder_preview(self, name: str, on_desktop: bool) -> dict:
+        """6H K1: where "Klasör oluştur" would create the new project's folder (reads only)."""
+        return self._call("project-folder-preview", lambda s: project_folder_preview_result(
+            self._memory(s), s, name, on_desktop))
+
+    def project_folder_create(self, project_id: str, path: str, on_desktop: bool) -> dict:
+        """6H K1: create exactly the shown folder and link it, through the app's audited path."""
+        return self._call("project-folder-create", lambda s: project_folder_result(
+            self._memory(s), s, "create", project_id, path=path, on_desktop=on_desktop))
 
     def project_lifecycle(self, action: str, project_id: str, name: str | None = None) -> dict:
         """rename / archive / unarchive through the existing app path."""

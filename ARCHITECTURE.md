@@ -3616,5 +3616,22 @@ kullanıcıya gösterilir.
   okur, hiçbir şey oluşturmaz.
 - **Bağı kaldırma klasörü asla silmez:** yalnız `unlinked_at` damgalanır;
   hiçbir dosya sistemi çağrısı yoktur.
-- **Ertelenen:** klasör oluşturma (K1 açılır pencere, K3 onay kartı) G6H1b /
-  G6H3'tedir (Salih Q5/Q2); arayüz G6H2'dedir.
+- **Oluşturma (K1, G6H1b):** yeni proje penceresinde "Klasör oluştur"
+  (+ "Masaüstünde"); Core önerilen yolu gösterir, kullanıcının tam o yola
+  "Oluştur" tıklaması onaydır (Salih Q5, Core kartı yok). `create` eylemi yolu
+  saklanan addan şimdi yeniden hesaplar ve eşit değilse hiçbir şey oluşturmaz
+  (D1). Klasör, deponun TEK `BEGIN IMMEDIATE` işleminde, uygunluk/güncel
+  bağ/çakışma denetiminden sonra ve INSERT'ten önce oluşturulur; tek yol
+  `project_folders.create_and_link` (origin `created`). Her klasör TUTULAN bir
+  tanıtıcıyla yargılanır: kendisi olarak açılır (reparse izlenmez), öznitelik
+  ve reparse etiketi ile son yol tanıtıcıdan okunur, paylaşım READ|WRITE
+  (DELETE yok: tutulurken taşınamaz/silinemez); çocuk yalnız tutulan ebeveyne
+  göre `NtCreateFile` ile aranır/oluşturulur (`FILE_CREATE`, var olan asla
+  yeniden kullanılmaz); INSERT'ten hemen önce hepsi yeniden yargılanır.
+  Yalnız Masaüstü\<ad> veya Belgeler\JARVIS Projeleri\<ad> (o ebeveyn yoksa
+  bir kez). JARVIS'in oluşturduğu hiçbir şey silinmez; ilk oluşturmadan
+  sonraki her hata oluşturulan klasörleri tanıtıcıdan okunan konumlarıyla
+  adlandırır ve bağ durumunu GERİ OKUR (bağlı / bağlı değil / bilinmiyor).
+  Kalan risk (Salih 2026-10-10 kabul): son yargıdan sonra klasör taşınabilir
+  veya OneDrive yer tutucusuna dönüşebilir; mevcut klasörü bağlamakla aynıdır.
+  Sohbetten oluşturma (K3, Core kartı) G6H3'tedir.

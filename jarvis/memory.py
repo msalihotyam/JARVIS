@@ -5105,7 +5105,7 @@ class SQLiteMemoryStore:
     # ------------------------------------------------------------------
 
     def link_explicit_user_project_folder(
-        self, project_id: str, path: str, origin: str
+        self, project_id: str, path: str, origin: str, *, create: Callable[[], str] | None = None
     ) -> project_folders.ProjectFolderLink:
         """THE explicit-user write boundary for a project folder link, reached
         only from the app's local-user result with a path
@@ -5113,16 +5113,24 @@ class SQLiteMemoryStore:
         are re-run here (never the filesystem); eligibility, the current link
         and overlap with another project's current link are checked and the
         row inserted in ONE ``BEGIN IMMEDIATE`` transaction. Every refusal
-        writes nothing."""
+        writes nothing.
+
+        H1b: origin ``created`` takes ``create`` (only from
+        ``project_folders.create_and_link``), called INSIDE the transaction
+        after those checks and before the INSERT; it returns the proven path,
+        which must be ``path`` and is checked for overlap again. Any exception
+        rolls back and propagates unchanged."""
         validate_project_id(project_id)
         if origin not in project_folders.LINK_ORIGINS:
             raise ValueError(f"Unknown folder link origin: {origin}")
+        if (create is None) != (origin == "picked"):
+            raise ValueError(f"A {origin} folder link origin does not take this create step.")
         project_folders.check_lexical(path, protected=(self.database_path.parent,))
         record = project_folders.ProjectFolderLink(
             id="pfl-" + uuid4().hex, project_id=project_id, path=path, origin=origin, linked_at=utc_now()
         )
-        with self._connection(write=True) as connection:
-            self._project_row_for_files(connection, project_id, need_active=True)
+
+        def check_free(connection: sqlite3.Connection) -> None:
             for row in connection.execute(
                 "SELECT project_id, path FROM project_folder_links WHERE unlinked_at IS NULL"
             ).fetchall():
@@ -5130,6 +5138,15 @@ class SQLiteMemoryStore:
                     raise ValueError("The project already has a linked folder; unlink it first.")
                 if project_folders.folders_overlap(path, str(row["path"])):
                     raise ValueError("That folder, or one inside or around it, is linked to another project.")
+
+        with self._connection(write=True) as connection:
+            self._project_row_for_files(connection, project_id, need_active=True)
+            check_free(connection)
+            if create is not None:
+                proven = create()
+                if not isinstance(proven, str) or not project_folders.same_folder(proven, path):
+                    raise ValueError("The created folder could not be proven to be the approved one.")
+                check_free(connection)
             connection.execute(
                 "INSERT INTO project_folder_links (id, project_id, path, origin, linked_at, unlinked_at) "
                 "VALUES (?, ?, ?, ?, ?, NULL)",

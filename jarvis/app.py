@@ -1692,22 +1692,8 @@ def project_file_result(
         )
 
 
-def project_folder_result(
-    memory: SQLiteMemoryStore,
-    settings: Settings,
-    action: str,
-    project_id: str,
-    *,
-    path: str | None = None,
-    on_desktop: bool = False,
-) -> CommandResult:
-    """``show`` / ``propose`` / ``link`` / ``unlink`` one project's folder
-    (Gate 6H H1). ``link`` is THE audited production caller of the store's
-    explicit-user folder boundary: the path is the person's own pick. The
-    link is CONTEXT for the LOCAL USER only - this result is the one place
-    the path appears; no root, working directory, task, event or model
-    payload ever gets it. Nothing here creates, moves or deletes a folder."""
-    command = f"project-folder-{action}"
+def _folder_protected(memory: SQLiteMemoryStore, settings: Settings) -> tuple[Path, ...]:
+    """JARVIS's own folders, which no project folder may be in or contain."""
     home = Path.home()
     own = (
         memory.database_path.parent,
@@ -1718,7 +1704,29 @@ def project_folder_result(
     )
     # JARVIS's own folders as spelled AND as resolved, so an 8.3, SUBST or
     # junction spelling of them cannot hide them from the proven pick.
-    protected = own + tuple(path.resolve() for path in own)
+    return own + tuple(path.resolve() for path in own)
+
+
+def project_folder_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    action: str,
+    project_id: str,
+    *,
+    path: str | None = None,
+    on_desktop: bool = False,
+) -> CommandResult:
+    """``show`` / ``propose`` / ``link`` / ``unlink`` / ``create`` one project's
+    folder (Gate 6H H1, H1b). ``link`` is THE audited production caller of the
+    store's explicit-user folder boundary: the path is the person's own pick.
+    ``create`` (K1) creates the folder at ``path`` only when it EQUALS what
+    ``propose_folder`` gives NOW for the stored name (D1): the person's click
+    on that exact shown path is the approval (Salih Q5), JARVIS decides the
+    path. The link is CONTEXT for the LOCAL USER only - this result is the one
+    place the path appears; no root, working directory, task, event or model
+    payload ever gets it. Nothing here moves or deletes a folder."""
+    command = f"project-folder-{action}"
+    protected = _folder_protected(memory, settings)
     try:
         validate_project_id(project_id)
         if action == "link":
@@ -1740,6 +1748,26 @@ def project_folder_result(
                 raise ValueError(f"Project is archived: {project_id}")
             proposed = project_folders.propose_folder(project.name, on_desktop, protected=protected)
             return CommandResult({"command": command, "project_id": project_id, "path": proposed}, EXIT_OK)
+        if action == "create":
+            if not project.active:
+                raise ValueError(f"Project is archived: {project_id}")
+            if project_folders.propose_folder(project.name, on_desktop, protected=protected) != path:
+                raise ValueError("Klasör yolu değişti; yeni yolu onaylayın.")
+            try:
+                link, creation = project_folders.create_and_link(memory, project_id, path, protected=protected)
+            except project_folders.FolderCreateError as exc:
+                # The paths travel as their own field: a diagnostic message is path-redacted.
+                state = {"linked": "bağlı", "not linked": "bağlı değil"}.get(exc.link_state, "bilinmiyor (okunamadı)")
+                failed = failure_result(
+                    command, settings.permission_mode, ErrorCode.INVALID_TASK,
+                    f"Klasör oluşturma yarıda kaldı: {len(exc.created)} klasör oluşturuldu ve korundu "
+                    f"(klasör silinmedi). Proje bağlantısı: {state}.",
+                    EXIT_INVALID_INPUT,
+                )
+                failed.payload.update(created=list(exc.created), link_state=exc.link_state)
+                return failed
+            return CommandResult({"command": command, "project_id": project_id, "folder": link.to_dict(),
+                                  "created": list(creation.created)}, EXIT_OK)
         raise ValueError(f"Unknown project folder action: {action}")
     except ValueError as exc:
         return failure_result(
@@ -1749,6 +1777,24 @@ def project_folder_result(
             str(exc),
             EXIT_INVALID_INPUT,
         )
+
+
+def project_folder_preview_result(
+    memory: SQLiteMemoryStore, settings: Settings, name: str, on_desktop: bool
+) -> CommandResult:
+    """Where "Klasör oluştur" WOULD create the folder of a project not stored
+    yet: ``propose_folder`` for the name as ``create_project`` stores it.
+    Reads only; creates and stores nothing."""
+    command = "project-folder-preview"
+    try:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("project name must be a non-blank string")
+        path = project_folders.propose_folder(name.strip(), on_desktop, protected=_folder_protected(memory, settings))
+    except ValueError as exc:
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK, str(exc), EXIT_INVALID_INPUT
+        )
+    return CommandResult({"command": command, "path": path}, EXIT_OK)
 
 
 def conversation_attach_preview_result(
