@@ -181,7 +181,7 @@ class ProjectsHeadTests(SidebarV2Case):
         self.data()
         bridge, root = self.open_window()
         self.assertEqual([], self.all_items(root, "sidebarNewProject"))            # no "+" on the row
-        self.assertEqual(["Tez", "Kod"], self.projects(root))
+        self.assertEqual(["Kod", "Tez"], self.projects(root))  # G6SB3 DRAG: a never-ordered project list is newest first
         self.assertFalse(self.item(root, "sidebarProjectsCount").isVisible())
         self.assertEqual(90, self.item(root, "sidebarProjectsChevron").property("rotation"))
         # The rest of the row collapses: the tree and "Tüm projeler" go, the count shows.
@@ -199,7 +199,7 @@ class ProjectsHeadTests(SidebarV2Case):
         root.hide()
         bridge, root = self.open_window()
         self.assertEqual([], self.projects(root))
-        self.tap(root, self.item(root, "sidebarProjectsToggle"), then=lambda: self.assertEqual(["Tez", "Kod"], self.projects(root)))
+        self.tap(root, self.item(root, "sidebarProjectsToggle"), then=lambda: self.assertEqual(["Kod", "Tez"], self.projects(root)))  # G6SB3 DRAG: a never-ordered project list is newest first
         # The word is a link to the Projects page.
         self.tap(root, self.item(root, "sidebarProjectsLink"), then=lambda: (
             self.assertEqual("projects", bridge.page),
@@ -216,7 +216,7 @@ class TreeTests(SidebarV2Case):
         self.assertTrue(bridge.openConversation(self.plain[0].id))
         db_before = dump(self.database)
         # Default: every project open, its live conversations newest first, flush left, times at right.
-        settled(300, lambda: self.assertEqual(["Tez 1", "Tez 0", "Kod 0"], self.tree_titles(root)))
+        settled(300, lambda: self.assertEqual(["Kod 0", "Tez 1", "Tez 0"], self.tree_titles(root)))  # G6SB3 DRAG: a never-ordered project list is newest first
         project = self.row(root, "sidebarProject", "Tez")
         conversation = self.row(root, "sidebarProjectConversation", "Tez 1")
         name = self.child(project, "sidebarProjectName")
@@ -242,14 +242,14 @@ class TreeTests(SidebarV2Case):
         ))
         # The open conversation stays in view in its collapsed project.
         self.assertTrue(bridge.openConversation(self.tezc[0].id))
-        settled(300, lambda: self.assertEqual(["Tez 0", "Kod 0"], self.tree_titles(root)))
+        settled(300, lambda: self.assertEqual(["Kod 0", "Tez 0"], self.tree_titles(root)))  # G6SB3 DRAG: a never-ordered project list is newest first
         # Remembered per project across a reopen.
         root.hide()
         bridge, root = self.open_window()
         self.assertTrue(bridge.openConversation(self.plain[0].id))
         settled(300, lambda: self.assertEqual(["Kod 0"], self.tree_titles(root)))
         self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
-            self.assertEqual(["Tez 1", "Tez 0", "Kod 0"], self.tree_titles(root)),
+            self.assertEqual(["Kod 0", "Tez 1", "Tez 0"], self.tree_titles(root)),  # G6SB3 DRAG: a never-ordered project list is newest first
         ))
         self.assertEqual([], json.loads(self.tree_file().read_text(encoding="utf-8"))["closed"])
         self.assertEqual(db_before, dump(self.database))                           # window preferences only
@@ -308,7 +308,7 @@ class ProjectMenuTests(SidebarV2Case):
         self.assertEqual("Kod", self.item(root, "sidebarProjectMenuHeader").property("text"))
         self.assertTrue(self.item(root, "sidebarProjectOpenItem").property("menuRow"))   # the K4 menu row
         self.assertTrue(self.tree_titles(root))                                     # a right-click toggles nothing
-        self.assertEqual(["Tez 1", "Tez 0", "Kod 0"], self.tree_titles(root))
+        self.assertEqual(["Kod 0", "Tez 1", "Tez 0"], self.tree_titles(root))  # G6SB3 DRAG: a never-ordered project list is newest first
         # Proje sayfasını aç.
         self.pick(root, menu, "sidebarProjectOpenItem")
         settled(300, lambda: (self.assertEqual("projects", bridge.page), self.assertEqual(self.kod.id, bridge.openProject["id"])))
@@ -329,7 +329,7 @@ class ProjectMenuTests(SidebarV2Case):
         menu = self.project_menu(root, self.row(root, "sidebarProject", "Kod"))
         self.assertEqual("Unpin", self.item(root, "sidebarProjectPinItem").property("label"))
         self.pick(root, menu, "sidebarProjectPinItem")
-        settled(300, lambda: self.assertEqual(["Tez", "Kod"], self.projects(root)))
+        settled(300, lambda: self.assertEqual(["Kod", "Tez"], self.projects(root)))  # G6SB3 DRAG: a never-ordered project list is newest first
         # Arşivle: through the app path; the archived project leaves the sidebar (V9).
         menu = self.project_menu(root, self.row(root, "sidebarProject", "Kod"))
         self.pick(root, menu, "sidebarProjectArchiveItem")
@@ -341,9 +341,9 @@ class ProjectMenuTests(SidebarV2Case):
         self.data()
         bridge, root = self.open_window()
         rowmenu = self.menu(root, self.row(root, "sidebarConversation", "Düz 1"))
-        menu = self.project_menu(root, self.row(root, "sidebarProject", "Kod"))
+        menu = self.project_menu(root, self.row(root, "sidebarProject", "Tez"))  # G6SB3 DRAG: Tez is the lower project now
         settled(300, lambda: (self.assertTrue(menu.property("visible")), self.assertFalse(rowmenu.property("visible"))))
-        self.menu(root, self.row(root, "sidebarProjectConversation", "Tez 1"))       # above Kod: not under its menu
+        self.menu(root, self.row(root, "sidebarProjectConversation", "Kod 0"))       # above Tez: not under its menu
         settled(300, lambda: self.assertFalse(menu.property("visible")))
         self.close_menu(root)
         self.assertEqual(0, self.execute_calls())

@@ -66,6 +66,7 @@ from jarvis.ui.preferences import (
     UiPreferences,
     FREEZE_KEYS,
     STATUS_INDICATORS,
+    ordered_projects,
     validate_preferences,
 )
 from jarvis.ui.present import (
@@ -1263,6 +1264,60 @@ class Bridge(QObject):
             return False
         return self.newProjectConversation(owner["id"])
 
+    # -- Gate 6G Sidebar v2 slice 3 (V4): the New chat screen's project picker --
+    #
+    # Navigation over the existing creation paths only: the store decides an
+    # owner when a conversation is created and the first message fixes it
+    # (the picker shows only while the open conversation is empty).
+
+    newProjectDialogRequested = Signal()
+
+    def _active_project(self, project_id: str) -> bool:
+        return any(r["id"] == project_id and r.get("active") for r in self._project_records)
+
+    @Slot(result=bool)
+    def startNewChat(self) -> bool:
+        """V4 "Yeni sohbet": the New chat screen - a new, empty conversation in
+        the current project (the open project page's, else the open
+        conversation's) when that one is active, else with no project."""
+        project = self._open_project if self._page_override == "projects" else ""
+        if not project:
+            project = self._conversation_owner.get("id") or ""
+        opened = self.newProjectConversation(project) if self._active_project(project) else self.newConversation()
+        if opened:
+            self.setPage("home")
+        return opened
+
+    @Slot(str, result=bool)
+    def setNewChatProject(self, project_id: str) -> bool:
+        """V4: the picker's choice ("" = no project) while the open conversation
+        is still empty: that owner's newest untitled conversation when it is
+        empty too, else a new one. Refused once a message was sent (the owner
+        is fixed) and for an unknown or archived project."""
+        project_id = str(project_id)
+        if not self._conversation_store.id or self._conversation_store.state.turns or self._conversation_archived:
+            return False
+        if (self._conversation_owner.get("id") or "") == project_id:
+            return True
+        if project_id and not self._active_project(project_id):
+            return False
+        store = self._conversation_db()
+        try:
+            spare = next((r.id for r in store.list_conversations(project_id=project_id or None)
+                          if not r.title and r.origin == "jarvis"), None) if store is not None else None
+            if spare is not None and store.load_conversation_state(spare).turns:
+                spare = None
+        except Exception:  # noqa: BLE001 - storage boundary: a new one instead
+            spare = None
+        if spare is not None:
+            return self._open_conversation(spare, expand=False)
+        return self.newProjectConversation(project_id) if project_id else self.newConversation()
+
+    @Slot()
+    def requestNewProject(self) -> None:
+        """V4 "Yeni proje…": the window opens the existing new-project dialog."""
+        self.newProjectDialogRequested.emit()
+
     # -- Gate 6F F6: pinned conversations and collapsible date groups ---------
     #
     # Window preferences only (UiPreferences' sidebar file): a pin is an id in
@@ -1383,6 +1438,59 @@ class Bridge(QObject):
                 self._deliver("conversationSearchDone", result)
 
         threading.Thread(target=run, name="jarvis-search", daemon=True).start()
+
+    # -- Gate 6G Sidebar v2 slice 3: DRAG (project order) and V10 (pin info card)
+
+    @Property("QVariantList", notify=projectsChanged)
+    def sidebarProjectOrder(self) -> list:
+        """DRAG: every project's id in the sidebar's manual order (a new one on top)."""
+        return ordered_projects(self._project_records, self.prefs.project_order)
+
+    @Slot(str, str, result=bool)
+    def moveProject(self, project_id: str, before_id: str) -> bool:
+        """DRAG: put a project just above ``before_id`` ("" = last). Window
+        preferences only (UiPreferences' order file)."""
+        project_id, before_id = str(project_id), str(before_id)
+        order = self.sidebarProjectOrder
+        if project_id not in order or project_id == before_id or (before_id and before_id not in order):
+            return False
+        order.remove(project_id)
+        order.insert(order.index(before_id) if before_id else len(order), project_id)
+        if not self.prefs.set_project_order(order):
+            return False
+        self.projectsChanged.emit()
+        return True
+
+    @Slot(str, result="QVariantMap")
+    def pinInfo(self, conversation_id: str) -> dict:
+        """V10, read only: what a SABİTLENENLER row's info card shows, every
+        value as stored (nothing generated, no model call): the owner, the
+        title, the project's instruction line (a project's) or the first
+        message (a plain one), the project's active file names, the last
+        change. A fact that cannot be read is left out; {} for no listed pin."""
+        record = self._pin_records.get(str(conversation_id))
+        store = self._conversation_db()
+        if record is None or store is None:
+            return {}
+        title = record.title or (("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ())
+                                 if record.origin == "legacy-import" else "")
+        owner = {**self._pin_projects, **{r["id"]: r for r in self._project_records}}.get(record.project_id or "", {})
+        info: dict[str, Any] = {"project_id": record.project_id or "", "project_name": str(owner.get("name") or ""),
+                                "title": render(title) if isinstance(title, tuple) else title,
+                                "instruction": "", "first_message": "", "files": [], "updated_at": record.updated_at}
+        try:
+            if record.project_id:
+                current = store.load_project_instruction(record.project_id)
+                text = current.text if current is not None else ""
+                info["instruction"] = next((line.strip() for line in text.splitlines() if line.strip()), "")
+                info["files"] = [str(f["display_name"]) for f in store.list_project_files(record.project_id)
+                                 if f.get("lifecycle") == "active"]
+            else:
+                first = next((t for t in store.load_conversation_state(record.id).turns if t.role == "user"), None)
+                info["first_message"] = (first.message or first.text).strip() if first is not None else ""
+        except Exception:  # noqa: BLE001 - a label only: what was read stays
+            pass
+        return info
 
     # -- Gate 6G Sidebar v2 slice 2: hide mode (V5), tiles mode (V6), widths (E1')
     #

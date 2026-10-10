@@ -2628,7 +2628,6 @@ class GlassMaterialTests(UiTestCase):
             b = it.mapToScene(QPointF(it.width(), it.height()))
             return tuple(round(v, 1) for v in (a.x(), a.y(), b.x(), b.y()))
 
-        before = [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "brandCard", "railTasks", "jarvisCore")]
         # Primary shell ~54 %, secondary shell ~66 %; the composer (interactive) ~89 %.
         self.assertAlmostEqual(0.54, self.alpha(self.item(root, "canonicalWorkspace"), "fill"), delta=0.03)
         self.assertAlmostEqual(0.66, self.alpha(self.item(root, "railTasks")), delta=0.03)
@@ -2638,6 +2637,9 @@ class GlassMaterialTests(UiTestCase):
         bridge._say("jarvis", "an answer")
         pump(300)
         self.assertGreaterEqual(self.alpha(self.item(root, "feedCard_user"), "color"), 0.0)   # gradient-backed; the stops are tokens
+        # G6SB3 V4: measured once the conversation has messages - the New chat screen's
+        # project picker (under the composer) leaves with the first message, a real change.
+        before = [box(n) for n in ("canonicalWorkspace", "panelColumn", "canonicalComposer", "brandCard", "railTasks", "jarvisCore")]
         # Reduced transparency: ambient off closes the shells, geometry identical.
         bridge.setAmbientEffects(False)
         pump(300)

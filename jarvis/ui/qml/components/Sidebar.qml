@@ -78,6 +78,8 @@ Rectangle {
         // F6, a pinned row: the grip on hover over its lead - drag it to
         // reorder; a tip saying where.
         property bool pinned: false
+        // DRAG, a project row: the whole row drags (a press and a move past 4 px).
+        property bool draggable: false
         property string tip: ""
         property bool dragging: false
         // F7, a conversation row: "⋯" in place of its time (or project) while the
@@ -160,10 +162,21 @@ Rectangle {
         MouseArea {
             id: area
             anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.LeftButton | Qt.RightButton
-            cursorShape: Qt.PointingHandCursor
+            cursorShape: row.dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+            preventStealing: row.draggable
+            property real startY: 0
+            property bool moved: false
+            onPressed: function (mouse) { startY = mouse.y; moved = false }
+            onPositionChanged: function (mouse) {
+                if (!row.draggable || !(pressedButtons & Qt.LeftButton)) return
+                if (!moved && Math.abs(mouse.y - startY) > 4) { moved = true; row.dragStarted() }
+                if (row.dragging) row.dragMoved(mapToItem(null, mouse.x, mouse.y).y)
+            }
+            onReleased: if (row.dragging) row.dragEnded()
+            onCanceled: if (row.dragging) row.dragEnded()
             onClicked: function (mouse) {
                 if (mouse.button === Qt.RightButton) row.contextRequested(Qt.point(mouse.x, mouse.y))
-                else if (row.available) row.activated()
+                else if (!moved && row.available) row.activated()
             }
         }
         // The grip: a press and a move past 4 px drags (the sidebar shows where it
@@ -202,8 +215,10 @@ Rectangle {
                         onClicked: row.contextRequested(Qt.point(row.width + 4, 0)) }
             HoverTip { objectName: "sidebarRowMenuTip"; text: qsTr("Conversation actions"); active: !row.menuHere }
         }
+        // A pinned row's whole title is in its info card (V10): its tip only says why it is busy.
         HoverTip { objectName: "sidebarRowTip"; text: !row.available ? busyReason.text : row.tip || row.title
-                   active: !row.dragging && !menuArea.containsMouse && (row.tip !== "" || nameText.truncated || !row.available) }
+                   active: !row.dragging && !menuArea.containsMouse
+                           && (!row.available || !row.pinned && (row.tip !== "" || nameText.truncated)) }
     }
     // A collapsible heading (SABİTLENENLER, Bugün / Dün / Daha eski): a click,
     // Return or Space toggles it; collapsed it shows its count; the chevron
@@ -316,12 +331,14 @@ Rectangle {
 
     // -- the navigation's data and metrics ------------------------------------
     Text { id: busyReason; visible: false; text: qsTr("Wait for the current run to finish.") }
-    readonly property var owner: bridge.conversationProject || ({})
     readonly property var tree: bridge.sidebarTree
     readonly property var lists: bridge.sidebarConversations
-    // V9: active projects only; T2 "Sabitle": the pinned ones first, newest pin on top.
+    // V9: active projects only; T2 "Sabitle": the pinned ones first, newest pin on top;
+    // the rest in the manual order (DRAG: a new project on top).
     readonly property var projects: {
+        var order = bridge.sidebarProjectOrder
         var active = bridge.projectRecords.filter(function (p) { return p.active })
+                                          .sort(function (a, b) { return order.indexOf(a.id) - order.indexOf(b.id) })
         var pinnedFirst = []
         for (var i = 0; i < tree.pinned_projects.length; ++i)
             for (var j = 0; j < active.length; ++j) if (active[j].id === tree.pinned_projects[i]) pinnedFirst.push(active[j])
@@ -380,7 +397,8 @@ Rectangle {
         if (!tree.projects_open) return out
         for (var i = 0; i < projects.length; ++i) {
             var p = projects[i], open = tree.closed.indexOf(p.id) < 0
-            out.push({ kind: "project", id: p.id, title: p.name, open: open, count: p.conversation_count || 0 })
+            out.push({ kind: "project", id: p.id, title: p.name, open: open, count: p.conversation_count || 0,
+                       pinned: tree.pinned_projects.indexOf(p.id) >= 0 })
             var rows = shownRows((lists[p.id] || []).filter(function (c) { return !pinnedIds[c.id] }), open)
             for (var k = 0; k < rows.length; ++k)
                 out.push({ kind: "conversation", id: rows[k].id, title: rows[k].title, updated_at: rows[k].updated_at, active: rows[k].active })
@@ -433,6 +451,10 @@ Rectangle {
         projectMenu.close()
         if (conversationMenu) conversationMenu.openFor(id, title, row, position, null, null, false, plain)
     }
+    PinInfoCard { id: pinCard }
+    // V4 "Yeni proje…" in the New chat screen's picker: the existing route to the
+    // new-project dialog (Main: the Projects page, its dialog open).
+    Connections { target: bridge; function onNewProjectDialogRequested() { sidebar.newProjectRequested() } }
     MenuSurface {
         id: projectMenu
         objectName: "sidebarProjectMenu"
@@ -499,7 +521,8 @@ Rectangle {
                 visible: !searchBox.active
                 titleName: "sidebarNewChatName"
                 lead: "plus"; title: qsTr("New chat"); muted: true
-                onActivated: sidebar.owner.global || sidebar.owner.archived ? bridge.newConversation() : bridge.newConversationInScope()
+                // V4: in the current project (its page or its conversation) when active, else none.
+                onActivated: bridge.startNewChat()
             }
 
             // L2: the word PROJELER links to the Projects page; the rest of the row
@@ -574,6 +597,42 @@ Rectangle {
                 onHeightChanged: Qt.callLater(keepSelected)
                 onContentHeightChanged: Qt.callLater(keepSelected)
                 Component.onCompleted: Qt.callLater(keepSelected)
+                // DRAG: which project, the pointer (scene y), the tree row it would go
+                // above (treeRows.length = the end), the edge it holds at (the tree
+                // scrolls under it). Only between unpinned projects: the pinned ones
+                // keep their place on top (T2).
+                property string dragId: ""
+                property int dropAt: -1
+                property real pointer: 0
+                property int edge: 0
+                function track() {
+                    var y = mapFromItem(null, 0, pointer).y
+                    edge = y > height - 18 ? 1 : y < 18 ? -1 : 0
+                    var rows = sidebar.treeRows, at = rows.length
+                    var gap = Math.max(0, Math.min(rows.length, Math.round(projectColumn.mapFromItem(null, 0, pointer).y / sidebar.step)))
+                    for (var i = gap; i < rows.length; ++i) if (rows[i].kind === "project" && !rows[i].pinned) { at = i; break }
+                    dropAt = at
+                }
+                function drop() {
+                    var id = dragId, at = dropAt
+                    dragId = ""; dropAt = -1; edge = 0
+                    if (id !== "" && at >= 0) bridge.moveProject(id, at < sidebar.treeRows.length ? sidebar.treeRows[at].id : "")
+                }
+                Timer {
+                    interval: 40; repeat: true; running: projectList.dragId !== "" && projectList.edge !== 0
+                    onTriggered: {
+                        projectList.contentY = Math.max(0, Math.min(projectList.contentHeight - projectList.height,
+                                                                    projectList.contentY + projectList.edge * 6))
+                        projectList.track()
+                    }
+                }
+                Rectangle {
+                    objectName: "sidebarProjectDropLine"
+                    z: 1
+                    visible: projectList.dragId !== "" && projectList.dropAt >= 0
+                    x: 6; width: projectColumn.width - 12; height: 2; radius: 1; color: Theme.accent
+                    y: Math.max(0, Math.min(projectColumn.height - height, projectList.dropAt * sidebar.step - 2))
+                }
                 Column {
                     id: projectColumn
                     width: projectList.width - (projectList.contentHeight > projectList.height ? 10 : 0); spacing: 2
@@ -595,6 +654,11 @@ Rectangle {
                             meta: isProject ? (modelData.open ? "" : sidebar.count(modelData.count)) : i18n.when(modelData.updated_at, sidebar.today, "short")
                             available: isProject || !bridge.navigationLocked
                             menuButton: !isProject
+                            draggable: isProject && !modelData.pinned
+                            dragging: isProject && projectList.dragId === modelData.id
+                            onDragStarted: { projectList.dragId = modelData.id; projectMenu.close() }
+                            onDragMoved: function (sceneY) { projectList.pointer = sceneY; projectList.track() }
+                            onDragEnded: projectList.drop()
                             current: !isProject && !!modelData.active
                             Accessible.description: isProject ? (modelData.open ? qsTr("Expanded") : qsTr("Collapsed"))
                                                               : available ? "" : busyReason.text
@@ -700,17 +764,19 @@ Rectangle {
                                         itemId: modelData.id; pinned: true; menuButton: true
                                         lead: modelData.project_id !== "" ? "folder" : "chat"
                                         title: modelData.title || qsTr("New Chat"); muted: !modelData.title
-                                        tip: modelData.project_id !== "" ? title + "\n" + qsTr("In the %1 project").arg(modelData.project_name) : ""
                                         current: !!modelData.active
                                         dragging: pinSection.dragId === modelData.id
-                                        onActivated: bridge.openConversation(modelData.id)
+                                        // V10: hover and wait - the info card at its right.
+                                        onHoveredChanged: if (hovered) pinCard.hoverRow(pinRow, modelData.id); else if (pinCard.row === pinRow) pinCard.leave()
+                                        onActivated: { pinCard.leave(); bridge.openConversation(modelData.id) }
                                         onContextRequested: function (position) {
+                                            pinCard.leave()
                                             projectMenu.close()
                                             if (sidebar.conversationMenu) sidebar.conversationMenu.openFor(modelData.id, modelData.title, pinRow, position,
                                                                                                            null, null, modelData.project_archived,
                                                                                                            modelData.project_id === "")
                                         }
-                                        onDragStarted: if (sidebar.openGroups.pinned) { pinSection.dragId = modelData.id; pinSection.from = index }
+                                        onDragStarted: { pinCard.leave(); if (sidebar.openGroups.pinned) { pinSection.dragId = modelData.id; pinSection.from = index } }
                                         onDragMoved: function (sceneY) { pinSection.pointer = sceneY; pinSection.track() }
                                         onDragEnded: pinSection.drop()
                                     }

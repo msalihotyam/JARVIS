@@ -395,6 +395,34 @@ def validate_sidebar_layout(candidate: Any) -> dict[str, Any]:
     return dict(candidate)
 
 
+ORDER_VERSION = 1
+
+
+def canonical_order() -> dict[str, Any]:
+    """Gate 6G Sidebar v2 DRAG: the sidebar's manual project order (ids, top first)."""
+    return {"version": ORDER_VERSION, "projects": []}
+
+
+def validate_order(candidate: Any) -> dict[str, Any]:
+    """The order document, or the canonical one when ANY part is malformed."""
+    defaults = canonical_order()
+    if not isinstance(candidate, dict) or set(candidate) != set(defaults) or candidate["version"] != ORDER_VERSION:
+        return defaults
+    ids = candidate["projects"]
+    if not isinstance(ids, list) or len(set(map(str, ids))) != len(ids) or any(type(i) is not str or not i for i in ids):
+        return defaults
+    return {"version": ORDER_VERSION, "projects": list(ids)}
+
+
+def ordered_projects(records: list[dict[str, Any]], order: list[str]) -> list[str]:
+    """Every record's id in the sidebar's order: a project the order does not
+    know yet (new) on top, newest first; then the order's known ids."""
+    known = {record["id"] for record in records}
+    fresh = sorted((r for r in records if r["id"] not in order),
+                   key=lambda r: (str(r.get("created_at") or ""), r["id"]), reverse=True)
+    return [r["id"] for r in fresh] + [i for i in order if i in known]
+
+
 def default_preferences_path() -> Path:
     return Path.home() / ".jarvis" / "ui-preferences.json"
 
@@ -660,6 +688,39 @@ class UiPreferences:
         try:
             self.sidebar_layout_path.parent.mkdir(parents=True, exist_ok=True)
             self.sidebar_layout_path.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        return True
+
+    # -- Gate 6G Sidebar v2 slice 3: the projects' manual order (DRAG) ---------
+    #
+    # A fourth sibling file (``<prefs>.sidebar-order.json``), like the pins: the
+    # main document and the tree file keep their exact key sets, so a schema-10
+    # release still reads both whole (rollback) and never opens this one.
+
+    @property
+    def order_path(self) -> Path:
+        return self.path.with_suffix(".sidebar-order.json")
+
+    @property
+    def project_order(self) -> list[str]:
+        if not hasattr(self, "_order"):
+            try:
+                raw = json.loads(self.order_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw = None
+            self._order = validate_order(raw)
+        return list(self._order["projects"])
+
+    def set_project_order(self, ids: list[str]) -> bool:
+        """Keep ``ids`` (top first) when valid and different; then save."""
+        candidate = {"version": ORDER_VERSION, "projects": list(ids)}
+        if candidate["projects"] == self.project_order or validate_order(candidate) != candidate:
+            return False
+        self._order = candidate
+        try:
+            self.order_path.parent.mkdir(parents=True, exist_ok=True)
+            self.order_path.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
         except OSError:
             pass
         return True

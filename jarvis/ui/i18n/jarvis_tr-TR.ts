@@ -2892,6 +2892,41 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>PinInfoCard</name>
+    <message>
+        <source>Project conversation · %1</source>
+        <translation>Proje sohbeti · %1</translation>
+    </message>
+    <message>
+        <source>Conversation without a project</source>
+        <translation>Projesiz sohbet</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Instruction</source>
+        <translation>Talimat</translation>
+    </message>
+    <message>
+        <source>First message</source>
+        <translation>İlk mesaj</translation>
+    </message>
+    <message>
+        <source>1 file</source>
+        <translation>1 dosya</translation>
+    </message>
+    <message>
+        <source>%1 files</source>
+        <translation>%1 dosya</translation>
+    </message>
+    <message>
+        <source>Last activity: %1</source>
+        <translation>Son etkinlik: %1</translation>
+    </message>
+</context>
+<context>
     <name>PowerControl</name>
     <message>
         <source>Resume JARVIS</source>
@@ -3180,6 +3215,37 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Project actions</source>
         <translation>Proje işlemleri</translation>
+    </message>
+</context>
+<context>
+    <name>ProjectPicker</name>
+    <message>
+        <source>Choose project</source>
+        <translation>Proje seç</translation>
+    </message>
+    <message>
+        <source>Without a project the conversation stays outside projects</source>
+        <translation>Proje seçmezsen sohbet projelerin dışında kalır</translation>
+    </message>
+    <message>
+        <source>The conversation starts in this project</source>
+        <translation>Sohbet bu projede başlar</translation>
+    </message>
+    <message>
+        <source>Search projects</source>
+        <translation>Projelerde ara</translation>
+    </message>
+    <message>
+        <source>No project</source>
+        <translation>Proje yok</translation>
+    </message>
+    <message>
+        <source>No project matches</source>
+        <translation>Eşleşen proje yok</translation>
+    </message>
+    <message>
+        <source>New project…</source>
+        <translation>Yeni proje…</translation>
     </message>
 </context>
 <context>
@@ -4036,10 +4102,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>New chat</source>
         <translation>Yeni sohbet</translation>
-    </message>
-    <message>
-        <source>In the %1 project</source>
-        <translation>%1 projesinde</translation>
     </message>
     <message>
         <source>1 conversation</source>

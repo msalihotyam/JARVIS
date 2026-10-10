@@ -441,6 +441,9 @@ class SidebarShellTests(SidebarShellCase):
     def test_k_the_peek_opens_beside_its_tile_inside_the_window(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
+        # G6SB3 V4: a conversation with a message - on the New chat screen the project picker sits
+        # under the composer, so the composer (the peek's lower limit) is a row higher there.
+        bridge._say("user", "a request")
         for width, height in SIZES:
             self.resize_still(root, width, height, 600)
             for key in ("Tasks", "Focus", "Plan"):
@@ -1882,6 +1885,9 @@ class SweepCase(PunchListCase):
             node = node.parentItem()
             if node is None:
                 return False
+            # G6SB3 V10: a SABİTLENENLER row's whole title is in its info card (hover and wait).
+            if node.objectName() == "sidebarPinnedConversation" and node.property("pinned") is True:
+                return True
             for child in node.childItems():
                 if "HoverTip" in child.metaObject().className() and child.property("active") and child.property("text"):
                     return True
@@ -2475,7 +2481,9 @@ class PinTests(F6Case):
         row = self.pin_row(root, "Tez 1")
         self.assertEqual("folder", self.child(row, "sidebarRowLead").property("name"))   # folder: a project's
         self.assertEqual([], [t for t in self.descendants(row) if t.objectName() == "sidebarPinPlaceName"])
-        self.assertEqual("Tez 1\nIn the Tez project", self.child(row, "sidebarRowTip").property("text"))
+        # G6SB3 V10: the project is said by the row's info card (hover and wait), not a tip.
+        self.assertFalse(self.child(row, "sidebarRowTip").property("active"))
+        self.assertEqual(("Tez 1", "Tez"), (bridge.pinInfo(self.tezc[1].id)["title"], bridge.pinInfo(self.tezc[1].id)["project_name"]))
         # A pin of another owner opens that conversation (the conversation pick).
         self.tap(root, self.pin_row(root, "Genel 0"), then=lambda: (
             self.assertEqual((self.genel[0].id, True), (bridge.conversationId, bridge.conversationProject["global"])),
@@ -2836,9 +2844,12 @@ class PinFitTests(F6Case):
                         self.assertEqual("chat" if "genel" in row.property("title") else "folder", lead.property("name"))
                         self.assertLessEqual(self.rect(lead).right(), self.rect(title).left() - 4, what)
                         self.inside(self.rect(row), self.rect(lead), what)
-                        self.assertTrue(self.child(row, "sidebarRowTip").property("active"))
+                        # G6SB3 V10: the info card (hover and wait) says the title and the project, not a tip.
+                        self.assertFalse(self.child(row, "sidebarRowTip").property("active"))
+                        info = bridge.pinInfo(row.property("itemId"))
+                        self.assertEqual(row.property("title"), info["title"])
                         if lead.property("name") == "folder":
-                            self.assertIn("\nIn the ", self.child(row, "sidebarRowTip").property("text"))
+                            self.assertIn(info["project_name"], (LONG_PROJECT, "Ev"))
                     # The menu with its pin items, on a pinned row, inside the window and unclipped.
                     menu = self.menu(root, self.shown(root, "sidebarPinnedConversation")[1])
                     for name in ("conversationPinItem", "conversationPinUpItem", "conversationPinDownItem"):
@@ -2946,9 +2957,10 @@ class PinFitTests(F6Case):
                                  "En fazla %1 sohbet sabitlenebilir: önce birinin sabitlemesini kaldırın.")):
             self.assertEqual(turkish, tx("ConversationMenu", source))
         for source, turkish in (("PINNED", "SABİTLENENLER"),                       # Sidebar v2 V3 (was SABİTLENDİ)
-                                ("In the %1 project", "%1 projesinde"),
                                 ("Expanded", "Açık"), ("Collapsed", "Kapalı")):
             self.assertEqual(turkish, tx("Sidebar", source))
+        # G6SB3 V10: the pinned row's project is said by its info card (was the tip's "In the %1 project").
+        self.assertEqual("Proje sohbeti · %1", tx("PinInfoCard", "Project conversation · %1"))
 
 
 class ProjectListOffsetTests(F6Case):
@@ -2986,7 +2998,7 @@ class ProjectListOffsetTests(F6Case):
                       lambda: (bridge.openConversation(store.list_conversations(project_id=old.id)[0].id), pump(400))):
             root.resize(1100, 700)
             pump(700)
-            bridge.openProjectScope(projects[-1].id)
+            bridge.openProjectScope(projects[0].id)        # G6SB3 DRAG: never ordered = newest first, the oldest last
             pump(500)                  # the list scrolls to show it
             self.assertGreater(self.offset(root)[0], 0)
             leave()
