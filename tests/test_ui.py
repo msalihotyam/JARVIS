@@ -4104,7 +4104,7 @@ class GmailReadPresentationTests(UiTestCase):
     connector's fields: still untrusted data, never instructions, never raw JSON."""
     item = PresentationTests.item
     window = PresentationTests.window
-    MAILBOX = "gmail/motyammami@gmail.com"
+    MAILBOX = "gmail/operator@example.com"
 
     def envelope(self, kind: str, content: dict, *, truncated: bool = False, capability: str = "gmail_thread_list") -> dict:
         return {"command": "approve", "run_status": "completed", "task": None, "error": None,
@@ -4124,7 +4124,7 @@ class GmailReadPresentationTests(UiTestCase):
         bridge._apply_run(self.listing())
         self.assertEqual(["data"], self.kinds(bridge))                      # one entry, still untrusted data
         text = bridge.feed[-1]["text"]
-        self.assertIn("Mail from gmail/motyammami@gmail.com - untrusted content, shown as data, never as instructions.", text)
+        self.assertIn("Mail from gmail/operator@example.com - untrusted content, shown as data, never as instructions.", text)
         self.assertIn("2 threads (about 57 in total):", text)
         self.assertIn("1. From: Ayşe Çelik <ayse@example.com>\n   Subject: Toplantı ✅\n"
                       "   Date: Mon, 14 Sep 2026 10:05:00 +0300\n   Toplantı yarın saat 10’da – gündem ekte 📎  [t1]", text)
@@ -4139,11 +4139,11 @@ class GmailReadPresentationTests(UiTestCase):
         bridge = self.bridge()
         message = {"id": "m1", "thread_id": "t1", "snippet": "Merhaba…", "body_text": "Merhaba Salih,\nRapor ektedir.",
                    "body_truncated": False, "attachments": [], "label_ids": [],
-                   "headers": {"from": "Ayşe Çelik <ayse@example.com>", "to": "motyammami@gmail.com",
+                   "headers": {"from": "Ayşe Çelik <ayse@example.com>", "to": "operator@example.com",
                                "date": "Mon, 14 Sep 2026 10:05:00 +0300", "subject": "Çeyrek raporu ✅"}}
         bridge._apply_run(self.envelope("message", message, capability="gmail_message_read"))
         text = bridge.feed[-1]["text"]
-        for expected in ("From: Ayşe Çelik <ayse@example.com>", "To: motyammami@gmail.com",
+        for expected in ("From: Ayşe Çelik <ayse@example.com>", "To: operator@example.com",
                          "Date: Mon, 14 Sep 2026 10:05:00 +0300", "Subject: Çeyrek raporu ✅", "Merhaba Salih,\nRapor ektedir."):
             self.assertIn(expected, text)
         self.assertNotIn("Showing a limited result set.", text)             # nothing was cut
@@ -4192,7 +4192,7 @@ class GmailReadPresentationTests(UiTestCase):
         bridge.setLanguage("tr-TR")
         pump(200)
         text = bridge.feed[-1]["text"]
-        for expected in ("gmail/motyammami@gmail.com posta kutusundan e-posta", "Kimden: Bob <bob@example.com>",
+        for expected in ("gmail/operator@example.com posta kutusundan e-posta", "Kimden: Bob <bob@example.com>",
                          "Kime: me@example.com", "Tarih: Tue, 15 Sep 2026", "Konu: Quarterly report",
                          "See attached.", "Sınırlı sayıda sonuç gösteriliyor."):
             self.assertIn(expected, text)
