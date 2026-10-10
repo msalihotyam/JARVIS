@@ -4059,6 +4059,61 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>SidebarSearch</name>
+    <message>
+        <source>Search conversations</source>
+        <translation>Sohbetlerde ara</translation>
+    </message>
+    <message>
+        <source>Close search</source>
+        <translation>Aramayı kapat</translation>
+    </message>
+    <message>
+        <source>Previous conversation</source>
+        <translation>Önceki sohbet</translation>
+    </message>
+    <message>
+        <source>New Chat</source>
+        <translation>Yeni Sohbet</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>old summary</source>
+        <translation>eski özet</translation>
+    </message>
+    <message>
+        <source>Wait for the current run to finish.</source>
+        <translation>Süren çalışmanın bitmesini bekleyin.</translation>
+    </message>
+    <message>
+        <source>The search could not be run.</source>
+        <translation>Arama yapılamadı.</translation>
+    </message>
+    <message>
+        <source>Searching…</source>
+        <translation>Aranıyor…</translation>
+    </message>
+    <message>
+        <source>No results</source>
+        <translation>Sonuç yok</translation>
+    </message>
+    <message>
+        <source>TITLES</source>
+        <translation>BAŞLIKLAR</translation>
+    </message>
+    <message>
+        <source>CONTENTS</source>
+        <translation>İÇERİKLER</translation>
+    </message>
+    <message>
+        <source>There are more results</source>
+        <translation>Daha fazla sonuç var</translation>
+    </message>
+</context>
+<context>
     <name>SummaryPeek</name>
     <message>
         <source>Current request</source>

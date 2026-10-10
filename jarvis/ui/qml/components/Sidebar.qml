@@ -400,7 +400,7 @@ Rectangle {
     // Height (T3): the fixed rows, then the tree and the list share the rest -
     // each its whole content when both fit, else the shorter keeps its own and
     // the longer the remainder, else half each; whole items only, each its own scroll.
-    readonly property real fixedH: step + 28 + 2 + (tree.projects_open ? linkH + 2 : 0) + 9 + 2
+    readonly property real fixedH: searchBox.entryH + 2 + step + 28 + 2 + (tree.projects_open ? linkH + 2 : 0) + 9 + 2
     readonly property real room: navigation.height - fixedH - (treeRows.length > 0 ? 2 : 0)
     readonly property var treeSizes: treeRows.map(function () { return rowH })
     readonly property var listSizes: {
@@ -484,10 +484,19 @@ Rectangle {
         Column {
             width: parent.width; spacing: 2
 
+            // F8 (S1): the search entry on top; while a query is active its results
+            // take the navigation's place (the rows below hide).
+            SidebarSearch {
+                id: searchBox
+                width: parent.width
+                big: sidebar.big; rowH: sidebar.rowH; room: navigation.height
+            }
+
             // N1: "Yeni sohbet" - the New chat screen (a new, empty conversation): in
             // the open conversation's project when that one is writable, else plain.
             NavRow {
                 objectName: "sidebarNewChat"
+                visible: !searchBox.active
                 titleName: "sidebarNewChatName"
                 lead: "plus"; title: qsTr("New chat"); muted: true
                 onActivated: sidebar.owner.global || sidebar.owner.archived ? bridge.newConversation() : bridge.newConversationInScope()
@@ -497,6 +506,7 @@ Rectangle {
             // collapses / opens the tree (the chevron at the right, the count while collapsed).
             Item {
                 id: projectsHead
+                visible: !searchBox.active
                 width: parent.width; height: 28
                 readonly property bool open: sidebar.tree.projects_open
                 function toggle() { bridge.setProjectsOpen(!open) }
@@ -538,7 +548,7 @@ Rectangle {
             Flickable {
                 id: projectList
                 objectName: "sidebarProjectList"
-                visible: sidebar.treeH > 0
+                visible: sidebar.treeH > 0 && !searchBox.active
                 width: parent.width; height: sidebar.treeH
                 clip: true; contentHeight: projectColumn.height
                 // The drawn icons stay inside the clip with every scene-graph backend.
@@ -600,13 +610,14 @@ Rectangle {
 
             NavLink {
                 objectName: "sidebarAllProjects"
-                visible: sidebar.tree.projects_open
+                visible: sidebar.tree.projects_open && !searchBox.active
                 height: sidebar.linkH
                 text: qsTr("All projects")
                 onActivated: bridge.showProject("")
             }
 
             Item {
+                visible: !searchBox.active
                 width: parent.width; height: 9
                 Rectangle {
                     x: 4; y: 4; width: parent.width - 8; height: 1
@@ -623,6 +634,7 @@ Rectangle {
             Flickable {
                 id: conversationList
                 objectName: "sidebarConversationList"
+                visible: !searchBox.active
                 width: parent.width; height: sidebar.listH
                 clip: true; contentHeight: conversationColumn.height
                 // The drawn glyphs and chevrons stay inside the clip with every scene-graph backend.

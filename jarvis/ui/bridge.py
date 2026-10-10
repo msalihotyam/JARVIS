@@ -46,7 +46,7 @@ from jarvis.context_items import (
     safe_name,
     same_reference,
 )
-from jarvis import project_files
+from jarvis import conversation_search, project_files
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
@@ -1350,6 +1350,39 @@ class Bridge(QObject):
     @Slot(str, bool)
     def setProjectPinned(self, project_id: str, pinned: bool) -> None:
         self._tree_saved(self.prefs.set_tree_member("pinned_projects", str(project_id), bool(pinned)))
+
+    # -- Gate 6G F8: the sidebar's conversation search (read-only) ------------
+    #
+    # A scan of the stored conversations through the store's read paths
+    # (jarvis.conversation_search), on its own thread: the window never waits.
+    # The answer carries the query exactly as asked, so the window keeps only
+    # the answer to what it shows now; a superseded scan delivers nothing.
+
+    conversationSearchDone = Signal("QVariantMap")
+
+    @Slot(str)
+    def searchConversations(self, query: str) -> None:
+        query = str(query)
+        self._search_seq = seq = getattr(self, "_search_seq", 0) + 1
+        store = self._conversation_db()
+
+        def work() -> dict:
+            try:
+                found = conversation_search.search(store, query, redact=redact_text)
+            except Exception:  # noqa: BLE001 - storage boundary: an honest failure, never a partial list
+                found = {"titles": [], "contents": [], "more": False, "failed": True}
+            return {"failed": store is None, **found, "query": query}
+
+        if self.sync:
+            self.conversationSearchDone.emit(work())
+            return
+
+        def run() -> None:
+            result = work()
+            if seq == self._search_seq:
+                self._deliver("conversationSearchDone", result)
+
+        threading.Thread(target=run, name="jarvis-search", daemon=True).start()
 
     # -- Gate 6G Sidebar v2 slice 2: hide mode (V5), tiles mode (V6), widths (E1')
     #

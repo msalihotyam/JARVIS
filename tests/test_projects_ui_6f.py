@@ -836,7 +836,9 @@ class SidebarNavTests(SidebarNavCase):
                     # T3: the tree and the list share the height (no fixed 5 / 3 project rows): both keep rows in
                     # view - at the 1920 class two or more each; below it (SIZE: no polish) the halves keep one
                     # whole row at least, and the list scrolls to the rest.
-                    self.assertGreaterEqual(shown["sidebarProject"] + shown["sidebarProjectConversation"], 2)
+                    # G6F8 (S1): the search row on top of the navigation takes one row's room, so below the
+                    # 1920 class the tree too keeps one whole row at least (was two at every size).
+                    self.assertGreaterEqual(shown["sidebarProject"] + shown["sidebarProjectConversation"], 2 if width >= 1600 else 1)
                     self.assertGreaterEqual(shown["sidebarConversation"], 2 if width >= 1600 else 1)
                     flick = self.item(root, "sidebarConversationList")
                     if shown["sidebarConversation"] < len(self.shown(root, "sidebarConversation")):
@@ -2895,14 +2897,22 @@ class PinFitTests(F6Case):
                         self.assertEqual(["Genel 2", "Genel 0"], self.pinned(root))
                         # G6SB2B: the newest ("Tez 1", the tree's first row) - with the L4 row the tree shows
                         # two rows at 1100x700, so "Tez 0" is a scroll away there (was "Tez 0").
-                        self.tap(root, self.row(root, "sidebarProjectConversation", "Tez 1"),
+                        # G6F8 (S1): with the search row on top the tree shows ONE whole row at 1100x700, so each
+                        # tree row is scrolled into view before its click (was: clicked where it sat).
+                        def tree_row(name, title):
+                            self.lists_at_rest(root)
+                            row, flick = self.row(root, name, title), self.item(root, "sidebarProjectList")
+                            top = row.mapToItem(flick.property("contentItem"), QPointF(0, 0)).y()
+                            flick.setProperty("contentY", max(0.0, min(top, flick.property("contentHeight") - flick.height())))
+                            return row
+                        self.tap(root, tree_row("sidebarProjectConversation", "Tez 1"),
                                  until=lambda: bridge.conversationProject["name"] == "Tez")
                         # A tree toggle re-shares the height (T3): the list comes to rest before the next click.
-                        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (               # a project's tree
+                        self.tap(root, tree_row("sidebarProject", "Tez"), then=lambda: (                     # a project's tree
                             self.assertIn(tez.id, bridge.sidebarTree["closed"]),
                             self.assertEqual(["Tez 1"], self.tree_titles(root)),                            # the open one stays
                         ))
-                        self.tap(root, self.row(root, "sidebarProject", "Tez"), then=lambda: (
+                        self.tap(root, tree_row("sidebarProject", "Tez"), then=lambda: (
                             self.assertNotIn(tez.id, bridge.sidebarTree["closed"]),
                         ))
                         self.lists_at_rest(root)
