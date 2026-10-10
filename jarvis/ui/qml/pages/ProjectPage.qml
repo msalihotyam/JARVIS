@@ -7,8 +7,8 @@ import "../components"
 // Gate 6G P3: one project's page (replaces the 6B-6E detail view). The name,
 // a "new conversation in this project" composer, its pinned and recent
 // conversations (and the archived ones, 6D-b); at the right, rows that open
-// the existing instruction editor and file panel as dialogs, and - only when
-// 6H H1 stored one - the current folder link, read only. No Memory or
+// the existing instruction editor and file panel as dialogs, and the 6H
+// folder link (G6H2: link an EXISTING folder, unlink). No Memory or
 // Scheduled row before their releases (V2.1 / V2.5): nothing fake or empty.
 // A project is context, never authority: every change goes through the
 // existing explicit-user paths and Core's answer is shown as returned.
@@ -18,7 +18,7 @@ Item {
     objectName: "projectDetail"
     property var project: ({})
     property var host: null                   // the Projects page: its one date formatter
-    // Which dialog is open: "conversations" (none), "instruction" or "files".
+    // Which dialog is open: "conversations" (none), "instruction", "files" or "folder".
     property string section: "conversations"
     readonly property bool live: project.active === true
     readonly property string shownId: project.id || ""
@@ -53,13 +53,15 @@ Item {
     // -- the open dialog follows `section` (the Projects page's card menu "Edit" sets it) --
     onSectionChanged: syncSection()
     // Leaving the page (another page loads) takes its dialogs with it: none outlives it open.
-    Component.onDestruction: { purgeDialog.close(); filesDialog.close(); instructionDialog.close() }
+    Component.onDestruction: { purgeDialog.close(); filesDialog.close(); instructionDialog.close(); folderDialog.close() }
     function syncSection() {
         var open = shownId !== ""
         if (section === "instruction" && open) instructionDialog.open()
         else if (instructionDialog.visible) instructionDialog.close()
         if (section === "files" && open) { if (!purgeDialog.visible) filesDialog.open() }
         else if (filesDialog.visible) filesDialog.close()
+        if (section === "folder" && open) folderDialog.open()
+        else if (folderDialog.visible) folderDialog.close()
     }
     // Gate 6E: the page fades in when another project opens; Q6: the rename
     // field shows only after "Rename" (Enter saves, Esc or Cancel puts it away).
@@ -256,7 +258,7 @@ Item {
         }
     }
 
-    // -- the right column: instruction, files and (6H, read only) the folder ----
+    // -- the right column: instruction, files and (6H) the folder ---------------
     readonly property real sideWidth: Math.round(Math.max(220, Math.min(340, width * 0.32)))
     Column {
         id: sideRows
@@ -278,15 +280,18 @@ Item {
             quiet: active === 0
             onOpened: projectPage.section = "files"
         }
-        // 6H H1: the CURRENT link only, read only - no link, change or unlink here yet.
+        // 6H: the CURRENT link, or honestly none; an archived project without one has no row.
         SideRow {
             id: folderRow
             objectName: "projectFolderRow"
-            visible: !!bridge.projectFolder.path
-            clickable: false
+            readonly property bool linked: !!bridge.projectFolder.path
+            visible: linked || projectPage.live
             icon: "folder"; label: qsTr("Folder")
-            body: bridge.projectFolder.path || ""
-            HoverTip { target: folderRow; text: folderRow.body; active: folderRow.visible }
+            action: !projectPage.live ? qsTr("View") : linked ? qsTr("Manage") : qsTr("Link a folder")
+            body: bridge.projectFolder.path || qsTr("No folder linked")
+            quiet: !linked
+            onOpened: projectPage.section = "folder"
+            HoverTip { target: folderRow; text: folderRow.body; active: folderRow.visible && folderRow.linked }
         }
     }
 
@@ -457,6 +462,61 @@ Item {
                    textFormat: Text.PlainText; text: bridge.projectInstructionNotice; color: Theme.warning; font: Theme.pageMeta }
         }
         buttons: [ ActionButton { objectName: "instructionDialogClose"; label: qsTr("Close"); height: 36; width: 110; onClicked: instructionDialog.close() } ]
+    }
+
+    // -- Klasör (Gate 6H): the folder link, in a dialog ---------------------------
+    // CONTEXT for the person only (Salih Q1): JARVIS never reads, writes or sends
+    // the folder. "Browse…" picks an EXISTING folder; its exact path shows before
+    // "Link". Unlink ends the link only - the folder is never deleted. The backend
+    // decides (reparse points, protected roots, overlap) and its reason is shown.
+    property string pickedFolder: ""            // the exact path "Link" sends ("" = none picked)
+    JarvisDialog {
+        id: folderDialog
+        objectName: "projectFolderDialog"
+        label: qsTr("Folder")
+        title: projectPage.project.name || ""
+        preferredWidth: 640
+        readonly property bool linked: !!bridge.projectFolder.path
+        onClosed: { projectPage.pickedFolder = ""; if (projectPage.section === "folder") projectPage.section = "conversations" }
+        Text { objectName: "folderContextNote"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.pageMeta
+               text: qsTr("A linked folder is context for you only: JARVIS does not read it, write into it or send it to the model.") }
+        Rectangle {
+            objectName: "folderPathCard"
+            width: parent ? parent.width : 0; height: folderPathColumn.height + 20; radius: Theme.radiusSmall
+            color: Theme.glassNested; border.width: 1; border.color: Theme.alpha(Theme.text, 0.10)
+            Column {
+                id: folderPathColumn
+                x: 12; y: 10; width: parent.width - 24; spacing: 4
+                Text { objectName: "folderPathLabel"; text: folderDialog.linked ? qsTr("Linked folder") : projectPage.pickedFolder !== "" ? qsTr("Selected folder") : qsTr("No folder linked")
+                       color: Theme.textLabel; font: Theme.pageMeta }
+                Text { objectName: "folderPath"; width: parent.width; wrapMode: Text.WrapAnywhere; textFormat: Text.PlainText; color: Theme.text; font: Theme.pageRowStrong
+                       visible: text !== ""; text: bridge.projectFolder.path || projectPage.pickedFolder }
+                Text { objectName: "folderLinkedAt"; visible: folderDialog.linked; color: Theme.textMuted; font: Theme.pageMeta
+                       text: qsTr("linked %1").arg(projectPage.when(bridge.projectFolder.linked_at)) }
+            }
+        }
+        Text { objectName: "folderUnlinkNote"; visible: folderDialog.linked && projectPage.live; width: parent ? parent.width : 0; wrapMode: Text.Wrap
+               color: Theme.textMuted; font: Theme.pageMeta
+               text: qsTr("Unlinking only ends the link to this project: the folder is not deleted and nothing in it changes.") }
+        Text { objectName: "folderReason"; visible: !projectPage.live; width: parent ? parent.width : 0; wrapMode: Text.Wrap
+               color: Theme.warning; font: Theme.pageMeta; text: qsTr("Archived project: the folder link cannot change.") }
+        Text { objectName: "folderNotice"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; visible: text !== ""
+               textFormat: Text.PlainText; text: bridge.projectFolderNotice; color: Theme.warning; font: Theme.pageMeta }
+        buttons: [
+            ActionButton { objectName: "projectFolderBrowse"; label: qsTr("Browse…"); height: 36; visible: projectPage.live && !folderDialog.linked
+                           onClicked: folderPicker.open() },
+            ActionButton { objectName: "projectFolderLink"; label: qsTr("Link"); primary: true; height: 36; width: 110
+                           visible: projectPage.live && !folderDialog.linked; enabled: projectPage.pickedFolder !== ""
+                           onClicked: { if (bridge.linkProjectFolder(projectPage.project.id, projectPage.pickedFolder)) projectPage.pickedFolder = "" } },
+            ActionButton { objectName: "projectFolderUnlink"; label: qsTr("Unlink"); height: 36; visible: projectPage.live && folderDialog.linked
+                           onClicked: bridge.unlinkProjectFolder(projectPage.project.id) },
+            ActionButton { objectName: "folderDialogClose"; label: qsTr("Close"); height: 36; width: 110; onClicked: folderDialog.close() }
+        ]
+    }
+    FolderDialog {
+        id: folderPicker
+        objectName: "projectFolderPicker"
+        onAccepted: projectPage.pickedFolder = bridge.folderPath(selectedFolder)
     }
 
     // -- Dosyalar: the existing file panel, in a dialog -------------------------

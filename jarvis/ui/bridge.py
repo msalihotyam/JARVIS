@@ -378,7 +378,8 @@ class Bridge(QObject):
         self._project_records: list[dict] = []
         self._project_counts: dict[str, tuple[int, int]] = {}      # project id -> (conversations, archived); presentation only
         self._instruction_lines: dict[str, str] = {}                # project id -> its card's instruction line; presentation only
-        self._project_folder: dict[str, str] = {}                   # the open project's current 6H folder link (read only)
+        self._project_folder: dict[str, str] = {}                   # the open project's current 6H folder link
+        self._project_folder_notice = ""                            # the last 6H link/unlink refusal, in plain words
         self._open_project = ""
         # G6SB3F: the picker's "New project…" in flight - (the new chat's id, the project ids before it).
         self._new_project_chat: tuple[str, frozenset] | None = None
@@ -1056,10 +1057,15 @@ class Bridge(QObject):
 
     @Property("QVariantMap", notify=projectsChanged)
     def projectFolder(self) -> dict:
-        """Gate 6G P3, read only: the open project's CURRENT folder link (6H H1)
-        as the store keeps it - {path, linked_at} - or {} when none. Context for
-        the local user, never authority; nothing here links, unlinks or creates."""
+        """Gate 6G P3: the open project's CURRENT folder link (6H H1) as the
+        store keeps it - {path, linked_at} - or {} when none. Context for the
+        local user, never authority; linkProjectFolder / unlinkProjectFolder
+        change it, nothing here creates a folder."""
         return dict(self._project_folder)
+
+    @Property(str, notify=projectsChanged)
+    def projectFolderNotice(self) -> str:
+        return self._project_folder_notice
 
     @Property("QVariantList", notify=projectsChanged)
     def projectJobs(self) -> list:
@@ -1115,11 +1121,7 @@ class Bridge(QObject):
             return
         store = self._conversation_db()
         try:
-            # Through the app's audited ``show`` path: only the store, the app and
-            # the 6H module name the link (Gate 6H A4).
-            loaded = self.backend.store.load() if store is not None else None
-            link = (project_folder_result(store, loaded.settings, "show", self._open_project).payload.get("folder")
-                    if loaded is not None and loaded.usable else None)
+            link = self._folder_result("show", self._open_project).get("folder")
         except Exception:  # noqa: BLE001 - a label only; an unreadable link is not shown
             link = None
         if link:
@@ -1157,6 +1159,7 @@ class Bridge(QObject):
                 return
         self._open_project = str(project_id)
         self._project_notice = self._project_instruction_notice = self._project_file_notice = ""
+        self._project_folder_notice = ""
         self.setPage("projects")
         self.refreshProjects()
 
@@ -1352,6 +1355,103 @@ class Bridge(QObject):
             return False
         self._file_action("purge", project_id, file_id=row["id"], confirm=row["id"])
         return True
+
+    # -- Gate 6H (G6H2): the project folder link, CONTEXT for the local user --
+    #
+    # Only through the app's audited project_folder_result (show / link /
+    # unlink; Gate 6H A4): the bridge never names the store's link methods.
+    # The path is the person's own pick; JARVIS never reads, writes or sends
+    # the folder (Salih Q1, 2026-10-10). Nothing here creates or deletes one.
+
+    # The backend's refusals (English, for logs) in plain words; any other
+    # message is shown as returned.
+    _FOLDER_REASONS = {
+        "A folder path must be a non-blank string.": QT_TRANSLATE_NOOP("Bridge", "No folder was chosen."),
+        "A folder path may not contain control or bidi characters.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder path contains characters that cannot be used."),
+        "A folder path must already be in normal form.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder path is not in plain form (it has . or .. or doubled separators)."),
+        "A folder name may not contain < > : \" | ? *.":
+            QT_TRANSLATE_NOOP("Bridge", "A folder name in this path cannot be used on Windows."),
+        "A folder name may not end with a dot or a space.":
+            QT_TRANSLATE_NOOP("Bridge", "A folder name in this path cannot be used on Windows."),
+        "A folder name may not be a Windows device name.":
+            QT_TRANSLATE_NOOP("Bridge", "A folder name in this path cannot be used on Windows."),
+        "A folder path may not use a short (8.3) name.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder path uses a short (8.3) name. Pick the folder by its full name."),
+        "A drive root cannot be a project folder.": QT_TRANSLATE_NOOP("Bridge", "A whole drive cannot be a project folder."),
+        "The user profile folder, or a folder containing it, cannot be a project folder.":
+            QT_TRANSLATE_NOOP("Bridge", "Your user folder itself, or a folder around it, cannot be a project folder. Pick a folder inside it."),
+        "A Windows or program folder cannot be a project folder.":
+            QT_TRANSLATE_NOOP("Bridge", "A Windows or program folder cannot be a project folder."),
+        "A JARVIS data, settings, install or backup folder cannot be a project folder.":
+            QT_TRANSLATE_NOOP("Bridge", "JARVIS's own data, settings, install or backup folders cannot be a project folder."),
+        "Project folders are supported on Windows only.":
+            QT_TRANSLATE_NOOP("Bridge", "Project folders are supported on Windows only."),
+        "A project folder must be on a local fixed drive.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder must be on a local fixed drive. Network, removable and other drives cannot be linked."),
+        "The folder does not exist.": QT_TRANSLATE_NOOP("Bridge", "The folder does not exist."),
+        "The folder could not be inspected.": QT_TRANSLATE_NOOP("Bridge", "The folder could not be checked."),
+        "A folder path may not pass through a link or junction.":
+            QT_TRANSLATE_NOOP("Bridge", "This folder is a link or junction, or lies inside one (an online-only OneDrive "
+                                        "folder can be one). Such folders are always refused; pick a regular folder."),
+        "The path is not a folder.": QT_TRANSLATE_NOOP("Bridge", "The chosen path is not a folder."),
+        "The folder could not be proven to be the named one.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder could not be verified as the one you picked (a substituted drive or a redirect)."),
+        "The project already has a linked folder; unlink it first.":
+            QT_TRANSLATE_NOOP("Bridge", "This project already has a linked folder. Unlink it first."),
+        "That folder, or one inside or around it, is linked to another project.":
+            QT_TRANSLATE_NOOP("Bridge", "That folder, or a folder inside or around it, is linked to another project."),
+    }
+    _FOLDER_REASON_PREFIXES = (
+        # Its example path comes back redacted ("[PATH]").
+        ("A folder path must be a local drive path like ",
+         QT_TRANSLATE_NOOP("Bridge", "Pick a folder on a local drive. Network and device paths cannot be linked.")),
+        ("A folder path is longer than ", QT_TRANSLATE_NOOP("Bridge", "The folder path is too long.")),
+        ("Project is archived: ", QT_TRANSLATE_NOOP("Bridge", "The project is archived: its folder link cannot change.")),
+        ("Unknown project: ", QT_TRANSLATE_NOOP("Bridge", "The project no longer exists.")),
+        ("No folder is linked to this project: ", QT_TRANSLATE_NOOP("Bridge", "No folder is linked to this project.")),
+    )
+
+    def _folder_reason(self, message: str) -> str:
+        source = self._FOLDER_REASONS.get(message) or next(
+            (said for prefix, said in self._FOLDER_REASON_PREFIXES if message.startswith(prefix)), None)
+        return tx("Bridge", source) if source else message
+
+    def _folder_result(self, action: str, project_id: str, **options: Any) -> dict:
+        store = self._conversation_db()
+        loaded = self.backend.store.load() if store is not None else None
+        if loaded is None or not loaded.usable:
+            return {"error": {"message": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "The project store is unavailable."))}}
+        return project_folder_result(store, loaded.settings, action, str(project_id), **options).payload
+
+    def _folder_change(self, action: str, project_id: str, **options: Any) -> bool:
+        try:
+            message = self._error_message(self._folder_result(action, project_id, **options))
+        except Exception as exc:  # noqa: BLE001 - storage boundary: only the type
+            message = type(exc).__name__
+        self._project_folder_notice = self._folder_reason(message) if message else ""
+        self.refreshProjects()
+        return not message
+
+    @Slot(str, result=str)
+    def folderPath(self, url: str) -> str:
+        """The exact local path a picked folder URL links as - what the window
+        shows before the person confirms, and then sends unchanged."""
+        local = QUrl(str(url)).toLocalFile() if str(url).startswith("file:") else str(url)
+        return os.path.normpath(local) if local else ""
+
+    @Slot(str, str, result=bool)
+    def linkProjectFolder(self, project_id: str, path: str) -> bool:
+        """Link the EXISTING folder the person picked (its exact path, as shown).
+        The backend proves it (no reparse point, protected root, overlap); a
+        refusal writes nothing and its reason becomes projectFolderNotice."""
+        return self._folder_change("link", project_id, path=str(path))
+
+    @Slot(str, result=bool)
+    def unlinkProjectFolder(self, project_id: str) -> bool:
+        """End the current link. The folder itself is never touched."""
+        return self._folder_change("unlink", project_id)
 
     @Slot(result="QVariantList")
     def projectChoices(self) -> list:

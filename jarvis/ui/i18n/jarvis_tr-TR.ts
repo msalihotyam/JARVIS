@@ -523,6 +523,102 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Kaydedildi. Depo kimlik bilgilerini veya yerel yolları gizledi; bu yüzden burada gösterilen kayıtlı metin yazdığınızdan farklı.</translation>
     </message>
     <message>
+        <source>No folder was chosen.</source>
+        <translation>Klasör seçilmedi.</translation>
+    </message>
+    <message>
+        <source>The folder path contains characters that cannot be used.</source>
+        <translation>Klasör yolunda kullanılamayan karakterler var.</translation>
+    </message>
+    <message>
+        <source>Pick a folder on a local drive. Network and device paths cannot be linked.</source>
+        <translation>Yerel bir sürücüde bir klasör seç. Ağ ve aygıt yolları bağlanamaz.</translation>
+    </message>
+    <message>
+        <source>The folder path is not in plain form (it has . or .. or doubled separators).</source>
+        <translation>Klasör yolu düz biçimde değil (. ya da .. ya da çift ayraç içeriyor).</translation>
+    </message>
+    <message>
+        <source>A folder name in this path cannot be used on Windows.</source>
+        <translation>Bu yoldaki bir klasör adı Windows&apos;ta kullanılamaz.</translation>
+    </message>
+    <message>
+        <source>The folder path uses a short (8.3) name. Pick the folder by its full name.</source>
+        <translation>Klasör yolu kısa (8.3) bir ad kullanıyor. Klasörü tam adıyla seç.</translation>
+    </message>
+    <message>
+        <source>A whole drive cannot be a project folder.</source>
+        <translation>Bütün bir sürücü proje klasörü olamaz.</translation>
+    </message>
+    <message>
+        <source>Your user folder itself, or a folder around it, cannot be a project folder. Pick a folder inside it.</source>
+        <translation>Kullanıcı klasörünün kendisi ya da onu içeren bir klasör proje klasörü olamaz. İçinde bir klasör seç.</translation>
+    </message>
+    <message>
+        <source>A Windows or program folder cannot be a project folder.</source>
+        <translation>Bir Windows ya da program klasörü proje klasörü olamaz.</translation>
+    </message>
+    <message>
+        <source>JARVIS&apos;s own data, settings, install or backup folders cannot be a project folder.</source>
+        <translation>JARVIS&apos;in kendi veri, ayar, kurulum ya da yedek klasörleri proje klasörü olamaz.</translation>
+    </message>
+    <message>
+        <source>Project folders are supported on Windows only.</source>
+        <translation>Proje klasörleri yalnız Windows&apos;ta desteklenir.</translation>
+    </message>
+    <message>
+        <source>The folder must be on a local fixed drive. Network, removable and other drives cannot be linked.</source>
+        <translation>Klasör yerel, sabit bir sürücüde olmalı. Ağ, çıkarılabilir ve diğer sürücüler bağlanamaz.</translation>
+    </message>
+    <message>
+        <source>The folder does not exist.</source>
+        <translation>Klasör yok.</translation>
+    </message>
+    <message>
+        <source>The folder could not be checked.</source>
+        <translation>Klasör denetlenemedi.</translation>
+    </message>
+    <message>
+        <source>This folder is a link or junction, or lies inside one (an online-only OneDrive folder can be one). Such folders are always refused; pick a regular folder.</source>
+        <translation>Bu klasör bir bağlantı (link ya da junction) ya da böyle birinin içinde (yalnız çevrimiçi bir OneDrive klasörü de böyle olabilir). Bu tür klasörler her zaman reddedilir; normal bir klasör seç.</translation>
+    </message>
+    <message>
+        <source>The chosen path is not a folder.</source>
+        <translation>Seçilen yol bir klasör değil.</translation>
+    </message>
+    <message>
+        <source>The folder could not be verified as the one you picked (a substituted drive or a redirect).</source>
+        <translation>Klasörün seçtiğin klasör olduğu doğrulanamadı (yerine konmuş bir sürücü ya da yönlendirme).</translation>
+    </message>
+    <message>
+        <source>This project already has a linked folder. Unlink it first.</source>
+        <translation>Bu projenin zaten bağlı bir klasörü var. Önce bağlantıyı kaldır.</translation>
+    </message>
+    <message>
+        <source>That folder, or a folder inside or around it, is linked to another project.</source>
+        <translation>Bu klasör ya da içindeki veya onu içeren bir klasör başka bir projeye bağlı.</translation>
+    </message>
+    <message>
+        <source>The folder path is too long.</source>
+        <translation>Klasör yolu çok uzun.</translation>
+    </message>
+    <message>
+        <source>The project is archived: its folder link cannot change.</source>
+        <translation>Proje arşivlenmiş: klasör bağlantısı değişemez.</translation>
+    </message>
+    <message>
+        <source>The project no longer exists.</source>
+        <translation>Proje artık yok.</translation>
+    </message>
+    <message>
+        <source>No folder is linked to this project.</source>
+        <translation>Bu projeye bağlı klasör yok.</translation>
+    </message>
+    <message>
+        <source>The project store is unavailable.</source>
+        <translation>Proje deposuna ulaşılamıyor.</translation>
+    </message>
+    <message>
         <source>The choice changed after the preview; check the new preview and confirm again.</source>
         <translation>Seçim önizlemeden sonra değişti; yeni önizlemeyi kontrol edip yeniden onaylayın.</translation>
     </message>
@@ -2520,6 +2616,10 @@ yok</translation>
         <translation>Yeni proje belirlenemedi, bu yüzden talimat kaydedilmedi. Talimat eklemek için projeyi Projeler sayfasından açın.</translation>
     </message>
     <message>
+        <source>The project was created, but the folder was not linked: %1</source>
+        <translation>Proje oluşturuldu, ama klasör bağlanmadı: %1</translation>
+    </message>
+    <message>
         <source>Project name</source>
         <translation>Proje adı</translation>
     </message>
@@ -2548,6 +2648,26 @@ yok</translation>
         <translation>%1 / %2</translation>
     </message>
     <message>
+        <source>Link a folder</source>
+        <translation>Klasöre bağla</translation>
+    </message>
+    <message>
+        <source>Browse…</source>
+        <translation>Göz at…</translation>
+    </message>
+    <message>
+        <source>No folder. A project can always be created without one.</source>
+        <translation>Klasör yok. Proje her zaman klasörsüz de oluşturulabilir.</translation>
+    </message>
+    <message>
+        <source>Remove</source>
+        <translation>Kaldır</translation>
+    </message>
+    <message>
+        <source>JARVIS does not read this folder, write into it or send it to the model: it is context for you only.</source>
+        <translation>JARVIS bu klasörü okumaz, içine yazmaz ve modele göndermez: yalnız senin için bağlamdır.</translation>
+    </message>
+    <message>
         <source>The instruction can be at most %1 characters.</source>
         <translation>Talimat en fazla %1 karakter olabilir.</translation>
     </message>
@@ -2560,8 +2680,16 @@ yok</translation>
         <translation>Vazgeç</translation>
     </message>
     <message>
+        <source>Continue without a folder</source>
+        <translation>Klasörsüz devam et</translation>
+    </message>
+    <message>
         <source>Create project</source>
         <translation>Proje oluştur</translation>
+    </message>
+    <message>
+        <source>Link folder</source>
+        <translation>Klasörü bağla</translation>
     </message>
 </context>
 <context>
@@ -3272,6 +3400,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Klasör</translation>
     </message>
     <message>
+        <source>Link a folder</source>
+        <translation>Klasöre bağla</translation>
+    </message>
+    <message>
+        <source>No folder linked</source>
+        <translation>Bağlı klasör yok</translation>
+    </message>
+    <message>
         <source>PINNED</source>
         <translation>SABİTLENEN</translation>
     </message>
@@ -3282,6 +3418,42 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Close</source>
         <translation>Kapat</translation>
+    </message>
+    <message>
+        <source>A linked folder is context for you only: JARVIS does not read it, write into it or send it to the model.</source>
+        <translation>Bağlı klasör yalnız senin için bağlamdır: JARVIS onu okumaz, içine yazmaz ve modele göndermez.</translation>
+    </message>
+    <message>
+        <source>Linked folder</source>
+        <translation>Bağlı klasör</translation>
+    </message>
+    <message>
+        <source>Selected folder</source>
+        <translation>Seçilen klasör</translation>
+    </message>
+    <message>
+        <source>linked %1</source>
+        <translation>%1 bağlandı</translation>
+    </message>
+    <message>
+        <source>Unlinking only ends the link to this project: the folder is not deleted and nothing in it changes.</source>
+        <translation>Bağlantıyı kaldırmak yalnız bu projeyle bağı bitirir: klasör silinmez ve içindeki hiçbir şey değişmez.</translation>
+    </message>
+    <message>
+        <source>Archived project: the folder link cannot change.</source>
+        <translation>Arşivlenmiş proje: klasör bağlantısı değişemez.</translation>
+    </message>
+    <message>
+        <source>Browse…</source>
+        <translation>Göz at…</translation>
+    </message>
+    <message>
+        <source>Link</source>
+        <translation>Bağla</translation>
+    </message>
+    <message>
+        <source>Unlink</source>
+        <translation>Bağlantıyı kaldır</translation>
     </message>
 </context>
 <context>

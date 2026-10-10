@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Dialogs
 import "../theme"
 import "../components"
 
@@ -7,11 +8,15 @@ import "../components"
 // (required) and an optional "what do you want to do?" text, which becomes
 // the project's instruction - the existing field: the store's 2,000-character
 // cap and PUBLIC / INTERNAL (6B: nothing preselected, asked only when there is
-// text). No folder yet (6H): a project without one is always valid.
+// text). Gate 6H (G6H2): optionally an EXISTING folder ("Browse…"), its exact
+// path shown before the click; a project without one is always valid. No
+// folder is created here (G6H1b).
 // It composes the existing paths: createProject, then - only when exactly one
 // new project with the typed name appeared and Core refused nothing - the
-// instruction save for that id. Anything else shows Core's notice and saves
-// nothing (fail closed). On success the new project opens.
+// folder link and the instruction save for that id. Anything else shows
+// Core's notice and saves nothing (fail closed). A refused folder leaves the
+// project created without one: the reason shows here, another folder can be
+// linked or the project kept without one. On success the new project opens.
 JarvisDialog {
     id: dialog
     objectName: "newProjectDialog"
@@ -32,19 +37,28 @@ JarvisDialog {
     property var before: []
     property var sent: ({})
     property string failure: ""
-    confirmEnabled: name !== "" && !overCap && (!hasInstruction || classification !== "") && !waiting
+    property string folder: ""              // the exact path the link sends ("" = no folder)
+    property string createdId: ""           // created, but its folder was refused
+    confirmEnabled: createdId !== "" ? folder !== ""
+                                     : name !== "" && !overCap && (!hasInstruction || classification !== "") && !waiting
 
     function openDialog() {
         bridge.showProject("")              // the grid, and no notice left from an earlier request
         nameField.text = ""; instructionField.text = ""
         classification = ""; failure = ""; before = []; sent = {}; waiting = false
+        folder = ""; createdId = ""
         open()
     }
     function create() {
         if (!confirmEnabled) return
         failure = ""
+        if (createdId !== "") {             // the project exists: only another folder is tried
+            if (bridge.linkProjectFolder(createdId, folder)) finish(createdId, null)
+            else failure = refused(bridge.projectFolderNotice)
+            return
+        }
         before = bridge.projectRecords.map(function (p) { return p.id })
-        sent = { name: name, text: instruction, classification: classification }
+        sent = { name: name, text: instruction, classification: classification, folder: folder }
         waiting = true
         bridge.createProject(name)          // sync or on the worker: settle() reads the answer
     }
@@ -60,10 +74,23 @@ JarvisDialog {
                     : qsTr("The new project could not be identified, so no instruction was saved. Open it from the Projects page to add one.")
             return
         }
-        var id = fresh[0].id, what = sent
+        var id = fresh[0].id, what = sent, b = bridge
+        if (what.folder !== "" && !b.linkProjectFolder(id, what.folder)) {
+            createdId = id
+            failure = refused(b.projectFolderNotice)
+            if (what.text.trim() !== "") b.saveProjectInstruction(id, what.text, what.classification)
+            return
+        }
+        finish(id, what)
+    }
+    function refused(reason) { return qsTr("The project was created, but the folder was not linked: %1").arg(reason) }
+    // Opens the project; `what` carries an instruction still to save (null = saved).
+    function finish(id, what) {
+        var b = bridge
+        failure = ""                        // a finished create keeps a waiting new chat's choice
         close()
-        bridge.showProject(id)
-        if (what.text.trim() !== "") bridge.saveProjectInstruction(id, what.text, what.classification)
+        b.showProject(id)
+        if (what && what.text.trim() !== "") b.saveProjectInstruction(id, what.text, what.classification)
     }
     Connections { target: bridge; function onProjectsChanged() { dialog.settle() } }
 
@@ -73,6 +100,7 @@ JarvisDialog {
         objectName: "newProjectName"
         width: parent ? parent.width : 0; height: 36
         selectByMouse: true; color: Theme.text; font: Theme.body; maximumLength: 120
+        readOnly: dialog.createdId !== ""
         placeholderText: qsTr("e.g. Kitchen renovation"); placeholderTextColor: Theme.textDim
         background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                 border.color: nameField.activeFocus ? Theme.commandEdge : Theme.border }
@@ -92,6 +120,7 @@ JarvisDialog {
                 id: instructionField
                 objectName: "newProjectInstruction"
                 wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; selectByMouse: true
+                readOnly: dialog.createdId !== ""
                 color: Theme.text; font: Theme.body; placeholderTextColor: Theme.textDim
                 placeholderText: qsTr("Goal, scope, what to watch for… This text becomes the project's instruction.")
                 background: null
@@ -106,13 +135,39 @@ JarvisDialog {
             anchors.verticalCenter: parent.verticalCenter; spacing: 8
             Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Classification:"); color: Theme.textLabel; font: Theme.pageMeta }
             // Domain codes, never translated (as the instruction editor shows them).
-            Segmented { segmentPrefix: "newProjectClass_"; implicitHeight: 28
+            Segmented { segmentPrefix: "newProjectClass_"; implicitHeight: 28; enabled: dialog.createdId === ""
                         options: [{ value: "public", label: "PUBLIC" }, { value: "internal", label: "INTERNAL" }]
                         value: dialog.classification; onPicked: function (value) { dialog.classification = value } }
         }
         Text { objectName: "newProjectCounter"; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                text: qsTr("%1 / %2").arg(instructionField.length).arg(bridge.projectInstructionCap)
                color: dialog.overCap ? Theme.warning : Theme.textMuted; font: Theme.captionFigures }
+    }
+    // Gate 6H: "Klasöre bağla" - an existing folder, its full path always shown.
+    Row {
+        spacing: 8
+        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Link a folder"); color: Theme.textLabel; font: Theme.pageMeta }
+        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("optional"); color: Theme.textDim; font: Theme.caption }
+    }
+    Item {
+        width: parent ? parent.width : 0; height: Math.max(36, folderText.implicitHeight)
+        ActionButton { id: browse; objectName: "newProjectFolderBrowse"; label: qsTr("Browse…"); height: 36
+                       anchors.verticalCenter: parent.verticalCenter; enabled: !dialog.waiting; onClicked: folderPicker.open() }
+        Text { id: folderText; objectName: "newProjectFolderPath"; x: browse.width + 10; anchors.verticalCenter: parent.verticalCenter
+               width: parent.width - x - (clearFolder.visible ? clearFolder.width + 10 : 0); wrapMode: Text.WrapAnywhere; textFormat: Text.PlainText
+               text: dialog.folder || qsTr("No folder. A project can always be created without one.")
+               color: dialog.folder ? Theme.text : Theme.textDim; font: Theme.caption }
+        ActionButton { id: clearFolder; objectName: "newProjectFolderClear"; compact: true; label: qsTr("Remove")
+                       anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                       visible: dialog.folder !== "" && !dialog.waiting; onClicked: dialog.folder = "" }
+    }
+    Text { objectName: "newProjectFolderNote"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; visible: dialog.folder !== ""
+           text: qsTr("JARVIS does not read this folder, write into it or send it to the model: it is context for you only.")
+           color: Theme.textMuted; font: Theme.caption }
+    FolderDialog {
+        id: folderPicker
+        objectName: "newProjectFolderPicker"
+        onAccepted: dialog.folder = bridge.folderPath(selectedFolder)
     }
     Text { objectName: "newProjectReason"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; visible: text !== ""
            color: dialog.overCap ? Theme.warning : Theme.textMuted; font: Theme.caption
@@ -122,8 +177,11 @@ JarvisDialog {
            textFormat: Text.PlainText; text: dialog.failure; color: Theme.warning; font: Theme.caption }
 
     buttons: [
-        ActionButton { objectName: "newProjectCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: dialog.close() },
-        ActionButton { id: createButton; objectName: "newProjectCreate"; label: qsTr("Create project"); primary: true; height: 36
+        ActionButton { objectName: "newProjectCancel"; height: 36; width: dialog.createdId !== "" ? implicitWidth : 110
+                       label: dialog.createdId !== "" ? qsTr("Continue without a folder") : qsTr("Cancel")
+                       onClicked: dialog.createdId !== "" ? dialog.finish(dialog.createdId, null) : dialog.close() },
+        ActionButton { id: createButton; objectName: "newProjectCreate"; primary: true; height: 36
+                       label: dialog.createdId !== "" ? qsTr("Link folder") : qsTr("Create project")
                        onClicked: dialog.create() }
     ]
 }

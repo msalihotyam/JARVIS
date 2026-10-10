@@ -11,7 +11,8 @@ C. New chat: the composer starts a conversation OWNED by this project, the
    typed text its first message; empty, it only opens a new one.
 D. Dialogs: the right column's rows open the existing instruction editor
    and file panel as dialogs; closing one returns to the page.
-E. Folder: the current 6H link shows read only; no link, no row.
+E. Folder: the current 6H link shows; no link is said ("No folder linked");
+   the row opens the folder dialog (G6H2).
 F. Archived: the page is read only (composer, editor and add off; Unarchive).
 
 No test performs a live model, auth or network call or opens the live DB.
@@ -177,7 +178,7 @@ class PageTests(Case):
         self.assertEqual(["Banyo fayansı"], self.rows(root, "projectPinnedRow"))       # only this project's pin
         self.assertEqual(["Mutfak teklifleri"], self.rows(root, "projectConversationRow"))
         self.assertEqual(["Eski notlar"], self.rows(root, "projectArchivedConversationRow"))
-        self.assertEqual([], self.visible(root, "projectFolderRow"))                 # no link, no row
+        self.assertEqual("No folder linked", self.item(root, "projectFolderRowBody").property("text"))   # G6H2: said, not hidden
         self.assertEqual([], [n for n in ("projectMemoryRow", "projectScheduledRow", "projectJobsHeading", "projectTabs")
                               if self.visible(root, n)])                            # nothing before its release
         # A pinned row opens its conversation.
@@ -263,31 +264,34 @@ class PageTests(Case):
         self.assertEqual("files", self.item(root, "projectsPage").property("section"))
         self.assertEqual("retired", store.list_project_files(self.project.id)[0]["lifecycle"])
 
-    def test_e_folder_row_read_only_and_hidden_without_a_link(self) -> None:
+    def test_e_folder_row_shows_the_link_or_says_none_and_opens_its_dialog(self) -> None:
         store, bridge, root = self.stage()
         self.assertEqual({}, bridge.projectFolder)
-        self.assertEqual([], self.visible(root, "projectFolderRow"))
+        self.assertEqual("No folder linked", self.item(root, "projectFolderRowBody").property("text"))
         store.link_explicit_user_project_folder(self.project.id, FOLDER, "picked")
         bridge.refreshProjects()
         pump(100)
         self.assertEqual(FOLDER, bridge.projectFolder["path"])
         row = self.visible(root, "projectFolderRow")[0]
         self.assertEqual(FOLDER, self.item(root, "projectFolderRowBody").property("text"))
-        self.assertFalse(row.property("activeFocusOnTab"))                           # read only: nothing to open
+        self.assertTrue(row.property("activeFocusOnTab"))                            # G6H2: it opens the folder dialog
         self.press(root, row)
-        self.assertEqual("conversations", self.item(root, "projectsPage").property("section"))
+        self.assertEqual("folder", self.item(root, "projectsPage").property("section"))
         self.assertEqual([], [d for d in ("projectInstructionDialog", "projectFilesDialog") if self.dialog(root, d).property("visible")])
-        # No link / change / unlink control anywhere on the page (6H UI waits for Salih's answers).
-        self.assertEqual([], [n for n in ("projectFolderLink", "projectFolderUnlink", "projectFolderChange", "projectFolderOpen")
-                              if self.all_items(root, n)])
+        self.assertTrue(self.dialog(root, "projectFolderDialog").property("visible"))
+        # G6H2 (Salih 6H answers 2026-10-10): unlink is offered; changing in place and
+        # opening in Explorer are not.
+        self.assertEqual(1, len(self.visible(root, "projectFolderUnlink")))
+        self.assertEqual([], [n for n in ("projectFolderChange", "projectFolderOpen") if self.all_items(root, n)])
+        self.click(root, "folderDialogClose")
         # Another project shows its own (none); an unlinked one shows none.
         bridge.showProject(self.other.id)
         pump(300)
-        self.assertEqual([], self.visible(root, "projectFolderRow"))
+        self.assertEqual("No folder linked", self.item(root, "projectFolderRowBody").property("text"))
         store.unlink_project_folder(self.project.id)
         bridge.showProject(self.project.id)
         pump(300)
-        self.assertEqual(({}, []), (bridge.projectFolder, self.visible(root, "projectFolderRow")))
+        self.assertEqual(({}, "No folder linked"), (bridge.projectFolder, self.item(root, "projectFolderRowBody").property("text")))
 
     def test_f_an_archived_project_page_is_read_only(self) -> None:
         store, bridge, root = self.stage()
