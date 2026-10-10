@@ -1544,7 +1544,8 @@ class LeftContextTests(UiTestCase):
                             (QDate(2033, 1, 1), QTime(0, 0, 0))):
             instant = QDateTime(date, clock)
             source.setProperty("now", instant)
-            pump(20)
+            # No pump: the bindings follow synchronously, and a pump would let the
+            # live 1 s tick overwrite the instant before it is read (a load race).
             self.assertEqual(instant.toString("HH:mm"), context.property("timeText"))
             self.assertEqual(instant.toString("ddd, d MMM"), context.property("dateText"))
             offset = instant.offsetFromUtc() // 60

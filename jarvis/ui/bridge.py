@@ -47,6 +47,7 @@ from jarvis.context_items import (
     same_reference,
 )
 from jarvis import conversation_search, project_files
+from jarvis.app import project_folder_result
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
@@ -1012,11 +1013,15 @@ class Bridge(QObject):
             return
         store = self._conversation_db()
         try:
-            link = store.load_project_folder(self._open_project) if store is not None else None
+            # Through the app's audited ``show`` path: only the store, the app and
+            # the 6H module name the link (Gate 6H A4).
+            loaded = self.backend.store.load() if store is not None else None
+            link = (project_folder_result(store, loaded.settings, "show", self._open_project).payload.get("folder")
+                    if loaded is not None and loaded.usable else None)
         except Exception:  # noqa: BLE001 - a label only; an unreadable link is not shown
             link = None
-        if link is not None:
-            self._project_folder = {"path": link.path, "linked_at": link.linked_at}
+        if link:
+            self._project_folder = {"path": link["path"], "linked_at": link["linked_at"]}
         try:
             records = (store.list_conversations(project_id=self._open_project, include_archived=True)
                        if store is not None else [])
