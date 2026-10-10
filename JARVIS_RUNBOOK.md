@@ -581,7 +581,9 @@ empty, or when the range is not a plain `A..B`. The result file records whether
 Salih approved the design on 2026-10-09. `scripts/conveyor.py` (stdlib only,
 tests `tests/test_conveyor.py`) keeps development flowing while the PC is on.
 It runs under a Windows Task Scheduler task, one pass every 60 s (`--once` for
-one pass). Its only git/gh calls are the push gate below, and it deletes no
+one pass). Its only git/gh calls are the push gate and the autopilot below
+(the autopilot runs only the gate's checks and `git diff --name-only`; it never
+pushes), and it deletes no
 file itself (lane sessions: see Cleanup below); its only model call is
 the optional report reader below. One instance at a time
 (`build/conveyor/conveyor.lock`, stale after 5 min). Runtime folder
@@ -684,7 +686,64 @@ the optional report reader below. One instance at a time
   or push: a `push_blocked` event with the reason and an attention item (id =
   the approval file name; ack `build/conveyor/ack/<name>`), nothing pushed,
   re-checked at most once per 10 min (`build/conveyor/push.json`). Removing
-  the approval withdraws it.
+  the approval withdraws it. Since CONV7 key 1 is also written by the
+  autopilot below; key 2 is unchanged.
+- **Autopilot (CONV7, Salih 2026-10-10 03:56).** The conveyor takes the three
+  routine orchestrator decisions itself; the orchestrator stays the watchman:
+  it checks `status.json` periodically, acks attention items, closes the
+  breaker and writes new slices. State: `build/conveyor/autopilot.json`
+  (`since`, `chains`, `slices`, `bad`, `breaker`, `last_auto`); only lanes
+  finished after `since` (the autopilot's first pass) are acted on. An
+  unreadable or malformed `autopilot.json` stops every autopilot action (its
+  fix slices are not dispatched either) and holds product lanes like an open
+  breaker until it is fixed by hand.
+  - Auto key 1. An integration lane (name matches `INT` as above; never a fix
+    lane, i.e. a chain's `-AFX` or any name ending `-AFX`) whose report has exactly one line `STATUS: GREEN` (nothing
+    else on it), exactly one `NEW MAIN SHA: <40 lowercase hex>` line, exactly
+    one `ci/<name>` branch and exactly one CI run URL
+    (`https://github.com/<o>/<r>/actions/runs/<id>`) gets
+    `build/approvals/push-<sha40>-<name>` written by the conveyor (never over
+    an existing file), only when: no other integration lane in `lanes.json` is
+    unfinished, and every gate check above passes now (local main is that
+    sha, fast-forward of origin/main, the newest `tests` run for that sha on
+    that `ci/*` branch is completed/success, no `uv.lock` in
+    `origin/main..sha`, `SCHEMA_VERSION = 10` at both ends), and the run the
+    gate verified is the report's run. Then an `auto_approve` event and the
+    band line `auto-approved <sha7>` (`status.json` `band`, 1 h); the push
+    gate runs its own checks again before pushing. Any other case, an
+    exception included: nothing is written, an `auto_approve_refused` event
+    and the lane is an attention item "auto-approval refused: <reason>"
+    (the orchestrator may still write key 1 by hand). One try per finished
+    report; a report written before CI finished is refused, not retried.
+  - Auto fix-forward, once per integration lane name. An integration lane
+    that finishes `STATUS: BLOCKED` whose report names failing test ids
+    (`tests.<module>.<Class>.test_*`) queues two slices ahead of
+    `backlog.json` (they are not written into it): `<INT>-AFX` (Opus, effort
+    high; tier T1; prompt from `build/conveyor/prompts/_autofix_template.md`,
+    written from the built-in text when missing, editable, placeholders
+    `{INT} {AFX} {R} {REPORT} {MAIN} {BRANCH} {TESTS} {FILES}`; branch from the
+    current local main; owned files = `git diff --name-only` from local main
+    at the lane's dispatch (`main_at_start` in `lanes.json`) to local main
+    now) and `<INT>-R` (the same INT prompt, same model/effort, with a
+    preface to pick only what is missing plus the fix commit; `depends_on
+    [<INT>-AFX]`). Prompts go to `build/conveyor/prompts/auto/`. No test id,
+    no picked file, unknown start main, an invalid slice or an `<INT>` name
+    already used for a chain: no chain (`auto_fix_skipped`, the reason is
+    added to the BLOCKED lane's attention item). Never a second automatic
+    attempt: a BLOCKED `<INT>-R` (or `<INT>` again) is attention only.
+  - Breaker. 3 lanes finishing BLOCKED/STOP/FAIL within 2 h, or a fix chain
+    lane (`-AFX` or `-R`) finishing with anything but a good STATUS (incl.
+    DEAD/STUCK), opens it: `status.json` `breaker: "open"`, band line
+    `breaker: open`, a `breaker` event and attention item `breaker`. While
+    open no new product lane starts (inbox prompts wait in the inbox,
+    backlog slices show `breaker_open`); integration and fix lanes
+    (`INT...` names) still start; running lanes are untouched. Acking the
+    item does not close it: only the orchestrator (or Salih) touching
+    `build/conveyor/breaker-reset` after it opened does; the BLOCKED count
+    then starts from zero.
+  - Night quiet. The 30 min escalation page (below) waits between 02:00 and
+    08:00 local time and goes out after 08:00 if the item is still unacked,
+    unless the breaker is open (then it pages at night too).
 - **Usage guard.** `claude` has no plan-usage command, so the newest
   `build/ledger/slices.jsonl` row (jarvis-flow slice ledger, `seven_day`) is
   read (a row older than 7 days is ignored). The limit comes from the pace
@@ -763,6 +822,7 @@ the optional report reader below. One instance at a time
   - 6G product slices: Opus, effort medium.
   - T2 / security / R1 / R2 / 6H / architecture: Opus, effort high.
   - Integration lanes: Sonnet, effort medium.
+  - Auto-fix lanes (`<INT>-AFX`, autopilot): Opus, effort high.
   - Mechanical lanes (test re-pointing, catalog, one-line fixes): Sonnet,
     effort medium.
   - Pace only via the number of parallel lanes (pace governor above).
@@ -777,7 +837,8 @@ the optional report reader below. One instance at a time
   lane name needs a fresh touch). ntfy (topic from `JARVIS_NTFY_TOPIC`, same
   rules as the jarvis-flow pager; never logged) reaches Salih only for: an
   attention item left unacked for 30 min (`ATTENTION_PAGE_S`, "the
-  orchestrator did not react"; once per item); and 3 failed conveyor passes in
+  orchestrator did not react"; once per item; held 02:00-08:00 unless the
+  breaker is open, see Autopilot); and 3 failed conveyor passes in
   a row (plus the push notices below). At most one push per 10 min; pages inside the
   gap, or after a failed send, are held and sent together.
 - **Report reader (advisory, optional).** Salih approved it on 2026-10-09

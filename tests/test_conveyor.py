@@ -160,6 +160,10 @@ class Base(unittest.TestCase):
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                           mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs)
         self.base = self.root / "build" / "conveyor"
+        self.hour = 12  # local hour for the night rule: never the real clock's
+        hour = mock.patch.object(conveyor, "local_hour", lambda t: self.hour)
+        hour.start()
+        self.addCleanup(hour.stop)
 
     def fake_disk(self, path):
         if isinstance(self.free, Exception):
@@ -454,7 +458,7 @@ class TestInbox(Base):
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
                                   "memory_hold", "memory", "presence", "lanes",
-                                  "backlog", "attention"})
+                                  "backlog", "breaker", "band", "attention"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -2300,6 +2304,378 @@ class TestPushGate(Base):
         f.unlink()
         self.c.pass_once()
         self.assertEqual(json.loads((self.base / "push.json").read_text()), {})
+
+
+START = "c" * 40  # local main when the integration lane started (FakeGit's MAIN is its new main)
+INT_HDR = "@jarvis lane={} model=sonnet effort=medium base=main\n"
+GREEN = f"NEW MAIN SHA: {MAIN} (local, not pushed)\nCI: https://github.com/x/y/actions/runs/1 success, branch ci/p2b\n"
+FAILING = "tests.test_conversation_attach.AttachWindowTests.test_e_entry_only"
+PICKED = ("git", "diff", "--name-only", f"{START}..{MAIN}")  # the files of the commits INT9 picked
+
+
+class AutopilotBase(Base):
+    def int_lane(self, name="INT9", body="INTEGRATE picks a, b\n"):
+        """Dispatch integration lane `name` from the inbox while local main is START."""
+        self.git.main = START
+        self.drop(f"{name}.md", INT_HDR.format(name) + body)
+        self.c.pass_once()
+        self.git.main = MAIN
+        self.assertIn(name, self.fake.bg_names())
+        self.assertEqual(self.lanes()[name]["main_at_start"], START)
+        self.t += 60
+
+    def finish(self, name, status, extra=""):
+        self.report(name, status, extra=extra, mtime=self.t)
+        self.c.pass_once()
+        self.t += 60
+
+    def approvals(self):
+        d = self.root / "build" / "approvals"
+        return sorted(p.relative_to(d).as_posix() for p in d.rglob("push-*")) if d.exists() else []
+
+    def ev(self, kind):
+        return [e for e in self.events() if e["event"] == kind]
+
+
+class TestAutoApproval(AutopilotBase):
+    def test_happy_path_writes_key1_and_the_gate_pushes(self):
+        self.int_lane()
+        self.finish("INT9", "GREEN", GREEN)
+        name = f"push-{MAIN}-p2b"
+        self.assertEqual(self.approvals(), [f"done/{name}"])
+        self.assertTrue((self.root / "build" / "approvals" / "done" / name).read_text(
+            encoding="utf-8").startswith("auto-approved by the conveyor"))
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
+        (ev,) = self.ev("auto_approve")
+        self.assertEqual((ev["lane"], ev["approval"], ev["ci_run"]),
+                         ("INT9", name, "https://github.com/x/y/actions/runs/1"))
+        self.assertEqual(self.status()["band"], ["auto-approved 1234567"])
+        self.assertEqual(self.attn_ex_dry(), [])
+        self.t += conveyor.AUTO_LINE_S
+        self.c.pass_once()
+        self.assertEqual(self.status()["band"], [])
+
+    def test_existing_orchestrator_key_is_kept(self):
+        self.int_lane()
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True)
+        (d / f"push-{MAIN}-p2b").write_text("orchestrator\n", encoding="utf-8")
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual((d / "done" / f"push-{MAIN}-p2b").read_text(encoding="utf-8"), "orchestrator\n")
+        self.assertEqual(len(self.git.pushes()), 1)
+
+    def test_each_refusal_reason(self):
+        cases = {
+            "status not exactly GREEN": ("GREEN (CI red)", GREEN, None, "single 'STATUS: GREEN'"),
+            "two STATUS lines": ("GREEN", GREEN + "STATUS: BLOCKED\n", None, "single 'STATUS: GREEN'"),
+            "short sha": ("GREEN", GREEN.replace(MAIN, MAIN[:7]), None, "NEW MAIN SHA: <40 hex>"),
+            "no sha line": ("GREEN", GREEN.replace("NEW MAIN SHA", "NEW MAIN"), None, "NEW MAIN SHA"),
+            "two sha lines": ("GREEN", GREEN + f"NEW MAIN SHA: {START}\n", None, "NEW MAIN SHA"),
+            "uppercase sha": ("GREEN", GREEN.replace(MAIN, MAIN.upper()), None, "NEW MAIN SHA"),
+            "no ci branch": ("GREEN", GREEN.replace("ci/p2b", "x"), None, "0 ci/* branches"),
+            "two ci branches": ("GREEN", GREEN + "also ci/other\n", None, "2 ci/* branches"),
+            "ci branch with a slash": ("GREEN", GREEN.replace("ci/p2b", "ci/p2b/x"), None, "0 ci/* branches"),
+            "no CI url": ("GREEN", GREEN.replace("https://", "see "), None, "0 CI run URLs"),
+            "two CI urls": ("GREEN", GREEN + "https://github.com/x/y/actions/runs/2\n", None, "2 CI run URLs"),
+            "local main moved": ("GREEN", GREEN, lambda g: setattr(g, "main", "d" * 40), "local main"),
+            "CI not success": ("GREEN", GREEN, lambda g: g.runs[0].update(conclusion="failure"),
+                               "CI tests on ci/p2b is not success"),
+            "CI pending": ("GREEN", GREEN, lambda g: g.runs[0].update(status="in_progress", conclusion=""),
+                           "is not success"),
+            "uv.lock": ("GREEN", GREEN, lambda g: setattr(g, "diff", "uv.lock\n"), "uv.lock changed"),
+            "schema changed": ("GREEN", GREEN, lambda g: g.memory.update({MAIN: "SCHEMA_VERSION = 11\n"}),
+                               "SCHEMA_VERSION = 10"),
+            "already pushed": ("GREEN", GREEN, lambda g: setattr(g, "origin", MAIN), "already on origin/main"),
+            "other run verified": ("GREEN", GREEN.replace("runs/1", "runs/7"), None, "not the report's"),
+            "git timeout": ("GREEN", GREEN, lambda g: setattr(g, "raise_on", ("git", "fetch")),
+                            "check error: TimeoutError"),
+        }
+        for label, (status, extra, change, why) in cases.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.int_lane()
+                if change:
+                    change(self.git)
+                self.finish("INT9", status, extra)
+                self.assertEqual(self.approvals(), [])
+                self.assertEqual(self.git.pushes(), [])
+                self.assertEqual(self.ev("auto_approve"), [])
+                (ev,) = self.ev("auto_approve_refused")
+                self.assertIn(why, ev["reason"])
+                (item,) = [a for a in self.status()["attention"] if a["id"] == "INT9"]
+                self.assertIn("auto-approval refused: ", item["reason"])
+
+    def test_no_approval_while_another_int_lane_is_unfinished(self):
+        self.int_lane()
+        lanes = self.lanes()
+        lanes["INT10"] = {"id": "0000beef", "model": "sonnet", "effort": "medium", "base": "main",
+                          "started_at": conveyor.iso(self.t), "started_ts": self.t, "state": "working",
+                          "prompt": "inbox/started/x.md", "files": []}
+        (self.base / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.git.pushes(), [])
+        (ev,) = self.ev("auto_approve_refused")
+        self.assertEqual(ev["reason"], "integration lane INT10 is running")
+
+    def test_only_green_integration_reports(self):
+        for name, status in (("INT9", "PASS"), ("INT9", "OK"), ("G6X", "GREEN")):
+            with self.subTest(name=name, status=status):
+                self.tearDown()
+                self.setUp()
+                self.int_lane(name) if name.startswith("INT") else self.drop("g.md", HDR.format(name))
+                self.c.pass_once()
+                self.finish(name, status, GREEN)
+                self.assertEqual(self.approvals(), [])
+                self.assertEqual(self.ev("auto_approve") + self.ev("auto_approve_refused"), [])
+
+    def test_lanes_finished_before_the_autopilot_are_left(self):
+        self.int_lane()
+        self.report("INT9", "GREEN", extra=GREEN)
+        ap = json.loads((self.base / "autopilot.json").read_text())
+        ap["since"] = self.t + 3600  # the autopilot began after this lane finished
+        (self.base / "autopilot.json").write_text(json.dumps(ap))
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT9"]["status"], "GREEN")
+        self.assertEqual(self.approvals(), [])
+
+    def test_branch_at_sentence_end_is_taken(self):
+        self.int_lane()
+        self.finish("INT9", "GREEN", GREEN.replace("branch ci/p2b", "branch ci/p2b."))
+        self.assertEqual(self.approvals(), [f"done/push-{MAIN}-p2b"])
+
+    def test_approvals_path_not_a_folder_is_refused(self):
+        self.int_lane()
+        (self.root / "build" / "approvals").write_text("x", encoding="utf-8")
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual(self.git.pushes(), [])
+        self.assertEqual(self.ev("auto_approve"), [])
+        self.assertEqual(len(self.ev("auto_approve_refused")), 1)
+        self.assertEqual(self.status()["band"], [])
+
+    def test_fix_lane_by_name_never_gets_key1(self):
+        self.int_lane("INT9-AFX")
+        self.finish("INT9-AFX", "GREEN", GREEN)
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.ev("auto_approve") + self.ev("auto_approve_refused"), [])
+
+    def test_malformed_state_fails_closed(self):
+        for bad in ({"since": 1, "breaker": {"reason": "x"}}, {"since": 1, "bad": [5]},
+                    {"since": 1, "chains": {"INT1": []}}, {"since": 1, "slices": [{"id": "X"}]},
+                    {"since": "now"}, []):
+            with self.subTest(bad=bad):
+                self.tearDown()
+                self.setUp()
+                (self.base / "autopilot.json").write_text(json.dumps(bad), encoding="utf-8")
+                self.int_lane()
+                self.finish("INT9", "GREEN", GREEN)
+                self.assertEqual(self.approvals(), [])
+                self.assertEqual(self.status()["breaker"], "open")
+                self.assertEqual(self.view(), {})
+
+    def test_unreadable_state_fails_closed(self):
+        (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
+        self.int_lane()
+        self.drop("p.md", HDR.format("P"))
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual(self.approvals(), [])
+        self.assertNotIn("P", self.fake.bg_names())
+        self.assertEqual(self.status()["breaker"], "open")
+        self.assertEqual((self.base / "autopilot.json").read_text(encoding="utf-8"), "{broken")
+
+
+class TestAutoFix(AutopilotBase):
+    def setUp(self):
+        super().setUp()
+        self.git.fail[PICKED] = (0,"jarvis/core.py\nscripts/x.py\n")
+
+    def blocked_int(self):
+        self.int_lane()
+        self.finish("INT9", "BLOCKED", f"FAILURE:\n  {FAILING}\n  line 367: assertFalse\n")
+
+    def test_one_fix_lane_then_the_rerun(self):
+        self.blocked_int()
+        (ev,) = self.ev("auto_fix")
+        self.assertEqual((ev["fix"], ev["rerun"], ev["files"]), ("INT9-AFX", "INT9-R", ["jarvis/core.py", "scripts/x.py"]))
+        call = self.fake.bg_calls()[-1]
+        self.assertEqual(call[:7], ["--bg", "--name", "INT9-AFX", "--model", "opus", "--effort", "high"])
+        text = call[-1]
+        self.assertTrue(text.startswith("@jarvis lane=INT9-AFX model=opus effort=high base=main\n"))
+        for part in (FAILING, "  jarvis/core.py\n  scripts/x.py", f"CURRENT local main ({MAIN})",
+                     "Never weaken", "INT9-R"):
+            self.assertIn(part, text)
+        tpl = self.base / "prompts" / "_autofix_template.md"
+        self.assertEqual(tpl.read_text(encoding="utf-8"), conveyor.AUTOFIX_TEMPLATE)
+        self.assertEqual(self.view()["INT9-R"], "waiting_deps")
+        self.assertIn("auto-fix queued: INT9-AFX, then INT9-R", self.status()["attention"][0]["reason"])
+        self.finish("INT9-AFX", "PASS", "FIX COMMIT: x\n")
+        call = self.fake.bg_calls()[-1]
+        self.assertEqual(call[:7], ["--bg", "--name", "INT9-R", "--model", "sonnet", "--effort", "medium"])
+        self.assertTrue(call[-1].startswith("@jarvis lane=INT9-R model=sonnet effort=medium base=main\n"
+                                            "INT9-R re-runs integration lane INT9"))
+        self.assertTrue(call[-1].endswith("INTEGRATE picks a, b\n"))
+        self.finish("INT9-R", "GREEN", GREEN)  # the re-run is an integration lane: auto key 1
+        self.assertEqual(len(self.ev("auto_approve")), 1)
+        self.assertEqual(self.status()["breaker"], "closed")
+
+    def test_edited_template_is_used(self):
+        (self.base / "prompts").mkdir()
+        (self.base / "prompts" / "_autofix_template.md").write_text(
+            "@jarvis lane=x model=opus effort=high base=main\nFIX {INT}: {TESTS} {{literal}}\n", encoding="utf-8")
+        self.blocked_int()
+        self.assertTrue(self.fake.bg_calls()[-1][-1].endswith(f"FIX INT9:   {FAILING} {{{{literal}}}}\n"))
+
+    def test_never_a_second_attempt(self):
+        self.blocked_int()
+        self.finish("INT9-AFX", "PASS")
+        self.finish("INT9-R", "BLOCKED", f"FAILURE: {FAILING}\n")
+        self.assertEqual(len(self.ev("auto_fix")), 1)
+        self.assertNotIn("INT9-R-AFX", self.fake.bg_names())
+        self.assertEqual(self.status()["breaker"], "open")  # the chain failed
+        # the orchestrator runs INT9 again by hand and it blocks again: attention only
+        (self.base / "breaker-reset").touch()
+        self.int_lane()
+        self.finish("INT9", "BLOCKED", f"FAILURE: {FAILING}\n")
+        self.assertEqual(len(self.ev("auto_fix")), 1)
+        self.assertEqual(self.ev("auto_fix_skipped")[-1]["reason"], "auto-fix already used for this integration lane")
+        self.assertEqual(self.fake.bg_names().count("INT9-AFX"), 1)
+
+    def test_failed_fix_opens_the_breaker_and_the_rerun_never_runs(self):
+        self.blocked_int()
+        self.finish("INT9-AFX", "BLOCKED")
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "open")
+        self.assertIn(conveyor.BREAKER_ID, self.attn())
+        self.assertIn("auto-fix chain failed: INT9-AFX BLOCKED", self.ev("breaker")[0]["reason"])
+        self.assertNotIn("INT9-R", self.fake.bg_names())
+
+    def test_skips(self):
+        cases = {
+            "no test id": ("FAILURE: shard 2 red\n", None, "names no failing test id"),
+            "nothing picked": (f"FAILURE: {FAILING}\n",
+                               lambda g: g.fail.update({PICKED: (0, "")}), "no picked files"),
+            "git diff fails": (f"FAILURE: {FAILING}\n",
+                               lambda g: g.fail.update({PICKED: (128, "bad")}), "rc=128"),
+        }
+        for label, (extra, change, why) in cases.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.int_lane()
+                if change:
+                    change(self.git)
+                self.finish("INT9", "BLOCKED", extra)
+                self.assertIn(why, self.ev("auto_fix_skipped")[0]["reason"])
+                self.assertEqual(self.ev("auto_fix"), [])
+                self.assertNotIn("INT9-AFX", self.fake.bg_names())
+                self.assertIn("auto-fix skipped", self.status()["attention"][0]["reason"])
+
+    def test_unknown_start_main_skips(self):
+        self.drop("i.md", INT_HDR.format("INT9"))
+        self.git.fail[("git", "rev-parse", "--verify", "refs/heads/main")] = (128, "fatal")
+        self.c.pass_once()
+        del self.git.fail[("git", "rev-parse", "--verify", "refs/heads/main")]
+        self.t += 60
+        self.finish("INT9", "BLOCKED", f"FAILURE: {FAILING}\n")
+        self.assertIn("unknown", self.ev("auto_fix_skipped")[0]["reason"])
+
+
+class TestBreaker(AutopilotBase):
+    def blocked(self, *names):
+        for n in names:
+            self.drop(f"{n}.md", HDR.format(n))
+            self.c.pass_once()
+            self.t += 60
+            self.finish(n, "BLOCKED")
+
+    def test_three_blocked_in_two_hours_holds_product_slices_only(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.drop("r.md", HDR.format("RUN"))
+        self.c.pass_once()
+        self.blocked("A", "B")
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.blocked("C")
+        st = self.status()
+        self.assertEqual((st["breaker"], st["band"]), ("open", ["breaker: open"]))
+        self.assertIn(conveyor.BREAKER_ID, self.attn())
+        self.assertIn("3 lanes finished BLOCKED/STOP/FAIL within 2 h: A, B, C", self.ev("breaker")[0]["reason"])
+        n = len(self.fake.calls)
+        self.drop("p.md", HDR.format("P"))
+        self.backlog({"id": "S"}, {"id": "INT-B"})
+        self.drop("i.md", HDR.format("INT11"))
+        self.c.pass_once()
+        self.assertTrue((self.base / "inbox" / "p.md").exists())
+        self.assertNotIn("P", self.fake.bg_names())
+        self.assertIn("INT11", self.fake.bg_names())  # integration lanes may still run
+        self.assertEqual(self.view()["S"], "breaker_open")
+        self.assertFalse([c for c in self.fake.calls[n:] if c[0] in ("stop", "rm")])  # running lanes untouched
+        self.assertEqual(self.lanes()["RUN"]["state"], "working")
+        # an ack hides the item but does not close the breaker; an old reset does not either
+        (self.base / "ack").mkdir()
+        (self.base / "ack" / conveyor.BREAKER_ID).touch()
+        reset = self.base / "breaker-reset"
+        reset.touch()
+        os.utime(reset, (self.t - 7200, self.t - 7200))
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "open")
+        self.assertNotIn("P", self.fake.bg_names())
+        os.utime(reset, (self.t, self.t))
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertIn("P", self.fake.bg_names())
+        self.assertEqual([e["state"] for e in self.ev("breaker")], ["open", "closed"])
+
+    def test_blocked_spread_over_more_than_two_hours(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.blocked("A", "B")
+        self.t += conveyor.BREAKER_WINDOW_S
+        self.blocked("C")
+        self.assertEqual(self.status()["breaker"], "closed")
+
+    def test_reset_starts_a_new_count(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.blocked("A", "B", "C")
+        (self.base / "breaker-reset").touch()
+        os.utime(self.base / "breaker-reset", (self.t, self.t))
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.blocked("D")
+        self.assertEqual(self.status()["breaker"], "closed")
+
+
+class TestNightQuiet(AutopilotBase):
+    def test_escalation_waits_for_the_morning(self):
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.finish("A", "BLOCKED")
+        self.hour = 3
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.t += conveyor.PAGE_GAP_S
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+        self.hour = 8
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("A: STATUS BLOCKED", self.pushes[0])
+
+    def test_breaker_open_pages_at_night(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.hour = 3
+        for n in "ABC":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        for n in "ABC":
+            self.report(n, "BLOCKED")
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "open")
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("breaker", self.pushes[0])
 
 
 class TestDiskGuard(Base):

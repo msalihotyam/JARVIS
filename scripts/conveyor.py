@@ -4,6 +4,9 @@ Stdlib only. Deletes no file itself; finished lane sessions it started are
 removed with `claude rm` after a grace period. Its only git/gh calls are the push
 gate: main is pushed to origin (fast-forward only) when the orchestrator's approval
 file build/approvals/push-<sha>[-<ci>] exists AND every deterministic check passes.
+The autopilot (CONV7) writes that file itself for a strictly GREEN integration report whose
+checks already pass, queues one fix-forward chain for a BLOCKED one, and opens a breaker
+that holds new product lanes after repeated failures; it never pushes (only the gate does).
 Runtime state lives in build/conveyor/ (gitignored). One pass every 60 s; `--once`
 runs one pass. The one model call is the optional, advisory report reader (Claude
 Haiku over the Anthropic API, key from JARVIS_READER_API_KEY, monthly cap): it only
@@ -101,6 +104,46 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
 STUCK_NOTE ="(no report: the conveyor marked this lane STUCK - re-dispatched twice, no progress)"
+# Autopilot (CONV7, Salih 2026-10-10 03:56): key 1 for a GREEN integration report, one
+# fix-forward per BLOCKED integration chain, and a breaker on repeated failures. State in
+# build/conveyor/autopilot.json; the orchestrator stays the watchman (closes the breaker).
+BREAKER_ID = "breaker"  # attention id; build/conveyor/breaker-reset (touched) closes it
+BREAKER_BAD = 3  # this many lanes finishing BAD within BREAKER_WINDOW_S open the breaker
+BREAKER_WINDOW_S = 7200
+NIGHT_HOURS = range(2, 8)  # 02:00-08:00 local: the 30 min escalation page waits, unless breaker open
+AUTO_LINE_S = 3600  # the band shows "auto-approved <sha7>" this long
+AUTOFIX_MODEL, AUTOFIX_EFFORT = "opus", "high"  # routing table: auto-fix lanes
+NEW_MAIN_RE = re.compile(r"(?m)^[ \t]*NEW MAIN SHA\b(.*)$")
+CI_RUN_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/(\d+)")
+# a name that goes on with "/" (ci/a/b) or more name characters is not taken at all
+CI_BRANCH_RE = re.compile(r"(?<![\w.-])ci/([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)(?![/\w-]|\.[\w-])")
+TEST_ID_RE = re.compile(r"\btests\.(?:\w+\.)+test\w*")
+AUTOFIX_TEMPLATE = """\
+@jarvis lane={AFX} model=opus effort=high base=main
+Automatic fix-forward lane, queued once by the conveyor (JARVIS_RUNBOOK.md "Konveyor",
+"Autopilot") because integration lane {INT} finished BLOCKED. Its report: {REPORT}
+
+Work in a new worktree branched from the CURRENT local main ({MAIN}); branch {BRANCH}.
+Goal: make these failing tests pass by fixing their cause. Never weaken, skip or remove a
+test or an assert:
+{TESTS}
+Owned files (the files of the commits {INT} picked); touch nothing else:
+{FILES}
+A fix that needs another file, a test whose meaning must change, or any decision: stop
+with STATUS: BLOCKED and say why (fail closed).
+Proofs: the failing tests above, then the test modules of the owned files; ruff
+E4,E7,E9,F on changed Python; git diff --check. GREEN MEANS STOP.
+Hard rules: never push; never touch uv.lock; stage explicit paths only; no
+reset/restore/stash/clean; never delete files.
+Commit on {BRANCH}. Report build/reports/{AFX}.md: STATUS PASS or BLOCKED, FIX COMMIT:
+<40-hex sha>, BRANCH: {BRANCH}, the tests run with real counts. The conveyor then
+dispatches {R}, which integrates FIX COMMIT onto main.
+"""
+RERUN_PREFACE = (
+    "{R} re-runs integration lane {INT} after the automatic fix lane {AFX} (its report "
+    "build/reports/{AFX}.md names FIX COMMIT and BRANCH). Local main may already hold {INT}'s "
+    "earlier picks: check git log first, pick only what is missing, then cherry-pick FIX "
+    "COMMIT. Your report is build/reports/{R}.md. The rest of the prompt is {INT}'s.\n\n")
 
 # The jarvis-flow lint's header rules (.claude/skills/jarvis-flow/hooks/lib/header.ts), the
 # single table here: a header the lint would block leaves an empty session (incident A,
@@ -400,6 +443,17 @@ def iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
 
 
+def local_hour(t):
+    return time.localtime(t).tm_hour
+
+
+def fill(template, **kw):
+    """template with each {KEY} replaced (plain replace: other braces in it stay)."""
+    for k, v in kw.items():
+        template = template.replace("{" + k + "}", v)
+    return template
+
+
 def glob_prefix(g):
     """Literal part of a glob before its first wildcard, normalised."""
     g = g.replace("\\", "/").lower()
@@ -507,6 +561,9 @@ class Conveyor:
         self.pace = {}
         self.backlog_view = []
         self.main_sha = False
+        self.auto_file = self.base / "autopilot.json"
+        self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
+        self.band = []  # status.json "band" lines (breaker, auto-approval)
 
     # ---- lock -------------------------------------------------------
     def acquire_lock(self):
@@ -652,6 +709,8 @@ class Conveyor:
         self.free_gb = self.disk_free_gb()
         if agents is not None:
             self.track(lanes, agents)
+        self.autopilot(lanes)  # before dispatch: a new fix lane or an open breaker counts now
+        if agents is not None:
             self.dispatch(lanes, agents)
             self.prioritize(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
@@ -911,6 +970,8 @@ class Conveyor:
                        "updated_at": iso(self.now()), "state": "working",
                        "prompt": str(prompt.relative_to(self.base)), "files": files or [],
                        "slice": slice_}
+        if INT_RE.match(name):  # auto-fix owns the files of the commits this lane picks
+            lanes[name]["main_at_start"] = self.main_head()
 
     def usage_pct(self):
         """Weekly plan % from the newest jarvis-flow slice-ledger row (claude has no
@@ -1160,7 +1221,7 @@ class Conveyor:
         if self.hold():
             return
         busy = self.busy_names(lanes, agents)
-        started = False
+        started, held = False, set()
         files = sorted(self.inbox.glob("*.md"), key=mtime_or_0)
         for f in files:
             try:
@@ -1175,6 +1236,9 @@ class Conveyor:
                 self.reject(f, why)
                 continue
             name = hdr["lane"]
+            if self.breaker and not INT_RE.match(name):
+                held.add(f)  # breaker open: no new product lane; integration/fix lanes go on
+                continue
             if len(self.running(lanes)) >= self.max_lanes:
                 return
             if name in busy or self.int_blocked(name, lanes):
@@ -1190,7 +1254,7 @@ class Conveyor:
             self.event("dispatch", lane=name, id=sid, model=hdr["model"],
                        effort=hdr["effort"], file=dest.name)
         waiting = list(self.inbox.glob("*.md"))
-        if not waiting:
+        if not set(waiting) - held:  # a breaker-held prompt does not keep a fix lane waiting
             started = self.dispatch_backlog(lanes, busy) or started
         if started or waiting or self.running(lanes):
             self.pager_flag("dry", False)
@@ -1205,17 +1269,19 @@ class Conveyor:
 
     # ---- backlog ------------------------------------------------------
     def load_backlog(self):
+        """(valid slices, errors): the autopilot's fix-forward slices first, then backlog.json."""
+        good = list((self.auto_state() or {}).get("slices", []))
         f = self.base / "backlog.json"
         if not f.exists():
-            return [], []
+            return good, []
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
-            return [], [f"backlog.json: {e}"]
+            return good, [f"backlog.json: {e}"]
         slices = data.get("slices") if isinstance(data, dict) else data
         if not isinstance(slices, list):
-            return [], ["backlog.json: no slices list"]
-        good, errors = [], []
+            return good, ["backlog.json: no slices list"]
+        errors = []
         for i, s in enumerate(slices):
             why = validate_slice(s)
             if why:
@@ -1254,6 +1320,8 @@ class Conveyor:
                 view[sid] = "same_name_busy"
             elif self.int_blocked(sid, lanes):
                 view[sid] = "int_busy"
+            elif self.breaker and not INT_RE.match(sid):
+                view[sid] = "breaker_open"
             elif why := self.slice_lint(s):
                 view[sid] = "held: " + why  # the lint would drop its header
             else:
@@ -1367,6 +1435,10 @@ class Conveyor:
             if r.get("kind", "pass") != "pass":
                 lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
                 why.append(f"{lead}: {r.get('summary', '')}")
+            if ln.get("auto_refused"):
+                why.append(f"auto-approval refused: {ln['auto_refused']}")
+            if why and ln.get("auto_fix"):
+                why.append(ln["auto_fix"])
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
         dry = self.pager_flag("dry")
@@ -1397,10 +1469,17 @@ class Conveyor:
         fail = self.pager_flag("power_switch_fail")
         if fail:
             items.append((POWER_SWITCH_ID, f"güç planı değişmedi ({fail[0]})", fail[1]))
+        if self.breaker:
+            items.append((BREAKER_ID, f"breaker open: {self.breaker['reason']}; product slices held "
+                                      "until build/conveyor/breaker-reset is touched",
+                          self.breaker["since"]))
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop(self, items):
-        """Page Salih once per attention item the orchestrator left unacked ATTENTION_PAGE_S."""
+        """Page Salih once per attention item the orchestrator left unacked ATTENTION_PAGE_S.
+        At night (NIGHT_HOURS) the page waits for the morning, unless the breaker is open."""
+        if local_hour(self.now()) in NIGHT_HOURS and not self.breaker:
+            return
         done = self.pager_flag("backstop") or {}
         for i, why, since in items:
             if self.now() - since >= ATTENTION_PAGE_S and done.get(i) != since:
@@ -1431,6 +1510,8 @@ class Conveyor:
                        "reading": ln.get("reading")}
                       for n, ln in lanes.items()],
             "backlog": self.backlog_view,
+            "breaker": "open" if self.breaker else "closed",
+            "band": self.band,
             "attention": [{"id": i, "reason": why, "since": iso(since)} for i, why, since in items],
         }
         tmp = self.base / "status.json.tmp"
@@ -1454,6 +1535,203 @@ class Conveyor:
                 spec.loader.exec_module(mod)
                 mod.main(out=self.root / "build" / "ledger" / "usage.json")
                 return
+
+    # ---- autopilot (CONV7): the three routine orchestrator decisions -----
+    def autopilot(self, lanes):
+        """Every pass, for each lane that reached a terminal status since the autopilot began:
+        count BAD finishes for the breaker, open it when an auto-fix chain lane fails, write
+        key 1 for a GREEN integration report (auto_approve) and queue one fix-forward chain
+        for a BLOCKED one (auto_fix). Only a breaker-reset touched after the breaker opened
+        closes it. Unreadable state: no action and the breaker counts as open (fail closed)."""
+        ap = self.auto_state()
+        if ap is None:
+            self.breaker = {"reason": "build/conveyor/autopilot.json unreadable (fix it by hand)",
+                            "since": mtime_or_0(self.auto_file)}
+            self.band = ["breaker: open"]
+            return
+        b = ap.get("breaker")
+        if b and mtime_or_0(self.base / "breaker-reset") >= b["since"]:
+            ap["breaker"], ap["bad"] = None, []
+            self.event("breaker", state="closed", reason=b["reason"])
+        chains = ap.setdefault("chains", {})
+        for name, ln in lanes.items():
+            fin = ln.get("finished_ts")
+            if fin is None or fin < ap["since"] or ln.get("ap") == fin:
+                continue
+            ln["ap"] = fin  # once per terminal status (a DEAD lane finished later by report: again)
+            st = ln.get("status")
+            role = next((r for c in chains.values() for r in ("afx", "r") if c.get(r) == name), None)
+            if st in BAD:
+                ap.setdefault("bad", []).append([name, fin])
+            if role and st not in GOOD:
+                self.open_breaker(ap, f"auto-fix chain failed: {name} {st}")
+            if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
+                continue  # a fix lane (also one started by hand) never gets key 1 or a chain
+            if st == "GREEN":
+                self.auto_approve(name, ln, lanes, ap)
+            elif st == "BLOCKED" and role is None and not name.endswith("-R"):
+                self.auto_fix(name, ln, chains, ap)
+        ap["bad"] = [x for x in ap.get("bad", []) if self.now() - x[1] < BREAKER_WINDOW_S]
+        if len(ap["bad"]) >= BREAKER_BAD:
+            self.open_breaker(ap, f"{len(ap['bad'])} lanes finished BLOCKED/STOP/FAIL within 2 h: "
+                                  + ", ".join(x[0] for x in ap["bad"]))
+        self.breaker = ap.get("breaker")
+        last = ap.get("last_auto")
+        self.band = (["breaker: open"] if self.breaker else []) + \
+            ([f"auto-approved {last[0][:7]}"] if last and self.now() - last[1] < AUTO_LINE_S else [])
+        try:
+            self.auto_file.write_text(json.dumps(ap, indent=2), encoding="utf-8")
+        except OSError as e:  # e.g. a sharing violation: the next pass re-reads the old state
+            self.error(f"autopilot.json: {e}")
+
+    def auto_state(self):
+        """autopilot.json as a dict of the expected shape; a fresh state when missing; None
+        when it is unreadable or malformed (fail closed: no autopilot action, no auto slice)."""
+        if not self.auto_file.exists():
+            return {"since": self.now()}  # lanes finished before the autopilot are not its business
+        ap = self.load_json(self.auto_file, None)
+        num = (int, float)
+        try:
+            b = ap.get("breaker")
+            ok = isinstance(ap["since"], num) and (
+                b is None or isinstance(b["reason"], str) and isinstance(b["since"], num)) and all(
+                isinstance(x[0], str) and isinstance(x[1], num) for x in ap.get("bad", [])) and all(
+                isinstance(c, dict) for c in ap.get("chains", {}).values()) and not any(
+                validate_slice(s) for s in ap.get("slices", [])) and (
+                ap.get("last_auto") is None or isinstance(ap["last_auto"][0], str)
+                and isinstance(ap["last_auto"][1], num))
+        except (AttributeError, KeyError, TypeError, IndexError):
+            ok = False
+        return ap if ok else None
+
+    def open_breaker(self, ap, reason):
+        if not ap.get("breaker"):
+            ap["breaker"] = {"reason": reason[:300], "since": self.now()}
+            self.event("breaker", state="open", reason=reason[:300])
+
+    def auto_approve(self, name, ln, lanes, ap):
+        """Key 1 written by the conveyor for a GREEN integration report: the approval file
+        push-<sha40>-<ci>, only when approval_for finds no reason to refuse. A refusal is an
+        attention item on the lane; push_gate still runs every key-2 check before a push."""
+        try:
+            why, approval, url = self.approval_for(name, ln, lanes)
+            if why is None:
+                self.approvals.mkdir(parents=True, exist_ok=True)
+                with open(self.approvals / approval, "x", encoding="utf-8") as f:
+                    f.write(f"auto-approved by the conveyor from {ln['report']} at {iso(self.now())}\n")
+        except FileExistsError:  # the orchestrator's own key 1 for this exact name, else refused
+            try:
+                there = approval in os.listdir(self.approvals) and (self.approvals / approval).is_file()
+            except OSError:  # build/approvals is not a folder
+                there = False
+            why = None if there else "approval path exists but is not that approval file"
+        except Exception as e:  # unreadable report, a git/gh timeout: refused, never approved
+            why = f"check error: {type(e).__name__}"
+        if why:
+            ln["auto_refused"] = why
+            self.event("auto_approve_refused", lane=name, reason=why)
+            return
+        ap["last_auto"] = [approval[len("push-"):len("push-") + 40], self.now()]
+        self.event("auto_approve", lane=name, approval=approval, ci_run=url)
+
+    def approval_for(self, name, ln, lanes):
+        """(None, approval name, CI run url) when lane `name`'s report earns an automatic key 1,
+        else (reason, None, None). Fail closed: exactly one 'STATUS: GREEN' line, one 'NEW
+        MAIN SHA: <40 hex>' line, one ci/* branch and one CI run URL; no other integration
+        lane unfinished; then every gate check (push_checks: local main is that sha, fast-
+        forward, CI success for that sha on that branch, no uv.lock, SCHEMA_VERSION 10) passes
+        now, and the run the gate verified is the report's run."""
+        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        st = [x for x in text.splitlines() if re.match(r"\s*STATUS:", x)]
+        if len(st) != 1 or not re.fullmatch(r"\s*STATUS:\s*GREEN\s*", st[0]):
+            return "the report has no single 'STATUS: GREEN' line", None, None
+        mains = NEW_MAIN_RE.findall(text)
+        m = len(mains) == 1 and re.match(r"\s*:\s*([0-9a-f]{40})(?![0-9A-Za-z])", mains[0])
+        if not m:
+            return "the report has no single 'NEW MAIN SHA: <40 hex>' line", None, None
+        sha, cis, runs = m.group(1), set(CI_BRANCH_RE.findall(text)), set(CI_RUN_RE.findall(text))
+        if len(cis) != 1:
+            return f"the report names {len(cis)} ci/* branches, not one", None, None
+        if len(runs) != 1:
+            return f"the report names {len(runs)} CI run URLs, not one", None, None
+        other = sorted(n for n, x in lanes.items() if n != name and INT_RE.match(n) and not x.get("finished"))
+        if other:
+            return f"integration lane {other[0]} is running", None, None
+        approval = f"push-{sha}-{cis.pop()}"
+        if not APPROVAL_RE.fullmatch(approval):
+            return "approval name invalid", None, None
+        why, got, url = self.push_checks(approval)
+        if why:
+            return why, None, None
+        if got != sha or runs.pop() not in CI_RUN_RE.findall(url or ""):
+            return "the CI run the gate verified is not the report's", None, None
+        return None, approval, url
+
+    def auto_fix(self, name, ln, chains, ap):
+        """One fix-forward chain per integration lane name, never a second: <INT>-AFX then
+        <INT>-R (depends on the fix). Any doubt: no chain; the BLOCKED lane stays an
+        attention item for the orchestrator."""
+        if name in chains:
+            why, slices = "auto-fix already used for this integration lane", None
+        else:
+            try:
+                why, slices = self.fix_chain(name, ln)
+            except Exception as e:  # unreadable report or prompt, a git timeout
+                why, slices = f"{type(e).__name__}", None
+        if why:
+            ln["auto_fix"] = f"auto-fix skipped: {why}"
+            self.event("auto_fix_skipped", lane=name, reason=why)
+            return
+        afx, r = slices[0]["id"], slices[1]["id"]
+        chains[name] = {"afx": afx, "r": r, "at": self.now()}
+        ap["slices"] = ap.get("slices", []) + slices
+        ln["auto_fix"] = f"auto-fix queued: {afx}, then {r}"
+        self.event("auto_fix", lane=name, fix=afx, rerun=r, tests=len(slices[0]["tests"]),
+                   files=slices[0]["files"])
+
+    def fix_chain(self, name, ln):
+        """(None, [fix slice, re-run slice]) from the BLOCKED report's failing test ids and
+        the files of the commits the lane picked (main at its start..main now), else
+        (reason, None). The fix prompt comes from build/conveyor/prompts/_autofix_template.md
+        (written from AUTOFIX_TEMPLATE when missing; the orchestrator may edit it)."""
+        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        tests = sorted(set(TEST_ID_RE.findall(text)))
+        if not tests:
+            return "the report names no failing test id", None
+        start, main = ln.get("main_at_start"), self.main_head()
+        if not (isinstance(start, str) and SHA_RE.fullmatch(start) and main):
+            return "main at the lane's start or now is unknown", None
+        rc, out = self.cmd(["git", "diff", "--name-only", f"{start}..{main}"])
+        files = sorted({p.strip() for p in out.splitlines() if p.strip()}) if rc == 0 else []
+        if not files:
+            return f"no picked files ({start[:7]}..{main[:7]}, rc={rc})", None
+        afx, r = f"{name}-AFX", f"{name}-R"
+        prompts = self.base / "prompts"
+        tpl = prompts / "_autofix_template.md"
+        if not tpl.exists():
+            prompts.mkdir(parents=True, exist_ok=True)
+            tpl.write_text(AUTOFIX_TEMPLATE, encoding="utf-8")
+        kw = {"INT": name, "AFX": afx, "R": r, "REPORT": ln["report"], "MAIN": main,
+              "BRANCH": afx.lower(), "TESTS": "\n".join("  " + t for t in tests),
+              "FILES": "\n".join("  " + f for f in files)}
+        rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
+        texts = {afx: fill(tpl.read_text(encoding="utf-8"), **kw),
+                 r: f"@jarvis lane={r} model={ln.get('model')} effort={ln.get('effort')} base=main\n"
+                    + fill(RERUN_PREFACE, **kw) + rest}
+        rel = "build/conveyor/prompts/auto/{}.md"
+        slices = [{"id": afx, "title": f"auto-fix {name}", "model": AUTOFIX_MODEL,
+                   "effort": AUTOFIX_EFFORT, "tier": "T1", "files": files, "depends_on": [],
+                   "prompt": rel.format(afx), "tests": tests},
+                  {"id": r, "title": f"re-run {name}", "model": ln.get("model"),
+                   "effort": ln.get("effort"), "tier": "T1", "files": ln.get("files", []),
+                   "depends_on": [afx], "prompt": rel.format(r)}]
+        bad = next((f"{s['id']}: {w}" for s in slices if (w := validate_slice(s))), None)
+        if bad:
+            return f"slice invalid: {bad}", None
+        (prompts / "auto").mkdir(parents=True, exist_ok=True)
+        for s in slices:
+            (self.root / s["prompt"]).write_text(texts[s["id"]], encoding="utf-8")
+        return None, slices
 
     # ---- push gate: verified main to GitHub under two keys ---------------
     def push_gate(self):
