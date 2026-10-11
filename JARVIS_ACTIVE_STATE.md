@@ -95,8 +95,15 @@ open. Next: integrate on "entegre et".
 - Gate 6 UX (6A–6D-b, 6E, 6F) as built; 6F F7: a Global conversation deletes
   in one step, an active project's unarchived one must be archived first.
 - The 6G/6H plan as recorded in the roadmap (mockup v16 approved 2026-10-05).
-- Mechanical lamp, freeze-key skins 3–4 and the usage popover's
-  context-window block: V2.1. V2.1 owns `conversation_global_memory_toggles`.
+- Mechanical lamp and freeze-key skins 3–4 shipped in V2.0 (Salih 2026-10-11,
+  A-2/A-3 accepted). Status lamp default stays as shipped: mechanical, glass
+  orb selectable in settings (G-2, orchestrator decision). V2.1 keeps the usage
+  popover's context-window block and owns `conversation_global_memory_toggles`.
+- Gate 6G close (Salih 2026-10-11): A-4 W3 work panel floats beside the stream
+  instead of the approved right-rail top: accepted, OPEN DOGFOOD item (Salih
+  judges it). B-2 K1 "Oluştur" while frozen still creates the folder (click =
+  approval, Q5), K3/E7 refuse: deferred, freeze feature revisited after V2.
+  "Gate 6G review leftovers" list lives in the roadmap V2.1 section.
 
 ## Decisions / external / backlog
 

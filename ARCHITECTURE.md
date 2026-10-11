@@ -3634,6 +3634,10 @@ kullanıcıya gösterilir.
   adlandırır ve bağ durumunu GERİ OKUR (bağlı / bağlı değil / bilinmiyor).
   Kalan risk (Salih 2026-10-10 kabul): son yargıdan sonra klasör taşınabilir
   veya OneDrive yer tutucusuna dönüşebilir; mevcut klasörü bağlamakla aynıdır.
+  Dondurulmuşken (yürütme kapalı) K1 "Oluştur" klasörü yine oluşturur:
+  kullanıcının tıklaması onaydır (Q5); K3/E7 dondurulmuşken reddeder (Salih
+  2026-10-11, B-2: şimdilik önemli değil, dondurma özelliği V2 sonrası
+  yeniden ele alınır; ertelendi).
   Sohbetten oluşturma (K3, Core kartı) G6H3'tedir.
 - **K3 sohbet onay kartı (G6H3):** sohbetten erişilen ilk yerel yazımdır;
   izinlidir çünkü yazımın her şeyini JARVIS hesaplar ve LOCAL_WRITE zorunlu

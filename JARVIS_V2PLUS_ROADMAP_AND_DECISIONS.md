@@ -102,7 +102,7 @@ Bunlar karar değil, planlama tahminidir; dilim = bir commit'lik iş. V2.0 kalem
 - V2.4A Jev: yalnız geliştirme pilotu (çevrimdışı eval + shadow) yapılır; ürün pilotu kalite kanıtlanana kadar ertelenir — blok küçülür.
 - V2.3 Deep Research, V2.4 Work durable state'in bir görev türü olarak kurulabilir (pause/resume, checkpoint, evidence ortak): V2.4'ten sonra ya da onunla birlikte yapılırsa küçülür.
 - V2.5 Routine = Skill'in zaman/koşul/olay sarmalayıcısı; V1 zamanlayıcısı ve V2.2 skill'leri üzerine ince bir katman olarak küçülebilir.
-- V2.1'den Memory Doctor ve history import bir V2.1.x'e ayrılabilir; daily-driver kapısı typed memory + capture + retrieval ile daha erken gelir. Taşınan arayüz kaplamaları (mekanik lamba, dondurma 3–4) daily-driver kapısına bağlı olmayan ayrı bir "kaplama paketi" olabilir.
+- V2.1'den Memory Doctor ve history import bir V2.1.x'e ayrılabilir; daily-driver kapısı typed memory + capture + retrieval ile daha erken gelir. (Mekanik lamba ve dondurma 3–4 V2.0'da gönderildi, Salih 2026-10-11; ayrı kaplama paketi gerekmez.)
 - V2.4 isimli kalıcı ajanlar, subagent'lardan sonra ayrı bir alt sürüm olabilir.
 
 ---
@@ -205,11 +205,36 @@ V2 Advanced Memory:
 
 V1 Context Manager, Advanced Memory yerine sayılmaz.
 
+### Gate 6G kapanış kararları (Salih 2026-10-11 03:35, GATE6G_review.md yanıtları)
+- **G-2:** durum lambası varsayılanı: Salih "farketmez" → orkestratör kararı: gönderilen varsayılan korunur (mekanik lamba; cam küre ayarlardan seçilir). Kod değişikliği yok.
+- **A-2/A-3:** mekanik lamba ve dondurma tuşu kaplamaları 3–4 V2.0'da gönderildi (V2.1 planlıydı): KABUL.
+- **A-4:** W3 çalışma paneli akışın yanında yüzer (onaylı sağ-sütun üstü yerine): şimdilik kabul; Salih dogfood sırasında değerlendirecek. AÇIK DOGFOOD KALEMİ.
+- **B-2:** dondurulmuşken (yürütme kapalı) K1 "Oluştur" klasörü yine oluşturur (kullanıcının tıklaması onaydır, Q5); K3/E7 dondurulmuşken reddeder. Salih: şimdilik önemli değil, dondurma özelliğine V2 sonrası döner. Mevcut davranış ARCHITECTURE.md 6H K1 paragrafında; ERTELENDİ.
+
 ### V2.0'dan taşınan arayüz kalemleri (Salih kararı 2026-10-06)
-- **Mekanik lamba = üçüncü durum göstergesi kaplaması** (S1'in yerine; saat tipi lamba ve pano 12 "TornLamp" SVG'si reddedildi, Salih 2026-10-05). Mevcut ayar `bridge.statusIndicator` / SettingsDrawer "statusIndicatorChoice" ("orb" Canonical Orb, "hud" HUD Orb) "mechanical" seçeneğini alır; isteğe bağlıdır, VARSAYILAN DEĞİŞMEZ (Salih 2026-10-06 01:04). Görünüm: JARVIS yüzeyi lamba yerinde yırtılmış, içinde ayrıntılı, gerçekçi mekanik iç (dişliler, eşapman, balans çarkı); metal renkler, renk/ışıkla dikkat çekme yok. Sanat: Astra kahraman görseli `master_v1.png` (onay 2026-10-05 23:10) + temiz plaka `plate_v1.png`; katmanlar `build.py` + `parts.py` ile; onaylı canlı prototip `mekanik_lamba.html` (artifact "Mekanik Durum Lambası" D4ECQ5x6MgZoCsGpwmPDcF, onay 2026-10-06 00:31). Hepsi `build\6g\lamp\` altında, henüz repoda değil. Boyut (onay 2026-10-05 23:56): 2,15x = kıvrık kanatlar dahil 120 px, üstten 4 px, sağ sütun üst kenarını tasarım gereği ~20 px örter; boyut TEK özelliktir, katmanlar ana çözünürlükte. TopBar durum yuvası kaplamaya göre boyutlanır (mekanik 120 px, diğerleri 60 px). Kinematik: tek motor açısı; büyük çark çalışırken %100'de 24 derece/s; ready %25; freezing ~4 s'de 0'a yavaşlar, sonra frozen durur; kafes 1,5 Hz salınır (çalışırken ±30, ready ±12); cırcır tıklar; zincirler/yay kayar; ambient kapalı = hareketsiz. 13 çark + 4 planet + kafes + 2 kol + 2 zincir + yay hareket eder; 14/15 kolları statik (örtücü). Hız tek sayıdır; son değer dogfood'da. QML katmanları canlandırır.
-- **Dondurma tuşu kaplamaları 3–4** (kaplama ayarı ve kaplama 1–2 V2.0'da): kaplama 3 = krom geçiş anahtarı (yarasa sap; plakada yazı YOK — dondurma kapatma değildir, Salih 2026-10-06 01:10); çok hızlı canlanır (~60–90 ms kol dönüşü + küçük oturma), ambient kapısından. Kaplama 4 = bıçaklı şalter, YIRTIK yüzey sürümü (Salih 2026-10-06 02:06; kaynak `build\6g\freeze\knife_torn_v1`, sığma testi `dondur_gorunumleri.png`); menteşelerinde döner (daha yavaş, ağırlıklı). Sanat kaynakları `build\6g\freeze\` (`toggle_v1.png`, `knife_torn_v1`); boyut kaplama başına tek sayı. Görsel durum yalnız `bridge.executionState`; yetki/anlam bugünküyle aynı.
+- **Mekanik lamba = üçüncü durum göstergesi kaplaması** (S1'in yerine; saat tipi lamba ve pano 12 "TornLamp" SVG'si reddedildi, Salih 2026-10-05). Mevcut ayar `bridge.statusIndicator` / SettingsDrawer "statusIndicatorChoice" ("orb" Canonical Orb, "hud" HUD Orb) "mechanical" seçeneğini alır; V2.0'da gönderildi (Salih 2026-10-11, Gate 6G kapanışı A-2/A-3: V2.1'den V2.0'a alındı, KABUL). VARSAYILAN: gönderilen varsayılan korunur, mekanik lamba varsayılandır; cam küre ayarlardan seçilir (Salih 2026-10-11 G-2: "farketmez" → orkestratör kararı; kod değişikliği yok; eski "varsayılan değişmez / mekanik isteğe bağlı" satırı geçersiz). Görünüm: JARVIS yüzeyi lamba yerinde yırtılmış, içinde ayrıntılı, gerçekçi mekanik iç (dişliler, eşapman, balans çarkı); metal renkler, renk/ışıkla dikkat çekme yok. Sanat: Astra kahraman görseli `master_v1.png` (onay 2026-10-05 23:10) + temiz plaka `plate_v1.png`; katmanlar `build.py` + `parts.py` ile; onaylı canlı prototip `mekanik_lamba.html` (artifact "Mekanik Durum Lambası" D4ECQ5x6MgZoCsGpwmPDcF, onay 2026-10-06 00:31). Hepsi `build\6g\lamp\` altında, henüz repoda değil. Boyut (onay 2026-10-05 23:56): 2,15x = kıvrık kanatlar dahil 120 px, üstten 4 px, sağ sütun üst kenarını tasarım gereği ~20 px örter; boyut TEK özelliktir, katmanlar ana çözünürlükte. TopBar durum yuvası kaplamaya göre boyutlanır (mekanik 120 px, diğerleri 60 px). Kinematik: tek motor açısı; büyük çark çalışırken %100'de 24 derece/s; ready %25; freezing ~4 s'de 0'a yavaşlar, sonra frozen durur; kafes 1,5 Hz salınır (çalışırken ±30, ready ±12); cırcır tıklar; zincirler/yay kayar; ambient kapalı = hareketsiz. 13 çark + 4 planet + kafes + 2 kol + 2 zincir + yay hareket eder; 14/15 kolları statik (örtücü). Hız tek sayıdır; son değer dogfood'da. QML katmanları canlandırır.
+- **Dondurma tuşu kaplamaları 3–4** (V2.0'da gönderildi, Salih 2026-10-11 A-2/A-3 KABUL; kaplama ayarı ve kaplama 1–2 de V2.0'da): kaplama 3 = krom geçiş anahtarı (yarasa sap; plakada yazı YOK — dondurma kapatma değildir, Salih 2026-10-06 01:10); çok hızlı canlanır (~60–90 ms kol dönüşü + küçük oturma), ambient kapısından. Kaplama 4 = bıçaklı şalter, YIRTIK yüzey sürümü (Salih 2026-10-06 02:06; kaynak `build\6g\freeze\knife_torn_v1`, sığma testi `dondur_gorunumleri.png`); menteşelerinde döner (daha yavaş, ağırlıklı). Sanat kaynakları `build\6g\freeze\` (`toggle_v1.png`, `knife_torn_v1`); boyut kaplama başına tek sayı. Görsel durum yalnız `bridge.executionState`; yetki/anlam bugünküyle aynı.
 - **Kullanım penceresinin bağlam penceresi bloğu** (Salih 2026-10-05): kullanılan / en çok, çubuk, "Otomatik sıkıştırmaya N", "Oturumu sıkıştır"; V2.0 penceresinin (U3) üstüne eklenir (yukarıdaki context-usage göstergesi kalemi).
 - Plan gereği V2.1'de gelenler: proje sayfasında Hafıza satırı (6G P3), sohbet menüsünde "Mark as unread" (F9 H3; 6G D1/D2 yalnız tamamlanma alt kümesidir).
+
+### Gate 6G review leftovers (Salih 2026-10-11, Gate 6G kapanışı; ertelendi)
+Kaynak: build/6g/GATE6G_review.md; G6H3POL kalanları build/reports/G6H3POL.md OPEN ISSUES. Hepsi V2.1 temizlik listesidir, V2.0 kapsamı değil.
+- **D-1:** yetim ModelSelector.qml / QuotaBar.qml.
+- **D-2:** QML çağıranı olmayan bridge API'si.
+- **D-3 / D-5:** yetim özellikler ve id'ler.
+- **D-4:** yinelenen talimat / etkin dosya okumaları.
+- **D-7:** UnreadBell simge yolu.
+- **D-9:** konveyör çıplak `except`.
+- **C-5:** CI skip-count kapısı.
+- **C-6:** bayat test adları.
+- **C-7:** F-gt izlenen kalsın.
+- **C-9:** "CLI uygulama kurulmadan reddeder" sabitlemesi.
+- **B-3:** genel belgelerde OS kullanıcı adı.
+- **B-4:** bozuk bağ satırı klasörsüz okunur.
+- **D-6 kalanı (G6H3POL):** (a) K1 metinleri app.py'de en-US altında hâlâ Türkçe, tests/test_g6h1b_ui.py ~212/~226-227 sabitler; (b) bilinmeyen klasör nedenleri ham geçer, tests/test_g6h2_folder_ui.py ~112 sabitler; (c) bağlayıcı klasör iletileri pencereye jarvis/ui/present.py'deki Core zarflarından ulaşır; (d) `_UNVERIFIED` Türkçe soneki; (e) köprü `_k3_switched_to`'nun gösterdiği E7 hata metinleri ham.
+- **K3 kalanı (G6H3POL):** öneri Core'un reddinden önce değiştiyse "var olan klasörü seç" hâlâ FAILED biter (REJECTED değil); hiçbir şey oluşturulmaz; düzeltme core.py ister.
+- **B-2 (dondurma sırasında K1):** bkz. aşağıdaki karar; dondurma özelliği V2 sonrası yeniden ele alınacak.
+- **A-4 (W3 çalışma paneli yerleşimi):** açık dogfood kalemi; bkz. aşağıdaki karar.
 
 ---
 
@@ -1120,7 +1145,7 @@ Salih kararı (2026-10-06): chip/açılır-liste öğeleri (Q3/Q4/Q7) ve Q2'deki
 - **LP4:** gönderince yapıştırılan metin mesajla mesaj düzeyi bağlam olarak gider (eklerle aynı yol, yazılan istekten ayrı, asla yetki değil); gönderilmiş mesaj aynı kartı gösterir, tıklamak salt-okunur önizleme açar. Mevcut yapıştırma sırası korunur: panodaki dosya/görseller önce eklenir (`bridge.attachClipboard`), sonra bu kural.
 
 **Üst çubuk: dondurma tuşu (6G)**
-- **S2 + dondurma kaplamaları (Salih 2026-10-05/06):** dondurma denetimi kaplanabilir olur (yeni ayar, durum göstergesi gibi). V2.0'da: kaplama 1 = bugünkü PowerControl; kaplama 2 = onaylı yeniden tasarlanmış tuş (Design pano 11 "Mechanism"; tuşun altındaki "Dondur" yazısı kalkar; hale statik, K2). Görsel durum yalnız `bridge.executionState`'i izler (asla tıklamayı değil): running = açık, freeze_requested = hareket/yarım, frozen = kapalı; devam ettirme yine onay ister. Yetki/anlam bugünküyle aynı. Salih kararı (2026-10-06): VARSAYILAN kaplama 1'dir (bugünkü PowerControl görünümü); kaplama 2 V2.0'da isteğe bağlıdır. Kaplama 3–4 V2.1'dedir (aşağıda).
+- **S2 + dondurma kaplamaları (Salih 2026-10-05/06):** dondurma denetimi kaplanabilir olur (yeni ayar, durum göstergesi gibi). V2.0'da: kaplama 1 = bugünkü PowerControl; kaplama 2 = onaylı yeniden tasarlanmış tuş (Design pano 11 "Mechanism"; tuşun altındaki "Dondur" yazısı kalkar; hale statik, K2). Görsel durum yalnız `bridge.executionState`'i izler (asla tıklamayı değil): running = açık, freeze_requested = hareket/yarım, frozen = kapalı; devam ettirme yine onay ister. Yetki/anlam bugünküyle aynı. Salih kararı (2026-10-06): VARSAYILAN kaplama 1'dir (bugünkü PowerControl görünümü); kaplama 2 V2.0'da isteğe bağlıdır. Kaplama 3–4 de V2.0'da gönderildi (Salih 2026-10-11 A-2/A-3 KABUL; önceki plan V2.1'di).
 
 **Uygulama taraması kalite dilimleri (2026-10-05, 63 QML dosyası salt-okunur; tam liste Doc "Uygulama taraması: eksikler ve düzeltmeler")**
 - **K1:** her unicode glif simgesinin yerine çizilmiş simge seti (bugün tofu: pencere denetimleri, panel ✕, PanelColumn satır simgeleri ✦ ➶ ◷ ⁘ ◈ ⚑ ⟳, NavMenu, Safety/Approval/Attention glifleri, IconBox). 6G'nin İLK dilimi (yeni arayüz bunu kullanır).
@@ -1138,7 +1163,7 @@ Salih kararı (2026-10-06): chip/açılır-liste öğeleri (Q3/Q4/Q7) ve Q2'deki
 
 **F7 doğrulama takipleri (2026-10-06):** (1) ARCHITECTURE.md 6D-b silme metni F7'ye göre güncellendi (G0). (2) Menü hatası yukarıda M1 altında.
 
-**V2.1'e taşınanlar (Salih 2026-10-06):** mekanik lamba (üçüncü durum göstergesi kaplaması) ve dondurma tuşu kaplamaları 3–4; kullanım penceresinin bağlam penceresi bloğu zaten V2.1. Ayrıntı: V2.1 bölümü, "V2.0'dan taşınan arayüz kalemleri".
+**[GEÇERSİZ 2026-10-11: mekanik lamba ve dondurma 3–4 V2.0'da gönderildi, A-2/A-3 KABUL] V2.1'e taşınanlar (Salih 2026-10-06):** mekanik lamba (üçüncü durum göstergesi kaplaması) ve dondurma tuşu kaplamaları 3–4; kullanım penceresinin bağlam penceresi bloğu zaten V2.1. Ayrıntı: V2.1 bölümü, "V2.0'dan taşınan arayüz kalemleri".
 
 ---
 
