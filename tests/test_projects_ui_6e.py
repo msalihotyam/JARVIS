@@ -1543,9 +1543,10 @@ class LiveLanguageTests(ListCase):
         self.assertFalse(self.item(root, "chatHeaderScope").isVisible())
         side = lambda: (self.item(root, "sidebarNewChat").property("title"),  # noqa: E731
                         [i.property("title") for i in self.visible(root, "sidebarConversation") if i.property("current")])
-        self.assertEqual(("Global", "New Chat", ("New chat", ["New Chat"])), (owner(), switcher(), side()))
+        # G6CAPWORD (V1/V7): the hidden chip's name is "" for a plain chat (was "Global"/"Genel"); the bridge keeps its name.
+        self.assertEqual(("", "New Chat", ("New chat", ["New Chat"])), (owner(), switcher(), side()))
         self.tr(bridge)                                                       # no refresh of any kind after the switch
-        self.assertEqual(("Genel", "Yeni Sohbet", ("Yeni sohbet", ["Yeni Sohbet"])), (owner(), switcher(), side()))
+        self.assertEqual(("", "Yeni Sohbet", ("Yeni sohbet", ["Yeni Sohbet"])), (owner(), switcher(), side()))
         self.assertEqual("Genel", bridge.conversationProject["name"])
         # The open project's detail: the untitled row and the archived section rewrite as well.
         bridge.showProject(self.project.id)
@@ -1560,10 +1561,10 @@ class LiveLanguageTests(ListCase):
         self.assertNotIn("Yeni Sohbet", self.shown_texts(self.item(root, "projectsPage")))
         bridge.setPage("home")
         pump(350)
-        self.assertEqual(("Global", "New Chat"), (owner(), switcher()))
+        self.assertEqual(("", "New Chat"), (owner(), switcher()))                  # G6CAPWORD: was "Global"
         bridge.setLanguage("tr-TR")
         pump(300)                                # and again, the other way
-        self.assertEqual(("Genel", "Yeni Sohbet"), (owner(), switcher()))
+        self.assertEqual(("", "Yeni Sohbet"), (owner(), switcher()))               # G6CAPWORD: was "Genel"
 
     def test_am_retranslated_reads_again_and_changes_nothing(self) -> None:
         store, bridge, root = self.lists()

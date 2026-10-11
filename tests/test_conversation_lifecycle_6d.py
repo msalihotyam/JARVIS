@@ -753,7 +753,9 @@ class DialogTests(WindowCase):
         identity = texts("deleteIdentity")
         self.assertTrue(identity.startswith("«Tatil planı» · 2 mesaj · oluşturma "), identity)
         self.assertIn(" · son değişiklik ", identity)
-        self.assertTrue(identity.endswith(" · Genel"), identity)
+        # G6CAPWORD (V1/V7): a plain chat's line ends at the last-changed date - no " · Genel".
+        self.assertRegex(identity, r" · son değişiklik [^·]+$")
+        self.assertNotIn("Genel", identity)
         self.assertEqual("SİLİNECEK: bu sohbetin mesajları ve başlığı (sohbetin içinde tutulan görev başlıkları dahil) "
                          "JARVIS sohbet deposundan. Sohbet hiçbir listede görünmez ve açılamaz.", texts("deleteRemoved"))
         self.assertEqual("KALANLAR: bu sohbete bağlı oturum, görev, checkpoint, onay ve denetim kayıtları (görev "

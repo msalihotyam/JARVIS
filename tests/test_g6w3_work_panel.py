@@ -157,7 +157,7 @@ class WindowTests(Case):
         pump(200)
         self.assertEqual(["workPanelInstruction", "workPanelFiles", "workPanelFolder", "workPanelCapabilities"], self.shown(root))
         line = self.visible(root, "workPanelCapability")
-        self.assertEqual(["web_research"], [i.property("text") for i in line])
+        self.assertEqual(["Web research"], [i.property("text") for i in line])     # G6CAPWORD A-8: its word, not "web_research"
         panel = self.item(root, "workPanel")                                # the last line fits inside the panel
         self.assertLessEqual(line[0].mapToItem(panel, QPointF(0, line[0].height())).y(), panel.height())
 

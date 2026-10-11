@@ -94,7 +94,10 @@ Rectangle {
                 objectName: "workPanelCapabilities"
                 visible: panel.capabilities.length > 0
                 icon: "plug"; title: qsTr("Used in this chat")
-                Repeater { model: panel.capabilities; Line { objectName: "workPanelCapability"; text: modelData } }
+                // K3 (G6CAPWORD): the capability's word, never its raw id ("Other capability" when unknown);
+                // read again on a live language switch (i18n.language).
+                Repeater { model: panel.capabilities
+                           Line { objectName: "workPanelCapability"; text: { i18n.language; return i18n.word("capability", modelData) } } }
             }
             Text {
                 objectName: "workPanelNothing"

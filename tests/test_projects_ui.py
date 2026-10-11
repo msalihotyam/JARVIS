@@ -213,8 +213,8 @@ class BadgeTests(ProjectsUiCase):
         chip = lambda: self.item(root, "chatHeaderScope").isVisible()  # noqa: E731
         # Sidebar v2 T1/T4: the open conversation is marked on its tree row; a project row is never "current".
         selected = lambda: [i.property("itemId") for i in self.all_items(root, "sidebarProjectConversation") if i.property("current")]  # noqa: E731
-        self.assertEqual("Global", owner())
-        self.assertFalse(chip())                                                        # V7: no scope line for a no-project chat
+        self.assertEqual("", owner())                                                   # G6CAPWORD (V1/V7): was "Global"
+        self.assertFalse(chip())                                                      # V7: no scope line for a no-project chat
         # V1: no "Genel" row; the open no-project conversation is marked in the fixed plain list.
         self.assertEqual([], self.all_items(root, "sidebarGlobal"))
         self.assertEqual([bridge.conversationId], [i.property("itemId") for i in self.all_items(root, "sidebarConversation")
@@ -230,7 +230,7 @@ class BadgeTests(ProjectsUiCase):
         self.assertEqual("home", bridge.page)
         bridge.newConversation()
         pump(300)
-        self.assertEqual("Global", owner())
+        self.assertEqual("", owner())                                                   # G6CAPWORD (V1/V7): was "Global"
         self.assertFalse(chip())
         self.assertEqual([], selected())
 

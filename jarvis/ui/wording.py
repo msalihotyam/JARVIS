@@ -7,7 +7,8 @@ changes; QML reads both through ``i18n`` (``i18n.when``, ``i18n.word``).
   year. ``now`` is passed in, so a fixed clock decides midnight; the moment is
   read in ``now``'s timezone. Unreadable: "" (the caller decides what shows).
 * ``code_word`` - a Core code as a word. A code with no word yet never shows
-  bare and never as a guess: "Unrecognized (<code>)" keeps it exact.
+  bare and never as a guess: "Unrecognized (<code>)" keeps it exact; an
+  unknown capability reads "Other capability" (no raw id in the work panel).
 """
 
 from __future__ import annotations
@@ -85,10 +86,54 @@ CODE_WORDS = {
         "inferred": QT_TRANSLATE_NOOP("Wording", "Inferred"),
         "imported": QT_TRANSLATE_NOOP("Wording", "Imported"),
     },
+    # G6CAPWORD (Gate 6G A-8): the work panel's "Used in this chat" - every capability a connector
+    # declares (intent.NL_CAPABILITIES, the connectors' manifests, web_research, intent_understanding).
+    "capability": {
+        "code_analysis": QT_TRANSLATE_NOOP("Wording", "Code analysis"),
+        "code_planning": QT_TRANSLATE_NOOP("Wording", "Code planning"),
+        "file_read": QT_TRANSLATE_NOOP("Wording", "File reading"),
+        "file_write": QT_TRANSLATE_NOOP("Wording", "File writing"),
+        "web_research": QT_TRANSLATE_NOOP("Wording", "Web research"),
+        "intent_understanding": QT_TRANSLATE_NOOP("Wording", "Understanding the request"),
+        "project_folder_create": QT_TRANSLATE_NOOP("Wording", "Project folder setup"),
+        "gmail_thread_list": QT_TRANSLATE_NOOP("Wording", "Mail list"),
+        "gmail_search": QT_TRANSLATE_NOOP("Wording", "Mail search"),
+        "gmail_message_read": QT_TRANSLATE_NOOP("Wording", "Mail reading"),
+        "gmail_thread_read": QT_TRANSLATE_NOOP("Wording", "Mail thread reading"),
+        "gmail_draft_create": QT_TRANSLATE_NOOP("Wording", "Mail draft"),
+        "gmail_send": QT_TRANSLATE_NOOP("Wording", "Mail sending"),
+        "github_repository_read": QT_TRANSLATE_NOOP("Wording", "GitHub repository reading"),
+        "github_file_read": QT_TRANSLATE_NOOP("Wording", "GitHub file reading"),
+        "github_issue_list": QT_TRANSLATE_NOOP("Wording", "GitHub issue list"),
+        "github_issue_read": QT_TRANSLATE_NOOP("Wording", "GitHub issue reading"),
+        "github_pull_request_list": QT_TRANSLATE_NOOP("Wording", "GitHub pull request list"),
+        "github_pull_request_read": QT_TRANSLATE_NOOP("Wording", "GitHub pull request reading"),
+        "github_pull_request_files": QT_TRANSLATE_NOOP("Wording", "GitHub pull request files"),
+        "github_commit_list": QT_TRANSLATE_NOOP("Wording", "GitHub commit list"),
+        "github_commit_read": QT_TRANSLATE_NOOP("Wording", "GitHub commit reading"),
+        "browser_navigate": QT_TRANSLATE_NOOP("Wording", "Browser navigation"),
+        "browser_page_read": QT_TRANSLATE_NOOP("Wording", "Browser page reading"),
+        "browser_wait": QT_TRANSLATE_NOOP("Wording", "Browser wait"),
+        "browser_click": QT_TRANSLATE_NOOP("Wording", "Browser click"),
+        "browser_type": QT_TRANSLATE_NOOP("Wording", "Browser typing"),
+        "browser_tab_list": QT_TRANSLATE_NOOP("Wording", "Browser tab list"),
+        "browser_tab_open": QT_TRANSLATE_NOOP("Wording", "Browser tab opening"),
+        "browser_tab_switch": QT_TRANSLATE_NOOP("Wording", "Browser tab switch"),
+        "browser_tab_close": QT_TRANSLATE_NOOP("Wording", "Browser tab closing"),
+        "desktop_app_launch": QT_TRANSLATE_NOOP("Wording", "App launch"),
+        "desktop_window_list": QT_TRANSLATE_NOOP("Wording", "Window list"),
+        "desktop_window_inspect": QT_TRANSLATE_NOOP("Wording", "Window inspection"),
+        "desktop_window_focus": QT_TRANSLATE_NOOP("Wording", "Window focus"),
+        "desktop_click": QT_TRANSLATE_NOOP("Wording", "Desktop click"),
+        "desktop_type": QT_TRANSLATE_NOOP("Wording", "Desktop typing"),
+    },
 }
 
 
 UNRECOGNIZED = QT_TRANSLATE_NOOP("Wording", "Unrecognized (%1)")
+
+#: A vocabulary whose unknown code reads as one plain word, never the raw id.
+FALLBACK_WORDS = {"capability": QT_TRANSLATE_NOOP("Wording", "Other capability")}
 
 
 def code_word(kind: str, code: str) -> str:
@@ -96,7 +141,7 @@ def code_word(kind: str, code: str) -> str:
     code = str(code or "")
     if not code:
         return ""
-    word = CODE_WORDS.get(kind, {}).get(code)
+    word = CODE_WORDS.get(kind, {}).get(code) or FALLBACK_WORDS.get(kind)
     return tx("Wording", word) if word else tx("Wording", UNRECOGNIZED, code)
 
 

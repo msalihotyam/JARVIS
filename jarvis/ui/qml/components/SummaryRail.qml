@@ -119,10 +119,11 @@ Item {
     readonly property bool global: !!rail.scope.global || !rail.scope.id
     readonly property var scopeRecord: rail.global ? null : bridge.projectRecords.filter(function(p) { return p.id === rail.scope.id })[0] || null
     readonly property var focusTile: {
-        var tile = { id: "focus", key: "Focus", title: qsTr("Focus"), icon: "focus", tone: Theme.warning, word: true, value: rail.scope.name || "" }
+        // G6CAPWORD (V1/V7): a plain chat has no scope word - the tile says only "no project context".
+        var tile = { id: "focus", key: "Focus", title: qsTr("Focus"), icon: "focus", tone: Theme.warning, word: true,
+                     value: rail.global ? "" : rail.scope.name || "" }
         if (rail.global)
-            return Object.assign(tile, { lines: [qsTr("no project context"), qsTr("no context")],
-                                         tip: (rail.scope.name || "") + " · " + qsTr("no project context") })
+            return Object.assign(tile, { lines: [qsTr("no project context"), qsTr("no context")], tip: qsTr("no project context") })
         var files = rail.scope.file_count || 0, talks = rail.scopeRecord ? rail.scopeRecord.conversation_count : 0
         var a = rail.scope.instruction ? qsTr("instruction ✓") : qsTr("no instruction")
         var b = files === 1 ? qsTr("1 file") : qsTr("%1 files").arg(files)

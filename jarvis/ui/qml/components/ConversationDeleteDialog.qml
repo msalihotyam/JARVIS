@@ -39,11 +39,12 @@ JarvisDialog {
         width: parent ? parent.width : 0; height: identity.height + 20; radius: Theme.radiusSmall
         color: Theme.glassNested; border.width: 1; border.color: Theme.alpha(Theme.text, 0.10)
         Line { id: identity; objectName: "deleteIdentity"; x: 12; y: 10; width: parent.width - 24; font: Theme.pageRowStrong
-               text: qsTr("«%1» · %2 · created %3 · last changed %4 · %5")
+               // G6CAPWORD (V1/V7): the project's name ends the line; a no-project chat adds no scope word.
+               text: qsTr("«%1» · %2 · created %3 · last changed %4")
                      .arg(dialog.preview.title || qsTr("New Chat"))
                      .arg(dialog.preview.turns === 1 ? qsTr("1 message") : qsTr("%1 messages").arg(dialog.preview.turns || 0))
                      .arg(dialog.when(dialog.preview.created_at)).arg(dialog.when(dialog.preview.updated_at))
-                     .arg(dialog.preview.owner ? dialog.preview.owner.name : qsTr("Global")) }
+                     + (dialog.preview.owner ? " · " + dialog.preview.owner.name : "") }
     }
     Line { objectName: "deleteNotice"; visible: text !== ""; text: bridge.conversationNotice; color: Theme.warning }
     Line { objectName: "deleteBlocked"; visible: dialog.shown && !!dialog.preview.blocked; color: Theme.warning

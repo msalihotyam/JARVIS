@@ -102,7 +102,7 @@ ContextPanel {
                      action: { label: qsTr("Open Tasks"), note: qsTr("Go to the full tasks page"), page: "tasks" } }
         }
         case "Focus":
-            return { title: qsTr("Focus"), subtitle: r.scope.name || "", icon: "focus", tone: "#b7801e",
+            return { title: qsTr("Focus"), subtitle: r.global ? "" : r.scope.name || "", icon: "focus", tone: "#b7801e",
                      metrics: [{ value: bridge.projects.length, label: qsTr("Active projects"), tone: "#37c4f0" },
                                { value: peek.focusScope ? peek.focusItems.length : "—",
                                  label: r.global ? qsTr("Memory items") : qsTr("Items in %1").arg(r.scope.name), tone: Theme.textLabel }],

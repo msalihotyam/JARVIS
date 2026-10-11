@@ -1036,8 +1036,8 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>PROJELER</translation>
     </message>
     <message>
-        <source>Global</source>
-        <translation>Genel</translation>
+        <source>No project</source>
+        <translation>Proje yok</translation>
     </message>
     <message>
         <source>All projects</source>
@@ -1480,10 +1480,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bu sohbet kalıcı olarak silinsin mi?</translation>
     </message>
     <message>
-        <source>«%1» · %2 · created %3 · last changed %4 · %5</source>
-        <translation>«%1» · %2 · oluşturma %3 · son değişiklik %4 · %5</translation>
-    </message>
-    <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
     </message>
@@ -1496,8 +1492,8 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>%1 mesaj</translation>
     </message>
     <message>
-        <source>Global</source>
-        <translation>Genel</translation>
+        <source>«%1» · %2 · created %3 · last changed %4</source>
+        <translation>«%1» · %2 · oluşturma %3 · son değişiklik %4</translation>
     </message>
     <message>
         <source>Cannot be deleted: %1</source>
@@ -5228,8 +5224,161 @@ DOĞRULANMADI</translation>
         <translation>İçe aktarıldı</translation>
     </message>
     <message>
+        <source>Code analysis</source>
+        <translation>Kod inceleme</translation>
+    </message>
+    <message>
+        <source>Code planning</source>
+        <translation>Kod planlama</translation>
+    </message>
+    <message>
+        <source>File reading</source>
+        <translation>Dosya okuma</translation>
+    </message>
+    <message>
+        <source>File writing</source>
+        <translation>Dosya yazma</translation>
+    </message>
+    <message>
+        <source>Web research</source>
+        <translation>Web araştırması</translation>
+    </message>
+    <message>
+        <source>Understanding the request</source>
+        <translation>İsteği anlama</translation>
+    </message>
+    <message>
+        <source>Project folder setup</source>
+        <translation>Proje klasörü kurulumu</translation>
+    </message>
+    <message>
+        <source>Mail list</source>
+        <translation>E-posta listesi</translation>
+    </message>
+    <message>
+        <source>Mail search</source>
+        <translation>E-posta arama</translation>
+    </message>
+    <message>
+        <source>Mail reading</source>
+        <translation>E-posta okuma</translation>
+    </message>
+    <message>
+        <source>Mail thread reading</source>
+        <translation>E-posta dizisi okuma</translation>
+    </message>
+    <message>
+        <source>Mail draft</source>
+        <translation>E-posta taslağı</translation>
+    </message>
+    <message>
+        <source>Mail sending</source>
+        <translation>E-posta gönderme</translation>
+    </message>
+    <message>
+        <source>GitHub repository reading</source>
+        <translation>GitHub deposu okuma</translation>
+    </message>
+    <message>
+        <source>GitHub file reading</source>
+        <translation>GitHub dosyası okuma</translation>
+    </message>
+    <message>
+        <source>GitHub issue reading</source>
+        <translation>GitHub issue okuma</translation>
+    </message>
+    <message>
+        <source>GitHub pull request reading</source>
+        <translation>GitHub pull request okuma</translation>
+    </message>
+    <message>
+        <source>GitHub commit reading</source>
+        <translation>GitHub commit okuma</translation>
+    </message>
+    <message>
+        <source>GitHub issue list</source>
+        <translation>GitHub issue listesi</translation>
+    </message>
+    <message>
+        <source>GitHub pull request list</source>
+        <translation>GitHub pull request listesi</translation>
+    </message>
+    <message>
+        <source>GitHub pull request files</source>
+        <translation>GitHub pull request dosyaları</translation>
+    </message>
+    <message>
+        <source>GitHub commit list</source>
+        <translation>GitHub commit listesi</translation>
+    </message>
+    <message>
+        <source>Browser navigation</source>
+        <translation>Tarayıcıda gezinme</translation>
+    </message>
+    <message>
+        <source>Browser page reading</source>
+        <translation>Tarayıcı sayfası okuma</translation>
+    </message>
+    <message>
+        <source>Browser wait</source>
+        <translation>Tarayıcıda bekleme</translation>
+    </message>
+    <message>
+        <source>Browser click</source>
+        <translation>Tarayıcıda tıklama</translation>
+    </message>
+    <message>
+        <source>Browser typing</source>
+        <translation>Tarayıcıda yazma</translation>
+    </message>
+    <message>
+        <source>Browser tab list</source>
+        <translation>Tarayıcı sekme listesi</translation>
+    </message>
+    <message>
+        <source>Browser tab opening</source>
+        <translation>Tarayıcı sekmesi açma</translation>
+    </message>
+    <message>
+        <source>Browser tab switch</source>
+        <translation>Tarayıcı sekmesi değiştirme</translation>
+    </message>
+    <message>
+        <source>Browser tab closing</source>
+        <translation>Tarayıcı sekmesi kapatma</translation>
+    </message>
+    <message>
+        <source>App launch</source>
+        <translation>Uygulama başlatma</translation>
+    </message>
+    <message>
+        <source>Window list</source>
+        <translation>Pencere listesi</translation>
+    </message>
+    <message>
+        <source>Window inspection</source>
+        <translation>Pencere inceleme</translation>
+    </message>
+    <message>
+        <source>Window focus</source>
+        <translation>Pencereyi öne getirme</translation>
+    </message>
+    <message>
+        <source>Desktop click</source>
+        <translation>Masaüstünde tıklama</translation>
+    </message>
+    <message>
+        <source>Desktop typing</source>
+        <translation>Masaüstünde yazma</translation>
+    </message>
+    <message>
         <source>Unrecognized (%1)</source>
         <translation>Tanınmayan (%1)</translation>
+    </message>
+    <message>
+        <source>Other capability</source>
+        <extracomment>A vocabulary whose unknown code reads as one plain word, never the raw id.</extracomment>
+        <translation>Diğer yetkinlik</translation>
     </message>
 </context>
 <context>

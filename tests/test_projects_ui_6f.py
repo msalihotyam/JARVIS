@@ -612,7 +612,8 @@ class TileContentTests(TileContentCase):
         root = self.window(bridge)
         bridge.openConversation(global_one.id)
         pump(400)
-        self.assertEqual(("Global", "no project context"), self.tile(root, "Focus")[:2])
+        # G6CAPWORD (V1/V7): a plain chat's Focus tile has no scope word ("Global" was the value and the tip's lead).
+        self.assertEqual(("", "no project context", "no project context"), self.tile(root, "Focus"))
         bridge.openConversation(conversations[0].id)
         pump(400)
         facts = bridge.conversationProject
@@ -1646,9 +1647,10 @@ class ChatHeaderTests(SidebarNavCase):
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         for source, turkish in (("Open the project page", "Proje sayfasını aç"), ("Conversation actions", "Sohbet işlemleri"),
                                 ("New Chat", "Yeni Sohbet"), ("ARCHIVED", "ARŞİV"), ("archived", "arşivlendi"),
-                                ("PROJECTS", "PROJELER"), ("Global", "Genel"), ("All projects", "Tüm projeler"),
-                                ("CONVERSATIONS", "SOHBETLER")):
+                                ("PROJECTS", "PROJELER"), ("No project", "Proje yok"), ("All projects", "Tüm projeler"),
+                                ("CONVERSATIONS", "SOHBETLER")):                 # G6CAPWORD: "Global"/"Genel" -> "No project"
             self.assertEqual(turkish, tx("ChatHeader", source))
+        self.assertEqual("Global", tx("ChatHeader", "Global"))           # gone from the header and its catalog (V1)
         # Gate 6G F9 H1: "Projeye bağla…" moved from the header to the conversation menu.
         self.assertEqual("Projeye bağla…", tx("ConversationMenu", "Attach to a project…"))
 

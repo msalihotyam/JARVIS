@@ -14,7 +14,7 @@ import "../theme"
 // window's attach dialog to that menu. H2 the project's name is a faint line
 // ABOVE the title and a link to that project's page (bridge.showProject).
 // In the Command preset (Q2) the chip is a button: it opens the scope menu
-// (projects, Genel, the two actions, then the scope's conversations) - the
+// (projects, "No project", the two actions, then the scope's conversations) - the
 // TopBar's former selector and switcher menus, moved.
 // Gate 6G Sidebar v2 V7: a no-project conversation has no scope line - the
 // title stands alone (in the Command preset the chip stays: it is the menu).
@@ -29,6 +29,8 @@ Item {
     readonly property bool archived: !!owner.archived
     readonly property color tint: archived ? Theme.warning : owner.global ? Theme.textLabel : Theme.accent
     readonly property bool scoped: !owner.global || scopeMenu
+    // G6CAPWORD (V1/V7): a no-project chat has no scope word (the Command preset's chip shows its icon only).
+    readonly property string scopeWord: owner.global ? "" : owner.name || ""
     // F9 H2: outside the Command preset the scope is a faint link line above the title.
     readonly property bool link: !scopeMenu
     height: big ? 52 : 44
@@ -44,7 +46,7 @@ Item {
     // keeps one character fewer). The chip's 32 % gives way to its floor first (the title has
     // the room); only if the title would then go under its own floor does the
     // ARCHIVED pill step down to a warning dot.
-    Text { id: nameSeven; visible: false; font: scopeName.font; textFormat: Text.PlainText; text: (header.owner.name || "").slice(0, 7) + "…" }
+    Text { id: nameSeven; visible: false; font: scopeName.font; textFormat: Text.PlainText; text: header.scopeWord.slice(0, 7) + "…" }
     Text { id: titleSeven; visible: false; font: title.font; textFormat: Text.PlainText; text: title.text.slice(0, 7) + "…" }
     readonly property real nameFloor: Math.min(scopeName.implicitWidth, Math.ceil(nameSeven.implicitWidth) + 1)
     readonly property real titleFloor: Math.min(title.implicitWidth, Math.ceil(titleSeven.implicitWidth) + 1)
@@ -58,7 +60,7 @@ Item {
         id: chip
         objectName: "chatHeaderScope"
         visible: header.scoped
-        readonly property string fullName: (header.owner.name || "") + (header.archived ? " · " + qsTr("archived") : "")
+        readonly property string fullName: header.scopeWord + (header.archived ? " · " + qsTr("archived") : "")
         readonly property real pad: header.link ? 0 : 10
         readonly property real iconSize: header.link ? 14 : 18
         readonly property real iconEnd: pad + iconSize + 6
@@ -96,7 +98,7 @@ Item {
             objectName: "chatHeaderScopeName"
             x: chip.lead; anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, chip.width - x - chip.pad))
-            text: header.owner.name || ""; textFormat: Text.PlainText; elide: Text.ElideRight
+            text: header.scopeWord; textFormat: Text.PlainText; elide: Text.ElideRight
             // H2: the link reads secondary (faint) and lights on hover; the preset's chip as before.
             color: header.link ? (chipArea.containsMouse ? Theme.accent : Theme.textMuted)
                                : header.archived ? Theme.textLabel : Theme.text
@@ -207,7 +209,7 @@ Item {
             }
             ConversationMenu.Divider { width: scopeList.availableWidth }
             ConversationMenu.ScopeChoice { objectName: "scopeMenuGlobal"; width: scopeList.availableWidth
-                                           label: qsTr("Global"); current: !!header.owner.global
+                                           label: qsTr("No project"); current: !!header.owner.global
                                            onTriggered: { scopeList.close(); bridge.openProjectScope("") } }
             ConversationMenu.Divider { width: scopeList.availableWidth }
             ConversationMenu.ScopeChoice { objectName: "scopeMenuAll"; width: scopeList.availableWidth; action: true

@@ -297,7 +297,7 @@ class SelectorTests(ProjectsUiCase):
         owned = store.create_conversation(home.id)
         bridge = self.bridge()
         root = self.window(bridge)
-        self.assertEqual("Global", self.owner(root))
+        self.assertEqual("", self.owner(root))                                  # G6CAPWORD (V1/V7): was "Global"
         self.assertFalse(self.item(root, "chatHeaderScope").isVisible())        # Sidebar v2 V7: no scope line here
         bridge.openConversation(owned.id)
         pump(300)
