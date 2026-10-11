@@ -30,7 +30,8 @@ The serial run stays the reference when a result is disputed.
   writes what it dispatched and ran (with every test's seconds);
   ``--aggregate DIR --shards N`` checks all the shard reports against a fresh
   discovery and the same plan and prints one combined summary, and with
-  ``--write-durations`` records CI's own seconds for the next plan.
+  ``--write-durations`` records CI's own seconds for the next plan. It prints
+  every skip with its reason and fails on any skip not on ``ALLOWED_SKIPS``.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH]
@@ -41,6 +42,7 @@ The serial run stays the reference when a result is disputed.
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import concurrent.futures as futures
 import json
@@ -71,6 +73,16 @@ _COUNTS = re.compile(r"^(?:OK|FAILED)(?: \(([^)]*)\))?\s*$", re.MULTILINE)
 _FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)", re.MULTILINE)
 _DURATION = re.compile(r"^\s*(\d+\.\d+)s\s+(\S.*)$", re.MULTILINE)
 _SEEN = re.compile(r"\b(\w+) \((tests\.[\w.]+)\)")
+_SKIPPED = re.compile(r" \.\.\. skipped (.*)$", re.MULTILINE)
+
+#: V2.1 C-5: the only skips CI's aggregate accepts, test id -> the reason it must skip with
+#: (a skipped schema-10 rollback proof must never pass as green). Any other skip fails it.
+ALLOWED_SKIPS = {
+    "tests.test_local_file_write.ContainmentTests.test_the_posix_parent_walk_is_no_follow_at_every_step":
+        "no directory-handle traversal",
+    "tests.test_ui.LocalizationTests.test_turkish_catalog_covers_every_marked_string":
+        "the PySide6 Linguist tools are not installed",
+}
 
 
 def discover(selected: list[str]) -> list[str]:
@@ -275,6 +287,7 @@ class Result:
                 counts[key] = int(value)
         self.failures, self.errors, self.skipped = (counts.get(k, 0) for k in ("failures", "errors", "skipped"))
         self.parsed = bool(ran) and bool(tail)
+        self.skips = _skips(output)
         # ("Class.test_name", "module") for every FAIL / ERROR line.
         self.failed = [(".".join(path.split(".")[-2:]), path.split(".")[-3] if path.count(".") >= 2 else "")
                        for path in (m.group(2) for m in _FAILED_TEST.finditer(output))]
@@ -286,6 +299,21 @@ class Result:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and self.parsed and not self.failures and not self.errors and self.accounted
+
+
+def _skips(output: str) -> list[list[str]]:
+    """[test id, reason] for every ``... skipped 'reason'`` line of a -v run; the id is the last
+    one named before it (a test with a docstring prints it on the line before)."""
+    seen = [(m.start(), m.group(2)) for m in _SEEN.finditer(output) if m.group(2).endswith("." + m.group(1))]
+    skips = []
+    for match in _SKIPPED.finditer(output):
+        named = [test for at, test in seen if at < match.start()]
+        try:
+            reason = ast.literal_eval(match.group(1).strip())
+        except Exception:  # noqa: BLE001 - any odd text is kept as it is, never ends the run
+            reason = match.group(1).strip()
+        skips.append([named[-1] if named else "?", str(reason)])
+    return skips
 
 
 def worker_env(index: int, bases: list[Path]) -> dict[str, str]:
@@ -533,6 +561,7 @@ def _write_report(path: Path, shard, units, results, wall, green, rule_d, discov
         "dispatched": [t for u in units for t in u.ids],
         "ran": sum(r.ran for r in results),
         "skipped": sum(r.skipped for r in results),
+        "skips": [skip for r in results for skip in r.skips],  # [id, reason] each; the aggregate gates them
         "failures": sum(r.failures for r in results),
         "errors": sum(r.errors for r in results),
         "accounted": all(r.accounted for r in results) and len(results) == len(units),
@@ -540,6 +569,21 @@ def _write_report(path: Path, shard, units, results, wall, green, rule_d, discov
         "durations": _durations_of(results),                 # every test: the aggregate writes CI's durations from them
         "discovered": sum(discovered_ids(discovery).values()),
     }, ensure_ascii=False), encoding="utf-8")
+
+
+def _gate_skips(shard: str, report: dict) -> list[str]:
+    """V2.1 C-5: print every skip with its reason; a problem for each one not on ALLOWED_SKIPS
+    (same id and reason), and when the skips cannot all be named."""
+    skips = report.get("skips")
+    problems = []
+    if not isinstance(skips, list) or len(skips) != report["skipped"]:
+        problems.append(f"{shard}: {report['skipped']} skipped, but {len(skips) if isinstance(skips, list) else 'none'} named")
+    for test, reason in skips if isinstance(skips, list) else []:
+        allowed = ALLOWED_SKIPS.get(test) == reason
+        print(f"  skipped{'' if allowed else ' (NOT ALLOWED)'}: {test}: {reason}")
+        if not allowed:
+            problems.append(f"{shard}: {test} skipped ({reason}) and is not on the allowed-skip list")
+    return problems
 
 
 def aggregate(args) -> int:
@@ -588,6 +632,7 @@ def aggregate(args) -> int:
               f" (planned UI {planned_ui:.0f}s / other {planned_other:.0f}s;"
               f" skipped={report['skipped']}, failures={report['failures']}, errors={report['errors']})"
               + (f", rule D: {report['rule_d']}" if report["rule_d"] else ""))
+        problems += _gate_skips(f"shard {index}/{shards}", report)
     if dispatched != expected:
         _print_set_difference("the shards' dispatched ids", dispatched, expected)
         problems.append("the union of dispatched ids is not the discovered set")

@@ -34,12 +34,12 @@ class CliK3Tests(K3Case):
         self.session_id, self.task_id, self.request_id, self.fingerprint = ids(self.payload)
         self.assertEqual("awaiting_approval", self.payload["run"]["run_status"])
 
-    def cli(self, verb: str, *extra: str) -> tuple[int, dict]:
+    def cli(self, verb: str, *extra: str, app_factory=None) -> tuple[int, dict]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = cli.main([verb, "--session-id", self.session_id, "--task-id", self.task_id,
                              "--request-id", self.request_id, "--fingerprint", self.fingerprint, *extra],
-                            settings=self.settings, app_factory=lambda settings: self.k3)
+                            settings=self.settings, app_factory=app_factory or (lambda settings: self.k3))
         return code, json.loads(out.getvalue())
 
     def state(self):
@@ -59,6 +59,24 @@ class CliK3Tests(K3Case):
                 self.assertIsNotNone(self.memory.load_pending_approval(self.task_id, self.session_id))
                 self.assertEqual(0, self.count("permission_grants"))
                 self.assertIsNone(self.memory.load_project_folder(self.p.id))
+
+    def test_the_refusal_comes_before_any_app_is_built(self) -> None:
+        """V2.1 C-9: the builder records and raises if called (main() would swallow a raise
+        into an internal error), so the refusal must come from before app_factory."""
+        built = []
+
+        def no_app(settings):
+            built.append(settings)
+            raise AssertionError("the CLI built the app before refusing the K3 approval")
+
+        for extra in ((), ("--remember-for-session",)):
+            with self.subTest(extra=extra):
+                before = self.state()
+                code, payload = self.cli("approve", *extra, app_factory=no_app)
+                self.assertEqual([], built)
+                self.assertNotEqual(0, code)
+                self.assertEqual(REFUSAL, payload["error"]["message"])
+                self.assertEqual(before, self.state())
 
     def test_reject_of_a_k3_request_still_rejects(self) -> None:
         folders = h6.dirs(self.folders)
