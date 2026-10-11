@@ -27,19 +27,22 @@ OUT = Path(__file__).resolve().parents[2] / "jarvis" / "ui" / "qml" / "assets"
 # Source pixels. crop = (x0, y0, x1, y1) of the running half; shift = where the
 # frozen half sits relative to it; up / down = lever shapes (("rect"|"ellipse"|"diff",
 # box), ...) in the running / frozen half; pivot = the hinge line (source y).
+# Each crop leaves >= 10 px of backdrop around the art (DFSWITCH: the toggle's
+# top and the knife handle's rim were cut flush by the old crops).
 SKINS = {
     "toggle": {
-        "source": "toggle_v1.png", "shift": 613, "crop": (262, 140, 692, 860), "pivot": 470,
+        "source": "toggle_v1.png", "shift": 613, "crop": (250, 104, 690, 860), "pivot": 470,
         "up": (("ellipse", (380, 296, 546, 440)), ("rect", (405, 360, 520, 505))),
         "down": (("ellipse", (380, 515, 552, 680)), ("rect", (408, 420, 522, 600))),
     },
     "knife": {
-        "source": "knife_torn_v1.png", "shift": 674, "crop": (90, 25, 780, 910), "pivot": 505,
-        "up": (("rect", (400, 25, 500, 225)), ("diff", (275, 210, 625, 470))),
-        "down": (("diff", (275, 535, 625, 705)), ("rect", (395, 685, 505, 905))),
+        "source": "knife_torn_v1.png", "shift": 674, "crop": (90, 12, 780, 922), "pivot": 505,
+        "up": (("rect", (400, 12, 500, 225)), ("diff", (275, 210, 625, 470))),
+        "down": (("diff", (275, 535, 625, 705)), ("rect", (395, 685, 505, 918))),
     },
 }
 FEATHER = 3         # px of soft mask edge, in source pixels
+EDGE = 8            # source px: clear for EDGE, then a fade over EDGE more, at each crop side
 SCALE = 0.5         # layers are stored at half the source size: still >2x the largest on-screen size
 
 
@@ -69,10 +72,19 @@ def matte(picture: Image.Image) -> Image.Image:
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     blue = np.clip((b - r - 8) / 14, 0, 1)
     dark = np.clip((95 - (r + g + b) / 3) / 40, 0, 1)
-    solid = Image.fromarray(np.where(blue * dark < 0.5, 255, 0).astype(np.uint8)).copy()  # writable
+    # A 1 px backdrop frame lets the fill reach every backdrop pocket that
+    # touches the crop edge, not only the one at its corner (DFSWITCH).
+    solid = Image.fromarray(np.pad(np.where(blue * dark < 0.5, 255, 0).astype(np.uint8), 1)).copy()  # writable
     ImageDraw.floodfill(solid, (0, 0), 128)
-    inside = Image.fromarray(np.where(np.asarray(solid) == 128, 0, 255).astype(np.uint8))
-    return inside.filter(ImageFilter.GaussianBlur(1))
+    inside = Image.fromarray(np.where(np.asarray(solid)[1:-1, 1:-1] == 128, 0, 255).astype(np.uint8))
+    # The torn knife surface's near-black shadow is not blue enough for the
+    # backdrop test: every layer fades out over its outer EDGE px, so nothing
+    # ends in a hard line at its box.
+    h, w = inside.height, inside.width
+    ramp = lambda n: np.clip((np.minimum(np.arange(n), np.arange(n)[::-1]) - EDGE) / EDGE, 0, 1)  # noqa: E731
+    fade = np.outer(ramp(h), ramp(w))
+    blurred = np.asarray(inside.filter(ImageFilter.GaussianBlur(1)), np.float32)
+    return Image.fromarray((blurred * fade).astype(np.uint8))
 
 
 def cut(source_dir: Path, name: str, spec: dict) -> None:
