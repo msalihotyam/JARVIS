@@ -32,6 +32,21 @@ rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
 
 ## Open blockers
 
+**V21K3 (V2.1 cleanup, T2) BLOCKED, 2026-10-11:** lane branch `v21k3`
+(base ca3ffb5, after INT34). The one required full suite was stopped by the
+host for low memory (5441 tests dispatched, no result); per the host notice it
+was not restarted. Work is UNCOMMITTED in the worktree
+(`.claude/worktrees/v21k3`; patch copy `build/reports/V21K3.patch`):
+ARCHITECTURE.md, jarvis/app.py, jarvis/core.py, jarvis/memory.py,
+jarvis/ui/bridge.py, jarvis/ui/i18n/jarvis_tr-TR.ts + .qm,
+tests/test_project_folders_6h.py, tests/test_v21k3.py (new, intent-to-add).
+(a) a K3 reject after a changed proposal ends REJECTED (Core falls back to
+the stored request, every identity/fingerprint check kept); (b) a malformed
+folder link row reads "unreadable", never folderless. Targeted 119 OK, one
+independent review (no BLOCKER/MAJOR; NITs fixed), ruff/bandit clean. Next:
+full suite once on a machine with free memory, then the planned commit.
+Report: `build/reports/V21K3.md`.
+
 **G6H3POL (6H follow-up D-6/F-2/B-1, T2) green, 2026-10-11 (G6H3POLB):**
 committed on lane branch `g6h3pol` (base 8ebe7e3; pick 81bccb8, then the
 fix commit); not integrated, not pushed. Targeted 135 OK (skipped=1); full
