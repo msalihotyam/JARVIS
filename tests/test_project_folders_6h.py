@@ -17,6 +17,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -45,7 +46,7 @@ from jarvis.contracts import (
     SessionState,
     Task,
 )
-from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, PROJECT_FOLDER_LINK_UNREADABLE, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import installed_cli, open_core, safe_cleanup
@@ -253,7 +254,7 @@ class StoreTests(FolderCase):
         # A prefix that is not a parent is no overlap.
         self.memory.link_explicit_user_project_folder(self.p.id, a + "b", "picked")
 
-    def test_s2_a_malformed_row_is_none(self) -> None:
+    def test_s2_a_malformed_row_reads_unreadable(self) -> None:
         good = ("pfl-" + uuid4().hex, "D:\\work\\x", "picked", "2026-10-10T00:00:00Z")
         for name, (link_id, path, origin, linked_at) in {
             "bad id": ("pf-1", *good[1:]),
@@ -270,8 +271,12 @@ class StoreTests(FolderCase):
                     connection.execute("INSERT INTO project_folder_links VALUES (?, ?, ?, ?, ?, NULL)",
                                        (link_id, project.id, path, origin, linked_at))
                     connection.commit()
-                self.assertIsNone(self.memory.load_project_folder(project.id))
-                self.assertIsNone(self.app("show", project.id).payload["folder"])
+                # V21K3 (B-4): unreadable, never "no folder" (so never folderless).
+                with self.assertRaisesRegex(ValueError, f"^{re.escape(PROJECT_FOLDER_LINK_UNREADABLE)}$"):
+                    self.memory.load_project_folder(project.id)
+                shown = self.app("show", project.id).payload
+                self.assertIsNone(shown.get("folder"))
+                self.assertEqual(PROJECT_FOLDER_LINK_UNREADABLE, shown["error"]["message"])
         # H1b: "created" is a stored origin now and loads like "picked".
         project = self.memory.create_project("Created origin")
         with contextlib.closing(sqlite3.connect(self.database)) as connection:

@@ -3657,7 +3657,7 @@ kullanıcıya gösterilir.
   hibe satırı `anthropic/claude-code` (katalog için); kart, etkinlik notu,
   karar makbuzu, görev paneli ve akış satırı hedefi "Bu bilgisayar"
   gösterir (yalnız görüntü; sonuç kartı bir hedef bildirirse o da). E5:
-  değişen öneri görevi FAILED bitirir, kendiliğinden yeni kart yok. Arşiv
+  değişen öneri görevi FAILED bitirir (kişinin reddi hariç, bkz. V21K3), kendiliğinden yeni kart yok. Arşiv
   (Salih 2026-10-10 kabul, "6H3 A"; core.py değişmedi): kart ile onay
   arasında arşivlenen projenin görevi Core'un `_inactive_project_refusal`'ında
   BEKLER (FAILED değil); proje onay süresi içinde arşivden çıkarsa eski
@@ -3681,12 +3681,25 @@ kullanıcıya gösterilir.
   arşiv, mevcut bağlantı, yol kanıtı, başka projenin bağlantısıyla çakışma;
   reddedilen seçim hiçbir şeye karar vermez, kart kalır), sonra ekrandaki
   isteği proje henüz klasörsüzken Core'dan reddeder (görev REJECTED biter;
-  Core'un tasdiki atlanmaz) ve Core'un yanıtından hemen sonra, yanıt ne
+  Core'un tasdiki atlanmaz; öneri bu arada değiştiyse yalnız tazelik denetimi, bkz. V21K3) ve Core'un yanıtından hemen sonra, yanıt ne
   olursa olsun, klasörü bağlar. Bir işlem sürerken ekrandaki istek için
   seçim yapılmaz (hiçbir şey değişmez). Ekranda olmayan istek (başka sohbet)
   beklemede kalır ve klasör hemen bağlanır; bağlı projede K3 isteği asla
-  çalışmaz. Kalıntı:
-  Core reddetmeden önce öneri değişmişse (ör. kişi önerilen yolda klasörü
-  kendisi açtıysa) görev yine FAILED biter; hiçbir şey oluşturulmaz.
+  çalışmaz. V21K3 (Salih 2026-10-11): Core reddetmeden önce öneri değişmişse
+  (ör. kişi önerilen yolda klasörü kendisi açtıysa, proje yeniden
+  adlandırıldıysa veya bağlandıysa) kişinin REDDİ de REJECTED biter
+  (`AgentCore._stale_folder_rejection`): yalnız red hibesinde, yalnız K3
+  connector'ında ve yalnız connector'ın kendi tazelik denetimi reddettiğinde
+  karar kalıcı bekleyen istek üzerinden verilir; o istekte kayıt kimliği,
+  hedef politikası, görev/oturum bağı, kapsam, taban ve tasdik
+  (`_authoritative_request`) ile hibenin istek/görev/oturum/parmak izi
+  denetimi yine çalışır, atlanan tek şey oluşturma uygunluğunun yeniden
+  denetimidir. Hiçbir şey oluşturulmaz, sonrasında onay imkânsızdır; aynı
+  değişiklikten sonra ONAY yine FAILED biter. Bozuk bir güncel bağ satırı
+  (6G B-4) "klasörsüz" değil "bağ okunamadı" okunur ("check" başka bir projenin
+  bozuk satırında da kapalı kalır, aynı uyarıyla):
+  `load_project_folder` `PROJECT_FOLDER_LINK_UNREADABLE` ile `ValueError`
+  verir, böylece K3 sunulmaz/önerilmez, kart ve oluşturma yoktur, proje
+  sayfası arayüz dilinde bir uyarı gösterir; satır asla onarılmaz.
   İkisi de onaylamaz ve ikisi de hem ana onay kartında (`SafetyCards.qml`)
   hem Command kartında (`ApprovalCard.qml`) vardır.

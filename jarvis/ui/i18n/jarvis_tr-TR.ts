@@ -606,6 +606,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bu klasör ya da içindeki veya onu içeren bir klasör başka bir projeye bağlı.</translation>
     </message>
     <message>
+        <source>A project folder link could not be read, so no folder is shown or offered. Nothing was changed.</source>
+        <translation>Bir proje klasörü bağlantısı okunamadı; bu yüzden klasör gösterilmiyor ve önerilmiyor. Hiçbir şey değiştirilmedi.</translation>
+    </message>
+    <message>
         <source>The project needs a name.</source>
         <translation>Projenin bir adı olmalı.</translation>
     </message>

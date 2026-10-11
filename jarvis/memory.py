@@ -178,6 +178,10 @@ from jarvis import project_folders
 
 SCHEMA_VERSION = 10
 
+#: V21K3: a malformed current project folder link row (a stable code; the
+#: window says it in the interface language).
+PROJECT_FOLDER_LINK_UNREADABLE = "The project's folder link could not be read; nothing was changed."
+
 #: Persisted task statuses that forbid *starting* an execution: a cancellation
 #: intent or any terminal decision that won first is authoritative (H2-F).
 _EXECUTION_BLOCKING_STATUSES = frozenset(
@@ -5167,8 +5171,10 @@ class SQLiteMemoryStore:
                 raise ValueError(f"No folder is linked to this project: {project_id}")
 
     def load_project_folder(self, project_id: str) -> project_folders.ProjectFolderLink | None:
-        """The current link, or ``None``. A malformed row fails closed as
-        ``None`` and is never shown."""
+        """The current link, or ``None`` when there is no current row. A
+        malformed current row fails closed as
+        ``ValueError(PROJECT_FOLDER_LINK_UNREADABLE)``
+        (V21K3): never "folderless", never shown, never repaired here."""
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT id, project_id, path, origin, linked_at FROM project_folder_links "
@@ -5184,7 +5190,7 @@ class SQLiteMemoryStore:
                 or row["origin"] not in project_folders.LINK_ORIGINS
                 or type(row["linked_at"]) is not str
             ):
-                return None
+                raise ValueError
             return project_folders.ProjectFolderLink(
                 id=row["id"],
                 project_id=validate_project_id(row["project_id"]),
@@ -5193,7 +5199,7 @@ class SQLiteMemoryStore:
                 linked_at=row["linked_at"],
             )
         except (TypeError, ValueError):
-            return None
+            raise ValueError(PROJECT_FOLDER_LINK_UNREADABLE) from None
 
     # ------------------------------------------------------------------
     # Conversations (V2 Projects foundation; the additive compatibility layer)

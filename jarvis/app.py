@@ -3908,7 +3908,8 @@ class JarvisApp:
     # -- Gate 6H H3 (K3): the project folder from chat ------------------------
 
     def _folderless(self, project_id: str | None) -> bool:
-        """An active project with no current folder link (a failed read: no)."""
+        """An active project with no current folder link (a failed read: no;
+        an unreadable link row raises in the store, so it is never folderless)."""
         try:
             project = None if project_id is None else self.memory.load_project(project_id)
             return project is not None and project.active and self.memory.load_project_folder(project_id) is None

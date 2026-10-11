@@ -50,6 +50,7 @@ from jarvis import conversation_search, project_files
 from jarvis.app import project_folder_result
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR, UNVERIFIED_SUFFIX
 from jarvis.destinations import CLAUDE_CODE_DESTINATION
+from jarvis.memory import PROJECT_FOLDER_LINK_UNREADABLE
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
@@ -1205,7 +1206,11 @@ class Bridge(QObject):
             return
         store = self._conversation_db()
         try:
-            link = self._folder_result("show", self._open_project).get("folder")
+            shown = self._folder_result("show", self._open_project)
+            link = shown.get("folder")
+            if (not self._project_folder_notice                                # a fresher refusal stays
+                    and self._error_message(shown) == PROJECT_FOLDER_LINK_UNREADABLE):   # V21K3: said, never "no folder"
+                self._project_folder_notice = self._folder_reason(PROJECT_FOLDER_LINK_UNREADABLE)
         except Exception:  # noqa: BLE001 - a label only; an unreadable link is not shown
             link = None
         if link:
@@ -1486,6 +1491,9 @@ class Bridge(QObject):
             QT_TRANSLATE_NOOP("Bridge", "This project already has a linked folder. Unlink it first."),
         "That folder, or one inside or around it, is linked to another project.":
             QT_TRANSLATE_NOOP("Bridge", "That folder, or a folder inside or around it, is linked to another project."),
+        PROJECT_FOLDER_LINK_UNREADABLE:
+            QT_TRANSLATE_NOOP("Bridge", "A project folder link could not be read, so no folder is shown or offered. "
+                                        "Nothing was changed."),
         # 6H K1 / K3: proposing and creating a folder.
         "project name must be a non-blank string": QT_TRANSLATE_NOOP("Bridge", "The project needs a name."),
         "The Desktop or Documents folder could not be found.":

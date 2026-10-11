@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import AbstractSet, Any, Callable
 
 from jarvis.connectors.base import BaseConnector
+from jarvis.connectors.project_folder import PROJECT_FOLDER_CONNECTOR
 from jarvis.contracts import (
     project_instruction_delivery,
     PROJECT_FILE_NOTICE,
@@ -1276,8 +1277,13 @@ class AgentCore:
                     return billing_failure
                 # The request always describes the task as it is *now*; a
                 # persisted pending request is reused only when it attests
-                # exactly this state, otherwise it is superseded.
-                current = self._attested_request(session, task, connector)
+                # exactly this state, otherwise it is superseded. The one
+                # exception is the person's K3 REJECT of a stale proposal.
+                current = self._stale_folder_rejection(
+                    session, task, connector, active_grant
+                )
+                if current is None:
+                    current = self._attested_request(session, task, connector)
                 if isinstance(current, AgentRun):
                     return current
                 request = self._exact_pending_request(session, task, current)
@@ -2539,6 +2545,60 @@ class AgentCore:
                 LoopStage.RISK_PERMISSION,
                 ErrorCode.EGRESS_REFUSED,
                 exc,
+            )
+
+    def _stale_folder_rejection(
+        self,
+        session: SessionState,
+        task: Task,
+        connector: BaseConnector,
+        grant: PermissionGrant | None,
+    ) -> PermissionRequest | AgentRun | None:
+        """V21K3: the person's REJECT of a K3 card whose proposal changed
+        since the card (they made the folder themselves, renamed or linked the
+        project) ends REJECTED, not FAILED.
+
+        Only for a rejection grant, only for the K3 connector and only when
+        the connector's own freshness check is what refuses: then the request
+        the person decided on is the PERSISTED pending one. Every other check
+        still runs on it here (``_authoritative_request``: registry identity,
+        destination policy, task/session binding, scope, floor, attestation)
+        and in ``_handle_approval`` (the grant's request id, task, session and
+        fingerprint). Skipping the creation-eligibility check cannot create
+        anything: a rejection never executes. ``None`` means the ordinary path.
+        """
+        if (
+            grant is None
+            or grant.approved
+            or connector.manifest.name != PROJECT_FOLDER_CONNECTOR
+        ):
+            return None
+        try:
+            connector.canonical_outbound(task)
+        except AttestationError:
+            pass
+        except Exception:  # noqa: BLE001 - the ordinary path fails it closed
+            return None
+        else:
+            return None
+        pending = self.memory.load_pending_approval(task.id, session.id)
+        if pending is None or is_expired(pending.expires_at):
+            return None
+        try:
+            return self._authoritative_request(
+                task,
+                session,
+                connector,
+                self._validated_permission_request(pending),
+                None,
+            )
+        except AttestationError as exc:
+            return self._terminal_failure(
+                session, task, diagnostic_from_exception(exc.code, exc)
+            )
+        except Exception as exc:  # noqa: BLE001 - refused like _attested_request
+            return self._stage_failure(
+                session, task, LoopStage.RISK_PERMISSION, ErrorCode.EGRESS_REFUSED, exc
             )
 
     def _destination_policy_refusal(
