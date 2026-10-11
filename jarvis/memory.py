@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -782,6 +784,62 @@ ANY_OWNER = object()
 CONVERSATION_GLOBAL_MEMORY_TOGGLES = "conversation_global_memory_toggles"
 
 
+_log = logging.getLogger(__name__)
+
+#: SQLite's own wait for a lock, per statement (the connection busy handler).
+_BUSY_TIMEOUT_S = 5.0
+#: Write-transaction busy retry (V2.1 cleanup, V21BUSY). Every write
+#: transaction starts with ``BEGIN IMMEDIATE``; a lock held by another writer
+#: surfaces there, before the transaction has read or written anything, so
+#: retrying that BEGIN retries the WHOLE transaction. At most this many BEGIN
+#: attempts, these pauses between them, and never past the total cap (the last
+#: attempt's busy wait is cut to what remains); then the original error is
+#: raised as before. A busy error after BEGIN rolls back and is raised, never
+#: retried: a transaction is never resumed half way.
+_WRITE_BUSY_ATTEMPTS = 3
+_WRITE_BUSY_BACKOFF_S = (0.05, 0.2)
+_WRITE_BUSY_TOTAL_S = 15.0
+
+
+def _is_busy(error: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY and its extended codes ("database is locked")."""
+    return ((getattr(error, "sqlite_errorcode", None) or 0) & 0xFF) == sqlite3.SQLITE_BUSY
+
+
+def _begin_immediate(connection: sqlite3.Connection) -> None:
+    """``BEGIN IMMEDIATE`` with the bounded busy retry above."""
+    started = time.monotonic()
+    for attempt in range(1, _WRITE_BUSY_ATTEMPTS + 1):
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            if not _is_busy(error):
+                raise
+            if connection.in_transaction:
+                connection.rollback()
+            remaining = 0.0
+            if attempt < _WRITE_BUSY_ATTEMPTS:
+                pause = _WRITE_BUSY_BACKOFF_S[min(attempt, len(_WRITE_BUSY_BACKOFF_S)) - 1]
+                remaining = _WRITE_BUSY_TOTAL_S - (time.monotonic() - started) - pause
+            if remaining <= 0:
+                _log.warning(
+                    "store write gave up after %d busy attempt(s) in %.2f s: %s",
+                    attempt, time.monotonic() - started, error,
+                )
+                raise
+            _log.warning(
+                "store write busy (attempt %d of %d): %s; whole transaction retried in %.2f s",
+                attempt, _WRITE_BUSY_ATTEMPTS, error, pause,
+            )
+            time.sleep(pause)
+            wait_ms = int(min(_BUSY_TIMEOUT_S, remaining) * 1000)
+            connection.execute(f"PRAGMA busy_timeout = {max(wait_ms, 1)}")
+        else:
+            if attempt > 1:
+                connection.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_S * 1000)}")
+            return
+
+
 def pre_v2_backup_path(database_path: Path) -> Path:
     return database_path.with_name(
         f"{database_path.stem}{PRE_V2_BACKUP_TAG}{database_path.suffix}"
@@ -799,10 +857,10 @@ class SQLiteMemoryStore:
         return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5.0)
+        connection = sqlite3.connect(self.database_path, timeout=_BUSY_TIMEOUT_S)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_S * 1000)}")
         connection.execute("PRAGMA synchronous = NORMAL")
         return connection
 
@@ -811,7 +869,7 @@ class SQLiteMemoryStore:
         connection = self._connect()
         try:
             if write:
-                connection.execute("BEGIN IMMEDIATE")
+                _begin_immediate(connection)
             yield connection
             if write:
                 connection.commit()
@@ -4979,7 +5037,7 @@ class SQLiteMemoryStore:
             previous = int(connection.execute("PRAGMA secure_delete").fetchone()[0])
             connection.execute("PRAGMA secure_delete = ON")
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                _begin_immediate(connection)
                 try:
                     self._project_row_for_files(connection, project_id, need_active=False)
                     row = self._file_for_update(connection, project_id, file_id)
@@ -5585,7 +5643,7 @@ class SQLiteMemoryStore:
             previous = int(connection.execute("PRAGMA secure_delete").fetchone()[0])
             connection.execute("PRAGMA secure_delete = ON")
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                _begin_immediate(connection)
                 try:
                     preview, refusal = self._delete_check(connection, conversation_id)
                     if refusal is None and (

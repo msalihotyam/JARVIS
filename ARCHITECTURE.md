@@ -2565,6 +2565,24 @@ Her proje ayrı bağlam ve oturumlara sahip olabilir. Bir çalışma oturumu hed
 
 İlk yerel saklama çözümü olarak SQLite uygundur; ancak depolama arayüzü daha sonra başka bir sisteme geçişi engellemeyecektir.
 
+**Depo yazma işlemleri ve meşgul kilit (V2.1 cleanup, V21BUSY, uygulandı):**
+deponun her çalışma zamanı yazma işlemi `BEGIN IMMEDIATE` ile başlar
+(`_connection(write=True)` ve iki `secure_delete` yolu; hepsi
+`memory._begin_immediate` üzerinden). Açılıştaki şema kurulumu/migrasyonu
+hariçtir: `executescript` bekleyen işlemi önce commit eder, oradaki sonraki
+deyimler yeniden denenmez.
+Başka bir yazarın tuttuğu kilit, SQLite'ın bağlantı başına 5 s bekleme
+süresinden sonra tam bu noktada `database is locked` olarak çıkar; işlem o an
+henüz hiçbir şey okumamış veya yazmamıştır, bu yüzden BEGIN'i yeniden denemek
+işlemin TAMAMINI yeniden denemektir. Politika: en çok 3 deneme, aralarında
+0,05 s ve 0,2 s bekleme, toplam 15 s üst sınır (son denemenin SQLite
+beklemesi kalan süreye kısaltılır); sonra özgün hata bugünkü gibi yükselir.
+Her yeniden deneme ve son vazgeçiş `jarvis.memory` günlüğüne WARNING olarak
+yazılır. BEGIN kazanıldıktan sonra gelen bir meşgul hatası işlemi tümüyle geri
+alır ve yeniden denenmeden yükselir: bir işlem asla yarıdan sürdürülmez.
+Okumalar, işlemlerin yazdıkları, idempotency korumaları ve `SCHEMA_VERSION`
+değişmez.
+
 ## 7. Maliyet yönetimi
 
 ### 7.1 Sağlayıcıdan bağımsız faturalandırma sınıfı (kullanıcı kararı)

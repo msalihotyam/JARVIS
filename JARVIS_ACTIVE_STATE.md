@@ -32,6 +32,16 @@ rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
 
 ## Open blockers
 
+**V21BUSY (V2.1 cleanup, T2) green, 2026-10-11:** committed on lane branch
+`v21busy` (base v21k3 95b67d3, so V21K3's memory.py is under it); not
+integrated, not pushed. Store write transactions retry `BEGIN IMMEDIATE` on
+SQLITE_BUSY (whole transaction, nothing read or written yet): 3 attempts,
+pauses 0.05/0.2 s, 15 s total cap, then the original error as before; every
+retry and the give-up logged (`jarvis.memory` WARNING). Full suite as
+foreground shards (N = 12 fallback; 6/6 shard 4 hit the 10-min cap)
+aggregate 5446 OK (skipped=2), no rule D reruns. Report:
+`build/reports/V21BUSY.md`.
+
 **V21K3 (V2.1 cleanup, T2) green, 2026-10-11 (V21K3C):** committed on lane
 branch `v21k3` (base ca3ffb5; pick db67868, then the fix commit); not
 integrated, not pushed. (a) a K3 reject after a changed proposal ends
