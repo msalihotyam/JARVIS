@@ -630,6 +630,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Oluşturulan klasörün onaylanan klasör olduğu doğrulanamadı.</translation>
     </message>
     <message>
+        <source>The folder path changed. Confirm the new path.</source>
+        <translation>Klasör yolu değişti; yeni yolu onaylayın.</translation>
+    </message>
+    <message>
+        <source>The stored configuration was refused, so execution is disabled. Repair it with &apos;jarvis config reset --all&apos;.</source>
+        <translation>Kayıtlı yapılandırma reddedildi, bu yüzden yürütme kapalı. &apos;jarvis config reset --all&apos; ile onarın.</translation>
+    </message>
+    <message>
+        <source>JARVIS is frozen; the folder request was not changed.</source>
+        <translation>JARVIS donduruldu; klasör isteği değiştirilmedi.</translation>
+    </message>
+    <message>
+        <source>This folder request is no longer pending here. Nothing was changed.</source>
+        <translation>Bu klasör isteği artık burada beklemiyor. Hiçbir şey değiştirilmedi.</translation>
+    </message>
+    <message>
         <source>The folder path is too long.</source>
         <translation>Klasör yolu çok uzun.</translation>
     </message>
@@ -652,6 +668,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Every possible folder name for this project is already taken.</source>
         <translation>Bu proje için olası her klasör adı zaten kullanılıyor.</translation>
+    </message>
+    <message>
+        <source>intended path; its location could not be verified</source>
+        <translation>amaçlanan yol; konumu doğrulanamadı</translation>
+    </message>
+    <message>
+        <source>Folder creation stopped partway: %1 folder(s) were created and kept (no folder was deleted). Project link: %2.</source>
+        <translation>Klasör oluşturma yarıda kaldı: %1 klasör oluşturuldu ve korundu (klasör silinmedi). Proje bağlantısı: %2.</translation>
     </message>
     <message>
         <source>The project store is unavailable.</source>
@@ -2955,6 +2979,45 @@ yok</translation>
         <translation>Bu site için kullanılabilir güncel bir JARVIS tarayıcı sekmesi yok. Önce siteyi yeni bir JARVIS sekmesinde açın.</translation>
     </message>
     <message>
+        <source>The folder proposal changed. Ask again.</source>
+        <translation>Klasör önerisi değişti; yeniden isteyin.</translation>
+    </message>
+    <message>
+        <source>The project folder could not be created. No folder was created and nothing changed.</source>
+        <translation>Proje klasörü oluşturulamadı; hiçbir klasör oluşturulmadı ve hiçbir şey değişmedi.</translation>
+    </message>
+    <message>
+        <source>The project folder was created but could not be linked. It was not deleted (its path was on the approval card). Project link: %1.</source>
+        <extracomment>The project-folder connector&apos;s partial failures: ``&lt;case&gt; Project link: &lt;state&gt;.`` Its case and its read-back link state, each in the interface language.</extracomment>
+        <translation>Proje klasörü oluşturuldu ama projeye bağlanamadı; klasör silinmedi (yolu onay kartındaydı). Proje bağlantısı: %1.</translation>
+    </message>
+    <message>
+        <source>Only the shared &quot;JARVIS Projeleri&quot; folder was created. The project folder was not, and nothing was deleted. Project link: %1.</source>
+        <translation>Yalnızca ortak &quot;JARVIS Projeleri&quot; klasörü oluşturuldu; proje klasörü oluşturulmadı ve hiçbir şey silinmedi. Proje bağlantısı: %1.</translation>
+    </message>
+    <message>
+        <source>linked</source>
+        <translation>bağlı</translation>
+    </message>
+    <message>
+        <source>not linked</source>
+        <translation>bağlı değil</translation>
+    </message>
+    <message>
+        <source>unknown (could not be read)</source>
+        <translation>bilinmiyor (okunamadı)</translation>
+    </message>
+    <message>
+        <source>The project folder was created and linked to the project.</source>
+        <extracomment>The K3 task&apos;s capability (``jarvis.connectors.project_folder``): its result summary is one of RESULT_TEXT&apos;s codes, and any other is never shown raw.</extracomment>
+        <translation>Proje klasörü oluşturuldu ve projeye bağlandı.</translation>
+    </message>
+    <message>
+        <source>The folder step did not complete as expected. Check the project&apos;s folder before trying again.</source>
+        <extracomment>The one line for a folder message JARVIS does not know (here and in the bridge).</extracomment>
+        <translation>Klasör adımı beklendiği gibi tamamlanmadı. Yeniden denemeden önce projenin klasörünü kontrol edin.</translation>
+    </message>
+    <message>
         <source>The backend response could not be read. Its OUTCOME IS UNKNOWN - nothing is assumed to have happened or not. Check History before doing it again.</source>
         <translation>Arka uç yanıtı okunamadı. SONUCU BİLİNMİYOR - bir şeyin olduğu ya da olmadığı varsayılmaz. Tekrar yapmadan önce Geçmiş&apos;i kontrol edin.</translation>
     </message>
@@ -2966,6 +3029,14 @@ yok</translation>
     <message>
         <source>JARVIS is frozen, so the request was understood but not started: no task or job was created and nothing was queued. Resume JARVIS and send it again to run it.</source>
         <translation>JARVIS donduruldu; istek anlaşıldı ama başlatılmadı: görev veya iş oluşturulmadı, kuyruğa hiçbir şey alınmadı. JARVIS&apos;i sürdürüp isteği yeniden gönderin.</translation>
+    </message>
+    <message>
+        <source>JARVIS could not propose a folder for this project. Nothing was created.</source>
+        <translation>JARVIS bu proje için bir klasör öneremedi. Hiçbir şey oluşturulmadı.</translation>
+    </message>
+    <message>
+        <source>The project folder proposal was refused: it may only say whether the folder goes on the Desktop. Nothing was done.</source>
+        <translation>Proje klasörü önerisi reddedildi: yalnızca klasörün Masaüstüne gidip gitmeyeceğini söyleyebilir. Hiçbir şey yapılmadı.</translation>
     </message>
     <message>
         <source>&apos;%1&apos; is not an authorized destination for &apos;%2&apos;. Nothing was done.%3</source>
@@ -2988,6 +3059,14 @@ yok</translation>
     <message>
         <source>A read-only page read. No content leaves this computer.</source>
         <translation>Salt okunur bir sayfa okuma. Hiçbir içerik bu bilgisayardan çıkmıyor.</translation>
+    </message>
+    <message>
+        <source>Create the project folder on the Desktop and link it. Nothing is sent.</source>
+        <translation>Proje klasörünü Masaüstünde oluştur ve bağla. Hiçbir şey gönderilmez.</translation>
+    </message>
+    <message>
+        <source>Create the project folder in Documents\JARVIS Projeleri and link it. Nothing is sent.</source>
+        <translation>Proje klasörünü Belgeler\JARVIS Projeleri içinde oluştur ve bağla. Hiçbir şey gönderilmez.</translation>
     </message>
     <message>
         <source>The connector &apos;%1&apos; will carry out exactly this scoped action.</source>

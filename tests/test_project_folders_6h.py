@@ -811,10 +811,11 @@ class CreateCase(FolderCase):
         self.assertNotEqual(EXIT_OK, result.exit_code)
         self.assertEqual((created, state), (result.payload["created"], result.payload["link_state"]))
         message = result.payload["error"]["message"]
-        self.assertIn("klasör silinmedi", message)
-        self.assertIn({"linked": "bağlı.", "not linked": "bağlı değil", "unknown": "bilinmiyor"}[state], message)
+        self.assertIn("(nothing was deleted)", message)
+        self.assertIn({"linked": "Project link: linked.", "not linked": "Project link: not linked.",
+                       "unknown": "Project link: unknown."}[state], message)
         for path in created if exist else ():
-            self.assertTrue(os.path.isdir(path.split(" (amaçlanan yol")[0]), path)
+            self.assertTrue(os.path.isdir(path.split(" (intended path")[0]), path)
 
 
 class CreateExactPathTests(CreateCase):
@@ -841,7 +842,7 @@ class CreateExactPathTests(CreateCase):
             with self.subTest(name):
                 before = self.state()
                 result = self.create(self.p, sent, on_desktop)
-                self.assertIn("Klasör yolu değişti; yeni yolu onaylayın.", result.payload["error"]["message"])
+                self.assertIn("The folder path changed; confirm the new path.", result.payload["error"]["message"])
                 self.assertEqual(before, self.state())
 
     def test_c1_a_leaf_collision_before_any_create_writes_nothing(self) -> None:
@@ -1114,7 +1115,7 @@ class CreatePartialFailureTests(CreateCase):
         # The leaf's final path cannot be read: its proof fails, and its location is reported as unverified.
         final = {"side_effect": lambda h: None if (real_final(h) or "").endswith("\\Alpha") else real_final(h)}
         _, result = self.run_case(patch=((project_folders, "_final_path", final),))
-        self.partial(result, [path + " (amaçlanan yol; konumu doğrulanamadı)"], "not linked")
+        self.partial(result, [path + " (intended path; location not verified)"], "not linked")
 
     def test_c5_a_failure_inside_create_folder_survives_a_failing_rollback(self) -> None:
         path = self.shown(self.p, False)

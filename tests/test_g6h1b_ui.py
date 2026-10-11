@@ -209,7 +209,7 @@ class CreateFolderPopupTests(Case):
         self.click(root, "newProjectCreate", then=lambda: self.assertNotEqual("", dialog.property("finalId")))
         notice = self.final_state(root, dialog, bridge, "Banyo")
         self.assertIn("The project was created, but its folder was not", notice)
-        self.assertIn("Klasör yolu değişti; yeni yolu onaylayın.", notice)
+        self.assertIn("The folder path changed. Confirm the new path.", notice)
         self.assertEqual(["Desktop\\Banyo"], self.made())                       # only the other one's
 
     def test_c11_a_partial_failure_names_what_was_kept(self) -> None:
@@ -223,8 +223,8 @@ class CreateFolderPopupTests(Case):
         settled(200, lambda: self.assertTrue(dialog.property("previewReady")))
         self.click(root, "newProjectCreate", then=lambda: self.assertNotEqual("", dialog.property("finalId")))
         notice = self.final_state(root, dialog, bridge, "Salon")
-        self.assertIn("klasör silinmedi", notice)
-        self.assertIn("bağlı değil", notice)
+        self.assertIn("no folder was deleted", notice)
+        self.assertIn("Project link: not linked.", notice)
         for path in (self.documents / JP, self.documents / JP / "Salon"):
             self.assertIn(str(path), notice)
             self.assertTrue(path.is_dir())

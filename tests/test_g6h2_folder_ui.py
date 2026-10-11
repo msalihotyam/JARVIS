@@ -108,8 +108,9 @@ class BridgeTests(Case):
         self.assertEqual("", bridge.projectFolderNotice)                      # a success clears the reason
         self.assertFalse(bridge.linkProjectFolder(self.project.id, str(self.folder("İkinci"))))
         self.assertIn("already has a linked folder", bridge.projectFolderNotice)
-        # An unknown backend message is shown as returned, never hidden.
-        self.assertEqual("Something new.", bridge._folder_reason("Something new."))
+        # An unknown backend message is one generic line, never shown raw (D-6).
+        self.assertEqual("The folder step did not complete as expected. Check the project's folder before trying again.",
+                         bridge._folder_reason("Something new."))
 
 
 class PageTests(Case):

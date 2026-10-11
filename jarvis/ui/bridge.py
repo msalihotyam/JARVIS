@@ -48,7 +48,7 @@ from jarvis.context_items import (
 )
 from jarvis import conversation_search, project_files
 from jarvis.app import project_folder_result
-from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR
+from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR, UNVERIFIED_SUFFIX
 from jarvis.destinations import CLAUDE_CODE_DESTINATION
 from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
 from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
@@ -73,12 +73,15 @@ from jarvis.ui.preferences import (
     validate_preferences,
 )
 from jarvis.ui.present import (
+    FOLDER_UNKNOWN,
+    LINK_STATE_TEXT,
     REFUSED_CODES,
     display_model_name,
     provider_brand,
     TERMINAL_STATUSES,
     approval_card,
     error_entries,
+    failure_message,
     outcome_kind,
     rows,
     run_entries,
@@ -1444,8 +1447,8 @@ class Bridge(QObject):
     # The path is the person's own pick; JARVIS never reads, writes or sends
     # the folder (Salih Q1, 2026-10-10). Nothing here creates or deletes one.
 
-    # The backend's refusals (English, for logs) in plain words; any other
-    # message is shown as returned.
+    # The backend's refusals (English, for logs: stable codes) in plain words;
+    # any other message is one generic line, never shown raw (D-6).
     _FOLDER_REASONS = {
         "A folder path must be a non-blank string.": QT_TRANSLATE_NOOP("Bridge", "No folder was chosen."),
         "A folder path may not contain control or bidi characters.":
@@ -1495,6 +1498,19 @@ class Bridge(QObject):
             QT_TRANSLATE_NOOP("Bridge", "A folder can be created only on the Desktop or in the JARVIS Projeleri folder in Documents."),
         "The created folder could not be proven to be the approved one.":
             QT_TRANSLATE_NOOP("Bridge", "The created folder could not be verified as the approved one."),
+        "The folder path changed; confirm the new path.":
+            QT_TRANSLATE_NOOP("Bridge", "The folder path changed. Confirm the new path."),
+        # The window's own store check (_folder_result) and the backend's
+        # refused-configuration answer (Backend._call), which keeps its repair hint.
+        "The project store is unavailable.": QT_TRANSLATE_NOOP("Bridge", "The project store is unavailable."),
+        "The stored configuration was refused, so execution is disabled. Repair it with 'jarvis config reset --all'.":
+            QT_TRANSLATE_NOOP("Bridge", "The stored configuration was refused, so execution is disabled. "
+                                        "Repair it with 'jarvis config reset --all'."),
+        # E7 "Masaüstünde oluştur" refusals (app.project_folder_switch).
+        "JARVIS is frozen; the folder request was not changed.":
+            QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen; the folder request was not changed."),
+        "This folder request is no longer pending here; nothing was changed.":
+            QT_TRANSLATE_NOOP("Bridge", "This folder request is no longer pending here. Nothing was changed."),
     }
     _FOLDER_REASON_PREFIXES = (
         # Its example path comes back redacted ("[PATH]").
@@ -1512,13 +1528,27 @@ class Bridge(QObject):
     def _folder_reason(self, message: str) -> str:
         source = self._FOLDER_REASONS.get(message) or next(
             (said for prefix, said in self._FOLDER_REASON_PREFIXES if message.startswith(prefix)), None)
-        return tx("Bridge", source) if source else message
+        return tx("Bridge", source) if source else tx("Present", FOLDER_UNKNOWN)
+
+    @staticmethod
+    def _folder_partial(folder: dict) -> str:
+        """K1's partial creation, from its own fields (the message is a code):
+        how many folders were made and kept, the link state read back, and
+        each kept folder's path - an unverified one labelled as such."""
+        created = [str(path) for path in folder.get("created") or ()]
+        state = folder.get("link_state") if folder.get("link_state") in ("linked", "not linked") else "unknown"
+        label = " (" + tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "intended path; its location could not be verified")) + ")"
+        return "\n".join([tx("Bridge", QT_TRANSLATE_NOOP(
+            "Bridge", "Folder creation stopped partway: %1 folder(s) were created and kept (no folder was deleted). "
+                      "Project link: %2."), len(created), tx("Present", LINK_STATE_TEXT[state]))]
+                         + [path[: -len(UNVERIFIED_SUFFIX)] + label if path.endswith(UNVERIFIED_SUFFIX) else path
+                            for path in created])
 
     def _folder_result(self, action: str, project_id: str, **options: Any) -> dict:
         store = self._conversation_db()
         loaded = self.backend.store.load() if store is not None else None
         if loaded is None or not loaded.usable:
-            return {"error": {"message": tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "The project store is unavailable."))}}
+            return {"error": {"message": "The project store is unavailable."}}    # a code: _FOLDER_REASONS says it
         return project_folder_result(store, loaded.settings, action, str(project_id), **options).payload
 
     def _folder_change(self, action: str, project_id: str, **options: Any) -> bool:
@@ -1589,10 +1619,10 @@ class Bridge(QObject):
             return
         folder = result.get("folder")
         message = self._error_message(folder)
-        notice = self._folder_reason(message) if message else ""
-        created = folder.get("created") if message and isinstance(folder, dict) else None
-        if isinstance(created, list) and created:
-            notice += "\n" + "\n".join(str(path) for path in created)
+        if message and isinstance(folder, dict) and "link_state" in folder:
+            notice = self._folder_partial(folder)
+        else:
+            notice = self._folder_reason(message) if message else ""
         self._project_notice, self._project_folder_notice = "", notice
         self.refreshProjects()
         self.projectFolderCreated.emit(project_id, not message, notice)
@@ -3277,8 +3307,16 @@ class Bridge(QObject):
                 notice = str(payload["notice"])
                 self._note(("Bridge", notice, ()) if notice in _K3_NOTICES else notice, "error")
         else:
-            self._note(self._error_message(payload) or ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Decision not recorded"), ()),
-                       "error")
+            # A message (re-rendered on a language switch): the app's E7 refusal,
+            # Core's refusal of the rejection itself, or one generic line - never raw.
+            message = self._error_message(payload)
+            code = str(payload["error"].get("code") or "") if message else ""
+            self._note(("Bridge", self._FOLDER_REASONS[message], ()) if message in self._FOLDER_REASONS
+                       else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Decision not recorded"), ()) if not message
+                       else ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Request changed, expired or was resolved elsewhere — "
+                                                                   "decision not recorded"), ())
+                       if code in ("invalid_grant", "stale_grant", "task_not_found")
+                       else ("Present", FOLDER_UNKNOWN, ()), "error")
 
     @Slot()
     def cancelTask(self) -> None:
@@ -4496,6 +4534,8 @@ class Bridge(QObject):
                                 else tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen. Approving is unavailable until you resume JARVIS; Reject still works."))
                                 if not self.executionEnabled else "")
         outcome = _here(task_outcome(self._task, self._last_outcome == "unmet"))
+        if outcome.get("message"):
+            outcome["message"] = render(failure_message(outcome["code"], outcome["message"]))
         items: list[dict[str, Any]] = []
         if execution in ("frozen", "freeze_requested", "resuming", "refused", "unconfirmed"):
             items.append({"key": "execution", "level": 1, "tone": "danger", "label": tx("Bridge", {
@@ -4515,6 +4555,8 @@ class Bridge(QObject):
         decision = dict(self._decision)
         if decision:
             decision["label"] = tx("Bridge", decision["label"])
+            if decision.get("message"):
+                decision["message"] = render(failure_message(decision.get("code"), decision["message"]))
             decision["time"] = (QLocale().toString(QDateTime.fromSecsSinceEpoch(int(decision["ts"])).time(), QLocale.FormatType.ShortFormat)
                                 if decision.get("ts") else "")
         return {"fixture": False, "execution": execution, "running": self._busy, "approval": approval,

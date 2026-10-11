@@ -1773,16 +1773,17 @@ def project_folder_result(
             if not project.active:
                 raise ValueError(f"Project is archived: {project_id}")
             if project_folders.propose_folder(project.name, on_desktop, protected=protected) != path:
-                raise ValueError("Klasör yolu değişti; yeni yolu onaylayın.")
+                raise ValueError("The folder path changed; confirm the new path.")
             try:
                 link, creation = project_folders.create_and_link(memory, project_id, path, protected=protected)
             except project_folders.FolderCreateError as exc:
                 # The paths travel as their own field: a diagnostic message is path-redacted.
-                state = {"linked": "bağlı", "not linked": "bağlı değil"}.get(exc.link_state, "bilinmiyor (okunamadı)")
+                # A stable code (D-6): the window says it from ``created`` and ``link_state``.
+                state = exc.link_state if exc.link_state in ("linked", "not linked") else "unknown"
                 failed = failure_result(
                     command, settings.permission_mode, ErrorCode.INVALID_TASK,
-                    f"Klasör oluşturma yarıda kaldı: {len(exc.created)} klasör oluşturuldu ve korundu "
-                    f"(klasör silinmedi). Proje bağlantısı: {state}.",
+                    f"Folder creation stopped partway: {len(exc.created)} folder(s) created and kept "
+                    f"(nothing was deleted). Project link: {state}.",
                     EXIT_INVALID_INPUT,
                 )
                 failed.payload.update(created=list(exc.created), link_state=exc.link_state)

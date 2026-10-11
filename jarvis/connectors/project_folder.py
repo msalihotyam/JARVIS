@@ -56,11 +56,22 @@ PROJECT_FOLDER_CONTEXT_KEY = "project_folder"
 PROJECT_FOLDER_TARGETS = {"": "documents", "desktop": "desktop"}
 PROJECT_FOLDER_FRAME_HEADER = b"JARVIS-PROJECT-FOLDER-CREATE/1"
 
-STALE_PROPOSAL = "Klasör önerisi değişti; yeniden isteyin."
-_CREATED = "Proje klasörü oluşturuldu ve projeye bağlandı."
-_NOTHING_CREATED = "Proje klasörü oluşturulamadı; hiçbir klasör oluşturulmadı ve hiçbir şey değişmedi."
-_LINK_STATE = {"linked": "bağlı", "not linked": "bağlı değil"}
-_UNVERIFIED_SUFFIX = f" ({project_folders._UNVERIFIED})"
+# Every message below is a stable code, not words (D-6): Core stores and logs
+# it as written, and the window says it in the interface language
+# (``jarvis.ui.present``). A changed sentence here needs its mapping there.
+STALE_PROPOSAL = "The folder proposal changed; ask again."
+CREATED = "The project folder was created and linked to the project."
+NOTHING_CREATED = "The project folder could not be created; no folder was created and nothing changed."
+#: ``_partial``'s two cases, each followed by " Project link: <linked|not linked|unknown>."
+PARTIAL_LEAF = ("The project folder was created but could not be linked; it was not deleted "
+                "(its path was on the approval card).")
+PARTIAL_PARENT = ("Only the shared \"JARVIS Projeleri\" folder was created; the project folder was not, "
+                  "and nothing was deleted.")
+#: The approval card's summary, per location.
+PREVIEW = {"desktop": "Create the project folder on the Desktop and link it; nothing is sent.",
+           "documents": "Create the project folder in Documents\\JARVIS Projeleri and link it; nothing is sent."}
+#: What ``project_folders`` appends to a created path its handle could not locate.
+UNVERIFIED_SUFFIX = f" ({project_folders._UNVERIFIED})"
 
 
 class ProjectFolderCreateConnector(BaseConnector):
@@ -160,7 +171,6 @@ class ProjectFolderCreateConnector(BaseConnector):
             _, _, location = self._bound(task)
         except Exception:  # noqa: BLE001 - attestation refuses it next
             return None
-        where = "Masaüstü" if location == "desktop" else "Belgeler\\JARVIS Projeleri"
         return OutboundDataPreview(
             # The scope's destination: Core refuses a preview naming another.
             destination=task.scope.destination,
@@ -168,7 +178,7 @@ class ProjectFolderCreateConnector(BaseConnector):
             field_names=("project_id", "path", "location"),
             approximate_bytes=0,
             redacted_items=0,
-            summary=f"Proje klasörü oluştur ve bağla ({where}); hiçbir şey gönderilmez.",
+            summary=PREVIEW[location],
         )
 
     # -- execution -------------------------------------------------------------
@@ -185,23 +195,19 @@ class ProjectFolderCreateConnector(BaseConnector):
         except project_folders.FolderCreateError as exc:
             return self._refusal(task, self._partial(exc, path))
         except Exception:  # noqa: BLE001 - nothing was created (create_and_link's contract)
-            return self._refusal(task, _NOTHING_CREATED)
-        return ToolResult(outcome=OutcomeStatus.SUCCESS, summary=_CREATED, usage=self._usage(task, session, 1))
+            return self._refusal(task, NOTHING_CREATED)
+        return ToolResult(outcome=OutcomeStatus.SUCCESS, summary=CREATED, usage=self._usage(task, session, 1))
 
     @staticmethod
     def _partial(exc: project_folders.FolderCreateError, path: str) -> str:
         """What was created and kept, in words, never as a path (D4)."""
-        state = _LINK_STATE.get(exc.link_state, "bilinmiyor (okunamadı)")
+        state = exc.link_state if exc.link_state in ("linked", "not linked") else "unknown"
         try:
-            created = [c[: -len(_UNVERIFIED_SUFFIX)] if c.endswith(_UNVERIFIED_SUFFIX) else c for c in exc.created]
+            created = [c[: -len(UNVERIFIED_SUFFIX)] if c.endswith(UNVERIFIED_SUFFIX) else c for c in exc.created]
             leaf = any(project_folders.same_folder(c, path) for c in created)
         except Exception:  # noqa: BLE001 - unreadable: say the stronger case
             leaf = True
-        if leaf:
-            return ("Proje klasörü oluşturuldu ama projeye bağlanamadı; klasör silinmedi "
-                    f"(yolu onay kartındaydı). Proje bağlantısı: {state}.")
-        return ("Yalnızca ortak \"JARVIS Projeleri\" klasörü oluşturuldu; proje klasörü oluşturulmadı "
-                f"ve hiçbir şey silinmedi. Proje bağlantısı: {state}.")
+        return f"{PARTIAL_LEAF if leaf else PARTIAL_PARENT} Project link: {state}."
 
     def verify(self, task: Task, result: ToolResult, session: SessionState) -> VerificationRecord:
         """Read back: the project's link is the created folder at the path."""
@@ -241,10 +247,16 @@ class ProjectFolderCreateConnector(BaseConnector):
 
 
 __all__ = [
+    "CREATED",
+    "NOTHING_CREATED",
+    "PARTIAL_LEAF",
+    "PARTIAL_PARENT",
+    "PREVIEW",
     "PROJECT_FOLDER_CAPABILITY",
     "PROJECT_FOLDER_CONNECTOR",
     "PROJECT_FOLDER_CONTEXT_KEY",
     "PROJECT_FOLDER_TARGETS",
     "ProjectFolderCreateConnector",
     "STALE_PROPOSAL",
+    "UNVERIFIED_SUFFIX",
 ]

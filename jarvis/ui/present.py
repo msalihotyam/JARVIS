@@ -88,7 +88,60 @@ FAILURE_TEXT = {
     ("connector_failed", "the browser state is ambiguous: no single tab of the authorized origin is current"):
         QT_TRANSLATE_NOOP("Present", "No current JARVIS browser tab is available for this site. "
                                      "Open the site in a new JARVIS tab first."),
+    # The project-folder connector's (K3) stable codes (D-6); the messages are
+    # ``jarvis.connectors.project_folder``'s constants. Core's attestation
+    # refuses a stale proposal as egress_refused, the connector as invalid_task.
+    ("egress_refused", "The folder proposal changed; ask again."):
+        QT_TRANSLATE_NOOP("Present", "The folder proposal changed. Ask again."),
+    ("invalid_task", "The folder proposal changed; ask again."):
+        QT_TRANSLATE_NOOP("Present", "The folder proposal changed. Ask again."),
+    ("invalid_task", "The project folder could not be created; no folder was created and nothing changed."):
+        QT_TRANSLATE_NOOP("Present", "The project folder could not be created. No folder was created and nothing changed."),
 }
+
+#: The project-folder connector's partial failures: ``<case> Project link: <state>.``
+#: Its case and its read-back link state, each in the interface language.
+_FOLDER_PARTIAL = re.compile(r"^(?P<case>.+) Project link: (?P<state>linked|not linked|unknown)\.$")
+FOLDER_PARTIAL_TEXT = {
+    "The project folder was created but could not be linked; it was not deleted (its path was on the approval card).":
+        QT_TRANSLATE_NOOP("Present", "The project folder was created but could not be linked. It was not deleted "
+                                     "(its path was on the approval card). Project link: %1."),
+    "Only the shared \"JARVIS Projeleri\" folder was created; the project folder was not, and nothing was deleted.":
+        QT_TRANSLATE_NOOP("Present", "Only the shared \"JARVIS Projeleri\" folder was created. The project folder was "
+                                     "not, and nothing was deleted. Project link: %1."),
+}
+LINK_STATE_TEXT = {
+    "linked": QT_TRANSLATE_NOOP("Present", "linked"),
+    "not linked": QT_TRANSLATE_NOOP("Present", "not linked"),
+    "unknown": QT_TRANSLATE_NOOP("Present", "unknown (could not be read)"),
+}
+
+#: The K3 task's capability (``jarvis.connectors.project_folder``): its result
+#: summary is one of RESULT_TEXT's codes, and any other is never shown raw.
+PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR = "project_folder_create", "project-folder-create"
+RESULT_TEXT = {
+    "The project folder was created and linked to the project.":
+        QT_TRANSLATE_NOOP("Present", "The project folder was created and linked to the project."),
+}
+#: The one line for a folder message JARVIS does not know (here and in the bridge).
+FOLDER_UNKNOWN = QT_TRANSLATE_NOOP("Present", "The folder step did not complete as expected. "
+                                              "Check the project's folder before trying again.")
+
+
+def _failure_text(code: str, message: Any) -> Any:
+    """JARVIS's own words for an established failure, or None."""
+    if (code, message) in FAILURE_TEXT:
+        return _msg(FAILURE_TEXT[(code, message)])
+    partial = _FOLDER_PARTIAL.match(message) if code == "invalid_task" and isinstance(message, str) else None
+    if partial is not None and partial["case"] in FOLDER_PARTIAL_TEXT:
+        return _msg(FOLDER_PARTIAL_TEXT[partial["case"]], _msg(LINK_STATE_TEXT[partial["state"]]))
+    return None
+
+
+def failure_message(code: Any, message: Any) -> Any:
+    """A Core error message for the Safety cards: JARVIS's words when the
+    failure is established (``_failure_text``), else exactly as Core wrote it."""
+    return _failure_text(str(code or ""), message) or message
 
 UNREADABLE = {
     "kind": "unknown",
@@ -108,6 +161,13 @@ VERDICT_TEXT = {
     "and nothing was queued. Resume JARVIS and send it again to run it.":
         QT_TRANSLATE_NOOP("Present", "JARVIS is frozen, so the request was understood but not started: no task or job was "
                                      "created and nothing was queued. Resume JARVIS and send it again to run it."),
+    # K3 (``jarvis.app``): the folder request's own refusals (D-6).
+    "JARVIS could not propose a folder for this project. Nothing was created.":
+        QT_TRANSLATE_NOOP("Present", "JARVIS could not propose a folder for this project. Nothing was created."),
+    "The project folder proposal was refused: it may only say whether the folder goes on the Desktop. "
+    "Nothing was executed.":
+        QT_TRANSLATE_NOOP("Present", "The project folder proposal was refused: it may only say whether the folder goes "
+                                     "on the Desktop. Nothing was done."),
 }
 
 #: The same, for a verdict that names something: ``(prefix, suffix)`` around
@@ -144,6 +204,11 @@ OUTBOUND_TEXT = {
         QT_TRANSLATE_NOOP("Present", "A read-only request. No content leaves this computer."),
     "Read-only page read; no content leaves the machine.":
         QT_TRANSLATE_NOOP("Present", "A read-only page read. No content leaves this computer."),
+    # K3 (``jarvis.connectors.project_folder.PREVIEW``).
+    "Create the project folder on the Desktop and link it; nothing is sent.":
+        QT_TRANSLATE_NOOP("Present", "Create the project folder on the Desktop and link it. Nothing is sent."),
+    "Create the project folder in Documents\\JARVIS Projeleri and link it; nothing is sent.":
+        QT_TRANSLATE_NOOP("Present", "Create the project folder in Documents\\JARVIS Projeleri and link it. Nothing is sent."),
 }
 
 #: Why an approval is being asked for, in JARVIS's words. Core writes the
@@ -323,8 +388,9 @@ def error_entries(error: Any) -> list[dict[str, str]]:
     if code == IN_PROGRESS_CODE:
         return [{"kind": "unknown", "text": _msg(QT_TRANSLATE_NOOP("Present",
             "IN PROGRESS ELSEWHERE [%1]: %2\nIts outcome is not known yet. Do not retry."), code, message)}]
-    if (code, message) in FAILURE_TEXT:
-        return [{"kind": "error", "text": _msg(FAILURE_TEXT[(code, message)])}]
+    known = _failure_text(code, message)
+    if known is not None:
+        return [{"kind": "error", "text": known}]
     if code in REFUSED_CODES:
         return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present", "REFUSED [%1]: %2\nNothing was executed."), code, message)}]
     return [{"kind": "error", "text": _msg(QT_TRANSLATE_NOOP("Present",
@@ -394,6 +460,15 @@ def _deliverable(text: Any, payload: Any, facts: Any = None) -> dict[str, Any]:
             "destination": known["destination"] or str(task.get("destination") or "")}
 
 
+def _summary_text(summary: str, payload: dict, facts: dict[str, str]) -> Any:
+    """A connector's result summary: a known code in the interface language;
+    a project-folder summary JARVIS does not know is never shown raw (D-6)."""
+    if summary in RESULT_TEXT:
+        return _msg(RESULT_TEXT[summary])
+    capability = facts["capability"] or str(_get(payload.get("task"), "capability") or "")
+    return _msg(FOLDER_UNKNOWN) if capability == PROJECT_FOLDER_CAPABILITY else summary
+
+
 def run_entries(payload: Any, facts: Any = None) -> list[dict[str, str]]:
     """What one run/approve/reject/cancel/resume envelope says.
 
@@ -442,14 +517,15 @@ def _run_entries(payload: Any, facts: Any = None) -> list[dict[str, str]]:
     # is not shown a JSON payload, a byte count or a file digest to get an answer.
     summary = _get(payload.get("result"), "summary")
     error = payload.get("error")
-    explained = isinstance(error, dict) and (str(error.get("code")), summary) in FAILURE_TEXT
+    explained = isinstance(error, dict) and _failure_text(str(error.get("code")), summary) is not None
     # A rendered mail read already says what was read and whether it is limited.
     explained = explained or mail is not None
     if isinstance(summary, str) and not isinstance(answer, str) and not explained:
         # The connector's own account of what the task did: a labelled result,
         # not JARVIS speaking (see ``_deliverable``), and subject to the same
         # boundary - a summary of a call that inspected nothing is not findings.
-        entries.append(_deliverable(_msg(NOT_INSPECTED) if withheld else summary, payload, known))
+        entries.append(_deliverable(_msg(NOT_INSPECTED) if withheld else _summary_text(summary, payload, known),
+                                    payload, known))
     task = payload.get("task")
     # The run's technical status line (command, run status, task id, stage,
     # connector) is not conversation: Active Workflow projects it, the live
@@ -554,8 +630,10 @@ def approval_card(payload: Any) -> dict[str, Any]:
     summary = str(_get(preview, "summary") or "")
     card = {
         # The connector's own sentence, in the interface language when JARVIS
-        # knows it (OUTBOUND_TEXT); otherwise exactly as the connector wrote it.
-        "summary": _msg(OUTBOUND_TEXT[summary]) if summary in OUTBOUND_TEXT else summary,
+        # knows it (OUTBOUND_TEXT); otherwise exactly as the connector wrote it -
+        # except K3's, whose unknown summary is one generic line (D-6).
+        "summary": (_msg(OUTBOUND_TEXT[summary]) if summary in OUTBOUND_TEXT
+                    else _msg(FOLDER_UNKNOWN) if _get(scope, "connector") == PROJECT_FOLDER_CONNECTOR else summary),
         "action": str(_get(scope, "action") or ""),
         "target": str(_get(scope, "target") or ""),
         "destination": str(_get(scope, "destination") or "(local)"),

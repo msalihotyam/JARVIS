@@ -344,7 +344,7 @@ class ChangeTests(K3Case):
     def test_h3_5_after_the_final_attestation_only_the_transaction_decides(self) -> None:
         done, path = self.late(lambda path: os.makedirs(path))
         self.assertEqual("failed", done["run_status"])
-        self.assertIn("hiçbir klasör oluşturulmadı", done["error"]["message"])
+        self.assertIn("no folder was created", done["error"]["message"])
         self.assertIsNone(self.memory.load_project_folder(self.p.id))
         other = self.folder("elsewhere")
         for name, change in (("link", lambda path: self.app("link", self.p.id, path=other)),
@@ -423,17 +423,17 @@ class PartialFailureTests(K3Case):
             return real(parent, leaf)
 
         path, message = self.run_failing((project_folders, "_create_child", {"side_effect": child}))
-        self.assertIn('Yalnızca ortak "JARVIS Projeleri" klasörü oluşturuldu', message)
-        self.assertIn("bağlı değil", message)
+        self.assertIn('Only the shared "JARVIS Projeleri" folder was created', message)
+        self.assertIn("Project link: not linked.", message)
         self.assertTrue(os.path.isdir(os.path.dirname(path)))
         self.assertFalse(os.path.exists(path))
 
     def test_h3_8_the_folder_created_but_not_linked(self) -> None:
         h6.CreatePartialFailureTests.insert_fails(self)
         path, message = self.run_failing()
-        self.assertIn("Proje klasörü oluşturuldu ama projeye bağlanamadı", message)
-        self.assertIn("yolu onay kartındaydı", message)
-        self.assertIn("Proje bağlantısı: bağlı değil", message)
+        self.assertIn("The project folder was created but could not be linked", message)
+        self.assertIn("its path was on the approval card", message)
+        self.assertIn("Project link: not linked", message)
         self.assertTrue(os.path.isdir(path))                                             # not deleted
         self.assertEqual([], self.rows("SELECT * FROM project_folder_links"))
 
@@ -445,11 +445,11 @@ class PartialFailureTests(K3Case):
             raise RuntimeError("after the commit")
 
         _, message = self.run_failing((self.memory, "link_explicit_user_project_folder", {"side_effect": then_fail}))
-        self.assertIn("Proje bağlantısı: bağlı.", message)
+        self.assertIn("Project link: linked.", message)
         self.p = self.memory.create_project("Alpha 2")
         h6.CreatePartialFailureTests.insert_fails(self)
         _, message = self.run_failing((project_folders, "_read_back", {"return_value": "unknown"}))
-        self.assertIn("Proje bağlantısı: bilinmiyor", message)
+        self.assertIn("Project link: unknown", message)
 
 
 # --------------------------------------------------------------------------

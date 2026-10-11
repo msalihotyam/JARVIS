@@ -71,7 +71,8 @@ _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 _FILE_OPEN_REPARSE_POINT = 0x00200000
 _FILE_ATTRIBUTE_TAG_INFO = 9
-_UNVERIFIED = "amaçlanan yol; konumu doğrulanamadı"
+#: A stable code, not words: the window shows its own localized suffix (D-6).
+_UNVERIFIED = "intended path; location not verified"
 _BIDI = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 _FORBIDDEN_CHARS = frozenset('<>:"|?*')
 _DRIVE_ABSOLUTE = re.compile(r"[A-Za-z]:\\")
