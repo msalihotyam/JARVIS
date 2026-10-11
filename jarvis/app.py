@@ -1700,7 +1700,7 @@ def project_file_result(
 
 
 def _folder_protected(memory: SQLiteMemoryStore, settings: Settings) -> tuple[Path, ...]:
-    """JARVIS's own folders, which no project folder may be in or contain."""
+    """JARVIS's own folders: no project folder may be one of them or inside one."""
     home = Path.home()
     own = (
         memory.database_path.parent,
@@ -1723,8 +1723,8 @@ def project_folder_result(
     path: str | None = None,
     on_desktop: bool = False,
 ) -> CommandResult:
-    """``show`` / ``propose`` / ``link`` / ``unlink`` / ``create`` one project's
-    folder (Gate 6H H1, H1b). ``link`` is THE audited production caller of the
+    """``show`` / ``propose`` / ``check`` / ``link`` / ``unlink`` / ``create`` one
+    project's folder (Gate 6H H1, H1b). ``link`` is THE audited production caller of the
     store's explicit-user folder boundary: the path is the person's own pick.
     ``create`` (K1) creates the folder at ``path`` only when it EQUALS what
     ``propose_folder`` gives NOW for the stored name (D1): the person's click
@@ -1750,6 +1750,20 @@ def project_folder_result(
             link = memory.load_project_folder(project_id)
             shown = None if link is None else link.to_dict()
             return CommandResult({"command": command, "project_id": project_id, "folder": shown}, EXIT_OK)
+        if action == "check":
+            # K3 "Choose an existing folder…": the link's own refusals, asked
+            # BEFORE the pending request is rejected, so a refused pick decides
+            # nothing. Reads only; ``link`` proves the folder again.
+            if not project.active:
+                raise ValueError(f"Project is archived: {project_id}")
+            if memory.load_project_folder(project_id) is not None:
+                raise ValueError("The project already has a linked folder; unlink it first.")
+            proven = project_folders.validate_folder(path, protected=protected)
+            for other in memory.list_projects():
+                link = None if other.id == project_id else memory.load_project_folder(other.id)
+                if link is not None and project_folders.folders_overlap(proven, link.path):
+                    raise ValueError("That folder, or one inside or around it, is linked to another project.")
+            return CommandResult({"command": command, "project_id": project_id, "folder": None}, EXIT_OK)
         if action == "propose":
             if not project.active:
                 raise ValueError(f"Project is archived: {project_id}")

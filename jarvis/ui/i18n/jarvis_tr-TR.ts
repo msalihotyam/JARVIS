@@ -606,6 +606,30 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Bu klasör ya da içindeki veya onu içeren bir klasör başka bir projeye bağlı.</translation>
     </message>
     <message>
+        <source>The project needs a name.</source>
+        <translation>Projenin bir adı olmalı.</translation>
+    </message>
+    <message>
+        <source>The Desktop or Documents folder could not be found.</source>
+        <translation>Masaüstü veya Belgeler klasörü bulunamadı.</translation>
+    </message>
+    <message>
+        <source>A possible folder name could not be checked.</source>
+        <translation>Olası bir klasör adı denetlenemedi.</translation>
+    </message>
+    <message>
+        <source>A folder or file with that name already exists. Nothing was reused.</source>
+        <translation>Bu adda bir klasör veya dosya zaten var. Hiçbir şey yeniden kullanılmadı.</translation>
+    </message>
+    <message>
+        <source>A folder can be created only on the Desktop or in the JARVIS Projeleri folder in Documents.</source>
+        <translation>Klasör yalnızca Masaüstünde veya Belgeler içindeki JARVIS Projeleri klasöründe oluşturulabilir.</translation>
+    </message>
+    <message>
+        <source>The created folder could not be verified as the approved one.</source>
+        <translation>Oluşturulan klasörün onaylanan klasör olduğu doğrulanamadı.</translation>
+    </message>
+    <message>
         <source>The folder path is too long.</source>
         <translation>Klasör yolu çok uzun.</translation>
     </message>
@@ -620,6 +644,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>No folder is linked to this project.</source>
         <translation>Bu projeye bağlı klasör yok.</translation>
+    </message>
+    <message>
+        <source>The folder could not be created.</source>
+        <translation>Klasör oluşturulamadı.</translation>
+    </message>
+    <message>
+        <source>Every possible folder name for this project is already taken.</source>
+        <translation>Bu proje için olası her klasör adı zaten kullanılıyor.</translation>
     </message>
     <message>
         <source>The project store is unavailable.</source>

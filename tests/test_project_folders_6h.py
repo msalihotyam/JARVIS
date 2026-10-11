@@ -472,7 +472,7 @@ class KnownFolderTests(FolderCase):
                         mock.patch.object(Path, "home", side_effect=AssertionError("Path.home fallback")), \
                         mock.patch.dict(os.environ, {"USERPROFILE": "Z:\\no-fallback"}):
                     for kind in ("desktop", "documents"):
-                        with self.assertRaisesRegex(ValueError, "bulunamadı"):
+                        with self.assertRaisesRegex(ValueError, "^The Desktop or Documents folder could not be found\\.$"):
                             project_folders.known_folder(kind, protected=())
                 with mock.patch.object(project_folders, "_shell_known_folder", **value):
                     result = self.app("propose", self.p.id)

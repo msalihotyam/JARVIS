@@ -1483,6 +1483,18 @@ class Bridge(QObject):
             QT_TRANSLATE_NOOP("Bridge", "This project already has a linked folder. Unlink it first."),
         "That folder, or one inside or around it, is linked to another project.":
             QT_TRANSLATE_NOOP("Bridge", "That folder, or a folder inside or around it, is linked to another project."),
+        # 6H K1 / K3: proposing and creating a folder.
+        "project name must be a non-blank string": QT_TRANSLATE_NOOP("Bridge", "The project needs a name."),
+        "The Desktop or Documents folder could not be found.":
+            QT_TRANSLATE_NOOP("Bridge", "The Desktop or Documents folder could not be found."),
+        "A proposed folder could not be inspected.":
+            QT_TRANSLATE_NOOP("Bridge", "A possible folder name could not be checked."),
+        "A folder or file with that name already exists; nothing is reused.":
+            QT_TRANSLATE_NOOP("Bridge", "A folder or file with that name already exists. Nothing was reused."),
+        "A folder is created only on the Desktop or in Documents\\JARVIS Projeleri.":
+            QT_TRANSLATE_NOOP("Bridge", "A folder can be created only on the Desktop or in the JARVIS Projeleri folder in Documents."),
+        "The created folder could not be proven to be the approved one.":
+            QT_TRANSLATE_NOOP("Bridge", "The created folder could not be verified as the approved one."),
     }
     _FOLDER_REASON_PREFIXES = (
         # Its example path comes back redacted ("[PATH]").
@@ -1492,6 +1504,9 @@ class Bridge(QObject):
         ("Project is archived: ", QT_TRANSLATE_NOOP("Bridge", "The project is archived: its folder link cannot change.")),
         ("Unknown project: ", QT_TRANSLATE_NOOP("Bridge", "The project no longer exists.")),
         ("No folder is linked to this project: ", QT_TRANSLATE_NOOP("Bridge", "No folder is linked to this project.")),
+        # Its status code is for the log.
+        ("The folder could not be created", QT_TRANSLATE_NOOP("Bridge", "The folder could not be created.")),
+        ("No free folder name up to ", QT_TRANSLATE_NOOP("Bridge", "Every possible folder name for this project is already taken.")),
     )
 
     def _folder_reason(self, message: str) -> str:
@@ -3078,10 +3093,14 @@ class Bridge(QObject):
 
     # -- slots: approval / task ------------------------------------------
 
-    def _decide(self, verb: str, request_id: str | None = None, fingerprint: str | None = None) -> bool:
+    def _decide(self, verb: str, request_id: str | None = None, fingerprint: str | None = None,
+                after: tuple[Callable[[], None], Callable[[], None]] | None = None) -> bool:
         """Submit one decision for the request ON SCREEN. With an identity, it
         must still be the current request - a newer revision is never decided
-        with an older rendering. Core re-proves the ticket either way."""
+        with an older rendering. Core re-proves the ticket either way.
+        ``after`` (6H K3 pick-existing): ``(work, shown)`` - ``work`` runs on
+        the worker once Core has answered (or the call failed); ``shown`` runs
+        when that answer is delivered, to whichever conversation."""
         ticket = self._ticket
         if ticket is None or self._busy or not self._approval.get("complete"):
             return False
@@ -3099,10 +3118,24 @@ class Bridge(QObject):
                           "code": "", "message": "", "time": ""}
         self.approvalChanged.emit()
         call = self.backend.approve if verb == "approve" else self.backend.reject
-        self._run("task", lambda: call(ticket), self._delivered(
+        work, then = after or (lambda: None, lambda: None)
+
+        def decided() -> Any:
+            try:
+                return call(ticket)
+            finally:
+                work()
+
+        deliver = self._delivered(
             lambda payload: self._apply_decision(payload, verb, ticket, shown),
-            project=lambda prior, payload: _kept_refusal(_project_run(prior, payload), payload, ticket, shown)),
-            executing=verb == "approve")
+            project=lambda prior, payload: _kept_refusal(_project_run(prior, payload), payload, ticket, shown))
+
+        def delivered(payload: Any) -> None:
+            deliver(payload)
+            then()                      # whichever conversation the answer went to
+
+        vars(delivered).update(vars(deliver))       # the run record reads the origin and snapshots
+        self._run("task", decided, delivered, executing=verb == "approve")
         return True
 
     def _apply_decision(self, payload: Any, verb: str, ticket: ApprovalTicket | None = None,
@@ -3200,6 +3233,41 @@ class Bridge(QObject):
 
         self._run("task", lambda: self.backend.project_folder_switch(ticket), self._delivered(self._k3_switched_to, project=kept))
         return True
+
+    @Slot(str, str, str, str, result=bool)
+    def pickExistingFolder(self, project_id: str, request_id: str, fingerprint: str, path: str) -> bool:
+        """K3 "Choose an existing folder…" for the project and request the
+        picker was bound to. The pick is checked first (reads only): a refused
+        folder decides nothing. Then the request ON SCREEN is rejected through
+        Core while its project is still folderless, so it ends REJECTED, and
+        the folder is linked right after Core's answer, whatever it was. While
+        an operation runs, the request on screen is not picked for (nothing
+        changes; pick again). A request not on this screen stays pending and
+        the folder is linked at once: Core never runs a K3 request for a
+        project that has a folder. Nothing is created either way."""
+        project_id, path = str(project_id), str(path)
+        ticket = self._ticket
+        if self._busy and ticket is not None and (ticket.request_id, ticket.fingerprint) == (str(request_id), str(fingerprint)):
+            return False
+        if not project_id or not self._folder_change("check", project_id, path=path):
+            return False
+        store, loaded = self._conversation_db(), self.backend.store.load()
+        said: list[str] = []
+
+        def link() -> None:
+            try:
+                said.append(self._error_message(project_folder_result(
+                    store, loaded.settings, "link", project_id, path=path).payload))
+            except Exception as exc:  # noqa: BLE001 - storage boundary: only the type
+                said.append(type(exc).__name__)
+
+        def shown() -> None:
+            self._project_folder_notice = self._folder_reason(said[0]) if said and said[0] else ""
+            self.refreshProjects()
+
+        if self._decide("reject", request_id, fingerprint, after=(link, shown)):
+            return True
+        return self._folder_change("link", project_id, path=path)
 
     def _k3_switched_to(self, payload: Any) -> None:
         if isinstance(payload, dict) and payload.get("run_status"):

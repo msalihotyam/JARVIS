@@ -32,23 +32,18 @@ rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
 
 ## Open blockers
 
-**G6H3POL (6H follow-up D-6/F-2/B-1, T2) BLOCKED, 2026-10-11:** worktree
-`.claude/worktrees/g6h3pol`, branch `g6h3pol` (base 8ebe7e3). The required
-full suite was killed by the host for low memory before it finished, so the
-code is left uncommitted (patch copy: `build/reports/G6H3POL.patch`). Done
-and targeted-green (135 OK, skipped=1), one independent review (1 MAJOR + 2
-MINOR + 1 NIT fixed): F-2 (pick-existing checks the folder read-only, rejects
-through Core, then links: REJECTED), B-1, and D-6 for the English refusals
-plus project_folders' Turkish one. D-6 remainder needs files this lane did
-not own: `tests/test_g6h1b_ui.py` (asserts app.py's Turkish K1 text),
-`tests/test_g6h2_folder_ui.py` (asserts raw pass-through, blocks the generic
-fallback), `jarvis/ui/present.py` (connector messages via Core envelopes).
-Uncommitted: ARCHITECTURE.md, jarvis/app.py, jarvis/project_folders.py,
-jarvis/ui/bridge.py, jarvis/ui/i18n/jarvis_tr-TR.ts + .qm,
-jarvis/ui/qml/components/ApprovalCard.qml + SafetyCards.qml,
-tests/test_g6h3pol.py (new), tests/test_project_folder_k3.py,
-tests/test_project_folders_6h.py. Next: full suite once on a machine with
-free memory, then commit. Report: `build/reports/G6H3POL.md`.
+**G6H3POL (6H follow-up D-6/F-2/B-1, T2) green, 2026-10-11 (G6H3POLB):**
+committed on lane branch `g6h3pol` (base 8ebe7e3; pick 81bccb8, then the
+fix commit); not integrated, not pushed. Targeted 135 OK (skipped=1); full
+suite `test_parallel.py --workers 4 --ui-workers 2` 5394 OK (skipped=2),
+1301 s, no rule D reruns. One independent review (1 MAJOR + 2 MINOR + 1 NIT
+fixed). F-2: pick-existing checks the folder read-only, rejects through
+Core, then links, so the request ends REJECTED. B-1 docstring. D-6 for the
+English refusals plus project_folders' Turkish one. Left for the V2.1 list
+(via G6DOCS): the D-6 remainder (`tests/test_g6h1b_ui.py`,
+`tests/test_g6h2_folder_ui.py`, `jarvis/ui/present.py`, the _UNVERIFIED
+suffix) and the FAILED residual when the proposal changed before Core's
+reject (needs core.py). Reports: `build/reports/G6H3POL.md`, `G6H3POLB.md`.
 
 **G6H3 (6H H3 K3 chat approval card, T2) green, 2026-10-11 (G6H3C):**
 committed on lane branch `worktree-G6H3` (base fea0ead); integrated on local main by INT26, not pushed.

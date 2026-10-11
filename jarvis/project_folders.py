@@ -21,6 +21,10 @@ user links an existing folder; a later UI shows such a folder as missing.
 Every helper takes the JARVIS-protected roots explicitly (``protected``);
 none reads Settings for them. The fixed system locations (Windows, Program
 Files, ProgramData, the profile root) are refused by this module itself.
+
+A refusal is a stable English sentence: a reason code for logs and the CLI,
+which the window maps to words in its own language (``Bridge._FOLDER_REASONS``).
+A message is data, never authority.
 """
 
 from __future__ import annotations
@@ -394,7 +398,7 @@ def _known_path(kind: str) -> str:
     except Exception:  # noqa: BLE001 - any failure refuses, no fallback
         found = None
     if not found:
-        raise ValueError("Masaüstü/Belgeler klasörü bulunamadı.")
+        raise ValueError("The Desktop or Documents folder could not be found.")
     return found
 
 

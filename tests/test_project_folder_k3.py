@@ -844,7 +844,7 @@ class CardTests(h1b.Case):
         self.assertTrue(cards)
         return root, cards[0]
 
-    def test_h3_11_choose_an_existing_folder_links_first_then_rejects(self) -> None:
+    def test_h3_11_choose_an_existing_folder_rejects_first_then_links(self) -> None:
         bridge = self.pending()
         old = bridge._ticket
         root, card = self.card(bridge)
@@ -863,9 +863,9 @@ class CardTests(h1b.Case):
         store = self.db()
         self.assertEqual((str(existing), "picked"), (store.load_project_folder(self.project.id).path,
                                                      store.load_project_folder(self.project.id).origin))
-        # Rejected after the link: Core re-attests first, so the now linked
-        # project ends it (terminal either way); nothing was created by K3.
-        self.assertIn(store.load_task(old.task_id).status.value, ("rejected", "failed"))
+        # Rejected BEFORE the link (G6H3POL F-2): Core re-attests a still
+        # folderless project, so the request ends REJECTED; nothing was created by K3.
+        self.assertEqual("rejected", store.load_task(old.task_id).status.value)
         self.assertFalse(bridge.approveRequest(old.request_id, old.fingerprint))       # nothing left to approve
         self.assertEqual(["Var olan"], self.made())
 
@@ -875,10 +875,13 @@ class CardTests(h1b.Case):
         root, card = self.card(bridge)
         QMetaObject.invokeMethod(card, "bindPicker")
         existing = self.folder("Var olan")
-        bridge._busy = True                                   # the rejection is refused
+        bridge._busy = True                                   # the rejection would be refused:
         QMetaObject.invokeMethod(card, "linkPicked", Q_ARG("QVariant", str(existing)))
         bridge._busy = False
         pump(30)
+        self.assertIsNone(self.db().load_project_folder(self.project.id))   # so nothing is picked (G6H3POL)
+        # Linked elsewhere (the project page) while the request is pending.
+        self.assertTrue(bridge.linkProjectFolder(self.project.id, str(existing)))
         store = self.db()
         self.assertEqual("picked", store.load_project_folder(self.project.id).origin)
         self.assertIsNotNone(store.load_pending_approval(old.task_id, old.session_id))
@@ -935,7 +938,7 @@ class CardTests(h1b.Case):
                          (new["target"], new["folder_location"], new["folder_project"]))
         settled(300, lambda: self.assertIs(True, self.under(card, "k3OnDesktop")[0].property("checked")))
         self.assertEqual((calls, []), (len(self.model.calls), self.made()))                # no model call, nothing made
-        # "Var olan klasörü seç…" on the main card: links first, then rejects.
+        # "Var olan klasörü seç…" on the main card: rejects first, then links.
         picker = card.findChild(QObject, "k3FolderPicker")
         QMetaObject.invokeMethod(card, "bindPicker")
         self.assertEqual((self.project.id, new["request_id"]), (picker.property("projectId"), picker.property("requestId")))
@@ -949,7 +952,7 @@ class CardTests(h1b.Case):
         store = self.db()
         self.assertEqual((str(existing), "picked"), (store.load_project_folder(self.project.id).path,
                                                      store.load_project_folder(self.project.id).origin))
-        self.assertIn(store.load_task(new["task_id"]).status.value, ("rejected", "failed"))
+        self.assertEqual("rejected", store.load_task(new["task_id"]).status.value)
         self.assertFalse(bridge.approvalPending)
         self.assertEqual(["Var olan"], self.made())
 

@@ -3672,6 +3672,17 @@ kullanıcıya gösterilir.
   çağırır). E7: "Masaüstünde
   oluştur" isteği Core'dan reddeder, sonra (donuk değilse) aynı proje ve
   oturum için öbür konumda yeni istek açar (model çağrısı yok, istek başına
-  bir kez); "Var olan klasörü seç…" önce bağlar, sonra isteği reddeder;
-  ikisi de onaylamaz ve ikisi de hem ana onay kartında (`SafetyCards.qml`)
+  bir kez); "Var olan klasörü seç…" (G6H3POL F-2, `Bridge.pickExistingFolder`)
+  seçimi önce yalnız okuyarak denetler (`project_folder_result` "check":
+  arşiv, mevcut bağlantı, yol kanıtı, başka projenin bağlantısıyla çakışma;
+  reddedilen seçim hiçbir şeye karar vermez, kart kalır), sonra ekrandaki
+  isteği proje henüz klasörsüzken Core'dan reddeder (görev REJECTED biter;
+  Core'un tasdiki atlanmaz) ve Core'un yanıtından hemen sonra, yanıt ne
+  olursa olsun, klasörü bağlar. Bir işlem sürerken ekrandaki istek için
+  seçim yapılmaz (hiçbir şey değişmez). Ekranda olmayan istek (başka sohbet)
+  beklemede kalır ve klasör hemen bağlanır; bağlı projede K3 isteği asla
+  çalışmaz. Kalıntı:
+  Core reddetmeden önce öneri değişmişse (ör. kişi önerilen yolda klasörü
+  kendisi açtıysa) görev yine FAILED biter; hiçbir şey oluşturulmaz.
+  İkisi de onaylamaz ve ikisi de hem ana onay kartında (`SafetyCards.qml`)
   hem Command kartında (`ApprovalCard.qml`) vardır.

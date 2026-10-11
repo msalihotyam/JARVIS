@@ -288,7 +288,7 @@ Column {
 
             // Gate 6H H3 (K3): "Var olan klasörü seç…" - the picker is bound to the
             // request's project, request id and fingerprint as they were at the click.
-            // The link comes first; only a successful link rejects the request.
+            // The bridge checks the pick, rejects the request (it ends REJECTED), then links.
             function bindPicker() {
                 k3Picker.projectId = approvalCard.a.folder_project || ""
                 k3Picker.requestId = approvalCard.a.request_id || ""
@@ -300,8 +300,8 @@ Column {
                     k3Picker.open()
             }
             function linkPicked(path) {
-                if (k3Picker.projectId !== "" && bridge.linkProjectFolder(k3Picker.projectId, path))
-                    bridge.rejectRequest(k3Picker.requestId, k3Picker.fingerprint)
+                if (k3Picker.projectId !== "")
+                    bridge.pickExistingFolder(k3Picker.projectId, k3Picker.requestId, k3Picker.fingerprint, path)
             }
         }
 
