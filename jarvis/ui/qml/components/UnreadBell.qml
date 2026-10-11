@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Shapes
 import "../theme"
 
 // Gate 6G R3U: the top bar's bell. Its badge counts bridge.unreadBell - the
@@ -24,23 +23,11 @@ Item {
         id: button
         objectName: "unreadBellButton"
         anchors.fill: parent
+        icon: "bell"                // K1: the one icon set (18 px in this 38 px button)
         active: bell.open
         tip: bell.count > 0 ? qsTr("Waiting: %1").arg(bell.count) : qsTr("Nothing waiting")
         onClicked: if (bell.open) menu.close()
                    else menu.popupAt(button, Qt.point(0, button.height + 8), { trigger: button, flip: true })
-        // K1: drawn on the icon set's 18-unit grid, 1.6 stroke, round caps (icons.js has no bell yet).
-        Shape {
-            objectName: "unreadBellIcon"
-            anchors.centerIn: parent
-            width: 18; height: 18
-            preferredRendererType: Shape.CurveRenderer
-            ShapePath {
-                strokeColor: bell.open ? Theme.accent : button.hovered ? Theme.text : Theme.textLabel
-                strokeWidth: 1.6; fillColor: "transparent"
-                joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
-                PathSvg { path: "M4.5 12.5 L4.5 8 A4.5 4.5 0 0 1 13.5 8 L13.5 12.5 L15 14 L3 14 Z M7.3 16.3 L10.7 16.3 M9 1.8 L9 3.5" }
-            }
-        }
     }
     Rectangle {
         objectName: "unreadBellBadge"

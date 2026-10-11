@@ -207,6 +207,13 @@ Item {
         default: return qsTr("SYSTEM")
         }
     }
+    // K3: a result's capability as a word, never the raw id (unknown reads "Other
+    // capability"); a feed without the localization context names none.
+    function capabilityPart(code) {
+        if (!code || typeof i18n === "undefined") return ""
+        i18n.language
+        return "  ·  " + i18n.word("capability", code)
+    }
 
     Flickable {
         id: flick
@@ -362,7 +369,7 @@ Item {
                             // the operator's bubble needs none; the rest are labelled.
                             Text { visible: row.loud || row.isResult || row.kind === "system" || row.kind === "scheduled" || row.kind === "data"
                                    text: feed.kindLabel(row.kind)
-                                         + (row.isResult && modelData.capability ? "  ·  " + modelData.capability : "")
+                                         + (row.isResult ? feed.capabilityPart(modelData.capability) : "")
                                          + (row.isResult && modelData.destination ? "  ·  " + modelData.destination : "")
                                    renderType: Theme.textRender
                                    color: row.tone

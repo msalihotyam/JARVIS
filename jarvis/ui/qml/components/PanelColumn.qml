@@ -435,7 +435,7 @@ Item {
                 v: workflowWell.approvalShown ? qsTr("Approval required") : workflowWell.has ? (column.statusWord(bridge.task.status) || "—") + (bridge.task.stage ? " / " + i18n.word("stage", bridge.task.stage) : "") : qsTr("No active task")
                 tip: workflowWell.has ? [bridge.task.status, bridge.task.stage].filter(function(c) { return !!c }).join(" · ") : "" }
             WRow { height: workflowWell.pitch; icon: "plug"; tint: Theme.accent; k: "Connector"; label: qsTr("Connector"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.connector || "—") : qsTr("Waiting for your request…") }
-            WRow { height: workflowWell.pitch; icon: "spark"; tint: Theme.accent; k: "Capability"; label: qsTr("Capability"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability || "—") : qsTr("Chosen by Core") }
+            WRow { height: workflowWell.pitch; icon: "spark"; tint: Theme.accent; k: "Capability"; label: qsTr("Capability"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.capability ? (i18n.language, i18n.word("capability", bridge.task.capability)) : "—") : qsTr("Chosen by Core") }
             WRow { height: workflowWell.pitch; icon: "arrow-up-right"; tint: Theme.accent; k: "Destination"; label: qsTr("Destination"); empty: !workflowWell.has; vColor: "#cfdceb"; v: workflowWell.has ? (bridge.task.destination || "—") : qsTr("Granted destinations only") }
             WRow { height: workflowWell.pitch; icon: "clock"; k: "Outcome"; label: qsTr("Outcome"); empty: !workflowWell.has; last: true
                 readonly property string kind: workflowWell.outcome.kind || ""

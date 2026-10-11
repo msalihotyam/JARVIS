@@ -4348,7 +4348,7 @@ class StateProjectionTests(UiTestCase):
         self.assertEqual(("No active task", "None yet"), (value("Status"), value("Outcome")))
         bridge.submitText("Bu projeyi incele.")
         pump(300)
-        self.assertEqual(("Approval required", "claude-code-plan", "code_analysis"),
+        self.assertEqual(("Approval required", "claude-code-plan", "Code analysis"),
                          (value("Status"), value("Connector"), value("Capability")))
         self.assertEqual(CLAUDE_CODE_DESTINATION, value("Destination"))
 
@@ -6566,7 +6566,7 @@ class ResponsePresentationTests(SurfaceCase):
         labels = [str(i.property("text")) for i in self.all_items(root)
                   if isinstance(i.property("text"), str) and "TASK RESULT" in str(i.property("text")) and i.isVisible()]
         self.assertEqual(1, len(labels))
-        self.assertIn("code_analysis", labels[0])
+        self.assertIn("Code analysis", labels[0])
         self.assertIn("anthropic/claude-code", labels[0])
         self.assertEqual([], [i for i in self.all_items(root) if i.objectName() == "feedAvatar_jarvis" and i.isVisible()])
         self.assertEqual([], [i for i in self.all_items(root) if i.objectName() == "feedCard_jarvis"])
