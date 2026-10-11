@@ -69,6 +69,13 @@ class WindowPowerFxTests(UiTestCase):
     def test_a_the_minimize_control_powers_down_then_minimizes_once(self) -> None:
         _bridge, root, fx, spy = self.window()
         control = self.minimize_control(root)
+        run = fx.findChild(QObject, "windowPowerRun")
+        # The effect's state at the minimize call - its own clock, not the wall clock (a loaded
+        # CI runner saw 0.195 s of wall time for the 220 ms Qt animation clock).
+        at_call = []
+        QObject.connect(fx, SIGNAL("minimizeNow()"), lambda: at_call.append(
+            (fx.property("phase"), fx.property("t"), fx.property("contentOpacity"), fx.property("ringR"),
+             run.property("running"))))
         started = time.monotonic()
         tap(root, control)
         self.assertEqual(("down", True, False, 1), (fx.property("phase"), fx.isVisible(), fx.isEnabled(), fx.property("plays")))
@@ -76,7 +83,8 @@ class WindowPowerFxTests(UiTestCase):
         tap(root, control)                                                        # a second click while it runs
         self.assertTrue(wait_until(lambda: spy.count() >= 1, 1000))
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 0.2)                                     # the effect ran first
+        # The effect ran first: the power-down timeline at its end, the veil fully opaque, the ring at the core.
+        self.assertEqual([("down", 1.0, 0.0, 0.0, False)], at_call)
         self.assertLessEqual(elapsed, CAP + LATENCY)
         self.assertEqual("Minimized", root.visibility().name)
         pump(400)
