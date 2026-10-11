@@ -226,7 +226,8 @@ class SidebarSearchTests(F6Case):
         self.assertFalse(self.shown(root, "sidebarNewChat"))
         self.assertEqual(["Sulama planı"], [r.property("name") for r in self.shown(root, "sidebarSearchTitleRow")])
         self.assertEqual(["Notlar"], [r.property("name") for r in self.shown(root, "sidebarSearchContentRow")])
-        self.assertEqual(["Global"], [r.property("scope") for r in self.shown(root, "sidebarSearchTitleRow")])
+        # G6UIPOL A-6 (V1: no "Genel" in the UI): a plain chat has no scope label.
+        self.assertEqual([""], [r.property("scope") for r in self.shown(root, "sidebarSearchTitleRow")])
         self.assertEqual(["Bahçe"], [r.property("scope") for r in self.shown(root, "sidebarSearchContentRow")])
         self.assertEqual(["sula"], [t.property("text") for t in self.shown(root, "sidebarSearchHit")])
         self.assertEqual(["TITLES"], [t.property("text") for t in self.shown(root, "sidebarSearchTitlesHead")])
@@ -295,7 +296,7 @@ class SidebarSearchTests(F6Case):
         self.item(root, "sidebarSearchField").setProperty("text", "sulama")
         wait_until(lambda: bool(self.shown(root, "sidebarSearchTitleRow")), 2000)
         self.assertEqual(["BAŞLIKLAR"], [t.property("text") for t in self.shown(root, "sidebarSearchTitlesHead")])
-        self.assertEqual(["Genel"], [r.property("scope") for r in self.shown(root, "sidebarSearchTitleRow")])
+        self.assertEqual([""], [r.property("scope") for r in self.shown(root, "sidebarSearchTitleRow")])   # G6UIPOL A-6: no "Genel" (V1)
         self.item(root, "sidebarSearchField").setProperty("text", "zzqq")
         wait_until(lambda: self.status(root) == "Sonuç yok", 2000)
         self.assertEqual("Sonuç yok", self.status(root))

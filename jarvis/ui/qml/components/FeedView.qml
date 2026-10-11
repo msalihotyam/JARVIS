@@ -662,11 +662,9 @@ Item {
                         MessageAction { id: copyAction; objectName: "messageCopy_" + index; label: qsTr("Copy"); confirmation: qsTr("Copied")
                                         onActivated: bridge.copyText(modelData.text) }
                         // Quoting adds a REFERENCE to the draft - it never writes into
-                        // the message being composed, and it authorizes nothing.
+                        // the message being composed, and it authorizes nothing. A selection
+                        // is quoted from the ONE floating button at it (Q1), not from here.
                         MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteMessage(modelData.id) }
-                        MessageAction { objectName: "messageQuoteSelection_" + index; label: qsTr("Quote selection")
-                                        visible: message.selectedText.length > 0
-                                        onActivated: feed.startQuote(message, modelData.id) }
                     }
                 }
             }

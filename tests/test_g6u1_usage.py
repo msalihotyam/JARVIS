@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tests.test_ui import _APP, pump  # noqa: F401 - the offscreen platform and the application
 
 import shiboken6  # noqa: E402
-from PySide6.QtCore import QDateTime, QLocale, QObject, QPointF, Qt, QUrl  # noqa: E402
+from PySide6.QtCore import QObject, QPointF, Qt, QUrl  # noqa: E402
 from PySide6.QtQml import QQmlComponent, QQmlEngine  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
@@ -191,11 +191,14 @@ class PopoverTests(UsageCase):
     def test_reset_times_read_as_human_times_and_a_missing_reset_is_hidden(self) -> None:
         self.ring.setProperty("rows", self.both)
         self.open_popover()
-        # G6MP1: under a day a countdown from the popover's clock, later the weekday and time.
+        # G6MP1: under a day a countdown from the popover's clock; later (G6UIPOL D-8,
+        # K3) its day and time from the window's one formatter, read against that clock.
+        from jarvis.ui.wording import human_date
         self.pop.setProperty("now", self.now.timestamp() * 1000)
         self.assertEqual("Resets in 2 h 30 min", self.text_in("usageRow_five_hour", "usageRowReset").property("text"))
-        self.assertEqual("Resets " + QLocale("en_US").toString(QDateTime.fromSecsSinceEpoch(self.week), "ddd HH:mm"),
-                         self.text_in("usageRow_weekly", "usageRowReset").property("text"))
+        later = human_date(self.week, self.now, "en_US", "time")
+        self.assertTrue(later.endswith(" 09:00"), later)
+        self.assertEqual("Resets " + later, self.text_in("usageRow_weekly", "usageRowReset").property("text"))
         self.ring.setProperty("rows", [dict(self.both[0], resets_at=0)])
         pump(10)
         self.assertFalse(self.text_in("usageRow_five_hour", "usageRowReset").isVisible())

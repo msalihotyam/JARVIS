@@ -356,7 +356,9 @@ requirement):** the machine is not idle. If, in a required run, the ONLY
 failures are tests on the load-sensitive list in `JARVIS_ACTIVE_STATE.md`
 (only the orchestrator adds to it), each is rerun ALONE once; if all pass the
 run counts as green and both results are recorded. Any other failure blocks.
-The parallel runner applies this itself.
+The parallel runner applies this itself only to listed `test_ui` ids
+(`scripts/test_parallel.py` `load_sensitive`); any other listed test that
+fails is rerun alone by hand.
 
 **Rule D addendum (Salih 2026-10-08):** if a required full suite fails only on
 tests NOT on the load-sensitive list, and each of them passes when rerun alone,

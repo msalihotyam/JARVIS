@@ -112,7 +112,8 @@ Item {
         readonly property bool available: !bridge.navigationLocked
         readonly property bool current: row.item.id === bridge.conversationId
         readonly property string name: row.item.title || (row.item.legacy ? qsTr("Previous conversation") : qsTr("New Chat"))
-        readonly property string scope: row.item.project_id ? row.item.project_name : qsTr("Global")
+        // V1: no "Genel" in the UI - a plain chat shows no scope, a project chat its project.
+        readonly property string scope: row.item.project_id ? (row.item.project_name || "") : ""
         function pick() { if (available) bridge.openConversation(row.item.id) }
         width: parent ? parent.width : 0
         height: content ? search.rowH + 18 : search.rowH
@@ -122,7 +123,7 @@ Item {
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
-        Accessible.name: name + ", " + scope
+        Accessible.name: scope ? name + ", " + scope : name
         Accessible.onPressAction: pick()
         Keys.onReturnPressed: pick()
         Keys.onSpacePressed: pick()

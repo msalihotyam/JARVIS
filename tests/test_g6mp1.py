@@ -32,7 +32,13 @@ ACCENT = "#20c7f6"
 
 
 def weekday(epoch: int, locale: str) -> str:
-    return QLocale(locale).toString(QDateTime.fromSecsSinceEpoch(epoch), "ddd HH:mm")
+    """G6UIPOL D-8 (K3, one date formatter): a reset a day or more away reads
+    as the window's one formatter says it ("time": "18 Oct 22:00"), no longer
+    a popover-only "ddd HH:mm"."""
+    from datetime import datetime
+
+    from jarvis.ui.wording import human_date
+    return human_date(epoch, datetime.now().astimezone(), locale, "time")
 
 
 class PopoverCase(UsageCase):

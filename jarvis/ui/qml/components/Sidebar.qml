@@ -401,11 +401,8 @@ Rectangle {
             return g
         }).filter(function (g) { return plainOpen ? g.items.length > 0 : g.shown.length > 0 })
     }
-    function when(c) {
-        var t = stamp(c.updated_at)
-        // Today / yesterday the time of day; earlier its day from the one formatter.
-        return isNaN(t) ? "" : t < yesterday ? i18n.when(c.updated_at, today, "day") : new Date(t).toLocaleString(Qt.locale(i18n.qtLocale), "HH:mm")
-    }
+    // K3: the one formatter, the tree rows' rule - today its time, else its day.
+    function when(c) { return i18n.when(c.updated_at, today, "short") }
     // T1: the project tree, flat - a project row, then (open) its unpinned
     // conversations newest first; a collapsed one keeps only the open one.
     readonly property var treeRows: {

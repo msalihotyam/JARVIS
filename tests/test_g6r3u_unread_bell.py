@@ -136,7 +136,8 @@ class BellTests(BellCase):
         pump(100)
         self.assertEqual([self.tezc[1].id, self.older.id], [e["id"] for e in bridge.unreadBell])
         menu = self.open_bell(root)
-        self.assertEqual([("Tez 1", "Tez", "Finished"), ("Düz eski", "Global", "Finished")], self.entries(root))
+        # G6UIPOL A-6 (V1: no "Genel" in the UI): a plain chat's entry has no scope line.
+        self.assertEqual([("Tez 1", "Tez", "Finished"), ("Düz eski", "", "Finished")], self.entries(root))
         entry = [e for e in self.all_items(root, "unreadBellEntry") if e.property("label") == "Tez 1"][0]
         self.tap(root, entry, until=lambda: bridge.conversationId == self.tezc[1].id)
         self.assertEqual(self.tezc[1].id, bridge.conversationId)
@@ -167,9 +168,11 @@ class BellTests(BellCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Okunmadı olarak işaretle", tx("ConversationMenu", "Mark as unread"))
-        self.assertEqual(["Bekleyen bir şey yok", "Bekleyen: %1", "Seni bekliyor", "Bitti", "Genel"],
+        self.assertEqual(["Bekleyen bir şey yok", "Bekleyen: %1", "Seni bekliyor", "Bitti"],
                          [tx("UnreadBell", s) for s in ("Nothing waiting", "Waiting: %1", "Waiting for you",
-                                                        "Finished", "Global")])
+                                                        "Finished")])
+        # G6UIPOL A-6: the bell no longer says "Genel" (V1), so it has no such string.
+        self.assertNotIn('qsTr("Global")', (QML_DIR / "components" / "UnreadBell.qml").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

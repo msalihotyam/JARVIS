@@ -1764,10 +1764,6 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Alıntıla</translation>
     </message>
     <message>
-        <source>Quote selection</source>
-        <translation>Seçileni alıntıla</translation>
-    </message>
-    <message>
         <source>Jump to latest message</source>
         <translation>En son mesaja git</translation>
     </message>
@@ -4122,10 +4118,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Yeni Sohbet</translation>
     </message>
     <message>
-        <source>Global</source>
-        <translation>Genel</translation>
-    </message>
-    <message>
         <source>old summary</source>
         <translation>eski özet</translation>
     </message>
@@ -4831,10 +4823,6 @@ DOĞRULANMADI</translation>
     <message>
         <source>New Chat</source>
         <translation>Yeni Sohbet</translation>
-    </message>
-    <message>
-        <source>Global</source>
-        <translation>Genel</translation>
     </message>
     <message>
         <source>Waiting for you</source>

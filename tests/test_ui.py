@@ -4951,7 +4951,8 @@ class ConversationUxTests(UiTestCase):
         pump(300)
         rows = [item for item in self.all_items(root) if item.objectName() == "feedMessage_jarvis"]
         reply = rows[0]
-        self.assertFalse(self.item(root, "messageQuoteSelection_1").property("visible"))   # nothing selected
+        tip = self.item(root, "quoteTip")
+        self.assertFalse(tip.property("shown"))                                          # nothing selected
         QMetaObject.invokeMethod(reply, "select", Q_ARG(int, 14), Q_ARG(int, 35))
         pump(50)
         # Only the selection. A rendered document marks a block boundary with
@@ -4959,8 +4960,13 @@ class ConversationUxTests(UiTestCase):
         # leaves the UI carries newlines for both (asserted below).
         shown = reply.property("selectedText").replace("\u2029", "\n").replace("\u2028", "\n")
         self.assertEqual("şöyle.\nİkinci satır ✅", shown)
-        self.assertTrue(self.item(root, "messageQuoteSelection_1").property("visible"))
-        QMetaObject.invokeMethod(self.item(root, "messageQuoteSelection_1"), "activated")
+        # G6UIPOL A-7 (Q1): the selection is quoted from the ONE floating button at it;
+        # the message actions carry no second "Quote selection".
+        self.assertTrue(tip.property("shown"))
+        self.assertEqual([], [i for i in self.all_items(root) if i.objectName().startswith("messageQuoteSelection")])
+        button = self.item(root, "quoteTipButton")
+        QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier,
+                         button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint())
         pump(100)
         # A reference on the draft - not a word written into the message being composed.
         self.assertEqual("", self.item(root, "composerInput").property("text"))

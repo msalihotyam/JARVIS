@@ -35,6 +35,29 @@ from tests.test_ui import UiTestCase, _APP, ambient_on, open_usage_popover, pump
 EFFORTS = ["low", "medium", "high"]
 
 
+def theme_tokens() -> dict:
+    """G6UIPOL C-2/C-3: the real Theme values (ambient on) the motion and hover
+    checks assert against, read from the one Theme singleton - never literals."""
+    from PySide6.QtCore import QUrl
+    from PySide6.QtQml import QQmlComponent, QQmlEngine
+
+    from jarvis.ui.typography import FONT_DIR
+    engine = QQmlEngine()
+    component = QQmlComponent(engine)
+    component.setData(b"""import QtQuick
+import "theme"
+QtObject {
+    readonly property int panelIn: Theme.panelIn
+    readonly property int panelOut: Theme.panelOut
+    readonly property real menuRowHover: Theme.menuRowHover.a
+}""", QUrl.fromLocalFile(str(FONT_DIR.parent / "token_probe.qml")))
+    probe = component.create()
+    assert probe is not None, component.errorString()
+    values = {name: probe.property(name) for name in ("panelIn", "panelOut", "menuRowHover")}
+    engine.deleteLater()
+    return values
+
+
 def ids(rows) -> list[str]:
     return [r["id"] for r in rows]
 
@@ -441,8 +464,10 @@ class PolishTests(WindowCase):
         # At rest it is text, not a box: nothing is filled. Hover lifts it (eased in).
         self.assertEqual(0.0, hint.property("color").alphaF())
         self.hover(hint)
-        settle(lambda: hint.property("color").alphaF() > 0.03)
-        self.assertGreater(hint.property("color").alphaF(), 0.03)
+        # C-3: exactly the hover token (G6MP1: the row is a MenuRow, so Theme.menuRowHover).
+        lift = theme_tokens()["menuRowHover"]
+        settle(lambda: abs(hint.property("color").alphaF() - lift) < 0.003)
+        self.assertAlmostEqual(lift, hint.property("color").alphaF(), places=2)
         # Focus: the fine edge (only then).
         self.assertEqual(0, QQmlProperty.read(hint, "border.width"))
         hint.forceActiveFocus()
@@ -470,8 +495,9 @@ class PolishTests(WindowCase):
         self.assertTrue(toggle.property("activeFocusOnTab"))
         self.assertEqual(0.0, toggle.property("color").alphaF())
         self.hover(toggle)
-        settle(lambda: toggle.property("color").alphaF() > 0.03)
-        self.assertGreater(toggle.property("color").alphaF(), 0.03)
+        lift = theme_tokens()["menuRowHover"]                    # C-3: exactly the hover token
+        settle(lambda: abs(toggle.property("color").alphaF() - lift) < 0.003)
+        self.assertAlmostEqual(lift, toggle.property("color").alphaF(), places=2)
         self.assertEqual(0, QQmlProperty.read(toggle, "border.width"))
         toggle.forceActiveFocus()
         pump(60)
@@ -572,25 +598,26 @@ class PolishTests(WindowCase):
         bridge, root = self.stage(old=True, size=(1100, 700))
         tap(root, self.chip)
         settle(lambda: not self.menu.property("visible"))
+        tokens = theme_tokens()                                                      # C-2: the real tokens, never literals
         samples = SixEWindowCase.motion(self, root, self.menu)
         mark, called = len(samples), time.monotonic()
         tap(root, self.chip)                                                         # opens over panelIn
-        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, True, 170)
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, True, tokens["panelIn"])
         mark, called = len(samples), time.monotonic()
         tap(root, self.chip)                                                         # closes over panelOut
-        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, False, 140)
+        SixEWindowCase.assert_motion_within_token_plus_one_frame(self, samples, called, mark, False, tokens["panelOut"])
         # Hover lifts follow hoverMs too: the end state is held once reached.
         self.open_menu(root)
         hint = self.shown(root, "modelMenuRow_claude_opus")
         self.hover(hint)
-        settle(lambda: hint.property("color").alphaF() > 0.03)
+        settle(lambda: abs(hint.property("color").alphaF() - tokens["menuRowHover"]) < 0.003)
         # Ambient effects off: every one of them at once.
         bridge.setAmbientEffects(False)
         pump(100)
         toggle = self.shown(root, "modelMenuMore")
         self.assertEqual(0.0, toggle.property("color").alphaF())
         self.hover(toggle)
-        self.assertGreater(toggle.property("color").alphaF(), 0.03)                  # one pump, no animation
+        self.assertAlmostEqual(tokens["menuRowHover"], toggle.property("color").alphaF(), places=2)   # one pump, no animation
         tap(root, self.chip)
         pump(10)
         self.assertFalse(self.menu.property("visible"))                             # closed at once

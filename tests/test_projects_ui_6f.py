@@ -902,7 +902,9 @@ class SidebarNavTests(SidebarNavCase):
         self.assertEqual({"today": ["Bugün ilk"], "yesterday": ["Dün son", "Dün ilk"], "earlier": ["Daha eski"]}, groups)
         self.assertEqual(["Today", "Yesterday", "Earlier"], self.texts(root, "sidebarGroupLabel"))
         times = {row.property("title"): row.property("meta") for row in self.shown(root, "sidebarConversation")}
-        self.assertEqual(("00:00", "23:59", "00:00"), (times["Bugün ilk"], times["Dün son"], times["Dün ilk"]))
+        # G6UIPOL D-8 (K3, one formatter): a plain row reads like a tree row - today its
+        # time, yesterday its day (was its time).
+        self.assertEqual(("00:00", "yesterday", "yesterday"), (times["Bugün ilk"], times["Dün son"], times["Dün ilk"]))
         older = cases[3][1]
         self.assertEqual(f"{older.day} {older.strftime('%b')}", times["Daha eski"])
         # Empty groups are not shown.

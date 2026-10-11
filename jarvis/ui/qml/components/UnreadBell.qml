@@ -65,7 +65,7 @@ Item {
                     required property var modelData
                     objectName: "unreadBellEntry"
                     label: modelData.title || qsTr("New Chat"); muted: !modelData.title
-                    detail: modelData.project || qsTr("Global")
+                    detail: modelData.project || ""             // V1: no "Genel"; a plain chat shows no scope
                     shortcut: modelData.state === "needsYou" ? qsTr("Waiting for you") : qsTr("Finished")
                     available: !bridge.navigationLocked
                     onTriggered: { var b = bridge, id = modelData.id; menu.close()

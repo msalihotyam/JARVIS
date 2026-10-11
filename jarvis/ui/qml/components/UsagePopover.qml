@@ -4,8 +4,8 @@ import "../theme"
 // Gate 6G U3 (G6U1A), reshaped by G6MP1 ("ModelPanel A", Salih 2026-10-10) after
 // Claude's own plan-usage panel: "Plan usage limits · <plan>" (the plan only when
 // the provider reported it) and one row per window the provider REPORTED -
-// the title, when it resets ("in 2 h 41 min" under a day, else the weekday and
-// time) and the used share, over a bar filled to exactly that share in the one
+// the title, when it resets ("in 2 h 41 min" under a day, else its day and time
+// from the one formatter, K3) and the used share, over a bar filled to exactly that share in the one
 // accent colour. A window not reported is not drawn - never a 0; none reported
 // says so. Beneath, "Details": what only the retired Model panel showed (plan
 // facts, Web Research, extra paid usage, the last call's tokens), each line only
@@ -39,7 +39,7 @@ MenuSurface {
              : row.window === "weekly" ? qsTr("Weekly · all models")
              : qsTr("Weekly · %1").arg(row.model || row.window)
     }
-    // Under a day: how long until it resets; later: the weekday and time (the window's locale).
+    // Under a day: how long until it resets; later: its day and time from the one formatter (K3).
     function resetText(at) {
         const left = (Number(at) || 0) - now / 1000
         if (!(Number(at) > 0) || left <= 0) return ""
@@ -48,7 +48,7 @@ MenuSurface {
             return minutes >= 60 ? qsTr("Resets in %1 h %2 min").arg(Math.floor(minutes / 60)).arg(minutes % 60)
                                  : qsTr("Resets in %1 min").arg(minutes)
         }
-        return qsTr("Resets %1").arg(new Date(at * 1000).toLocaleString(Qt.locale(i18n.qtLocale), "ddd HH:mm"))
+        return qsTr("Resets %1").arg(i18n.when(Number(at), now, "time"))
     }
     readonly property var shown: rows.filter(r => r && used(r.window) !== null)
         .map(r => ({ window: r.window, title: rowTitle(r), used: used(r.window), reset: resetText(r.resets_at) }))
