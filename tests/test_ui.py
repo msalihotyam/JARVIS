@@ -2022,15 +2022,19 @@ def w_now():
 
 #: The real ``python -m jarvis.ui`` shape - ``raise SystemExit(main())`` - on
 #: throwaway state, quitting through the tray's Quit path after the first frames.
+#: ``import tests`` comes first: the live-database guard must hold in this child too.
 SHUTDOWN_SCRIPT = r'''
+import tests
 import os, sys, tempfile
+from dataclasses import replace
 from pathlib import Path
 from PySide6.QtCore import QCoreApplication, QTimer
 from jarvis.settings import ConfigStore
 from jarvis.ui import app as ui_app
 tmp = Path(tempfile.mkdtemp(prefix="jarvis-shutdown-test-"))
+store = ConfigStore(tmp / "config.json"); store.mutate(lambda s: replace(s, memory_database=tmp / "jarvis.db"))
 Backend, Prefs, engine_of, sweeps = ui_app.Backend, ui_app.UiPreferences, ui_app.create_engine, ui_app.install_scheduler_sweeps
-ui_app.Backend = lambda: Backend(ConfigStore(tmp / "config.json"))
+ui_app.Backend = lambda: Backend(store)
 Backend.provider_line = lambda self, pid: {"id": pid, "status": "not_installed", "models": []}   # no real provider CLI
 ui_app.UiPreferences = lambda: Prefs(tmp / "prefs.json")
 say = lambda what: os.write(2, (what + "\n").encode())
@@ -2119,6 +2123,32 @@ class ShutdownLifecycleTests(UiTestCase):
         self.assertIsNone(bridge._weather_reading)
         # Quitting is not Freeze, Cancel or a hide: the product state is untouched.
         self.assertEqual(before, (bridge.executionState, bridge.quitting, bridge.trayAvailable, bridge.quitWarning))
+
+
+class LiveDatabaseChildGuardTests(unittest.TestCase):
+    """A child process that imports ``tests`` first is refused the live database
+    too - before anything is created. Run in a temp-rooted copy of the layout, so
+    the default path it is refused is never the real checkout's data/."""
+
+    def test_a_child_that_imports_tests_cannot_open_the_default_database(self) -> None:
+        import subprocess
+        import sys
+        repo = Path(__file__).resolve().parents[1]
+        temp = tempfile.TemporaryDirectory(prefix="jarvis-live-guard-")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        shutil.copytree(repo / "jarvis", root / "jarvis", ignore=lambda folder, names: [
+            n for n in names if n == "__pycache__" or not (n.endswith(".py") or (Path(folder) / n).is_dir())])
+        (root / "tests").mkdir()
+        shutil.copy2(repo / "tests" / "__init__.py", root / "tests" / "__init__.py")
+        script = ("import tests\nfrom jarvis.memory import SQLiteMemoryStore\n"
+                  "print(tests.LIVE_DATABASE, flush=True)\nSQLiteMemoryStore(tests.LIVE_DATABASE)\n")
+        done = subprocess.run([sys.executable, "-c", script], cwd=root, env={**os.environ, "PYTHONPATH": str(root)},
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(str(root / "data" / "jarvis.db"), done.stdout.strip())   # the copy's default, not the checkout's
+        self.assertNotEqual(0, done.returncode)
+        self.assertIn("a test tried to open the live database", done.stderr)
+        self.assertFalse((root / "data").exists())
 
 
 class ConversationSurfaceTests(UiTestCase):

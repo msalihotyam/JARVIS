@@ -8,6 +8,13 @@ repair, the additive compatibility layer). So opening that exact path from a
 test process fails loudly instead. Production code is untouched: this guard
 exists only while the ``tests`` package is imported.
 
+CHILD PROCESSES TOO. The guard lives in the process that imported ``tests``;
+a ``python -c`` child does not inherit it. So a child that starts the app or
+opens a store imports ``tests`` FIRST (before any ``jarvis`` import) AND names
+a temporary ``memory_database``. The one exception is the clean-launch check
+in ``test_ui``, which must import only what ``jarvis.ui.app`` imports; it
+names its temporary database explicitly.
+
 THE SAME SUITE ON EVERY MACHINE. Two facts of the developer's machine used to
 leak into the results:
 
