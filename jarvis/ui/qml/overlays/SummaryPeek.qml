@@ -83,7 +83,7 @@ ContextPanel {
         case "Tasks": {
             var rows = []
             if (bridge.taskLive)
-                rows.push({ title: bridge.task.title || bridge.task.capability || qsTr("Current request"),
+                rows.push({ title: bridge.task.title || i18n.word("capability", bridge.task.capability || "") || qsTr("Current request"),
                             id: bridge.task.task_id || "", named: bridge.task.title || "",
                             sub: bridge.task.stage ? qsTr("Stage: %1").arg(i18n.word("stage", bridge.task.stage)) : (bridge.task.connector || qsTr("Live task")),
                             pill: r.statusWord(bridge.task.status) || qsTr("Running"), meta: qsTr("Now"),

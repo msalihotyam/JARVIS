@@ -248,13 +248,10 @@ class SidebarTests(Sweep, r3u.BellCase):
         self.assertTrue(self.shown(root, "sidebarStatusDot"))
         return bridge, root
 
-    @unittest.expectedFailure
     def test_a5_the_unread_bell_reads_in_both_themes(self) -> None:
-        """KNOWN, not this lane's file: the bell's state word ("Finished" / "Waiting for you") is
-        the shared K4 MenuRow's right-hand tail, inked Theme.textDim; on the menu's current
-        (first, highlighted) row it measures 4.01:1 in space and 4.05:1 in dark, under AA. The
-        fix is one token in MenuRow.qml (tail ink -> Theme.textMuted), left to its owner
-        (G6DARK report). This test then passes and the marker must go."""
+        """The bell's state word ("Finished" / "Waiting for you") is the shared K4 MenuRow's
+        right-hand tail. Inked Theme.textDim it measured 4.01:1 (space) / 4.05:1 (dark) on the
+        menu's current row; G6POL2 inks every MenuRow tail Theme.textMuted."""
         bridge, root = self.stage()
         menu = self.popup_named(root, "unreadBellMenu")
 

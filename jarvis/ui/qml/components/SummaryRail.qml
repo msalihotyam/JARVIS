@@ -85,7 +85,7 @@ Item {
             var at = ""
             for (var i = bridge.feed.length - 1; i >= 0; i--)
                 if (bridge.feed[i].task_id === t.task_id && bridge.feed[i].ts) { at = new Date(bridge.feed[i].ts * 1000).toISOString(); break }
-            return { name: t.title || t.capability || qsTr("Current request"), status: t.status, at: at }
+            return { name: t.title || i18n.word("capability", t.capability || "") || qsTr("Current request"), status: t.status, at: at }
         }
         var s = bridge.sessions.filter(function(r) { return !!r.latest_status })[0]
         return s ? { name: s.latest_title || s.title || qsTr("Current request"), status: s.latest_status, at: s.latest_updated_at || "" } : null
@@ -93,7 +93,7 @@ Item {
     readonly property var tasksTile: {
         var tile = { id: "tasks", key: "Tasks", title: qsTr("Tasks"), icon: "tasks", tone: "#4fd8ff" }
         if (rail.running) {
-            var name = bridge.task.title || bridge.task.capability || qsTr("Current request")
+            var name = bridge.task.title || i18n.word("capability", bridge.task.capability || "") || qsTr("Current request")
             var time = bridge.workStartedAt > 0 ? rail.clockOf(rail.tick - bridge.workStartedAt) : ""
             return Object.assign(tile, { value: time || rail.statusWord(bridge.task.status), word: !time, dot: Theme.accent,
                                          lines: [name], tip: time ? qsTr("%1 · running for %2").arg(name).arg(time) : name })

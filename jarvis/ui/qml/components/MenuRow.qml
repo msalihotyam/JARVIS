@@ -67,7 +67,7 @@ Rectangle {
                wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption }
     }
     Text { id: tail; visible: row.shortcut !== ""; anchors.right: parent.right; anchors.rightMargin: 12
-           anchors.verticalCenter: parent.verticalCenter; text: row.shortcut; color: Theme.textDim; font: Theme.caption }
+           anchors.verticalCenter: parent.verticalCenter; text: row.shortcut; color: Theme.textMuted; font: Theme.caption }
     MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                 onClicked: row.triggered() }
     HoverTip { text: row.label; active: labelText.truncated }
