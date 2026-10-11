@@ -50,7 +50,7 @@ Rectangle {
         Text { objectName: "projectCardInstruction"; width: parent.width; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
                textFormat: Text.PlainText; font: Theme.pageMeta
                text: card.project.instruction_line || qsTr("No instruction")
-               color: card.project.instruction_line ? Theme.textMuted : Theme.textDim }
+               color: Theme.textMuted }
     }
     Text { objectName: "projectCardActivity"; x: 16; anchors.bottom: parent.bottom; anchors.bottomMargin: 12
            width: parent.width - 32; elide: Text.ElideRight; textFormat: Text.PlainText

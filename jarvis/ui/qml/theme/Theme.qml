@@ -383,7 +383,7 @@ QtObject {
     property color textLabel: space ? "#b8c6d4" : "#b2c1cb"       // secondary: helper text, row sub-lines
     property color textMuted: space ? "#98aabb" : "#93a4b0"       // metadata, placeholder, timestamps
     readonly property color eventMetaInk: textLabel                // a live event's secondary lines
-    property color textDim: space ? "#6f8294" : "#6b7d89"         // tertiary / disabled
+    property color textDim: space ? "#6f8294" : command ? "#6b7d89" : "#71838f"   // tertiary / disabled; >= 4.5:1 on every glass (G6DARK)
     Behavior on text { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
     Behavior on textLabel { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }
     Behavior on textMuted { SequentialAnimation { PauseAnimation { duration: theme.dur(260) } ColorAnimation { duration: theme.dur(160); easing.type: Easing.InOutCubic } } }

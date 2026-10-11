@@ -142,7 +142,7 @@ Item {
             width: Math.min(implicitWidth, row.width * 0.4)
             x: row.width - 10 - width; anchors.verticalCenter: nameText.verticalCenter
             text: row.scope; textFormat: Text.PlainText; elide: Text.ElideRight
-            color: Theme.textDim; font: Theme.caption
+            color: Theme.textMuted; font: Theme.caption
         }
         Item {
             id: snippet
@@ -152,7 +152,7 @@ Item {
             width: row.width - 20; height: hitText.implicitHeight
             Text { id: markText; objectName: "sidebarSearchDigest"; visible: !!row.item.digest
                    width: visible ? implicitWidth + 6 : 0
-                   text: qsTr("old summary"); textFormat: Text.PlainText; color: Theme.textDim; font: Theme.caption }
+                   text: qsTr("old summary"); textFormat: Text.PlainText; color: Theme.textMuted; font: Theme.caption }
             Text { id: beforeText; objectName: "sidebarSearchBefore"; x: markText.width
                    width: Math.min(implicitWidth, Math.max(0, (snippet.width - x - hitText.width) * 0.4))
                    text: row.item.before || ""; textFormat: Text.PlainText; elide: Text.ElideLeft
@@ -176,7 +176,7 @@ Item {
     component Heading: Text {
         width: parent ? parent.width : 0; height: 22
         leftPadding: 10; bottomPadding: 3; verticalAlignment: Text.AlignBottom
-        textFormat: Text.PlainText; font: Theme.label; color: Theme.textDim
+        textFormat: Text.PlainText; font: Theme.label; color: Theme.textMuted
     }
     component Note: Text {
         width: parent ? parent.width : 0

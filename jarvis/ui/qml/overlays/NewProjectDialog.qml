@@ -165,7 +165,7 @@ JarvisDialog {
     Row {
         spacing: 8
         Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("What do you want to do?"); color: Theme.textLabel; font: Theme.pageMeta }
-        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("optional"); color: Theme.textDim; font: Theme.caption }
+        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("optional"); color: Theme.textMuted; font: Theme.caption }
     }
     Rectangle {
         width: parent ? parent.width : 0; height: 120; radius: 6
@@ -204,7 +204,7 @@ JarvisDialog {
     Row {
         spacing: 8
         Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("Link a folder"); color: Theme.textLabel; font: Theme.pageMeta }
-        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("optional"); color: Theme.textDim; font: Theme.caption }
+        Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("optional"); color: Theme.textMuted; font: Theme.caption }
     }
     Row {
         spacing: 8
@@ -245,7 +245,7 @@ JarvisDialog {
                      : dialog.name === "" ? qsTr("Type a name to see where the folder will be created.")
                      : dialog.previewKey === dialog.inputKey && dialog.previewNotice !== "" ? dialog.previewNotice
                      : qsTr("Finding the folder's place…")
-               color: dialog.folder !== "" || dialog.previewReady ? Theme.text : Theme.textDim; font: Theme.caption }
+               color: dialog.folder !== "" || dialog.previewReady ? Theme.text : Theme.textMuted; font: Theme.caption }
         ActionButton { id: clearFolder; objectName: "newProjectFolderClear"; compact: true; label: qsTr("Remove")
                        anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                        visible: (dialog.folder !== "" || dialog.makeFolder) && !dialog.waiting && dialog.finalId === ""
