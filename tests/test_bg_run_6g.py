@@ -25,6 +25,19 @@ from tests.test_intent import proposal, task_proposal
 from tests.test_ui import UiTestCase, pump, tiny_png
 
 TABLES = ("conversations", "conversation_sessions", "conversation_deletions")
+# Sized for a starved CI runner: the module ran 74 s there (7 s locally) and a
+# 10 s wait for the approval card timed out (run 38109324177). A healthy run
+# never comes near it; the waits end as soon as their condition holds.
+PATIENCE = 60
+
+
+def state(bridge) -> str:
+    """What the bridge showed when a wait gave up, for the failure message."""
+    feed = bridge.feed
+    return (f"busy={bridge.busy} approvalPending={bridge.approvalPending} "
+            f"conversation={bridge.conversationId!r} running={bridge.runningConversationId!r} "
+            f"coreState={bridge.coreState!r} task={bridge.task.get('status')!r} "
+            f"lastError={bridge._last_error!r} lastFeed={feed[-1]['text'] if feed else None!r}")
 
 
 class BackgroundRunTests(UiTestCase):
@@ -36,17 +49,17 @@ class BackgroundRunTests(UiTestCase):
 
         def hold(task) -> None:            # the paused provider call
             self.started.set()
-            self.gate.wait(10)
+            self.gate.wait(PATIENCE)
             self.provider_saw.extend(path.exists() for path in self.watch)
         self.model.on_complete = hold
 
     # -- helpers ---------------------------------------------------------------
 
-    def wait(self, condition, seconds: float = 10) -> None:
+    def wait(self, bridge, condition, what: str, seconds: float = PATIENCE) -> None:
         deadline = time.monotonic() + seconds
         while not condition() and time.monotonic() < deadline:
             pump(20)
-        self.assertTrue(condition())
+        self.assertTrue(condition(), f"after {seconds} s still not {what}: {state(bridge)}")
 
     def two(self, *answers, project: bool = False):
         """A (open) and B, Global unless ``project``; a threaded bridge."""
@@ -66,13 +79,14 @@ class BackgroundRunTests(UiTestCase):
         self.started.clear()
         self.gate.clear()
         self.assertTrue(bridge.submitText(text))
-        self.assertTrue(self.started.wait(5))
+        self.assertTrue(self.started.wait(PATIENCE),
+                        f"after {PATIENCE} s the worker still had not reached the provider: {state(bridge)}")
         pump(20)
         self.assertTrue(bridge.busy)
 
     def finish(self, bridge) -> None:
         self.gate.set()
-        self.wait(lambda: not bridge.busy)
+        self.wait(bridge, lambda: not bridge.busy, "idle")
         bridge.waitIdle()
         pump(50)
 
@@ -87,9 +101,9 @@ class BackgroundRunTests(UiTestCase):
         """A's own session, linked to A, its task rejected (no open work)."""
         self.gate.set()
         self.assertTrue(bridge.submitText("Bu projeyi incele."))
-        self.wait(lambda: not bridge.busy and bridge.approvalPending)
+        self.wait(bridge, lambda: not bridge.busy and bridge.approvalPending, "idle with the approval card")
         bridge.deny()
-        self.wait(lambda: not bridge.busy and bridge.task.get("status") == "rejected")
+        self.wait(bridge, lambda: not bridge.busy and bridge.task.get("status") == "rejected", "idle with the task rejected")
         bridge.waitIdle()
         session = bridge.sessionId
         self.assertEqual(a, store.conversation_for_session(session))
@@ -352,7 +366,7 @@ class BackgroundRunTests(UiTestCase):
             self.gate.clear()
 
             def sweep(answer=answer):
-                self.gate.wait(10)
+                self.gate.wait(PATIENCE)
                 return answer
             bridge.backend.scheduler_once = sweep
             feed = len(bridge.feed)

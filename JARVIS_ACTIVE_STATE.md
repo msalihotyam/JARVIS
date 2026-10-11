@@ -122,7 +122,13 @@ open. Next: integrate on "entegre et".
   38093652961, test 26.6 s there vs 1.3 s locally; a runner whose write waits
   past the store's 5 s busy timeout raises `database is locked` out of
   `run_chain`; the test now puts each runner's traceback in its failure
-  message). `scripts/test_parallel.py`
+  message),
+  `test_bg_run_6g` (whole module; orchestrator G6BGFLAKE 2026-10-11:
+  `test_t4_the_running_conversation_refuses_its_mutations_with_zero_writes`
+  timed out its 10 s wait for the approval card on CI shard 4/4, run
+  38109324177, test 15.3 s and module 74 s there vs 7 s locally; every test
+  pauses a real worker thread, so all of them depend on timing. Its waits are now
+  60 s and a timeout names its condition and the bridge state). `scripts/test_parallel.py`
   reruns only `test_ui` ids itself; rule D for the others is applied by hand.
 - Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
 - Push: `main` not authorized; `ci/*` branches are standing-authorized
