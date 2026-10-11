@@ -162,10 +162,11 @@ class PopoverResetTests(UsageCase):
     def test_d8_a_later_reset_is_the_one_formatters_day_and_time(self) -> None:
         from datetime import datetime
         now = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
-        self.pop.setProperty("now", now.timestamp() * 1000)
         tomorrow = int((now + timedelta(days=1, hours=2)).timestamp())
         self.ring.setProperty("rows", [{"window": "weekly", "remaining": 41, "resets_at": tomorrow}])
-        self.open_popover()
+        self.open_popover()                                  # opening reads the real clock (onAboutToShow)
+        self.pop.setProperty("now", now.timestamp() * 1000)  # so the clock is pinned after it
+        pump(10)
         self.assertEqual("Resets tomorrow 12:00", self.text_in("usageRow_weekly", "usageRowReset").property("text"))
         self.loc.apply("tr-TR")
         self.addCleanup(lambda: self.loc.apply("en-US"))
