@@ -20,7 +20,9 @@ _SPEC = importlib.util.spec_from_file_location(
 tp = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(tp)
 
-POSIX, LINGUIST = sorted(tp.ALLOWED_SKIPS)
+POSIX = "tests.test_local_file_write.ContainmentTests.test_the_posix_parent_walk_is_no_follow_at_every_step"
+LINGUIST = "tests.test_ui.LocalizationTests.test_turkish_catalog_covers_every_marked_string"
+GWS = "the Google Workspace CLI is not installed here"
 IDS = ["tests.test_fake.C.test_a", "tests.test_fake.C.test_b"]
 UNKNOWN = "tests.test_conversation_store.RollbackTests.test_schema_10_release_reads_it"
 
@@ -37,12 +39,16 @@ class SkipParsingTests(unittest.TestCase):
         self.assertEqual([["tests.m.C.test_b", "no directory-handle traversal"],
                           ["tests.m.D.test_c", "it's not here"]], result.skips)
 
-    def test_the_allowlist_names_todays_two_skips_with_their_reasons(self) -> None:
+    def test_the_allowlist_names_todays_skips_with_their_reasons(self) -> None:
         self.assertEqual({
-            "tests.test_local_file_write.ContainmentTests.test_the_posix_parent_walk_is_no_follow_at_every_step":
-                "no directory-handle traversal",
-            "tests.test_ui.LocalizationTests.test_turkish_catalog_covers_every_marked_string":
-                "the PySide6 Linguist tools are not installed",
+            POSIX: "no directory-handle traversal",
+            LINGUIST: "the PySide6 Linguist tools are not installed",
+            "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_can_read_a_held_credential_but_not_remove_it":
+                GWS,
+            "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_refuses_an_empty_dedicated_directory":
+                GWS,
+            "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_rehearses_both_writes_as_bodiless_multipart_uploads":
+                GWS,
         }, tp.ALLOWED_SKIPS)
 
 

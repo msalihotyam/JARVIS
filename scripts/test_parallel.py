@@ -82,6 +82,13 @@ ALLOWED_SKIPS = {
         "no directory-handle traversal",
     "tests.test_ui.LocalizationTests.test_turkish_catalog_covers_every_marked_string":
         "the PySide6 Linguist tools are not installed",
+    # CI's windows-latest runner has no gws; locally these run against the installed CLI.
+    "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_can_read_a_held_credential_but_not_remove_it":
+        "the Google Workspace CLI is not installed here",
+    "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_refuses_an_empty_dedicated_directory":
+        "the Google Workspace CLI is not installed here",
+    "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_rehearses_both_writes_as_bodiless_multipart_uploads":
+        "the Google Workspace CLI is not installed here",
 }
 
 
