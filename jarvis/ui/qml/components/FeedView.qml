@@ -506,7 +506,11 @@ Item {
                                     Connections { target: feed; function onReferenceLayoutChanged() { message.applyRhythm() } }
                                     // The offer to quote appears AT the selection, and only
                                     // for a message that may be quoted at all.
-                                    onSelectedTextChanged: row.conversational ? feed.offerQuote(message, modelData.id) : feed.hideQuoteTip()
+                                    // One selection at a time: this one clears any other first.
+                                    onSelectedTextChanged: {
+                                        if (selectedText.length > 0) feed.claimSelection(message)
+                                        row.conversational ? feed.offerQuote(message, modelData.id) : feed.hideQuoteTip()
+                                    }
                                     // Right-click: Copy (the selection, or the whole message) and Select All.
                                     TapHandler { acceptedButtons: Qt.RightButton
                                                  onTapped: function(point) { messageMenu.editor = message; messageMenu.wholeText = modelData.text
@@ -1010,6 +1014,25 @@ Item {
     }
     function hideQuoteTip() { quoteTip.source = null; quoteTip.shown = false }
     Connections { target: bridge; function onFeedChanged() { feed.hideQuoteTip() } }
+
+    // ONE text selection at a time: a selection started in a message - or in the
+    // focused text outside the conversation, the composer's draft among them -
+    // clears the one held before it, so Copy and Quote only ever meet the current
+    // selection.
+    property Item selectionHolder: null
+    function claimSelection(edit) {
+        var previous = selectionHolder
+        selectionHolder = edit
+        if (previous && previous !== edit) previous.deselect()
+    }
+    Connections {
+        target: feed.Window.activeFocusItem
+        ignoreUnknownSignals: true
+        function onSelectedTextChanged() {
+            var edit = feed.Window.activeFocusItem
+            if (edit && edit.selectedText.length > 0) feed.claimSelection(edit)
+        }
+    }
 
     Item {
         id: quoteTip
