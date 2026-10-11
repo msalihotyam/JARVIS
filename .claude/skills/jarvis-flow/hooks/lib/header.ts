@@ -1,12 +1,12 @@
 // The prompt header contract:
-//   @jarvis lane=<slice-id> model=<opus|sonnet|haiku> effort=<medium|high|xhigh> base=<sha|main>
+//   @jarvis lane=<slice-id> model=<opus|sonnet|haiku|fable> effort=<medium|high|xhigh|max> base=<sha|main>
 // Parsed strictly. A prompt that does not start with @jarvis is normal chat.
 
-export type Family = 'opus' | 'sonnet' | 'haiku'
-export type Effort = 'medium' | 'high' | 'xhigh'
+export type Family = 'opus' | 'sonnet' | 'haiku' | 'fable'
+export type Effort = 'medium' | 'high' | 'xhigh' | 'max'
 
-export const FAMILIES: readonly Family[] = ['opus', 'sonnet', 'haiku']
-export const EFFORTS: readonly Effort[] = ['medium', 'high', 'xhigh']
+export const FAMILIES: readonly Family[] = ['opus', 'sonnet', 'haiku', 'fable']
+export const EFFORTS: readonly Effort[] = ['medium', 'high', 'xhigh', 'max']
 
 export type Header = { lane: string; model: Family; effort: Effort; base: string }
 

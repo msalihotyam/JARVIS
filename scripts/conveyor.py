@@ -160,8 +160,8 @@ RERUN_PREFACE = (
 # The jarvis-flow lint's header rules (.claude/skills/jarvis-flow/hooks/lib/header.ts), the
 # single table here: a header the lint would block leaves an empty session (incident A,
 # 2026-10-09), so such a prompt is never dispatched. tests/test_conveyor.py fails on drift.
-FAMILIES = ("opus", "sonnet", "haiku")
-EFFORTS = ("medium", "high", "xhigh")
+FAMILIES = ("opus", "sonnet", "haiku", "fable")  # passed verbatim: the CLI's --model aliases
+EFFORTS = ("medium", "high", "xhigh", "max")
 LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA_HDR_RE = re.compile(r"^[0-9a-f]{7,40}$")
 HEADER_KEYS = ("lane", "model", "effort", "base")

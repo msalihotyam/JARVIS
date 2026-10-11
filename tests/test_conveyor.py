@@ -254,8 +254,12 @@ class TestHeader(unittest.TestCase):
         """The jarvis-flow lint's parseHeader: any field order, exact families and efforts."""
         ok = conveyor.check_header("@jarvis base=main effort=medium model=haiku lane=g6.k3\nbody")
         self.assertEqual(ok, ({"lane": "g6.k3", "model": "haiku", "effort": "medium", "base": "main"}, None))
+        fable = conveyor.check_header("@jarvis lane=CORE model=fable effort=max base=main")
+        self.assertEqual(fable, ({"lane": "CORE", "model": "fable", "effort": "max", "base": "main"}, None))
         cases = {"@jarvis lane=AGY0 model=opus effort=low base=main": "effort invalid: low",
-                 "@jarvis lane=A model=opus effort=max base=main": "effort invalid: max",
+                 "@jarvis lane=A model=opus effort=ultra base=main": "effort invalid: ultra",
+                 "@jarvis lane=A model=gpt effort=high base=main": "model invalid: gpt",
+                 "@jarvis lane=A model=claude-fable-5-1 effort=max base=main": "model invalid",
                  "@jarvis lane=A model=claude-opus-5-5 effort=high base=main": "model invalid",
                  "@jarvis lane=A model=opus effort=High base=main": "effort invalid",
                  "@jarvis lane=-A model=opus effort=high base=main": "lane invalid",
@@ -287,6 +291,12 @@ class TestHeader(unittest.TestCase):
             return m.group(1)
         self.assertEqual(arr("FAMILIES"), conveyor.FAMILIES)
         self.assertEqual(arr("EFFORTS"), conveyor.EFFORTS)
+        self.assertIn("fable", conveyor.FAMILIES)
+        self.assertIn("max", conveyor.EFFORTS)
+        fam, eff = "|".join(conveyor.FAMILIES), "|".join(conveyor.EFFORTS)
+        self.assertIn("export type Family = " + " | ".join(f"'{x}'" for x in conveyor.FAMILIES), src)
+        self.assertIn("export type Effort = " + " | ".join(f"'{x}'" for x in conveyor.EFFORTS), src)
+        self.assertIn(f"model=<{fam}> effort=<{eff}> base=<sha|main>", src)  # the contract comment
         self.assertEqual(regex("LANE"), conveyor.LANE_RE.pattern)
         self.assertEqual(regex("SHA"), conveyor.SHA_HDR_RE.pattern)
         m = re.search(r"const REQUIRED = \[([^\]]*)\]", src)
@@ -340,6 +350,14 @@ class TestInbox(Base):
         self.assertEqual(len(list((self.base / "inbox" / "started").glob("*-A.md"))), 1)
         self.assertEqual([e["event"] for e in self.events()], ["dispatch"])
 
+    def test_dispatch_fable_max(self):
+        """The CLI takes `fable` as a --model alias and `max` as an --effort level: passed verbatim."""
+        self.drop("a.md", "@jarvis lane=A model=fable effort=max base=main\nx\n")
+        self.c.pass_once()
+        (call,) = self.fake.bg_calls()
+        self.assertEqual(call[:7], ["--bg", "--name", "A", "--model", "fable", "--effort", "max"])
+        self.assertEqual((self.lanes()["A"]["model"], self.lanes()["A"]["effort"]), ("fable", "max"))
+
     def test_reject_path(self):
         self.drop("bad.md", "no header here\n")
         self.c.pass_once()
@@ -364,7 +382,7 @@ class TestInbox(Base):
         self.assertNotIn("AGY0", self.lanes())
         # the same file name again: the earlier rejected file is kept, not overwritten
         self.t += 1
-        self.drop("agy0.md", "@jarvis lane=AGY0 model=opus effort=max base=main\n")
+        self.drop("agy0.md", "@jarvis lane=AGY0 model=opus effort=ultra base=main\n")
         self.c.pass_once()
         self.assertEqual((rej / "agy0.md").read_text(encoding="utf-8"), text)
         self.assertEqual(len(list(rej.glob("*agy0.md"))), 2)
@@ -905,6 +923,16 @@ class TestBlockedLane(Base):
         self.c.pass_once()
         self.assertEqual(len(self.resumes()), 1)
         self.assertNotIn("blocked_since", self.lanes()["A"])
+
+    def test_nudge_resumes_with_the_lanes_fable_max(self):
+        d = self.lanes()
+        d["A"].update(model="fable", effort="max")
+        (self.base / "lanes.json").write_text(json.dumps(d))
+        self.net = True
+        self.t += 600
+        self.c.pass_once()
+        (call,) = self.resumes()
+        self.assertEqual(call[5:9], ["--model", "fable", "--effort", "max"])
 
     def test_network_down_no_nudge(self):
         self.t += 1200

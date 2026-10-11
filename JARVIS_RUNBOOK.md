@@ -596,7 +596,7 @@ the optional report reader below. One instance at a time
   --effort <e> --settings build/conveyor/lanes.settings.json <prompt>`; at most
   3 lanes at a time. Inbox first: `inbox/*.md`, oldest first, line 1 a valid
   `@jarvis` header by exactly the jarvis-flow lint's rules (model
-  `opus|sonnet|haiku`, effort `medium|high|xhigh`, base `main` or 7-40 hex, any
+  `opus|sonnet|haiku|fable`, effort `medium|high|xhigh|max`, base `main` or 7-40 hex, any
   field order; a sha base must prefix-match canonical `main`'s HEAD, as in
   `lint.ts`; one table in `conveyor.py`, a test fails if it drifts from
   `header.ts`/`lint.ts`). A bad header is never dispatched: the prompt is moved
@@ -948,8 +948,9 @@ the optional report reader below. One instance at a time
   paged the phone at once. Fix (CONV3): a reader verdict never pages; it is an
   attention item ("reader says needs_salih: ...") and only the 30 min
   escalation, failed passes and push notices reach Salih.
-- **Rules.** Efforts are `medium|high|xhigh` only (never `low` or `max`);
-  models `opus|sonnet|haiku`; a sha base must be main's HEAD. A bad status or a
+- **Rules.** Efforts are `medium|high|xhigh|max` only (never `low`);
+  models `opus|sonnet|haiku|fable` (CLI aliases, passed verbatim); a sha base
+  must be main's HEAD. A bad status or a
   problem lane goes to `attention` for the orchestrator, never straight to the
   phone as an alarm; Salih is paged only by the backstop or repeated conveyor
   failures (and push notices).
