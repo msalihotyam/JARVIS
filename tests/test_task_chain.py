@@ -33,6 +33,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import traceback
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -5148,23 +5149,36 @@ class DriverConcurrencyTests(DriverTestCase):
                 )
                 barrier = threading.Barrier(2)
                 verdicts: list[str] = []
+                failures: list[str] = []
                 guard = threading.Lock()
 
                 def race(
                     gate: threading.Barrier = barrier,
                     lock: threading.Lock = guard,
                     sink: list = verdicts,
+                    errors: list = failures,
                     session_id: str = self.session.id,
                 ) -> None:
-                    store = SQLiteMemoryStore(self.database)
-                    core = open_core(
-                        memory=store,
-                        registry=self.registry,
-                        settings=self.settings,
-                        destination_policy=_DRIVER_POLICY,
-                    )
-                    gate.wait(timeout=10)
-                    _run, verdict = core.run_chain(session_id)
+                    # A runner that dies must say why in the failure message:
+                    # a thread's exception otherwise reaches only stderr, which
+                    # the parallel runner's failure report does not keep.
+                    try:
+                        store = SQLiteMemoryStore(self.database)
+                        core = open_core(
+                            memory=store,
+                            registry=self.registry,
+                            settings=self.settings,
+                            destination_policy=_DRIVER_POLICY,
+                        )
+                        # Sized for a starved CI runner (the test took 26 s
+                        # there, 1.3 s locally); a broken barrier would also
+                        # end up in the failure message.
+                        gate.wait(timeout=60)
+                        _run, verdict = core.run_chain(session_id)
+                    except BaseException:
+                        with lock:
+                            errors.append(traceback.format_exc())
+                        return
                     with lock:
                         sink.append(verdict)
 
@@ -5172,9 +5186,9 @@ class DriverConcurrencyTests(DriverTestCase):
                 for thread in threads:
                     thread.start()
                 for thread in threads:
-                    thread.join(timeout=40)
+                    thread.join(timeout=120)
                     self.assertFalse(thread.is_alive())
-                self.assertEqual(len(verdicts), 2)
+                self.assertEqual(len(verdicts), 2, "\n".join(failures))
                 bound = [t for t in self.chain_now().step_task_ids if t]
                 self.assertEqual(len(bound), len(set(bound)))
                 self.assertEqual(self.task_rows(), len(bound))
