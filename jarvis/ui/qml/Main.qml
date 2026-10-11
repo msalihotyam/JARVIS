@@ -235,7 +235,7 @@ Window {
         panelsRaised: root.homeCanonical
         // Under the chat header, above the first message (L1).
         progressTop: root.homeCanonical && content.headerOnTop ? content.workTop + 8 + 52 + 6 : -1
-        onMinimizeRequested: bridge.minimizeWindow(root)
+        onMinimizeRequested: powerFx.powerDown()
         onRestoreRequested: root.fullscreen ? root.showNormal() : root.showFullScreen()
         onCloseRequested: root.close()
         onOpenSettings: root.toggleSettings()
@@ -640,6 +640,16 @@ Window {
             font: Theme.label }
         // Shown at once, gone at once after a hold (K2: no exit without an entry).
         Timer { id: auditionFade; interval: 1150; onTriggered: auditionLabel.opacity = 0 }
+    }
+    // V2.1: power down to the core on the minimize control, power up on every
+    // return; over everything, never interactive (WindowPowerFx).
+    WindowPowerFx {
+        id: powerFx
+        objectName: "windowPowerFx"
+        anchors.fill: parent; z: 9900
+        host: root
+        coreX: topBar.coreCx; coreY: topBar.coreCy; coreSize: topBar.coreDiameter
+        onMinimizeNow: bridge.minimizeWindow(root)
     }
     Shortcut { id: pageHistory; sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
     Shortcut { id: pageProjects; sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }
