@@ -930,7 +930,8 @@ class SourceEligibilityTests(HandoffTestCase):
         self.refused(self.handoff_task(source.id), session.id, "carries no model answer")
 
     def test_a_truncated_answer_is_refused(self) -> None:
-        source, session = self.completed_source("def f():\n    pass\n" * 1000)
+        # DFREPLY: was * 1000 (18,000 chars past the old 8,000 cap); 72,000 is past 64,000.
+        source, session = self.completed_source("def f():\n    pass\n" * 4000)
         self.assertTrue(source.model_answer.truncated)
         self.refused(self.handoff_task(source.id), session.id, "truncated")
 

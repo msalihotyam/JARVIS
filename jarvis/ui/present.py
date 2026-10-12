@@ -81,6 +81,30 @@ REASON_TEXT = {
                                                       "only the ChatGPT subscription sign-in, so nothing was sent."),
 }
 
+#: DFREPLY: a reply the person saw that was cut short is kept as a reply, and
+#: this line under it says why (``jarvis.conversation.CUT_REASONS``). A notice,
+#: never an error card: what was shown stays, and nothing was executed from it.
+CUT_TEXT = {
+    "too_long": QT_TRANSLATE_NOOP("Present", "Cut short: the reply was longer than one message can hold (about 50,000 "
+                                             "characters). The part shown is kept; ask for the rest in parts. Nothing was done."),
+    "cancelled": QT_TRANSLATE_NOOP("Present", "Cut short: you stopped it. The part shown is kept. Nothing was done."),
+    "timed_out": QT_TRANSLATE_NOOP("Present", "Cut short: the reply timed out. The part shown is kept. Nothing was done."),
+    "error": QT_TRANSLATE_NOOP("Present", "Cut short: an error stopped the reply. The part shown is kept. Nothing was done."),
+}
+# The reason code of a chat reply kept up to its ceiling (``jarvis.intent.CHAT_REPLY_TOO_LONG``).
+CHAT_REPLY_TOO_LONG = "chat_reply_too_long"
+
+
+def cut_reason(status: str) -> str:
+    """Why a streamed reply stopped, from the verdict that ended it."""
+    return {"model_cancelled": "cancelled", "model_timeout": "timed_out"}.get(status, "error")
+
+
+def cut_entries(text: str, reason: str) -> list[dict[str, Any]]:
+    """A cut-short reply: JARVIS's turn as shown (marked incomplete), then the notice saying why."""
+    return [{"kind": "jarvis", "text": text, "cut": reason, "interrupted": True},
+            {"kind": "notice", "text": _msg(CUT_TEXT[reason])}]
+
 #: JARVIS's own explanation of an established connector failure, keyed by
 #: the exact (code, message) the envelope carries - the envelope keeps no
 #: details. The message is ``jarvis.browser_cdp.NO_CURRENT_TAB_MESSAGE``.
@@ -168,6 +192,9 @@ VERDICT_TEXT = {
     "Nothing was executed.":
         QT_TRANSLATE_NOOP("Present", "The project folder proposal was refused: it may only say whether the folder goes "
                                      "on the Desktop. Nothing was done."),
+    # DFREPLY (DFDIAG Q1): the refusal of an answer with no usable proposal.
+    "The understanding model returned no usable proposal. Nothing was executed.":
+        QT_TRANSLATE_NOOP("Present", "The understanding model returned no usable proposal. Nothing was done."),
 }
 
 #: The same, for a verdict that names something: ``(prefix, suffix)`` around
@@ -553,6 +580,8 @@ def group_sections(sections: list) -> Any:
         status = section.get("status")
         if status == "answered" and section.get("text"):
             body: Any = str(section["text"])
+            if section.get("cut") in CUT_TEXT:
+                body = _join(body, ("Present", "\n%1", (_msg(CUT_TEXT[section["cut"]]),)))
         elif status == "cancelled":
             body = _msg(QT_TRANSLATE_NOOP("Present", "Not answered: the request was stopped before this group."))
         elif status == "not_answered":
@@ -591,7 +620,10 @@ def text_entries(payload: Any) -> list[dict[str, str]]:
     elif status == "conversation":
         # General Chat: the model's words, shown as JARVIS's turn, as written.
         reply = intent.get("reply")
-        entries.append({"kind": "jarvis", "text": str(reply)} if reply else dict(UNREADABLE))
+        if reply and intent.get("reason") == CHAT_REPLY_TOO_LONG:
+            entries += cut_entries(str(reply), "too_long")
+        else:
+            entries.append({"kind": "jarvis", "text": str(reply)} if reply else dict(UNREADABLE))
     elif status == "research":
         # Web Research: the answer as written, and the public pages behind it -
         # untrusted links, redacted, shown as plain data.

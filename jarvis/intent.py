@@ -39,7 +39,7 @@ from urllib.parse import urlsplit
 
 from jarvis.browser import BROWSER_CAPABILITY_RESOURCE, BROWSER_DESTINATION_PREFIX
 from jarvis.connectors.base import ConnectorManifest
-from jarvis.conversation import ContextProfile, argv_chars
+from jarvis.conversation import REPLY_MAX_CHARS, ContextProfile, argv_chars
 from jarvis.connectors.claude_code import (
     AUTH_NOT_LOGGED_IN_EVIDENCE,
     TIMEOUT_MESSAGE,
@@ -84,8 +84,12 @@ PROPOSAL_MAX_ARGUMENTS = 12
 PROPOSAL_ARGUMENT_MAX_CHARS = GMAIL_BODY_MAX_BYTES
 PROPOSAL_LIST_MAX_ITEMS = 10
 PROPOSAL_MAX_INT = 1_000_000_000
-#: A General Chat reply: conversational text, inside the bounded model answer.
-CHAT_REPLY_MAX_CHARS = 6_000
+#: A General Chat reply: conversational text, inside the bounded model answer
+#: (DFREPLY, Salih 2026-10-12: about 50,000 characters; the prompt says so).
+CHAT_REPLY_MAX_CHARS = REPLY_MAX_CHARS
+#: The reason code of a chat reply that was longer than JARVIS keeps: what
+#: was shown is kept up to the ceiling, marked cut short; nothing is executed.
+CHAT_REPLY_TOO_LONG = "chat_reply_too_long"
 #: The response-language hint the caller may pass (a BCP 47 tag like ``tr-TR``).
 RESPONSE_LANGUAGE_MAX_CHARS = 16
 #: The conversation a request carries is assembled by
@@ -189,24 +193,25 @@ NL_CAPABILITIES: Mapping[str, CapabilityHint] = {
         {"target": "\"desktop\" only when the user asks for the Desktop, otherwise \"\""},
     ),
     "gmail_thread_list": CapabilityHint(
-        "gmail", "read", "List the most recent mail threads.", {"limit": _LIMIT}
+        "gmail", "read", "List the most recent e-mail threads (Gmail).", {"limit": _LIMIT}
     ),
     "gmail_search": CapabilityHint(
-        "gmail", "read", "Search mail with a Gmail search query.",
+        "gmail", "read", "Search e-mail with a Gmail search query.",
         {"query": "Gmail search query (required)", "limit": _LIMIT},
     ),
     "gmail_message_read": CapabilityHint(
-        "gmail", "read", "Read one message.", {"message_id": "Gmail message id (required)"}
+        "gmail", "read", "Read one e-mail message (Gmail).", {"message_id": "Gmail message id (required)"}
     ),
     "gmail_thread_read": CapabilityHint(
-        "gmail", "read", "Read one thread.", {"thread_id": "Gmail thread id (required)"}
+        "gmail", "read", "Read one e-mail thread (Gmail).", {"thread_id": "Gmail thread id (required)"}
     ),
     "gmail_draft_create": CapabilityHint(
-        "gmail", "draft", "Create ONE draft; nothing is sent.", _RECIPIENTS
+        "gmail", "draft", "Create ONE e-mail draft (Gmail); nothing is sent.", _RECIPIENTS
     ),
     "gmail_send": CapabilityHint(
         "gmail", "send",
-        "Send ONE message. A side effect: the user still approves it.",
+        "Send ONE e-mail (Gmail) to the given addresses - never a chat message. "
+        "A side effect: the user still approves it.",
         _RECIPIENTS,
     ),
     "github_repository_read": CapabilityHint(
@@ -1238,6 +1243,19 @@ INTENT_SYSTEM_PROMPT = (
     "Language: write objective, question, reason, reply and query in the language "
     "the user wrote the request in; only when that cannot be told (just a "
     "name, a number or code) use context.response_language, a language tag.\n"
+    # DFREPLY (Salih 2026-10-12): the address form, the word "mesaj" and the length.
+    "Address form: in Turkish ALWAYS address the user formally as 'siz' (siz, "
+    "sizin, -siniz/-sınız, isteyin, yapabilirsiniz), never 'sen', in every "
+    "sentence of every reply - keep it the same within a reply and across "
+    "replies.\n"
+    "Messages: in this chat 'mesaj' / 'message' means a chat message in this "
+    "conversation. It means an e-mail only when the user says e-posta, e-mail, "
+    "mail or Gmail or gives an e-mail address. When the user asks for several "
+    "messages, write them all inside ONE chat reply (for example numbered "
+    "1., 2., 3.) - never explain a format limit instead.\n"
+    f"Length: a chat reply may be up to {CHAT_REPLY_MAX_CHARS:,} characters; JARVIS "
+    "keeps nothing past that. When the full answer would be longer, write the "
+    "first part within the limit and say the user can ask for the rest.\n"
     "Rules: never invent a capability, a destination or an argument, and "
     "never write account, owner, repository, origin or app - the destination "
     "supplies them. If the request needs a capability or destination the "
@@ -1589,6 +1607,24 @@ class ChatReplyStream:
             pos += 6
         self._pos = pos
         return len(self.text) > before
+
+
+def too_long_reply(content: str, truncated: bool) -> str | None:
+    """DFREPLY: the visible General Chat reply of an answer too long to keep
+    whole - the bounded answer was cut, or its reply passes
+    ``CHAT_REPLY_MAX_CHARS`` - kept up to that ceiling; else ``None``.
+
+    Only the text a chat preview shows (``ChatReplyStream``) can come out of
+    here: whatever the object carried after the reply - a capability, a
+    destination, arguments - is dropped unread. ``None`` for any other shape,
+    for an empty reply and for one carrying a NUL, which are refused as before.
+    """
+    reply = ChatReplyStream()
+    reply.feed(content)
+    if not (truncated or len(reply.text) > CHAT_REPLY_MAX_CHARS):
+        return None
+    kept = reply.text[:CHAT_REPLY_MAX_CHARS]
+    return kept if kept.strip() and chr(0) not in kept else None
 
 
 #: The shortest gap between two previews handed to the listener; the final

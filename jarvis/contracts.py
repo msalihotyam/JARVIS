@@ -3154,7 +3154,10 @@ MODEL_ANSWER_RESULT_KEY = "model_answer"
 #: A read excerpt is a bounded view of a local file this machine already owns;
 #: this is inbound text from an external model, and the two ceilings answer
 #: different questions and must stay free to diverge.
-MODEL_ANSWER_MAX_CHARS = 8_000
+#: DFREPLY (Salih 2026-10-12, "Sınırı yükselt"): sized so a General Chat reply
+#: of ``jarvis.conversation.REPLY_MAX_CHARS`` (50,000) still fits inside the
+#: understanding call's JSON proposal with its envelope and escapes.
+MODEL_ANSWER_MAX_CHARS = 64_000
 
 #: Bounded working window applied to the RAW model text before any redaction
 #: pass runs over it. Everything past it is discarded rather than processed,
@@ -3200,7 +3203,7 @@ def bound_model_text(value: str) -> tuple[str, bool]:
     be reduced to a prefix too short for its own pattern to recognize - and a
     prefix is never redacted, because there is nothing left to match. Heavy
     redaction earlier in the window can then compress the retained text far
-    enough that the fragment lands inside the 8000-character deliverable.
+    enough that the fragment lands inside the ``MODEL_ANSWER_MAX_CHARS`` deliverable.
 
     The boundary is therefore the last NEWLINE inside the window, and the
     entire boundary-crossing final line is discarded. Newline is not chosen
@@ -5198,7 +5201,10 @@ def _redact_cli_credentials(text: str, replacement: str) -> tuple[str, int]:
 _CREDENTIAL_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
-    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    # DFREPLY: a match starts only where a run of the class starts (never after a
+    # "-" inside one), so "a-a-a-..." costs linear, not quadratic, time on the
+    # 512k answer window. It matches wherever ``\b`` did, from the run's start.
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     # AWS access key ids carry their own documented unique-id prefix, so they
     # are recognizable with no label at all - which matters because a bare
     # ``AKIA...`` in file content has no ``key=`` next to it to catch.

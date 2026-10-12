@@ -179,6 +179,7 @@ from jarvis.github import (
     external_read_refusal,
 )
 from jarvis.intent import (
+    CHAT_REPLY_TOO_LONG,
     INTENT_ACTION,
     INTENT_CAPABILITY,
     ClaudeIntentAdapter,
@@ -193,6 +194,7 @@ from jarvis.intent import (
     model_failure_reason,
     resolve_proposal,
     response_language_hint,
+    too_long_reply,
 )
 from jarvis.conversation import (
     ConversationState,
@@ -1021,7 +1023,7 @@ _LABELLED_SECRET_PATTERN = re.compile(
 _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
-    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # linear (DFREPLY)
     re.compile(
         r"\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b"
     ),
@@ -3396,6 +3398,9 @@ _INTENT_EXIT: dict[IntentStatus, tuple[int, ErrorCode | None]] = {
 
 #: Why Web Research could not run, as stable non-secret codes for the interface.
 RESEARCH_PROVIDER_UNSUPPORTED = "research_provider_unsupported"
+#: The ``chat_reply_too_long`` verdict's sentence (the interface says it in its own words).
+_TOO_LONG_MESSAGE = ("The reply was longer than JARVIS keeps in one message (about 50,000 characters), so it was "
+                     "cut there; the part shown was kept. Nothing was executed.")
 
 #: The execution barrier on the free-text entry: the request was understood,
 #: and nothing authoritative followed.
@@ -3760,6 +3765,13 @@ class JarvisApp:
         if cancelled:
             return refused(IntentStatus.MODEL_CANCELLED, "The understanding call was cancelled.")
         answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
+        # DFREPLY: a chat reply too long to keep whole is kept up to the ceiling as
+        # what it is - text to show, cut short. Nothing else of the answer is read,
+        # so no proposal is resolved and nothing can be executed from it.
+        kept = too_long_reply(answer.content, answer.truncated) if type(answer) is ModelAnswer and answer.present else None
+        if kept is not None:
+            return respond(mode, IntentStatus.CONVERSATION, request_id, reply=kept, reason=CHAT_REPLY_TOO_LONG,
+                           message=_TOO_LONG_MESSAGE)
         if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
             return refused(
                 IntentStatus.MALFORMED_MODEL_OUTPUT,
@@ -4172,6 +4184,8 @@ class JarvisApp:
                 "cancelled": "[not answered: stopped before this group]",
                 "not_answered": "[not answered: this group asked for something to be done; nothing was started]",
             }.get(section["status"], "")
+            if section.get("cut"):
+                body += "\n\n[reply cut short: too_long]"
             plain.append(f"{section['label']}\n{body}")
         return respond(mode, IntentStatus.CONVERSATION, request_id, reply="\n\n".join(plain), sections=sections)
 
@@ -4191,6 +4205,9 @@ class JarvisApp:
         if cancelled:
             return {"label": label, "status": "cancelled"}
         answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
+        kept = too_long_reply(answer.content, answer.truncated) if type(answer) is ModelAnswer and answer.present else None
+        if kept is not None:            # DFREPLY: shown up to the ceiling, marked cut short
+            return {"label": label, "status": "answered", "kind": "chat", "text": kept, "cut": "too_long"}
         if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
             return {"label": label, "status": "failed", "intent_status": IntentStatus.MALFORMED_MODEL_OUTPUT.value,
                     "message": "The model returned no usable answer."}

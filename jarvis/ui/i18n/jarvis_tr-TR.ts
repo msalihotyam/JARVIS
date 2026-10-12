@@ -2978,6 +2978,23 @@ yok</translation>
         <translation>Codex, kullanım başına ücretlendirilecek bir API anahtarıyla kurulmuş. JARVIS yalnızca ChatGPT abonelik oturumunu kullanır; bu yüzden hiçbir şey gönderilmedi.</translation>
     </message>
     <message>
+        <source>Cut short: the reply was longer than one message can hold (about 50,000 characters). The part shown is kept; ask for the rest in parts. Nothing was done.</source>
+        <extracomment>DFREPLY: a reply the person saw that was cut short is kept as a reply, and this line under it says why (``jarvis.conversation.CUT_REASONS``). A notice, never an error card: what was shown stays, and nothing was executed from it.</extracomment>
+        <translation>Yarım kaldı: yanıt tek mesaja sığmayacak kadar uzundu (yaklaşık 50.000 karakter). Gösterilen kısım saklandı; devamını parça parça isteyin. Hiçbir işlem yapılmadı.</translation>
+    </message>
+    <message>
+        <source>Cut short: you stopped it. The part shown is kept. Nothing was done.</source>
+        <translation>Yarım kaldı: yanıtı siz durdurdunuz. Gösterilen kısım saklandı. Hiçbir işlem yapılmadı.</translation>
+    </message>
+    <message>
+        <source>Cut short: the reply timed out. The part shown is kept. Nothing was done.</source>
+        <translation>Yarım kaldı: yanıt zaman aşımına uğradı. Gösterilen kısım saklandı. Hiçbir işlem yapılmadı.</translation>
+    </message>
+    <message>
+        <source>Cut short: an error stopped the reply. The part shown is kept. Nothing was done.</source>
+        <translation>Yarım kaldı: bir hata yanıtı durdurdu. Gösterilen kısım saklandı. Hiçbir işlem yapılmadı.</translation>
+    </message>
+    <message>
         <source>No current JARVIS browser tab is available for this site. Open the site in a new JARVIS tab first.</source>
         <extracomment>JARVIS&apos;s own explanation of an established connector failure, keyed by the exact (code, message) the envelope carries - the envelope keeps no details. The message is ``jarvis.browser_cdp.NO_CURRENT_TAB_MESSAGE``.</extracomment>
         <translation>Bu site için kullanılabilir güncel bir JARVIS tarayıcı sekmesi yok. Önce siteyi yeni bir JARVIS sekmesinde açın.</translation>
@@ -3041,6 +3058,10 @@ yok</translation>
     <message>
         <source>The project folder proposal was refused: it may only say whether the folder goes on the Desktop. Nothing was done.</source>
         <translation>Proje klasörü önerisi reddedildi: yalnızca klasörün Masaüstüne gidip gitmeyeceğini söyleyebilir. Hiçbir şey yapılmadı.</translation>
+    </message>
+    <message>
+        <source>The understanding model returned no usable proposal. Nothing was done.</source>
+        <translation>Anlama modeli kullanılabilir bir öneri döndürmedi. Hiçbir işlem yapılmadı.</translation>
     </message>
     <message>
         <source>&apos;%1&apos; is not an authorized destination for &apos;%2&apos;. Nothing was done.%3</source>

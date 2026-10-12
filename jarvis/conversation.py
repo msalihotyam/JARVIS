@@ -59,8 +59,16 @@ from uuid import uuid4
 SCHEMA_VERSION = 1
 
 #: One turn is kept whole up to this size; past it the text is clipped with a
-#: visible marker (a normal reply is at most ``MODEL_ANSWER_MAX_CHARS``).
+#: visible marker. A General Chat reply has its own, larger ceiling below.
 TURN_MAX_CHARS = 8_000
+#: DFREPLY (Salih 2026-10-12): the longest General Chat reply JARVIS keeps
+#: (``jarvis.intent.CHAT_REPLY_MAX_CHARS`` is this value). A reply turn holds it
+#: plus its cut-short marker; a schema-10 reader takes any turn text up to 100,000.
+REPLY_MAX_CHARS = 50_000
+#: Why a reply the person saw was cut short. Stored as the reply's last line
+#: (``cut_reply``), never as a new turn kind, so an older build still reads it.
+CUT_REASONS = ("too_long", "cancelled", "timed_out", "error")
+_CUT_LINE = re.compile(r"\n\n\[reply cut short: (" + "|".join(CUT_REASONS) + r")\]\Z")
 #: The length of one digest line in the checkpoint.
 DIGEST_MAX_CHARS = 240
 #: Raw turns the record keeps; older turns keep their digest only.
@@ -369,6 +377,28 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 40].rstrip() + " [... clipped for context ...]"
 
 
+def cut_reply(text: str, reason: str) -> str:
+    """A reply that was cut short, as the turn stores it: what was shown, at most
+    ``REPLY_MAX_CHARS``, then one marker line naming why. Plain text in the turn's
+    own field, so a later call (and an older build) reads it as said."""
+    if reason not in CUT_REASONS:
+        raise ValueError(f"unknown cut reason {reason!r}")
+    return f"{str(text)[:REPLY_MAX_CHARS]}\n\n[reply cut short: {reason}]"
+
+
+def plain_reply(text: str) -> str:
+    """A reply that was NOT cut, as the turn stores it: one that merely ends with
+    the marker's words (a model can write them) gets a trailing newline, so it is
+    never read back as cut short."""
+    return f"{text}\n" if _CUT_LINE.search(text) else text
+
+
+def split_cut(text: str) -> tuple[str, str]:
+    """``(shown text, reason)`` of a stored reply; reason ``""`` when it was not cut."""
+    found = _CUT_LINE.search(text)
+    return (text[: found.start()], found.group(1)) if found else (text, "")
+
+
 def digest(text: str) -> str:
     """One deterministic line for a turn: its opening, whitespace collapsed."""
     line = " ".join(str(text).split())
@@ -385,7 +415,7 @@ def append_turn(state: ConversationState, *, role: str, kind: str, text: str, me
     """
     if role not in ROLES or kind not in KINDS:
         raise ValueError(f"unknown role/kind {role}/{kind}")
-    text = _clip(str(text), TURN_MAX_CHARS)
+    text = _clip(str(text), REPLY_MAX_CHARS + 64 if kind == "reply" else TURN_MAX_CHARS)
     if not text.strip():
         return state, None
     if key and key in state.keys:
@@ -1176,10 +1206,11 @@ def rehydrate(conversation: Any, current_text: str, present: Iterable[str] = (),
 
 
 __all__ = [
-    "CONTEXT_TOKEN_CAP", "COMPACTED_MAX", "DEFAULT_PROFILE", "ESTIMATOR", "PINS_SHOWN_MAX", "RAW_TURNS_MAX",
-    "TURN_MAX_CHARS", "CharEstimator", "Compacted", "ContextPlan", "ContextProfile", "ConversationState",
-    "ConversationStore", "CorruptConversation", "Pin", "Title", "TokenEstimator", "Turn", "append_turn", "argv_chars",
-    "assemble_context", "context_fields", "context_profile_of", "digest", "json_text", "load_state",
-    "name_titles", "pin_candidates", "rehydrate", "rename_title", "state_from_dict", "task_title", "turn_refs",
+    "CONTEXT_TOKEN_CAP", "COMPACTED_MAX", "CUT_REASONS", "DEFAULT_PROFILE", "ESTIMATOR", "PINS_SHOWN_MAX",
+    "RAW_TURNS_MAX", "REPLY_MAX_CHARS", "TURN_MAX_CHARS", "CharEstimator", "Compacted", "ContextPlan",
+    "ContextProfile", "ConversationState", "ConversationStore", "CorruptConversation", "Pin", "Title",
+    "TokenEstimator", "Turn", "append_turn", "argv_chars", "assemble_context", "context_fields",
+    "context_profile_of", "cut_reply", "digest", "json_text", "load_state", "name_titles", "pin_candidates",
+    "plain_reply", "rehydrate", "rename_title", "split_cut", "state_from_dict", "task_title", "turn_refs",
     "update_pins",
 ]

@@ -5177,12 +5177,13 @@ class StreamingChatTests(UiTestCase):
         root = self.window(bridge)
         bridge.submitText("Merhaba")
         settled(300, lambda: (
-            self.assertEqual(["user", "jarvis", "error"], self.kinds(bridge)),
+            self.assertEqual(["user", "jarvis", "notice"], self.kinds(bridge)),         # DFREPLY: was "error"
         ))
         partial = bridge.feed[1]
         self.assertEqual(("Kısmi bir yanıt", True), (partial["text"], partial.get("interrupted")))
-        self.assertNotIn("chat", partial)                                               # never part of the conversation window
-        self.assertEqual(["Merhaba"], [t["text"] for t in bridge._conversation()])
+        self.assertTrue(partial["chat"])                       # DFREPLY: was assertNotIn("chat"): kept, marked cut short
+        self.assertEqual(["Merhaba", "Kısmi bir yanıt\n\n[reply cut short: error]"],    # DFREPLY: was ["Merhaba"]
+                         [t["text"] for t in bridge._conversation()])
         self.assertIn("INTERRUPTED - INCOMPLETE ANSWER", self.item(root, "feedInterrupted").property("text"))
         self.assertEqual("", bridge.streamText)
         before = self.streaming(previews=(), error=failure)

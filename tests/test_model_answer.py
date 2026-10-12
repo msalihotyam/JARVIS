@@ -274,8 +274,8 @@ class BoundingTests(unittest.TestCase):
     def test_the_cap_is_its_own_policy_surface(self) -> None:
         from jarvis.contracts import LOCAL_READ_EXCERPT_MAX_CHARS
 
-        self.assertEqual(8_000, MODEL_ANSWER_MAX_CHARS)
-        self.assertEqual(64_000, MODEL_ANSWER_SOURCE_MAX_CHARS)
+        self.assertEqual(64_000, MODEL_ANSWER_MAX_CHARS)             # DFREPLY: was 8_000
+        self.assertEqual(512_000, MODEL_ANSWER_SOURCE_MAX_CHARS)     # DFREPLY: was 64_000 (8 x the cap)
         self.assertNotEqual(MODEL_ANSWER_MAX_CHARS, LOCAL_READ_EXCERPT_MAX_CHARS)
 
     def test_an_oversized_answer_is_bounded_and_flagged(self) -> None:

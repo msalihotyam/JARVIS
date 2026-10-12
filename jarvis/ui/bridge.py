@@ -51,8 +51,9 @@ from jarvis.app import project_folder_result
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY, PROJECT_FOLDER_CONNECTOR, UNVERIFIED_SUFFIX
 from jarvis.destinations import CLAUDE_CODE_DESTINATION
 from jarvis.memory import PROJECT_FOLDER_LINK_UNREADABLE
-from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text
-from jarvis.conversation import CorruptConversation, PersistedConversation, task_title, turn_refs
+from jarvis.contracts import PROJECT_INSTRUCTION_TEXT_CAP, normalize_retrieved_text, redact_credentials
+from jarvis.conversation import (REPLY_MAX_CHARS, CorruptConversation, PersistedConversation, cut_reply, plain_reply,
+                                 split_cut, task_title, turn_refs)
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration, newest_per_name
 from jarvis.ui.backend import ATTACHMENT_SUPPORT, HISTORY_LIMIT, ApprovalTicket, Backend, approval_ticket, redact_text
@@ -76,11 +77,14 @@ from jarvis.ui.preferences import (
 from jarvis.ui.present import (
     FOLDER_UNKNOWN,
     LINK_STATE_TEXT,
+    REASON_TEXT,
     REFUSED_CODES,
     display_model_name,
     provider_brand,
     TERMINAL_STATUSES,
     approval_card,
+    cut_entries,
+    cut_reason,
     error_entries,
     failure_message,
     outcome_kind,
@@ -232,6 +236,30 @@ def _kept_refusal(slots: dict, payload: Any, ticket: ApprovalTicket | None, show
     return slots
 
 
+def _kept_partial(text: str) -> str:
+    """DFREPLY: a streamed reply that stopped, as it may be kept: at most a reply's
+    ceiling, credential-redacted by the same rules as a finished model answer, and
+    without a token-shaped last word the stream may have cut (a credential prefix too
+    short for any rule to match; the shortest rule needs 8 such characters)."""
+    text = redact_credentials(str(text)[:REPLY_MAX_CHARS])[0]
+    start = len(text)
+    while start and text[start - 1] in _TOKEN_CHARS:
+        start -= 1
+    return (text[:start] if len(text) - start >= 8 else text).rstrip()
+
+
+_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-")
+
+
+def _cut_feed(seen: str, status: str, intent: Any, payload: Any) -> list[dict[str, Any]]:
+    """The cut-short reply and its notice; an established cause the verdict names
+    (a sign-in, a billing route) keeps its own card after them, so it stays actionable."""
+    entries = cut_entries(seen, cut_reason(status))
+    if REASON_TEXT.get(str((intent or {}).get("reason") or "")):
+        entries += text_entries(payload)
+    return entries
+
+
 def _guarded(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
@@ -340,6 +368,7 @@ class Bridge(QObject):
         # Gate 6G R3 (D1): conversations a recorded run finished for while another one was open,
         # until opened (bridge memory only, never persisted: a restart shows none).
         self._finished_unseen: set[str] = set()
+        self._run_preview = ""        # DFREPLY: the finished run's streamed text while it is delivered
         self._restored_session = ""                  # the session the open screen got back from its parked state
         self._deliveries: dict[str, int] = {}        # per conversation: envelopes delivered so far (newest wins)
         self._executing = False    # the current / last task run is an approved execution
@@ -524,10 +553,16 @@ class Bridge(QObject):
             if origin and origin != self._conversation_store.id:      # R3 (D1): finished while away
                 self._finished_unseen.add(origin)
                 self.sidebarChanged.emit()
+            # DFREPLY: what the run streamed, for a reply that ends cut short in a
+            # conversation that is not open (``_remember_elsewhere``).
+            self._run_preview = self._run_record["preview"] if self._run_record is not None else ""
             self._end_run()
             if self._work_started is not None:
                 self._work_ms = max(0, round((self._clock() - self._work_started) * 1000))
-        handler(result)
+        try:
+            handler(result)
+        finally:
+            self._run_preview = ""
         if kind == "task" and not self._busy:
             self._recheck_open()
         if kind == "task" and self._freeze_waiting and not self._busy:
@@ -591,10 +626,10 @@ class Bridge(QObject):
     def _remember(self, entry: dict, refs: Any, owner: PersistedConversation | None = None) -> None:
         """Enter one shown entry into the canonical conversation, if it is one.
 
-        What the person typed, General Chat's completed replies and the task
-        results they were shown - exactly once each - and nothing else: never a
-        notice, an approval, an error, a fixture, a partial or interrupted reply,
-        or anything a planning component wrote. A user turn keeps its own words
+        What the person typed, General Chat's replies and the task results they
+        were shown - exactly once each - and nothing else: never a notice, an
+        approval, an error, a fixture or anything a planning component wrote. A
+        reply cut short (DFREPLY) is kept as what was shown plus its marker line. A user turn keeps its own words
         apart (only they can become a pinned decision) and its references by
         identity; a result keeps its provenance as a marker, not as the content.
         """
@@ -608,7 +643,9 @@ class Bridge(QObject):
             if first and turn is not None:
                 self._name_conversation(store, message)
         elif kind == "jarvis" and entry.get("chat") and isinstance(message, str):
-            store.append(role="assistant", kind="reply", text=message, key=f"{self._store_run}:{entry['id']}")
+            # DFREPLY: a reply cut short keeps why as its last line (an ordinary reply turn).
+            text = cut_reply(message, entry["cut"]) if entry.get("cut") else plain_reply(message)
+            store.append(role="assistant", kind="reply", text=text, key=f"{self._store_run}:{entry['id']}")
         elif kind == "result":
             shown = render(message)
             # A result's identity is its TASK and the OUTCOME Core reported for it -
@@ -750,17 +787,24 @@ class Bridge(QObject):
         words that were shown, never re-remembered."""
         feed = []
         for turn in state.turns:
+            notice = None
             if turn.kind == "user":
                 entry: dict[str, Any] = {"kind": "user", "msg": self._redacted(turn.message or turn.text)}
             elif turn.kind == "reply":
-                entry = {"kind": "jarvis", "msg": self._redacted(turn.text), "chat": True}
+                shown, cut = split_cut(turn.text)
+                entry = {"kind": "jarvis", "msg": self._redacted(shown), "chat": True}
+                if cut:                         # DFREPLY: cut short - and the notice under it again
+                    reply, line = cut_entries(shown, cut)
+                    entry.update(cut=cut, interrupted=reply["interrupted"])
+                    notice = {"kind": line["kind"], "msg": line["text"]}
             else:
                 text = turn.text.split("\n", 1)[1] if turn.text.startswith("[Task result") and "\n" in turn.text else turn.text
                 entry = {"kind": "result", "msg": self._redacted(text), "capability": turn.capability,
                          "destination": turn.destination}
-            self._entry_seq += 1
-            entry.update(ts=float(turn.ts), id=f"m{self._entry_seq}", restored=True)
-            feed.append(entry)
+            for item in (entry, notice) if notice is not None else (entry,):
+                self._entry_seq += 1
+                item.update(ts=float(turn.ts), id=f"m{self._entry_seq}", restored=True)
+                feed.append(item)
         self._feed = feed[-FEED_LIMIT:]
         self.feedChanged.emit()
 
@@ -2356,9 +2400,13 @@ class Bridge(QObject):
         intent = payload.get("intent") if isinstance(payload, dict) and isinstance(payload.get("intent"), dict) else None
         status = str((intent or {}).get("status") or "")
         if intent is not None:
-            for entry in text_entries(payload):
-                if status in ("conversation", "research") and isinstance(entry.get("text"), str):
-                    self._say(entry.pop("kind"), entry.pop("text"), chat=True, owner=owner)
+            # DFREPLY: a reply the run streamed that ended cut short is kept there too.
+            seen = _kept_partial(self._run_preview) if status not in ("conversation", "research") else ""
+            kept = bool(seen)
+            for entry in cut_entries(seen, cut_reason(status)) if kept else text_entries(payload):
+                if (kept or status in ("conversation", "research")) and entry["kind"] == "jarvis" \
+                        and isinstance(entry.get("text"), str):
+                    self._say(entry.pop("kind"), entry.pop("text"), chat=True, owner=owner, **entry)
         run = payload.get("run") if intent is not None and isinstance(payload, dict) else payload
         if isinstance(run, dict) and isinstance(run.get("task"), dict):
             facts = {key: task_status(run, intent).get(key, "") for key in ("capability", "destination")}
@@ -2701,10 +2749,11 @@ class Bridge(QObject):
             intent = None
         status = str((intent or {}).get("status") or "")
         partial = self._end_stream()
-        if partial and status not in ("conversation", "research"):
-            # The reply had started and did not finish: what was shown stays, marked
-            # incomplete - never passed off as an answer, never part of the history.
-            self._say("jarvis", partial, interrupted=True)
+        # DFREPLY: the reply had started and did not finish. What was shown stays as
+        # JARVIS's reply - in the history too - marked cut short with a notice saying
+        # why, in place of the verdict card. Only that text: nothing of the proposal.
+        seen = _kept_partial(partial) if partial and status not in ("conversation", "research") else ""
+        kept = bool(seen)
         if isinstance(intent, dict) and isinstance(intent.get("usage"), dict):
             self._chat_usage = dict(intent["usage"])
             for call in (self._chat_usage, self._chat_usage.get("research")):
@@ -2721,10 +2770,12 @@ class Bridge(QObject):
                 if provider.get("id") == "codex":
                     provider["models"] = [{**m, "verified": dict(verified.get(m.get("id"), {}))} for m in provider.get("models") or []]
             self.providersChanged.emit()
-        entries = text_entries(payload)
+        entries = _cut_feed(seen, status, intent, payload) if kept else text_entries(payload)
         answered = status in ("conversation", "research")
-        for index, entry in enumerate(entries):
-            if answered and index == len(entries) - 1:
+        for entry in entries:
+            # The reply itself; a cut-short reply's notice is JARVIS's own line, not part of it.
+            reply = entry["kind"] != "notice" if answered else (kept and entry["kind"] == "jarvis")
+            if answered and reply and "cut" not in entry:
                 measured = self._measured(*self._intent_reports(intent))
                 if measured:
                     entry["telemetry"] = measured
@@ -2732,9 +2783,9 @@ class Bridge(QObject):
                 # Separately answered groups: rendered once, in the interface language,
                 # so the reply is ordinary text - copyable, quotable, part of the history.
                 entry["text"] = render(entry["text"])
-            if partial and status == "conversation":
+            if partial and reply:
                 entry["streamed"] = True        # replaces the preview in place: no second entrance
-            self._say(entry.pop("kind"), entry.pop("text"), chat=status in ("conversation", "research"), **entry)
+            self._say(entry.pop("kind"), entry.pop("text"), chat=reply, **entry)
         self._clarification = {}
         if status == "structured":
             self._apply_run(payload.get("run"), intent, request=request or text)

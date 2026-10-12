@@ -84,7 +84,7 @@ class CaretTests(FeedCase):
         bridge.submitText("Merhaba")
         pump(200)
         self.assertEqual([True], seen)
-        self.assertEqual(["user", "jarvis", "error"], [e["kind"] for e in bridge.feed])
+        self.assertEqual(["user", "jarvis", "notice"], [e["kind"] for e in bridge.feed])   # DFREPLY: was "error"
         self.assertTrue(bridge.feed[1].get("interrupted"))
         self.assertFalse(caret.property("visible"))
 
