@@ -6321,7 +6321,7 @@ class FinalPolishTests(SurfaceCase):
             self.assertEqual(0, self.execute_calls()),
         ))
 
-    def test_a_low_quota_is_amber_attention_never_red(self) -> None:
+    def test_a_low_quota_keeps_the_one_accent_never_amber_or_red(self) -> None:
         bridge = self.bridge()
         bridge._claude_limits = {"seen_at": 10, "windows": {"five_hour": {"utilization": 0.08, "resets_at": 1789560046},
                                                             "seven_day": {"utilization": 0.92, "resets_at": int(time.time()) + 3 * 86400}}}
@@ -7937,7 +7937,7 @@ class ContextMenuPolishTests(SurfaceCase):
         pump(300)
 
     @ambient_on          # THIZ: it reads the ambient glass
-    def test_menus_carry_actions_only_and_a_lighter_glass(self) -> None:
+    def test_menus_carry_actions_only_on_an_opaque_glass(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
         pump(700)                                                                # the work surface has settled

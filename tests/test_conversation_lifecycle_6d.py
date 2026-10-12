@@ -399,7 +399,7 @@ class SchemaTests(StoreCase):
         with contextlib.closing(sqlite3.connect(self.database)) as connection:
             return connection.execute(sql).fetchall()
 
-    def test_d_schema_ten_and_exactly_one_new_compatibility_object(self) -> None:
+    def test_d_schema_ten_and_exactly_three_new_compatibility_objects(self) -> None:
         self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual([(10,)], self.rows("SELECT version FROM schema_version"))
         self.assertEqual(list(range(1, 11)), [r[0] for r in self.rows("SELECT version FROM schema_migrations ORDER BY version")])
