@@ -218,6 +218,26 @@ class Typography(QObject):
             block.setBottomMargin(float(paragraph))
             cursor.mergeBlockFormat(block)
             return
+        # ONE edit for the whole pass: the document lays itself out once at the end
+        # instead of after every block and span format (a 50,000-character reply has
+        # thousands of them). The formats set are exactly the same. Display formatting is
+        # not an edit anyone undoes: a document with no history (a message whose text was
+        # just set) gets none from it; one with history keeps it, plus this one step.
+        quiet = text_document.isUndoRedoEnabled() and not (
+            text_document.isUndoAvailable() or text_document.isRedoAvailable())
+        if quiet:
+            text_document.setUndoRedoEnabled(False)
+        edit = QTextCursor(text_document)
+        edit.beginEditBlock()
+        try:
+            self._style_blocks(text_document, line, paragraph)
+        finally:
+            edit.endEditBlock()
+            if quiet:
+                text_document.setUndoRedoEnabled(True)
+
+    def _style_blocks(self, text_document: Any, line: float, paragraph: float) -> None:
+        """Every block of a Markdown-rendered document, in order (see ``setLineHeight``)."""
         block = text_document.firstBlock()
         while block.isValid():
             existing = block.blockFormat()

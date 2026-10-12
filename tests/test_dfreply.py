@@ -398,11 +398,10 @@ class LongMarkdownTests(UiTestCase):
         return None
 
     def test_a_50000_character_markdown_reply_renders_whole(self) -> None:
-        """The whole document is rendered and streamed; the bounds are hang guards only.
-        Measured here 1.9-2.8 s to show and about 1.4 s per 50,000-character preview, almost
-        all in ``Typography.setLineHeight`` (one relayout per block format; a single
-        ``beginEditBlock`` around it measured 0.28 s / 0.10 s). That file is outside DFREPLY's
-        owned list, so the no-stall bound waits for it (see build/reports/DFREPLY.md)."""
+        """The whole document is rendered and streamed without stalling the window.
+        DFREPLY2: ``Typography.setLineHeight`` restyles in one edit block, so the document
+        lays out once. Measured here 0.24 s to show (1.85 s before) and 0.20-0.24 s per
+        50,000-character preview (1.53 s before); the bounds keep about 3x margin."""
         block = ("## Bölüm\n\n1. **Kalın** bir madde ve `kod` parçası.\n- Bir liste satırı, biraz daha uzun yazılmış.\n\n"
                  "```python\nprint('merhaba')\n```\n\n")
         text = (block * (REPLY_MAX_CHARS // len(block) + 1))[:REPLY_MAX_CHARS]
@@ -415,14 +414,17 @@ class LongMarkdownTests(UiTestCase):
         shown = time.monotonic() - started
         self.assertIsNotNone(message)
         self.assertGreater(message.property("length"), REPLY_MAX_CHARS // 2)              # the document is there
-        self.assertLess(shown, 15.0, f"a 50,000-character reply took {shown:.1f} s to show")
+        self.assertLess(shown, 0.8, f"a 50,000-character reply took {shown:.2f} s to show")
         # Streaming the same length: every growing preview is shown, whole.
         bridge._busy, bridge._request_id = True, "live"
         started = time.monotonic()
         for size in range(10_000, REPLY_MAX_CHARS + 1, 10_000):
+            preview = time.monotonic()
             bridge._on_preview("live", text[:size])
             pump(10)
+            preview = time.monotonic() - preview
+            self.assertLess(preview, 0.75, f"a {size:,}-character preview took {preview:.2f} s")
         streamed = time.monotonic() - started
         self.assertEqual(text, bridge.streamText)
-        self.assertLess(streamed, 20.0, f"five previews up to 50,000 characters took {streamed:.1f} s")
+        self.assertLess(streamed, 2.0, f"five previews up to 50,000 characters took {streamed:.2f} s")
         bridge._busy = False
