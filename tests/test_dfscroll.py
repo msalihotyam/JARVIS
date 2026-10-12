@@ -20,6 +20,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QMetaObject, QPointF, QRect, Q_ARG, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtQml import QQmlProperty
 from PySide6.QtTest import QTest
 
 from tests import test_ui as ui
@@ -102,6 +103,18 @@ class VisibilityTests(JumpCase):
         self.assertAlmostEqual(0, self.gap(feed), delta=1)
         self.assertFalse(feed.property("jumpVisible"))
         self.assertFalse(jump.isVisible())
+
+    def test_the_ring_sits_on_the_solid_fill(self) -> None:
+        # DFSCROLL2: the key itself is the opaque fill; its ring is a child drawn on top.
+        _bridge, _root, feed, jump = self.open()
+        self.scroll_up(feed)
+        self.assertEqual(1.0, jump.property("color").alphaF())
+        ring = jump.childItems()[0]
+        self.assertEqual((jump.width(), jump.height(), jump.property("radius")),
+                         (ring.width(), ring.height(), ring.property("radius")))
+        self.assertEqual(0.0, ring.property("color").alphaF())
+        self.assertEqual(1, QQmlProperty.read(ring, "border.width"))
+        self.assertAlmostEqual(0.55, QQmlProperty.read(ring, "border.color").alphaF(), places=2)
 
 
 class LookTests(JumpCase):

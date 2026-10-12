@@ -843,9 +843,14 @@ Item {
         opacity: feed.jumpVisible ? 1 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: Theme.dur(160); easing.type: Theme.ease } }
-        color: jumpArea.containsMouse ? Theme.alpha(Theme.accent, 0.22) : Theme.glassPrimaryReading
-        border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55)
+        // A solid fill (DFSCROLL2): nothing behind the key shows through, in any
+        // theme or state; hover is the accent tinted into it, still opaque.
+        color: jumpArea.containsMouse ? Qt.tint(Theme.menuSurface, Theme.alpha(Theme.accent, 0.22)) : Theme.menuSurface
+        Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
         Accessible.role: Accessible.Button
+        // The ring sits on the fill, so its translucent stroke shows the fill, not the text.
+        Rectangle { anchors.fill: parent; radius: parent.radius; color: "transparent"
+                    border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55) }
         Accessible.name: qsTr("Jump to latest message")
         Icon { objectName: "jumpArrow"; anchors.centerIn: parent; name: "arrow-down"; size: 16; tint: Theme.text
                opacity: jump.showDots ? 0 : 1
