@@ -20,6 +20,8 @@
 
 # 1. MASTER V2+ ROADMAP
 
+> Not (Salih 2026-10-12): bölümler aşağıda numara sırasıyla durur; uygulama sırası için §14 "Kesin ana sıra"ya bak (V2.4 → V2.3; Uzaktan/Eklentiler/Kendini geliştirme → V2.5/V2.6; dağıtım en sonda).
+
 ## V2.0 — Projects
 **Statü: KESİN / post-V1 #1 öncelik**
 
@@ -97,10 +99,10 @@ Bunlar karar değil, planlama tahminidir; dilim = bir commit'lik iş. V2.0 kalem
 | V2.6 Browser/Desktop 2.0 | araç seçim sırası, replay, UIA, vision fallback | 12–18 |
 
 ### V2.1–V2.6 birleştirme / küçültme önerileri (Salih için ÖNERİ, karar değil)
-- V2.2 "Workflow Recording → Skill" ile V2.6 "Workflow Recording" aynı kayıt/yeniden oynatma motorunu ister: motor bir kez (V2.6'da ya da öne çekilerek) yapılır, V2.2 yalnız skill tarafını alır.
-- V2.4B Faz 1 (parent/child, Core pipeline'ı) V2.4 subagent işiyle aynı yüzeydedir: tek bir V2.4 bloğunda birleşebilir.
-- V2.4A Jev: yalnız geliştirme pilotu (çevrimdışı eval + shadow) yapılır; ürün pilotu kalite kanıtlanana kadar ertelenir — blok küçülür.
-- V2.3 Deep Research, V2.4 Work durable state'in bir görev türü olarak kurulabilir (pause/resume, checkpoint, evidence ortak): V2.4'ten sonra ya da onunla birlikte yapılırsa küçülür.
+- V2.2 "Workflow Recording → Skill" ile V2.6 "Workflow Recording" aynı kayıt/yeniden oynatma motorunu ister: motor bir kez (V2.6'da ya da öne çekilerek) yapılır, V2.2 yalnız skill tarafını alır. KARAR (Salih 2026-10-12): kabul — motor V2.6'da.
+- V2.4B Faz 1 (parent/child, Core pipeline'ı) V2.4 subagent işiyle aynı yüzeydedir: tek bir V2.4 bloğunda birleşebilir. KARAR (Salih 2026-10-12): kabul.
+- V2.4A Jev: yalnız geliştirme pilotu (çevrimdışı eval + shadow) yapılır; ürün pilotu kalite kanıtlanana kadar ertelenir — blok küçülür. KARAR (Salih 2026-10-12): kabul.
+- V2.3 Deep Research, V2.4 Work durable state'in bir görev türü olarak kurulabilir (pause/resume, checkpoint, evidence ortak): V2.4'ten sonra ya da onunla birlikte yapılırsa küçülür. KARAR (Salih 2026-10-12): kabul — V2.3, V2.4'ten sonra.
 - V2.5 Routine = Skill'in zaman/koşul/olay sarmalayıcısı; V1 zamanlayıcısı ve V2.2 skill'leri üzerine ince bir katman olarak küçülebilir.
 - V2.1'den Memory Doctor ve history import bir V2.1.x'e ayrılabilir; daily-driver kapısı typed memory + capture + retrieval ile daha erken gelir. (Mekanik lamba ve dondurma 3–4 V2.0'da gönderildi, Salih 2026-10-11; ayrı kaplama paketi gerekmez.)
 - V2.4 isimli kalıcı ajanlar, subagent'lardan sonra ayrı bir alt sürüm olabilir.
@@ -1481,17 +1483,20 @@ Referansların eski özelliklerini current fact gibi kabul etmeme.
 
 ## Kesin ana sıra
 
-1. **V2.0 Projects**
-2. **V2.1 Advanced Memory + official daily-driver**
-3. **V2.2 Skills + Experience + Teach/Workflow Learning**
-4. **V2.3 Deep Research**
-5. **V2.4 Work + Subagents + Persistent Specialist Agents**
-6. **V2.5 Automation 2.0 + Routines**
-7. **V2.6 Browser/Desktop 2.0 + Workflow Recording**
-8. **Remote/Mobile**
-9. **Artifact/Data/Image**
-10. **Plugins/Connectors**
-11. **Self-Development/Dreaming**
+Salih 2026-10-12 (16:18, 16:24, 16:38): V2.4, V2.3'ten önce; Uzaktan/Eklentiler/Kendini geliştirme V2.5/V2.6'dan önce; dağıtım en sona. Başlık numaraları (V2.x) değişmez.
+
+1. **V2.0 Projects** (gönderildi)
+2. **V2.1 Hafıza** (a, b) + official daily-driver
+3. **V2.2 Beceriler** — yalnız skill tarafı; workflow kayıt motoru V2.6'da bir kez kurulur
+4. **V2.4 Work + ajanlar** (ince): V2.4A Jev = yalnız geliştirme pilotu; V2.4B Faz 1 subagent bloğuna katılır → **GÜNLÜK KULLANIM NOKTASI**
+5. **V2.3 Derin araştırma** — Work görev türü olarak kurulur
+6. **Uzaktan/Mobil (P7)** — V2.5'e kadar yalnız V1 zamanlayıcı işlerini gösterir
+7. **Eklentiler/Bağlayıcılar (P10)**
+8. **Kendini geliştirme (P11)** — V2.2 becerilerine dayanır
+9. **V2.5 Automation 2.0 + Routines**
+10. **V2.6 Browser/Desktop 2.0 + workflow kayıt motoru**
+11. **Dağıtım: installer + onboarding** (JARVIS başkalarıyla paylaşılmadan önce)
+12. Sonra: **Artifact/Data/Image (P9)** ve **Voice (P8)**
 
 ### Voice
 Master listte tarihsel P8 olarak kalabilir fakat **kullanıcı yeniden istemeden aktif sıraya alınmaz.**
