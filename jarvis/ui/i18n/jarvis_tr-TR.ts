@@ -539,7 +539,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>Pick a folder on a local drive. Network and device paths cannot be linked.</source>
-        <translation>Yerel bir sürücüde bir klasör seç. Ağ ve aygıt yolları bağlanamaz.</translation>
+        <translation>Yerel bir sürücüde bir klasör seçin. Ağ ve aygıt yolları bağlanamaz.</translation>
     </message>
     <message>
         <source>The folder path is not in plain form (it has . or .. or doubled separators).</source>
@@ -551,7 +551,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>The folder path uses a short (8.3) name. Pick the folder by its full name.</source>
-        <translation>Klasör yolu kısa (8.3) bir ad kullanıyor. Klasörü tam adıyla seç.</translation>
+        <translation>Klasör yolu kısa (8.3) bir ad kullanıyor. Klasörü tam adıyla seçin.</translation>
     </message>
     <message>
         <source>A whole drive cannot be a project folder.</source>
@@ -559,7 +559,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>Your user folder itself, or a folder around it, cannot be a project folder. Pick a folder inside it.</source>
-        <translation>Kullanıcı klasörünün kendisi ya da onu içeren bir klasör proje klasörü olamaz. İçinde bir klasör seç.</translation>
+        <translation>Kullanıcı klasörünün kendisi ya da onu içeren bir klasör proje klasörü olamaz. İçinde bir klasör seçin.</translation>
     </message>
     <message>
         <source>A Windows or program folder cannot be a project folder.</source>
@@ -587,7 +587,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>This folder is a link or junction, or lies inside one (an online-only OneDrive folder can be one). Such folders are always refused; pick a regular folder.</source>
-        <translation>Bu klasör bir bağlantı (link ya da junction) ya da böyle birinin içinde (yalnız çevrimiçi bir OneDrive klasörü de böyle olabilir). Bu tür klasörler her zaman reddedilir; normal bir klasör seç.</translation>
+        <translation>Bu klasör bir bağlantı (link ya da junction) ya da böyle birinin içinde (yalnız çevrimiçi bir OneDrive klasörü de böyle olabilir). Bu tür klasörler her zaman reddedilir; normal bir klasör seçin.</translation>
     </message>
     <message>
         <source>The chosen path is not a folder.</source>
@@ -595,11 +595,11 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
     <message>
         <source>The folder could not be verified as the one you picked (a substituted drive or a redirect).</source>
-        <translation>Klasörün seçtiğin klasör olduğu doğrulanamadı (yerine konmuş bir sürücü ya da yönlendirme).</translation>
+        <translation>Klasörün seçtiğiniz klasör olduğu doğrulanamadı (yerine konmuş bir sürücü ya da yönlendirme).</translation>
     </message>
     <message>
         <source>This project already has a linked folder. Unlink it first.</source>
-        <translation>Bu projenin zaten bağlı bir klasörü var. Önce bağlantıyı kaldır.</translation>
+        <translation>Bu projenin zaten bağlı bir klasörü var. Önce bağlantıyı kaldırın.</translation>
     </message>
     <message>
         <source>That folder, or a folder inside or around it, is linked to another project.</source>
@@ -2429,7 +2429,7 @@ yok</translation>
     </message>
     <message>
         <source>What do you want to do?</source>
-        <translation>Ne yapmak istiyorsun?</translation>
+        <translation>Ne yapmak istiyorsunuz?</translation>
     </message>
     <message>
         <source>optional</source>
@@ -2481,11 +2481,11 @@ yok</translation>
     </message>
     <message>
         <source>JARVIS creates exactly this folder when you click Create project. </source>
-        <translation>Proje oluştur&apos;a tıkladığında JARVIS tam olarak bu klasörü oluşturur. </translation>
+        <translation>Proje oluştur&apos;a tıkladığınızda JARVIS tam olarak bu klasörü oluşturur. </translation>
     </message>
     <message>
         <source>JARVIS does not read this folder, write into it or send it to the model: it is context for you only.</source>
-        <translation>JARVIS bu klasörü okumaz, içine yazmaz ve modele göndermez: yalnız senin için bağlamdır.</translation>
+        <translation>JARVIS bu klasörü okumaz, içine yazmaz ve modele göndermez: yalnız sizin için bağlamdır.</translation>
     </message>
     <message>
         <source>The instruction can be at most %1 characters.</source>
@@ -3273,7 +3273,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>No instruction yet. Write the context every conversation in this project should carry.</source>
-        <translation>Henüz talimat yok. Bu projedeki her sohbete eşlik edecek bağlamı buraya yaz.</translation>
+        <translation>Henüz talimat yok. Bu projedeki her sohbete eşlik edecek bağlamı buraya yazın.</translation>
     </message>
     <message>
         <source>Files</source>
@@ -3321,7 +3321,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>A linked folder is context for you only: JARVIS does not read it, write into it or send it to the model.</source>
-        <translation>Bağlı klasör yalnız senin için bağlamdır: JARVIS onu okumaz, içine yazmaz ve modele göndermez.</translation>
+        <translation>Bağlı klasör yalnız sizin için bağlamdır: JARVIS onu okumaz, içine yazmaz ve modele göndermez.</translation>
     </message>
     <message>
         <source>Linked folder</source>
@@ -3364,7 +3364,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>Without a project the conversation stays outside projects</source>
-        <translation>Proje seçmezsen sohbet projelerin dışında kalır</translation>
+        <translation>Proje seçmezseniz sohbet projelerin dışında kalır</translation>
     </message>
     <message>
         <source>The conversation starts in this project</source>
@@ -3439,7 +3439,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>Your projects</source>
-        <translation>Projelerin</translation>
+        <translation>Projeleriniz</translation>
     </message>
     <message>
         <source>Archived</source>
@@ -4290,7 +4290,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
     <message>
         <source>Waiting for you</source>
-        <translation>Seni bekliyor</translation>
+        <translation>Sizi bekliyor</translation>
     </message>
     <message>
         <source>Finished</source>
@@ -4958,7 +4958,7 @@ DOĞRULANMADI</translation>
     </message>
     <message>
         <source>Waiting for you</source>
-        <translation>Seni bekliyor</translation>
+        <translation>Sizi bekliyor</translation>
     </message>
     <message>
         <source>Finished</source>

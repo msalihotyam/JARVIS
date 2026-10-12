@@ -8,7 +8,7 @@ D1  Every conversation row (SABİTLENENLER, the plain list, the project trees) s
     green until that conversation is opened. The open one is never green.
 D2  A green row also glows (green tint + slow pulse); dot and glow clear when it is opened.
 K2  Ambient effects off: static colours, nothing blinks or pulses.
-K3  The state is said in words (tip and accessible name): Çalışıyor / Seni bekliyor / Bitti.
+K3  The state is said in words (tip and accessible name): Çalışıyor / Sizi bekliyor / Bitti.
 
 Real bridge state only; bridge memory only (a restart shows none). Runs are scripted Core /
 model answers; nothing reaches a model, a network or the live DB.
@@ -170,7 +170,7 @@ class DotTests(StatusDotCase):
         self.assertEqual("", idle.property("words"))
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
-        self.assertEqual(["Çalışıyor", "Seni bekliyor", "Bitti"],
+        self.assertEqual(["Çalışıyor", "Sizi bekliyor", "Bitti"],
                          [tx("StatusDot", s) for s in ("Running", "Waiting for you", "Finished")])
 
     def test_f_nothing_survives_a_restart(self) -> None:

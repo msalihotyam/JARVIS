@@ -168,7 +168,7 @@ class BellTests(BellCase):
         localization(_APP).apply("tr-TR")
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         self.assertEqual("Okunmadı olarak işaretle", tx("ConversationMenu", "Mark as unread"))
-        self.assertEqual(["Bekleyen bir şey yok", "Bekleyen: %1", "Seni bekliyor", "Bitti"],
+        self.assertEqual(["Bekleyen bir şey yok", "Bekleyen: %1", "Sizi bekliyor", "Bitti"],
                          [tx("UnreadBell", s) for s in ("Nothing waiting", "Waiting: %1", "Waiting for you",
                                                         "Finished")])
         # G6UIPOL A-6: the bell no longer says "Genel" (V1), so it has no such string.

@@ -140,7 +140,7 @@ class ListTests(ProjectsUiCase):
         page = self.item(root, "projectsPage")
         settled(200, lambda: (
             self.assertEqual({"Evim": True, "Tez 2025": False}, {r["name"]: r["active"] for r in bridge.projectRecords}),
-            self.assertEqual(["Evim"], self.texts(root, "projectCardName")),               # active on "Projelerin"
+            self.assertEqual(["Evim"], self.texts(root, "projectCardName")),               # active on "Projeleriniz"
         ))
         page.setProperty("tab", "archived")
         settled(200, lambda: self.assertEqual(["Tez 2025"], self.texts(root, "projectCardName")))
