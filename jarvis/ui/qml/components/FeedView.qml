@@ -47,13 +47,14 @@ Item {
     // Its arrival also resizes the viewport (the attention strip appears), so
     // that resize joins the same single glide instead of jumping.
     property bool approvalGlide: false
-    onApprovalCardShownChanged: if (approvalCardShown) { if (flick.followEnd) { approvalGlide = true; growth.restart() } else newBelow = true }
-    // Newer content arrived below while the reader was reading older messages.
-    property bool newBelow: false
-    readonly property bool jumpVisible: newBelow && !flick.followEnd
+    onApprovalCardShownChanged: if (approvalCardShown && flick.followEnd) { approvalGlide = true; growth.restart() }
+    // The arrow: whenever the reader is not at the end (DFSCROLL, Salih 2026-10-12),
+    // idle or running. A small margin (about two rows) keeps a tiny overscroll from
+    // flickering it.
+    readonly property bool jumpVisible: !flick.followEnd && flick.endY - flick.contentY > 48
     // The arrow and sending a message: one smooth glide to the exact end.
     function jumpToLatest() {
-        newBelow = false; flick.followEnd = true
+        flick.followEnd = true
         if (Math.abs(flick.endY - flick.contentY) > 1) {
             glideCount += 1
             glide.stop(); glide.from = flick.contentY; glide.to = flick.endY; glide.start()
@@ -253,11 +254,7 @@ Item {
             }
             settling = false
         }
-        function settleGrowth() {
-            if (!followEnd && endY - contentY > 6) feed.newBelow = true
-            settle(true); feed.approvalGlide = false
-        }
-        onFollowEndChanged: if (followEnd) feed.newBelow = false
+        function settleGrowth() { settle(true); feed.approvalGlide = false }
         function settleResize() { primed = true; if (feed.approvalGlide) growth.restart(); else settle(false) }
         // A burst of growth (a card laying itself out in steps) is one glide:
         // the changes are gathered for a few frames, then settled once.
@@ -829,11 +826,16 @@ Item {
         }
     }
 
-    // -- jump to latest: a small arrow just above the composer, only while newer
-    //    content waits below the reading position ---------------------------------
+    // -- jump to latest: a small round key just above the composer whenever the
+    //    reader is above the end. While JARVIS works in this conversation it shows
+    //    the live activity dots (the same rhythm as the live line); under the
+    //    pointer, and once the run ends, the arrow -------------------------------
     Rectangle {
         id: jump
         objectName: "jumpToLatest"
+        // For inspection: which face shows, and whether the dots move.
+        readonly property bool showDots: streamRow.working && !jumpArea.containsMouse
+        readonly property bool dotsAnimated: showDots && Theme.ambient && visible
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.horizontalCenterOffset: -feed.strip / 2
         anchors.bottom: parent.bottom; anchors.bottomMargin: 12
@@ -845,7 +847,32 @@ Item {
         border.width: 1; border.color: feed.approvalCardShown ? Theme.warning : Theme.alpha(Theme.accent, 0.55)
         Accessible.role: Accessible.Button
         Accessible.name: qsTr("Jump to latest message")
-        Icon { anchors.centerIn: parent; name: "arrow-down"; size: 16; tint: Theme.text }
+        Icon { objectName: "jumpArrow"; anchors.centerIn: parent; name: "arrow-down"; size: 16; tint: Theme.text
+               opacity: jump.showDots ? 0 : 1
+               Behavior on opacity { NumberAnimation { duration: Theme.dur(160); easing.type: Easing.OutCubic } } }
+        Row {
+            objectName: "jumpDots"
+            anchors.centerIn: parent
+            spacing: 4
+            opacity: jump.showDots ? 1 : 0
+            Behavior on opacity { NumberAnimation { duration: Theme.dur(160); easing.type: Easing.OutCubic } }
+            Repeater {
+                model: 3
+                Rectangle {
+                    width: 5; height: 5; radius: 2.5
+                    color: Theme.accent
+                    opacity: jump.dotsAnimated ? 0.28 : 0.9
+                    SequentialAnimation on opacity {
+                        running: jump.dotsAnimated
+                        loops: Animation.Infinite
+                        PauseAnimation { duration: Theme.dur(index * 160) }
+                        NumberAnimation { to: 1; duration: Theme.dur(320); easing.type: Easing.InOutSine }
+                        NumberAnimation { to: 0.28; duration: Theme.dur(420); easing.type: Easing.InOutSine }
+                        PauseAnimation { duration: Theme.dur((2 - index) * 160 + 120) }
+                    }
+                }
+            }
+        }
         MouseArea { id: jumpArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     enabled: feed.jumpVisible; onClicked: feed.jumpToLatest() }
     }

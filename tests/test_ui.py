@@ -4887,7 +4887,7 @@ class ConversationUxTests(UiTestCase):
         self.fill(bridge)
         QMetaObject.invokeMethod(feed, "scrollTo", Q_ARG("QVariant", 100.0))
         pump(200)
-        self.assertFalse(feed.property("jumpVisible"))                                  # nothing new yet
+        self.assertTrue(feed.property("jumpVisible"))                                   # DFSCROLL: above the end, offered at once
         count = feed.property("glideCount")
         bridge._say("jarvis", "arrives while reading", chat=True)
         pump(600)
