@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import Q_ARG, QMetaObject, QObject, QTimer, Slot
 from PySide6.QtGui import QIcon, QWindow
 
 from jarvis.ui.i18n import QT_TRANSLATE_NOOP, tx
@@ -104,8 +104,16 @@ class TrayController(QObject):
 
     @Slot()
     def quit(self) -> None:
+        window = self.window
         if self.bridge.quitWarning:
             self.open()                          # the confirmation needs the window
+        elif self.bridge.ambientEffects and window.isVisible() and window.visibility() != QWindow.Visibility.Minimized:
+            # DFWIN2B: on screen, the quit powers down first; its quitNow confirms the quit once.
+            # Ambient off there is no effect to play (Theme.ambient is ambientEffects): the direct path.
+            fx = window.findChild(QObject, "windowPowerFx")
+            if fx is not None:
+                QMetaObject.invokeMethod(fx, "powerOff", Q_ARG("QVariant", "quit"))
+                return
         self.bridge.requestQuit()
 
 
