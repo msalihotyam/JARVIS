@@ -32,9 +32,17 @@ The serial run stays the reference when a result is disputed.
   discovery and the same plan and prints one combined summary, and with
   ``--write-durations`` records CI's own seconds for the next plan. It prints
   every skip with its reason and fails on any skip not on ``ALLOWED_SKIPS``.
+* CONVUI: the UI units of one run at a time on this machine (Salih 2026-10-12,
+  "arayuz testleri sirayla"). A run with UI units takes ``build/locks/ui.json``
+  of the main checkout before its first UI process and frees it when its last
+  UI unit ends (or on an error); meanwhile another run's UI processes wait in the
+  foreground and its non-UI units go on. A full suite holding the A1 suite lock
+  (``build/locks/suite.json``) of another session counts as holding it; a holder
+  whose pid is gone is taken over. No lock under CI (the ``CI`` variable) or with
+  ``--no-ui-lock``.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
-                                    [--python PATH] [--shard I/N] [--report PATH]
+                                    [--python PATH] [--shard I/N] [--report PATH] [--no-ui-lock]
                                     [--write-durations PATH] [modules ...]
     python scripts/test_parallel.py --aggregate DIR --shards N [--durations N] [--write-durations PATH]
 """
@@ -54,7 +62,15 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
@@ -323,6 +339,151 @@ def _skips(output: str) -> list[list[str]]:
     return skips
 
 
+#: CONVUI: the byte locked while a lock file is read and changed (past any record, so readers never block).
+_CAS_OFFSET = 1 << 20
+#: A1: a suite lock heartbeat older than this, or further ahead than _FUTURE_SKEW, is stale.
+_SUITE_STALE = 45 * 60
+_FUTURE_SKEW = 5 * 60
+_SUITE_FIELDS = ("lane", "session", "started_at", "command", "heartbeat")
+
+
+def lock_dir() -> Path:
+    """``build/locks`` of the main checkout, shared by every worktree's runs (A1)."""
+    try:
+        done = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT,
+                              capture_output=True, text=True, encoding="utf-8")
+        common = done.stdout.strip() if done.returncode == 0 else ""
+    except OSError:
+        common = ""
+    return (Path(common).parent if common else ROOT) / "build" / "locks"
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    # os.kill(pid, 0) would END the process on Windows: ask for its exit code instead.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() == 5  # access denied: it exists
+    try:
+        code = wintypes.DWORD()
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _cas(path: Path, change):
+    """``change(text) -> (result, new_text | None)`` on the lock file, one run at a time (empty file = free)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        while True:
+            os.lseek(fd, _CAS_OFFSET, os.SEEK_SET)
+            try:
+                if os.name == "nt":
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _CAS_OFFSET)
+                break
+            except OSError:
+                time.sleep(0.05)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            result, new = change(os.read(fd, 1 << 16).decode("utf-8", "replace"))
+            if new is not None:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, new.encode("utf-8"))
+            return result
+        finally:
+            os.lseek(fd, _CAS_OFFSET, os.SEEK_SET)
+            if os.name == "nt":
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.lockf(fd, fcntl.LOCK_UN, 1, _CAS_OFFSET)
+    finally:
+        os.close(fd)
+
+
+def _plain(text: object, limit: int = 40) -> str:
+    return re.sub(r"[^A-Za-z0-9._:+-]", "_", str(text))[:limit]
+
+
+class UiLock:
+    """CONVUI: the machine-wide UI test lock, ``build/locks/ui.json`` (the A1 record plus ``pid``)."""
+
+    poll = 2.0
+    notice = 30.0
+
+    def __init__(self, folder: Path, command: str):
+        self.path, self.suite = folder / "ui.json", folder / "suite.json"
+        self.session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.record = json.dumps({"lane": ROOT.name, "session": self.session, "pid": os.getpid(), "started_at": stamp,
+                                  "command": command[:200], "heartbeat": stamp})
+        self.held = False
+
+    def _suite_holder(self) -> str | None:
+        """Another session's live full suite (A1 rules: fresh heartbeat, all fields)."""
+        try:
+            rec = json.loads(self.suite.read_text(encoding="utf-8"))
+            if not all(isinstance(rec.get(k), str) for k in _SUITE_FIELDS) or (self.session and rec["session"] == self.session):
+                return None
+            age = time.time() - datetime.fromisoformat(rec["heartbeat"].replace("Z", "+00:00")).timestamp()
+        except (OSError, ValueError, AttributeError):
+            return None  # no file, free (empty), mid-write or garbage: not a holder
+        if not -_FUTURE_SKEW <= age <= _SUITE_STALE:
+            return None
+        return f"{_plain(rec['lane'])} (full suite) since {_plain(rec['started_at'])}"
+
+    def _take(self, text: str):
+        if text.strip() and text != self.record:
+            try:
+                rec = json.loads(text)
+                pid = int(rec["pid"])
+            except (ValueError, KeyError, TypeError):
+                pid = 0  # garbage: stale
+            if pid_alive(pid):
+                return f"{_plain(rec.get('lane'))}/{pid} since {_plain(rec.get('started_at'))}", None
+        return None, self.record
+
+    def acquire(self) -> None:
+        told = None
+        while True:
+            holder = self._suite_holder() or _cas(self.path, self._take)
+            if holder is None:
+                self.held = True
+                return
+            if told is None or time.monotonic() - told >= self.notice:
+                print(f"waiting for the UI test lock held by {holder}", flush=True)
+                told = time.monotonic()
+            time.sleep(self.poll)
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            _cas(self.path, lambda text: (None, "" if text == self.record else None))
+
+
+def ui_lock_for(args, units: list[Unit]) -> UiLock | None:
+    if args.no_ui_lock or os.environ.get("CI") or not any(u.ui for u in units):
+        return None
+    return UiLock(lock_dir(), " ".join(["test_parallel.py", *sys.argv[1:]]))
+
+
 def worker_env(index: int, bases: list[Path]) -> dict[str, str]:
     base = Path(tempfile.mkdtemp(prefix=f"jarvis-test-w{index}-"))
     bases.append(base)
@@ -344,16 +505,24 @@ def run_unit(python: str, unit: Unit, env: dict[str, str], durations: int | None
     return Result(unit, command, done.returncode, done.stdout + done.stderr, time.monotonic() - started)
 
 
-def execute(args, units: list[Unit], ui_workers: int, workers: int) -> tuple[list[Result], dict[str, float], float, list[Path]]:
+def execute(args, units: list[Unit], ui_workers: int, workers: int,
+            ui_lock: UiLock | None = None) -> tuple[list[Result], dict[str, float], float, list[Path]]:
     durations = 0 if args.write_durations or args.report else (args.durations or None)
     bases: list[Path] = []
     results: list[Result] = []
-    lock = threading.Lock()
+    lock, gate = threading.Lock(), threading.Lock()
     order = lambda u: (-(u.seconds if u.seconds is not None else CHUNK_SECONDS / 4), u.label)  # noqa: E731
     queues = {"ui": sorted((u for u in units if u.ui), key=order), "plain": sorted((u for u in units if not u.ui), key=order)}
+    ui_left = len(queues["ui"])
     worker_wall: dict[str, float] = {}
 
     def worker(kind: str, index: int) -> None:
+        nonlocal ui_left
+        if kind == "ui" and ui_lock is not None:
+            # CONVUI: UI processes start only under the machine-wide UI lock; the plain workers do not wait.
+            with gate:
+                if ui_left and not ui_lock.held:
+                    ui_lock.acquire()
         env, began = worker_env(index, bases), time.monotonic()
         while True:
             with lock:
@@ -366,13 +535,21 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int) -> tuple[lis
             result = run_unit(args.python, unit, env, durations)
             with lock:
                 results.append(result)
+                if unit.ui:
+                    ui_left -= 1
+                    if not ui_left and ui_lock is not None:
+                        ui_lock.release()
         worker_wall[f"{kind}{index}"] = time.monotonic() - began
 
     started = time.monotonic()
     plan = [("ui", i) for i in range(1, ui_workers + 1)] + [("plain", i) for i in range(ui_workers + 1, ui_workers + workers + 1)]
-    with futures.ThreadPoolExecutor(len(plan)) as pool:
-        for job in [pool.submit(worker, kind, i) for kind, i in plan]:
-            job.result()
+    try:
+        with futures.ThreadPoolExecutor(len(plan)) as pool:
+            for job in [pool.submit(worker, kind, i) for kind, i in plan]:
+                job.result()
+    finally:
+        if ui_lock is not None:
+            ui_lock.release()
     return results, worker_wall, time.monotonic() - started, bases
 
 
@@ -389,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write-durations", default="", help="record every test class's seconds to this JSON file")
     parser.add_argument("--aggregate", default="", help="check and combine the shard reports in this directory")
     parser.add_argument("--shards", type=int, default=0, help="with --aggregate: the number of shards")
+    parser.add_argument("--no-ui-lock", action="store_true", help="do not wait for the machine-wide UI test lock (a deliberate manual run)")
     parser.add_argument("--_discover-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_serial", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_no-serial", action="store_true", help=argparse.SUPPRESS)
@@ -442,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(units)} units: {ui_count} UI over {ui_workers} processes, {len(units) - ui_count} other over {workers} workers;"
           f" {sum(dispatched.values())} tests dispatched", flush=True)
 
-    results, worker_wall, wall, bases = execute(args, units, ui_workers, workers)
+    results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units))
     try:
         ran = sum(r.ran for r in results)
         skipped = sum(r.skipped for r in results)
