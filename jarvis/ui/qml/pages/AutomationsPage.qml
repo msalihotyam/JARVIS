@@ -84,7 +84,9 @@ SecondaryPage {
             radius: Theme.radiusSmall
             color: Theme.surfaceRaised; border.width: 1; border.color: Theme.border
             ScrollView { anchors.fill: parent; anchors.margins: 6
-                TextArea { id: spec; objectName: "jobSpecInput"; color: Theme.text; font: Theme.pageCode; wrapMode: TextEdit.Wrap; selectByMouse: true; background: Item {} placeholderText: "{ ... }"; placeholderTextColor: Theme.textDim }
+                TextArea { id: spec; objectName: "jobSpecInput"; color: Theme.text; font: Theme.pageCode; wrapMode: TextEdit.Wrap; selectByMouse: true; background: Item {} placeholderText: "{ ... }"; placeholderTextColor: Theme.textDim
+                           ContextMenu.menu: null
+                           EditMenu { objectName: "jobSpecInputMenu"; editor: spec } }
             }
         }
         ActionButton { id: createButton; objectName: "createJobButton"; label: qsTr("Create job"); onClicked: { bridge.createJob(spec.text); spec.text = "" } }

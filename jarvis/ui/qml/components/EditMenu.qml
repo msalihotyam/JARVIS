@@ -16,9 +16,21 @@ import "../theme"
 // above or to the left where the window ends. Labels only - the shortcuts are
 // the platform's own and need no reminder here. K4: the one menu surface and
 // row (opaque; Esc returns focus to the editor).
+//
+// DFMENU (Salih 2026-10-12): the one context menu of every text field. A right-
+// click on `editor` opens this menu (a TapHandler it creates on the editor), so
+// a field needs only this menu and `ContextMenu.menu: null` - Qt's stock menu
+// never shows (tests/test_dfmenu.py guards every field). A menu shared by many
+// texts (`ownsRightClick: false`) is opened by its caller.
 MenuSurface {
     id: menu
     property Item editor: null
+    property bool ownsRightClick: true
+    property Component rightClick: Component {
+        TapHandler { acceptedButtons: Qt.RightButton; onTapped: function (point) { menu.openAt(menu.editor, point.position) } }
+    }
+    // The editor is fixed at creation; only a menu with ownsRightClick: false changes it later.
+    Component.onCompleted: if (ownsRightClick && editor) rightClick.createObject(editor)
     property bool attachAware: false
     // What Copy takes from a read-only text when nothing is selected.
     property string wholeText: ""

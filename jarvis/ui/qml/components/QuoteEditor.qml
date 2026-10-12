@@ -53,7 +53,7 @@ Item {
             Keys.onReturnPressed: editor.accepted()
             Keys.onEnterPressed: editor.accepted()
             Keys.onPressed: function(event) { if (event.matches(StandardKey.Paste)) { editor.paste(); event.accepted = true } }
-            TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { menu.openAt(field, point.position) } }
+            ContextMenu.menu: null      // menu (quoteCommentMenu) instead
             background: Rectangle { radius: Theme.radiusTiny; color: Theme.surfaceDeep; border.width: 1
                                     border.color: field.activeFocus ? Theme.commandEdge : Theme.border }
         }

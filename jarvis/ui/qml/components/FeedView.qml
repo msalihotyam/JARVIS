@@ -928,7 +928,7 @@ Item {
     }
 
     // One read-only menu for every message: the right-clicked one is its editor.
-    EditMenu { id: messageMenu; objectName: "messageEditMenu" }
+    EditMenu { id: messageMenu; objectName: "messageEditMenu"; ownsRightClick: false }
 
     // -- the contextual quote action (Quoting v2) ---------------------------------
     // Selecting text inside a message JARVIS or the person wrote offers ONE small

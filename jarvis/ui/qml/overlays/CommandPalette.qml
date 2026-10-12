@@ -99,7 +99,9 @@ Item {
                     Keys.onBacktabPressed: palette.move(-1)
                     Keys.onReturnPressed: palette.runCurrent()
                     Keys.onEnterPressed: palette.runCurrent()
-                    Keys.onEscapePressed: palette.hide() } }
+                    Keys.onEscapePressed: palette.hide()
+                    ContextMenu.menu: null
+                    EditMenu { objectName: "commandPaletteSearchMenu"; editor: search } } }
             Text { objectName: "commandPaletteEmpty"; visible: palette.matches.length === 0; width: parent.width; wrapMode: Text.Wrap
                    leftPadding: 14; text: qsTr("No command matches \"%1\".").arg(search.text); color: Theme.textMuted; font: Theme.body }
             ListView {

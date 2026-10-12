@@ -195,7 +195,7 @@ Item {
                                 // stable id, so sending mid-typing carries the latest text.
                                 onTextChanged: { card.noteText = text; bridge.setGroupNote(card.groupId, text) }
                                 // An ordinary text editor: its Paste is text only, never an attachment.
-                                TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { noteMenu.openAt(noteInput, point.position) } }
+                                ContextMenu.menu: null      // noteMenu instead
                                 // Reached by Tab instead of the pencil: the edit starts the same way.
                                 onActiveFocusChanged: if (activeFocus && !noteBox.open) { noteBox.before = text; noteBox.open = true }
                                 Keys.onReturnPressed: noteBox.finish(true)

@@ -93,6 +93,8 @@ Item {
             Keys.onEscapePressed: search.close()
             Keys.onReturnPressed: if (search.active) search.run()
             Keys.onEnterPressed: if (search.active) search.run()
+            ContextMenu.menu: null
+            EditMenu { objectName: "sidebarSearchFieldMenu"; editor: field }
         }
         IconButton {
             id: closeButton

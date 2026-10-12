@@ -93,10 +93,13 @@ Item {
     }
 
     component Field: TextField {
+        id: field
         selectByMouse: true; color: Theme.text; font: Theme.body; maximumLength: 120
         placeholderTextColor: Theme.textDim
         background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                 border.color: parent.activeFocus ? Theme.commandEdge : Theme.border }
+        ContextMenu.menu: null
+        EditMenu { objectName: field.objectName + "Menu"; editor: field }
     }
     component Choice: Rectangle {
         id: chip
@@ -427,6 +430,7 @@ Item {
                         textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap; selectByMouse: true
                         readOnly: !projectPage.live
                         color: Theme.text; font: Theme.body
+                        EditMenu { objectName: "instructionEditorMenu"; editor: instructionEditor }
                     }
                 }
             }

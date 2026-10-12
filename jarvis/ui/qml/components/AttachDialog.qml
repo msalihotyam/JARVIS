@@ -89,6 +89,8 @@ JarvisDialog {
                                     border.color: newName.activeFocus ? Theme.commandEdge
                                                   : dialog.useNew ? Theme.alpha(Theme.accent, 0.6) : Theme.border }
             onTextEdited: { dialog.useNew = text !== ""; if (!dialog.useNew) dialog.chosenId = ""; dialog.repreview() }
+            ContextMenu.menu: null
+            EditMenu { objectName: "attachNewNameMenu"; editor: newName }
         }
     }
     Line { objectName: "attachNotice"; visible: text !== ""; text: bridge.attachNotice; color: Theme.warning }

@@ -52,6 +52,8 @@ MenuSurface {
             font: Theme.body
             background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                     border.color: field.activeFocus ? Theme.commandEdge : Theme.border }
+            ContextMenu.menu: null
+            EditMenu { objectName: "renameFieldMenu"; editor: field }
         }
         buttons: [
             ActionButton { objectName: "renameCancel"; label: qsTr("Cancel"); height: 36; width: 110; onClicked: renameDialog.close() },

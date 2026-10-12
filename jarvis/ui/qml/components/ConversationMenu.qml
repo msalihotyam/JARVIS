@@ -210,6 +210,8 @@ Item {
                 // Esc is the editor's: it reverts and returns focus to the opener.
                 Keys.onShortcutOverride: function (event) { if (event.key === Qt.Key_Escape) event.accepted = true }
                 onAccepted: editor.commit()
+                ContextMenu.menu: null
+                EditMenu { objectName: "conversationRenameFieldMenu"; editor: renameField }
             }
             Text { objectName: "conversationRenameNotice"; visible: bridge.conversationRenameNotice !== ""
                    width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText

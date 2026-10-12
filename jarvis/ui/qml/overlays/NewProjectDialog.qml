@@ -161,6 +161,8 @@ JarvisDialog {
         placeholderText: qsTr("e.g. Kitchen renovation"); placeholderTextColor: Theme.textDim
         background: Rectangle { radius: 6; color: Theme.surfaceDeep; border.width: 1
                                 border.color: nameField.activeFocus ? Theme.commandEdge : Theme.border }
+        ContextMenu.menu: null
+        EditMenu { objectName: "newProjectNameMenu"; editor: nameField }
     }
     Row {
         spacing: 8
@@ -181,6 +183,8 @@ JarvisDialog {
                 color: Theme.text; font: Theme.body; placeholderTextColor: Theme.textDim
                 placeholderText: qsTr("Goal, scope, what to watch for… This text becomes the project's instruction.")
                 background: null
+                ContextMenu.menu: null
+                EditMenu { objectName: "newProjectInstructionMenu"; editor: instructionField }
             }
         }
     }

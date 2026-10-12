@@ -83,6 +83,8 @@ Item {
                                         border.color: search.activeFocus ? Theme.commandEdge : Theme.border }
                 onTextChanged: picker.query = text
                 Keys.onDownPressed: menu.step(1)
+                ContextMenu.menu: null
+                EditMenu { objectName: "projectPickerSearchMenu"; editor: search }
             }
             MenuRow { objectName: "projectPickerNone"; icon: "chat"; label: qsTr("No project")
                       checked: picker.none; onTriggered: picker.choose("") }

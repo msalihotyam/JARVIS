@@ -241,8 +241,8 @@ Item {
                 else if (event.key === Qt.Key_Menu) {
                     composerMenu.openAt(input, Qt.point(cursorRectangle.x, cursorRectangle.y + cursorRectangle.height)); event.accepted = true }
             }
-            // The JARVIS edit menu replaces the platform one, at the pointer; its Paste is the same route.
-            TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { composerMenu.openAt(input, point.position) } }
+            // The JARVIS edit menu (composerMenu) replaces the platform one, at the pointer; its Paste is the same route.
+            ContextMenu.menu: null
             // Real typing activity for the core: on while text is being entered,
             // off 900 ms after the last edit or as soon as the field is empty.
             onTextChanged: {
