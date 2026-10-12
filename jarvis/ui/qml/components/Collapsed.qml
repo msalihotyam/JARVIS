@@ -66,6 +66,9 @@ Item {
         width: parent.width
         height: field.listHeight > 0 ? Math.min(field.listHeight, list.height) : list.height
         visible: field.open
+        // DFMOTION: the choices fade in as the field opens (its height glides above).
+        opacity: field.open ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
         Flickable {
             anchors.fill: parent
             contentHeight: list.height

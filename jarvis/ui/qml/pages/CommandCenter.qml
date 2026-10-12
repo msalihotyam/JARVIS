@@ -85,6 +85,18 @@ Item {
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: attention.top
                   topMargin: Math.max(page.fade, chatHeader.y + chatHeader.height + 8); leftMargin: page.inset + (page.roomy ? 12 : 4)
                   rightMargin: page.inset + (page.roomy ? 4 : 0) + (workPanel.visible ? workPanel.width + 12 : 0); bottomMargin: 10 }
+        // DFMOTION (Salih 2026-10-12): a conversation switch (a sidebar row, New chat, a search
+        // hit, back / forward, the tray) brings the new one in - 160 ms fade and a Theme.travel
+        // rise. The bridge swaps the content in one frame, so nothing old is held back, and the
+        // composer is outside: typing goes on at once, into the new conversation. Ambient off: none.
+        readonly property string shownConversation: bridge.conversationId
+        onShownConversationChanged: flowIn.restart()
+        transform: Translate { id: flowRise }
+        ParallelAnimation {
+            id: flowIn
+            NumberAnimation { target: flowArea; property: "opacity"; from: 0; to: 1; duration: Theme.dur(160); easing.type: Theme.ease }
+            NumberAnimation { target: flowRise; property: "y"; from: Theme.travel; to: 0; duration: Theme.dur(160); easing.type: Theme.ease }
+        }
         FeedView {
             id: conversation
             objectName: "conversationFeed"

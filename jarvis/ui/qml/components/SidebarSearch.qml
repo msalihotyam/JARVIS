@@ -192,6 +192,9 @@ Item {
         id: results
         objectName: "sidebarSearchResults"
         visible: search.active
+        // DFMOTION: the results fade in where the navigation was.
+        opacity: search.active ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.panelIn; easing.type: Theme.ease } }
         y: entry.height + 6
         width: parent.width; height: Math.max(0, search.height - y)
         clip: true; contentHeight: resultColumn.height

@@ -16,8 +16,9 @@ import "../theme"
 // - Place: popupAt() sets it at a point of an item, kept 8 px inside the
 //   window (`flip`: a pointer menu opens to the other side where the window ends);
 //   placed again by the same rule whenever its size changes while open (G6MENUFIX).
-// - Motion: opacity and Theme.travel over panelIn in, panelOut out; none at
-//   all with ambient effects off (K2).
+// - Motion: opacity, Theme.travel and a scale from its anchor corner (no edge
+//   moves more than Theme.travel) over panelIn in, a fade over the quicker
+//   panelOut out; none at all with ambient effects off (K2, DFMOTION).
 Popup {
     id: surface
     property real restY: 0
@@ -64,12 +65,14 @@ Popup {
         }
     }
 
+    transformOrigin: Popup.TopLeft
     enter: Theme.ambient ? menuIn : null
     exit: Theme.ambient ? menuOut : null
     readonly property Transition menuIn: Transition {
         ParallelAnimation {
             NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
             NumberAnimation { property: "y"; from: surface.restY - Theme.travel; to: surface.restY; duration: Theme.panelIn; easing.type: Theme.ease }
+            NumberAnimation { property: "scale"; from: 1 - Theme.travel / Math.max(1, width, height); to: 1; duration: Theme.panelIn; easing.type: Theme.ease }
         }
     }
     readonly property Transition menuOut: Transition {
@@ -77,7 +80,7 @@ Popup {
     }
     // G6F1: re-bind y, never assign it: an assignment broke `y: restY`, and only
     // menuIn (ambient on) wrote y again, so motion-free the next open kept the last place.
-    onClosed: { opacity = 1; y = Qt.binding(() => restY) }
+    onClosed: { opacity = 1; scale = 1; y = Qt.binding(() => restY) }
     // G6MENUFIX: a row shown or hidden after popupAt (its layout runs at the next
     // polish) changes the size: place it again. menuIn ends on the restY it started
     // with, so the open menu takes the current one.

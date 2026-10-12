@@ -56,7 +56,22 @@ Item {
             ChatHeader { id: chatHeader; width: parent.width; scopeMenu: true
                          conversationMenu: cockpit.conversationMenu; attachDialog: cockpit.attachDialog }
             Text { y: chatHeader.height + 10; visible: bridge.feed.length === 0; width: parent.width; wrapMode: Text.Wrap; text: qsTr("Waiting for your request. The model proposes; you remain in control of each authorized action."); color: Theme.textLabel; font: Theme.lead }
-            FeedView { anchors.fill: parent; anchors.topMargin: chatHeader.height + 10; visible: bridge.feed.length > 0 }
+            FeedView {
+                id: presetFeed
+                anchors.fill: parent; anchors.topMargin: chatHeader.height + 10; visible: bridge.feed.length > 0
+                // DFMOTION (Salih 2026-10-12): a conversation switch (a sidebar row, New chat, a search
+                // hit, back / forward, the tray) brings the new one in - 160 ms fade and a Theme.travel
+                // rise. The bridge swaps the content in one frame, so nothing old is held back, and the
+                // composer is outside: typing goes on at once, into the new conversation. Ambient off: none.
+                readonly property string shownConversation: bridge.conversationId
+                onShownConversationChanged: presetIn.restart()
+                transform: Translate { id: presetRise }
+                ParallelAnimation {
+                    id: presetIn
+                    NumberAnimation { target: presetFeed; property: "opacity"; from: 0; to: 1; duration: Theme.dur(160); easing.type: Theme.ease }
+                    NumberAnimation { target: presetRise; property: "y"; from: Theme.travel; to: 0; duration: Theme.dur(160); easing.type: Theme.ease }
+                }
+            }
             Flow { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } spacing: 8
                 Repeater { model: bridge.clarification.choices || []; ActionButton { label: modelData.label; enabled: !bridge.busy; onClicked: bridge.chooseOption(modelData.label) } }
             }

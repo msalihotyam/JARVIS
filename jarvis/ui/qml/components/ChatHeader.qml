@@ -132,6 +132,10 @@ Item {
         text: bridge.conversationTitle || qsTr("New Chat"); textFormat: Text.PlainText; elide: Text.ElideRight
         color: bridge.conversationTitle ? Theme.text : Theme.textLabel; font: Theme.subtitle
         HoverTip { objectName: "chatHeaderTitleTip"; text: title.text; active: title.truncated }
+        // DFMOTION: on a conversation switch the new title fades in with the feed (160 ms).
+        readonly property string shownConversation: bridge.conversationId
+        onShownConversationChanged: titleIn.restart()
+        NumberAnimation { id: titleIn; target: title; property: "opacity"; from: 0; to: 1; duration: Theme.dur(160); easing.type: Theme.ease }
     }
 
     // -- the actions ------------------------------------------------------------

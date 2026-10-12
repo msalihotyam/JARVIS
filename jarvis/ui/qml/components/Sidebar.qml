@@ -110,7 +110,9 @@ Rectangle {
         signal dragEnded()
         width: parent ? parent.width : 0
         height: sidebar.rowH
-        opacity: dragging ? 0.5 : available ? 1 : 0.38
+        // DFMOTION: a row of a section that just opened fades in with it (sidebar.revealed).
+        property real appear: 1
+        opacity: (dragging ? 0.5 : available ? 1 : 0.38) * appear
         radius: Theme.radiusSmall
         color: current ? Theme.alpha(Theme.accent, 0.10) : hovered ? Theme.alpha(Theme.text, 0.05) : "transparent"
         Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
@@ -251,7 +253,7 @@ Rectangle {
         property int count: 0
         property bool open: true
         property font face: Theme.caption
-        function toggle() { bridge.setGroupOpen(head.key, !head.open) }
+        function toggle() { sidebar.sectionToggled(head.key, head.parent.height, !head.open); bridge.setGroupOpen(head.key, !head.open) }
         width: parent ? parent.width : 0; height: sidebar.labelH
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
@@ -388,6 +390,22 @@ Rectangle {
         return at < shown.length ? all.indexOf(shown[at]) : shown.length > 0 ? all.indexOf(shown[shown.length - 1]) + 1 : 0
     }
     readonly property var openGroups: bridge.sidebarGroups
+    // DFMOTION (Salih 2026-10-12): a section toggle moves smoothly. Every toggle
+    // rebuilds the lists (JS-array models), so the motion lives here, not in the
+    // rows: the toggled section's key, its height before, whether it opened, and
+    // t 0 -> 1 over panelIn. The section's wrapper glides from that height to its
+    // new one (moved) and an opening section's rows fade in (revealed); only the
+    // toggled section reads t. Ambient off: t is 1 at once (K2).
+    property string motionKey: ""
+    property real motionFrom: 0
+    property bool motionOpen: false
+    property real motionT: 1
+    NumberAnimation { id: sectionMotion; target: sidebar; property: "motionT"; from: 0; to: 1; duration: Theme.panelIn
+                      easing.type: Theme.ease; onFinished: projectList.keepSelected() }
+    function sectionToggled(key, from, open) { motionKey = key; motionFrom = from; motionOpen = open; sectionMotion.restart() }
+    function moved(key, to) { return motionKey === key && motionT < 1 ? motionFrom + (to - motionFrom) * motionT : to }
+    function revealed(key) { return motionKey === key && motionOpen ? motionT : 1 }
+    readonly property bool treeMoving: motionKey === "projects" || motionKey.indexOf("project:") === 0
     function shownRows(items, open) { return open ? items : items.filter(function (c) { return !!c.active }) }
     // V1: the plain (no-project) conversations, whatever is open; P1 hides them
     // all but the open one.
@@ -418,7 +436,8 @@ Rectangle {
                        pinned: tree.pinned_projects.indexOf(p.id) >= 0 })
             var rows = shownRows((lists[p.id] || []).filter(function (c) { return !pinnedIds[c.id] }), open)
             for (var k = 0; k < rows.length; ++k)
-                out.push({ kind: "conversation", id: rows[k].id, title: rows[k].title, updated_at: rows[k].updated_at, active: rows[k].active })
+                out.push({ kind: "conversation", id: rows[k].id, title: rows[k].title, updated_at: rows[k].updated_at, active: rows[k].active,
+                           project: p.id })
         }
         return out
     }
@@ -552,7 +571,7 @@ Rectangle {
                 visible: !searchBox.active
                 width: parent.width; height: 28
                 readonly property bool open: sidebar.tree.projects_open
-                function toggle() { bridge.setProjectsOpen(!open) }
+                function toggle() { sidebar.sectionToggled("projects", projectList.height, !open); bridge.setProjectsOpen(!open) }
                 NavLink {
                     id: projectsLink
                     objectName: "sidebarProjectsLink"
@@ -591,8 +610,8 @@ Rectangle {
             Flickable {
                 id: projectList
                 objectName: "sidebarProjectList"
-                visible: sidebar.treeH > 0 && !searchBox.active
-                width: parent.width; height: sidebar.treeH
+                visible: height > 0 && !searchBox.active
+                width: parent.width; height: sidebar.treeMoving ? sidebar.moved(sidebar.motionKey, sidebar.treeH) : sidebar.treeH
                 clip: true; contentHeight: projectColumn.height
                 // The drawn icons stay inside the clip with every scene-graph backend.
                 layer.enabled: true
@@ -603,6 +622,7 @@ Rectangle {
                 // The open conversation's row stays in view (P3): on open, on a switch, when the tree or
                 // its room changes. Only those events move it - never the reader's own scrolling.
                 function keepSelected() {
+                    if (sectionMotion.running) return             // DFMOTION: once the section's glide ends
                     var at = -1
                     for (var i = 0; i < sidebar.treeRows.length; ++i) if (sidebar.treeRows[i].active) at = i
                     if (height <= 0) return
@@ -655,6 +675,7 @@ Rectangle {
                 }
                 Column {
                     id: projectColumn
+                    opacity: sidebar.revealed("projects")
                     width: projectList.width - (projectList.contentHeight > projectList.height ? 10 : 0); spacing: 2
                     Repeater {
                         model: sidebar.treeRows
@@ -684,7 +705,12 @@ Rectangle {
                             current: !isProject && !!modelData.active
                             Accessible.description: isProject ? (modelData.open ? qsTr("Expanded") : qsTr("Collapsed"))
                                                               : available ? "" : busyReason.text
-                            onActivated: isProject ? bridge.setProjectOpen(modelData.id, !modelData.open) : bridge.openConversation(modelData.id)
+                            appear: isProject ? 1 : sidebar.revealed("project:" + modelData.project)
+                            onActivated: {
+                                if (!isProject) { bridge.openConversation(modelData.id); return }
+                                sidebar.sectionToggled("project:" + modelData.id, projectList.height, !modelData.open)
+                                bridge.setProjectOpen(modelData.id, !modelData.open)
+                            }
                             onContextRequested: function (position) {
                                 if (treeRow.isProject) sidebar.openProjectMenu(treeRow, position, modelData)
                                 else sidebar.openRowMenu(treeRow, position, modelData.id, modelData.title, false)
@@ -737,6 +763,7 @@ Rectangle {
                         objectName: "sidebarPinned"
                         visible: sidebar.pins.length > 0
                         width: parent.width; spacing: 2
+                        height: sidebar.moved("pinned", implicitHeight); clip: height !== implicitHeight
                         // The drag: which pin, from where, the pointer (scene y), the gap it
                         // would drop into, and whether it holds at the list's top / bottom edge
                         // (-1 / 1: the list scrolls under it, so every gap is reachable).
@@ -787,6 +814,7 @@ Rectangle {
                                         lead: modelData.project_id !== "" ? "folder" : "chat"
                                         title: modelData.title || qsTr("New Chat"); muted: !modelData.title
                                         current: !!modelData.active
+                                        appear: sidebar.revealed("pinned")
                                         dragging: pinSection.dragId === modelData.id
                                         // V10: hover and wait - the info card at its right.
                                         onHoveredChanged: if (hovered) pinCard.hoverRow(pinRow, modelData.id); else if (pinCard.row === pinRow) pinCard.leave()
@@ -822,7 +850,7 @@ Rectangle {
                         readonly property bool hovered: plainArea.containsMouse || activeFocus
                         readonly property string countText: sidebar.plain.length === 1 ? qsTr("1 conversation")
                                                                                        : qsTr("%1 conversations").arg(sidebar.plain.length)
-                        function toggle() { bridge.setPlainOpen(!open) }
+                        function toggle() { sidebar.sectionToggled("plain", 0, !open); bridge.setPlainOpen(!open) }
                         visible: sidebar.plain.length > 0
                         width: parent.width; height: sidebar.barH
                         activeFocusOnTab: true
@@ -864,6 +892,8 @@ Rectangle {
                             id: group
                             readonly property string key: modelData.key
                             width: parent.width; spacing: 2
+                            height: sidebar.moved(key, implicitHeight); clip: height !== implicitHeight
+                            opacity: sidebar.revealed("plain")
                             GroupHead {
                                 objectName: "sidebarGroupHead"; labelName: "sidebarGroupLabel"; key: group.key
                                 text: modelData.label; count: modelData.items.length; open: !!sidebar.openGroups[group.key]
@@ -878,6 +908,7 @@ Rectangle {
                                     title: modelData.title || qsTr("New Chat"); muted: !modelData.title
                                     meta: sidebar.when(modelData)
                                     current: !!modelData.active
+                                    appear: sidebar.revealed(group.key)
                                     onActivated: bridge.openConversation(modelData.id)
                                     onContextRequested: function (position) { sidebar.openRowMenu(conversationRow, position, modelData.id, modelData.title, true) }
                                 }
