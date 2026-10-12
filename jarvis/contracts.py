@@ -2015,6 +2015,310 @@ class ProjectMemoryItem:
         )
 
 
+# --- V2.1 typed memory records -------------------------------------------
+#
+# NEW contracts that live NEXT TO the M1 project-memory contracts above
+# (``ProjectMemoryKind``/``MemoryOrigin``/``ProjectMemoryItem`` are unchanged).
+# A record is untrusted reference data with NO execution authority. Its
+# status is not a field: status changes are append-only events owned by the
+# store (no UPDATE/DELETE on record tables), and Core - never the model -
+# assigns origin, scope, actor, classification and status.
+
+
+class MemoryRecordKind(str, Enum):
+    """The closed V2.1 typed-memory vocabulary (KARAR-3 approval policy)."""
+
+    FACT = "fact"
+    DECISION = "decision"
+    RULE = "rule"
+    LESSON = "lesson"
+    PREFERENCE = "preference"
+
+
+class MemoryRecordStatus(str, Enum):
+    """The closed status vocabulary of one record's append-only event log.
+
+    Only ``APPROVED`` may ever be delivered; every other status stays out
+    of retrieval.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    RETRACTED = "retracted"
+    SUPERSEDED = "superseded"
+    EXPIRED = "expired"
+
+
+class MemoryRecordOrigin(str, Enum):
+    """Closed provenance vocabulary of one V2.1 record. Data, never authority.
+
+    ``EXPLICIT_USER`` is established by a trusted explicit-human write
+    boundary, never self-asserted, and requires the ``USER`` actor.
+    ``LEGACY_M1`` marks a record read from the M1 ``project_memory_items``.
+    """
+
+    EXPLICIT_USER = "explicit_user"
+    CAPTURE_SESSION_END = "capture_session_end"
+    CAPTURE_PRECOMPACT = "capture_precompact"
+    CONSOLIDATION = "consolidation"
+    IMPORT = "import"
+    LEGACY_M1 = "legacy_m1"
+
+
+class MemoryRecordActor(str, Enum):
+    """Who produced a record: the user, a model, or a named tool."""
+
+    USER = "user"
+    MODEL = "model"
+    TOOL = "tool"
+
+
+class MemoryRecordScopeKind(str, Enum):
+    """``PROJECT`` stores records; ``GLOBAL_READONLY`` is a retrieval label only."""
+
+    PROJECT = "project"
+    GLOBAL_READONLY = "global_readonly"
+
+
+#: Hard ceiling for one record text; oversized text is REJECTED, never
+#: truncated (same bound as an M1 project memory item).
+MEMORY_RECORD_TEXT_CAP = PROJECT_MEMORY_TEXT_CAP
+#: Hard ceiling for one normalized subject key (the supersession key).
+MEMORY_SUBJECT_KEY_CAP = 120
+#: Hard ceiling for a tool name carried as actor provenance.
+MEMORY_RECORD_TOOL_CAP = 64
+#: Hard ceiling for provenance/evidence turn ids on one record or candidate.
+MEMORY_RECORD_TURN_IDS_CAP = 32
+#: Grammar of every record/conversation/turn identifier on these contracts.
+MEMORY_RECORD_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+#: The only kinds Core may approve automatically (KARAR-3: FACT/LESSON are
+#: automatic but undoable). Every other kind - including PREFERENCE until
+#: Salih decides SLICES_V21 Q1 - waits for the user (fail-closed).
+_AUTO_APPROVED_MEMORY_RECORD_KINDS = frozenset(
+    {MemoryRecordKind.FACT, MemoryRecordKind.LESSON}
+)
+
+
+def needs_user_approval(kind: MemoryRecordKind) -> bool:
+    """True when a new record of ``kind`` must stay PENDING until the user approves."""
+    if type(kind) is not MemoryRecordKind:
+        raise ValueError("kind must be a MemoryRecordKind")
+    return kind not in _AUTO_APPROVED_MEMORY_RECORD_KINDS
+
+
+def validate_memory_record_id(value: Any, name: str = "record_id") -> str:
+    """Validate one record/conversation/turn id; other shapes raise ValueError."""
+    if type(value) is not str or not MEMORY_RECORD_ID_PATTERN.fullmatch(value):
+        raise ValueError(f"{name} must be a 1-128 character identifier")
+    return value
+
+
+def normalize_memory_subject_key(value: Any) -> str:
+    """The canonical supersession key: casefolded, NFKD with combining marks
+    dropped (so "İzmir" == "izmir"), runs of non-word characters collapsed to
+    ``-``. Blank or oversized keys raise ValueError."""
+    if type(value) is not str:
+        raise ValueError("subject_key must be a string")
+    folded = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(char)
+    )
+    key = re.sub(r"[\W_]+", "-", folded).strip("-")
+    if not key:
+        raise ValueError("subject_key must contain a letter or digit")
+    if len(key) > MEMORY_SUBJECT_KEY_CAP:
+        raise ValueError(
+            f"subject_key is longer than {MEMORY_SUBJECT_KEY_CAP} characters"
+        )
+    return key
+
+
+def validate_memory_record_text(value: Any) -> str:
+    """A non-blank record text within ``MEMORY_RECORD_TEXT_CAP``, else ValueError."""
+    if type(value) is not str or not value.strip():
+        raise ValueError("memory record text must be a non-blank string")
+    if len(value) > MEMORY_RECORD_TEXT_CAP:
+        raise ValueError(
+            f"memory record text is longer than {MEMORY_RECORD_TEXT_CAP} characters"
+        )
+    return value
+
+
+def validate_memory_record_confidence(value: Any) -> float:
+    """A finite number in [0, 1] (bool refused), returned as float, else ValueError."""
+    if type(value) not in (int, float):
+        raise ValueError("confidence must be a number")
+    # The range check alone refuses NaN, infinities and huge ints (no overflow).
+    if not 0 <= value <= 1:
+        raise ValueError("confidence must be between 0 and 1")
+    return float(value)
+
+
+def validate_memory_turn_ids(value: Any, name: str) -> tuple[str, ...]:
+    """A bounded tuple of valid turn ids, else ValueError."""
+    if type(value) is not tuple:
+        raise ValueError(f"{name} must be a tuple")
+    if len(value) > MEMORY_RECORD_TURN_IDS_CAP:
+        raise ValueError(
+            f"{name} holds more than {MEMORY_RECORD_TURN_IDS_CAP} ids"
+        )
+    for turn_id in value:
+        validate_memory_record_id(turn_id, name)
+    return value
+
+
+def _memory_record_timestamp(value: Any, name: str) -> datetime:
+    if canonical_utc_timestamp(value) is None:
+        raise ValueError(f"{name} must be a canonical UTC timestamp")
+    return datetime.fromisoformat(value)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecordScope:
+    """Where a record lives: one project, optionally one conversation.
+
+    ``GLOBAL_READONLY`` (no project) is only a retrieval label for the
+    per-conversation, default-off "all projects" toggle; a stored
+    ``MemoryRecord`` refuses it.
+    """
+
+    project_id: str | None
+    conversation_id: str | None = None
+    kind: MemoryRecordScopeKind = MemoryRecordScopeKind.PROJECT
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not MemoryRecordScopeKind:
+            raise ValueError("scope kind must be a MemoryRecordScopeKind")
+        if self.kind is MemoryRecordScopeKind.PROJECT:
+            validate_project_id(self.project_id)
+        elif self.project_id is not None:
+            raise ValueError("a GLOBAL_READONLY scope carries no project_id")
+        if self.conversation_id is not None:
+            validate_memory_record_id(self.conversation_id, "conversation_id")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecordCandidate:
+    """What a model may PROPOSE. Deliberately no origin, status, scope,
+    actor or classification field: Core assigns those when it turns a
+    validated candidate into a ``MemoryRecord``."""
+
+    kind: MemoryRecordKind
+    text: str
+    subject_key: str
+    confidence: float
+    evidence_turn_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not MemoryRecordKind:
+            raise ValueError("kind must be a MemoryRecordKind")
+        validate_memory_record_text(self.text)
+        object.__setattr__(
+            self, "subject_key", normalize_memory_subject_key(self.subject_key)
+        )
+        object.__setattr__(
+            self,
+            "confidence",
+            validate_memory_record_confidence(self.confidence),
+        )
+        validate_memory_turn_ids(self.evidence_turn_ids, "evidence_turn_ids")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecord:
+    """One V2.1 typed memory record (immutable once written).
+
+    Untrusted reference data: its text is data, not instructions, and no
+    field grants approval, execution or egress authority. A SECRET record
+    is refused at construction (secrets are never stored as memory).
+    Supersession is a NEW record naming the old one in ``supersedes`` with
+    the same normalized ``subject_key``; status lives in the event log.
+    """
+
+    kind: MemoryRecordKind
+    text: str
+    subject_key: str
+    scope: MemoryRecordScope
+    origin: MemoryRecordOrigin
+    actor: MemoryRecordActor
+    confidence: float
+    classification: DataClassification
+    record_id: str = field(default_factory=lambda: str(uuid4()))
+    tool: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    last_verified_at: str | None = None
+    expires_at: str | None = None
+    supersedes: str | None = None
+    source_conversation_id: str | None = None
+    source_turn_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_memory_record_id(self.record_id)
+        if type(self.kind) is not MemoryRecordKind:
+            raise ValueError("kind must be a MemoryRecordKind")
+        validate_memory_record_text(self.text)
+        object.__setattr__(
+            self, "subject_key", normalize_memory_subject_key(self.subject_key)
+        )
+        if type(self.scope) is not MemoryRecordScope:
+            raise ValueError("scope must be a MemoryRecordScope")
+        if self.scope.kind is not MemoryRecordScopeKind.PROJECT:
+            # Every stored record belongs to exactly one project; the
+            # global label exists for retrieval only.
+            raise ValueError("a stored memory record needs a PROJECT scope")
+        if type(self.origin) is not MemoryRecordOrigin:
+            raise ValueError("origin must be a MemoryRecordOrigin")
+        if type(self.actor) is not MemoryRecordActor:
+            raise ValueError("actor must be a MemoryRecordActor")
+        if (
+            self.origin is MemoryRecordOrigin.EXPLICIT_USER
+            and self.actor is not MemoryRecordActor.USER
+        ):
+            raise ValueError("EXPLICIT_USER origin requires the USER actor")
+        if (self.tool is None) is (self.actor is MemoryRecordActor.TOOL):
+            raise ValueError("tool is required for a TOOL actor and refused otherwise")
+        if self.tool is not None and (
+            type(self.tool) is not str
+            or not self.tool.strip()
+            or len(self.tool) > MEMORY_RECORD_TOOL_CAP
+        ):
+            raise ValueError(
+                f"tool must be a non-blank name of at most "
+                f"{MEMORY_RECORD_TOOL_CAP} characters"
+            )
+        object.__setattr__(
+            self,
+            "confidence",
+            validate_memory_record_confidence(self.confidence),
+        )
+        if type(self.classification) is not DataClassification:
+            raise ValueError("classification must be a DataClassification")
+        if self.classification is DataClassification.SECRET:
+            raise ValueError("a SECRET memory record is refused")
+        created = _memory_record_timestamp(self.created_at, "created_at")
+        if self.last_verified_at is not None and (
+            _memory_record_timestamp(self.last_verified_at, "last_verified_at")
+            < created
+        ):
+            raise ValueError("last_verified_at is before created_at")
+        if self.expires_at is not None and (
+            _memory_record_timestamp(self.expires_at, "expires_at") <= created
+        ):
+            raise ValueError("expires_at must be after created_at")
+        if self.supersedes is not None:
+            validate_memory_record_id(self.supersedes, "supersedes")
+            if self.supersedes == self.record_id:
+                raise ValueError("a record cannot supersede itself")
+        if self.source_conversation_id is not None:
+            validate_memory_record_id(
+                self.source_conversation_id, "source_conversation_id"
+            )
+        validate_memory_turn_ids(self.source_turn_ids, "source_turn_ids")
+
+
 class RetrievedMemoryKind(str, Enum):
     """The closed kind vocabulary of one retrieved memory item.
 
