@@ -658,9 +658,9 @@ Item {
                                renderType: Theme.textRender; font: parent.font; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
                     }
                     // Copy / Quote, hidden until hover: only on what the person wrote
-                    // and on General Chat replies - never on cards, notices, errors,
-                    // external data or task results.
-                    readonly property bool conversational: row.isUser || modelData.chat === true
+                    // and on General Chat replies or a clarification question - never on
+                    // cards, notices, errors, external data or task results.
+                    readonly property bool conversational: row.isUser || modelData.chat === true || row.kind === "clarify"
                     HoverHandler { id: rowHover; enabled: row.conversational }
                     Row {
                         objectName: "messageActions_" + index

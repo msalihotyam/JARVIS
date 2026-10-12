@@ -138,7 +138,7 @@ Item {
                                     objectName: "contextGroupNoteToggle_" + card.groupId
                                     width: 24; height: 24; icon: "pencil"
                                     tip: qsTranslate("QuoteDetail", "Edit")
-                                    onClicked: { noteBox.open = true; noteInput.forceActiveFocus() }
+                                    onClicked: { noteBox.before = noteInput.text; noteBox.open = true; noteInput.forceActiveFocus() }
                                 }
                                 IconButton {
                                     id: remove
@@ -170,7 +170,16 @@ Item {
                         Item {
                             id: noteBox
                             property bool open: false
+                            property string before: ""      // the comment as it was when the pencil opened it
                             visible: open || card.commented
+                            // Enter keeps what was typed (it is already on the group); Esc puts
+                            // back the comment from before. Either way the edit closes.
+                            function finish(keep) {
+                                if (!keep)
+                                    noteInput.text = before
+                                open = false
+                                noteInput.focus = false
+                            }
                             width: parent.width; height: 30
                             TextField {
                                 id: noteInput
@@ -187,6 +196,13 @@ Item {
                                 onTextChanged: { card.noteText = text; bridge.setGroupNote(card.groupId, text) }
                                 // An ordinary text editor: its Paste is text only, never an attachment.
                                 TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { noteMenu.openAt(noteInput, point.position) } }
+                                // Reached by Tab instead of the pencil: the edit starts the same way.
+                                onActiveFocusChanged: if (activeFocus && !noteBox.open) { noteBox.before = text; noteBox.open = true }
+                                Keys.onReturnPressed: noteBox.finish(true)
+                                Keys.onEnterPressed: noteBox.finish(true)
+                                // Esc is the field's, before the window's own Escape chain sees it.
+                                Keys.onShortcutOverride: function (event) { if (event.key === Qt.Key_Escape) event.accepted = true }
+                                Keys.onEscapePressed: noteBox.finish(false)
                                 Keys.onMenuPressed: noteMenu.openAt(noteInput, Qt.point(cursorRectangle.x, cursorRectangle.y + cursorRectangle.height))
                                 background: Rectangle { radius: 6; color: noteInput.activeFocus ? Theme.surfaceDeep : "transparent"; border.width: 1
                                                         border.color: noteInput.activeFocus ? Theme.commandEdge : "transparent" }

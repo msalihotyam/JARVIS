@@ -4059,11 +4059,12 @@ class Bridge(QObject):
 
     def _entry(self, entry_id: str) -> dict | None:
         """The conversational feed entry with this id: what the person wrote and
-        General Chat's replies only. A notice, an approval, an error, external
-        data or a task result is never quotable."""
+        General Chat's replies only - a clarification question is one of them.
+        A notice, an approval, an error, external data or a task result is never
+        quotable."""
         for entry in self._feed:
             if entry.get("id") == entry_id and isinstance(entry.get("msg"), str):
-                return entry if entry["kind"] == "user" or entry.get("chat") else None
+                return entry if entry["kind"] in ("user", "clarify") or entry.get("chat") else None
         return None
 
     def _item_count(self) -> int:
