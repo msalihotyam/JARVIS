@@ -13,7 +13,9 @@ wires it to a ``QSystemTrayIcon`` (which needs a ``QApplication``).
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Slot
+import sys
+
+from PySide6.QtCore import QObject, QTimer, Slot
 from PySide6.QtGui import QIcon, QWindow
 
 from jarvis.ui.i18n import QT_TRANSLATE_NOOP, tx
@@ -28,6 +30,14 @@ _RING = {"running": "#3aa8f0", "frozen": "#ff5c6c", "attention": "#ffb347"}
 #: One ``QIcon`` per badge state, loaded once from the approved artwork and
 #: reused - ``refresh()`` asks for one on every bridge state change.
 _ICONS: dict[str, QIcon] = {}
+
+# The hide-to-tray notice: a 2 s timeout hint, then taken down at 2.5 s,
+# because Windows 10/11 shows a tray balloon as a toast and largely ignores
+# the hint. Re-issuing the balloon with an empty title and text sets NIF_INFO
+# with an empty szInfo, the documented way to remove it (NOTIFYICONDATA);
+# it touches neither the icon, its tooltip nor its menu.
+_NOTICE_MS = 2000
+_NOTICE_DISMISS_MS = 2500
 
 
 class TrayController(QObject):
@@ -70,7 +80,7 @@ class TrayController(QObject):
         return tx("Tray", QT_TRANSLATE_NOOP("Tray", "Open JARVIS")), tx("Tray", QT_TRANSLATE_NOOP("Tray", "Quit JARVIS"))
 
     def hidden_message(self) -> str:
-        return tx("Tray", QT_TRANSLATE_NOOP("Tray", "JARVIS is still running in the background."))
+        return tx("Tray", QT_TRANSLATE_NOOP("Tray", "JARVIS is running in the background."))
 
     @Slot()
     def open(self) -> None:
@@ -146,7 +156,10 @@ def install_tray(app, bridge, window):
         if not told:                             # once per run, never on every X
             told.append(True)
             icon.showMessage("JARVIS", controller.hidden_message(),
-                             QSystemTrayIcon.MessageIcon.Information, 4000)
+                             QSystemTrayIcon.MessageIcon.Information, _NOTICE_MS)
+            if sys.platform == "win32":          # the empty-balloon removal is a Windows contract
+                QTimer.singleShot(_NOTICE_DISMISS_MS, icon, lambda: icon.showMessage(
+                    "", "", QSystemTrayIcon.MessageIcon.NoIcon, 0))
 
     icon.activated.connect(lambda reason: controller.open() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
     bridge.attentionChanged.connect(refresh)

@@ -3697,7 +3697,7 @@ class LocalizationTests(UiTestCase):
         self.assertEqual(("JARVIS'i Aç", "JARVIS'ten Çık"), tray.menu_labels())
         self.assertEqual(("JARVIS'i Dondur", True), tray.lifecycle_action())
         self.assertEqual("JARVIS — Dikkat gerekiyor", tray.status_text())
-        self.assertEqual("JARVIS arka planda çalışmaya devam ediyor.", tray.hidden_message())
+        self.assertEqual("JARVIS arka planda çalışıyor.", tray.hidden_message())
         # Nothing but presentation moved: the same ticket, task, gate, layout and entries.
         self.assertEqual(state, (bridge._ticket, dict(bridge.task), bridge.executionState, bridge.coreState, json.dumps(bridge.prefs.data["rail"]),
                                  [(e["kind"]) for e in bridge.feed], bridge.approval["request_id"]))

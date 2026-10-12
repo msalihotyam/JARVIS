@@ -4917,8 +4917,8 @@ DOĞRULANMADI</translation>
         <translation>JARVIS&apos;ten Çık</translation>
     </message>
     <message>
-        <source>JARVIS is still running in the background.</source>
-        <translation>JARVIS arka planda çalışmaya devam ediyor.</translation>
+        <source>JARVIS is running in the background.</source>
+        <translation>JARVIS arka planda çalışıyor.</translation>
     </message>
 </context>
 <context>
