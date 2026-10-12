@@ -366,6 +366,16 @@ rerun the FULL suite once on a quiet machine (the suite queue free, no own
 background runs). Green: the run counts as green; record both runs. Any
 failure again: STOP.
 
+**Conveyor lanes (Salih 2026-10-12; source `build/conveyor/notes/LANE_RULES.md`
+R2/R4):** feature lanes - window layer = targeted modules + the whole
+`test_ui` module; core / app / intent / contracts / store = targeted modules +
+every test module importing a touched module; a full suite only for T2 /
+schema / memory / store / authority / security slices, exactly ONCE on the
+frozen tree via `build/conveyor/notes/SUITE_FG.md` (a shard that finishes in
+the background counts; the aggregate decides). Integration lanes - the same
+local set; the FULL suite is GitHub CI on `ci/<name>` and its success is
+required for GREEN.
+
 **Full product suite:**
 
 - Run only when the tier above requires it.
@@ -971,6 +981,33 @@ the optional report reader below. One instance at a time
   `scripts/usage_ledger.py` (tests `tests/test_usage_ledger.py`; it merges into
   `build/ledger/usage.json` and never drops a known session; an unreadable file
   is left untouched), else the older runtime `build/conveyor/usage_ledger.py`.
+
+### Lane process (2026-10-12)
+
+Rules live in `build/conveyor/notes/LANE_RULES.md` (R1-R10); this is the map.
+
+- **Bootstrap** (R7): lanes read `build/conveyor/notes/LANE_BRIEF.md` + their
+  prompt, not the whole runbook/state/roadmap (CLAUDE.md "Başlarken").
+- **Review subagent** (R8) only for core / contracts / store / authority /
+  security code or T2. **Effort** (R9): Opus medium for small slices, high by
+  default, xhigh only with a written reason in the prompt.
+- **One final report** (R10) per lane. A Stop hook blocks a lane session that
+  has not written it (CONVSTOP: `build/conveyor/hooks/stop_report.py`, max 2
+  consecutive / 6 total blocks, fails open).
+- **NEEDS FILES** (R3): the conveyor may grant the files and resume the same
+  session in place.
+- **UI test lock** (CONVUI): one lane at a time runs `test_ui` units.
+- **CI handoff** (CONV12): an INT report may end `STATUS: CI_PENDING` + `NEW
+  MAIN SHA` + its `ci/<name>` branch; the conveyor waits for CI and turns it
+  GREEN / BLOCKED. An INT report must name its `ci/<name>` branch, or the auto
+  key 1 is refused.
+- **Pace** (`build/conveyor/pace.json`): the weekly-quota alert and the
+  new-lane hold are both at 97 %; running lanes finish. After Salih's one
+  manual reset the conveyor switches to 7-day paced mode by itself.
+- **PAUSE** (`build/conveyor/PAUSE`): nothing new starts; the push gate still
+  runs. A `STATUS: DROPPED` report frees an idle lane but cannot stop a BUSY
+  session - stop it with `claude stop <id>`. To resume, move PAUSE to
+  `build/conveyor/hold/`; never delete it.
 
 ### Incidents and lessons
 

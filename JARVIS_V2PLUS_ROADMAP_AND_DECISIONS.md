@@ -236,6 +236,17 @@ Kaynak: build/6g/GATE6G_review.md; G6H3POL kalanları build/reports/G6H3POL.md O
 - **B-2 (dondurma sırasında K1):** bkz. aşağıdaki karar; dondurma özelliği V2 sonrası yeniden ele alınacak.
 - **A-4 (W3 çalışma paneli yerleşimi):** açık dogfood kalemi; bkz. aşağıdaki karar.
 
+### Salih kararları (2026-10-12 10:13)
+
+Kaynak: `build/v21/PLAN_DRAFT_V21.md` (V2.1 plan taslağı, KARAR-1..5 soruları).
+
+- KARAR-1: ek tablolar, SCHEMA_VERSION 10'da kalır.
+- KARAR-2: önce yerel FTS5 + typed filtreler; embedding V2.1b'de ölçüme göre.
+- KARAR-3: karma - Decision/Rule kullanıcı onaylı, Fact/Lesson otomatik + geri alınabilir.
+- KARAR-4: V2.1a / V2.1b ayrımı kabul.
+- KARAR-5: temizliklerin hepsi: D-1/D-2 yetim kod/testler (silme = hold'a taşıma), B-3 açık repodaki kullanıcı adı/yol, küçük temizlikler (ARCHITECTURE.md:3655 eski metin, cli.py:925 Türkçe K3 reddi, test_motion_6g settingsOrb sıra bağımlılığı, "Mark as unread").
+- Font render: T varsayılan (Salih 2026-10-12 13:00, DFFONT).
+
 ---
 
 ## Dağıtım: installer + onboarding

@@ -11,24 +11,17 @@ daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "Salih kararları — V2.0 Gate 6G / 6H planı". V2.0 scope is frozen (Salih
 2026-10-06): only bugs and blockers.
 
-Gates 1–5, 6A–6F (6F = left sidebar, F1–F7) and S5 (model list) are complete
-on main; `ci/gate6f` ran green (run 37425225354). Installed:
-`1.0.0-a26d790` (predates 6F F6/F7); previous `1.0.0-8fbbaef`; `1.0.0-1c68161`
-retained. Local `main` is ahead of `origin/main` `4f5a93d`, not pushed.
+Gates 1–5, 6A–6H and S5 (model list) are on main. V2.0 is in dogfood: the
+dogfood fixes were integrated by INT37 / INT38 / INT39 and pushed; `origin/main`
+= `3d6400b` (INT39 GREEN, CI run 38236839853; `build/reports/INT39.md`).
 
-S0 speed-up is done: S0a rules (2eb095b), S0b test/CI speed (7bb272b; local
-full suite 445 s, CI 4 shards 11.3 min). **Gate 6G** is under way: K1 icon
-set and the F-ee reflow fix are on main; **K2** motion contract (Theme.dur
-gate, 4 px travel, one HoverTip, calm idle core, destructive dialogs at once)
-is on lane branch `worktree-6g-k2-motion` with its fix-up (destructive
-confirm keeps a motion-free 300 ms input guard) and the test-settling fixes
-F-ee2 (6f) and F-ee3 (test_ui): one full suite green under rule D (4765).
-Next: OB1 Part 3 integrates the lane (delegated T1), then Part 4 (MA-guard).
+Installed: `1.0.0-3d6400b`, checked by Salih on 2026-10-12 (single instance,
+window effects, drafts, jump-to-latest, own context menu: all pass);
+`1.0.0-c3df707` previous (rollback target).
 
-Integrated on local main (Salih 2026-10-09, INTNIGHT, not pushed): THIZ (UI
-tests motion-free by default, condition waits, split sweeps, duration-balanced
-CI shards; 58c2f75) and MA1 (jarvis-flow wave 2 + jarvis-codex review bridge +
-rule D addendum; 317be3b). Proof: `build/reports/INTNIGHT.md`.
+INT40 in progress: DFTONE, DFQUEUE, DFSPEED, DFMOTION, DFFONTTRY, DFFONT (font
+rendering T by default), V20DOCS. Conveyor lanes follow
+`build/conveyor/notes/LANE_RULES.md` (runbook "Konveyor" → "Lane process").
 
 ## Open blockers
 
@@ -174,15 +167,18 @@ open. Next: integrate on "entegre et".
 
 ## Next action (in order)
 
-1. Integrate K2 (on "entegre et"). 2. Gate 6G (the remaining 6G slices;
-F8/F9 folded in). 3. Gate 6H (authority review). 4. Full suite / CI on the
-integrated release HEAD. 5. Re-install (Salih's go). 6. Dogfood (D-2/D-3).
-7. Rollback (D-4). 8. V2.0 close.
+1. INT40 (integrate, CI, push on Salih's go). 2. Install INT40 + Salih's
+checks. 3. D-4: packaged `-Rollback` and back. 4. V2.0 close.
+
+Core refresh (DFCOREA, parked in `build/conveyor/hold/`) postponed by Salih
+(2026-10-12): a later week near the weekly quota renewal if quota is
+plentiful, else the very last item.
 
 ## Rollback / safety anchors
 
-- Releases: `1.0.0-a26d790` active; `1.0.0-8fbbaef` previous (rollback
-  available); `1.0.0-1c68161` retained (Chrome).
+- Releases (`%USERPROFILE%\Apps\JARVIS\release-state.json`): `1.0.0-3d6400b`
+  active; `1.0.0-c3df707` previous (rollback target); `1.0.0-cf53097`
+  retained. Pushed anchor: `origin/main` `3d6400b`.
 - `%USERPROFILE%\JARVIS-backups`: `releases\legacy-1.0.0-5976769` (+
   `.manifest.sha256`, 2929 files verified) and `2026-09-30-gate7`
   (`data\jarvis.db` + `~\.jarvis\*.json`, SHA-256 manifest, taken before
