@@ -21,7 +21,7 @@ changed 2026-10-07 (S0d): native worktrees, no chat rebinding.
   schema/migrations, authority/approval/attestation) are owned by one lane at
   a time.
 - **Chats stay bound to the canonical folder
-  `C:\Users\realk\Masaüstü\JARVIS` and are never rebound.** Salih drives
+  `%USERPROFILE%\Masaüstü\JARVIS` and are never rebound.** Salih drives
   everything by messaging chats (works from a phone); no folder rebinding is
   ever required.
 - **Opening a code lane:** the lane's chat starts with `EnterWorktree`
@@ -55,7 +55,7 @@ changed 2026-10-07 (S0d): native worktrees, no chat rebinding.
   worktrees) stays available. The REBOUND attestation and the "Worktree
   lifecycle — HARD RULE" below apply only to those helper worktrees.
 - **Base check (2026-10-07, F-ee lane):** code lanes start ONLY from a chat
-  launched in canonical `C:\Users\realk\Masaüstü\JARVIS`. A chat launched
+  launched in canonical `%USERPROFILE%\Masaüstü\JARVIS`. A chat launched
   from a `dev.ps1` helper folder (e.g. `JARVIS-Claude-6g-k1-icons`) does not
   load canonical's `.claude/settings.json`, so `EnterWorktree` falls back to
   `baseRef "fresh"` (origin/main, about 64 commits behind then); even with
@@ -195,7 +195,7 @@ a chat's scrollback.
   most one chat on canonical main at a time. Rotation rules above are
   unchanged, per chat.
 - Before retiring a chat: the accepted work must be canonical, and the chat
-  must be rebound to `C:\Users\realk\Masaüstü\JARVIS`.
+  must be rebound to `%USERPROFILE%\Masaüstü\JARVIS`.
 - Archive old chats; do not delete them.
 - Start the fresh chat with exactly:
 
@@ -1169,7 +1169,7 @@ following must be true, in order:
 1. The implementation has been accepted.
 2. The worktree is clean (`git status --porcelain` empty).
 3. The persistent Claude development chat has been rebound to
-   `C:\Users\realk\Masaüstü\JARVIS`.
+   `%USERPROFILE%\Masaüstü\JARVIS`.
 4. The handoff is confirmed **to the helper**: in an interactive console
    `finish-current` / `cleanup` ask one explicit question and accept only the
    typed answer `REBOUND`; the helper then resolves the exact task-generation
@@ -1182,7 +1182,7 @@ The normal interactive sequence is therefore:
 
 ```
 # 1. work accepted, worktree clean
-# 2. rebind the persistent Claude chat to C:\Users\realk\Masaüstü\JARVIS
+# 2. rebind the persistent Claude chat to %USERPROFILE%\Masaüstü\JARVIS
 .\dev.ps1 finish-current            # answer REBOUND when asked
 # 3. from canonical main
 .\dev.ps1 cleanup <worker> <task>   # answer REBOUND when asked

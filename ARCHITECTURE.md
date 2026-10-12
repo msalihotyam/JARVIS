@@ -807,7 +807,7 @@ Bağımsız incelemenin dört P1 bulgusu için son düzeltmeler:
 - **P1-B — Yol ve komut satırı kimlik bilgisi boşlukları:** Bir yolun son
   bileşeni artık yalnızca **kanıtlanabilir** biçimde bir dosya adıysa korunur:
   sınırlı bir tanımlayıcı artı kısa, harfle başlayan bir dosya uzantısı. Aksi
-  hâlde — sonda ayırıcı, çıplak dizin adı (`C:\Users\realk`, `/home/realk`),
+  hâlde — sonda ayırıcı, çıplak dizin adı (`C:\Users\<kullanıcı>`, `/home/<kullanıcı>`),
   sürüm son eki (`python3.13`), nokta ile başlayan dizin (`.cache`), aşırı uzun
   veya olağandışı segment — yol tümüyle sabit `[PATH]` işaretçisine indirgenir.
   Böylece kullanıcı/profil/temp/yorumlayıcı/depo mutlak yolları yerel hesap veya
@@ -3670,7 +3670,9 @@ kullanıcıya gösterilir.
   hesaplar ve yalnız connector'a özel `task.context["project_folder"]`'a
   koyar; tasdik `{project_id, path, location}` çerçevesini bağlar ve her
   tasdikte proje aktif+klasörsüz, yol sözcüksel geçerli ve öneri ŞİMDİ aynı
-  değilse yolsuz "Klasör önerisi değişti; yeniden isteyin." ile reddeder.
+  değilse yolsuz sabit `STALE_PROPOSAL` ("The folder proposal changed; ask again.";
+  pencere bunu `present.FAILURE_TEXT` ile yerelleştirir: "Klasör önerisi
+  değişti; yeniden isteyin.") ile reddeder.
   Son tasdikten sonra yalnız o yol `create_and_link` ile oluşturulur. E4:
   hibe satırı `anthropic/claude-code` (katalog için); kart, etkinlik notu,
   karar makbuzu, görev paneli ve akış satırı hedefi "Bu bilgisayar"
