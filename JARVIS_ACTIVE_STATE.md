@@ -138,7 +138,8 @@ open. Next: integrate on "entegre et".
   (orchestrator 2026-10-10: GUI-thread SQLite commit + WAL checkpoint takes
   0.03 s alone, 0.57 s only under full-suite disk load; follow-up F-gt (T2,
   memory.py/bridge save order, V2.1): move the user-turn save and checkpoint
-  off the GUI thread),
+  off the GUI thread; Gate 6G C-7: it stays on this list only until F-gt
+  lands in V2.1 and must not hide a real stall),
   `test_task_chain.DriverConcurrencyTests.test_two_runners_never_duplicate_a_step_task`
   (orchestrator G6TCFLAKE 2026-10-11: one runner died on CI shard 3/4, run
   38093652961, test 26.6 s there vs 1.3 s locally; a runner whose write waits

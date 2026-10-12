@@ -105,6 +105,19 @@ ALLOWED_SKIPS = {
         "the Google Workspace CLI is not installed here",
     "tests.test_gmail_minimum.LiveProbeTests.test_the_installed_cli_rehearses_both_writes_as_bodiless_multipart_uploads":
         "the Google Workspace CLI is not installed here",
+    # Gate 6G C-5: tool- or font-dependent skips the windows-latest image may hit (allowed when unsure).
+    "tests.test_dffont.FaceTests.test_freetype_gets_the_variable_face_not_the_static_fallback":
+        "Windows 11 Segoe UI Variable",
+    "tests.test_dffont.FaceTests.test_directwrite_keeps_its_own_family":
+        "Windows 11 Segoe UI Variable",
+    "tests.test_trusted_exec.ChromeTrustTests.test_the_real_system_chrome_resolves_when_installed":
+        "Google Chrome is not installed for this machine",
+    "tests.test_trusted_exec.SpawnShapeTests.test_the_connector_and_the_intent_adapter_both_spawn_an_absolute_path":
+        "the Claude CLI is not installed on this machine",
+    "tests.test_trusted_exec.LegitimateAvailabilityTests.test_an_installed_tool_on_the_real_path_still_resolves":
+        "no trusted CLI is installed on this machine",
+    "tests.test_trusted_exec.LegitimateAvailabilityTests.test_a_real_resolution_survives_a_spawn_shaped_revalidation":
+        "no trusted CLI is installed on this machine",
 }
 
 
