@@ -1223,17 +1223,18 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.lanes_for(97), 0)
         self.assertTrue(self.status()["usage_hold"])
         self.assertEqual(self.status()["pace"]["limit_pct"], 97)
+        self.assertEqual(self.status()["pace"]["band"], "paced: hold at 97 %")
 
     def test_pace_bands_at_boundaries(self):
-        for pct, want in ((52, 3), (52.1, 2), (57, 2), (57.1, 1), (62, 1), (62.1, 0)):
+        for pct, want in ((52, 3), (52.1, 2), (57, 2), (57.1, 2), (62, 2), (62.1, 2), (96.9, 2)):
             self.fresh()
             self.paced()
             self.assertEqual(self.lanes_for(pct), want, pct)
             p = self.status()["pace"]
             self.assertEqual((p["mode"], p["pace_line"], p["usage_pct"], p["max_lanes"]),
                              ("paced", 50.0, pct, want))
-            self.assertFalse(self.status()["usage_hold"])  # band 0 holds dispatch, not via the limit
-        self.assertEqual(p["band"], "over")
+            self.assertFalse(self.status()["usage_hold"])  # ahead of the line: the min_lanes floor
+        self.assertEqual(p["band"], "paced: ahead of line -> min 2")
 
     def test_band_zero_leaves_running_lanes(self):
         self.paced()
@@ -1294,7 +1295,7 @@ class TestPaceGovernor(TestUsageGuard):
         attn = {a["id"]: a["reason"] for a in self.status()["attention"]}
         self.assertEqual(attn[conveyor.RESET_DONE_ID], "kota sıfırlandı, tempo modu açık")
         self.assertNotIn(conveyor.RESET_ALERT_ID, attn)  # paced: the alert episode is over
-        self.assertEqual(self.status()["pace"]["max_lanes"], 0)  # 56 > pace_line 0 + 12
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)  # 56 > pace_line 0 + 2: min_lanes
 
     def test_smaller_drop_is_no_reset(self):
         self.ledger(96)
@@ -1310,14 +1311,14 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.status()["pace"]["max_lanes"], 3)
         self.paced()
         self.c.pass_once()
-        self.assertEqual(self.status()["pace"]["max_lanes"], 1)
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)
 
     def test_invalid_pace_is_paced_from_now(self):
         for bad in ("{not json", json.dumps({"mode": "warp"}), json.dumps({"mode": "paced"}),
                     json.dumps({"days": 0}), json.dumps([1])):
             self.fresh()
             (self.base / "pace.json").write_text(bad, encoding="utf-8")
-            self.assertEqual(self.lanes_for(12.1), 0, bad)  # pace_line 0: above 0 + 12
+            self.assertEqual(self.lanes_for(12.1), 2, bad)  # pace_line 0: ahead -> min_lanes 2
             p = self.status()["pace"]
             self.assertEqual((p["mode"], p["window_start"], p["pace_line"]),
                              ("paced", conveyor.iso(self.t), 0.0))
@@ -1362,14 +1363,14 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(len(self.fake.bg_calls()), 4)
 
     def test_paced_bands_with_max_lanes_5(self):
-        for pct, want in ((52, 5), (52.1, 2), (57, 2), (57.1, 1), (62, 1), (62.1, 0)):
+        for pct, want in ((52, 5), (52.1, 2), (57, 2), (57.1, 2), (62, 2), (62.1, 2)):
             self.fresh()
             self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=5)
             self.assertEqual(self.lanes_for_8(pct), want, pct)
             self.assertEqual(self.status()["pace"]["max_lanes"], want)
 
     def test_paced_lower_bands_capped_by_max_lanes_1(self):
-        for pct, want in ((52, 1), (55, 1), (60, 1), (62.1, 0)):
+        for pct, want in ((52, 1), (55, 1), (60, 1), (62.1, 1)):  # default min 2 capped by max 1
             self.fresh()
             self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=1)
             self.assertEqual(self.lanes_for_8(pct), want, pct)
@@ -1381,6 +1382,74 @@ class TestPaceGovernor(TestUsageGuard):
         self.c.pass_once()
         self.assertEqual(len(self.fake.bg_calls()), 3)
         self.assertEqual(self.status()["pace"]["band"], "unknown")
+
+    def paced_min_max(self, lo=2, hi=3):
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400),
+                  min_lanes=lo, max_lanes=hi)
+
+    def test_paced_ahead_of_line_keeps_min_lanes(self):
+        for pct, lo, want in ((52.1, 2, 2), (70, 2, 2), (96.9, 2, 2), (80, 3, 3), (80, 1, 1)):
+            self.fresh()
+            self.paced_min_max(lo)
+            self.assertEqual(self.lanes_for_8(pct), want, (pct, lo))
+            p = self.status()["pace"]
+            self.assertEqual((p["max_lanes"], p["band"], p["error"]),
+                             (want, f"paced: ahead of line -> min {want}", None))
+            self.assertFalse(self.status()["usage_hold"])
+
+    def test_paced_on_or_under_line_runs_max_lanes(self):
+        for pct in (0, 50, 52):
+            self.fresh()
+            self.paced_min_max()
+            self.assertEqual(self.lanes_for_8(pct), 3, pct)
+            self.assertEqual(self.status()["pace"]["band"], "paced: on/under line -> max 3")
+        self.fresh()  # a hand-set min_lanes above lanes_present (3) wins on the line too
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), min_lanes=5)
+        self.assertEqual(self.lanes_for_8(50), 5)
+        self.assertEqual(self.status()["pace"]["band"], "paced: on/under line -> max 5")
+
+    def test_paced_hold_at_97_overrides_min_lanes(self):
+        self.paced_min_max()
+        self.assertEqual(self.lanes_for_8(97), 0)
+        st = self.status()
+        self.assertTrue(st["usage_hold"])
+        self.assertEqual((st["pace"]["max_lanes"], st["pace"]["band"]), (0, "paced: hold at 97 %"))
+
+    def test_min_lanes_above_max_lanes_is_invalid(self):
+        for bad in ({"min_lanes": 3, "max_lanes": 2}, {"min_lanes": "2"}, {"min_lanes": True}):
+            self.fresh()
+            self.pace(**bad)
+            self.c.pass_once()
+            p = self.status()["pace"]
+            self.assertTrue(p["error"], bad)
+            self.assertEqual((p["mode"], p["window_start"]), ("paced", conveyor.iso(self.t)))
+            self.assertIn(conveyor.PACE_BAD_ID, self.attn())
+
+    def test_min_lanes_clamped_like_the_other_lane_keys(self):
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), min_lanes=40)
+        self.assertEqual(self.lanes_for_8(80), 6)  # clamped to MAX_LANES_CAP; no max_lanes set
+        self.assertIsNone(self.status()["pace"]["error"])
+
+    def test_reset_keeps_min_and_max_lanes(self):
+        self.pace(min_lanes=2, max_lanes=3)
+        self.ledger(96)
+        self.c.pass_once()
+        self.t += 3600
+        self.ledger(56)
+        self.c.pass_once()
+        self.assertEqual(self.pace_file(), {**conveyor.PACE_DEFAULTS, "mode": "paced",
+                                            "window_start": conveyor.iso(self.t),
+                                            "min_lanes": 2, "max_lanes": 3})
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)
+
+    def test_full_burn_ignores_min_lanes(self):
+        self.pace(min_lanes=5)  # lanes_present 3: a floor of 5 would show
+        self.assertEqual(self.lanes_for_8(90), 3)
+        self.assertEqual(self.status()["pace"]["band"], "full_burn")
+        self.fresh()
+        self.pace(min_lanes=2, max_lanes=3)
+        self.assertEqual(self.lanes_for_8(98), 0)
+        self.assertEqual(self.status()["pace"]["band"], "full_burn")
 
 
 class TestMemoryGuard(Base):
@@ -1548,7 +1617,7 @@ class TestPresence(Base):
                "seven_day": {"start": 55, "end": 55}}
         (self.root / "build" / "ledger" / "slices.jsonl").write_text(json.dumps(row) + "\n")
         self.c.pass_once()
-        self.assertEqual(self.status()["pace"]["max_lanes"], 2)  # band +7 caps away's 5
+        self.assertEqual(self.status()["pace"]["max_lanes"], 2)  # ahead of the line: min_lanes 2
 
     def own_tree(self):
         """L1's session (pid 101) with a child and grandchild; a pid-reuse orphan claiming

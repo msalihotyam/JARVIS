@@ -100,8 +100,8 @@ POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed powe
 SESSION_EXE = "claude.exe"  # a lane's session pid is touched only when it is this image
 COMMIT_PCT_RANGE = (80, 97)  # pace.json max_commit_pct (memory guard: no new lane above it) clamp
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
-PACE_BANDS = ((2, None), (7, 2), (12, 1))  # usage <= pace_line + margin -> max lanes (None:
-# pace.json max_lanes); above all: 0
+PACE_MARGIN = 2  # paced: usage <= pace_line + this -> max lanes, else min_lanes (Salih 2026-10-12)
+MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
 INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
 RESET_DROP = 40  # usage falling this many points between two readings = the quota was reset
 PACE_BAD_ID = "pace-invalid"  # attention ids (and ack files)
@@ -1214,7 +1214,7 @@ class Conveyor:
             p = {**PACE_DEFAULTS, **json.loads(f.read_text(encoding="utf-8"))}
             if p["mode"] not in ("full_burn", "paced"):
                 raise ValueError(f"mode {p['mode']!r}")
-            lane_keys = [k for k in ("max_lanes", "lanes_present", "lanes_away") if k in p]
+            lane_keys = [k for k in ("max_lanes", "min_lanes", "lanes_present", "lanes_away") if k in p]
             for k in ("days", "reset_alert_pct", "full_burn_limit_pct", "min_free_mem_gb",
                       "max_commit_pct", "away_after_min", "blocked_nudge_min", *lane_keys):
                 if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
@@ -1222,6 +1222,8 @@ class Conveyor:
                     raise ValueError(f"{k} {p[k]!r}")
             for k in lane_keys:
                 p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
+            if p.get("min_lanes", 0) > p.get("max_lanes", MAX_LANES_CAP):
+                raise ValueError(f"min_lanes {p['min_lanes']} > max_lanes {p['max_lanes']}")
             p["max_commit_pct"] = min(COMMIT_PCT_RANGE[1], max(COMMIT_PCT_RANGE[0], p["max_commit_pct"]))
             p["blocked_nudge_min"] = min(NUDGE_MIN_RANGE[1], max(NUDGE_MIN_RANGE[0], p["blocked_nudge_min"]))
             cmd = p["power_switch_cmd"]
@@ -1244,7 +1246,7 @@ class Conveyor:
         if u is not None:
             if isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
-                keep = [*PACE_DEFAULTS, *(["max_lanes"] if "max_lanes" in p else [])]
+                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
@@ -1268,15 +1270,18 @@ class Conveyor:
             self.pager_flag("reset_alert", False)  # re-armed for the next full_burn episode
             start = datetime.fromisoformat(p["window_start"]).timestamp()
             line = 100 * max(0.0, self.now() - start) / 86400 / p["days"]
-            limit, n, band = PACED_LIMIT, 0, "over"
+            limit = PACED_LIMIT
+            floor = p.get("min_lanes", min(MIN_LANES, top))  # a hand-set min_lanes wins
             if u is None:
                 n, band = min(MAX_LANES, top), "unknown"  # no reading: no hold, at most 3
+            elif u <= line + PACE_MARGIN:
+                n = max(top, floor)
+                band = f"paced: on/under line -> max {n}"
             else:
-                for margin, lanes in PACE_BANDS:
-                    if u <= line + margin:
-                        n, band = min(lanes or top, top), f"<=pace+{margin}"
-                        break
+                n, band = floor, f"paced: ahead of line -> min {floor}"
         self.usage_hold = u is not None and u >= limit
+        if self.usage_hold and p["mode"] == "paced":
+            band = f"paced: hold at {PACED_LIMIT} %"
         self.max_lanes = 0 if self.usage_hold else n
         m = self.memory
         self.mem_hold = m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > p["max_commit_pct"])

@@ -840,10 +840,12 @@ the optional report reader below. One instance at a time
     sıfırlama hakkını şimdi kullanabilirsin") and attention item
     `quota-reset-alert` is added.
   - `paced`: `pace_line = 100 * elapsed_since(window_start) / days`.
-    Effective max lanes: `max_lanes` when `usage_pct <= pace_line + 2`, 2 when
-    `<= pace_line + 7`, 1 when `<= pace_line + 12` (never above `max_lanes`),
-    else 0 (no new dispatch;
-    running lanes are never touched). No new lane at `usage_pct >= 97`.
+    Effective max lanes: `max_lanes` when `usage_pct <= pace_line + 2`, else
+    `min_lanes` (Salih 2026-10-12: 2-3 lanes non-stop). `min_lanes` (optional,
+    default `min(2, max_lanes)`) is clamped 1..6 like the other lane keys;
+    `min_lanes > max_lanes` makes pace.json invalid. Running lanes are never
+    touched. No new lane at `usage_pct >= 97` (hold, whatever `min_lanes` says).
+    A reset rewrite keeps `min_lanes` and `max_lanes`. full_burn ignores `min_lanes`.
     Integration lanes count like any lane (and at most one runs, see above).
     Unknown usage: `min(3, max_lanes)` lanes.
   - Reset detection: `usage_pct` dropping 40 or more points between two
