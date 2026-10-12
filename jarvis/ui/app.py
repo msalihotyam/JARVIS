@@ -114,7 +114,27 @@ def install_scheduler_sweeps(bridge: Bridge):
     return timer
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, instance: str | None = None) -> int:
+    """Start JARVIS, or bring the running one to the front.
+
+    One JARVIS per Windows user: the launch (``argv`` None, the process's own
+    command line) claims the per-user instance name; an embedded call with an
+    explicit ``argv`` claims only the ``instance`` it is given, if any - so a
+    test never takes the real one. The lock comes before anything else; a
+    launch that loses it asks the winner to show itself and returns 0 without
+    a window, a tray icon or a store.
+    """
+    from jarvis.ui import single_instance
+
+    name = instance or (single_instance.default_name() if argv is None else None)
+    lock = single_instance.acquire(name) if name else None
+    if name and lock is None:
+        if single_instance.notify_running(name):
+            return 0
+        # Nobody answered: a JARVIS that was quitting may be gone now - take over.
+        lock = single_instance.acquire(name)
+        if lock is None:
+            return 0
     # The Basic style is the one whose look this UI fully overrides; nothing
     # of the platform's stock widget styling is meant to show through.
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
@@ -124,9 +144,12 @@ def main(argv: list[str] | None = None) -> int:
     from PySide6.QtWidgets import QApplication
 
     from jarvis.ui.resources import asset_path
-    from jarvis.ui.tray import install_tray
+    from jarvis.ui.tray import TrayController, install_tray
 
     app = QApplication(argv if argv is not None else sys.argv)
+    # Later launches are heard from now on; the lock lives as long as the process.
+    server = single_instance.InstanceServer(name, app) if name else None
+    app._jarvis_instance = (lock, server)
     app.setApplicationName("JARVIS")
     app.setOrganizationName("JARVIS")
     # The approved mark, set once and reused: as the application default (new
@@ -145,8 +168,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     # Window X hides to the tray when there is one; Quit JARVIS (tray) is the
     # orderly exit, so a hidden last window must not end the process.
-    if install_tray(app, bridge, engine.rootObjects()[0]) is not None:
+    window = engine.rootObjects()[0]
+    if install_tray(app, bridge, window) is not None:
         app.setQuitOnLastWindowClosed(False)
+    # A second launch shows this window exactly as the tray's Open does.
+    # A quitting JARVIS stops answering, so a launch right after Quit takes over.
+    if server is not None:
+        server.showRequested.connect(TrayController(bridge, window, app).open)
+        app.aboutToQuit.connect(server.close)
     bridge.quitRequested.connect(app.quit)
     # Due work is swept while the application runs, the tray included; the
     # timer belongs to the bridge, so quitting ends it with the process.
