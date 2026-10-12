@@ -51,6 +51,30 @@ NUDGE_GAP_S = 900
 BLOCKED_ATTENTION_S = 2700  # blocked this long with no worktree activity -> attention item
 NUDGE = ("Continue the task from where you stopped. Nobody can answer questions; follow the "
          "UNATTENDED rules in your prompt.")
+# CONV12: a live lane idle with no report and no activity this long gets one nudge; idle that long
+# again after it -> STUCK (INT38 sat idle after pushing ci/int38 and never wrote its report).
+IDLE_NO_REPORT_S = 900
+IDLE_NUDGE = ("Write your report file now with the STATUS line; if you were waiting, say what you "
+              "were waiting for.")
+# CONV12 / LANE_RULES R3: a feature lane BLOCKED only on 'NEEDS FILES: <path>[, <path>]' is resumed once.
+GRANT_NUDGE = ("You may now edit {paths} (orchestrator-approved by rule R3). Finish your goal and "
+               "rewrite your report.")
+GRANT_MAX = 3
+NEEDS_RE = re.compile(r"(?m)^[ \t]*NEEDS FILES:[ \t]*(.*)$")
+BLOCKER_RE = re.compile(r"(?im)^[ \t]*(?:BLOCKER\w*|BLOCKED[ \t]+\w+|FAIL\w*|ERRORS?|REASON)[ \t]*:[ \t]*(.*)$")
+NONE_WORDS = {"", "none", "-", "n/a", "no", "yok"}
+GRANT_PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+# the R1 security list, as lowercase substrings (fail closed: broader than the rule's words)
+GRANT_DENY = ("policy", "approv", "authori", "auth", "credential", "secret", "redact", "token",
+              "password", "api_key", "apikey", "memory.py", "schema", "trusted_exec", "conveyor",
+              "push", "release", "uv.lock", ".env", "scripts/", ".github/", ".claude/", "build/",
+              "data/")
+# CONV12: an integration lane may finish 'STATUS: CI_PENDING' + 'NEW MAIN SHA' + ci/<name>; the
+# conveyor then waits for that sha's CI (push_checks' query) and turns it GREEN or BLOCKED.
+CI_PENDING = "CI_PENDING"
+CI_ERROR_GAP_S = 3600  # gh unreadable during a CI wait: one error line per hour
+CI_PAGE_S = 7200  # a CI wait unresolved this long pages once
+CI_STACK_S = 86400  # ponytail: stacking checks look at pending/success handoff lanes this young only (failed: until acked)
 API_HOST = "api.anthropic.com"  # the network probe: a TCP connect to 443, nothing is sent
 PAGE_GAP_S = 600
 ATTENTION_PAGE_S = 1800  # an attention item unacked this long pages Salih (orchestrator did not react)
@@ -167,7 +191,7 @@ SHA_HDR_RE = re.compile(r"^[0-9a-f]{7,40}$")
 HEADER_KEYS = ("lane", "model", "effort", "base")
 JS_WS = "\t\n\v\f\r    -     　﻿"  # JS \s
 BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
-STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*([A-Za-z]+)")
+STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -732,12 +756,13 @@ class Conveyor:
         self.free_gb = self.disk_free_gb()
         if agents is not None:
             self.track(lanes, agents)
+        self.ci_wait(lanes)  # before the autopilot: a CI result is acted on in the same pass
         self.autopilot(lanes)  # before dispatch: a new fix lane or an open breaker counts now
         if agents is not None:
             self.dispatch(lanes, agents)
             self.prioritize(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
-        self.push_gate()
+        self.push_gate(lanes)
         items = self.attention(lanes)
         if agents is not None:
             self.stop_finished(lanes, agents, {i for i, _, _ in items})
@@ -766,6 +791,8 @@ class Conveyor:
         if quiet:
             return
         ln["finished_ts"] = self.now()  # since of its attention item (bad STATUS, non-pass reading)
+        if status == CI_PENDING:
+            return  # read when ci_wait turns it GREEN or BLOCKED
         try:
             text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -847,8 +874,10 @@ class Conveyor:
             ln["updated_at"] = iso(self.now())
             if ln.get("finished") and ln.get("status") and ln["status"] != "DEAD":
                 continue  # DEAD: a report the rescued session writes later still finishes it
-            found = self.find_report(name, self.started_ts(ln), a and a.get("cwd"))
+            found = self.find_report(name, ln.get("report_since") or self.started_ts(ln), a and a.get("cwd"))
             if found:  # a report wins over any session state
+                if found[1] == "BLOCKED" and self.resume_in_place(name, ln, found[0], a, lanes):
+                    continue
                 self.finish(name, ln, *found)
                 continue
             if ln.get("finished"):
@@ -883,7 +912,83 @@ class Conveyor:
                 else:
                     self.redispatch(name, ln)
                 continue
+            if alive and self.watch_idle(name, ln, a):
+                continue
             self.unblock(name, ln, a)
+
+    def watch_idle(self, name, ln, a):
+        """CONV12 idle-lane watchdog: a live session idle (not blocked: unblock owns that) with no
+        report and no activity for IDLE_NO_REPORT_S gets one IDLE_NUDGE; idle that long again
+        after it -> STUCK (attention + page). A busy session is never touched. True when it acted."""
+        if a.get("status") != "idle" or ln.get("state") == "blocked":
+            ln.pop("idle_since", None)
+            return False
+        now = self.now()
+        since = ln.setdefault("idle_since", now)
+        if now - since < IDLE_NO_REPORT_S or self.active_since(name, now - IDLE_NO_REPORT_S, a.get("cwd")):
+            return False
+        if "idle_nudged" not in ln:
+            ln["idle_nudged"] = ln["idle_since"] = now  # the resumed turn gets its own 15 min
+            self.nudge(name, ln, a, IDLE_NUDGE, "idle_nudge")
+            return True
+        ln.update(finished=True, status="STUCK", finished_ts=now)
+        self.event("finish", lane=name, id=ln["id"], status="STUCK", reason="idle, no report after a nudge")
+        self.page(f"{name}: {IDLE_NO_REPORT_S // 60} dk boşta, rapor yok (dürtüldü): STUCK")
+        self.read_report(name, ln, None)
+        return True
+
+    def resume_in_place(self, name, ln, report, a, lanes):
+        """LANE_RULES R3: a feature lane's BLOCKED report whose only blocker is one 'NEEDS FILES:
+        <path>[, <path>]' line gets ONE in-place continuation: when every path is grantable (not a
+        running lane's, not on the R1 security list, at most GRANT_MAX), its files are extended and
+        the SAME session is resumed via nudge(). True when resumed (the lane runs on); otherwise the
+        caller finishes it as usual (attention). Once per lane, granted or not."""
+        if INT_RE.match(name) or a is None or ln.get("finished") or "resumed_in_place" in ln:
+            return False  # a DEAD lane's late report is only collected
+        try:
+            text = Path(report).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        needs = NEEDS_RE.findall(text)
+        if not needs:
+            return False  # an ordinary BLOCKED report
+        ln["resumed_in_place"] = self.now()
+        why, paths = self.grant_check(name, needs, text, lanes)
+        ok = why is None and self.nudge(name, ln, a, GRANT_NUDGE.format(paths=", ".join(paths)),
+                                        "resume_in_place", paths=paths)
+        if why:
+            self.event("resume_in_place", lane=name, id=ln["id"], granted=False, reason=why)
+        if not ok:
+            ln["resume_refused"] = why or "resume failed (see the resume_in_place event)"
+            return False
+        ln["files"] = ln.get("files", []) + paths
+        ln["report_since"] = max(self.now(), mtime_or_0(report)) + 0.001  # the old report is spent
+        ln.update(state="working", idle=False)
+        return True
+
+    def grant_check(self, name, needs, text, lanes):
+        """(None, paths) when the NEEDS FILES request is grantable, else (reason, paths). Fail closed."""
+        if len(needs) != 1:
+            return "more than one NEEDS FILES line", []
+        if TEST_ID_RE.search(text) or any(v.strip().lower() not in NONE_WORDS
+                                          for v in BLOCKER_RE.findall(text)):
+            return "the report names another blocker", []
+        paths = [q for q in (p.strip(" `'\"").replace("\\", "/") for p in needs[0].split(",")) if q]
+        if needs[0].strip().lower() in NONE_WORDS or not paths:
+            return "no path named", []
+        if len(paths) > GRANT_MAX:
+            return f"{len(paths)} paths (at most {GRANT_MAX})", paths
+        for p in paths:
+            if (not GRANT_PATH_RE.fullmatch(p) or ".." in p.split("/") or "." not in p.rsplit("/", 1)[-1].strip(".")
+                    or (self.root / p).is_dir()):
+                return f"not a repo file path: {p[:80]}", paths  # a folder would cover the R1 files in it
+            if any(d in p.lower() for d in GRANT_DENY):
+                return f"security list (R1): {p}", paths
+            other = next((n for n in self.running(lanes) if n != name
+                          and files_overlap([p], lanes[n].get("files", []))), None)
+            if other:
+                return f"{p} is owned by running lane {other}", paths
+        return None, paths
 
     def unblock(self, name, ln, a):
         """A live lane session in state "blocked" (CONV9): nudge it once blocked nudge_s while
@@ -905,22 +1010,25 @@ class Conveyor:
             self.event("blocked_attention", lane=name, id=ln["id"], since=iso(since),
                        nudges=ln.get("nudges", 0))
 
-    def nudge(self, name, ln, a):
-        """`claude stop` the blocked session (its conversation is kept), then `claude --bg
-        --resume <sessionId>` it with NUDGE in its own cwd, same model, effort and settings.
-        Counted even when it fails; one `nudge` event with each step."""
-        ln["nudges"] = ln.get("nudges", 0) + 1
-        ln["nudged_ts"] = self.now()
+    def nudge(self, name, ln, a, text=NUDGE, kind="nudge", **kw):
+        """`claude stop` the session (its conversation is kept), then `claude --bg --resume
+        <sessionId>` it with `text` in its own cwd, same model, effort and settings. One `kind`
+        event with each step; a blocked-lane nudge (kind "nudge") is counted even when it fails
+        (the idle watchdog and resume in place keep their own once-flags). True when both steps ran."""
+        if kind == "nudge":
+            ln["nudges"] = ln.get("nudges", 0) + 1
+            ln["nudged_ts"] = self.now()
+            kw["n"] = ln["nudges"]
         sid, steps = str(a.get("sessionId") or ""), []
         if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
-            self.event("nudge", lane=name, id=ln["id"], n=ln["nudges"], steps=[{"error": "no session id"}])
-            return
+            self.event(kind, lane=name, id=ln["id"], steps=[{"error": "no session id"}], **kw)
+            return False
         cwd = a.get("cwd") if a.get("cwd") and Path(a["cwd"]).is_dir() else str(self.root)
         resume = ["--bg", "--resume", sid, "--name", name, "--model", ln["model"], "--effort",
-                  ln["effort"], "--settings", str(self.root / SETTINGS), NUDGE]
-        for args, kw in ((["stop", ln["id"]], {}), (resume, {"cwd": cwd})):
+                  ln["effort"], "--settings", str(self.root / SETTINGS), text]
+        for args, opt in ((["stop", ln["id"]], {}), (resume, {"cwd": cwd})):
             try:
-                rc, out = self.run(args, **kw)
+                rc, out = self.run(args, **opt)
             except Exception as e:  # e.g. a timeout: logged, the lane goes on
                 rc, out = type(e).__name__, ""
             steps.append({"cmd": args[0], "rc": rc, "output": out[-300:]})
@@ -930,7 +1038,8 @@ class Conveyor:
         if m and m.group(1) != ln["id"]:  # the CLI started a copy: follow it
             ln.setdefault("prev_ids", []).append(ln["id"])
             ln["id"] = m.group(1)
-        self.event("nudge", lane=name, id=ln["id"], n=ln["nudges"], steps=steps)
+        self.event(kind, lane=name, id=ln["id"], steps=steps, **kw)
+        return rc == 0
 
     def dead_reason(self, ln, a):
         """Why a lane's session is dead DEAD_S after its dispatch, else None. Signals (the
@@ -1333,7 +1442,8 @@ class Conveyor:
         waiting = list(self.inbox.glob("*.md"))
         if not set(waiting) - held:  # a breaker-held prompt does not keep a fix lane waiting
             started = self.dispatch_backlog(lanes, busy) or started
-        if started or waiting or self.running(lanes):
+        if started or waiting or self.running(lanes) or any(
+                ln.get("status") == CI_PENDING for ln in lanes.values()):  # a CI wait is work too
             self.pager_flag("dry", False)
         elif self.pager_flag("dry") in (None, False, True):  # True: a v1 flag without a time
             self.pager_flag("dry", self.now())  # the dry episode's attention since
@@ -1367,12 +1477,15 @@ class Conveyor:
                 good.append(s)
         return good, errors
 
-    def slice_done(self, sid, lanes):
+    def slice_done(self, sid, lanes, for_int=False):
+        """A dependency is done at a good STATUS; for an integration lane also at CI_PENDING
+        (CONV12: the next integration lane stacks on the pending sha)."""
+        done = GOOD | {CI_PENDING} if for_int else GOOD
         ln = lanes.get(sid)
         if ln and ln.get("status"):
-            return ln["status"] in GOOD
+            return ln["status"] in done
         found = self.find_report(sid)
-        return bool(found) and found[1] in GOOD
+        return bool(found) and found[1] in done
 
     def pick_slice(self, slices, lanes, busy):
         """First dispatchable slice (or None) and a {id: state} view of the backlog."""
@@ -1382,14 +1495,15 @@ class Conveyor:
             sid = s["id"]
             if sid in lanes:
                 ln = lanes[sid]
-                view[sid] = ln.get("status") or ("finished" if ln.get("finished") else "running")
+                view[sid] = "ci_pending" if ln.get("status") == CI_PENDING else \
+                    ln.get("status") or ("finished" if ln.get("finished") else "running")
                 continue
             found = self.find_report(sid)
             if found:
                 view[sid] = found[1]
             elif s["tier"] == "T2" and s.get("approved") is not True:
                 view[sid] = "needs_t2_approval"
-            elif not all(self.slice_done(d, lanes) for d in s.get("depends_on", [])):
+            elif not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
                 view[sid] = "waiting_deps"
             elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
                 view[sid] = "overlap"
@@ -1514,6 +1628,9 @@ class Conveyor:
                 why.append(f"prompt not delivered / session gone: {ln.get('dead')}")
             elif ln.get("status") in BAD or ln.get("status") == "STUCK":
                 why.append(f"STATUS {ln['status']}")
+                for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: ")):
+                    if ln.get(k):
+                        why.append(lead + ln[k])
             r = ln.get("reading") or {}
             if r.get("kind", "pass") != "pass":
                 lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
@@ -1650,6 +1767,8 @@ class Conveyor:
                 continue
             ln["ap"] = fin  # once per terminal status (a DEAD lane finished later by report: again)
             st = ln.get("status")
+            if st == CI_PENDING:
+                continue  # not terminal: ci_wait sets GREEN/BLOCKED with a new finished_ts
             role = next((r for c in chains.values() for r in ("afx", "r") if c.get(r) == name), None)
             if st in BAD:
                 ap.setdefault("bad", []).append([name, fin])
@@ -1730,32 +1849,164 @@ class Conveyor:
         MAIN SHA: <40 hex>' line, one ci/* branch and one CI run URL; no other integration
         lane unfinished; then every gate check (push_checks: local main is that sha, fast-
         forward, CI success for that sha on that branch, no uv.lock, SCHEMA_VERSION 10) passes
-        now, and the run the gate verified is the report's run."""
+        now, and the run the gate verified is the report's run.
+        CONV12 handoff (ci_wait found CI success): the single STATUS line is 'STATUS: CI_PENDING',
+        sha and branch are the ones waited for, the run is the one ci_wait saw, and a running
+        integration lane is fine (it stacks on this sha; push_checks keeps the order)."""
         text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        ci = ln.get("ci") or {}
+        handoff = ci.get("state") == "success"
+        want = CI_PENDING if handoff else "GREEN"
         st = [x for x in text.splitlines() if re.match(r"\s*STATUS:", x)]
-        if len(st) != 1 or not re.fullmatch(r"\s*STATUS:\s*GREEN\s*", st[0]):
-            return "the report has no single 'STATUS: GREEN' line", None, None
-        mains = NEW_MAIN_RE.findall(text)
-        m = len(mains) == 1 and re.match(r"\s*:\s*([0-9a-f]{40})(?![0-9A-Za-z])", mains[0])
-        if not m:
-            return "the report has no single 'NEW MAIN SHA: <40 hex>' line", None, None
-        sha, cis, runs = m.group(1), set(CI_BRANCH_RE.findall(text)), set(CI_RUN_RE.findall(text))
-        if len(cis) != 1:
-            return f"the report names {len(cis)} ci/* branches, not one", None, None
+        if len(st) != 1 or not re.fullmatch(rf"\s*STATUS:\s*{want}\s*", st[0]):
+            return f"the report has no single 'STATUS: {want}' line", None, None
+        why, sha, branch = self.main_and_ci(text)
+        if why:
+            return why, None, None
+        if handoff and (sha, f"ci/{branch}") != (ci.get("sha"), ci.get("branch")):
+            return "the report's sha or ci/* branch is not the one CI was awaited for", None, None
+        runs = set(CI_RUN_RE.findall((ci.get("url") or "") if handoff else text))
         if len(runs) != 1:
             return f"the report names {len(runs)} CI run URLs, not one", None, None
         other = sorted(n for n, x in lanes.items() if n != name and INT_RE.match(n) and not x.get("finished"))
-        if other:
+        if other and not handoff:
             return f"integration lane {other[0]} is running", None, None
-        approval = f"push-{sha}-{cis.pop()}"
+        approval = f"push-{sha}-{branch}"
         if not APPROVAL_RE.fullmatch(approval):
             return "approval name invalid", None, None
-        why, got, url = self.push_checks(approval)
+        why, got, url = self.push_checks(approval, lanes)
         if why:
             return why, None, None
         if got != sha or runs.pop() not in CI_RUN_RE.findall(url or ""):
             return "the CI run the gate verified is not the report's", None, None
         return None, approval, url
+
+    def main_and_ci(self, text):
+        """(None, sha40, ci name) from a report's single 'NEW MAIN SHA: <40 hex>' line and single
+        ci/<name> branch, else (reason, None, None)."""
+        mains = NEW_MAIN_RE.findall(text)
+        m = len(mains) == 1 and re.match(r"\s*:\s*([0-9a-f]{40})(?![0-9A-Za-z])", mains[0])
+        if not m:
+            return "the report has no single 'NEW MAIN SHA: <40 hex>' line", None, None
+        cis = set(CI_BRANCH_RE.findall(text))
+        if len(cis) != 1:
+            return f"the report names {len(cis)} ci/* branches, not one", None, None
+        return None, m.group(1), cis.pop()
+
+    # ---- CI handoff (CONV12): the conveyor waits for an integration lane's CI ----
+    def ci_wait(self, lanes):
+        """Each pass, oldest first, for every lane at CI_PENDING: read the CI of exactly its NEW MAIN
+        SHA on its ci/* branch (ci_runs, the push gate's query). success -> GREEN (a 'CI: <url>
+        success' line appended to the report; the autopilot's key 1 and the gate's key 2 follow),
+        any other conclusion -> BLOCKED. Strict order: a lane stacked on a failed handoff sha is
+        BLOCKED, one stacked on a handoff sha not yet on origin/main waits. Unreadable gh or any
+        error: keep waiting (one error line per hour); unresolved CI_PAGE_S: one page. Never GREEN
+        without a success run."""
+        for name in sorted((n for n, x in lanes.items() if x.get("status") == CI_PENDING),
+                           key=lambda n: lanes[n].get("finished_ts", 0)):
+            ln = lanes[name]
+            try:
+                self.ci_step(name, ln, lanes)
+            except Exception as e:  # a git/gh timeout etc.: fail closed, keep waiting
+                self.ci_slow(name, ln, f"check error: {type(e).__name__}", error=True)
+
+    def ci_step(self, name, ln, lanes):
+        if "sha" not in (ln.get("ci") or {}):
+            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            st = [x for x in text.splitlines() if re.match(r"\s*STATUS:", x)]
+            why, sha, branch = self.main_and_ci(text)
+            if len(st) != 1 or not re.fullmatch(rf"\s*STATUS:\s*{CI_PENDING}\s*", st[0]):
+                why = f"the report has no single 'STATUS: {CI_PENDING}' line"
+            if not INT_RE.match(name):
+                why = "CI_PENDING from a lane that is not an integration lane"
+            elif not why and not self.is_ancestor(sha, "refs/heads/main"):  # an unknown sha raises: waits
+                why = f"NEW MAIN SHA {sha[:7]} is not on local main"
+            if why:
+                return self.ci_done(name, ln, "BLOCKED", why)
+            ln["ci"] = {"since": self.now(), **(ln.get("ci") or {}), "sha": sha, "branch": f"ci/{branch}"}
+            self.event("ci_pending", lane=name, sha=sha, branch=f"ci/{branch}")
+        ci = ln["ci"]
+        under = self.stacked(ci["sha"], lanes, CI_STACK_S)
+        failed = next(((n, c) for n, c in under if c.get("state") == "failed"), None)
+        if failed:
+            ci["state"] = "failed"
+            return self.ci_done(name, ln, "BLOCKED", f"stacked on failed {failed[1]['sha'][:7]} ({failed[0]})")
+        if under:
+            n, c = under[0]
+            return self.ci_slow(name, ln, f"waits for {n} {c['sha'][:7]} to reach origin/main")
+        state, url, why = self.ci_runs(ci["branch"], ci["sha"])
+        if state is None:
+            return self.ci_slow(name, ln, why, error=True)
+        if state == "pending":
+            return self.ci_slow(name, ln, why)
+        line = f"CI: {url} {state}"
+        try:
+            with open(ln["report"], "a", encoding="utf-8") as f:  # appended, the lane's lines untouched
+                f.write("\n" + line + "\n")
+        except OSError as e:
+            return self.ci_slow(name, ln, f"report append: {e}", error=True)
+        ci.update(state="success" if state == "success" else "failed", url=url)
+        self.event("ci_result", lane=name, sha=ci["sha"], result=state, url=url)
+        if state == "success":
+            return self.ci_done(name, ln, "GREEN", None)
+        running = [n for n in self.running(lanes) if INT_RE.match(n)]
+        self.ci_done(name, ln, "BLOCKED", line + (f"; running integration lane(s) {', '.join(running)} may "
+                                                  "be stacked on it" if running else ""))
+
+    def ci_done(self, name, ln, status, why):
+        ln.setdefault("ci", {})  # marks a handoff lane (no auto-fix chain) even when the report was bad
+        ln["status"] = status
+        ln["finished_ts"] = self.now()  # a new terminal status: the autopilot acts on it
+        if why:
+            ln["ci_why"] = why
+        self.event("finish", lane=name, id=ln["id"], status=status, reason=why)
+        try:
+            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = None
+        self.read_report(name, ln, text)
+
+    def ci_slow(self, name, ln, why, error=False):
+        """Still waiting: an error line at most once per CI_ERROR_GAP_S (unreadable gh, git
+        errors) and one page once the wait is CI_PAGE_S old."""
+        ci = ln.setdefault("ci", {"since": ln.get("finished_ts") or self.now()})
+        now = self.now()
+        if error and now - ci.get("error_ts", 0) >= CI_ERROR_GAP_S:
+            ci["error_ts"] = now
+            self.error(f"CI wait {name}: {why}", lane=name)
+        if now - ci.get("since", now) >= CI_PAGE_S and "paged" not in ci:
+            ci["paged"] = now
+            self.page(f"{name}: CI {CI_PAGE_S // 3600} saattir sonuçsuz ({why})")
+
+    def is_ancestor(self, a, b):
+        """`git merge-base --is-ancestor`; RuntimeError on any rc but 0/1 (fail closed)."""
+        rc, out = self.cmd(["git", "merge-base", "--is-ancestor", a, b])
+        if rc not in (0, 1):
+            raise RuntimeError(f"git merge-base rc={rc}: {out.strip()[-120:]}")
+        return rc == 0
+
+    def stacked(self, sha, lanes, window):
+        """[(lane, ci record)] of the handoff lanes whose sha is a strict ancestor of `sha` and not
+        on origin/main (the local remote-tracking ref; once seen there it is cached as on_origin).
+        A failed record counts until the orchestrator acks that lane's attention item (it decides
+        about main); any other record only while younger than `window`. RuntimeError on a git error."""
+        out = []
+        for n, x in lanes.items():
+            c = x.get("ci")
+            if (not isinstance(c, dict) or not isinstance(c.get("sha"), str) or c["sha"] == sha
+                    or c.get("on_origin")):
+                continue
+            if c.get("state") == "failed":
+                if self.acked(n, x.get("finished_ts") or 0):
+                    continue
+            elif self.now() - c.get("since", 0) > window:
+                continue
+            if self.is_ancestor(c["sha"], sha):
+                if self.is_ancestor(c["sha"], "refs/remotes/origin/main"):
+                    c["on_origin"] = True
+                else:
+                    out.append((n, c))
+        return out
 
     def auto_fix(self, name, ln, chains, ap):
         """One fix-forward chain per integration lane name, never a second: <INT>-AFX then
@@ -1763,6 +2014,8 @@ class Conveyor:
         attention item for the orchestrator."""
         if name in chains:
             why, slices = "auto-fix already used for this integration lane", None
+        elif "ci" in ln:  # CONV12: GitHub CI failed (or stacked on a failure): no local test ids
+            why, slices = "CI-handoff failure, the orchestrator decides", None
         else:
             try:
                 why, slices = self.fix_chain(name, ln)
@@ -1824,11 +2077,12 @@ class Conveyor:
         return None, slices
 
     # ---- push gate: verified main to GitHub under two keys ---------------
-    def push_gate(self):
+    def push_gate(self, lanes=None):
         """For each build/approvals/push-<sha>[-<ci>] (key 1, the orchestrator's) whose
         checks all pass (key 2, push_checks): `git push origin <sha>:refs/heads/main`,
         never --force, then move the approval to done/. A blocked approval is an
         attention item and is re-checked at most once per PUSH_RETRY_S."""
+        lanes = self.load_lanes() if lanes is None else lanes
         state = self.load_json(self.push_file, {})
         files = sorted(f for f in self.approvals.glob("push-*") if f.is_file())
         for f in files:
@@ -1838,7 +2092,7 @@ class Conveyor:
             st["tried"] = self.now()
             sha = url = None
             try:
-                why, sha, url = self.push_checks(f.name)
+                why, sha, url = self.push_checks(f.name, lanes)
                 if why is None:
                     rc, out = self.cmd(["git", "push", "origin", f"{sha}:refs/heads/main"])
                     if rc != 0:
@@ -1869,16 +2123,23 @@ class Conveyor:
         if state or self.push_file.exists():
             self.push_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-    def push_checks(self, name):
-        """(None, full sha, CI run url) when every check passes, else (reason, sha, None)."""
+    def push_checks(self, name, lanes=None):
+        """(None, full sha, CI run url) when every check passes, else (reason, sha, None).
+        CONV12: a CI-handoff lane's exact 40-hex sha may sit under newer local main commits (the
+        next integration lane stacked on it); a sha stacked on a handoff sha that is not on
+        origin/main and not CI success is refused (strict push order)."""
+        lanes = self.load_lanes() if lanes is None else lanes
         m = APPROVAL_RE.fullmatch(name)
         if not m:
             return "approval name is not push-<sha>[-<ci>]", None, None
         want, ci = m.groups()
         rc, sha = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
-        sha = sha.strip()
+        head = sha = sha.strip()
+        if rc == 0 and SHA_RE.fullmatch(head) and not head.startswith(want) and any(
+                (x.get("ci") or {}).get("sha") == want for x in lanes.values()):
+            sha = want if self.is_ancestor(want, head) else head
         if rc != 0 or not SHA_RE.fullmatch(sha) or not sha.startswith(want):
-            return f"local main {sha[:12]} is not {want}", want, None
+            return f"local main {head[:12]} is not {want}", want, None
         rc, _ = self.cmd(["git", "fetch", "origin", "main"])
         if rc != 0:
             return f"git fetch rc={rc}", sha, None
@@ -1891,6 +2152,10 @@ class Conveyor:
         rc, _ = self.cmd(["git", "merge-base", "--is-ancestor", om, sha])
         if rc != 0:
             return f"not a fast-forward of origin/main {om[:7]}", sha, None
+        late = [(n, c) for n, c in self.stacked(sha, lanes, CI_STACK_S) if c.get("state") != "success"]
+        if late:
+            n, c = late[0]
+            return f"stacked on {n} {c['sha'][:7]} whose CI is {c.get('state') or 'pending'}", sha, None
         rc, out = self.cmd(["git", "diff", "--name-only", f"{om}..{sha}"])
         if rc != 0:
             return f"git diff rc={rc}", sha, None
@@ -1912,6 +2177,16 @@ class Conveyor:
                 return (f"{len(cands)} origin/ci/* branches contain {sha[:7]}: "
                         "name the approval push-<sha>-<ci>"), sha, None
             branch = cands[0]
+        state, url, why = self.ci_runs(branch, sha)
+        if state != "success":
+            return why, sha, None
+        return None, sha, url
+
+    def ci_runs(self, branch, sha):
+        """CI of exactly `sha` on `branch` (the push gate's one gh query): ("success", run urls,
+        None) when the newest run of every REQUIRED_WORKFLOWS for that sha completed success;
+        (conclusion, that run's url, reason) when one completed otherwise; ("pending", None,
+        reason) when one is missing or not completed; (None, None, reason) when gh is unreadable."""
         rc, out = self.cmd(["gh", "run", "list", "--branch", branch, "--limit", "50",
                             "--json", "headSha,conclusion,status,workflowName,url"])
         try:
@@ -1919,15 +2194,18 @@ class Conveyor:
         except ValueError:
             runs = None
         if not isinstance(runs, list):
-            return f"gh run list {branch} rc={rc}", sha, None
+            return None, None, f"gh run list {branch} rc={rc}"
         urls = []
         for wf in REQUIRED_WORKFLOWS:  # the newest run of the workflow for exactly this sha
             mine = [r for r in runs if isinstance(r, dict)
                     and r.get("workflowName") == wf and r.get("headSha") == sha]
-            if not mine or mine[0].get("status") != "completed" or mine[0].get("conclusion") != "success":
-                return f"CI {wf} on {branch} is not success for {sha[:7]}", sha, None
+            why = f"CI {wf} on {branch} is not success for {sha[:7]}"
+            if not mine or mine[0].get("status") != "completed":
+                return "pending", None, why
+            if mine[0].get("conclusion") != "success":
+                return str(mine[0].get("conclusion") or "unknown")[:40], str(mine[0].get("url")), why
             urls.append(str(mine[0].get("url")))
-        return None, sha, " ".join(urls)
+        return "success", " ".join(urls), None
 
     # ---- cleanup of finished lane sessions -----------------------------
     def collected_ts(self, ln):

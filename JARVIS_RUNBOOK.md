@@ -656,6 +656,25 @@ the optional report reader below. One instance at a time
   `nudge` event each; never for a lane with a report. 45 min blocked with no new file
   in its worktree: attention item `<lane>` "lane blocked, needs orchestrator" (one
   `blocked_attention` event; night quiet as in Autopilot) to drop or requeue it.
+- **Idle lane (CONV12).** A live lane session that is idle (not `blocked`, never a
+  busy one) with no report and no activity (worktree file or ledger row) for 15 min
+  (`IDLE_NO_REPORT_S`) is nudged once like a blocked lane, with "Write your report
+  file now with the STATUS line; if you were waiting, say what you were waiting
+  for." (`idle_nudge` event; it does not use the blocked-lane nudge budget). Idle
+  15 min again after it: finished `STUCK` (attention item and a page).
+- **Resume in place (CONV12, LANE_RULES R3).** A feature lane (not `INT...`) whose
+  report is `STATUS: BLOCKED` with exactly one `NEEDS FILES: <path>[, <path>]`
+  line and no other blocker (no failing test id, no `BLOCKER`/`BLOCKED <x>`/
+  `FAIL...`/`ERROR`/`REASON:` line other than none) is resumed once in its SAME
+  session (nudge) with "You may now edit <paths> (orchestrator-approved by rule
+  R3). Finish your goal and rewrite your report." when: at most 3 repo-relative
+  file paths (a name with an extension; no folder), none listed by another running lane, none on the R1 security list
+  (substrings policy, approv, auth, credential, secret, redact, token, password,
+  api_key, memory.py, schema, trusted_exec, conveyor, push, release, uv.lock, .env;
+  folders scripts/, .github/, .claude/, build/, data/). The paths are added to the
+  lane's `files`, the old report is spent and the lane runs on (`resume_in_place`
+  event). Otherwise, or on a second BLOCKED, the lane finishes as before; the
+  attention item says why the resume was refused.
 - **PAUSE.** `build/conveyor/PAUSE` present: nothing new starts (no dispatch,
   no re-dispatch); tracking, report collection and respawn go on.
 - **Disk guard.** Free space on the repo drive under 10 GB (`MIN_FREE_GB`,
@@ -675,7 +694,30 @@ the optional report reader below. One instance at a time
   `INT` not followed by a letter (`INT7`, `int-x`; not `INTERACT1`) is not
   dispatched while another such lane is running, whatever `max_lanes` allows
   (they share the main checkout and run the full suite). An inbox prompt
-  waits in the inbox; a backlog slice shows `int_busy`.
+  waits in the inbox; a backlog slice shows `int_busy`. A lane at
+  `CI_PENDING` (CI handoff below) counts as finished here and for the
+  `@main-checkout` overlap, and an integration slice may depend on it, so the
+  next integration lane starts on top of the pending sha.
+- **CI handoff (CONV12, Salih 2026-10-12).** An integration lane may finish with
+  exactly one `STATUS: CI_PENDING` line, one `NEW MAIN SHA: <40 hex>` (on local
+  main) and its pushed `ci/<name>` branch instead of waiting for GitHub CI in
+  the foreground. The conveyor then owns the wait (`ci_pending` event;
+  `status.json` backlog state `ci_pending`): every pass, oldest first, it reads
+  the CI of exactly that sha on that branch with the push gate's own `gh run
+  list` query and `tests` workflow rule. Success: a `CI: <url> success` line is
+  appended to the report (the lane's lines are never rewritten), the lane
+  becomes `GREEN` (`ci_result` event) and auto key 1 / key 2 follow as usual.
+  Any other conclusion (failure, cancelled, ...): `BLOCKED` with that line,
+  an attention item and no auto-fix chain (no local test ids). Unreadable gh
+  or a git error: it keeps waiting, one error line per hour; a wait still
+  unresolved after 2 h pages once. Never GREEN without a success run.
+  Strict order: a pending sha stacked on a handoff sha whose CI failed is
+  `BLOCKED` "stacked on failed <sha7> (<lane>)"; one stacked on a handoff sha
+  not yet on origin/main waits for that push. Nothing resets main: after a
+  failure the orchestrator decides; a failed handoff sha holds everything
+  stacked on it (here and in key 2) until its lane's attention item is acked
+  (`build/conveyor/ack/<lane>`); pending ones count for 24 h. A malformed handoff report (no single
+  sha/branch, not an integration lane, sha not on local main) is `BLOCKED`.
 - **Auto-push of main (two keys).** Salih (2026-10-09 21:32) delegated the
   main push: "push it when you judge it right". Lanes still never push main;
   only the conveyor does, and no model is the authority. Key 1: the
@@ -683,8 +725,12 @@ the optional report reader below. One instance at a time
   `build/approvals/push-<sha>` or `push-<sha>-<ci>` (content free text, only
   the name counts; `<sha>` 7-40 hex). Key 2: every pass, for each approval,
   all checks must hold: (1) `<sha>` matches `git rev-parse` of local `main`
-  in the canonical checkout; (2) after `git fetch origin main`, origin/main is
-  an ancestor of `<sha>` and not equal to it (fast-forward only); (3) on the
+  in the canonical checkout (CONV12: or is the exact 40-hex sha of a CI-handoff
+  lane and an ancestor of local main, i.e. the next integration lane stacked on
+  it); (2) after `git fetch origin main`, origin/main is
+  an ancestor of `<sha>` and not equal to it (fast-forward only), and no
+  CI-handoff sha under `<sha>` that is not on origin/main is still pending or
+  failed (strict push order); (3) on the
   CI branch the newest run of every required workflow (`tests`) with
   `headSha` exactly `<sha>` is completed with conclusion success (`gh run
   list --branch`); the CI branch is `ci/<ci>` from the approval name, else
@@ -728,6 +774,10 @@ the optional report reader below. One instance at a time
     and the lane is an attention item "auto-approval refused: <reason>"
     (the orchestrator may still write key 1 by hand). One try per finished
     report; a report written before CI finished is refused, not retried.
+    A CI-handoff lane turned GREEN by the conveyor is judged the same way,
+    except that its single STATUS line is `STATUS: CI_PENDING`, its sha and
+    branch must be the ones waited for, the run is the one the conveyor saw,
+    and a running integration lane (stacked on it) does not refuse it.
   - Auto fix-forward, once per integration lane name. An integration lane
     that finishes `STATUS: BLOCKED` whose report names failing test ids
     (`tests.<module>.<Class>.test_*`) queues two slices ahead of

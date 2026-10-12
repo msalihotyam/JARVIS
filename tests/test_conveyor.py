@@ -3111,6 +3111,367 @@ class TestDiskGuard(Base):
         self.assertTrue(self.status()["disk_hold"])
 
 
+SHA_A, SHA_B = "a1" + "0" * 38, "b2" + "0" * 38  # two integration commits stacked on ORIGIN
+
+
+class StackGit(FakeGit):
+    """FakeGit over one line of commits (oldest first): ancestry and diffs for any pair; a push
+    moves origin/main."""
+
+    def __init__(self, line):
+        super().__init__()
+        self.line = line
+        self.memory = {s: SCHEMA for s in line}
+        self.runs = []
+
+    def __call__(self, args, timeout=120):
+        a = tuple(args)
+        if self.raise_on and a[:len(self.raise_on)] == self.raise_on or any(a[:len(k)] == k for k in self.fail):
+            return super().__call__(args, timeout)
+        pos = {s: i for i, s in enumerate(self.line)}
+        refs = {"refs/remotes/origin/main": self.origin, "refs/heads/main": self.main}
+        if a[:3] == ("git", "merge-base", "--is-ancestor"):
+            self.calls.append(args)
+            x, y = (refs.get(v, v) for v in a[3:5])
+            return (0 if pos[x] <= pos[y] else 1, "") if x in pos and y in pos else (128, "fatal: bad object")
+        if a[:3] == ("git", "diff", "--name-only"):
+            self.calls.append(args)
+            return 0, self.diff
+        if a[:2] == ("git", "push"):
+            self.calls.append(args)
+            self.origin = a[3].split(":")[0]
+            return 0, "ok"
+        return super().__call__(args, timeout)
+
+    def ci(self, sha, conclusion="success"):
+        """The newest `tests` run for sha: completed with `conclusion`."""
+        self.runs.insert(0, {"headSha": sha, "status": "completed", "conclusion": conclusion,
+                             "workflowName": "tests", "url": f"https://github.com/x/y/actions/runs/{self.line.index(sha)}0"})
+
+
+class TestCIHandoff(AutopilotBase):
+    """CONV12: an integration lane finishes CI_PENDING; the conveyor waits for its GitHub CI."""
+
+    def setUp(self):
+        super().setUp()
+        self.git = self.c.cmd = StackGit([ORIGIN, SHA_A, SHA_B])
+
+    def int_lane(self, name, main):
+        """Dispatch integration lane `name` from the inbox; it then commits up to `main`."""
+        self.drop(f"{name}.md", INT_HDR.format(name) + "INTEGRATE\n")
+        self.c.pass_once()
+        self.assertIn(name, self.fake.bg_names())
+        self.git.main = main
+        self.t += 60
+
+    def pending(self, name, sha):
+        self.finish(name, "CI_PENDING", f"NEW MAIN SHA: {sha}\nCI: pushed ci/{name.lower()}, run in progress\n")
+
+    def text(self, name):
+        return Path(self.lanes()[name]["report"]).read_text(encoding="utf-8")
+
+    def test_success_turns_green_writes_key1_and_the_gate_pushes(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        ln = self.lanes()["INT1"]
+        self.assertEqual((ln["status"], ln["ci"]["sha"], ln["ci"]["branch"]), ("CI_PENDING", SHA_A, "ci/int1"))
+        self.assertEqual([(e["lane"], e["sha"]) for e in self.ev("ci_pending")], [("INT1", SHA_A)])
+        self.assertEqual((self.approvals(), self.git.pushes(), self.attn_ex_dry()), ([], [], []))
+        self.git.ci(SHA_A)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+        self.assertTrue(self.text("INT1").endswith("\nCI: https://github.com/x/y/actions/runs/10 success\n"))
+        self.assertIn("STATUS: CI_PENDING\n", self.text("INT1"))  # the lane's lines are untouched
+        (ev,) = self.ev("ci_result")
+        self.assertEqual((ev["lane"], ev["sha"], ev["result"]), ("INT1", SHA_A, "success"))
+        (ev,) = self.ev("auto_approve")
+        self.assertEqual(ev["approval"], f"push-{SHA_A}-int1")
+        self.assertEqual(self.approvals(), [f"done/push-{SHA_A}-int1"])
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_A}:refs/heads/main"]])
+        self.assertEqual(self.attn_ex_dry(), [])
+
+    def test_failure_or_cancelled_blocks_without_a_fix_chain(self):
+        for conclusion in ("failure", "cancelled"):
+            with self.subTest(conclusion):
+                self.tearDown()
+                self.setUp()
+                self.int_lane("INT1", SHA_A)
+                self.pending("INT1", SHA_A)
+                self.git.ci(SHA_A, conclusion)
+                self.c.pass_once()
+                self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+                line = f"CI: https://github.com/x/y/actions/runs/10 {conclusion}"
+                self.assertTrue(self.text("INT1").endswith(f"\n{line}\n"))
+                self.assertEqual((self.approvals(), self.git.pushes(), self.ev("auto_fix")), ([], [], []))
+                (item,) = [a for a in self.status()["attention"] if a["id"] == "INT1"]
+                self.assertIn(f"STATUS BLOCKED; {line}", item["reason"])
+                self.assertIn("auto-fix skipped: CI-handoff failure", item["reason"])
+
+    def test_gh_unreadable_keeps_waiting_never_green(self):
+        self.int_lane("INT1", SHA_A)
+        self.git.fail[("gh",)] = (1, "auth")
+        t0 = self.t
+        self.pending("INT1", SHA_A)
+        for at in (1800, 3600, 5400, 7199, 7200, 9000):
+            self.t = t0 + at
+            self.c.pass_once()
+            self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+            self.assertEqual(self.git.pushes(), [])
+            if at == 7199:
+                self.assertEqual(self.pushes, [])  # no page before 2 h
+        errors = [e for e in self.events() if e["event"] == "error" and e["message"].startswith("CI wait INT1")]
+        self.assertEqual(len(errors), 3)  # at 0, 1 h and 2 h
+        self.assertEqual(self.pushes, ["INT1: CI 2 saattir sonuçsuz (gh run list ci/int1 rc=1)"])
+        self.git.fail.clear()
+        self.git.ci(SHA_A)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+        self.assertEqual(len(self.git.pushes()), 1)
+
+    def test_next_int_dispatches_and_the_pending_sha_is_pushed_under_it(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)  # starts while INT1 waits, commits on top of SHA_A
+        self.assertFalse(self.lanes()["INT2"].get("finished"))
+        self.git.ci(SHA_A)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_A}:refs/heads/main"]])
+
+    def test_backlog_shows_ci_pending_and_the_next_int_may_depend_on_it(self):
+        self.backlog({"id": "INT1", "files": ["@main-checkout"]},
+                     {"id": "INT2", "files": ["@main-checkout"], "depends_on": ["INT1"]},
+                     {"id": "F", "depends_on": ["INT1"]})
+        self.c.pass_once()
+        self.assertEqual(self.view(), {"INT1": "running", "INT2": "waiting_deps", "F": "waiting_deps"})
+        self.git.main = SHA_A
+        self.pending("INT1", SHA_A)
+        self.assertEqual(self.view(), {"INT1": "ci_pending", "INT2": "running", "F": "waiting_deps"})
+        self.assertEqual(self.fake.bg_names(), ["INT1", "INT2"])
+
+    def test_push_order_holds_with_two_stacked_pending_shas(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)
+        self.pending("INT2", SHA_B)
+        self.git.ci(SHA_B)  # the later sha's CI finishes first: it waits for SHA_A
+        self.c.pass_once()
+        self.t += 60
+        self.assertEqual(self.lanes()["INT2"]["status"], "CI_PENDING")
+        self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
+        self.git.ci(SHA_A)
+        for _ in range(2):
+            self.c.pass_once()
+            self.t += 60
+        self.assertEqual([c[3] for c in self.git.pushes()], [f"{SHA_A}:refs/heads/main", f"{SHA_B}:refs/heads/main"])
+        self.assertEqual([self.lanes()[n]["status"] for n in ("INT1", "INT2")], ["GREEN", "GREEN"])
+
+    def test_hand_key1_stacked_on_a_pending_sha_is_refused(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)
+        self.pending("INT2", SHA_B)
+        self.git.ci(SHA_B)
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"push-{SHA_B}-int2").write_text("orchestrator\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [])
+        (ev,) = self.ev("push_blocked")
+        self.assertEqual(ev["reason"], f"stacked on INT1 {SHA_A[:7]} whose CI is pending")
+
+    def test_first_fails_then_the_stacked_second_is_blocked(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)
+        self.pending("INT2", SHA_B)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        lanes = self.lanes()
+        self.assertEqual((lanes["INT1"]["status"], lanes["INT2"]["status"]), ("BLOCKED", "BLOCKED"))
+        self.assertEqual(lanes["INT2"]["ci_why"], f"stacked on failed {SHA_A[:7]} (INT1)")
+        attn = {a["id"]: a["reason"] for a in self.status()["attention"]}
+        self.assertIn(f"stacked on failed {SHA_A[:7]} (INT1)", attn["INT2"])
+        self.assertIn("CI: https://github.com/x/y/actions/runs/10 failure", attn["INT1"])
+        self.git.ci(SHA_B)  # its own CI green later: still BLOCKED, never pushed
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT2"]["status"], "BLOCKED")
+        self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
+        self.assertFalse([c for c in self.git.calls if "reset" in c])  # main is the orchestrator's
+
+    def test_failed_sha_holds_stacked_pushes_until_acked_not_for_a_day(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)
+        self.pending("INT2", SHA_B)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.git.ci(SHA_B)
+        self.t += 2 * 86400  # older than CI_STACK_S: a failure still counts
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"push-{SHA_B}-int2").write_text("orchestrator\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [])
+        self.assertEqual(self.ev("push_blocked")[-1]["reason"], f"stacked on INT1 {SHA_A[:7]} whose CI is failed")
+        ack = self.base / "ack"
+        ack.mkdir(exist_ok=True)
+        for n in ("INT1", "INT2"):  # the orchestrator decided (here: keep main, push B by hand)
+            (ack / n).write_text("")
+            os.utime(ack / n, (self.t, self.t))
+        self.t += conveyor.PUSH_RETRY_S
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]])
+
+    def test_bad_handoff_reports_are_blocked(self):
+        cases = {"not an integration lane": ("G6X", SHA_A, "not an integration lane"),
+                 "no sha line": ("INT1", None, "NEW MAIN SHA"),
+                 "sha not on local main": ("INT1", SHA_B, "is not on local main")}
+        for label, (name, sha, why) in cases.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                if name.startswith("INT"):
+                    self.int_lane(name, SHA_A)
+                else:
+                    self.drop("g.md", HDR.format(name))
+                    self.c.pass_once()
+                    self.git.main = SHA_A
+                self.finish(name, "CI_PENDING", f"NEW MAIN SHA: {sha}\nci/int1\n" if sha else "ci/int1\n")
+                ln = self.lanes()[name]
+                self.assertEqual(ln["status"], "BLOCKED")
+                self.assertIn(why, ln["ci_why"])
+                self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
+
+    def test_plain_green_report_works_as_before(self):
+        self.git = self.c.cmd = FakeGit()
+        AutopilotBase.int_lane(self)
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual(self.approvals(), [f"done/push-{MAIN}-p2b"])
+        self.assertEqual(self.ev("ci_pending") + self.ev("ci_result"), [])
+
+
+class TestIdleWatchdog(Base):
+    """CONV12: INT38 sat idle after pushing ci/int38 and never wrote its report (2026-10-12)."""
+
+    def setUp(self):
+        super().setUp()
+        self.drop("a.md", HDR.format("A") + "do things\n")
+        self.c.pass_once()
+        self.a = self.fake.agent("A")
+        self.wt = self.root / ".claude" / "worktrees" / "a"
+        self.wt.mkdir(parents=True)
+        old = self.wt / "x.py"
+        old.write_text("x")
+        os.utime(old, (self.t - 9000, self.t - 9000))
+
+    def resumes(self):
+        return [c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]
+
+    def go_idle(self):
+        self.a.update(status="idle", cwd=str(self.wt))
+
+    def test_one_nudge_then_stuck(self):
+        self.go_idle()
+        self.c.pass_once()  # first seen idle: the 15 min start now
+        self.t += conveyor.IDLE_NO_REPORT_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.resumes(), [])
+        self.t += 1
+        self.c.pass_once()
+        (call,) = self.resumes()
+        self.assertEqual((call[2], call[-1]), (self.a["sessionId"], conveyor.IDLE_NUDGE))
+        (ev,) = [e for e in self.events() if e["event"] == "idle_nudge"]
+        self.assertEqual(ev["lane"], "A")
+        self.assertNotIn("nudges", self.lanes()["A"])  # the blocked-lane budget is untouched
+        self.c.pass_once()  # the resumed turn is busy
+        self.go_idle()  # ... and ends again without a report
+        self.c.pass_once()
+        self.t += conveyor.IDLE_NO_REPORT_S
+        self.c.pass_once()
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "STUCK"))
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertIn("A", self.attn())
+        self.assertTrue(any("STUCK" in p for p in self.pushes))
+
+    def test_busy_session_never_nudged(self):
+        for _ in range(8):
+            self.t += conveyor.IDLE_NO_REPORT_S
+            self.c.pass_once()
+        self.assertEqual(self.resumes(), [])
+        self.assertFalse(self.lanes()["A"].get("finished"))
+        self.assertFalse([e for e in self.events() if e["event"] == "idle_nudge"])
+
+
+class TestResumeInPlace(Base):
+    """CONV12 / LANE_RULES R3: a feature lane BLOCKED only on NEEDS FILES is resumed once."""
+
+    def setUp(self):
+        super().setUp()
+        self.backlog({"id": "F", "files": ["jarvis/a.py"]}, {"id": "G", "files": ["jarvis/c.py"]})
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["F", "G"])
+        self.t += 60
+
+    def resumes(self):
+        return [c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]
+
+    def blocked(self, needs="NEEDS FILES: jarvis/b.py, tests/test_b.py\n"):
+        self.report("F", "BLOCKED", mtime=self.t, extra=needs)
+        self.c.pass_once()
+
+    def test_eligible_resumes_the_same_session_with_extended_files(self):
+        sid = self.fake.agent("F")["sessionId"]
+        self.blocked()
+        ln = self.lanes()["F"]
+        self.assertFalse(ln.get("finished"))
+        self.assertEqual(ln["files"], ["jarvis/a.py", "jarvis/b.py", "tests/test_b.py"])
+        (call,) = self.resumes()
+        self.assertEqual((call[2], call[-1]), (sid, "You may now edit jarvis/b.py, tests/test_b.py "
+                         "(orchestrator-approved by rule R3). Finish your goal and rewrite your report."))
+        (ev,) = [e for e in self.events() if e["event"] == "resume_in_place"]
+        self.assertEqual(ev["paths"], ["jarvis/b.py", "tests/test_b.py"])
+        self.assertNotIn("F", self.attn())
+        self.t += 60
+        self.c.pass_once()  # the old BLOCKED report is spent
+        self.assertFalse(self.lanes()["F"].get("finished"))
+        self.report("F", "PASS", mtime=self.t)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["F"]["status"], "PASS")
+
+    def test_not_resumed(self):
+        cases = {"security path": "NEEDS FILES: jarvis/policy_proxy.py\n",
+                 "the conveyor": "NEEDS FILES: scripts/conveyor.py\n",
+                 "a running lane's file": "NEEDS FILES: jarvis/c.py\n",
+                 "four paths": "NEEDS FILES: a/1.py, a/2.py, a/3.py, a/4.py\n",
+                 "a folder": "NEEDS FILES: jarvis/\n",
+                 "a folder by dot": "NEEDS FILES: jarvis/.\n",
+                 "another blocker": f"NEEDS FILES: jarvis/b.py\nFAILURE: {FAILING}\n",
+                 "none": "NEEDS FILES: none\n"}
+        for label, needs in cases.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.blocked(needs)
+                ln = self.lanes()["F"]
+                self.assertEqual((ln["finished"], ln["status"], ln["files"]), (True, "BLOCKED", ["jarvis/a.py"]))
+                self.assertEqual(self.resumes(), [])
+                (item,) = [a for a in self.status()["attention"] if a["id"] == "F"]
+                self.assertIn("resume in place refused: ", item["reason"])
+
+    def test_second_blocked_goes_to_attention(self):
+        self.blocked()
+        self.t += 60
+        self.blocked("NEEDS FILES: jarvis/d.py\n")
+        ln = self.lanes()["F"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "BLOCKED"))
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertIn("F", self.attn())
+
+
 class TestLock(Base):
     def test_live_lock_blocks(self):
         (self.base / "conveyor.lock").write_text(json.dumps({"pid": -5, "heartbeat": self.t - 60}))
