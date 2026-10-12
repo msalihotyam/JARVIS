@@ -1,7 +1,8 @@
 """Gate 6H H3 (Salih 2026-10-11, "A"): `jarvis approve` refuses a K3 request.
 
 The folder path is shown only on the app's card, so the CLI never approves a
-project_folder_create request: refused with the exact Turkish message,
+project_folder_create request: refused with the exact message (English, like
+every other CLI message),
 non-zero, nothing approved, the request still pending, no grant, no folder;
 `--remember-for-session` changes nothing. `jarvis reject` of it still works,
 an ordinary approval still executes, and an unreadable request is refused.
@@ -24,7 +25,7 @@ from tests import test_project_folders_6h as h6
 from tests.test_project_folder_k3 import K3Case, ids
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 
-REFUSAL = "Bu klasör onayı yalnız JARVIS uygulamasındaki karttan verilebilir; klasörün yeri orada gösterilir."
+REFUSAL = "This folder approval can only be given from the card in the JARVIS app; the folder's location is shown there."
 
 
 class CliK3Tests(K3Case):

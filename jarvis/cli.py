@@ -922,8 +922,8 @@ def _dispatch_chain_command(
 
 
 K3_CLI_REFUSAL = (
-    "Bu klasör onayı yalnız JARVIS uygulamasındaki karttan verilebilir; "
-    "klasörün yeri orada gösterilir."
+    "This folder approval can only be given from the card in the JARVIS app; "
+    "the folder's location is shown there."
 )
 
 

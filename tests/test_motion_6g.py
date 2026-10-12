@@ -105,6 +105,21 @@ def gated(expression: str) -> bool:
     return False
 
 
+def qml_block(text: str, marker: str) -> str:
+    """The whole `Type { ... }` object that contains `marker`, by brace depth
+    (no dependence on which declaration comes next in the file)."""
+    start, depth = text.index(marker), 0
+    while depth >= 0:
+        start -= 1
+        depth += {"}": 1, "{": -1}.get(text[start], 0)
+    end, depth = start, 0
+    while True:
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        end += 1
+        if depth == 0:
+            return text[text.rfind("\n", 0, start) + 1:end]
+
+
 class DurationGateTests(unittest.TestCase):
     def test_every_duration_outside_the_theme_goes_through_the_gate(self) -> None:
         bad = [f"{name}:{line}: {expr}" for name, text in sources() if name != "theme/Theme.qml"
@@ -210,7 +225,8 @@ class NoForeverTests(unittest.TestCase):
         power = (QML_DIR / "components/PowerControl.qml").read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"loops:|Animation\.Infinite|SequentialAnimation on", power))
         bar = (QML_DIR / "components/TopBar.qml").read_text(encoding="utf-8")
-        orb = bar[bar.index('objectName: "settingsOrb"'):bar.index('id: wordmark')]
+        orb = qml_block(bar, 'objectName: "settingsOrb"')
+        self.assertIn('HoverTip { text: qsTr("Settings")', orb)  # the whole orb, not a prefix
         self.assertIsNone(re.search(r"RotationAnimator|RotationAnimation|loops:|Animation\.Infinite", orb))
 
     def test_no_effect_surfaces_never_loop(self) -> None:
