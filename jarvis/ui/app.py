@@ -26,10 +26,11 @@ MAIN_QML = QML_DIR / "Main.qml"
 FIRST_SWEEP_MS = 2_500
 SWEEP_INTERVAL_MS = 30_000
 
-#: DFFONTTRY dev switch (dev/font_try.ps1), read once at startup; never a
-#: setting, never persisted. O = Qt's FreeType engine with vertical hinting,
-#: T = O with stem darkening (build/reports/DFFONTLAB2.md). Unset or any
-#: other value is today's native path, untouched.
+#: How text is rasterized, read once at startup; never a setting, never
+#: persisted. T (the default, Salih 2026-10-12) = Qt's FreeType engine with
+#: vertical hinting and stem darkening (build/reports/DFFONTLAB2.md). Dev
+#: overrides (dev/font_try.ps1): native = the platform's DirectWrite path,
+#: O = T without stem darkening. Unset or any other value is T.
 FONT_RENDER_ENV = "JARVIS_FONT_RENDER"
 
 
@@ -39,7 +40,9 @@ def apply_font_render_env() -> str:
     ``setdefault``, so a platform the caller already chose (the tests'
     offscreen) keeps winning."""
     mode = os.environ.get(FONT_RENDER_ENV)
-    if mode not in ("O", "T") or sys.platform != "win32":
+    if mode not in ("native", "O"):
+        mode = "T"
+    if mode == "native" or sys.platform != "win32":
         return "native"
     os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
     if mode == "T":
@@ -102,8 +105,8 @@ def create_engine(bridge: Bridge, *, icon=None):
     from jarvis.ui.i18n import localization
     from jarvis.ui.typography import Typography, load_fonts
 
-    # Every text on the platform's native (ClearType) rasterizer, the explicit
-    # and the defaulted alike: a mix with Qt's distance-field glyphs reads dirty.
+    # Every text as native glyphs from the font engine (FreeType under T), the
+    # explicit and the defaulted alike: a mix with Qt's distance-field glyphs reads dirty.
     QQuickWindow.setTextRenderType(QQuickWindow.TextRenderType.NativeTextRendering)
     engine = QQmlApplicationEngine()
     engine.addImportPath(str(QML_DIR))

@@ -22,6 +22,7 @@ the text document here.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -69,9 +70,15 @@ CHAT_STRONG_WEIGHT = 600
 UI_FACES = (
     # Windows 11, DirectWrite: the Text optical size, and its own semibold.
     ("Segoe UI Variable Text", "Segoe UI Variable Text Semibold", 400),
+    # Windows 11, Qt's FreeType engine (the T render): the same system file,
+    # registered by load_fonts - one family, weight and optical size on its axes.
+    ("Segoe UI Variable", "Segoe UI Variable", 600),
     # Windows 10, or a rasterizer that only sees the static files.
     ("Segoe UI", "Segoe UI", 600),
 )
+#: Segoe UI Variable's own file. FreeType's font list has only the static
+#: Segoe UI files, which draw the 12-15 px interface text thin (DFFONT).
+SYSTEM_UI_VARIABLE = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "SegUIVar.ttf"
 
 #: The reading scale INSIDE a rendered Markdown document, which no QML font
 #: token can reach: a heading is a character format on a block, not a property
@@ -128,11 +135,16 @@ def load_fonts() -> dict[str, str]:
                 if names:
                     found.setdefault(role, names[0])
         installed = set(QFontDatabase.families()) | set(found.values())
+        # Only where the system's static Segoe UI is seen but not the variable
+        # family: never offscreen (no system faces) and never under DirectWrite.
+        if UI_FACES[0][0] not in installed and "Segoe UI" in installed and SYSTEM_UI_VARIABLE.is_file():
+            font_id = QFontDatabase.addApplicationFont(str(SYSTEM_UI_VARIABLE))
+            installed |= set(QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else [])
         bundled = found.get("sans", "")
         regular, strong, weight = next(((r, s, w) for r, s, w in UI_FACES if r in installed and s in installed),
                                        (bundled, bundled, 600))
         found.update({"ui": regular, "uiStrong": strong, "uiStrongWeight": weight,
-                      "reading": regular, "sans": regular})
+                      "uiVariable": regular == UI_FACES[1][0], "reading": regular, "sans": regular})
         for family in MONO_FAMILIES:
             if family in installed:
                 found["mono"] = family
@@ -162,6 +174,11 @@ class Typography(QObject):
     @Property(int, constant=True)
     def uiStrongWeight(self) -> int:
         return int(self._families.get("uiStrongWeight", 600))
+
+    @Property(bool, constant=True)
+    def uiVariable(self) -> bool:
+        """The interface face is the registered Segoe UI Variable file: its weight is an axis."""
+        return bool(self._families.get("uiVariable", False))
 
     @Property(str, constant=True)
     def sans(self) -> str:

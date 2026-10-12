@@ -54,29 +54,43 @@ QtObject {
     //   `display` - Space Grotesk, the identity only: wordmark, greeting, clock
     //       and large instrument numerals. Never running text or small print.
     //   `mono` - a real fixed-pitch face for code and technical literals.
-    // How text is rasterized: native (the platform rasterizer, crisp stems and
-    // Turkish diacritics). Nothing here is scaled or rotated.
+    // How text is rasterized: native glyphs from the font engine (Qt's FreeType
+    // under the T default, grayscale; jarvis/ui/app.py). Nothing here is scaled or rotated.
     readonly property int textRender: Text.NativeRendering
     readonly property bool faces: typeof typography !== "undefined" && typography.ui !== ""
     readonly property string ui: faces ? typography.ui : "Segoe UI"
     readonly property string uiStrong: faces ? typography.uiStrong : "Segoe UI"
     readonly property int uiStrongWeight: faces ? typography.uiStrongWeight : Font.DemiBold
+    // DFFONT: under FreeType the interface face is the registered Segoe UI
+    // Variable file, its weight and optical size on axes. The regular is drawn
+    // at 500 - the weight of the conversation text - because a 400 stem at
+    // 12-15 px is about one pixel wide and grayscale spreads it into grey; the
+    // semibold stays 600, the optical size is DirectWrite's Text cut (10.5).
+    readonly property bool uiAxes: faces && typography.uiVariable === true
+    readonly property int uiRegularWeight: uiAxes ? 500 : Font.Normal
     readonly property string sans: ui
     readonly property string reading: ui
     readonly property string font: ui
     readonly property string display: typeof typography !== "undefined" && typography.display !== "" ? typography.display : ui
     readonly property string mono: typeof typography !== "undefined" && typography.mono !== "" ? typography.mono : "Cascadia Mono"
     readonly property var tabular: ({ "tnum": 1 })
-    function face(px, strong, spacing, figures) {
-        return Qt.font({ family: strong ? uiStrong : ui, pixelSize: px, weight: strong ? uiStrongWeight : Font.Normal,
-                         letterSpacing: spacing || 0, features: figures ? tabular : ({}) })
+    // `snapped` (the 12 px tracked label only): full hinting under FreeType, so
+    // the stems of each tracked capital land on whole pixels instead of the
+    // fractional phases the tracking gives them.
+    function face(px, strong, spacing, figures, snapped) {
+        var weight = strong ? uiStrongWeight : uiRegularWeight
+        var spec = { family: strong ? uiStrong : ui, pixelSize: px, weight: weight,
+                     letterSpacing: spacing || 0, features: figures ? tabular : ({}) }
+        if (uiAxes) spec.variableAxes = { "wght": weight, "opsz": 10.5 }
+        if (uiAxes && snapped) spec.hintingPreference = Font.PreferFullHinting
+        return Qt.font(spec)
     }
 
     // -- the ramp (1920x1080 baseline) ------------------------------------
     // Informational text is never below 13 px, and small text is never a
     // hairline: hierarchy comes from size steps, the semibold and the ink,
     // not from shrinking. 12 px exists only as the tracked uppercase label.
-    readonly property font label: face(12, true, 0.7)          // UPPERCASE section / column labels
+    readonly property font label: face(12, true, 0.7, false, true)   // UPPERCASE section / column labels
     readonly property font caption: face(13, false)            // metadata, timestamps, helper, row sub-lines, actions
     readonly property font captionStrong: face(13, true)       // a caption that names something (a chip, a counter's label)
     readonly property font captionFigures: face(13, false, 0, true)   // a caption count or time (tabular)

@@ -55,10 +55,14 @@ class SwitchTests(unittest.TestCase):
         ui_app.apply_font_render_hinting(app, mode)
         return mode, seen, app.fonts
 
-    def test_unset_or_garbage_is_native_and_touches_nothing(self):
-        for value in (None, "", "native", "o", "t", "OT", "freetype", " O"):
+    def test_unset_or_garbage_is_t_and_native_touches_nothing(self):
+        """DFFONT: T is the default; only an explicit native is today's untouched native path."""
+        for value in (None, "", "o", "t", "OT", "freetype", " O"):
             with self.subTest(value=value):
-                self.assertEqual(self.mode(value), ("native", {"QT_QPA_PLATFORM": None, "FREETYPE_PROPERTIES": None}, []))
+                self.assertEqual(self.mode(value), ("T", {"QT_QPA_PLATFORM": "windows:fontengine=freetype",
+                                                          "FREETYPE_PROPERTIES": "autofitter:no-stem-darkening=0"},
+                                                    self.mode("T")[2]))
+        self.assertEqual(self.mode("native"), ("native", {"QT_QPA_PLATFORM": None, "FREETYPE_PROPERTIES": None}, []))
 
     def test_o_is_freetype_with_vertical_hinting(self):
         mode, seen, fonts = self.mode("O")
