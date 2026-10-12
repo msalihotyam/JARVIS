@@ -13,9 +13,12 @@ Item {
     property string status: ""
     readonly property string words: status === "running" ? qsTr("Running")
                                     : status === "needsYou" ? qsTr("Waiting for you")
+                                    : status === "queued" ? qsTr("Queued")
                                     : status === "finished" ? qsTr("Finished") : ""
+    // DFQUEUE "queued": a message waits there for the one run at a time - accent, steady.
     readonly property color tone: status === "running" ? Theme.violet
-                                  : status === "needsYou" ? Theme.warning : Theme.success
+                                  : status === "needsYou" ? Theme.warning
+                                  : status === "queued" ? Theme.accent : Theme.success
     readonly property bool blinking: status === "running" && Theme.ambient && visible
     readonly property bool pulsing: status === "finished" && Theme.ambient && visible
     readonly property bool animated: blinking || pulsing

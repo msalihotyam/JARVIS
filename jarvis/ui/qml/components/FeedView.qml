@@ -814,6 +814,42 @@ Item {
                                     onActivated: bridge.copyText(bridge.streamText) }
                 }
             }
+            // DFQUEUE: this conversation's messages waiting for the one run at a time, after
+            // everything else - marked "Queued" (with the place when more than one waits),
+            // each one with the way to take it back into the draft. Not part of the feed.
+            Repeater {
+                model: bridge.queuedHere
+                delegate: Item {
+                    objectName: "queuedMessage_" + index
+                    width: stack.width
+                    height: queuedCard.height
+                    Text { id: queuedProbe; visible: false; text: modelData.text; font: queuedText.font }
+                    Rectangle {
+                        id: queuedCard
+                        readonly property real maxUser: Math.min(720, Math.max(280, stack.width * 0.62))
+                        x: parent.width - width
+                        width: Math.min(maxUser, Math.max(Math.ceil(queuedProbe.implicitWidth), queuedLine.width) + 40)
+                        height: queuedLine.y + queuedLine.height + 12
+                        radius: 12
+                        color: "transparent"
+                        border.width: 1; border.color: Theme.alpha(Theme.accent, 0.45)
+                        Text { id: queuedText; objectName: "queuedText"; x: 20; y: 12; width: queuedCard.width - 40
+                               text: modelData.text; textFormat: Text.PlainText; wrapMode: Text.Wrap
+                               color: Theme.textMuted; renderType: Theme.textRender
+                               font: feed.referenceLayout ? Theme.conversationUser : Theme.conversationCompact }
+                        Row {
+                            id: queuedLine
+                            x: 20; y: queuedText.y + queuedText.height + 8
+                            spacing: 14
+                            Text { objectName: "queuedLabel"; anchors.verticalCenter: parent.verticalCenter
+                                   text: modelData.total > 1 ? qsTr("Queued (%1)").arg(modelData.position) : qsTr("Queued")
+                                   color: Theme.accent; renderType: Theme.textRender; font: Theme.caption }
+                            MessageAction { objectName: "queuedRemove_" + index; label: qsTr("Remove from queue")
+                                            onActivated: bridge.unqueue(modelData.id) }
+                        }
+                    }
+                }
+            }
             Loader {
                 id: safetyLoader
                 width: stack.width

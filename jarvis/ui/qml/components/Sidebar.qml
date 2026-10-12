@@ -100,6 +100,7 @@ Rectangle {
         readonly property string status: !dotted || itemId === "" ? ""
                                          : bridge.needsYouIds.indexOf(itemId) >= 0 ? "needsYou"
                                          : bridge.runningIds.indexOf(itemId) >= 0 ? "running"
+                                         : bridge.queuedIds.indexOf(itemId) >= 0 ? "queued"     // DFQUEUE
                                          : bridge.finishedUnseenIds.indexOf(itemId) >= 0 ? "finished" : ""
         readonly property bool hovered: area.containsMouse || gripArea.containsMouse || menuArea.containsMouse
         signal activated()

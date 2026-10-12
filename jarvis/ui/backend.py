@@ -14,7 +14,7 @@ names a capability and never interprets destination grammar.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -309,10 +309,14 @@ class Backend:
         response_language: str = "", conversation: tuple = (), provider: str = "claude", model: str = "",
         effort: str = "", context_groups: tuple = (), context_attachments: tuple = (), response_mode: str = "together",
         on_reply_preview: Callable[[str], None] | None = None, conversation_id: str | None = None,
+        claude: tuple[str | None, str | None] | None = None,
     ) -> dict:
         request_id = request_id or str(uuid4())
 
         def run(settings: Settings) -> Any:
+            if claude is not None and provider == "claude":
+                # DFQUEUE: a queued message runs with the Claude model / effort chosen when it was queued.
+                settings = replace(settings, claude_model=claude[0], claude_effort=claude[1])
             app = self._app(settings)
             if provider == "codex":
                 # The person chose Codex: it interprets, the same code judges.

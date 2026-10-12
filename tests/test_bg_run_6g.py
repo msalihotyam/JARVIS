@@ -156,12 +156,15 @@ class BackgroundRunTests(UiTestCase):
         bridge._on_preview(bridge._request_id, "inceliyorum, dosyalar")     # arrives while B is open
         self.assertEqual("", bridge.streamText)
         self.assertEqual("", bridge.sessionId)
-        # T8: Send in B is refused, the draft stays and no second run is queued.
+        # T8 (DFQUEUE): Send in B starts no second run - it waits in the queue; taken back, the draft is back.
         sequence = bridge._sequence["task"]
         composer = root.findChild(QObject, "canonicalComposer")
         composer.setProperty("text", "B'de bir taslak")
         QMetaObject.invokeMethod(composer, "submit")
         self.assertFalse(bridge.submitText("B'de bir taslak"))
+        self.assertEqual(("", sequence, [b]), (composer.property("text"), bridge._sequence["task"], bridge.queuedIds))
+        self.assertTrue(bridge.unqueue(bridge.queuedHere[0]["id"]))
+        pump(50)
         self.assertEqual(("B'de bir taslak", sequence), (composer.property("text"), bridge._sequence["task"]))
         self.assertTrue(bridge.openRunningConversation())                  # the composer's link: back to A
         pump(50)

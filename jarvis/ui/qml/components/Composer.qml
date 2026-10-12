@@ -36,7 +36,9 @@ Item {
     // An archived project's conversation is read-only (V2.0 Gate 6A). Presentation
     // only: Core refuses the work anyway (ARCHITECTURE 4.22).
     property bool readOnly: bridge.conversationReadOnly
-    property bool blocked: bridge.busy || bridge.approvalPending || bridge.configRefused || readOnly
+    // DFQUEUE: while JARVIS works for another conversation a send joins the queue (bridge.queueText).
+    readonly property bool queueable: conversationBound && bridge.queueing
+    property bool blocked: (bridge.busy && !queueable) || bridge.approvalPending || bridge.configRefused || readOnly
     // Attached items travel WITH a message; the request itself is still the words
     // the person writes, so an empty draft sends nothing.
     property bool canSend: !blocked && input.text.trim() !== ""
@@ -52,7 +54,7 @@ Item {
     property string sendTip: ""                 // the send key's hover tip ("" = none)
     // The send: the open conversation's submit by default; a host may route the
     // draft elsewhere (true = accepted: the draft clears, then `submitted`).
-    property var sendHandler: function (text) { return bridge.submitText(text) }
+    property var sendHandler: function (text) { return composer.queueable ? bridge.queueText(text) : bridge.submitText(text) }
     signal submitted()
     // A press anywhere else releases the draft's focus (jarvis.ui.app); inside
     // the composer - the draft, its chips and actions - it stays.
@@ -469,8 +471,8 @@ Item {
             width: Math.max(0, Math.min(implicitWidth, rightChips.x - x - 8)); elide: Text.ElideRight
             text: qsTr("JARVIS is working…"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
         }
-        // R1: JARVIS works for ANOTHER conversation. Send stays off (one run at a time), the
-        // draft stays, and a mouse-first link opens the conversation it works for.
+        // R1: JARVIS works for ANOTHER conversation. One run at a time: a send here waits in
+        // the queue (DFQUEUE), and a mouse-first link opens the conversation it works for.
         Row {
             id: elsewhere
             objectName: "composerElsewhere"

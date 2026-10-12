@@ -101,6 +101,7 @@ from jarvis.ui.present import (
 from jarvis.settings import CLAUDE_EFFORT_VALUES
 
 FEED_LIMIT = 200
+QUEUE_LIMIT = 5         # DFQUEUE: messages that may wait for the one run at a time
 ACTIVITY_LIMIT = 50
 CORE_STATES = ("idle", "running", "awaiting_approval", "awaiting_input", "completed",
                "error", "unknown", "disabled")
@@ -161,6 +162,15 @@ def _waiting(slots: dict) -> bool:
     """The person is needed (Q2): an approval card (an incomplete one too), a clarification, or a
     task Core reports awaiting clarification (a bare run keeps that only in the task)."""
     return bool(slots["approval"] or slots["clarification"] or slots["task"].get("status") == "awaiting_clarification")
+
+
+def _draft_merged(base: dict | None, front: dict) -> dict[str, Any]:
+    """DFQUEUE: ``front`` (a queued message or a parked draft) put before the draft ``base``."""
+    base = base or {"text": "", "groups": [], "attachments": [], "mode": DEFAULT_RESPONSE_MODE}
+    text = "\n\n".join(part for part in (front["text"], base["text"]) if part.strip())
+    return {"text": text, "groups": [dict(g) for g in (*front["groups"], *base["groups"])],
+            "attachments": [dict(a) for a in (*front["attachments"], *base["attachments"])],
+            "mode": front["mode"] if front["groups"] else base["mode"], "at": int(time.time())}
 
 
 def _parks(slots: dict) -> bool:
@@ -358,6 +368,8 @@ class Bridge(QObject):
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
         # -- state --
         self._busy = False
+        # DFQUEUE: messages sent while JARVIS works elsewhere, oldest first (bridge memory only).
+        self._queue: list[dict[str, Any]] = []
         # Gate 6G R1: the run record of the conversation-bound "task" run in flight (bridge memory only,
         # never persisted): origin conversation, request / session / task identity, the attachment
         # snapshots its request references and its latest preview. None for any other run (a sweep).
@@ -498,6 +510,12 @@ class Bridge(QObject):
         # R2: every change of the live slots or of the run says so through one of these.
         for signal in (self.approvalChanged, self.stateChanged):
             signal.connect(self._needs_you_check)
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setSingleShot(True)
+        self._queue_timer.setInterval(0)
+        self._queue_timer.timeout.connect(self._drain_queue)
+        self.stateChanged.connect(self.queueChanged)
+        self.queueChanged.connect(self.attentionChanged)
         # DFDRAFT: every conversation's own unsent draft - the open one's live
         # (its text as the composer reports it, its context above), the others
         # parked here by key; written to the preferences' drafts file shortly
@@ -582,6 +600,8 @@ class Bridge(QObject):
             self._run_preview = ""
         if kind == "task" and not self._busy:
             self._recheck_open()
+        if kind == "task" and self._queue and not self._busy:
+            self._queue_timer.start()       # DFQUEUE: any outcome lets the oldest queued message start
         if kind == "task" and self._freeze_waiting and not self._busy:
             # The operation that was running when Freeze arrived has returned
             # (at its next safe point, or finished): now JARVIS is frozen.
@@ -603,8 +623,9 @@ class Bridge(QObject):
                 Path(path).unlink(missing_ok=True)
 
     def _draft_snapshots(self) -> frozenset[str]:
-        """The snapshot files the open screen's draft and every parked draft (DFDRAFT) reference."""
-        drafts = [{"groups": self._groups, "attachments": self._attachments}, *self._drafts.values()]
+        """The snapshot files the open screen's draft, every parked draft (DFDRAFT) and every
+        queued message (DFQUEUE) reference."""
+        drafts = [{"groups": self._groups, "attachments": self._attachments}, *self._drafts.values(), *self._queue]
         items = [item for d in drafts for item in (*d["attachments"], *(a for g in d["groups"] for a in g["attachments"]))]
         return frozenset(item["path"] for item in items if type(item.get("path")) is str)
 
@@ -788,7 +809,7 @@ class Bridge(QObject):
         try:
             project = store.load_project(project_id) if project_id is not None else None
             if project_id is None or (project is not None and project.active):
-                blank = set(store.blank_conversation_ids())
+                blank = set(store.blank_conversation_ids()) - self._queued_ids()     # DFQUEUE: a queued one exists
                 blank.discard(self._run_record["origin"] if self._run_record is not None else None)
                 if any(entry.get("kind") == "user" for entry in self._feed):
                     blank.discard(self._conversation_store.id)
@@ -856,7 +877,8 @@ class Bridge(QObject):
             everything = store.list_conversations(include_archived=True) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
             everything, listed = [], False
-        blank = self._blank_ids(store)          # DFNEW: a New chat is listed nowhere until its first message
+        # DFNEW: a New chat is listed nowhere until its first message (DFQUEUE: or a queued one).
+        blank = self._blank_ids(store) - self._queued_ids()
         everything = [r for r in everything if r.id not in blank]
         records = [r for r in everything if r.project_id is None]
         self._conversation_list = [
@@ -1324,7 +1346,7 @@ class Bridge(QObject):
                        if store is not None else [])
         except Exception:  # noqa: BLE001 - storage boundary
             records = []
-        blank = self._blank_ids(store)
+        blank = self._blank_ids(store) - self._queued_ids()     # DFQUEUE: a queued one is listed
         rows_of = [
             {"id": r.id, "updated_at": r.updated_at, "archived_at": r.archived_at,
              "title": r.title or ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"), ())}
@@ -1816,7 +1838,8 @@ class Bridge(QObject):
         once a message was sent (the owner is fixed) and for an unknown or
         archived project."""
         project_id = str(project_id)
-        if not self._conversation_store.id or self._conversation_store.state.turns or self._conversation_archived:
+        if (not self._conversation_store.id or self._conversation_store.state.turns or self._conversation_archived
+                or self._conversation_store.id in self._queued_ids()):      # DFQUEUE: a queued message fixes it too
             return False
         if (self._conversation_owner.get("id") or "") == project_id:
             return True
@@ -2320,6 +2343,9 @@ class Bridge(QObject):
         self._lifecycle_done(conversation_id, payload, True)
         if self._drafts.pop(conversation_id, None) is not None:     # DFDRAFT: its draft goes with it
             self._save_drafts()
+        if any(entry["cid"] == conversation_id for entry in self._queue):     # DFQUEUE: and its queued messages
+            self._queue = [entry for entry in self._queue if entry["cid"] != conversation_id]
+            self.queueChanged.emit()
         self._set_sessions({"sessions": self._sessions})
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation deleted permanently"), ()), "system")
         return True
@@ -2514,6 +2540,8 @@ class Bridge(QObject):
         if ids != self._needs_you_seen:
             self._needs_you_seen = ids
             self.sidebarChanged.emit()
+        if self._queue and not self._busy:
+            self._queue_timer.start()       # DFQUEUE: an approval answered (or gone) may let the queue go on
 
     @Property("QVariantList", notify=sidebarChanged)
     def needsYouIds(self) -> list:
@@ -3167,25 +3195,37 @@ class Bridge(QObject):
             task_id = self._task["task_id"]
             self._run("task", lambda: self.backend.clarify(session_id, task_id, text), self._delivered(self._apply_run))
             return True
-        self._task = {}
+        self._start_text(text, session_id, request_id, conversation, groups, attachments, mode, self._provider_route())
+        return True
+
+    def _start_text(self, text: str, session_id: str | None, request_id: str, conversation: Any, groups: tuple,
+                    attachments: tuple, mode: str, route: dict, origin: PersistedConversation | None = None,
+                    claude: tuple | None = None) -> None:
+        """Start one new text request: the open conversation's - or (DFQUEUE) a queued
+        message's whose conversation ``origin`` is not open, its screen left untouched."""
+        if origin is None:
+            self._task = {}
+            if self._clarification or self._decision:   # DFQUEUE: a queued start leaves no old card above it
+                self._clarification, self._decision = {}, {}
+                self.approvalChanged.emit()
+            self._end_stream()
         language = self.language           # the default reply language for General Chat
-        route = self._provider_route()
-        owner = self._conversation_store.id or ""     # its owner scopes the request ("" = unsaved Global)
-        self._end_stream()
+        owner = (origin or self._conversation_store).id or ""     # its owner scopes the request ("" = unsaved Global)
         relay = self._preview_relay(request_id)
         # The files this request references: its run record keeps them until the run has finished (R1).
         snapshots = frozenset(item["path"] for item in (*attachments, *(a for g in groups for a in g["attachments"]))
                               if type(item.get("path")) is str)
+        extra = {} if claude is None else {"claude": claude}
         self._run(
             "task",
             lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
                                              conversation=conversation, context_groups=groups,
                                              context_attachments=attachments, response_mode=mode,
-                                             on_reply_preview=relay, conversation_id=owner, **route),
+                                             on_reply_preview=relay, conversation_id=owner, **route, **extra),
             self._delivered(lambda payload: self._apply_text(payload, text), snapshots,
-                            project=lambda prior, payload: _project_text(prior, payload, text)),
+                            project=lambda prior, payload: _project_text(prior, payload, text), origin=origin,
+                            identity=None if origin is None else (session_id or "", "")),
         )
-        return True
 
     @Slot(str)
     def chooseOption(self, label: str) -> None:
@@ -4420,9 +4460,10 @@ class Bridge(QObject):
             self._draft_text = text
             self._draft_timer.start()
 
-    @staticmethod
-    def _draft_key_of(conversation: PersistedConversation) -> str:
-        return conversation.id if conversation.id and conversation.state.turns else NEW_CHAT_DRAFT
+    def _draft_key_of(self, conversation: PersistedConversation) -> str:
+        """Its id once it has a turn or a queued message (DFQUEUE), else the New chat key."""
+        exists = conversation.state.turns or conversation.id in self._queued_ids()
+        return conversation.id if conversation.id and exists else NEW_CHAT_DRAFT
 
     def _live_draft(self) -> dict[str, Any] | None:
         if not (self._draft_text or self._groups or self._attachments):
@@ -4442,6 +4483,7 @@ class Bridge(QObject):
         self._draft_key = self._draft_key_of(opened)
         self._restore_draft()
         self._save_drafts()
+        self.queueChanged.emit()            # DFQUEUE: the opened one's queued messages
 
     def _restore_draft(self) -> None:
         draft = (None if self._draft_held else self._drafts.pop(self._draft_key, None)) or {}
@@ -4529,6 +4571,166 @@ class Bridge(QObject):
         return {"text": stored["text"], "groups": groups, "attachments": files(stored["attachments"]),
                 "mode": stored["mode"] if stored["mode"] in RESPONSE_MODES else DEFAULT_RESPONSE_MODE, "at": stored["at"]}
 
+    # -- DFQUEUE (Salih 2026-10-12 "Siraya alsin"): a message sent while JARVIS works elsewhere waits --
+    #
+    # One run at a time stays the rule: submitText never starts a second one. A send
+    # from any conversation but the running one (the New chat screen too) while a run
+    # is active - or while older messages still wait - joins the queue instead: shown
+    # in its conversation as "Queued", its draft spent, the New chat screen's
+    # conversation listed from then on. When nothing runs and no approval waits
+    # anywhere, the oldest starts exactly as if sent then, with the provider, model
+    # and effort chosen when it was queued. Taken back, Freeze or quit: it returns
+    # to its conversation's draft and nothing starts. Bridge memory only.
+
+    queueChanged = Signal()
+
+    @Property(bool, notify=queueChanged)
+    def queueing(self) -> bool:
+        """A send from the open conversation's composer joins the queue now."""
+        return (self._busy or bool(self._queue)) and not self.openRunning and not self.navigationLocked
+
+    @Property("QVariantList", notify=queueChanged)
+    def queuedHere(self) -> list:
+        """The open conversation's queued messages: their place in the one queue, oldest first."""
+        cid = self._conversation_store.id
+        return [{"id": entry["id"], "text": redact_text(entry["text"]), "position": index + 1, "total": len(self._queue)}
+                for index, entry in enumerate(self._queue) if cid and entry["cid"] == cid]
+
+    @Property("QVariantList", notify=queueChanged)
+    def queuedIds(self) -> list:
+        """The conversations that hold a queued message (the sidebar's marker)."""
+        return sorted(self._queued_ids())
+
+    def _queued_ids(self) -> set[str]:
+        return {entry["cid"] for entry in self._queue}
+
+    def _approval_waiting(self) -> bool:
+        """An approval waits somewhere: its run still counts as active, so the queue waits."""
+        return any(slots["ticket"] is not None or bool(slots["approval"])
+                   for slots in (self._live_slots(), *self._parked.values()))
+
+    @Slot(str, result=bool)
+    def queueText(self, text: str) -> bool:
+        """Queue one message from the open conversation. True when queued (the composer
+        clears); False when refused - said in the conversation - and the draft stays."""
+        text = str(text)
+        cid = self._conversation_store.id
+        if not text.strip() or not self.queueing or self._ticket is not None or self.conversationReadOnly or not cid:
+            return False
+        if not self.executionEnabled or self._execution_request:
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen, so the message was not queued; it stays in the draft."))
+            return False
+        if _waiting(self._live_slots()):
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "This conversation is waiting for your answer, so the message was not "
+                                                             "queued; send it when JARVIS is free. It stays in the draft."))
+            return False
+        if len(self._queue) >= QUEUE_LIMIT:
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "The queue is full (%1 messages), so this message was not queued; "
+                                                             "it stays in the draft."), QUEUE_LIMIT)
+            return False
+        groups, attachments, mode = self._take_context()
+        claude = (self._config.get("claude_model") or None, self._config.get("claude_effort") or None)
+        self._queue.append({"id": self._new_id("q-"), "cid": cid, "text": text, "groups": groups,
+                            "attachments": attachments, "mode": mode, "route": self._provider_route(), "claude": claude})
+        self.clearContext()
+        self._draft_sent(text)              # the New chat screen's conversation exists from now on
+        self._refresh_conversations()
+        self.queueChanged.emit()
+        self.inputAccepted.emit()
+        return True
+
+    @Slot(str, result=bool)
+    def unqueue(self, entry_id: str) -> bool:
+        """Take one queued message back: it returns to its conversation's draft; nothing runs."""
+        entry = next((e for e in self._queue if e["id"] == str(entry_id)), None)
+        if entry is None:
+            return False
+        self._queue.remove(entry)
+        self._to_draft(entry)
+        self._refresh_conversations()
+        self.queueChanged.emit()
+        return True
+
+    def _return_queue(self) -> int:
+        """Every queued message back to its conversation's draft (Freeze, quit, frozen): none starts."""
+        returned, self._queue = self._queue, []
+        for entry in returned:
+            self._to_draft(entry)
+        if returned:
+            self._refresh_conversations()
+            self.queueChanged.emit()
+        return len(returned)
+
+    def _to_draft(self, entry: dict[str, Any]) -> None:
+        """``entry`` (already out of the queue) goes in front of its conversation's draft."""
+        store = self._conversation_db()
+        here = entry["cid"] == self._conversation_store.id
+        conversation = self._conversation_store if here else self._load_conversation(store, entry["cid"]) if store else None
+        key = self._draft_key_of(conversation) if conversation is not None else entry["cid"]
+        if here or key == self._draft_key:  # the open screen's own key (a New chat's): into the live draft
+            base = self._live_draft()
+            if key != self._draft_key:      # a New chat whose only message came back: the New chat screen again
+                parked, self._draft_key = self._drafts.pop(key, None), key
+                base = _draft_merged(base, parked) if parked else base
+            merged = _draft_merged(base, entry)
+            self._groups, self._attachments = merged["groups"], merged["attachments"]
+            self._draft_text, self._response_mode = merged["text"], merged["mode"]
+            self._attach_revision += 1
+            for signal in (self.groupsChanged, self.attachmentsChanged, self.modeChanged, self.draftRestored):
+                signal.emit()
+        else:
+            self._drafts[key] = _draft_merged(self._drafts.get(key), entry)
+        self._save_drafts()
+
+    def _drain_queue(self) -> None:
+        """Start the oldest queued message once nothing runs and no approval waits; frozen: none
+        ever starts, they all return to their drafts."""
+        if not self._queue or self._busy or self._quitting:
+            return
+        if not self.executionEnabled or self._execution_request:
+            if self._return_queue():
+                self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen: queued messages went back to their drafts"), ()), "system")
+            return
+        if self._approval_waiting():
+            return
+        while self._queue and not self._busy and not self._approval_waiting():
+            self._start_queued(self._queue.pop(0))
+        self._refresh_conversations()
+        self.queueChanged.emit()
+
+    def _start_queued(self, entry: dict[str, Any]) -> None:
+        store = self._conversation_db()
+        cid = entry["cid"]
+        here = cid == self._conversation_store.id
+        try:
+            deleted = store is not None and store.load_conversation(cid) is None
+        except Exception:  # noqa: BLE001 - unreadable is not deleted: it goes back to its draft below
+            deleted = False
+        if deleted:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A queued message for a conversation that was deleted was dropped."), ()), "system")
+            return
+        origin = None if here else self._load_conversation(store, cid)
+        slots = self._live_slots() if here else self._parked.get(cid) or _empty_slots()
+        try:
+            archived = store.load_conversation(cid).archived_at is not None
+        except Exception:  # noqa: BLE001 - unreadable: fail closed, it is not started
+            archived = True
+        if (not here and origin is None) or archived or _waiting(slots):
+            self._to_draft(entry)
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A queued message went back to its draft: its conversation is "
+                                                              "archived, unreadable or waiting for your answer."), ()), "system")
+            return
+        groups, attachments, text = entry["groups"], entry["attachments"], entry["text"]
+        conversation = (self._conversation_store if here else origin).state     # before this turn: what came earlier
+        self._say("user", text, owner=origin,
+                  groups=[{**g, "attachments": [self._shown(a) for a in g["attachments"]]} for g in groups],
+                  attachments=[self._shown(a) for a in attachments], refs=turn_refs(groups, attachments))
+        session_id = (self._session_id if here else slots["session_id"]) or None
+        request_id = str(uuid4())
+        self._request_id = request_id
+        self._start_text(text, session_id, request_id, conversation, groups, attachments, entry["mode"], entry["route"],
+                         origin=origin, claude=entry["claude"])
+
     # -- conversation actions ----------------------------------------------------
 
     @Slot(str)
@@ -4611,7 +4813,10 @@ class Bridge(QObject):
 
     @Slot()
     def freezeJarvis(self) -> None:
-        """The red control and the tray: close the execution gate now. No confirmation."""
+        """The red control and the tray: close the execution gate now. No confirmation.
+        DFQUEUE: every queued message goes back to its draft first; none runs later."""
+        if self._return_queue():
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Freeze: queued messages went back to their drafts"), ()), "system")
         self._set_gate(False)
 
     @Slot()
@@ -4735,16 +4940,19 @@ class Bridge(QObject):
 
     @Property(str, notify=attentionChanged)
     def quitWarning(self) -> str:
-        """Why quitting now needs a confirmation, from real state - or ""."""
+        """Why quitting now needs a confirmation, from real state - or "". DFQUEUE: queued
+        messages are named too."""
+        queued = (tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "%1 queued message(s) will go back to their drafts and will not start."),
+                     len(self._queue)) if self._queue else "")
         if self._busy:
-            return tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: "
+            return " ".join(part for part in (tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: "
                                                             "the operation may keep running until it returns, and anything already sent to its "
-                                                            "destination is not stopped or undone."))
+                                                            "destination is not stopped or undone.")), queued) if part)
         outcome = task_outcome(self._task)
         if outcome.get("kind") in ("unknown", "in_progress") or outcome.get("run_status") == "cancelling":
-            return tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS has work whose outcome is not established. Quitting does not resolve or stop it; "
-                                                            "it stays recorded in History, and anything already sent to its destination is not undone."))
-        return ""
+            return " ".join(part for part in (tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "JARVIS has work whose outcome is not established. Quitting does not resolve or stop it; "
+                                                            "it stays recorded in History, and anything already sent to its destination is not undone.")), queued) if part)
+        return queued
 
     @Slot()
     def requestQuit(self) -> None:
@@ -4757,6 +4965,7 @@ class Bridge(QObject):
     @Slot()
     def confirmQuit(self) -> None:
         """The orderly quit. The window accepts its close from here on."""
+        self._return_queue()                   # DFQUEUE: queued messages wait in their drafts; none starts on its own
         self._save_drafts()                    # DFDRAFT: before the discard below empties the open one
         self._quitting = True
         self._discard_snapshots()
@@ -5154,6 +5363,8 @@ class Bridge(QObject):
             self._shutting_down = True
         for timer in self.findChildren(QTimer):
             timer.stop()
+        if not self._quitting:
+            self._return_queue()               # DFQUEUE: a quit by another path keeps them too, as drafts
         self._save_drafts()                    # DFDRAFT: the last keystrokes too (no-op after confirmQuit's)
         # A turn whose write met a busy file is written now, not lost with the process.
         self._conversation_store.flush()

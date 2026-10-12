@@ -913,12 +913,44 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Önceki sohbet sürdürülüyor (%1 mesaj)</translation>
     </message>
     <message>
+        <source>JARVIS is frozen, so the message was not queued; it stays in the draft.</source>
+        <translation>JARVIS dondurulmuş olduğu için mesaj sıraya alınmadı; taslakta duruyor.</translation>
+    </message>
+    <message>
+        <source>This conversation is waiting for your answer, so the message was not queued; send it when JARVIS is free. It stays in the draft.</source>
+        <translation>Bu sohbet yanıtınızı beklediği için mesaj sıraya alınmadı; JARVIS boşaldığında gönderin. Mesaj taslakta duruyor.</translation>
+    </message>
+    <message>
+        <source>The queue is full (%1 messages), so this message was not queued; it stays in the draft.</source>
+        <translation>Sıra dolu (%1 mesaj), bu yüzden bu mesaj sıraya alınmadı; taslakta duruyor.</translation>
+    </message>
+    <message>
+        <source>JARVIS is frozen: queued messages went back to their drafts</source>
+        <translation>JARVIS donduruldu: sıradaki mesajlar taslaklarına döndü</translation>
+    </message>
+    <message>
+        <source>A queued message for a conversation that was deleted was dropped.</source>
+        <translation>Silinmiş bir sohbete ait sıradaki mesaj kaldırıldı.</translation>
+    </message>
+    <message>
+        <source>A queued message went back to its draft: its conversation is archived, unreadable or waiting for your answer.</source>
+        <translation>Sıradaki bir mesaj taslağına döndü: sohbeti arşivlenmiş, okunamıyor ya da yanıtınızı bekliyor.</translation>
+    </message>
+    <message>
+        <source>Freeze: queued messages went back to their drafts</source>
+        <translation>Dondurma: sıradaki mesajlar taslaklarına döndü</translation>
+    </message>
+    <message>
         <source>JARVIS resumed</source>
         <translation>JARVIS sürdürüldü</translation>
     </message>
     <message>
         <source>JARVIS resumed - the paused task could not be continued</source>
         <translation>JARVIS devam ettirildi - duraklatılan görev sürdürülemedi</translation>
+    </message>
+    <message>
+        <source>%1 queued message(s) will go back to their drafts and will not start.</source>
+        <translation>Sıradaki %1 mesaj taslaklarına dönecek ve başlamayacak.</translation>
     </message>
     <message>
         <source>JARVIS is running an operation right now. Quitting closes JARVIS without cancelling it: the operation may keep running until it returns, and anything already sent to its destination is not stopped or undone.</source>
@@ -1818,6 +1850,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Quote</source>
         <translation>Alıntıla</translation>
+    </message>
+    <message>
+        <source>Queued (%1)</source>
+        <translation>Sırada (%1)</translation>
+    </message>
+    <message>
+        <source>Queued</source>
+        <translation>Sırada</translation>
+    </message>
+    <message>
+        <source>Remove from queue</source>
+        <translation>Sıradan çıkar</translation>
     </message>
     <message>
         <source>Jump to latest message</source>
@@ -4291,6 +4335,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Waiting for you</source>
         <translation>Sizi bekliyor</translation>
+    </message>
+    <message>
+        <source>Queued</source>
+        <translation>Sırada</translation>
     </message>
     <message>
         <source>Finished</source>

@@ -25,7 +25,8 @@ Item {
     property Item conversationMenu: null
     property var attachDialog: null
     readonly property bool roomy: width >= 700
-    readonly property bool empty: bridge.feed.length === 0 && !bridge.safety.cards
+    // DFQUEUE: a queued message is not in the feed, yet the conversation is no longer empty.
+    readonly property bool empty: bridge.feed.length === 0 && !bridge.safety.cards && bridge.queuedHere.length === 0
     // Primary content glass: the shell lets the space through in its unused
     // areas; every message and structured block sits on its own darker
     // reading island (FeedView).
