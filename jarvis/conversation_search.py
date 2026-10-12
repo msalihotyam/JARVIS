@@ -25,7 +25,8 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-MIN_CHARS = 2
+TITLE_MIN_CHARS = 1     # DFSIDE (Salih 2026-10-12): one character already finds titles
+MIN_CHARS = 2           # ... and contents only from two (a one-letter content scan matches everything)
 RESULT_CAP = 50
 SNIPPET_CHARS = 80
 
@@ -54,9 +55,9 @@ def fold(text: str) -> str:
 
 
 def pattern(query: str) -> re.Pattern[str] | None:
-    """The query as a pattern over folded text; ``None`` below ``MIN_CHARS``."""
+    """The query as a pattern over folded text; ``None`` below ``TITLE_MIN_CHARS``."""
     query = normalized(query)
-    if len(query) < MIN_CHARS:
+    if len(query) < TITLE_MIN_CHARS:
         return None
     return re.compile("".join(_LETTERS.get(ch) or re.escape(ch) for ch in fold(query)))
 
@@ -107,7 +108,8 @@ def _content_hit(compiled: re.Pattern[str], state: Any, redact: Callable[[str], 
 
 def search(store: Any, query: str, *, redact: Callable[[str], str] = str) -> dict[str, Any]:
     """BAŞLIKLAR (title matches) then İÇERİKLER (content matches of the rest), newest
-    first, at most ``RESULT_CAP`` together; ``more`` when at least one more matched."""
+    first, at most ``RESULT_CAP`` together; ``more`` when at least one more matched.
+    Below ``MIN_CHARS`` only titles are matched (no conversation state is read)."""
     compiled = pattern(query)
     out: dict[str, Any] = {"titles": [], "contents": [], "more": False}
     if compiled is None or store is None:
@@ -129,6 +131,8 @@ def search(store: Any, query: str, *, redact: Callable[[str], str] = str) -> dic
                 return out
             out["titles"].append(row(record))
             titled.add(record.id)
+    if len(normalized(query)) < MIN_CHARS:
+        return out
     for record in records:
         if record.id in titled:
             continue

@@ -70,11 +70,14 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(query=query, text=text):
                 self.assertFalse(self.hits(query, text))
 
-    def test_at_least_two_characters(self) -> None:
-        for short in ("", " ", "a", "  ş  ", "İ"):
+    def test_at_least_one_character(self) -> None:
+        # DFSIDE: one character already makes a pattern (titles; contents from two, test_dfside).
+        for short in ("", " "):
             self.assertIsNone(cs.pattern(short), short)
+        for one in ("a", "  ş  ", "İ"):
+            self.assertIsNotNone(cs.pattern(one), one)
         self.assertIsNotNone(cs.pattern("ab"))
-        self.assertEqual({"titles": [], "contents": [], "more": False}, cs.search(object(), "a"))
+        self.assertEqual({"titles": [], "contents": [], "more": False}, cs.search(object(), " "))
 
     def test_the_hit_keeps_its_place_and_its_own_letters(self) -> None:
         text = cs.normalized("Yarın  İSTANBUL'da\nbuluşuyoruz")
@@ -214,11 +217,13 @@ class SidebarSearchTests(F6Case):
         field = self.item(root, "sidebarSearchField")
         self.assertTrue(field.property("activeFocus"))
         self.assertTrue(self.shown(root, "sidebarSearchClose"))
-        # One character: still the normal list.
+        # DFSIDE: one character already searches - the titles only.
         self.type(root, "s")
-        pump(400)
-        self.assertFalse(self.shown(root, "sidebarSearchResults"))
-        self.assertTrue(self.shown(root, "sidebarConversation"))
+        wait_until(lambda: bool(self.shown(root, "sidebarSearchTitleRow")), 2000)
+        self.assertTrue(self.shown(root, "sidebarSearchResults"))
+        self.assertFalse(self.shown(root, "sidebarConversation"))
+        self.assertEqual(["Sulama planı"], [r.property("name") for r in self.shown(root, "sidebarSearchTitleRow")])
+        self.assertEqual([], self.shown(root, "sidebarSearchContentRow"))
         # Two and more (debounced): the results take the list's place.
         self.type(root, "ula")
         wait_until(lambda: bool(self.shown(root, "sidebarSearchTitleRow")), 2000)

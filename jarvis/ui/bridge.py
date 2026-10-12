@@ -808,6 +808,7 @@ class Bridge(QObject):
             for r in records if r.archived_at is not None
         ]
         open_id = self._conversation_store.id if hasattr(self, "_conversation_store") else None
+        self._new_chat_open = bool(open_id) and open_id in blank
         readable = store is not None and bool(open_id)
         try:
             open_record = store.load_conversation(open_id) if readable else None
@@ -922,6 +923,12 @@ class Bridge(QObject):
     @Property(str, notify=conversationChanged)
     def conversationId(self) -> str:
         return self._conversation_store.id or ""
+
+    @Property(bool, notify=conversationChanged)
+    def newChatOpen(self) -> bool:
+        """DFSIDE: the open conversation is a New chat screen (blank, listed
+        nowhere) - the sidebar shows its New chat row as the current one. Read only."""
+        return getattr(self, "_new_chat_open", False)
 
     # -- Gate 6D-a: the top-bar conversation switcher and its rename ----------
     #

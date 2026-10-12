@@ -222,7 +222,8 @@ class TreeTests(SidebarV2Case):
         name = self.child(project, "sidebarProjectName")
         self.assertTrue(name.property("font").bold())                               # semibold (T4)
         self.assertAlmostEqual(name.x(), self.child(conversation, "sidebarProjectConversationTitle").x(), delta=0.5)
-        self.assertEqual([], [c for c in project.childItems() if c.objectName() == "sidebarRowLead" and c.isVisible()])
+        self.assertEqual(["project"], [c.property("name") for c in project.childItems()
+                                       if c.objectName() == "sidebarRowLead" and c.isVisible()])   # DFSIDE: the project icon
         self.assertEqual("", self.child(project, "sidebarProjectCount").property("text"))   # count only while collapsed
         self.assertRegex(self.child(conversation, "sidebarProjectConversationTime").property("text"), r"^\d\d:\d\d$")
         self.assertEqual("yesterday", self.child(self.row(root, "sidebarProjectConversation", "Tez 0"),

@@ -94,6 +94,9 @@ Rectangle {
         property bool dotted: false
         property bool gutter: dotted
         readonly property int inset: gutter ? 12 : 0
+        // DFSIDE: a gutter row without a dot (a project row) draws its lead in the
+        // dot's column, so the tree's names stay flush.
+        readonly property bool leadInGutter: gutter && !dotted && lead !== ""
         readonly property string status: !dotted || itemId === "" ? ""
                                          : bridge.needsYouIds.indexOf(itemId) >= 0 ? "needsYou"
                                          : bridge.runningIds.indexOf(itemId) >= 0 ? "running"
@@ -145,7 +148,7 @@ Rectangle {
         Text {
             id: nameText
             objectName: row.titleName
-            x: (row.pinned || row.lead !== "" ? 28 : 10) + row.inset
+            x: (row.pinned || row.lead !== "" && !row.leadInGutter ? 28 : 10) + row.inset
             anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, metaText.x - 8 - x,
                                         row.showMenu ? rowMenu.x - 8 - x : implicitWidth))
@@ -160,8 +163,8 @@ Rectangle {
                color: Theme.textMuted; font: Theme.captionFigures }
         // The lead glyph, or on a pinned row's hover the grip (two columns of three dots).
         Icon { objectName: "sidebarRowLead"; visible: row.lead !== "" && !(row.pinned && (row.hovered || row.dragging))
-               x: 8 + row.inset; anchors.verticalCenter: parent.verticalCenter; size: 14; name: row.lead
-               tint: row.current ? Theme.accent : row.lead === "folder" ? Theme.alpha(Theme.accent, 0.75) : Theme.textLabel }
+               x: row.leadInGutter ? 4 : 8 + row.inset; anchors.verticalCenter: parent.verticalCenter; size: 14; name: row.lead
+               tint: row.current ? Theme.accent : row.lead === "folder" || row.lead === "project" ? Theme.alpha(Theme.accent, 0.75) : Theme.textLabel }
         Grid {
             objectName: "sidebarPinGrip"
             visible: row.pinned && (row.hovered || row.dragging)
@@ -534,6 +537,9 @@ Rectangle {
                 visible: !searchBox.active
                 titleName: "sidebarNewChatName"
                 lead: "plus"; title: qsTr("New chat"); muted: true
+                // DFSIDE (Salih 2026-10-12): the New chat screen is open - this row is its current row
+                // (the blank conversation is listed nowhere, so no conversation row is current).
+                current: bridge.newChatOpen
                 // V4: in the current project (its page or its conversation) when active, else none.
                 onActivated: bridge.startNewChat()
             }
@@ -661,6 +667,7 @@ Rectangle {
                             title: isProject ? modelData.title : modelData.title || qsTr("New Chat")
                             muted: !isProject && !modelData.title
                             strong: isProject
+                            lead: isProject ? "project" : ""          // DFSIDE: a project is told apart at a glance
                             // T4: a project row shows its count only while collapsed; T1 its click
                             // toggles the tree (never busy-gated: nothing runs).
                             // A tree row has no day heading: today's time, else its day (K3).

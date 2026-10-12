@@ -5,7 +5,8 @@ import "../theme"
 // Gate 6G F8 (S1-S9): the sidebar's conversation search. On top of the
 // navigation a field-like "Sohbetlerde ara" button; one click turns it into
 // the field, its X closes it and the normal list returns (Esc / Return are
-// extras only). From two characters on, after a short pause in typing, the
+// extras only). From the first character on (DFSIDE: one character matches
+// titles only, contents from two), after a short pause in typing, the
 // bridge scans the stored conversations off the window's thread
 // (jarvis.conversation_search) and the results take the navigation's place:
 // BAŞLIKLAR (name matches), then İÇERİKLER (text matches with a snippet, the
@@ -22,7 +23,7 @@ Item {
     property real room: 0
     property bool open: false
     readonly property string query: open ? field.text.trim().replace(/\s+/g, " ") : ""
-    readonly property bool active: query.length >= 2
+    readonly property bool active: query !== ""
     property bool searching: false
     property var result: null
     readonly property int entryH: big ? 38 : 32
@@ -34,8 +35,9 @@ Item {
     function run() { debounce.stop(); searching = true; bridge.searchConversations(query) }
 
     // A new query drops the old answer (no stale rows under new words); the scan
-    // starts once typing pauses.
-    onQueryChanged: { result = null; searching = false; if (active) debounce.restart(); else debounce.stop() }
+    // starts once typing pauses. DFSIDE: it reads `query`, not `active` - that binding may
+    // not have re-evaluated yet when this handler runs (the first character was lost).
+    onQueryChanged: { result = null; searching = false; if (query !== "") debounce.restart(); else debounce.stop() }
     Timer { id: debounce; interval: 250; onTriggered: search.run() }
     Connections {
         target: bridge
