@@ -57,7 +57,7 @@ from jarvis.conversation import (REPLY_MAX_CHARS, CorruptConversation, Persisted
                                  split_cut, task_title, turn_refs)
 from jarvis.model_catalog import ProviderCatalog, default_catalog_path
 from jarvis.model_retirement import adopt_claude_lane, claude_lane, claude_migration, codex_migration, newest_per_name
-from jarvis.ui.backend import ATTACHMENT_SUPPORT, HISTORY_LIMIT, ApprovalTicket, Backend, approval_ticket, redact_text
+from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, approval_ticket, redact_text
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
 from jarvis.ui.telemetry import Sampler
