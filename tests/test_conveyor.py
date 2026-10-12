@@ -1076,6 +1076,23 @@ class TestPager(Base):
         self.assertEqual(len(self.pushes), 1)
         self.assertIn("3", self.pushes[0])
 
+    def test_failing_page_flush_is_logged_once_per_error_and_the_loop_goes_on(self):
+        (self.base / "PAUSE").write_text("")
+        calls = []
+
+        def broken_flush():  # also called inside a pass: the same error until the 3rd call
+            calls.append(1)
+            raise OSError("pager.json locked") if len(calls) <= 3 else ValueError("bad json")
+
+        with mock.patch.object(self.c, "flush_pages", side_effect=broken_flush), \
+                mock.patch.object(self.c, "pass_once", wraps=self.c.pass_once) as passes, \
+                mock.patch.object(self.c, "own_lock", side_effect=[True, True, True, False]), \
+                mock.patch.object(conveyor.time, "sleep"):
+            self.assertEqual(self.c.loop(), 0)
+        self.assertEqual(passes.call_count, 4)
+        logged = [e["error"] for e in self.events() if e["event"] == "flush_error"]
+        self.assertEqual(logged, ["OSError('pager.json locked')", "ValueError('bad json')"])
+
     def test_success_resets_crash_count(self):
         (self.base / "PAUSE").write_text("")
         self.fake.fail_agents = True

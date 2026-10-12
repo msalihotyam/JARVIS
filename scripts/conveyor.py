@@ -2415,6 +2415,7 @@ class Conveyor:
         if not self.acquire_lock():
             return 0  # another instance is alive
         last_usage = 0.0
+        flush_errors = set()  # note_pass/flush_pages errors already logged
         while True:
             ok = False
             try:
@@ -2432,8 +2433,14 @@ class Conveyor:
             try:
                 self.note_pass(ok)
                 self.flush_pages()
-            except Exception:
-                pass
+            except Exception as e:  # never stops the pass; one event per distinct error
+                if repr(e) not in flush_errors:
+                    flush_errors.add(repr(e))
+                    try:
+                        fn, at = where_raised(e)
+                        self.event("flush_error", error=repr(e), file=fn and str(fn), at=at)
+                    except Exception:
+                        pass  # the event log itself is unwritable: nowhere left to record it
             if once:  # release: a zero heartbeat is stale at once
                 self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": 0}))
                 return 0
