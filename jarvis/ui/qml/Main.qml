@@ -58,7 +58,9 @@ Window {
     // Window X hides JARVIS to the system tray: the process, the session and
     // any work keep running (unless JARVIS is frozen separately). Only Quit
     // JARVIS in the tray ends the application; without a tray, closing quits.
+    // DFWIN2: the power down plays first (WindowPowerFx), then this close runs again.
     onClosing: function(close) {
+        if (powerFx.holdClose()) { close.accepted = false; return }
         if (bridge.quitting || !bridge.trayAvailable) return
         close.accepted = false
         root.closeContexts()
@@ -199,7 +201,7 @@ Window {
         // From the tray: the same confirmations the window uses.
         function onResumeConfirmRequested() { root.closeContexts(); resumeConfirm.open = true }
         function onQuitConfirmRequested() {
-            confirm.ask(qsTr("Quit JARVIS?"), bridge.quitWarning, qsTr("Quit JARVIS"), false, function() { bridge.confirmQuit() }, qsTr("Cancel"))
+            confirm.ask(qsTr("Quit JARVIS?"), bridge.quitWarning, qsTr("Quit JARVIS"), false, function() { powerFx.powerOff("quit") }, qsTr("Cancel"))
         }
     }
 
@@ -650,6 +652,7 @@ Window {
         host: root
         coreX: topBar.coreCx; coreY: topBar.coreCy; coreSize: topBar.coreDiameter
         onMinimizeNow: bridge.minimizeWindow(root)
+        onQuitNow: bridge.confirmQuit()
     }
     Shortcut { id: pageHistory; sequence: "Ctrl+5"; onActivated: bridge.setPage("history") }
     Shortcut { id: pageProjects; sequence: "Ctrl+6"; onActivated: bridge.setPage("projects") }

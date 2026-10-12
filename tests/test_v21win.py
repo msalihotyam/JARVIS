@@ -113,16 +113,21 @@ class WindowPowerFxTests(UiTestCase):
         bridge, root, fx, spy = self.window()
         bridge.setTrayAvailable(True)
         tray = TrayController(bridge, root)
-        for name, away, back in (("native minimize", lambda: bridge.minimizeWindow(root), lambda: self.restore(root)),
-                                 ("hide to tray", root.close, tray.open)):
+        # DFWIN2: the window's X (hide to tray) powers down first (one play), then hides.
+        for name, away, back, downs in (("native minimize", lambda: bridge.minimizeWindow(root), lambda: self.restore(root), 0),
+                                        ("hide to tray", root.close, tray.open, 1)):
             with self.subTest(way=name):
                 plays = fx.property("plays")
                 away()
-                pump(50)
-                self.assertFalse(fx.isVisible())                                  # a native minimize / hide: no power down
-                self.assertEqual(plays, fx.property("plays"))
+                if downs:
+                    self.assertTrue(wait_until(lambda: not root.isVisible(), 1000))
+                    self.assertEqual("down", fx.property("phase"))                # held while hidden
+                else:
+                    pump(50)
+                    self.assertFalse(fx.isVisible())                              # a native minimize: no power down
+                self.assertEqual(plays + downs, fx.property("plays"))
                 back()
-                self.assertEqual(("up", plays + 1), (fx.property("phase"), fx.property("plays")))
+                self.assertEqual(("up", plays + downs + 1), (fx.property("phase"), fx.property("plays")))
                 self.assertTrue(fx.isVisible())
                 self.assertLess(fx.property("contentOpacity"), 1.0)
                 self.assertFalse(fx.isEnabled())

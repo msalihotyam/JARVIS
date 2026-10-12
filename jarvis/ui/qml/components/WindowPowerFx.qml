@@ -5,7 +5,9 @@ import "../theme"
 
 // V2.1 (Salih 2026-10-11), v2 (DFWIN, Salih 2026-10-12: "richer and slower"): the
 // window powers down INTO the core on OUR minimize and powers up FROM it on every
-// return (taskbar, tray Open, Alt+Tab).
+// return (taskbar, tray Open, Alt+Tab). DFWIN2 (Salih 2026-10-12): the same power down
+// on the window's close (X, Alt+F4: then the hide to the tray, or the quit without a
+// tray, exactly as before - Main.qml onClosing asks holdClose) and on a confirmed quit.
 // Power down, 520 ms: a rim light runs once round the window edge while the content
 // brightens a touch; a frozen snapshot of the window (never the live UI, which is
 // never re-laid out) collapses like a CRT onto the core's centre line into a bright
@@ -19,8 +21,8 @@ import "../theme"
 // A native minimize (Win+D, the taskbar button) cannot be pre-animated: only its
 // return plays. Ambient effects off: no frame at all - minimize at once, content at
 // once. Never interactive; a safety Timer (the effect + 60 ms) ends every run even
-// when the timeline stalls (the window not drawn), so the minimize always happens
-// and the content always ends at full opacity.
+// when the timeline stalls (the window not drawn), so the minimize, hide or quit always
+// happens and the content always ends at full opacity.
 Item {
     id: fx
     enabled: false
@@ -31,11 +33,16 @@ Item {
     property real coreY: height / 2
     property real coreSize: 200
     signal minimizeNow()
+    signal quitNow()
 
-    // "" at rest, "down" (power down; held while minimized), "up" (power up).
+    // "" at rest, "down" (power down; held while minimized, hidden or quitting), "up" (power up).
     property string phase: ""
     property real t: 0                      // the timeline, 0..1 over the span
-    property bool pending: false            // our minimize is on its way
+    property bool pending: false            // our minimize / close / quit is on its way
+    // DFWIN2: what the power down ends in - "minimize", "close" (the window's own close, run
+    // again: hide to the tray, or the quit without a tray) or "quit" (a confirmed quit).
+    property string finish: ""
+    property bool closeReleased: false      // that close runs once, past holdClose
     property bool away: false               // minimized or hidden
     property int plays: 0                   // observable from the outside (tests): runs started
     property bool snapshotHeld: false       // a power down's frozen window, released as the band vanishes
@@ -95,11 +102,31 @@ Item {
         return out
     }
 
-    function powerDown() {
-        if (pending) return                                     // a second click adds nothing
-        if (!Theme.ambient) { minimizeNow(); return }
-        pending = true
+    function powerDown() { powerOff("minimize") }
+    function powerOff(what) {
+        var rank = ["minimize", "close", "quit"]
+        if (pending) {                                          // a second click / close adds nothing;
+            if (rank.indexOf(what) > rank.indexOf(finish)) finish = what   // a close outranks a minimize, a quit both
+            return
+        }
+        if (!Theme.ambient) { finish = what; end(); return }
+        pending = true; finish = what
         begin("down")
+    }
+    // Main.qml's onClosing asks first: true holds that close for the power down, which then
+    // closes again, released. Ambient off, or nothing on screen: the close goes on at once.
+    function holdClose() {
+        if (closeReleased) { closeReleased = false; return false }
+        if (!Theme.ambient || !host || host.visibility === Window.Minimized || host.visibility === Window.Hidden) return false
+        powerOff("close")
+        return true
+    }
+    function end() {
+        var what = finish
+        finish = ""
+        if (what === "close") { closeReleased = true; host.close() }
+        else if (what === "quit") quitNow()
+        else minimizeNow()
     }
     function powerUp() {
         if (!Theme.ambient) { stopRun(); phase = ""; return }
@@ -121,9 +148,10 @@ Item {
         if (phase !== "down") { phase = ""; return }
         if (!pending) return
         pending = false
-        minimizeNow()
-        if (!away) phase = ""                                   // the window stayed up: never a dim window
-    }
+        var quitting = finish === "quit"
+        end()
+        if (!away && !quitting) phase = ""                      // the window stayed up: never a dim window
+    }                                                           // (a quit stays dark to the end: no flash back)
 
     Connections {
         target: fx.host
@@ -131,8 +159,11 @@ Item {
             var v = fx.host.visibility
             if (v === Window.Minimized || v === Window.Hidden) {
                 fx.away = true
-                // Gone natively (or hidden) mid-run: never minimize again later.
-                if (fx.pending) { fx.pending = false; fx.stopRun() }
+                // Gone natively (or hidden) mid-run: never minimize again later; a close or quit is never lost.
+                if (fx.pending) {
+                    fx.pending = false; fx.stopRun()
+                    if (fx.finish === "minimize") fx.finish = ""; else fx.end()
+                }
             } else if (fx.away) {
                 fx.away = false
                 fx.powerUp()
