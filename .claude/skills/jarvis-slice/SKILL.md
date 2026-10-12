@@ -14,7 +14,9 @@ overrides it. Where the two disagree, the runbook wins.
 
 - Bootstrap per the runbook ("Session bootstrap"): runbook,
   `JARVIS_ACTIVE_STATE.md`, the active roadmap section, then the freshness
-  check. Contradiction: stop and report.
+  check. Contradiction: stop and report. Conveyor lanes (prompt starts with
+  `@jarvis lane=`) bootstrap from `build/conveyor/notes/LANE_BRIEF.md` in the
+  main checkout instead (CLAUDE.md "Başlarken"; quota, Salih 2026-10-12).
 - Establish the facts live (`jarvis-lifecycle` section 1): toplevel, worktree
   list, branch, HEAD, `git status --short`. Never from the prompt. A code
   slice runs inside its native worktree (`EnterWorktree name=<slice-id>`);
@@ -35,10 +37,12 @@ overrides it. Where the two disagree, the runbook wins.
 1. Implement with only the smallest related tests.
 2. Freeze, then run the TEST BUDGET tier for the change ONCE (targeted, then
    the tier's required run; rule D for the listed load-sensitive tests).
-3. T0 / T1: screenshots for visible changes (`scripts/ui_visual.py`), then ONE
-   independent review subagent with fresh context. Give it the diff and the
-   acceptance criteria only; it returns PASS or findings. Fix real findings
-   (re-run only what they affect), then commit without waiting.
+3. T0 / T1: screenshots for visible changes (`scripts/ui_visual.py`, one
+   contact sheet). Core / contracts / store / authority / security code at any
+   tier: then ONE independent review subagent with fresh context. Give it the
+   diff and the acceptance criteria only; it returns PASS or findings. Fix real
+   findings (re-run only what they affect), then commit without waiting.
+   Window-layer T0 / T1: no review subagent (quota, Salih 2026-10-12).
 4. T2: the full flow of "Standard gate order & exits"; no self-verified
    shortcut.
 5. `git diff --check`. GREEN MEANS STOP.

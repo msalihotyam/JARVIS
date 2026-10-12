@@ -14,6 +14,11 @@ adımlarını uygula: runbook + `JARVIS_ACTIVE_STATE.md` + aktif roadmap
 bölümü, ardından durum dosyasının son commit'inden bu yana git ile tazelik
 kontrolü.
 
+Konveyor lane'leri (istemin ilk satırı `@jarvis lane=` ile başlar) bunun
+yerine ana checkout'taki `build/conveyor/notes/LANE_BRIEF.md` ve `LANE_RULES.md`
+dosyalarını ve kendi istemini okur; runbook, durum ve roadmap'i bütün okumaz,
+gerekeni başlıkla grep'leyip bölüm bölüm okur. Neden: kota (Salih, 2026-10-12).
+
 Dilim (slice) başlatırken `jarvis-slice`, kuyruk çalıştırırken `jarvis-queue`
 skill'ini kullan (`.claude/skills/`). İstem biçimi: runbook → "Prompt template
 (lanes)".
