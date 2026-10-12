@@ -11,7 +11,8 @@ C  While the New chat screen is open (DFNEW's blank conversation) the sidebar's
    conversation moves it there; deleting the open chat brings it back.
 
 Temp stores only: no test opens the live DB or makes a live model, auth or
-network call. With JARVIS_SHOTS_DIR set, the sidebar stills are saved there.
+network call. With JARVIS_SHOTS_DIR set, the sidebar stills are saved there
+(otherwise to a temp folder, so the still test never skips).
 """
 
 from __future__ import annotations
@@ -178,8 +179,10 @@ class NewChatSelectedTests(DfSideCase):
 class StillTests(DfSideCase):
     def test_s_sidebar_stills_in_space_and_dark(self) -> None:
         folder = os.environ.get("JARVIS_SHOTS_DIR")
-        if not folder:
-            self.skipTest("JARVIS_SHOTS_DIR not set")
+        if not folder:                                                       # still runs: the stills go to a temp folder
+            temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+            self.addCleanup(temp.cleanup)
+            folder = temp.name
         store = self.data()
         say(store, self.tezc[1].id, "bir")
         bridge, root = self.open_window()
