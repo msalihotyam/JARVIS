@@ -175,11 +175,11 @@ class CountTests(SidebarDataCase):
         # create: a project's own new conversation, then Global's (no project moves)
         self.assertTrue(bridge.newProjectConversation(self.one.id))
         pump(100)
-        self.assertEqual((2, 0), self.counts(bridge)["Tek"])
+        self.assertEqual((1, 0), self.counts(bridge)["Tek"])          # DFNEW: a new chat counts after its first message
         self.assertIn("projects", seen)
         self.assertTrue(bridge.newConversation())
         pump(100)
-        self.assertEqual({"Boş": (0, 0), "Tek": (2, 0), "Çok": (3, 2), "Eski": (1, 0)}, self.counts(bridge))
+        self.assertEqual({"Boş": (0, 0), "Tek": (1, 0), "Çok": (3, 2), "Eski": (1, 0)}, self.counts(bridge))
         # archive / unarchive a project conversation
         victim = self.live[0].id
         self.assertTrue(bridge.archiveConversation(victim))
@@ -986,7 +986,9 @@ class SidebarNavTests(SidebarNavCase):
         self.tap(root, plus)
         self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
         self.assertTrue(bridge.conversationProject["global"])
-        self.assertTrue(self.row(root, "sidebarConversation", "New Chat").property("current"))
+        # DFNEW: the New chat screen has no row until its first message.
+        self.assertEqual([], [r for r in self.shown(root, "sidebarConversation")
+                              if r.property("current") or r.property("title") == "New Chat"])
         # In an open, writable project's conversation: the new one starts in that project.
         self.tap(root, self.row(root, "sidebarProjectConversation", "Tek sohbet"), then=lambda: (
             self.assertEqual(self.one.id, bridge.conversationProject["id"]),
@@ -1000,7 +1002,7 @@ class SidebarNavTests(SidebarNavCase):
         ))
         self.tap(root, plus)
         self.assertEqual(1, len(store.list_conversations(project_id=self.old.id)))
-        self.assertEqual(count + 2, len(store.list_conversations(project_id=None)))
+        self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))      # DFNEW: Global's blank one, reused
         self.assertTrue(bridge.conversationProject["global"])
         # While busy: dimmed, the reason in its tip, and a click does nothing.
         bridge._busy = True
@@ -1012,7 +1014,7 @@ class SidebarNavTests(SidebarNavCase):
                 self.assertEqual("Wait for the current run to finish.", self.child(plus, "sidebarRowTip").property("text")),
             ))
             self.tap(root, plus)
-            self.assertEqual(count + 2, len(store.list_conversations(project_id=None)))
+            self.assertEqual(count + 1, len(store.list_conversations(project_id=None)))
         finally:
             bridge._busy = False
         self.assertEqual(0, self.execute_calls())

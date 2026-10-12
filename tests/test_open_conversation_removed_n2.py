@@ -135,7 +135,8 @@ class OpenConversationRemovedTests(F6Case):
         store.delete_conversation(open_id, confirm=open_id, expected_next_seq=preview["expected_next_seq"],
                                   expected_title=preview["title"])
         bridge.refreshProjects()
-        self.new_chat(root, bridge, store, [open_id, first, *(c.id for c in self.genel)])
+        # DFNEW: Global's blank one (``first``) is reused, never a second one.
+        self.assertEqual(first, self.new_chat(root, bridge, store, [open_id, *(c.id for c in self.genel)]))
         self.assertEqual(0, self.execute_calls())
 
     def test_n2_a_page_switch_or_history_refresh_rechecks_and_the_page_asked_for_wins(self) -> None:

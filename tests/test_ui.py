@@ -7321,7 +7321,7 @@ class ConversationEntryTests(SurfaceCase):
         root = self.window(bridge)
         rows = self.history(root)
         self.assertEqual("history", bridge.page)
-        self.assertEqual(2, len(rows))
+        self.assertEqual(1, len(rows))                       # DFNEW: the new, still empty one has no row
         title = next(r["title"] for r in bridge.conversations if r["id"] == first)
         target = [r for r in rows if r.childItems()[0].property("text").startswith(title)]
         self.assertEqual(1, len(target))
@@ -7329,23 +7329,25 @@ class ConversationEntryTests(SurfaceCase):
             self.assertEqual((first, "home"), (bridge.conversationId, bridge.page)),
             self.assertEqual(["A konuşması: Postgres kullan.", "A yanıtı."], [e["text"] for e in bridge.feed]),
         ))
-        # A new one from the page: distinct, open, empty.
+        # A new one from the page: open, empty - DFNEW: the still empty ``second``, reused, no row.
         self.history(root)
         self.click(root, "historyNewConversation")
         third = bridge.conversationId
-        self.assertNotIn(third, (first, second))
+        self.assertEqual(second, third)
         self.assertEqual("home", bridge.page)
         self.assertEqual([], bridge.feed)
-        self.assertEqual(3, len(bridge.conversations))
-        # The palette entry does the same.
+        self.assertEqual(1, len(bridge.conversations))
+        # The palette entry does the same (from ``first``, so the switch is seen).
+        bridge.openConversation(first)
+        settled(300, lambda: self.assertEqual(first, bridge.conversationId))
         QTest.keyClick(root, Qt.Key_K, Qt.ControlModifier)
         pump(100)
         root.activeFocusItem().setProperty("text", "New conversation")      # the palette's search field
         pump(50)
         QTest.keyClick(root, Qt.Key_Return)
         settled(300, lambda: (
-            self.assertNotIn(bridge.conversationId, (first, second, third)),
-            self.assertEqual(4, len(bridge.conversations)),
+            self.assertEqual(second, bridge.conversationId),
+            self.assertEqual(1, len(bridge.conversations)),
             self.assertEqual(0, self.execute_calls()),
         ))
 

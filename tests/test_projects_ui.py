@@ -159,7 +159,7 @@ class DetailTests(ProjectsUiCase):
     def test_c_detail_lists_its_own_conversations_and_creates_owned_ones(self) -> None:
         store = self.db()
         a, b = store.create_project("A"), store.create_project("B")
-        a1 = store.create_conversation(a.id)
+        a1 = store.create_conversation(a.id, title="A1")      # DFNEW: a blank one is listed nowhere (and reused)
         store.create_conversation(b.id)
         bridge = self.bridge()
         root = self.window(bridge)
@@ -174,7 +174,7 @@ class DetailTests(ProjectsUiCase):
         self.assertEqual(a.id, store.load_conversation(bridge.conversationId).project_id)
         bridge.showProject(a.id)
         settled(300, lambda: (
-            self.assertEqual(2, len(bridge.projectConversations)),
+            self.assertEqual(1, len(bridge.projectConversations)),     # DFNEW: the new one shows after its first message
             # No move control here: the only owner change is the Gate 6C
             # Global -> project attach, offered in the top-bar selector alone.
             self.assertEqual([], [n for n in ("projectMove", "conversationMove", "moveConversation")
@@ -206,7 +206,8 @@ class BadgeTests(ProjectsUiCase):
     def test_d_selector_names_the_owner_and_opens_its_menu(self) -> None:
         store = self.db()
         project = store.create_project("Evim")
-        owned = store.create_conversation(project.id)
+        owned = store.create_conversation(project.id, title="Ev")       # DFNEW: a blank one has no row
+        store.create_conversation(title="Düz")                           # the startup one, with a row
         bridge = self.bridge()
         root = self.window(bridge)
         owner = lambda: self.item(root, "chatHeaderScope").property("fullName")  # noqa: E731

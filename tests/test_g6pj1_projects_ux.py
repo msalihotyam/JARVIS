@@ -203,9 +203,9 @@ class GridTests(Case):
         self.evim, self.tez, self.arsiv = store.create_project("Evim"), store.create_project("Tez 2025"), store.create_project("Eski iş")
         self.stamp(self.evim.id, "2026-01-01T10:00:00+00:00")
         self.stamp(self.tez.id, "2026-03-01T10:00:00+00:00")
-        conversation = store.create_conversation(self.evim.id)
+        conversation = store.create_conversation(self.evim.id, title="Ev")   # DFNEW: a blank one is unlisted
         self.touch(conversation.id, "2026-05-01T10:00:00+00:00")                 # Evim's last activity is newer
-        self.archived_conversation = store.create_conversation(self.arsiv.id)    # created while the project was live
+        self.archived_conversation = store.create_conversation(self.arsiv.id, title="Eski")  # created while the project was live
         store.set_project_active(self.arsiv.id, False)
 
     def ready(self):

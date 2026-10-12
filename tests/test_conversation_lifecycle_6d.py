@@ -575,6 +575,7 @@ class TransitionTests(WindowCase):
         store.set_conversation_title(older, "Eski")
         project = store.create_project("Evim")
         first, second = store.create_conversation(project.id, title="Bir"), store.create_conversation(project.id)
+        say(store, second.id, "arşivlenecek")          # DFNEW: a turnless one is listed nowhere
         newer = store.create_conversation(title="Yeni")
         say(store, newer.id, "silinecek")
         # Archive of the open Global conversation: a new Global one, not the newest other one.
@@ -603,7 +604,7 @@ class TransitionTests(WindowCase):
         ))
         self.delete_open(root)
         self.gone(bridge, store, newer.id)
-        self.new_chat(bridge, store, (older, newer.id, fresh))
+        self.assertEqual(fresh, self.new_chat(bridge, store, (older, newer.id)))     # DFNEW: Global's blank one, reused
         self.assertEqual(0, self.execute_calls())
 
     def test_g_archived_project_falls_back_to_a_new_global_chat(self) -> None:
@@ -623,7 +624,8 @@ class TransitionTests(WindowCase):
         self.press(root, self.item(root, "conversationDeleteItem"))
         self.confirm_delete(root)
         self.gone(bridge, store, owned.id)
-        self.new_chat(bridge, store, (global_id, owned.id))                          # never in the archived project
+        # Never in the archived project; DFNEW: Global's blank one (the startup one) is reused.
+        self.assertEqual(global_id, self.new_chat(bridge, store, (owned.id,)))
 
     def test_g_no_global_conversation_opens_a_new_one(self) -> None:
         store = self.db()
@@ -680,8 +682,10 @@ class ArchivedSectionTests(WindowCase):
             self.assertTrue(self.item(root, "sidebarNewChat").property("available")),
         ))
         before = len(store.list_conversations(project_id=None))
+        # DFNEW: the New chat screen reuses Global's blank conversation (the startup one): nothing new is stored.
         self.press(root, self.item(root, "sidebarNewChat"), then=lambda: (
-            self.assertEqual(before + 1, len(store.list_conversations(project_id=None))),
+            self.assertEqual(before, len(store.list_conversations(project_id=None))),
+            self.assertEqual(kept, bridge.conversationId),
             self.assertIsNone(store.load_conversation(bridge.conversationId).project_id),
         ))
         self.assertTrue(bridge.openConversation(archived.id))

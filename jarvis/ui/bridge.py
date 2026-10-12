@@ -712,6 +712,39 @@ class Bridge(QObject):
             return None
         return PersistedConversation(store, conversation_id, state)
 
+    # DFNEW (Salih 2026-10-12): "Yeni sohbet" is a screen; a conversation shows only
+    # after its first message. A blank one (store.blank_conversation_ids) is listed
+    # nowhere, and every new chat reuses its owner's newest blank one, so they never
+    # pile up. Nothing is bound to a blank one: a session links only after a turn.
+
+    @staticmethod
+    def _blank_ids(store: Any) -> frozenset[str]:
+        try:
+            return store.blank_conversation_ids() if store is not None else frozenset()
+        except Exception:  # noqa: BLE001 - a listing filter only: unreadable hides nothing
+            return frozenset()
+
+    def _new_chat_conversation(self, store: Any, project_id: str | None) -> PersistedConversation:
+        """The owner's newest non-archived blank conversation, else a new one
+        through the store's creation path (which refuses an unknown or archived
+        owner, so none is reused for one either). Never the recorded run's
+        conversation, nor the open one once its screen shows a message (its
+        first turn may have failed to save). Raises what the store raises."""
+        try:
+            project = store.load_project(project_id) if project_id is not None else None
+            if project_id is None or (project is not None and project.active):
+                blank = set(store.blank_conversation_ids())
+                blank.discard(self._run_record["origin"] if self._run_record is not None else None)
+                if any(entry.get("kind") == "user" for entry in self._feed):
+                    blank.discard(self._conversation_store.id)
+                spare = next((r.id for r in store.list_conversations(project_id=project_id) if r.id in blank), None)
+                opened = self._load_conversation(store, spare) if spare is not None else None
+                if opened is not None:
+                    return opened
+        except Exception:  # noqa: BLE001 - storage boundary: a new one instead
+            pass
+        return PersistedConversation(store, store.create_conversation(project_id).id)
+
     def _restore_feed(self, state: Any) -> None:
         """The opened conversation's remembered turns, shown again - the same
         words that were shown, never re-remembered."""
@@ -732,18 +765,18 @@ class Bridge(QObject):
         self.feedChanged.emit()
 
     def _name_conversation(self, conversation: PersistedConversation, message: str) -> None:
-        """A conversation is named from its first message, once."""
+        """A conversation is named from its first message, once. DFNEW: named
+        or not, the lists are read again - the first message makes its row."""
         title = task_title(message)[:120]
-        if not title or conversation.store is None:
+        if conversation.store is None:
             return
         try:
             # Never over a name the person already gave (Gate 6D-a).
             record = conversation.store.load_conversation(conversation.id)
-            if record is None or record.title:
-                return
-            conversation.store.set_conversation_title(conversation.id, title)
+            if title and record is not None and not record.title:
+                conversation.store.set_conversation_title(conversation.id, title)
         except Exception:  # noqa: BLE001 - a label only; the conversation is unaffected
-            return
+            pass
         self._refresh_conversations()
 
     @staticmethod
@@ -761,6 +794,8 @@ class Bridge(QObject):
             everything = store.list_conversations(include_archived=True) if store is not None else []
         except Exception:  # noqa: BLE001 - storage boundary
             everything, listed = [], False
+        blank = self._blank_ids(store)          # DFNEW: a New chat is listed nowhere until its first message
+        everything = [r for r in everything if r.id not in blank]
         records = [r for r in everything if r.project_id is None]
         self._conversation_list = [
             {"id": r.id, "origin": r.origin, "updated_at": r.updated_at, "title": self._listed_title(r)}
@@ -983,19 +1018,19 @@ class Bridge(QObject):
 
     @Slot(result=bool)
     def newConversation(self) -> bool:
-        """Start a new Global conversation and open it."""
+        """Open a new Global conversation (DFNEW: Global's blank one when there is one)."""
         if self.navigationLocked:
             return False
         store = self._conversation_db()
         if store is None:
             return False
         try:
-            record = store.create_conversation()
+            opened = self._new_chat_conversation(store, None)
         except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A new conversation could not be created: %1"),
                         (type(exc).__name__,)), "error")
             return False
-        self._activate(PersistedConversation(store, record.id))
+        self._activate(opened)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()), "system")
         return True
 
@@ -1220,10 +1255,11 @@ class Bridge(QObject):
                        if store is not None else [])
         except Exception:  # noqa: BLE001 - storage boundary
             records = []
+        blank = self._blank_ids(store)
         rows_of = [
             {"id": r.id, "updated_at": r.updated_at, "archived_at": r.archived_at,
              "title": r.title or ("Bridge", QT_TRANSLATE_NOOP("Bridge", "New Chat"), ())}
-            for r in records
+            for r in records if r.id not in blank
         ]
         self._project_conversations = [row for row in rows_of if row["archived_at"] is None]
         self._project_archived_conversations = [row for row in rows_of if row["archived_at"] is not None]
@@ -1291,22 +1327,23 @@ class Bridge(QObject):
 
     @Slot(str, result=bool)
     def newProjectConversation(self, project_id: str) -> bool:
-        """A new conversation OWNED by ``project_id``, opened. The store's own
-        creation path decides: an unknown or archived owner is refused inside
-        its write transaction and nothing is created. The owner is fixed."""
+        """A new conversation OWNED by ``project_id``, opened (DFNEW: that
+        owner's blank one when there is one). The store's own creation path
+        decides: an unknown or archived owner is refused inside its write
+        transaction and nothing is created. The owner is fixed."""
         if self.navigationLocked:
             return False
         store = self._conversation_db()
         if store is None:
             return False
         try:
-            record = store.create_conversation(str(project_id))
+            opened = self._new_chat_conversation(store, str(project_id))
         except Exception as exc:  # noqa: BLE001 - storage boundary: shown as returned
             self._project_notice = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
             self.projectsChanged.emit()
             return False
         self._project_notice = ""
-        self._activate(PersistedConversation(store, record.id))
+        self._activate(opened)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "New conversation"), ()), "system")
         self.refreshProjects()
         return True
@@ -1705,9 +1742,10 @@ class Bridge(QObject):
     @Slot(str, result=bool)
     def setNewChatProject(self, project_id: str) -> bool:
         """V4: the picker's choice ("" = no project) while the open conversation
-        is still empty: that owner's newest untitled conversation when it is
-        empty too, else a new one. Refused once a message was sent (the owner
-        is fixed) and for an unknown or archived project."""
+        is still empty: that owner's blank conversation when there is one, else
+        a new one (DFNEW, in newConversation / newProjectConversation). Refused
+        once a message was sent (the owner is fixed) and for an unknown or
+        archived project."""
         project_id = str(project_id)
         if not self._conversation_store.id or self._conversation_store.state.turns or self._conversation_archived:
             return False
@@ -1715,16 +1753,6 @@ class Bridge(QObject):
             return True
         if project_id and not self._active_project(project_id):
             return False
-        store = self._conversation_db()
-        try:
-            spare = next((r.id for r in store.list_conversations(project_id=project_id or None)
-                          if not r.title and r.origin == "jarvis"), None) if store is not None else None
-            if spare is not None and store.load_conversation_state(spare).turns:
-                spare = None
-        except Exception:  # noqa: BLE001 - storage boundary: a new one instead
-            spare = None
-        if spare is not None:
-            return self._open_conversation(spare, expand=False)
         return self.newProjectConversation(project_id) if project_id else self.newConversation()
 
     @Slot()
@@ -2133,14 +2161,15 @@ class Bridge(QObject):
 
     def _leave_open_conversation(self, scope: str | None, writable: bool) -> None:
         """The open conversation was archived or deleted: never stay on it.
-        N2 (Salih 2026-10-05): the New chat screen - a new, empty conversation
-        in its scope when that scope is writable, else in Global (the store
-        refuses an owner archived meanwhile), on the chat page."""
+        N2 (Salih 2026-10-05): the New chat screen - its scope's blank
+        conversation (DFNEW; a new one only when it has none) when that scope
+        is writable, else Global's (the store refuses an owner archived
+        meanwhile), on the chat page."""
         store = self._conversation_db()
         opened, error = None, None
         for owner in ([scope] if writable and scope is not None else []) + [None]:
             try:
-                opened = PersistedConversation(store, store.create_conversation(owner).id)
+                opened = self._new_chat_conversation(store, owner)
                 break
             except Exception as exc:  # noqa: BLE001 - storage boundary; only the type
                 error = exc

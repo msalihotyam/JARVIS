@@ -306,7 +306,8 @@ class SelectorTests(ProjectsUiCase):
         self.assertEqual(["Evim", "Tez"], sorted(self.menu_labels(root)))       # no archived project
         # Sidebar v2 V1: no "Genel" row; the fixed plain list holds the no-project conversations instead.
         self.assertEqual([], self.all_items(root, "sidebarGlobal"))
-        self.assertEqual(sorted(c.id for c in store.list_conversations(project_id=None)),
+        blank = store.blank_conversation_ids()                                   # DFNEW: listed nowhere
+        self.assertEqual(sorted(c.id for c in store.list_conversations(project_id=None) if c.id not in blank),
                          sorted(i.property("itemId") for i in self.all_items(root, "sidebarConversation") if i.isVisible()))
         self.assertTrue(self.item(root, "sidebarProjectsLink").isVisible())     # "All projects" (Q10)
         self.assertEqual("All projects", self.item(root, "sidebarProjectsLink").property("tip"))
@@ -322,6 +323,7 @@ class SelectorTests(ProjectsUiCase):
         older = store.create_conversation(home.id)
         newest = store.create_conversation(home.id)
         store.archive_conversation(newest.id)
+        store.create_conversation(title="Düz")       # DFNEW: the startup one has a row (a blank one has none)
         bridge = self.bridge()
         root = self.window(bridge)
         global_open = bridge.conversationId
@@ -374,7 +376,7 @@ class SelectorTests(ProjectsUiCase):
     def test_c_new_conversation_in_the_current_scope(self) -> None:
         store = self.db()
         home = store.create_project("Evim")
-        owned = store.create_conversation(home.id)
+        owned = store.create_conversation(home.id, title="Ev")      # DFNEW: a blank one would be reused
         bridge = self.bridge()
         root = self.window(bridge)
         bridge.openConversation(owned.id)
@@ -388,7 +390,7 @@ class SelectorTests(ProjectsUiCase):
         pump(200)
         before = bridge.conversationId
         self.click(root, "sidebarNewChat")
-        self.assertNotEqual(before, bridge.conversationId)
+        self.assertEqual(before, bridge.conversationId)               # DFNEW: Global's blank one (startup), reused
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         # Archived owner: the scope's own new conversation is still refused, nothing is created there;
         # "Yeni sohbet" stays available and starts a no-project one (N1: else plain).
@@ -406,7 +408,8 @@ class SelectorTests(ProjectsUiCase):
         self.assertEqual("Evim · archived", self.owner(root))
         owned_count = len(store.list_conversations(project_id=home.id, include_archived=True))
         self.click(root, "sidebarNewChat")
-        self.assertEqual(count + 1, len(store.list_conversations(include_archived=True)))
+        self.assertEqual(count, len(store.list_conversations(include_archived=True)))   # DFNEW: Global's blank one
+        self.assertEqual(before, bridge.conversationId)
         self.assertIsNone(store.load_conversation(bridge.conversationId).project_id)
         self.assertEqual(owned_count, len(store.list_conversations(project_id=home.id, include_archived=True)))
 

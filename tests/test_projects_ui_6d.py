@@ -28,7 +28,7 @@ from pathlib import Path
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 
-from jarvis.conversation import task_title
+from jarvis.conversation import append_turn, task_title
 from tests.test_intent import task_proposal
 from tests.test_projects_ui import ProjectsUiCase
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
@@ -93,6 +93,8 @@ class SwitcherTests(SwitcherCase):
         project = store.create_project("Evim")
         first = store.create_conversation(title="Birinci")
         second = store.create_conversation()                                       # untitled
+        store.update_conversation_state(second.id, lambda s: append_turn(          # DFNEW: a turnless one is unlisted
+            s, role="user", kind="user", text="selam", message="selam")[0])
         third = store.create_conversation(title="Üçüncü")
         archived = store.create_conversation(title="Arşiv")
         store.archive_conversation(archived.id)

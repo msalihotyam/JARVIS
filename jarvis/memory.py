@@ -5423,6 +5423,23 @@ class SQLiteMemoryStore:
         records = (self._conversation_record(row) for row in rows)
         return [record for record in records if record is not None]
 
+    def blank_conversation_ids(self) -> frozenset[str]:
+        """Read only: the live conversations nothing ever happened in -
+        untitled, made by JARVIS, not archived, no turn ever appended
+        (``next_seq`` still 1) and no session linked. The window lists none of
+        them (a New chat is a screen until its first message); nothing here
+        changes or removes a row. A state that is not valid JSON is not blank
+        (it stays listed)."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM conversations WHERE title = '' AND origin = 'jarvis' AND archived_at IS NULL "
+                f"AND {self._NOT_DELETED} "  # nosec B608 - constant SQL fragments only
+                "AND id NOT IN (SELECT conversation_id FROM conversation_sessions) "
+                "AND CASE WHEN json_valid(state_json) THEN json_extract(state_json, '$.next_seq') = 1 "
+                "AND COALESCE(json_array_length(state_json, '$.turns'), 0) = 0 ELSE 0 END"
+            ).fetchall()
+        return frozenset(row["id"] for row in rows)
+
     def update_conversation_state(
         self,
         conversation_id: str,

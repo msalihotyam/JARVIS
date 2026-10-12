@@ -339,7 +339,9 @@ class BackgroundRunTests(UiTestCase):
             self.assertEqual((b, feed), (bridge.conversationId, list(bridge.feed)))
         else:
             self.assertNotEqual(a, bridge.conversationId)                   # N2 left the deleted one
-            self.assertEqual(1, len(after["conversations"]) - len(before["conversations"]))
+            # DFNEW: for Global's blank one (the startup one), reused - nothing new is stored.
+            self.assertEqual(0, len(after["conversations"]) - len(before["conversations"]))
+            self.assertIn(bridge.conversationId, store.blank_conversation_ids())
         return bridge
 
     def test_t9a_a_sessionless_reply_for_a_deleted_conversation_is_dropped(self) -> None:

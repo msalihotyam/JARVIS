@@ -191,8 +191,11 @@ class UntitledNameTests(WindowCase):
         store = self.db()
         project = store.create_project("Evim")
         loose = store.create_conversation()
-        store.archive_conversation(loose.id)
         inside, archived = store.create_conversation(project.id), store.create_conversation(project.id)
+        plain = store.create_conversation()                 # the open one (startup: Global's newest)
+        for record in (loose, inside, archived, plain):     # DFNEW: untitled with a message (a turnless one is unlisted)
+            say(store, record.id, "selam")
+        store.archive_conversation(loose.id)
         store.archive_conversation(archived.id)
         bridge = self.bridge()
         root = self.window(bridge)
@@ -1098,7 +1101,9 @@ class ListCase(DialogAdoptionCase):
         store = self.db()
         self.project = store.create_project(LONG_PROJECT)
         for title in ("Mutfak planı", LONG_NAME, ""):
-            store.create_conversation(self.project.id, title=title)
+            record = store.create_conversation(self.project.id, title=title)
+            if not title:
+                say(store, record.id, "bir")              # DFNEW: untitled with a message (a turnless one is unlisted)
         kept = store.create_conversation(self.project.id, title="Eski teklif notları")
         store.archive_conversation(kept.id)
         store.create_conversation(title="Mutfak bütçesi soruları")
@@ -1528,7 +1533,9 @@ def dump(database) -> dict:
 
 class LiveLanguageTests(ListCase):
     def untitled_global(self, store, bridge) -> None:
-        bridge.openConversation(store.create_conversation().id)
+        record = store.create_conversation()
+        say(store, record.id, "selam")                    # DFNEW: untitled with a message (a turnless one is unlisted)
+        bridge.openConversation(record.id)
         bridge.setPage("home")
         pump(350)
 
