@@ -33,6 +33,7 @@ from jarvis.context_items import (
     MAX_ITEMS,
     NOTE_MAX_CHARS,
     RESPONSE_MODES,
+    TEXT_ATTACHMENT_MAX_CHARS,
     AttachmentRefused,
     attach_bytes,
     attach_file,
@@ -64,6 +65,7 @@ from jarvis.ui.preferences import (
     CHAT_PROVIDERS,
     CONTEXTUAL_PANELS,
     GLOBAL_SCOPE,
+    NEW_CHAT_DRAFT,
     PAGES,
     PIN_LIMIT,
     PROFILES,
@@ -496,6 +498,21 @@ class Bridge(QObject):
         # R2: every change of the live slots or of the run says so through one of these.
         for signal in (self.approvalChanged, self.stateChanged):
             signal.connect(self._needs_you_check)
+        # DFDRAFT: every conversation's own unsent draft - the open one's live
+        # (its text as the composer reports it, its context above), the others
+        # parked here by key; written to the preferences' drafts file shortly
+        # after a change, on a switch and on quit.
+        self._draft_text = ""
+        self._draft_key = self._draft_key_of(self._conversation_store)
+        self._drafts: dict[str, dict[str, Any]] = {}
+        self._draft_held = False
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(800)
+        self._draft_timer.timeout.connect(self._save_drafts)
+        for signal in (self.groupsChanged, self.attachmentsChanged, self.modeChanged):
+            signal.connect(lambda: self._draft_timer.start())
+        self._load_drafts()
 
     # -- worker --------------------------------------------------------------
 
@@ -586,8 +603,9 @@ class Bridge(QObject):
                 Path(path).unlink(missing_ok=True)
 
     def _draft_snapshots(self) -> frozenset[str]:
-        """The snapshot files the open screen's draft references."""
-        items = [*self._attachments, *(item for group in self._groups for item in group["attachments"])]
+        """The snapshot files the open screen's draft and every parked draft (DFDRAFT) reference."""
+        drafts = [{"groups": self._groups, "attachments": self._attachments}, *self._drafts.values()]
+        items = [item for d in drafts for item in (*d["attachments"], *(a for g in d["groups"] for a in g["attachments"]))]
         return frozenset(item["path"] for item in items if type(item.get("path")) is str)
 
     # -- feed ---------------------------------------------------------------
@@ -1057,7 +1075,7 @@ class Bridge(QObject):
         if record is not None:
             self._session_id = record["session_id"]
         self._decision = {}
-        self._discard_snapshots()
+        self._swap_draft(opened)
         self._end_stream()
         if record is not None and record["preview"]:
             self._stream_text, self._stream_ts = record["preview"], record["stream_ts"]
@@ -2300,6 +2318,8 @@ class Bridge(QObject):
             return False
         self._delete_preview = {}
         self._lifecycle_done(conversation_id, payload, True)
+        if self._drafts.pop(conversation_id, None) is not None:     # DFDRAFT: its draft goes with it
+            self._save_drafts()
         self._set_sessions({"sessions": self._sessions})
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Conversation deleted permanently"), ()), "system")
         return True
@@ -3138,6 +3158,7 @@ class Bridge(QObject):
                   groups=[{**g, "attachments": [self._shown(a) for a in g["attachments"]]} for g in groups],
                   attachments=[self._shown(a) for a in attachments], refs=turn_refs(groups, attachments))
         self.clearContext()
+        self._draft_sent(text)
         self.inputAccepted.emit()
         session_id = self._session_id or None
         request_id = str(uuid4())
@@ -3439,15 +3460,18 @@ class Bridge(QObject):
     def _discard_snapshots(self) -> None:
         """Throw away every attachment snapshot JARVIS copied for this session -
         except those the recorded run in flight still references: a provider
-        reads them later (and skips a missing one), so they go when it ends (R1)."""
+        reads them later (and skips a missing one), so they go when it ends (R1) - and
+        those another conversation's parked draft holds (DFDRAFT)."""
         self.clearContext()
         record = self._run_record if self._busy else None
-        if record is None or not record["snapshots"]:
+        if record is not None and record["snapshots"]:
+            record["discard"] = True
+        keep = self._draft_snapshots() | (record["snapshots"] if record is not None else frozenset())
+        if not keep:
             discard_snapshots(self._snapshots)
             return
-        record["discard"] = True
         for path in self._snapshots.glob("*"):
-            if str(path) not in record["snapshots"]:
+            if str(path) not in keep:
                 with contextlib.suppress(OSError):
                     path.unlink()
 
@@ -4179,6 +4203,7 @@ class Bridge(QObject):
         found = self._group(group_id)
         if found is not None:
             found["note"] = redact_text(str(note)[:NOTE_MAX_CHARS])
+            self._draft_timer.start()
 
     @Slot(str)
     def removeGroup(self, group_id: str) -> None:
@@ -4368,6 +4393,141 @@ class Bridge(QObject):
                         "attachments": [dict(item) for item in group["attachments"]]} for group in self._groups)
         attachments = tuple(dict(item) for item in self._attachments)
         return groups, attachments, (self._response_mode if groups else DEFAULT_RESPONSE_MODE)
+
+    # -- DFDRAFT (Salih 2026-10-12): every conversation keeps its own draft --------
+    #
+    # "Her sohbetin kendi hafizasinda kalmali taslaklar." The open screen's draft
+    # is live: its text as the composer reports it (setDraftText) and the
+    # context above. A switch parks it under its key - the conversation's id, or
+    # NEW_CHAT_DRAFT for the New chat screen, whichever owner its picker shows -
+    # and brings back the opened one's. The drafts file (UiPreferences) keeps
+    # them over a restart: text, quotes, notes and TEXT files; an image's
+    # snapshot belongs to this run, so it is not kept past it. A draft is local
+    # data only: nothing here sends, logs or uploads anything.
+
+    draftRestored = Signal()
+
+    @Property(str, notify=draftRestored)
+    def draftText(self) -> str:
+        """The open screen's draft text as last restored (a switch, a start, a send)."""
+        return self._draft_text
+
+    @Slot(str)
+    def setDraftText(self, text: str) -> None:
+        """What the composer holds now; kept for the open screen only."""
+        text = str(text)
+        if text != self._draft_text:
+            self._draft_text = text
+            self._draft_timer.start()
+
+    @staticmethod
+    def _draft_key_of(conversation: PersistedConversation) -> str:
+        return conversation.id if conversation.id and conversation.state.turns else NEW_CHAT_DRAFT
+
+    def _live_draft(self) -> dict[str, Any] | None:
+        if not (self._draft_text or self._groups or self._attachments):
+            return None
+        return {"text": self._draft_text, "groups": self._groups, "attachments": self._attachments,
+                "mode": self._response_mode, "at": int(time.time())}
+
+    def _swap_draft(self, opened: PersistedConversation) -> None:
+        """Park the open screen's draft, drop the snapshot files nothing holds any
+        more (the run in flight's stay, R1), then bring back ``opened``'s own."""
+        live = self._live_draft()
+        if live is not None:
+            self._drafts[self._draft_key] = live
+        self._groups, self._attachments, self._draft_text = [], [], ""
+        self._response_mode = DEFAULT_RESPONSE_MODE
+        self._discard_snapshots()
+        self._draft_key = self._draft_key_of(opened)
+        self._restore_draft()
+        self._save_drafts()
+
+    def _restore_draft(self) -> None:
+        draft = (None if self._draft_held else self._drafts.pop(self._draft_key, None)) or {}
+        self._groups, self._attachments = draft.get("groups", []), draft.get("attachments", [])
+        self._response_mode = draft.get("mode", DEFAULT_RESPONSE_MODE)
+        self._draft_text = draft.get("text", "")
+        self._attach_revision += 1
+        for signal in (self.groupsChanged, self.attachmentsChanged, self.modeChanged, self.draftRestored):
+            signal.emit()
+        self._draft_timer.stop()        # a restore is not an edit
+
+    def _draft_sent(self, text: str) -> None:
+        """An accepted send spends the draft it came from (its context went with
+        it). Typed text it did not carry stays, parked under the New chat key it
+        was typed on when the send gave the screen its first message."""
+        if text == self._draft_text:
+            self._draft_text = ""
+        key = self._draft_key_of(self._conversation_store)
+        if key != self._draft_key:
+            live = self._live_draft()
+            if live is not None:
+                self._drafts[self._draft_key] = live
+            self._draft_key, self._groups, self._attachments, self._draft_text = key, [], [], ""
+            self.draftRestored.emit()
+        self._save_drafts()
+
+    @Slot(bool)
+    def holdDraft(self, hold: bool) -> None:
+        """A composer that is not the open conversation's (a project page's)
+        sends: while held, a switch parks the open screen's draft but brings
+        none back, so no parked draft - the New chat screen's above all - goes
+        out with that message. Released: the open screen's own comes back."""
+        self._draft_held = bool(hold)
+        if not hold and self._live_draft() is None and self._draft_key in self._drafts:
+            self._restore_draft()
+            self._save_drafts()
+
+    def _save_drafts(self) -> None:
+        if self._quitting:              # the quit saved them before it emptied the open one
+            return
+        self._draft_timer.stop()
+        live = self._live_draft()
+        try:
+            self.prefs.save_drafts({**self._drafts, **({self._draft_key: live} if live is not None else {})})
+        except Exception:  # noqa: BLE001 - a draft that cannot be written never stops a switch or a quit
+            pass
+
+    def _load_drafts(self) -> None:
+        """The stored drafts, with fresh ids; a conversation deleted meanwhile
+        (by any path) leaves its draft behind. Then the open screen's own."""
+        store = self._conversation_db()
+        for key, stored in self.prefs.load_drafts().items():
+            try:
+                gone = key != NEW_CHAT_DRAFT and store is not None and store.load_conversation(key) is None
+            except ValueError:              # not a conversation id at all
+                gone = True
+            except Exception:  # noqa: BLE001 - unreadable is not deleted: the draft stays
+                gone = False
+            if not gone:
+                self._drafts[key] = self._revived(stored)
+        self._restore_draft()
+
+    def _revived(self, stored: dict[str, Any]) -> dict[str, Any]:
+        """A stored draft as live context: this run's ids, the same caps as when attached."""
+        count = 0
+
+        def files(raw: list) -> list:
+            nonlocal count
+            kept = []
+            for item in raw:
+                if count < MAX_ITEMS:
+                    count += 1
+                    kept.append({**item, "id": self._new_id("att-"), "text": item["text"][:TEXT_ATTACHMENT_MAX_CHARS]})
+            return kept
+        groups = []
+        for raw in stored["groups"]:
+            if count >= MAX_ITEMS:
+                break
+            count += 1
+            ref = raw["reference"]          # its feed entry id was the last run's: it names nothing now
+            primary = reference(self._new_id("ref-"), source_role=ref["source_role"], source_id="",
+                                selection=ref["selection"], text=ref["text"], source_time=ref["source_time"])
+            groups.append({**group(self._new_id("grp-"), primary), "note": raw["note"][:NOTE_MAX_CHARS],
+                           "attachments": files(raw["attachments"])})
+        return {"text": stored["text"], "groups": groups, "attachments": files(stored["attachments"]),
+                "mode": stored["mode"] if stored["mode"] in RESPONSE_MODES else DEFAULT_RESPONSE_MODE, "at": stored["at"]}
 
     # -- conversation actions ----------------------------------------------------
 
@@ -4597,6 +4757,7 @@ class Bridge(QObject):
     @Slot()
     def confirmQuit(self) -> None:
         """The orderly quit. The window accepts its close from here on."""
+        self._save_drafts()                    # DFDRAFT: before the discard below empties the open one
         self._quitting = True
         self._discard_snapshots()
         discard_snapshots(self._snapshots)     # quitting keeps none, a running request's included (R1)
@@ -4993,6 +5154,7 @@ class Bridge(QObject):
             self._shutting_down = True
         for timer in self.findChildren(QTimer):
             timer.stop()
+        self._save_drafts()                    # DFDRAFT: the last keystrokes too (no-op after confirmQuit's)
         # A turn whose write met a busy file is written now, not lost with the process.
         self._conversation_store.flush()
 

@@ -20,6 +20,7 @@ from pathlib import Path
 import tests.test_ui as ui
 from tests.test_ui import _APP, pump  # noqa: F401 - _APP: the application
 from tests.helpers import settled
+from jarvis.ui.preferences import UiPreferences
 
 from PySide6.QtCore import QMetaObject, QMimeData, QObject, QUrl, Qt  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
@@ -68,6 +69,7 @@ class ThresholdTests(LongPasteCase):
                  ("\n".join(["satır"] * 29) + "\n", False)]       # a final line break is not a 30th line
         for text, card in cases:
             with self.subTest(chars=len(text), lines=text.count("\n") + 1, card=card):
+                UiPreferences(self.prefs_path).save_drafts({})   # DFDRAFT: the case before left its draft stored
                 bridge = self.bridge()
                 root = self.window(bridge)
                 editor = self.item(root, "composerInput")

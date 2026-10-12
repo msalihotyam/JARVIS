@@ -58,8 +58,27 @@ Item {
     // the composer - the draft, its chips and actions - it stays.
     readonly property bool keepsTextFocus: true
     readonly property alias inputHeight: input.implicitHeight
-    // Clear the draft only when the application really accepted it.
-    function submit() { if (canSend && sendHandler(input.text)) { input.text = ""; pastes = ({}); submitted() } }
+    // Clear the draft only when the application really accepted it. The pencil texts
+    // of the cards it carried go with it; another conversation's parked cards keep theirs.
+    // Not the open conversation's (a project page's): no parked draft travels with it.
+    function submit() {
+        if (!canSend) return
+        var sent = conversationBound ? bridge.globalAttachments.map(function (file) { return file.id }) : []
+        var accepted = false
+        if (!conversationBound) bridge.holdDraft(true)
+        try { accepted = sendHandler(input.text) } finally { if (!conversationBound) bridge.holdDraft(false) }
+        if (accepted) { input.text = ""; sent.forEach(function (id) { delete pastes[id] }); submitted() }
+    }
+    // DFDRAFT: a conversation-bound composer shows the OPEN conversation's own draft.
+    // It reports every edit (bridge.setDraftText); a switch, a start or a send puts
+    // that conversation's draft back here, the caret at its end. Local data only.
+    function restoreDraft() {
+        if (!conversationBound || input.text === bridge.draftText) return
+        input.text = bridge.draftText
+        input.cursorPosition = input.length
+    }
+    Component.onCompleted: restoreDraft()
+    Connections { target: bridge; function onDraftRestored() { composer.restoreDraft() } }
 
     readonly property var permissionModes: [
         { id: "strict", short: qsTr("Ask"), name: qsTr("Ask every time"),
@@ -226,7 +245,12 @@ Item {
             TapHandler { acceptedButtons: Qt.RightButton; onTapped: function(point) { composerMenu.openAt(input, point.position) } }
             // Real typing activity for the core: on while text is being entered,
             // off 900 ms after the last edit or as soon as the field is empty.
-            onTextChanged: { if (text.length > 0) { bridge.setComposing(true); composingQuiet.restart() } else { composingQuiet.stop(); bridge.setComposing(false) } }
+            onTextChanged: {
+                var restored = composer.conversationBound && text === bridge.draftText    // a restored draft, not typing
+                if (composer.conversationBound && !restored) bridge.setDraftText(text)
+                if (text.length === 0) { composingQuiet.stop(); bridge.setComposing(false) }
+                else if (!restored) { bridge.setComposing(true); composingQuiet.restart() }
+            }
         }
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; width: 6 }
     }

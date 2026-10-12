@@ -423,6 +423,77 @@ def ordered_projects(records: list[dict[str, Any]], order: list[str]) -> list[st
     return [r["id"] for r in fresh] + [i for i in order if i in known]
 
 
+DRAFTS_VERSION = 1
+#: DFDRAFT: one stored draft's ceiling (its JSON, UTF-8) and how many are kept, newest first.
+DRAFT_MAX_BYTES = 64 * 1024
+DRAFT_MAX_COUNT = 50
+#: The New chat screen's draft: one, whichever owner its picker shows.
+NEW_CHAT_DRAFT = "new"
+_DRAFT_REFERENCE = ("source_role", "source_id", "source_time", "selection", "text")
+_DRAFT_FILE = {"name": str, "media_type": str, "bytes": int, "sha256": str, "text": str,
+               "truncated": bool, "pasted": bool, "attached_at": int}
+
+
+def _draft_file(raw: Any) -> dict[str, Any] | None:
+    """A TEXT attachment's stored fields; an image (its snapshot is this run's) or anything else: None."""
+    if not isinstance(raw, dict) or raw.get("kind") != "text" or type(raw.get("text")) is not str:
+        return None
+    return {"type": "attachment", "kind": "text", "scope": "chat",
+            **{key: raw[key] for key, kind in _DRAFT_FILE.items() if type(raw.get(key)) is kind}}
+
+
+def _draft_group(raw: Any) -> dict[str, Any] | None:
+    ref = raw.get("reference") if isinstance(raw, dict) else None
+    if (not isinstance(ref, dict) or any(type(ref.get(key)) is not str for key in _DRAFT_REFERENCE)
+            or type(raw.get("note")) is not str or not isinstance(raw.get("attachments"), list)):
+        return None
+    return {"reference": {"type": "reference", "kind": "quote", **{key: ref[key] for key in _DRAFT_REFERENCE}},
+            "note": raw["note"], "attachments": [f for f in map(_draft_file, raw["attachments"]) if f]}
+
+
+def _draft_size(entry: dict[str, Any]) -> int:
+    """Its bytes as written: ASCII JSON, so any string - a lone surrogate too - fits."""
+    return len(json.dumps(entry))
+
+
+def stored_draft(raw: Any) -> dict[str, Any] | None:
+    """One draft as it is stored: the text, the quote groups (note, text files),
+    the text files and the answer mode, rebuilt from known fields only. Over
+    ``DRAFT_MAX_BYTES`` the text files go first (largest first), then the
+    quotes, then the text's tail.
+    ``None`` when malformed or empty. Ids and snapshot paths are never stored."""
+    if (not isinstance(raw, dict) or type(raw.get("text")) is not str or type(raw.get("mode")) is not str
+            or type(raw.get("at")) is not int or not isinstance(raw.get("groups"), list)
+            or not isinstance(raw.get("attachments"), list)):
+        return None
+    groups = [_draft_group(g) for g in raw["groups"]]
+    if None in groups:
+        return None
+    entry = {"text": raw["text"], "mode": raw["mode"], "at": raw["at"], "groups": groups,
+             "attachments": [f for f in map(_draft_file, raw["attachments"]) if f]}
+    files = [(owner, f) for owner in (entry["attachments"], *(g["attachments"] for g in groups)) for f in owner]
+    for owner, file in sorted(files, key=lambda pair: len(pair[1]["text"]), reverse=True):
+        if _draft_size(entry) <= DRAFT_MAX_BYTES:
+            break
+        owner.remove(file)
+    if _draft_size(entry) > DRAFT_MAX_BYTES:
+        entry["groups"] = []
+    while _draft_size(entry) > DRAFT_MAX_BYTES:
+        entry["text"] = entry["text"][: len(entry["text"]) * 3 // 4]
+    return entry if entry["text"] or entry["groups"] or entry["attachments"] else None
+
+
+def validate_drafts(candidate: Any) -> dict[str, dict[str, Any]]:
+    """Every readable draft by key (a conversation id or ``NEW_CHAT_DRAFT``),
+    newest ``DRAFT_MAX_COUNT``; {} when the document itself is malformed."""
+    if not isinstance(candidate, dict) or candidate.get("version") != DRAFTS_VERSION or not isinstance(candidate.get("drafts"), dict):
+        return {}
+    kept = {key: entry for key, entry in ((k, stored_draft(v)) for k, v in candidate["drafts"].items())
+            if type(key) is str and 0 < len(key) <= 64 and entry is not None}
+    newest = sorted(kept, key=lambda key: kept[key]["at"], reverse=True)[:DRAFT_MAX_COUNT]
+    return {key: kept[key] for key in newest}
+
+
 def default_preferences_path() -> Path:
     return Path.home() / ".jarvis" / "ui-preferences.json"
 
@@ -756,4 +827,31 @@ class UiPreferences:
             self.work_panel_path.write_text(json.dumps({"version": 1, "collapsed": self._work_panel}), encoding="utf-8")
         except OSError:
             pass
+        return True
+
+    # -- DFDRAFT: each conversation's unsent draft (Salih 2026-10-12) ----------
+    #
+    # A sixth sibling file (``<prefs>.drafts.json``) for the same rollback
+    # reason. Local to this PC and never sent, logged or uploaded; a bad file
+    # reads as no drafts.
+
+    @property
+    def drafts_path(self) -> Path:
+        return self.path.with_suffix(".drafts.json")
+
+    def load_drafts(self) -> dict[str, dict[str, Any]]:
+        try:
+            return validate_drafts(json.loads(self.drafts_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, RecursionError):
+            return {}
+
+    def save_drafts(self, drafts: dict[str, Any]) -> bool:
+        """Write ``drafts`` (by key) through ``validate_drafts``; ``False`` when it cannot."""
+        document = {"version": DRAFTS_VERSION,
+                    "drafts": validate_drafts({"version": DRAFTS_VERSION, "drafts": dict(drafts)})}
+        try:
+            self.drafts_path.parent.mkdir(parents=True, exist_ok=True)
+            self.drafts_path.write_text(json.dumps(document), encoding="ascii")
+        except (OSError, ValueError):
+            return False
         return True

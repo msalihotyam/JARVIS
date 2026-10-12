@@ -5951,6 +5951,7 @@ class EditMenuPasteTests(SurfaceCase):
             outcomes = []
             for route in ("keyboard", "menu"):
                 with self.subTest(kind=kind, route=route):
+                    UiPreferences(self.prefs_path).save_drafts({})   # DFDRAFT: the case before left its draft stored
                     bridge = self.bridge()
                     root = self.window(bridge)
                     editor = self.item(root, "composerInput")
