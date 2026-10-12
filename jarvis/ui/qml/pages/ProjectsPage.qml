@@ -50,7 +50,6 @@ SecondaryPage {
 
         // -- Gate 6G P2: the card grid (no project open) --------------------------
         Item {
-            id: gridPane
             objectName: "projectGridPane"
             visible: !page.current.id
             anchors.fill: parent

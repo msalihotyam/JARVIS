@@ -1298,10 +1298,6 @@ class Bridge(QObject):
         this project may have more jobs than it shows."""
         return self._project_jobs_bounded
 
-    @Property(int, constant=True)
-    def projectJobsLimit(self) -> int:
-        return HISTORY_LIMIT
-
     @Property(str, notify=projectsChanged)
     def projectNotice(self) -> str:
         return self._project_notice
@@ -3768,12 +3764,6 @@ class Bridge(QObject):
         the providers listed, not just the newest version per model name."""
         return self._show_old_models
 
-    @Slot(bool)
-    def setShowOldModels(self, show: bool) -> None:
-        if bool(show) != self._show_old_models:
-            self._show_old_models = bool(show)
-            self.providersChanged.emit()
-
     @Property(dict, notify=providersChanged)
     def modelLists(self) -> dict:
         """DISPLAY ONLY (S5): per provider the ids the selector shows and
@@ -3915,12 +3905,6 @@ class Bridge(QObject):
         (``reported``: the provider's own token fields and model; absent fields
         were not reported) plus measured request / conversation / catalogue sizes."""
         return dict(self._chat_usage)
-
-    @Property("QVariantMap", notify=providersChanged)
-    def claudeLimits(self) -> dict:
-        """Claude plan limits as Claude Code last REPORTED them on a real call
-        (``windows``: utilization 0-1 and reset time; ``seen_at``), or {}."""
-        return dict(self._claude_limits)
 
     @Property("QVariantMap", notify=providersChanged)
     def codexQuota(self) -> dict:

@@ -290,7 +290,6 @@ Item {
                     color: Theme.alpha(sendButton.tone, 0.16); opacity: sendButton.hovered && sendButton.enabled ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } } }
         Item {
-            id: keyFace
             objectName: "composerSendFace"
             anchors.fill: parent
             // Lift under the pointer, set down by a press.

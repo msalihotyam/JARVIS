@@ -37,8 +37,6 @@ Item {
     property bool settingsOpen: false
     property Item controlLayer: null
     readonly property point settingsAnchor: Qt.point(orb.x - 4, orb.y + orb.height + 14)
-    // Under the strip, where the 54 px selector's panel always opened (ContextPanel caps it from there).
-    readonly property point modelAnchor: Qt.point(controls.x + brandCard.x, controls.y + controls.height + 14)
     readonly property point killAnchor: Qt.point(controls.x + killSlot.x + killSlot.width, controls.y + controls.height + 22)
     readonly property point navAnchor:Qt.point(controls.x + navigationTrigger.x + navigationTrigger.width, controls.y + navigationTrigger.height + 18)
     readonly property Item navTrigger: navigationTrigger        // K4: the nav menu's opener and toggle

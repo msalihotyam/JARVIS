@@ -197,7 +197,6 @@ Item {
         Row {
             spacing: 6
             Text {
-                id: backLink
                 objectName: "projectsBack"
                 text: qsTranslate("ProjectsPage", "Projects"); color: backArea.containsMouse || activeFocus ? Theme.text : Theme.textLabel
                 font.family: Theme.pageMeta.family; font.pixelSize: Theme.pageMeta.pixelSize
@@ -264,7 +263,6 @@ Item {
     // -- the right column: instruction, files and (6H) the folder ---------------
     readonly property real sideWidth: Math.round(Math.max(220, Math.min(340, width * 0.32)))
     Column {
-        id: sideRows
         objectName: "projectSideRows"
         x: parent.width - width; y: header.height + 16
         width: projectPage.sideWidth; spacing: 10
