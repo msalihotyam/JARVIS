@@ -50,8 +50,9 @@ EXCEPTIONS = (
     ("components/FeedView.qml", 420,
      "the live activity dots: a rhythm only while work really runs, not a transition"),
     ("components/FreezeKeySwitch.qml", None,
-     "the freeze switch lever (6G S2, Salih 2026-10-06): a toggle snaps (~80 ms + tiny settle), "
-     "a knife switch swings slower and weighted; each move follows a real execution-state change"),
+     "the freeze switch lever (6G S2, Salih 2026-10-06): a toggle snaps (eased ~110 ms + tiny settle), "
+     "a knife switch swings slower and weighted; the knife's arcs on open/close (280 ms burst, "
+     "DFSWITCH, Salih 2026-10-12); each move follows a real execution-state change"),
     ("components/Composer.qml", 1200,
      "the stop key's turning ring (M2): a rhythm only while a run is active, not a transition"),
     ("components/UsageRing.qml", 9000,
