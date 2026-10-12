@@ -11,12 +11,12 @@ window's WindowPowerFx itself; its quitNow confirms the quit, once.
 """
 from __future__ import annotations
 
-import time
-
 from tests.test_ui import _APP, UiTestCase, find, pump, tap  # noqa: F401 - the offscreen platform and the application
-from tests.helpers import wait_until
+from tests.helpers import CHECK_FLOOR_MS, wait_until
 from tests import test_dfwin2   # the module, not its class: unittest would collect that class here again
-from tests.test_v21win import CAP, LATENCY
+from tests.test_v21win import CAP
+
+from PySide6.QtCore import SIGNAL, QObject  # noqa: E402
 
 
 class TrayQuitPowerDownTests(UiTestCase):
@@ -24,13 +24,18 @@ class TrayQuitPowerDownTests(UiTestCase):
     window = test_dfwin2.WindowPowerCloseTests.window
 
     def test_tray_quit_with_the_window_on_screen_powers_down_then_quits_once(self) -> None:
+        # CIFLAKE: "within the effect + 60 ms" is measured on the effect's own clock, not the
+        # machine's - a wall-clock bound failed on a loaded runner (0.87 s) with the effect intact.
         from jarvis.ui.tray import TrayController
         bridge, root, fx = self.window()
-        started = time.monotonic()
+        at_end = []                                                     # the quits when the timeline ended
+        QObject.connect(fx.findChild(QObject, "windowPowerRun"), SIGNAL("finished()"), lambda: at_end.append(list(self.quits)))
         TrayController(bridge, root).quit()
         self.assertEqual(("down", 1, []), (fx.property("phase"), fx.property("plays"), self.quits))
-        self.assertTrue(wait_until(lambda: bool(self.quits), 1000))
-        self.assertLessEqual(time.monotonic() - started, CAP + LATENCY)
+        safety = fx.findChild(QObject, "windowPowerSafety")             # the effect + 60 ms, armed with the run
+        self.assertEqual((True, round(CAP * 1000)), (safety.property("running"), safety.property("interval")))
+        self.assertTrue(wait_until(lambda: bool(self.quits), CHECK_FLOOR_MS))
+        self.assertEqual([[("down", 1.0, 1.0)]], at_end)               # the quit came out of the run's own end, in that call
         self.assertEqual([("down", 1.0, 1.0)], self.quits)              # the band shrunk into the core, then the quit
         pump(700)
         self.assertEqual((1, True, "down", 1), (len(self.quits), bridge.quitting, fx.property("phase"), fx.property("plays")))
@@ -49,12 +54,15 @@ class TrayQuitPowerDownTests(UiTestCase):
         from jarvis.ui.tray import TrayController
         bridge, root, fx = self.window()
         bridge._busy = True
+        at_end = []                                                     # CIFLAKE: the time bound, on the effect's clock
+        QObject.connect(fx.findChild(QObject, "windowPowerRun"), SIGNAL("finished()"), lambda: at_end.append(list(self.quits)))
         TrayController(bridge, root).quit()
         pump(200)
         self.assertEqual(("", 0, []), (fx.property("phase"), fx.property("plays"), self.quits))  # the dialog, no effect
         tap(root, find(root.contentItem(), "confirmAccept"))
         self.assertEqual(("down", []), (fx.property("phase"), self.quits))
-        self.assertTrue(wait_until(lambda: bool(self.quits), 1000))
+        self.assertTrue(wait_until(lambda: bool(self.quits), CHECK_FLOOR_MS))
+        self.assertEqual([[("down", 1.0, 1.0)]], at_end)               # the quit came out of the run's own end
         pump(700)
         self.assertEqual((1, 1), (len(self.quits), fx.property("plays")))
         bridge._busy = False

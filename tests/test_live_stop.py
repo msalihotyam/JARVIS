@@ -91,6 +91,11 @@ def _executable_source(obj) -> str:
 #: Event, and this only decides how soon the watcher notices.
 FAST_POLL = 0.005
 
+#: CIFLAKE: a hang guard, never a bound - each wait it caps ends the moment its Event is set.
+#: An approved resume commits several SQLite transactions before execute; on a CI disk ~70x
+#: slower than a desk that took longer than the old ten seconds, with nothing wrong.
+HANG_GUARD = 120
+
 
 def _open_in_flight_attempt(memory, database, session_id: str, task_id: str) -> str:
     """An authoritative IN_FLIGHT attempt, the way a live owner leaves one."""
@@ -147,11 +152,13 @@ class _BlockingConnector(BaseConnector):
         self.handle_ready = True
         self.raise_on_execute: Exception | None = None
         self.outcome = OutcomeStatus.SUCCESS
+        #: How long execute stays live without a release (HANG_GUARD: only a release ends it).
+        self.release_ceiling = 10
 
     def execute(self, task: Task, session: SessionState) -> ToolResult:
         self.execute_calls += 1
         self.executing.set()
-        self.release.wait(timeout=10)
+        self.release.wait(timeout=self.release_ceiling)
         if self.raise_on_execute is not None:
             raise self.raise_on_execute
         return ToolResult(
@@ -255,7 +262,7 @@ class LiveStopTestCase(unittest.TestCase):
         thread = threading.Thread(target=go, name="jarvis-owner")
         thread.start()
         self.assertTrue(
-            self.connector.executing.wait(timeout=10), "execute never started"
+            self.connector.executing.wait(timeout=HANG_GUARD), "execute never started"
         )
         return thread, runs
 
@@ -280,7 +287,7 @@ class LiveStopTestCase(unittest.TestCase):
 
     def finish(self, thread: threading.Thread, runs: list):
         self.connector.release.set()
-        thread.join(timeout=20)
+        thread.join(timeout=HANG_GUARD)
         self.assertFalse(thread.is_alive(), "the owner thread never finished")
         self.assertTrue(runs, "the owner produced no run")
         return runs[0]
@@ -839,6 +846,8 @@ class UnknownAfterStopTests(LiveStopTestCase):
             ),
         )
         egress.raise_on_execute = RuntimeError("the network vanished")
+        # The call stays live until the stop attempt releases it, never a timeout.
+        egress.release_ceiling = HANG_GUARD
         registry = ToolRegistry()
         registry.register(egress)
         core = open_core(
@@ -868,11 +877,12 @@ class UnknownAfterStopTests(LiveStopTestCase):
             )
         )
         thread.start()
-        self.assertTrue(egress.executing.wait(timeout=10), "execute never ran")
+        executed = egress.executing.wait(timeout=HANG_GUARD)
+        self.assertTrue(executed, f"execute never ran; the owner returned {runs!r}")
         # The operator asks to stop while the unknowable call is live.
         self.memory.cancel_task(gated.session.id, task.id)
-        self.assertTrue(egress.signalled.wait(timeout=10), "no stop attempt")
-        thread.join(timeout=20)
+        self.assertTrue(egress.signalled.wait(timeout=HANG_GUARD), "no stop attempt")
+        thread.join(timeout=HANG_GUARD)
         self.assertTrue(runs, "the owner never returned")
         run = runs[0]
 
@@ -1416,9 +1426,9 @@ class AuthorityBarrierTests(LiveStopTestCase):
                 )
             )
             thread.start()
-            self.assertTrue(egress.executing.wait(timeout=10))
+            self.assertTrue(egress.executing.wait(timeout=HANG_GUARD))
             egress.release.set()
-            thread.join(timeout=20)
+            thread.join(timeout=HANG_GUARD)
 
         self.assertEqual(order[:2], ["barrier", "unknown"], f"order: {order}")
         run = runs[0]
