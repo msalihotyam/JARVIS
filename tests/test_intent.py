@@ -707,7 +707,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(INTENT_SYSTEM_PROMPT, command[command.index("--system-prompt") + 1])
         self.assertEqual("", command[command.index("--tools") + 1])
         self.assertIn("--no-session-persistence", command)
-        self.assertEqual(90, adapter.timeout_seconds)
+        self.assertEqual(180, adapter.timeout_seconds)
         self.assertEqual("claude-intent", adapter.name)
         self.assertEqual((INTENT_CAPABILITY,), adapter.manifest.capabilities)
         # The base connector's SAFETY framing is byte-identical to before; the

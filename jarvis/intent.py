@@ -78,7 +78,8 @@ INTENT_ACTION = "understand"
 
 #: Ceilings. A request is one typed sentence or paragraph, not a document.
 INTENT_TEXT_MAX_CHARS = 4_000
-INTENT_TIMEOUT_SECONDS = 90
+#: Long enough for a ~50,000-character reply to finish (DFTIMEOUT, Salih 2026-10-12).
+INTENT_TIMEOUT_SECONDS = 180
 PROPOSAL_TEXT_MAX_CHARS = CHAIN_OBJECTIVE_MAX_CHARS
 PROPOSAL_MAX_ARGUMENTS = 12
 PROPOSAL_ARGUMENT_MAX_CHARS = GMAIL_BODY_MAX_BYTES
