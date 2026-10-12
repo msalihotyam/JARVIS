@@ -8380,12 +8380,12 @@ class ResponseTelemetryTests(SurfaceCase):
         self.assertNotIn("telemetry", user)                                        # never on the person's own message
         # 1400 of the 7400 came from a cache, so the cached share is named beside the total.
         self.assertEqual({"elapsed_ms": 14200, "first_ms": 3800, "tokens": 7400, "cached_tokens": 1400}, reply["telemetry"])
-        self.assertEqual(["14.2 s · First response 3.8 s · 7.4K tokens (1.4K cached)"], self.line(root))
+        self.assertEqual(["First text 3.8 s · total 14.2 s · 7.4K tokens (1.4K cached)"], self.line(root))
         from jarvis.ui.i18n import localization
         self.addCleanup(lambda: localization(_APP).apply("en-US"))
         bridge.setLanguage("tr-TR")
         pump(300)
-        self.assertEqual(["14,2 sn · İlk yanıt 3,8 sn · 7,4K token (1,4K önbellek)"], self.line(root))
+        self.assertEqual(["İlk yanıt 3,8 sn · toplam 14,2 sn · 7,4K token (1,4K önbellek)"], self.line(root))
 
     def test_a_mostly_cached_call_never_reads_as_an_equally_expensive_fresh_one(self) -> None:
         """A call that is 98% cheap cache reads must not show the same bare
@@ -8398,14 +8398,14 @@ class ResponseTelemetryTests(SurfaceCase):
         pump(400)
         self.assertEqual({"elapsed_ms": 1000, "first_ms": 1000, "tokens": 21820, "cached_tokens": 21400},
                          bridge.feed[-1]["telemetry"])
-        self.assertEqual(["1.0 s · First response 1.0 s · 21.8K tokens (21.4K cached)"], self.line(root))
+        self.assertEqual(["First text 1.0 s · total 1.0 s · 21.8K tokens (21.4K cached)"], self.line(root))
         # No cache at all: the same visible total alone, exactly as before this fix.
         bridge2 = self.clocked(self.chatting({"input_tokens": 21820}), 0.0, 1.0)
         root2 = self.window(bridge2)
         bridge2.submitText("Bugün hava nasıl?")
         pump(400)
         self.assertEqual({"elapsed_ms": 1000, "first_ms": 1000, "tokens": 21820}, bridge2.feed[-1]["telemetry"])
-        self.assertEqual(["1.0 s · First response 1.0 s · 21.8K tokens"], self.line(root2))
+        self.assertEqual(["First text 1.0 s · total 1.0 s · 21.8K tokens"], self.line(root2))
 
     def test_no_reported_usage_means_no_token_count_and_no_stream_no_first_text(self) -> None:
         bridge = self.clocked(self.chatting(usage=None, previews=()), 10.0, 12.5)
@@ -8456,13 +8456,15 @@ class ResponseTelemetryTests(SurfaceCase):
                   "error": {"code": "connector_failed", "message": "boom", "retryable": True}, "result": {"summary": "boom"}}
         bridge._run("task", lambda: failed, lambda payload: bridge._apply_run(payload, self.INTENT))
         self.assertFalse([e for e in bridge.feed if "telemetry" in e])
-        # A reply cut off mid-stream is marked incomplete and carries no measurement.
+        # A reply cut off mid-stream is marked incomplete; DFSPEED: it keeps its timing
+        # (first text, total) and nothing else - no token count was reported.
         self.model = StreamingModel(previews=("Yarım",), error=StructuredError(code=ErrorCode.CONNECTOR_FAILED, message="kesildi"))
         bridge = self.clocked(self.bridge(), 0.0, 1.0, 2.0)
         bridge.submitText("Selam")
         interrupted = [e for e in bridge.feed if e.get("interrupted")]
         self.assertTrue(interrupted)
-        self.assertFalse([e for e in bridge.feed if "telemetry" in e])
+        self.assertEqual([interrupted[0]["id"]], [e["id"] for e in bridge.feed if "telemetry" in e])
+        self.assertEqual({"elapsed_ms": 2000, "first_ms": 1000}, interrupted[0]["telemetry"])
 
 
 class TypographySystemTests(SurfaceCase):
@@ -8807,7 +8809,7 @@ class LiveTurnTests(SurfaceCase):
         self.assertEqual(6400, first["elapsed_ms"])                                # the one measured duration
         lines = [str(i.property("text")) for i in self.all_items(root) if i.objectName() == "feedTelemetry" and i.isVisible()]
         self.assertEqual(1, len(lines))
-        self.assertTrue(lines[0].startswith("6.4 s"), lines)
+        self.assertTrue(lines[0].startswith("First text 1.5 s · total 6.4 s"), lines)
         self.assertEqual(1, lines[0].count("6.4 s"))                               # stated once: no second, contradicting duration
         # The next turn: its own start, its own duration; the first answer's stays what it was.
         started = []
@@ -8818,7 +8820,7 @@ class LiveTurnTests(SurfaceCase):
             self.assertEqual(6400, [e for e in bridge.feed if e.get("telemetry")][0]["telemetry"]["elapsed_ms"]),
         ))
         lines = [str(i.property("text")) for i in self.all_items(root) if i.objectName() == "feedTelemetry" and i.isVisible()]
-        self.assertEqual(["3.0 s", "6.4 s"], sorted(line.split(" · ")[0] for line in lines))
+        self.assertEqual(["total 3.0 s", "total 6.4 s"], sorted(line.split(" · ")[1] for line in lines))
 
     @ambient_on          # THIZ: liveActivity.animated is ambient-gated
     def test_waiting_for_the_person_is_said_in_the_chat_calm_and_untimed(self) -> None:

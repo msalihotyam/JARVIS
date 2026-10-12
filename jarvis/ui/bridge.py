@@ -272,6 +272,16 @@ def _cut_feed(seen: str, status: str, intent: Any, payload: Any) -> list[dict[st
     return entries
 
 
+def _waited(payload: Any, queued_ms: int | None) -> Any:
+    """DFSPEED: a queued message's wait, added to its turn's ``timing`` - only when
+    the envelope carries one (a model was asked); anything else passes unchanged."""
+    intent = payload.get("intent") if isinstance(payload, dict) else None
+    usage = intent.get("usage") if isinstance(intent, dict) else None
+    if queued_ms is not None and isinstance(usage, dict) and isinstance(usage.get("timing"), dict):
+        usage["timing"]["queued_ms"] = queued_ms
+    return payload
+
+
 def _guarded(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
@@ -2823,7 +2833,7 @@ class Bridge(QObject):
         for entry in entries:
             # The reply itself; a cut-short reply's notice is JARVIS's own line, not part of it.
             reply = entry["kind"] != "notice" if answered else (kept and entry["kind"] == "jarvis")
-            if answered and reply and "cut" not in entry:
+            if reply and (answered or kept):        # DFSPEED: a reply cut short keeps its timing too
                 measured = self._measured(*self._intent_reports(intent))
                 if measured:
                     entry["telemetry"] = measured
@@ -3200,9 +3210,11 @@ class Bridge(QObject):
 
     def _start_text(self, text: str, session_id: str | None, request_id: str, conversation: Any, groups: tuple,
                     attachments: tuple, mode: str, route: dict, origin: PersistedConversation | None = None,
-                    claude: tuple | None = None) -> None:
+                    claude: tuple | None = None, queued_ms: int | None = None) -> None:
         """Start one new text request: the open conversation's - or (DFQUEUE) a queued
-        message's whose conversation ``origin`` is not open, its screen left untouched."""
+        message's whose conversation ``origin`` is not open, its screen left untouched.
+        ``queued_ms`` (DFSPEED) is how long a queued message waited: it joins the turn's
+        ``timing`` in the envelope's usage record."""
         if origin is None:
             self._task = {}
             if self._clarification or self._decision:   # DFQUEUE: a queued start leaves no old card above it
@@ -3218,10 +3230,11 @@ class Bridge(QObject):
         extra = {} if claude is None else {"claude": claude}
         self._run(
             "task",
-            lambda: self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
-                                             conversation=conversation, context_groups=groups,
-                                             context_attachments=attachments, response_mode=mode,
-                                             on_reply_preview=relay, conversation_id=owner, **route, **extra),
+            lambda: _waited(self.backend.submit_text(text, session_id, request_id=request_id, response_language=language,
+                                                     conversation=conversation, context_groups=groups,
+                                                     context_attachments=attachments, response_mode=mode,
+                                                     on_reply_preview=relay, conversation_id=owner, **route, **extra),
+                            queued_ms),
             self._delivered(lambda payload: self._apply_text(payload, text), snapshots,
                             project=lambda prior, payload: _project_text(prior, payload, text), origin=origin,
                             identity=None if origin is None else (session_id or "", "")),
@@ -4631,7 +4644,8 @@ class Bridge(QObject):
         groups, attachments, mode = self._take_context()
         claude = (self._config.get("claude_model") or None, self._config.get("claude_effort") or None)
         self._queue.append({"id": self._new_id("q-"), "cid": cid, "text": text, "groups": groups,
-                            "attachments": attachments, "mode": mode, "route": self._provider_route(), "claude": claude})
+                            "attachments": attachments, "mode": mode, "route": self._provider_route(), "claude": claude,
+                            "queued_at": self._clock()})
         self.clearContext()
         self._draft_sent(text)              # the New chat screen's conversation exists from now on
         self._refresh_conversations()
@@ -4729,7 +4743,8 @@ class Bridge(QObject):
         request_id = str(uuid4())
         self._request_id = request_id
         self._start_text(text, session_id, request_id, conversation, groups, attachments, entry["mode"], entry["route"],
-                         origin=origin, claude=entry["claude"])
+                         origin=origin, claude=entry["claude"],
+                         queued_ms=max(0, round((self._clock() - entry["queued_at"]) * 1000)))
 
     # -- conversation actions ----------------------------------------------------
 

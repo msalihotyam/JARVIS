@@ -1338,9 +1338,33 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         self._catalog_text = ""
         #: ``(id, media_type, snapshot path)`` of the images THIS call carries.
         self._images: list[tuple[str, str, str]] = []
+        #: DFSPEED: request id -> the ``time.monotonic()`` marks of that call (the auth
+        #: check, the CLI spawn and exit, the first and last streamed text) and the
+        #: streamed characters. Measured only; nothing reads them to decide anything.
+        self.timings: dict[str, dict[str, Any]] = {}
+        self._marks: dict[str, Any] | None = None
 
     def complete(self, task: Task, session: SessionState) -> ToolResult:
         return self.execute(task, session)
+
+    def execute(self, task: Task, session: SessionState) -> ToolResult:
+        self._marks = marks = {"started": time.monotonic()}
+        try:
+            return super().execute(task, session)
+        finally:
+            marks["ended"] = time.monotonic()
+            self.timings[task.id], self._marks = marks, None
+
+    def _mark(self, name: str) -> None:
+        if self._marks is not None:
+            self._marks[name] = time.monotonic()
+
+    def _auth_status(self) -> dict[str, Any] | None:
+        self._mark("auth_started")
+        try:
+            return super()._auth_status()
+        finally:
+            self._mark("auth_ended")
 
     def context_profile(self) -> ContextProfile:
         """What one call through this adapter can carry, REPORTED to the
@@ -1411,6 +1435,13 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         return blob
 
     def _collect_output(self, process: subprocess.Popen[str]) -> tuple[str, str]:
+        self._mark("spawned")               # the CLI process exists and has its request
+        try:
+            return self._read_output(process)
+        finally:
+            self._mark("exited")
+
+    def _read_output(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         listener = self.stream_listener
         if listener is None:
             return super()._collect_output(process)
@@ -1431,11 +1462,16 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         reply = ChatReplyStream()
         shown, last = 0, 0.0
         try:
+            marks = self._marks
             for line in process.stdout:
                 lines.append(line)
+                chunk = _text_delta(line)
+                if chunk and marks is not None:
+                    marks.setdefault("first_text", time.monotonic())
+                    marks["last_text"] = time.monotonic()
+                    marks["output_chars"] = marks.get("output_chars", 0) + len(chunk)
                 if reply.state in ("off", "done"):
                     continue
-                chunk = _text_delta(line)
                 if chunk and reply.feed(chunk):
                     now = time.monotonic()
                     if shown == 0 or now - last >= STREAM_PREVIEW_INTERVAL_SECONDS or reply.state == "done":

@@ -1756,8 +1756,12 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Düşünme %1</translation>
     </message>
     <message>
-        <source>First response %1</source>
+        <source>First text %1</source>
         <translation>İlk yanıt %1</translation>
+    </message>
+    <message>
+        <source>total %1</source>
+        <translation>toplam %1</translation>
     </message>
     <message>
         <source>%1 tokens</source>

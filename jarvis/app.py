@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -3525,6 +3526,36 @@ def _model_usage(model: Any, request_id: str) -> dict[str, Any]:
     return found
 
 
+def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
+    """DFSPEED: one text turn's phases in whole milliseconds, from ``time.monotonic()``
+    marks - measured, never estimated; a phase that did not happen is absent.
+    ``spawn_ms`` / ``first_visible_ms`` count from the turn's start, ``auth_ms`` is the
+    auth check, ``first_text_ms`` the CLI spawn to the first streamed text, ``text_ms``
+    the first to the last, ``parse_ms`` the model's return to the validated verdict."""
+    def ms(a: float, b: float) -> int:
+        return max(0, round((b - a) * 1000))
+
+    start = turn["started"]
+    timings = getattr(turn["model"], "timings", None)
+    call = timings.get(turn["request_id"]) if isinstance(timings, dict) else None
+    call = call if isinstance(call, dict) else {}
+    timing: dict[str, Any] = {"total_ms": ms(start, now)}
+    if "auth_started" in call and "auth_ended" in call:
+        timing["auth_ms"] = ms(call["auth_started"], call["auth_ended"])
+    if "spawned" in call:
+        timing["spawn_ms"] = ms(start, call["spawned"])
+        if "first_text" in call:
+            timing["first_text_ms"] = ms(call["spawned"], call["first_text"])
+            timing["first_visible_ms"] = ms(start, call["first_text"])
+            timing["text_ms"] = ms(call["first_text"], call["last_text"])
+    if "returned" in turn:
+        timing["parse_ms"] = ms(turn["returned"], turn.get("validated", now))
+    chars = call.get("output_chars", turn.get("output_chars"))
+    if type(chars) is int:
+        timing["output_chars"] = chars
+    return timing
+
+
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
 
@@ -3615,8 +3646,12 @@ class JarvisApp:
         # What the call really cost in tokens, as the provider reported it, and
         # the measured sizes of what was sent - filled only after the call.
         usage: dict[str, Any] = {}
+        # DFSPEED: when this turn's phases happened; ``timing`` in ``usage`` once a model is asked.
+        turn: dict[str, Any] = {"started": time.monotonic(), "request_id": request_id}
 
         def respond(*args: Any, **kwargs: Any) -> CommandResult:
+            if "model" in turn:
+                usage["timing"] = _turn_timing(turn, time.monotonic())
             return text_result(*args, usage=usage, **kwargs)
 
         def refused(status: IntentStatus, message: str, reason: str = "") -> CommandResult:
@@ -3682,6 +3717,7 @@ class JarvisApp:
         # iff eligible for this call's own classification. Guidance only.
         intent_scope = ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION)
         instruction = self._intent_instruction(owner, intent_scope, usage)
+        turn["model"] = model
         if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
             # Strict isolation: one call per group, merged into one reply.
             return self._answer_groups_separately(
@@ -3747,6 +3783,7 @@ class JarvisApp:
         finally:
             if streams:
                 model.stream_listener = None
+        turn["returned"] = time.monotonic()
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)
         usage.update({
@@ -3765,6 +3802,8 @@ class JarvisApp:
         if cancelled:
             return refused(IntentStatus.MODEL_CANCELLED, "The understanding call was cancelled.")
         answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if isinstance(result.data, dict) else None
+        if type(answer) is ModelAnswer and answer.present:
+            turn["output_chars"] = len(answer.content)      # when nothing streamed
         # DFREPLY: a chat reply too long to keep whole is kept up to the ceiling as
         # what it is - text to show, cut short. Nothing else of the answer is read,
         # so no proposal is resolved and nothing can be executed from it.
@@ -3787,6 +3826,7 @@ class JarvisApp:
         # Only the user's CURRENT turn may choose among several configured
         # destinations - never the model, and never an earlier turn.
         resolution = resolve_proposal(proposal, catalog, now, text)
+        turn["validated"] = time.monotonic()
         # K3 (E1): the model chooses only "" or "desktop"; a path, a read window
         # or any other field is refused before a task can exist.
         if (resolution.status is IntentStatus.STRUCTURED and resolution.capability == PROJECT_FOLDER_CAPABILITY

@@ -151,7 +151,7 @@ Item {
     // -- response telemetry: measured, never estimated ----------------------------
     // Seconds with one decimal below a minute, whole minutes and seconds above;
     // tokens as the provider reported them. "Thinking" is only ever a provider's
-    // own reasoning time; otherwise the second figure is the first visible text.
+    // own reasoning time; otherwise a streamed answer reads "first text · total" (DFSPEED).
     function duration(ms, locale) {
         if (ms < 60000) return qsTr("%1 s").arg(Number(ms / 1000).toLocaleString(Qt.locale(locale), "f", 1))
         var total = Math.round(ms / 1000)
@@ -161,7 +161,8 @@ Item {
         if (!t || t.elapsed_ms === undefined) return ""
         var parts = [duration(t.elapsed_ms, locale)]
         if (t.thinking_ms !== undefined) parts.push(qsTr("Thinking %1").arg(duration(t.thinking_ms, locale)))
-        else if (t.first_ms !== undefined) parts.push(qsTr("First response %1").arg(duration(t.first_ms, locale)))
+        else if (t.first_ms !== undefined)
+            parts = [qsTr("First text %1").arg(duration(t.first_ms, locale)), qsTr("total %1").arg(duration(t.elapsed_ms, locale))]
         if (t.tokens !== undefined) {
             var tokenText = t.tokens < 1000 ? qsTr("%1 tokens").arg(t.tokens)
                                             : qsTr("%1K tokens").arg(Number(t.tokens / 1000).toLocaleString(Qt.locale(locale), "f", 1))
