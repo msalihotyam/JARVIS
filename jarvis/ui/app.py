@@ -26,6 +26,37 @@ MAIN_QML = QML_DIR / "Main.qml"
 FIRST_SWEEP_MS = 2_500
 SWEEP_INTERVAL_MS = 30_000
 
+#: DFFONTTRY dev switch (dev/font_try.ps1), read once at startup; never a
+#: setting, never persisted. O = Qt's FreeType engine with vertical hinting,
+#: T = O with stem darkening (build/reports/DFFONTLAB2.md). Unset or any
+#: other value is today's native path, untouched.
+FONT_RENDER_ENV = "JARVIS_FONT_RENDER"
+
+
+def apply_font_render_env() -> str:
+    """Before the QApplication exists: the mode's environment. Returns the mode.
+
+    ``setdefault``, so a platform the caller already chose (the tests'
+    offscreen) keeps winning."""
+    mode = os.environ.get(FONT_RENDER_ENV)
+    if mode not in ("O", "T") or sys.platform != "win32":
+        return "native"
+    os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
+    if mode == "T":
+        os.environ.setdefault("FREETYPE_PROPERTIES", "autofitter:no-stem-darkening=0")
+    return mode
+
+
+def apply_font_render_hinting(app, mode: str) -> None:
+    """After the QApplication exists: O and T hint vertically, app-wide."""
+    if mode == "native":
+        return
+    from PySide6.QtGui import QFont
+
+    font = app.font()
+    font.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
+    app.setFont(font)
+
 
 def _text_focus_release():
     """An event filter for the window: a press outside the text editor that has
@@ -138,6 +169,7 @@ def main(argv: list[str] | None = None, *, instance: str | None = None) -> int:
     # The Basic style is the one whose look this UI fully overrides; nothing
     # of the platform's stock widget styling is meant to show through.
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
+    font_render = apply_font_render_env()
     # A QApplication (a QGuiApplication with widgets) because the system tray
     # icon and its menu are widgets; the interface itself stays QML.
     from PySide6.QtGui import QIcon
@@ -147,6 +179,7 @@ def main(argv: list[str] | None = None, *, instance: str | None = None) -> int:
     from jarvis.ui.tray import TrayController, install_tray
 
     app = QApplication(argv if argv is not None else sys.argv)
+    apply_font_render_hinting(app, font_render)
     # Later launches are heard from now on; the lock lives as long as the process.
     server = single_instance.InstanceServer(name, app) if name else None
     app._jarvis_instance = (lock, server)
