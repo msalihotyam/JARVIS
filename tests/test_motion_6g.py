@@ -60,6 +60,9 @@ EXCEPTIONS = (
      "a sidebar row's violet blink (6G R3 D1): a rhythm only while that conversation's run really runs"),
     ("components/StatusDot.qml", 1800,
      "a finished row's slow green pulse (6G R3 D2): a rhythm only until that conversation is opened"),
+    ("components/WindowPowerFx.qml", None,
+     "the window power-down/power-up (Salih 2026-10-12: richer and slower than the 220 ms transition "
+     "range; a real window state change)"),
 )
 # Loops allowed to run forever, each a rhythm of a real state or the ambient atmosphere.
 INFINITE = {
