@@ -145,13 +145,15 @@ def ui_modules(names: list[str]) -> set[str]:
 
 
 def load_sensitive() -> set[str]:
-    """Test ids (``Class.test_name``) the orchestrator listed as load-sensitive."""
+    """Test ids (``module.Class.test_name``) the orchestrator listed as load-sensitive: only the
+    "Load-sensitive list" item of the state file counts, never an id mentioned elsewhere in it."""
     try:
         text = STATE.read_text(encoding="utf-8")
     except OSError:
         return set()
-    flat = re.sub(r"\s+", " ", text)
-    return {f"{m.group(1)}.{m.group(2)}" for m in re.finditer(r"test_ui\.(\w+)\.(test_\w+)", flat)}
+    section = re.search(r"^- Load-sensitive list.*?(?=^- |^#|\Z)", text, re.MULTILINE | re.DOTALL)
+    flat = re.sub(r"\s+", " ", section.group(0)) if section else ""
+    return set(re.findall(r"\b(test_\w+\.\w+\.test_\w+)", flat))
 
 
 # -- discovery (in its own process) ---------------------------------------------
@@ -684,7 +686,7 @@ def _report_failures(broken: list[Result], args, bases: list[Path], rule_d: list
     allowed = load_sensitive()
     named = [test for r in broken for test in r.failed]
     only_known = (not args.no_rerun and bool(named) and all(r.parsed and r.accounted for r in broken)
-                  and all(key in allowed and module == "test_ui" for key, module in named)
+                  and all(f"{module}.{key}" in allowed for key, module in named)
                   and sum(len(r.failed) for r in broken) == sum(r.failures + r.errors for r in broken))
     for result in broken:
         print(f"\n===== FAILED: {result.label} (exit {result.returncode}) {' '.join(result.command[2:])}")
@@ -693,13 +695,13 @@ def _report_failures(broken: list[Result], args, bases: list[Path], rule_d: list
         return False
     print("\nOnly load-sensitive tests failed; rerunning each alone once (rule D):")
     green = True
-    for key, _module in dict.fromkeys(named):
-        command = [args.python, "-m", "unittest", f"tests.test_ui.{key}"]
+    for key, module in dict.fromkeys(named):
+        command = [args.python, "-m", "unittest", f"tests.{module}.{key}"]
         done = subprocess.run(command, cwd=ROOT, env=worker_env(99, bases), capture_output=True, text=True,
                               encoding="utf-8", errors="replace")
         passed = done.returncode == 0
-        rule_d.append({"test": key, "alone": "PASS" if passed else "FAIL"})
-        print(f"  {key}: {'PASS' if passed else 'FAIL'} alone (first run failed)")
+        rule_d.append({"test": f"{module}.{key}", "alone": "PASS" if passed else "FAIL"})
+        print(f"  {module}.{key}: {'PASS' if passed else 'FAIL'} alone (first run failed)")
         if not passed:
             print(done.stdout + done.stderr)
         green &= passed

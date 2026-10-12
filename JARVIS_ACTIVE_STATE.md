@@ -151,8 +151,13 @@ open. Next: integrate on "entegre et".
   timed out its 10 s wait for the approval card on CI shard 4/4, run
   38109324177, test 15.3 s and module 74 s there vs 7 s locally; every test
   pauses a real worker thread, so all of them depend on timing. Its waits are now
-  60 s and a timeout names its condition and the bridge state). `scripts/test_parallel.py`
-  reruns only `test_ui` ids itself; rule D for the others is applied by hand.
+  60 s and a timeout names its condition and the bridge state),
+  `test_dfreply.LongMarkdownTests.test_a_50000_character_markdown_reply_renders_whole`
+  and
+  `test_dfwin.WindowPowerV2Tests.test_the_power_up_ignites_the_core_then_unfolds_the_content`
+  (orchestrator 2026-10-13: render/animation timing under parallel lanes; pass alone).
+  `scripts/test_parallel.py` reruns every listed `module.Class.test` id itself; rule D
+  for whole-module entries is applied by hand.
 - Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
 - Push: `main` not authorized; `ci/*` branches are standing-authorized
   (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
