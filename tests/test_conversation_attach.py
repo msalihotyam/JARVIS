@@ -201,13 +201,17 @@ class AttachStoreTests(StoreCase):
 
     def test_a_the_reserved_v21_table_contract(self) -> None:
         self.assertEqual("conversation_global_memory_toggles", CONVERSATION_GLOBAL_MEMORY_TOGGLES)
-        self.assertNotIn(CONVERSATION_GLOBAL_MEMORY_TOGGLES, COMPATIBILITY_SCHEMA_OBJECTS)
+        self.assertIn(CONVERSATION_GLOBAL_MEMORY_TOGGLES, COMPATIBILITY_SCHEMA_OBJECTS)
         with contextlib.closing(sqlite3.connect(self.database)) as connection:
-            self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = ?",
-                                                 (CONVERSATION_GLOBAL_MEMORY_TOGGLES,)).fetchone())  # 6C never creates it
-            # A V2.1-shaped table with a row for this conversation: never movable.
-            connection.execute(f"CREATE TABLE {CONVERSATION_GLOBAL_MEMORY_TOGGLES} (conversation_id TEXT NOT NULL, enabled_at TEXT)")
-            connection.execute(f"INSERT INTO {CONVERSATION_GLOBAL_MEMORY_TOGGLES} VALUES (?, 'a')", (self.conversation.id,))
+            self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = ?",
+                                                    (CONVERSATION_GLOBAL_MEMORY_TOGGLES,)).fetchone())  # V2.1 creates it, empty
+            self.assertEqual(0, connection.execute(f"SELECT COUNT(*) FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES}").fetchone()[0])
+        # An empty table changes nothing: attach is allowed.
+        self.assertEqual("", self.memory.conversation_attach_preview(self.conversation.id, project_id=self.p.id)["blocked"])
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            # A row for this conversation: never movable.
+            connection.execute(f"INSERT INTO {CONVERSATION_GLOBAL_MEMORY_TOGGLES} (conversation_id, enabled, actor, at)"
+                               " VALUES (?, 1, 'user', 'a')", (self.conversation.id,))
             connection.commit()
         self.assertRefusedNothingWritten(lambda: self.attach(project_id=self.p.id), "all projects memory")
         other = self.memory.create_conversation()

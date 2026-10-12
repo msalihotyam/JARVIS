@@ -119,7 +119,7 @@ class StoreCase(unittest.TestCase):
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
             for name in sorted(COMPATIBILITY_SCHEMA_OBJECTS & tables):
-                connection.execute(f"DROP TABLE {name}")
+                connection.execute(f"DROP TABLE IF EXISTS {name}")
             connection.commit()
         finally:
             connection.close()

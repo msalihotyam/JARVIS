@@ -97,7 +97,9 @@ def say(memory, conversation_id: str, text: str) -> None:
 def dump(database) -> dict:
     with contextlib.closing(sqlite3.connect(database)) as connection:
         tables = [r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
-        return {t: connection.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in tables}
+        without_rowid = {r[0] for r in connection.execute("SELECT name FROM pragma_table_list WHERE wr = 1")}
+        return {t: connection.execute(f"SELECT * FROM {t}" + ("" if t in without_rowid else " ORDER BY rowid")).fetchall()
+                for t in tables}
 
 
 class SidebarDataCase(ProjectsUiCase):

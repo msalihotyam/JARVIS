@@ -740,7 +740,111 @@ CREATE TABLE IF NOT EXISTS project_folder_links (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_folder_links_current
     ON project_folder_links(project_id) WHERE unlinked_at IS NULL;
+CREATE TABLE IF NOT EXISTS memory_records (
+    record_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('fact', 'decision', 'rule', 'lesson', 'preference')),
+    text TEXT NOT NULL CHECK (length(text) > 0),
+    subject_key TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    conversation_id TEXT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind = 'project'),
+    origin TEXT NOT NULL CHECK (origin IN ('explicit_user', 'capture_session_end',
+        'capture_precompact', 'consolidation', 'import', 'legacy_m1')),
+    actor TEXT NOT NULL CHECK (actor IN ('user', 'model', 'tool')),
+    tool TEXT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    classification TEXT NOT NULL CHECK (classification IN ('public', 'internal', 'sensitive')),
+    created_at TEXT NOT NULL,
+    last_verified_at TEXT NULL,
+    expires_at TEXT NULL,
+    supersedes TEXT NULL,
+    source_conversation_id TEXT NULL,
+    source_turn_ids TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_memory_records_subject
+    ON memory_records(project_id, subject_key);
+CREATE TABLE IF NOT EXISTS memory_record_events (
+    event_id INTEGER PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES memory_records(record_id),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'retracted',
+        'superseded', 'expired')),
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_record_events_record
+    ON memory_record_events(record_id, event_id);
+CREATE TABLE IF NOT EXISTS memory_record_supersessions (
+    old_record_id TEXT PRIMARY KEY REFERENCES memory_records(record_id),
+    new_record_id TEXT NOT NULL REFERENCES memory_records(record_id),
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    CHECK (old_record_id <> new_record_id)
+);
+CREATE TABLE IF NOT EXISTS conversation_global_memory_toggles (
+    conversation_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_capture_runs (
+    run_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    trigger TEXT NOT NULL CHECK (trigger IN ('session_end', 'precompact', 'import', 'manual')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    outcome TEXT NULL,
+    counts TEXT NOT NULL DEFAULT '{}'
+);
 """
+
+# V2.1 typed memory (above): every memory_record* table and the toggle table
+# are append-only - a record's status is its LATEST memory_record_events row
+# (highest event_id), a replacement is a memory_record_supersessions row -
+# and nothing here offers an UPDATE or DELETE of them.
+
+#: The FTS5 index over record text + subject_key. Its rows are written by the
+#: record store in the same transaction as the record; retrieval falls back to
+#: LIKE wherever ``memory_records_fts_available`` says False.
+MEMORY_RECORDS_FTS = "memory_records_fts"
+_MEMORY_RECORDS_FTS_SQL = (
+    f"CREATE VIRTUAL TABLE IF NOT EXISTS {MEMORY_RECORDS_FTS} USING fts5("
+    "record_id UNINDEXED, text, subject_key, tokenize = 'unicode61 remove_diacritics 2')"
+)
+
+
+def _sqlite_has_fts5() -> bool:
+    """Fail-closed probe: the exact DDL on a throwaway in-memory database."""
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute(_MEMORY_RECORDS_FTS_SQL)
+        finally:
+            probe.close()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+#: Whether this process's SQLite can build the FTS5 index at all.
+MEMORY_RECORDS_FTS5_AVAILABLE = _sqlite_has_fts5()
+
+
+def memory_records_fts_available(connection: sqlite3.Connection) -> bool:
+    """Read-only: True only when this SQLite has FTS5 AND this database holds
+    the index. Any doubt (unreadable schema) is False, so callers use LIKE."""
+    if not MEMORY_RECORDS_FTS5_AVAILABLE:
+        return False
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (MEMORY_RECORDS_FTS,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
 
 def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
     """Idempotent on every open. Statement by statement, NOT ``executescript``
@@ -749,7 +853,37 @@ def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
     for statement in COMPATIBILITY_SCHEMA_SQL.split(";"):
         if statement.strip():
             connection.execute(statement)
+    if not MEMORY_RECORDS_FTS5_AVAILABLE:
+        return
+    # In a savepoint: a failing CREATE leaves no table and never fails the open.
+    connection.execute("SAVEPOINT memory_records_fts")
+    try:
+        connection.execute(_MEMORY_RECORDS_FTS_SQL)
+    except sqlite3.Error as error:
+        connection.execute("ROLLBACK TO memory_records_fts")
+        _log.warning("memory_records_fts not created (%s); retrieval uses LIKE", error)
+    connection.execute("RELEASE memory_records_fts")
 
+
+#: The V2.1 typed-memory objects of the compatibility layer; the FTS index and
+#: its five FTS5 shadow tables only where this SQLite can build them.
+MEMORY_V21_SCHEMA_OBJECTS = frozenset(
+    {
+        "memory_records",
+        "idx_memory_records_subject",
+        "memory_record_events",
+        "idx_memory_record_events_record",
+        "memory_record_supersessions",
+        "conversation_global_memory_toggles",
+        "memory_capture_runs",
+    }
+    | (
+        {MEMORY_RECORDS_FTS}
+        | {f"{MEMORY_RECORDS_FTS}_{shadow}" for shadow in ("data", "idx", "content", "docsize", "config")}
+        if MEMORY_RECORDS_FTS5_AVAILABLE
+        else set()
+    )
+)
 
 #: Every object the compatibility layer owns - kept apart from the numbered
 #: schema's objects so a migration test can still say exactly what ITS step
@@ -770,7 +904,7 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "project_folder_links",
         "idx_project_folder_links_current",
     }
-)
+) | MEMORY_V21_SCHEMA_OBJECTS
 
 #: The one pre-V2 copy, beside the database: ``<stem>.pre-v2<suffix>``.
 PRE_V2_BACKUP_TAG = ".pre-v2"
@@ -778,7 +912,7 @@ PRE_V2_BACKUP_TAG = ".pre-v2"
 #: A caller that does not filter conversations by owner.
 ANY_OWNER = object()
 
-#: RESERVED for V2.1 (future compatibility contract; never created here): the
+#: V2.1 compatibility table (append-only, created empty on every open): the
 #: per-conversation "all projects memory" record. A conversation with any row
 #: in it can never be attached to a project (Gate 6C, Salih decision).
 CONVERSATION_GLOBAL_MEMORY_TOGGLES = "conversation_global_memory_toggles"
@@ -5864,9 +5998,9 @@ class SQLiteMemoryStore:
     def _attach_toggle_refusal(connection: sqlite3.Connection, conversation_id: str) -> str | None:
         """FUTURE COMPATIBILITY CONTRACT (V2.1): a conversation that EVER had
         "all projects memory" on can never be attached (Salih decision). V2.1
-        owns the reserved table ``conversation_global_memory_toggles``
-        (append-only, explicit-user writes only, keyed by conversation_id);
-        6C never creates it. Evaluated on every call: absent -> no refusal; a
+        owns the table ``conversation_global_memory_toggles`` (append-only,
+        explicit-user writes only, keyed by conversation_id); the compatibility
+        layer creates it empty. Evaluated on every call: absent -> no refusal; a
         row for the conversation -> refused; present but unreadable -> refused."""
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
