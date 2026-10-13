@@ -61,8 +61,8 @@ def _load_store(store: SQLiteMemoryStore, fixture: dict) -> tuple[dict, dict]:
     return projects, labels
 
 
-def _search(store, text, scope, strategy):
-    """Return [(record, rank)] best first, at most K."""
+def _search(store, text, scope, strategy, labels):
+    """Return [(record, rank)] best first, at most K; ties break by fixture label."""
     if strategy == "and":
         return [(view.record, rank) for view, rank in store.search_records(text, scope, limit=K)]
     # ponytail: OR merge in Python over the public API; a real OR mode belongs in memory.py if adopted.
@@ -72,7 +72,7 @@ def _search(store, text, scope, strategy):
             entry = hits.setdefault(view.record.record_id, [view.record, 0, 0.0])
             entry[1] += 1
             entry[2] += rank
-    ordered = sorted(hits.values(), key=lambda e: (-e[1], e[2], e[0].record_id))
+    ordered = sorted(hits.values(), key=lambda e: (-e[1], e[2], labels.get(e[0].record_id, "?")))
     return [(record, matched) for record, matched, _ in ordered[:K]]
 
 
@@ -81,7 +81,7 @@ def _run_mode(store, fixture, projects, labels, strategy) -> dict:
     leaks = 0
     for query in fixture["queries"]:
         project_id = projects[query["project"]]
-        results = _search(store, query["text"], MemoryRecordScope(project_id), strategy)
+        results = _search(store, query["text"], MemoryRecordScope(project_id), strategy, labels)
         leaked = [r for r, _ in results if r.scope.project_id != project_id]
         leaks += len(leaked)
         got = [labels.get(r.record_id, "?") for r, _ in results]
