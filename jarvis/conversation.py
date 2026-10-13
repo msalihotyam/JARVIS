@@ -74,6 +74,8 @@ _CUT_LINE = re.compile(r"\n\n\[reply cut short: (" + "|".join(CUT_REASONS) + r")
 DIGEST_MAX_CHARS = 240
 #: Raw turns the record keeps; older turns keep their digest only.
 RAW_TURNS_MAX = 160
+#: Raw turns the person's "Oturumu sıkıştır" (``compact_now``) keeps.
+COMPACT_KEEP_LAST = 6
 #: Digest lines the record keeps; older ones are counted, not kept.
 COMPACTED_MAX = 600
 #: Pins the record keeps (active and retired); retired ones go first.
@@ -431,14 +433,23 @@ def append_turn(state: ConversationState, *, role: str, kind: str, text: str, me
                 role=role, kind=kind, text=text, message=str(message)[:TURN_MAX_CHARS] if role == "user" else "",
                 capability=str(capability)[:200], destination=str(destination)[:400],
                 refs=tuple(dict(r) for r in refs), ts=int(now if now is not None else time.time()))
-    turns = state.turns + (turn,)
-    compacted, omitted = state.compacted, state.omitted
-    if on_compact is not None and len(turns) > raw_turns_max:
+    compacted = _compact(replace(state, turns=state.turns + (turn,)), raw_turns_max, on_compact)
+    pins = update_pins(state.pins, turn) if role == "user" else state.pins
+    keys = state.keys + ((key,) if key else ())
+    return replace(compacted, pins=pins, keys=keys[-(raw_turns_max * 4):], next_seq=seq + 1), turn
+
+
+def _compact(state: ConversationState, keep: int,
+             on_compact: Callable[[tuple[Turn, ...]], None] | None) -> ConversationState:
+    """``state`` with all but its last ``keep`` raw turns compacted to digests.
+    The one compaction: ``append_turn`` at the threshold and ``compact_now``."""
+    turns, compacted, omitted = state.turns, state.compacted, state.omitted
+    if on_compact is not None and len(turns) > keep:
         try:
-            on_compact(turns[: len(turns) - raw_turns_max])
+            on_compact(turns[: len(turns) - keep])
         except Exception:  # noqa: BLE001 - capture never blocks compaction (I12)
             pass
-    while len(turns) > raw_turns_max:
+    while len(turns) > keep:
         # Older history compacts into the checkpoint; it does not disappear.
         old, turns = turns[0], turns[1:]
         compacted = compacted + (Compacted(seq=old.seq, role=old.role, kind=old.kind,
@@ -446,10 +457,21 @@ def append_turn(state: ConversationState, *, role: str, kind: str, text: str, me
     if len(compacted) > COMPACTED_MAX:
         omitted += len(compacted) - COMPACTED_MAX
         compacted = compacted[-COMPACTED_MAX:]
-    pins = update_pins(state.pins, turn) if role == "user" else state.pins
-    keys = state.keys + ((key,) if key else ())
-    return replace(state, turns=turns, compacted=compacted, omitted=omitted, pins=pins,
-                   keys=keys[-(raw_turns_max * 4):], next_seq=seq + 1), turn
+    return replace(state, turns=turns, compacted=compacted, omitted=omitted)
+
+
+def compact_now(conversation: "PersistedConversation", keep_last: int = COMPACT_KEEP_LAST) -> bool:
+    """The person's "Oturumu sıkıştır": compact ``conversation`` down to its
+    last ``keep_last`` raw turns with the same compaction ``append_turn``
+    uses, the PreCompact hook firing first on the stored record. True when
+    written or nothing was left to compact; False (``diagnostic`` says why)
+    when the store refused it."""
+    if type(keep_last) is not int or keep_last < 0:
+        raise ValueError("keep_last must be a non-negative int")
+    if len(conversation.state.turns) <= keep_last:
+        return True
+    on_compact = conversation._precompact()
+    return conversation._change(lambda base: _compact(base, keep_last, on_compact))
 
 
 # -- titles -------------------------------------------------------------------
@@ -910,14 +932,18 @@ class PersistedConversation:
         fields = dict(fields, now=turn.ts)
         # The hook fires on the stored apply only (it runs once, on the
         # authoritative record), never on the local preview above.
+        on_compact = self._precompact()
+        return turn if self._change(
+            lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, on_compact=on_compact, **fields)[0]
+        ) else None
+
+    def _precompact(self) -> Callable[[tuple[Turn, ...]], None] | None:
+        """This conversation's PreCompact callback, or ``None`` when no hook."""
         try:
             hook = _PRECOMPACT_HOOKS.get(self.store) if self.store is not None and self.id is not None else None
         except TypeError:  # a store that cannot be weakly keyed has no hook
             hook = None
-        on_compact = None if hook is None else (lambda turns, cid=self.id: hook(cid, turns))
-        return turn if self._change(
-            lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, on_compact=on_compact, **fields)[0]
-        ) else None
+        return None if hook is None else (lambda turns, cid=self.id: hook(cid, turns))
 
     def name_auto(self, ids: Iterable[str], auto: str) -> None:
         ids = tuple(ids)

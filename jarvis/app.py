@@ -19,6 +19,8 @@ import math
 import re
 import threading
 import time
+from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -209,9 +211,12 @@ from jarvis.intent import (
 )
 from jarvis.context_usage import context_usage
 from jarvis.conversation import (
+    COMPACT_KEEP_LAST,
     ConversationState,
+    PersistedConversation,
     argv_chars,
     assemble_context,
+    compact_now,
     context_fields,
     context_profile_of,
     json_text,
@@ -3674,6 +3679,27 @@ class MemoryTriggers:
 
 MEMORY_TRIGGERS = MemoryTriggers()
 
+#: Conversations with a reply in flight in this process (per-call ``JarvisApp``s
+#: share it), so "Oturumu sıkıştır" never compacts under a streaming reply.
+_REPLYING: Counter[str] = Counter()
+_REPLYING_LOCK = threading.Lock()
+
+
+@contextmanager
+def _replying(conversation_id: str | None):
+    if not conversation_id:
+        yield
+        return
+    with _REPLYING_LOCK:
+        _REPLYING[conversation_id] += 1
+    try:
+        yield
+    finally:
+        with _REPLYING_LOCK:
+            _REPLYING[conversation_id] -= 1
+            if _REPLYING[conversation_id] <= 0:
+                del _REPLYING[conversation_id]
+
 
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
@@ -3714,7 +3740,12 @@ class JarvisApp:
     def permission_mode(self) -> PermissionMode:
         return self.settings.permission_mode
 
-    def submit_text(
+    def submit_text(self, text: str, session_id: str | None = None, **kwargs: Any) -> CommandResult:
+        """``_submit_text``, with its conversation marked as replying meanwhile."""
+        with _replying(kwargs.get("conversation_id")):
+            return self._submit_text(text, session_id, **kwargs)
+
+    def _submit_text(
         self,
         text: str,
         session_id: str | None = None,
@@ -4300,6 +4331,33 @@ class JarvisApp:
             "turns_until_autocompact": usage.turns_until_autocompact,
             "label_key": usage.label_key,
         }
+
+    def compact_conversation(self, conversation_id: str, keep_last: int = COMPACT_KEEP_LAST) -> dict[str, Any]:
+        """"Oturumu sıkıştır": compact the stored conversation now (PreCompact
+        capture first, see ``compact_now``) and return its new context usage.
+        Refused while a reply for it is streaming, and when the store refuses."""
+        if type(conversation_id) is not str:
+            return {"ok": False, "error": "Unknown conversation."}
+        # ponytail: one process-wide lock held through the compaction write, so no reply
+        # (of any conversation) starts mid-compaction; per-conversation marks if that stalls.
+        with _REPLYING_LOCK:
+            if _REPLYING.get(conversation_id):
+                return {"ok": False, "error": "A reply is still streaming; compact after it finishes."}
+            try:
+                record = self.memory.load_conversation(conversation_id)
+                state = self.memory.load_conversation_state(conversation_id)
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False, "error": f"Unknown conversation: {conversation_id}."}
+            if record is None or record.archived_at is not None:
+                return {"ok": False, "error": f"Conversation is archived or unknown: {conversation_id}."}
+            conversation = PersistedConversation(self.memory, conversation_id, state)
+            try:
+                written = compact_now(conversation, keep_last)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+        if not written:
+            return {"ok": False, "error": conversation.diagnostic or "The conversation could not be compacted."}
+        return self.context_usage_payload(conversation_id)
 
     # -- Gate 6H H3 (K3): the project folder from chat ------------------------
 
