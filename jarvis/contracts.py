@@ -18,7 +18,8 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
-    from jarvis.conversation import ConversationRecord
+    from jarvis.conversation import ConversationRecord, ConversationState
+    from jarvis.memory import MemoryRecordView
 
 # Scheduler phase 1A kernels. Both are PURE - stdlib only, no persistence, no
 # clock, no Core import - so depending on them here creates no cycle, and the
@@ -9504,6 +9505,12 @@ class MemoryStore(Protocol):
     def conversation_for_session(self, session_id: str) -> str | None: ...
 
     def load_conversation(self, conversation_id: str) -> "ConversationRecord | None": ...
+
+    #: V2.1 capture: a conversation's turns, and the one V2.1 record write
+    #: boundary (the store filters again and decides the status).
+    def load_conversation_state(self, conversation_id: str) -> "ConversationState": ...
+
+    def insert_record(self, record: MemoryRecord) -> "MemoryRecordView": ...
 
     #: Gate 5. Pure reads: the deterministic excerpt selection for a task, and
     #: one chunk with its file's current state for re-proof.

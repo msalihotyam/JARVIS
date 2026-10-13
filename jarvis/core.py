@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import AbstractSet, Any, Callable
 
@@ -66,8 +67,16 @@ from jarvis.contracts import (
     LocalWriteRecord,
     LoopStage,
     MemoryOrigin,
+    MemoryRecord,
+    MemoryRecordActor,
+    MemoryRecordCandidate,
+    MemoryRecordKind,
+    MemoryRecordOrigin,
+    MemoryRecordScope,
+    MemoryRecordStatus,
     MemoryRetrievalQuery,
     MemoryStore,
+    ModelAdapter,
     ModelAnswer,
     MonetaryState,
     OutboundDataPreview,
@@ -110,6 +119,7 @@ from jarvis.contracts import (
     local_write_source_refusal,
     merge_side_effects,
     model_answer_refusal,
+    utc_now,
     nano_usd,
     require_billing_class,
     result_to_dict,
@@ -174,7 +184,8 @@ from jarvis.progress import (
     set_issue,
     set_waiting_issue,
 )
-from jarvis import project_files
+from jarvis import memory_capture, project_files
+from jarvis.memory_filter import classify_candidate_text
 from jarvis.registry import (
     AmbiguousConnectorError,
     ConnectorNotFoundError,
@@ -594,6 +605,131 @@ class _LiveStopWatcher:
                 # discarded silently, and read by nothing that decides
                 # anything.
                 self.last_stop_error = exc
+
+
+#: The capture origins Core runs, mapped to their ``memory_capture_runs``
+#: trigger. Core sets the origin; nothing from model output does.
+_CAPTURE_TRIGGERS = {
+    MemoryRecordOrigin.CAPTURE_SESSION_END: "session_end",
+    MemoryRecordOrigin.CAPTURE_PRECOMPACT: "precompact",
+}
+#: The named tool every captured record is attributed to.
+_CAPTURE_TOOL = "memory_capture"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryCaptureOutcome:
+    """What one ``AgentCore.capture_memory`` call did.
+
+    ``outcome`` is ``ok`` or the fail-closed reason; a refusal before the
+    record writes (bad trigger, conversation, run store, provider, answer or
+    parse) wrote no record, and ``record_ids`` lists what an ``ok`` run
+    wrote. ``duplicate`` means this conversation, trigger and turn
+    range was already captured and nothing ran. Counts never carry text.
+    """
+
+    run_id: str
+    outcome: str
+    record_ids: tuple[str, ...] = ()
+    approved: int = 0
+    pending: int = 0
+    refused: int = 0
+    dropped: int = 0
+    failed: int = 0
+    duplicate: bool = False
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "approved": self.approved,
+            "pending": self.pending,
+            "refused": self.refused,
+            "dropped": self.dropped,
+            "failed": self.failed,
+        }
+
+
+def _validated_capture_candidate(
+    value: Any, known_turn_ids: frozenset[str], user_turn_ids: frozenset[str]
+) -> MemoryRecordCandidate | None:
+    """Re-check one parsed candidate in Core before it reaches the store.
+
+    The parser already refused authority keys and unknown evidence; this is
+    Core's own deterministic check, so a parser regression cannot widen what
+    is stored. At least one evidence turn must be the user's own: a reply or
+    a tool result (web, file, GitHub content) alone is not something the user
+    stated, and FACT/LESSON would be auto-approved from it. ``None`` means
+    refuse.
+    """
+    if type(value) is not MemoryRecordCandidate:
+        return None
+    if type(value.kind) is not MemoryRecordKind:
+        return None
+    if type(value.text) is not str or type(value.subject_key) is not str:
+        return None
+    if type(value.evidence_turn_ids) is not tuple or not value.evidence_turn_ids:
+        return None
+    if not all(turn_id in known_turn_ids for turn_id in value.evidence_turn_ids):
+        return None
+    if not any(turn_id in user_turn_ids for turn_id in value.evidence_turn_ids):
+        return None
+    for text in (value.text, value.subject_key):
+        try:
+            if not classify_candidate_text(text).allowed:
+                return None
+        except Exception:  # noqa: BLE001 - a filter error refuses
+            return None
+    return value
+
+
+def _capture_run_connection(store: Any) -> Any:
+    # ponytail: MemoryStore has no capture-run API yet (jarvis/memory.py is
+    # another lane's), so the ledger uses the SQLite store's write transaction.
+    # Any other store has no ledger: capture fails closed before the model call.
+    # Upgrade: public claim/finish methods on MemoryStore, then drop this.
+    connection = getattr(store, "_connection", None)
+    if not callable(connection):
+        raise RuntimeError("the memory store has no capture-run ledger")
+    return connection(write=True)
+
+
+def _global_memory_ever_used(store: Any, conversation_id: str) -> bool:
+    """Whether "all projects memory" was EVER on for the conversation.
+
+    Other projects' memory may then sit in its turns, so capturing it into
+    this project would leak scope; the same rule refuses attach. An
+    unreadable toggle record counts as used.
+    """
+    # ponytail: same missing MemoryStore API as the ledger; reuses the
+    # store's attach refusal. Upgrade: a public "ever used" read, then drop.
+    check = getattr(type(store), "_attach_toggle_refusal", None)
+    connection = getattr(store, "_connection", None)
+    if not callable(check) or not callable(connection):
+        raise RuntimeError("the memory store cannot answer the all-projects toggle")
+    with connection() as reader:
+        return check(reader, conversation_id) is not None
+
+
+def _claim_capture_run(store: Any, run_id: str, conversation_id: str, trigger: str) -> bool:
+    """Insert the run row first, as the idempotency claim; ``False`` if it exists."""
+    with _capture_run_connection(store) as connection:
+        try:
+            connection.execute(
+                "INSERT INTO memory_capture_runs (run_id, conversation_id, trigger, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, conversation_id, trigger, utc_now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+def _finish_capture_run(store: Any, result: MemoryCaptureOutcome) -> None:
+    with _capture_run_connection(store) as connection:
+        connection.execute(
+            "UPDATE memory_capture_runs SET finished_at = ?, outcome = ?, counts = ? "
+            "WHERE run_id = ? AND finished_at IS NULL",
+            (utc_now(), result.outcome, json.dumps(result.counts(), sort_keys=True), result.run_id),
+        )
 
 
 class AgentCore:
@@ -4977,6 +5113,148 @@ class AgentCore:
         if requested is not None:
             session.project_id = requested
         return None
+
+    def capture_memory(
+        self,
+        conversation_id: str,
+        trigger: MemoryRecordOrigin,
+        model: ModelAdapter,
+    ) -> MemoryCaptureOutcome:
+        """Capture memory from one conversation: the model proposes, Core decides.
+
+        ``model`` is the provider adapter to ask - the conversation's current
+        provider/model, chosen by the caller; no SDK is touched here. Core
+        alone sets origin (``trigger``), scope (the conversation's project),
+        actor/tool and provenance turn ids. The reply may only propose kind,
+        text, subject key, confidence and evidence; an authority key in it
+        refuses the whole reply. Each candidate is re-validated and
+        re-filtered here, and the store filters again and sets the status
+        (FACT/LESSON approved and undoable, the rest pending).
+
+        Never raises. An unknown or Global conversation, one that ever used
+        "all projects memory", no turns, a provider
+        error, a malformed answer or an unparseable reply writes no record;
+        once a run is claimed its outcome is recorded. The same conversation,
+        trigger and turn range is captured at most once.
+        """
+        label = _CAPTURE_TRIGGERS.get(trigger) if type(trigger) is MemoryRecordOrigin else None
+        if label is None:
+            return MemoryCaptureOutcome(run_id="", outcome="invalid_trigger")
+        try:
+            conversation = self.memory.load_conversation(conversation_id)
+            turns = tuple(self.memory.load_conversation_state(conversation_id).turns)
+        except Exception:  # noqa: BLE001 - unreadable conversation fails closed
+            return MemoryCaptureOutcome(run_id="", outcome="unknown_conversation")
+        if conversation is None:
+            return MemoryCaptureOutcome(run_id="", outcome="unknown_conversation")
+        if conversation.project_id is None:
+            return MemoryCaptureOutcome(run_id="", outcome="no_project")
+        if not turns:
+            return MemoryCaptureOutcome(run_id="", outcome="no_turns")
+        key = f"{conversation_id}|{label}|{turns[0].id}|{turns[-1].id}"
+        run_id = "cap-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        try:
+            if _global_memory_ever_used(self.memory, conversation_id):
+                return MemoryCaptureOutcome(run_id=run_id, outcome="global_memory_used")
+            claimed = _claim_capture_run(self.memory, run_id, conversation_id, label)
+        except Exception:  # noqa: BLE001 - no run store means no model call
+            return MemoryCaptureOutcome(run_id=run_id, outcome="run_store_error")
+        if not claimed:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="duplicate", duplicate=True)
+        try:
+            result = self._run_capture(
+                run_id, conversation_id, conversation.project_id, trigger, turns, model
+            )
+        except Exception:  # noqa: BLE001 - capture never breaks the chat path
+            result = MemoryCaptureOutcome(run_id=run_id, outcome="internal_error")
+        try:
+            _finish_capture_run(self.memory, result)
+        except Exception:  # noqa: BLE001 - the run row stays unfinished
+            pass
+        return result
+
+    def _run_capture(
+        self,
+        run_id: str,
+        conversation_id: str,
+        project_id: str,
+        trigger: MemoryRecordOrigin,
+        turns: tuple[Any, ...],
+        model: ModelAdapter,
+    ) -> MemoryCaptureOutcome:
+        prompt = memory_capture.build_capture_prompt(turns, trigger, "")
+        task = Task(
+            objective=prompt,
+            capability=_CAPTURE_TOOL,
+            scope=ActionScope(action=_CAPTURE_TOOL),
+            project_id=project_id,
+        )
+        try:
+            response = model.complete(task, SessionState(objective=prompt))
+        except Exception:  # noqa: BLE001 - provider boundary
+            return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
+        if type(response) is not ToolResult or not response.ok or type(response.data) is not dict:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
+        try:
+            answer = self._validated_model_answer(response.data.get(MODEL_ANSWER_RESULT_KEY))
+        except TypeError:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="malformed_answer")
+        if not answer.present or answer.truncated:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="malformed_answer")
+        parsed = memory_capture.parse_candidates(answer.content, turns)
+        if type(parsed) is not memory_capture.CaptureResult:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="parse_error")
+        known = frozenset(turn.id for turn in turns)
+        user_turns = frozenset(
+            turn.id for turn in turns if turn.role == "user" and turn.kind == "user"
+        )
+        record_ids: list[str] = []
+        approved = pending = failed = 0
+        refused = parsed.refused
+        for value in parsed.candidates:
+            candidate = _validated_capture_candidate(value, known, user_turns)
+            if candidate is None:
+                refused += 1
+                continue
+            try:
+                view = self.memory.insert_record(
+                    MemoryRecord(
+                        kind=candidate.kind,
+                        text=candidate.text,
+                        subject_key=candidate.subject_key,
+                        scope=MemoryRecordScope(
+                            project_id=project_id, conversation_id=conversation_id
+                        ),
+                        origin=trigger,
+                        actor=MemoryRecordActor.TOOL,
+                        tool=_CAPTURE_TOOL,
+                        confidence=candidate.confidence,
+                        classification=DataClassification.INTERNAL,
+                        source_conversation_id=conversation_id,
+                        source_turn_ids=candidate.evidence_turn_ids,
+                    )
+                )
+            except ValueError:  # includes MemoryRecordRefused: the store said no
+                refused += 1
+                continue
+            except Exception:  # noqa: BLE001 - one bad write never stops the run
+                failed += 1
+                continue
+            record_ids.append(view.record.record_id)
+            if view.status is MemoryRecordStatus.APPROVED:
+                approved += 1
+            else:
+                pending += 1
+        return MemoryCaptureOutcome(
+            run_id=run_id,
+            outcome="ok",
+            record_ids=tuple(record_ids),
+            approved=approved,
+            pending=pending,
+            refused=refused,
+            dropped=len(parsed.dropped),
+            failed=failed,
+        )
 
     def _conversation_owner_refusal(
         self, session: SessionState, task: Task, requested: str | None
