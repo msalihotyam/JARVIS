@@ -82,6 +82,13 @@ from jarvis.contracts import (
     ChainStep,
     CostEstimate,
     DataClassification,
+    MemoryRecordActor,
+    MemoryRecordKind,
+    MemoryRecordScope,
+    MemoryRecordStatus,
+    normalize_memory_subject_key,
+    redact_credentials,
+    redact_local_paths,
     ErrorCode,
     LocalReadContextKind,
     LocalReadKind,
@@ -197,6 +204,7 @@ from jarvis.intent import (
     response_language_hint,
     too_long_reply,
 )
+from jarvis.context_usage import context_usage
 from jarvis.conversation import (
     ConversationState,
     argv_chars,
@@ -206,7 +214,7 @@ from jarvis.conversation import (
     json_text,
     rehydrate,
 )
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import _RECORD_CURRENT_SQL, MemoryRecordApproval, MemoryRecordRefused, SQLiteMemoryStore
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
 from jarvis.scheduler_runner import SchedulerRunner
@@ -3956,6 +3964,218 @@ class JarvisApp:
             if other is None or other.project_id != owner:
                 return None, "The session belongs to a conversation of another project scope."
         return owner, None
+
+    # -- V2.1a M4 (MEMAPPAPI): memory app API ----------------------------------
+    # Plain payload dicts for the bridge: ``{"ok": True, ...}`` or
+    # ``{"ok": False, "error": ...}``. Approve/reject/undo/Hatırla are USER
+    # actions: this is the trusted boundary that builds the explicit-user
+    # proof (I2/I3); nothing a model returns ever reaches these methods.
+
+    @staticmethod
+    def _record_payload(view: Any) -> dict[str, Any]:
+        record = view.record
+        return {
+            "record_id": record.record_id,
+            "kind": record.kind.value,
+            "text": record.text,
+            "subject_key": record.subject_key,
+            "status": view.status.value,
+            "origin": record.origin.value,
+            "actor": record.actor.value,
+            "classification": record.classification.value,
+            "project_id": record.scope.project_id,
+            "conversation_id": record.scope.conversation_id,
+            "created_at": record.created_at,
+            "expires_at": record.expires_at,
+            "supersedes": record.supersedes,
+        }
+
+    def _active_project_refusal(self, project_id: Any) -> str | None:
+        try:
+            validate_project_id(project_id)
+            project = self.memory.load_project(project_id)
+        except (TypeError, ValueError):
+            project = None
+        if project is None or not project.active:
+            return f"Unknown or inactive project: {project_id}."
+        return None
+
+    def memory_records_payload(self, project_id: str, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        refusal = self._active_project_refusal(project_id)
+        if refusal:
+            return {"ok": False, "error": refusal}
+        filters = {} if filters is None else filters
+        if not isinstance(filters, Mapping):
+            return {"ok": False, "error": "filters must be a mapping."}
+        try:
+            statuses = (
+                {MemoryRecordStatus(value) for value in filters["statuses"]}
+                if filters.get("statuses") else None
+            )
+            kinds = {MemoryRecordKind(value) for value in filters["kinds"]} if filters.get("kinds") else None
+            limit = filters.get("limit", 100)
+            query = filters.get("query") or ""
+            if type(query) is not str:
+                raise ValueError("query must be text")
+            scope = MemoryRecordScope(project_id)
+            if query.strip():
+                views = [
+                    view for view, _rank in self.memory.search_records(
+                        query, scope, kinds=kinds, statuses=statuses, limit=limit
+                    )
+                ]
+            else:
+                views = self.memory.list_records(scope, statuses=statuses, kinds=kinds, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"Invalid memory filter: {exc}"}
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "records": [self._record_payload(view) for view in views],
+        }
+
+    def _owned_record_refusal(self, project_id: Any, record_id: Any, status: MemoryRecordStatus) -> str | None:
+        """None when ``record_id`` is a project-wide record of ``project_id``
+        in ``status``; otherwise a refusal (unknown, other project, wrong
+        state - indistinguishable on purpose).
+
+        ponytail: one read-only row lookup on the store's own connection
+        because ``record_event``/``undo`` do not check the project; a
+        store-side project-checked transition replaces this."""
+        refusal = self._active_project_refusal(project_id)
+        if refusal:
+            return refusal
+        if type(record_id) is not str:
+            return "Unknown memory record."
+        with self.memory._connection() as connection:
+            row = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ? AND r.project_id = ? AND r.conversation_id IS NULL",
+                (record_id, project_id),
+            ).fetchone()
+        if row is None or row["current_status"] != status.value:
+            return f"No {status.value} memory record {record_id} in this project."
+        return None
+
+    def _record_action(self, project_id: str, record_id: str, expected: MemoryRecordStatus, action) -> dict[str, Any]:
+        refusal = self._owned_record_refusal(project_id, record_id, expected)
+        if refusal:
+            return {"ok": False, "error": refusal}
+        try:
+            action()
+            status = self.memory.current_status(record_id)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "record_id": record_id, "status": status.value}
+
+    def approve_memory_record(self, project_id: str, record_id: str) -> dict[str, Any]:
+        # The explicit-user proof is built HERE, from the user's click (I3).
+        return self._record_action(
+            project_id,
+            record_id,
+            MemoryRecordStatus.PENDING,
+            lambda: self.memory.approve_record(
+                record_id, MemoryRecordApproval(project_id=project_id, record_id=record_id)
+            ),
+        )
+
+    def reject_memory_record(self, project_id: str, record_id: str) -> dict[str, Any]:
+        return self._record_action(
+            project_id,
+            record_id,
+            MemoryRecordStatus.PENDING,
+            lambda: self.memory.record_event(
+                record_id, MemoryRecordStatus.REJECTED, MemoryRecordActor.USER, "user-reject"
+            ),
+        )
+
+    def undo_memory_record(self, project_id: str, record_id: str) -> dict[str, Any]:
+        return self._record_action(
+            project_id,
+            record_id,
+            MemoryRecordStatus.APPROVED,
+            lambda: self.memory.undo(record_id, MemoryRecordActor.USER),
+        )
+
+    def remember_message(self, conversation_id: str, message_id: str, kind: str = "fact") -> dict[str, Any]:
+        """'Hatırla': the user's click stores one message as an EXPLICIT_USER
+        record of the conversation's project (project-wide, so it is listed
+        and undoable). FACT/LESSON land approved; DECISION/RULE/PREFERENCE
+        land PENDING and still need the approval card (I4). Connector output
+        (``result`` turns) is untrusted and never remembered (I11)."""
+        try:
+            record = self.memory.load_conversation(conversation_id)
+        except (TypeError, ValueError):
+            record = None
+        if record is None:
+            return {"ok": False, "error": f"Unknown conversation: {conversation_id}."}
+        if record.archived_at is not None:
+            return {"ok": False, "error": "This conversation is archived; it is read-only."}
+        if record.project_id is None:
+            return {"ok": False, "error": "Only a project conversation can remember a message."}
+        refusal = self._active_project_refusal(record.project_id)
+        if refusal:
+            return {"ok": False, "error": refusal}
+        try:
+            state = self.memory.load_conversation_state(conversation_id)
+        except (KeyError, ValueError):
+            return {"ok": False, "error": f"Unknown conversation: {conversation_id}."}
+        turn = next((turn for turn in state.turns if turn.id == message_id), None)
+        if turn is None:
+            return {"ok": False, "error": f"Unknown message: {message_id}."}
+        if turn.kind == "user":
+            text = turn.message or turn.text
+        elif turn.kind == "reply":
+            text = turn.text
+        else:
+            return {"ok": False, "error": "Tool results cannot be remembered."}
+        try:
+            # 60 characters keep the key under its 120 cap even after casefold
+            # expansion; a key that still cannot be derived refuses. Derived
+            # from the redacted text: the store redacts only ``text``.
+            redacted = redact_local_paths(redact_credentials(text)[0])
+            subject_key = normalize_memory_subject_key(redacted.strip()[:60])
+            view = self.memory.insert_explicit_user_record(
+                record.project_id, kind, DataClassification.INTERNAL.value, text, subject_key
+            )
+        except MemoryRecordRefused as exc:
+            return {"ok": False, "refused": exc.category, "error": "This message cannot be stored in memory."}
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "record": self._record_payload(view)}
+
+    def global_memory_toggle_payload(self, conversation_id: str) -> dict[str, Any]:
+        try:
+            enabled = self.memory.global_memory_enabled(conversation_id)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "conversation_id": conversation_id, "enabled": enabled}
+
+    def set_global_memory_toggle(self, conversation_id: str, enabled: bool) -> dict[str, Any]:
+        try:
+            self.memory.set_global_memory_toggle(conversation_id, enabled, MemoryRecordActor.USER)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return self.global_memory_toggle_payload(conversation_id)
+
+    def context_usage_payload(self, conversation_id: str) -> dict[str, Any]:
+        """Context use of the stored conversation. Without a chat model the
+        window is unknown and says so ("bilinmiyor") instead of guessing."""
+        try:
+            state = self.memory.load_conversation_state(conversation_id)
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": f"Unknown conversation: {conversation_id}."}
+        profile = None if self.intent_model is None else context_profile_of(self.intent_model)
+        plan = assemble_context(state, profile) if profile is not None else assemble_context(state)
+        usage = context_usage(len(state.turns), plan.used_chars, profile, assembled_tokens=plan.used_tokens)
+        return {
+            "ok": True,
+            "conversation_id": conversation_id,
+            "used_tokens": usage.used_tokens,
+            "max_tokens": usage.max_tokens,
+            "ratio": usage.ratio,
+            "turns_until_autocompact": usage.turns_until_autocompact,
+            "label_key": usage.label_key,
+        }
 
     # -- Gate 6H H3 (K3): the project folder from chat ------------------------
 
