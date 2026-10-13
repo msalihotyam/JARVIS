@@ -21,12 +21,19 @@ from jarvis.contracts import (
     MemoryRecordKind,
     MemoryRecordStatus,
     canonical_utc_timestamp,
+    normalize_symbol,
 )
 
 # A memory nobody re-verified for this long is reported as stale.
 STALE_AFTER = timedelta(days=180)
 # A proposal waiting for approval longer than this is reported.
 PENDING_MAX_AGE = timedelta(days=14)
+# An approved lesson nobody re-verified for this many days is proposed for expiry.
+LESSON_FRESHNESS_DAYS = 90
+# Newer records of these kinds can contradict an older lesson.
+LESSON_CONTRADICTING_KINDS = frozenset(
+    {MemoryRecordKind.DECISION, MemoryRecordKind.RULE, MemoryRecordKind.LESSON}
+)
 
 # Statuses that are, or may become, delivered to a model (I12). Only these
 # are checked for content and scope problems.
@@ -51,6 +58,8 @@ class FindingCode(StrEnum):
     PENDING_TOO_OLD = "PENDING_TOO_OLD"
     FILTER_VIOLATION = "FILTER_VIOLATION"
     LEGACY_M1_UNMAPPED = "LEGACY_M1_UNMAPPED"
+    LESSON_STALE = "LESSON_STALE"
+    LESSON_CONTRADICTED = "LESSON_CONTRADICTED"
 
 
 class Severity(StrEnum):
@@ -162,6 +171,8 @@ def diagnose(
     findings += _pending_too_old(snapshot.records, now)
     findings += _filter_violations(snapshot.records, is_storable)
     findings += _legacy_unmapped(snapshot.legacy_items)
+    findings += _lesson_stale(snapshot.records, now)
+    findings += _lesson_contradicted(snapshot.records, now)
     order = list(FindingCode)
     findings.sort(key=lambda f: (order.index(f.code), f.record_ids))
     return tuple(findings)
@@ -331,3 +342,52 @@ def _legacy_unmapped(items: Iterable[LegacyM1Item]) -> list[Finding]:
         for item in items
         if item.kind not in LEGACY_M1_KIND_MAP
     ]
+
+
+def _lesson_stale(records: Iterable[DoctorRecordState], now: datetime) -> list[Finding]:
+    found = []
+    for state in records:
+        record = state.record
+        if state.status is not MemoryRecordStatus.APPROVED or record.kind is not MemoryRecordKind.LESSON:
+            continue
+        if record.expires_at is not None and _ts(record.expires_at) <= now:
+            continue  # STALE already proposes expiring it
+        if now - _ts(record.last_verified_at or record.created_at) > timedelta(days=LESSON_FRESHNESS_DAYS):
+            rid = (record.record_id,)
+            found.append(Finding(
+                FindingCode.LESSON_STALE, Severity.INFO, rid,
+                "memory_doctor.lesson_stale", RepairProposal(RepairAction.EXPIRE, rid),
+            ))
+    return found
+
+
+def _lesson_contradicted(records: Iterable[DoctorRecordState], now: datetime) -> list[Finding]:
+    # Same subject in the same scope (project and scope kind, never across
+    # projects, I6); a newer approved record that says something else.
+    # Already-expired records are left to STALE on both sides.
+    groups: dict[tuple[str | None, str, str], list[MemoryRecord]] = {}
+    for state in records:
+        record = state.record
+        if record.expires_at is not None and _ts(record.expires_at) <= now:
+            continue
+        if state.status is MemoryRecordStatus.APPROVED and record.kind in LESSON_CONTRADICTING_KINDS:
+            key = (record.scope.project_id, record.scope.kind.value, record.subject_key)
+            groups.setdefault(key, []).append(record)
+    found = []
+    for group in groups.values():
+        for lesson in group:
+            if lesson.kind is not MemoryRecordKind.LESSON:
+                continue
+            folded = normalize_symbol(lesson.text)
+            newer = sorted(
+                other.record_id for other in group
+                if _ts(other.created_at) > _ts(lesson.created_at)
+                and normalize_symbol(other.text) != folded
+            )
+            if newer:
+                rid = (lesson.record_id,)
+                found.append(Finding(
+                    FindingCode.LESSON_CONTRADICTED, Severity.WARNING, (*rid, *newer),
+                    "memory_doctor.lesson_contradicted", RepairProposal(RepairAction.EXPIRE, rid),
+                ))
+    return found
