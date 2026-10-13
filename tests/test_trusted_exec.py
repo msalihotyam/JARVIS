@@ -726,7 +726,7 @@ class HeadlessConsoleTests(unittest.TestCase):
         with patch.object(codex.subprocess, "Popen", return_value=process) as popen:
             codex._app_server("C:/abs/codex.exe", [("account/read", None)], 0.01)
         argv, kwargs = popen.call_args[0][0], popen.call_args[1]
-        self.assertEqual(["C:/abs/codex.exe", "app-server"], argv)
+        self.assertEqual(["C:/abs/codex.exe", "app-server", "--disable", "memories"], argv)
         self.assertEqual(codex.NO_CONSOLE_WINDOW, kwargs["creationflags"])
         self.assertEqual((subprocess.PIPE, subprocess.PIPE), (kwargs["stdin"], kwargs["stdout"]))
         self.assertFalse(kwargs["shell"])

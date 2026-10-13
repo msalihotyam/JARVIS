@@ -65,6 +65,7 @@ CODEX_DISABLED_FEATURES = (
     "shell_snapshot", "remote_plugin", "skill_mcp_dependency_install", "tool_call_mcp_elicitation",
     "guardian_approval",
 )
+CODEX_NO_MEMORIES = ("--disable", "memories")
 #: The catalog tool mode under which EVERY tool goes through the code-mode host.
 CODEX_SAFE_TOOL_MODE = "code_mode_only"
 CODEX_TIMEOUT_SECONDS = 120
@@ -131,7 +132,9 @@ def prohibited_env_present() -> bool:
 
 def _app_server(executable: str, calls: list[tuple[str, dict | None]], timeout: float) -> dict[str, Any]:
     """Answers of a short read-only app-server session, keyed by method."""
-    process = subprocess.Popen([executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    # app-server loads the user's config.toml (exec runs ignore it), so Codex
+    # memories are switched off here explicitly: no JARVIS run reads or writes them.
+    process = subprocess.Popen([executable, "app-server", *CODEX_NO_MEMORIES], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                                env=_environment(), shell=False, creationflags=NO_CONSOLE_WINDOW)
     replies: dict[int, dict] = {}

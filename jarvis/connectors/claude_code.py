@@ -138,6 +138,12 @@ PROHIBITED_BILLING_ENV_VARS = (
 CLAUDE_ALLOWED_ENV_PREFIXES = ("CLAUDE_",)
 CLAUDE_ALLOWED_ENV_VARS = ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "NODE_OPTIONS")
 
+#: Set on every Claude CLI child after the allowlist and the billing
+#: subtraction. The CLI keeps no auto memory of its own for JARVIS runs: Core
+#: owns memory, and a second store it never sees must not grow (Salih
+#: 2026-10-14). Keys are upper case; any parent casing is dropped first.
+CLAUDE_FORCED_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+
 #: The only task preferences that may leave the machine, in this order.
 #:
 #: Default-deny on purpose: AgentCore writes internal runtime, billing,
@@ -492,17 +498,21 @@ class ClaudeCodeConnector(BaseConnector):
         as well, because two of them match ``CLAUDE_*`` and their ABSENCE is
         what the subscription billing route is established on. Matching is
         case-insensitive so Windows environment casing cannot smuggle a
-        prohibited variable through.
+        prohibited variable through. ``CLAUDE_FORCED_ENV`` is set last, after
+        any parent value of it in any casing is dropped, so the parent cannot
+        turn the CLI's auto memory back on.
         """
         prohibited = {name.upper() for name in PROHIBITED_BILLING_ENV_VARS}
         child = trusted_environment(
             allow=CLAUDE_ALLOWED_ENV_VARS, prefixes=CLAUDE_ALLOWED_ENV_PREFIXES
         )
-        return {
+        child = {
             key: value
             for key, value in child.items()
-            if key.upper() not in prohibited
+            if key.upper() not in prohibited and key.upper() not in CLAUDE_FORCED_ENV
         }
+        child.update(CLAUDE_FORCED_ENV)
+        return child
 
     def outbound_preview(self, task: Task) -> OutboundDataPreview:
         payload, redacted_count = self._sanitized_payload(task)
