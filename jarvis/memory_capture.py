@@ -12,6 +12,7 @@ failure cannot block chat or compaction.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -56,6 +57,60 @@ class CaptureResult:
     candidates: tuple[MemoryRecordCandidate, ...]
     dropped: tuple[str, ...]
     refused: int
+
+
+def extraction_skip_reason(
+    turns: Iterable[Any],
+    *,
+    temporary: bool,
+    quota_remaining_pct: float | None,
+    min_user_turns: int = 2,
+    min_user_chars: int = 200,
+    quota_floor_pct: float = 10,
+) -> str | None:
+    """Why a session must not be sent for extraction, or ``None`` to extract.
+
+    Deterministic and pure. Codes, first match wins: ``temporary``,
+    ``empty`` (no user turn), ``too_short`` (fewer user turns or fewer
+    characters of the person's own words than the minimums), ``quota_floor``
+    (remaining quota below the floor). An unknown quota (``None``) never
+    skips. Anything unreadable skips: skipping loses one capture, extracting
+    by mistake spends quota and stores what nobody meant."""
+    if temporary is not False:
+        return "temporary"
+    try:
+        messages = [
+            turn.message if isinstance(turn.message, str) else ""
+            for turn in turns
+            if getattr(turn, "role", None) == "user"
+        ]
+    except Exception:  # a caller bug must not escape (capture never blocks chat)
+        return "empty"
+    if not messages:
+        return "empty"
+    chars = sum(len(message.strip()) for message in messages)
+    if (
+        not (_finite(min_user_turns) and _finite(min_user_chars))
+        or len(messages) < min_user_turns
+        or chars < min_user_chars
+    ):
+        return "too_short"
+    if quota_remaining_pct is None:
+        return None
+    if (
+        not (_finite(quota_remaining_pct) and _finite(quota_floor_pct))
+        or quota_remaining_pct < quota_floor_pct
+    ):
+        return "quota_floor"
+    return None
+
+
+def _finite(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
 
 
 def _data(value: Any) -> str:

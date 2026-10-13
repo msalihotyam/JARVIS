@@ -182,6 +182,11 @@ class Settings:
     #: never a grant, so turning this on approves, pre-approves and relaxes
     #: nothing - every step still passes Core policy and the approval gate.
     skills_enabled: bool = False
+    #: The model that runs memory extraction. ``""`` (the default) means the
+    #: conversation's current model. Not authority: a value that is not a
+    #: well-formed model name (any other type, a flag-like string) falls back
+    #: to ``""`` rather than reaching a connector.
+    memory_extract_model: str = ""
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -355,6 +360,11 @@ class Settings:
             object.__setattr__(
                 self, "claude_effort", validate_claude_effort(self.claude_effort)
             )
+        if type(self.memory_extract_model) is not str or not (
+            self.memory_extract_model == ""
+            or CLAUDE_MODEL_PATTERN.match(self.memory_extract_model)
+        ):
+            object.__setattr__(self, "memory_extract_model", "")
 
     def enable_paid_api(self, approval_id: str) -> Settings:
         if not approval_id.strip():
@@ -417,11 +427,17 @@ CONFIG_KEYS = (
     # Windows Desktop basic. Authority as CONFIGURATION: the exact
     # applications whose windows may be driven. Not a credential.
     "desktop_apps",
+    # V2.1 memory extraction: which model extracts; "" = the current one.
+    "memory_extract_model",
 )
+
+#: The pre-memory-extract key set: the document exactly as the Desktop build
+#: wrote it. Accepted whole, with extraction on the current model.
+PRE_MEMORY_EXTRACT_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"memory_extract_model"}
 
 #: The pre-Desktop key set: the document exactly as the Browser build wrote
 #: it. Accepted whole, with no application configured.
-PRE_DESKTOP_CONFIG_KEYS = frozenset(CONFIG_KEYS) - {"desktop_apps"}
+PRE_DESKTOP_CONFIG_KEYS = PRE_MEMORY_EXTRACT_CONFIG_KEYS - {"desktop_apps"}
 
 #: The pre-Browser key set: the document exactly as the Gmail build wrote it.
 #: Accepted whole, with no origin configured, for the same reason every older
@@ -791,6 +807,7 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "gmail_principal": settings.gmail_principal,
         "browser_origins": list(settings.browser_origins),
         "desktop_apps": list(settings.desktop_apps),
+        "memory_extract_model": settings.memory_extract_model,
     }
     if settings.skills_enabled:
         document[SKILLS_ENABLED_KEY] = True
@@ -811,6 +828,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     if keys not in (
         set(CONFIG_KEYS),
         set(SKILLS_CONFIG_KEYS),
+        set(PRE_MEMORY_EXTRACT_CONFIG_KEYS),
         set(PRE_DESKTOP_CONFIG_KEYS),
         set(PRE_BROWSER_CONFIG_KEYS),
         set(PRE_GMAIL_CONFIG_KEYS),
@@ -881,6 +899,9 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             # Absent means unset (a pre-Desktop document): no application.
             desktop_apps=_exact_desktop_apps(document.get("desktop_apps")),
             skills_enabled=skills_enabled,
+            # Absent (a pre-memory-extract document) or unusable: the
+            # constructor falls back to "", the conversation's current model.
+            memory_extract_model=document.get("memory_extract_model", ""),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

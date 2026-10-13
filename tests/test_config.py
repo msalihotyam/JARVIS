@@ -177,6 +177,7 @@ class ParsingTests(ConfigTestCase):
                 "memory_database", "claude_model", "claude_effort",
                 "github_principal", "github_repositories",
                 "gmail_principal", "browser_origins", "desktop_apps",
+                "memory_extract_model",
             },
         )
 
