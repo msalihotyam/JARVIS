@@ -209,7 +209,7 @@ class AttachStoreTests(StoreCase):
         # An empty table changes nothing: attach is allowed.
         self.assertEqual("", self.memory.conversation_attach_preview(self.conversation.id, project_id=self.p.id)["blocked"])
         with contextlib.closing(sqlite3.connect(self.database)) as connection:
-            # A row for this conversation: never movable.
+            # An enabled row for this conversation: never movable.
             connection.execute(f"INSERT INTO {CONVERSATION_GLOBAL_MEMORY_TOGGLES} (conversation_id, enabled, actor, at)"
                                " VALUES (?, 1, 'user', 'a')", (self.conversation.id,))
             connection.commit()

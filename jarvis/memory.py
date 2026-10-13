@@ -6113,8 +6113,10 @@ class SQLiteMemoryStore:
         "all projects memory" on can never be attached (Salih decision). V2.1
         owns the table ``conversation_global_memory_toggles`` (append-only,
         explicit-user writes only, keyed by conversation_id); the compatibility
-        layer creates it empty. Evaluated on every call: absent -> no refusal; a
-        row for the conversation -> refused; present but unreadable -> refused."""
+        layer creates it empty. Evaluated on every call: absent -> no refusal; ANY
+        enabled row for the conversation (even if a later row turned it off) ->
+        refused; only disabled rows (never on) -> allowed; present but
+        unreadable -> refused."""
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
             (CONVERSATION_GLOBAL_MEMORY_TOGGLES,),
@@ -6122,12 +6124,55 @@ class SQLiteMemoryStore:
             return None
         try:
             used = connection.execute(
-                f"SELECT 1 FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? LIMIT 1",  # nosec B608 - constant SQL fragments only; values are bound
+                f"SELECT 1 FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? AND enabled = 1 LIMIT 1",  # nosec B608 - constant SQL fragments only; values are bound
                 (conversation_id,),
             ).fetchone() is not None
         except sqlite3.Error:
             return "This conversation's \"all projects memory\" record cannot be read, so it cannot be attached."
         return "This conversation used \"all projects memory\"; it can never be attached to a project." if used else None
+
+    def set_global_memory_toggle(
+        self, conversation_id: str, enabled: bool, actor: MemoryRecordActor
+    ) -> None:
+        """Turn a conversation's "all projects memory" on or off.
+
+        Append-only: every call adds one row, nothing is updated or deleted,
+        so "was it ever on" stays answerable for the attach refusal. Only the
+        user may flip it (``MemoryRecordActor.USER``); a model or tool is
+        refused. Unknown or deleted conversations raise ValueError."""
+        self._require_conversation_id(conversation_id)
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a bool")
+        if actor is not MemoryRecordActor.USER:
+            raise ValueError("only the user may change all projects memory")
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                f"SELECT 1 FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
+                (conversation_id,),
+            ).fetchone() is None:
+                raise ValueError("unknown conversation")
+            connection.execute(
+                f"INSERT INTO {CONVERSATION_GLOBAL_MEMORY_TOGGLES} (conversation_id, enabled, actor, at) VALUES (?, ?, ?, ?)",  # nosec B608 - constant SQL fragments only; values are bound
+                (conversation_id, int(enabled), actor.value, utc_now()),
+            )
+
+    def global_memory_enabled(self, conversation_id: str) -> bool:
+        """The conversation's latest toggle row; default (no row) and an
+        unreadable table both read as off."""
+        self._require_conversation_id(conversation_id)
+        with self._connection() as connection:
+            return self._global_memory_enabled(connection, conversation_id)
+
+    @staticmethod
+    def _global_memory_enabled(connection: sqlite3.Connection, conversation_id: str) -> bool:
+        try:
+            row = connection.execute(
+                f"SELECT enabled FROM {CONVERSATION_GLOBAL_MEMORY_TOGGLES} WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 1",  # nosec B608 - constant SQL fragments only; values are bound
+                (conversation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None and row[0] == 1
 
     def conversation_attach_preview(
         self, conversation_id: str, *, project_id: str | None = None, new_project_name: str | None = None
@@ -6905,8 +6950,11 @@ class SQLiteMemoryStore:
 
         Only the scope's project is ever read; a conversation-scoped query
         also sees project-wide records but never another conversation's.
-        GLOBAL_READONLY is refused here (the all-projects toggle is not this
-        store's surface). Legacy M1 ``project_memory_items`` are adapted
+        A GLOBAL_READONLY scope (read-only, only while that conversation's
+        "all projects memory" toggle is on) reads every project's V2.1
+        records; each view keeps its source ``scope.project_id`` for the
+        provenance label. Only APPROVED rows are returned, SECRET or
+        filter-refused rows never. Legacy M1 ``project_memory_items`` are adapted
         read-only as LEGACY_M1 records; nothing is migrated. Corrupt rows are
         skipped, never normalized.
         """
@@ -6915,12 +6963,21 @@ class SQLiteMemoryStore:
         )
         sql = f"{_RECORD_CURRENT_SQL} WHERE {where} ORDER BY r.created_at, r.record_id"
         with self._connection() as connection:
-            rows = connection.execute(sql, params).fetchall()
+            connection.execute("BEGIN")  # toggle check and read: one snapshot
+            try:
+                self._require_global_read(connection, scope)
+                rows = connection.execute(sql, params).fetchall()
+            finally:
+                connection.rollback()
         views = [
             view
             for view in map(self._record_view_from_row, rows)
-            if view is not None
+            if view is not None and self._view_readable(view, scope)
         ]
+        if scope.kind is MemoryRecordScopeKind.GLOBAL_READONLY:
+            # ponytail: global reads cover V2.1 records only; adapt legacy M1
+            # items here if all-projects memory must also see them.
+            return views[:limit]
         views.extend(
             view
             for view in self._legacy_record_views(scope.project_id)
@@ -6946,10 +7003,17 @@ class SQLiteMemoryStore:
         """Validate a record query and build its WHERE clause (no keyword).
 
         The project scope is always an SQL predicate, never a post-filter.
+        A GLOBAL_READONLY scope must name its conversation (whose toggle the
+        caller re-checks in the read's own connection, see
+        ``_require_global_read``); it drops the project predicate only, keeps
+        the conversation predicate and never matches SECRET rows.
         """
         if type(scope) is not MemoryRecordScope:
             raise ValueError("scope must be a MemoryRecordScope")
-        if scope.kind is not MemoryRecordScopeKind.PROJECT:
+        global_read = scope.kind is MemoryRecordScopeKind.GLOBAL_READONLY
+        if global_read:
+            SQLiteMemoryStore._require_conversation_id(scope.conversation_id)
+        elif scope.kind is not MemoryRecordScopeKind.PROJECT:
             raise ValueError(f"{caller} needs a PROJECT scope")
         if type(limit) is not int or not 1 <= limit <= _RECORD_LIST_MAX_LIMIT:
             raise ValueError(
@@ -6965,8 +7029,15 @@ class SQLiteMemoryStore:
             type(k) is not MemoryRecordKind for k in kind_set
         ):
             raise ValueError("kinds must be MemoryRecordKind members")
-        where = "r.project_id = ?"
-        params: list[object] = [scope.project_id]
+        if global_read:
+            # Only APPROVED may ever be delivered, across projects even more.
+            approved = frozenset({MemoryRecordStatus.APPROVED})
+            status_set = approved if status_set is None else status_set & approved
+            where = "r.classification <> ?"
+            params: list[object] = [DataClassification.SECRET.value]
+        else:
+            where = "r.project_id = ?"
+            params = [scope.project_id]
         if scope.conversation_id is not None:
             where += " AND (r.conversation_id IS NULL OR r.conversation_id = ?)"
             params.append(scope.conversation_id)
@@ -7011,42 +7082,86 @@ class SQLiteMemoryStore:
                 f"query_text has more than {_RECORD_SEARCH_MAX_TOKENS} words"
             )
         with self._connection() as connection:
-            if memory_records_fts_available(connection):
-                match = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
-                rows = connection.execute(
-                    f"{_RECORD_SEARCH_FTS_SQL} WHERE {MEMORY_RECORDS_FTS} MATCH ? "  # nosec B608 - constant SQL fragments only
-                    f"AND {where} ORDER BY search_rank, r.created_at, r.record_id LIMIT ?",
-                    [match, *params, limit],
-                ).fetchall()
-                ranks = [float(row["search_rank"]) for row in rows]
-            else:
-                connection.create_function(
-                    "jarvis_fold",
-                    1,
-                    lambda v: None if v is None else _fold_search_text(str(v)),
-                    deterministic=True,
-                )
-                like = " AND ".join(
-                    "(jarvis_fold(r.text) LIKE ? ESCAPE '\\' "
-                    "OR jarvis_fold(r.subject_key) LIKE ? ESCAPE '\\')"
-                    for _ in tokens
-                )
-                patterns: list[object] = []
-                for token in tokens:
-                    escaped = re.sub(r"([\\%_])", r"\\\1", token)
-                    patterns += [f"%{escaped}%", f"%{escaped}%"]
-                rows = connection.execute(
-                    f"{_RECORD_CURRENT_SQL} WHERE {where} AND {like} "  # nosec B608 - constant SQL fragments only
-                    "ORDER BY r.created_at, r.record_id LIMIT ?",
-                    [*params, *patterns, limit],
-                ).fetchall()
-                ranks = [0.0] * len(rows)
+            connection.execute("BEGIN")  # toggle check and read: one snapshot
+            try:
+                rows, ranks = self._search_rows(connection, scope, tokens, where, params, limit)
+            finally:
+                connection.rollback()
         results = []
         for row, rank in zip(rows, ranks):
             view = self._record_view_from_row(row)
-            if view is not None:
+            if view is not None and self._view_readable(view, scope):
                 results.append((view, rank))
         return results
+
+    def _search_rows(
+        self,
+        connection: sqlite3.Connection,
+        scope: MemoryRecordScope,
+        tokens: list[str],
+        where: str,
+        params: list[object],
+        limit: int,
+    ) -> tuple[list[sqlite3.Row], list[float]]:
+        """search_records' query, inside the caller's read transaction."""
+        self._require_global_read(connection, scope)
+        if memory_records_fts_available(connection):
+            match = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+            rows = connection.execute(
+                f"{_RECORD_SEARCH_FTS_SQL} WHERE {MEMORY_RECORDS_FTS} MATCH ? "  # nosec B608 - constant SQL fragments only
+                f"AND {where} ORDER BY search_rank, r.created_at, r.record_id LIMIT ?",
+                [match, *params, limit],
+            ).fetchall()
+            ranks = [float(row["search_rank"]) for row in rows]
+        else:
+            connection.create_function(
+                "jarvis_fold",
+                1,
+                lambda v: None if v is None else _fold_search_text(str(v)),
+                deterministic=True,
+            )
+            like = " AND ".join(
+                "(jarvis_fold(r.text) LIKE ? ESCAPE '\\' "
+                "OR jarvis_fold(r.subject_key) LIKE ? ESCAPE '\\')"
+                for _ in tokens
+            )
+            patterns: list[object] = []
+            for token in tokens:
+                escaped = re.sub(r"([\\%_])", r"\\\1", token)
+                patterns += [f"%{escaped}%", f"%{escaped}%"]
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE {where} AND {like} "  # nosec B608 - constant SQL fragments only
+                "ORDER BY r.created_at, r.record_id LIMIT ?",
+                [*params, *patterns, limit],
+            ).fetchall()
+            ranks = [0.0] * len(rows)
+        return rows, ranks
+
+    @staticmethod
+    def _require_global_read(connection: sqlite3.Connection, scope: MemoryRecordScope) -> None:
+        """A GLOBAL_READONLY read needs the conversation's toggle on, checked
+        in the read's own connection; off, missing or unreadable refuses, and
+        so does a missing or deleted conversation."""
+        if scope.kind is not MemoryRecordScopeKind.GLOBAL_READONLY:
+            return
+        if not SQLiteMemoryStore._global_memory_enabled(connection, scope.conversation_id):
+            raise ValueError("all projects memory is off for this conversation")
+        if connection.execute(
+            f"SELECT 1 FROM conversations WHERE id = ? AND {SQLiteMemoryStore._NOT_DELETED}",  # nosec B608 - constant SQL fragment
+            (scope.conversation_id,),
+        ).fetchone() is None:
+            raise ValueError("all projects memory needs an existing conversation")
+
+    @staticmethod
+    def _view_readable(view: MemoryRecordView, scope: MemoryRecordScope) -> bool:
+        """Project reads trust the store; a global read re-applies the
+        never-stored filter and the SECRET ban to every row it returns."""
+        if scope.kind is not MemoryRecordScopeKind.GLOBAL_READONLY:
+            return True
+        return (
+            view.record.classification is not DataClassification.SECRET
+            and classify_candidate_text(view.record.text).allowed
+        )
 
     def _legacy_record_views(self, project_id: str) -> list[MemoryRecordView]:
         """Read-only adapter: M1 project_memory_items as LEGACY_M1 records.
