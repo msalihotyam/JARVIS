@@ -23,7 +23,7 @@
 > Not (Salih 2026-10-12): bölümler aşağıda numara sırasıyla durur; uygulama sırası için §14 "Kesin ana sıra"ya bak (V2.4 → V2.3; Uzaktan/Eklentiler/Kendini geliştirme → V2.5/V2.6; dağıtım en sonda).
 
 ## V2.0 — Projects
-**Statü: KESİN / post-V1 #1 öncelik**
+**Statü: KAPANDI (2026-10-13, Salih) — KESİN / post-V1 #1 öncelik**
 
 Projects, V1 sonrası ilk büyük ürün katmanıdır.
 
@@ -1485,7 +1485,7 @@ Referansların eski özelliklerini current fact gibi kabul etmeme.
 
 Salih 2026-10-12 (16:18, 16:24, 16:38): V2.4, V2.3'ten önce; Uzaktan/Eklentiler/Kendini geliştirme V2.5/V2.6'dan önce; dağıtım en sona. Başlık numaraları (V2.x) değişmez.
 
-1. **V2.0 Projects** (gönderildi)
+1. **V2.0 Projects** (gönderildi; kapandı 2026-10-13)
 2. **V2.1 Hafıza** (a, b) + official daily-driver
 3. **V2.2 Beceriler** — yalnız skill tarafı; workflow kayıt motoru V2.6'da bir kez kurulur
 4. **V2.4 Work + ajanlar** (ince): V2.4A Jev = yalnız geliştirme pilotu; V2.4B Faz 1 subagent bloğuna katılır → **GÜNLÜK KULLANIM NOKTASI**

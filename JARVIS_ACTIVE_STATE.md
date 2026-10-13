@@ -11,17 +11,20 @@ daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
 "Salih kararları — V2.0 Gate 6G / 6H planı". V2.0 scope is frozen (Salih
 2026-10-06): only bugs and blockers.
 
-Gates 1–5, 6A–6H and S5 (model list) are on main. V2.0 is in dogfood: the
-dogfood fixes were integrated by INT37 / INT38 / INT39 and pushed; `origin/main`
-= `3d6400b` (INT39 GREEN, CI run 38236839853; `build/reports/INT39.md`).
+Gates 1–5, 6A–6H and S5 (model list) are on main. **V2.0 CLOSED 2026-10-13**
+(Salih 23:29, orchestrator 23:32). Current work: V2.1 Hafıza (INT43 and INT44
+pushed; INT45 in a CI fix).
 
-Installed: `1.0.0-3d6400b`, checked by Salih on 2026-10-12 (single instance,
-window effects, drafts, jump-to-latest, own context menu: all pass);
-`1.0.0-c3df707` previous (rollback target).
+Installed and active: `1.0.0-df463a5` (INT40); `1.0.0-3d6400b` previous
+(rollback target); 3 releases installed; release manager consistent; Desktop
+shortcut OK. Salih's dogfood checks on `1.0.0-df463a5` passed (2026-10-13):
+T font rendering (sidebar, tiles, clock strip, motto, model menu, conversation
+text), motion (sections, menus, panels, pages, conversation switches), message
+queue, timing line under replies, "siz" everywhere. A few very small bugs seen,
+not worth fixing now; Salih will report them (not listed yet).
 
-INT40 in progress: DFTONE, DFQUEUE, DFSPEED, DFMOTION, DFFONTTRY, DFFONT (font
-rendering T by default), V20DOCS. Conveyor lanes follow
-`build/conveyor/notes/LANE_RULES.md` (runbook "Konveyor" → "Lane process").
+Conveyor lanes follow `build/conveyor/notes/LANE_RULES.md` (runbook
+"Konveyor" → "Lane process").
 
 ## Open blockers
 
@@ -163,18 +166,21 @@ open. Next: integrate on "entegre et".
   (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
 - Old dashboard retired (Salih 2026-10-06). The orchestrator's board is the
   artifact "JARVIS Pano" (https://claude.ai/artifact/LboCEVPnvVb9QapsNbD8GZ).
-- Gate 7 still to do: D-3 one approved live Claude call after Salih's own CLI
-  re-login; D-4 packaged `-Rollback` and back (approvals cleared,
-  `conversation.json` backed up and restored). Codex review queue (one commit
-  per session): session1 remainder, Gate 5, 6A–6D-b, fixes.
+- Gate 7 done (2026-10-13): D-3 live Claude replies through Salih's own CLI
+  worked (timing line, queued run); D-4 PASS: packaged `release.ps1 -Rollback`
+  (`1.0.0-df463a5` → `1.0.0-3d6400b`, the old release opened with the
+  conversations) and `-Activate 1.0.0-df463a5` back; `~/.jarvis/conversation.json`
+  backed up first (`%USERPROFILE%\JARVIS-backups\conversation-D4-20261013.json`)
+  and unchanged after. Codex review queue (one commit per session): session1
+  remainder, Gate 5, 6A–6D-b, fixes.
 - Backlog: project-filtered jobs query; catalog test skips on a system
   Python; Gate 4B Edge retirement deferred; regenerate
   `scripts/test_durations.json` now and then (`--write-durations`).
 
 ## Next action (in order)
 
-1. INT40 (integrate, CI, push on Salih's go). 2. Install INT40 + Salih's
-checks. 3. D-4: packaged `-Rollback` and back. 4. V2.0 close.
+V2.0 closed (2026-10-13). Next: the V2.1 Hafıza waves (INT45 CI fix, then
+the following waves); Salih's small V2.0 bug list when he sends it.
 
 Core refresh (DFCOREA, parked in `build/conveyor/hold/`) postponed by Salih
 (2026-10-12): a later week near the weekly quota renewal if quota is
@@ -182,9 +188,9 @@ plentiful, else the very last item.
 
 ## Rollback / safety anchors
 
-- Releases (`%USERPROFILE%\Apps\JARVIS\release-state.json`): `1.0.0-3d6400b`
-  active; `1.0.0-c3df707` previous (rollback target); `1.0.0-cf53097`
-  retained. Pushed anchor: `origin/main` `3d6400b`.
+- Releases (`%USERPROFILE%\Apps\JARVIS\release-state.json`): `1.0.0-df463a5`
+  active; `1.0.0-3d6400b` previous (rollback target, D-4 verified
+  2026-10-13); 3 releases installed.
 - `%USERPROFILE%\JARVIS-backups`: `releases\legacy-1.0.0-5976769` (+
   `.manifest.sha256`, 2929 files verified) and `2026-09-30-gate7`
   (`data\jarvis.db` + `~\.jarvis\*.json`, SHA-256 manifest, taken before
