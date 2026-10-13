@@ -168,6 +168,12 @@ from jarvis.contracts import (
     utc_now,
     validate_project_id,
 )
+from jarvis.memory_consolidation import (
+    ConsolidationEvent,
+    ConsolidationPlan,
+    Supersession,
+    plan_consolidation,
+)
 from jarvis.memory_filter import classify_candidate_text
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.conversation import (
@@ -1015,6 +1021,25 @@ class MemoryRecordRefused(ValueError):
     def __init__(self, category: str | None) -> None:
         self.category = category or "filter_error"
         super().__init__(f"memory record refused: {self.category}")
+
+
+#: The only actor a consolidation plan is applied as (stored as text).
+CONSOLIDATION_ACTOR = MemoryRecordOrigin.CONSOLIDATION.value
+
+
+class ConsolidationPlanRejected(ValueError):
+    """One plan step was invalid; the whole plan was rolled back.
+
+    Carries the step kind, a record id and a fixed reason - never record text.
+    """
+
+    def __init__(self, step: str, record_id: object, reason: str) -> None:
+        self.step = step
+        self.record_id = sanitize_diagnostic_text(record_id, 80)
+        self.reason = reason
+        super().__init__(
+            f"consolidation plan refused at {step} {self.record_id}: {reason}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -6938,6 +6963,179 @@ class SQLiteMemoryStore:
                 reason,
             )
         return MemoryRecordStatus.SUPERSEDED
+
+    def apply_consolidation_plan(
+        self, plan: ConsolidationPlan, actor: str = CONSOLIDATION_ACTOR
+    ) -> dict[str, int]:
+        """Apply a consolidation plan in ONE transaction (events + supersessions).
+
+        Every step is re-checked against current SQLite state: the record
+        exists, its status allows the transition, both sides of a
+        supersession share project, conversation, kind, subject and
+        classification, and the new side is APPROVED. An approved DECISION,
+        RULE or PREFERENCE is never touched here, and a RULE or explicit-user
+        record is never superseded here (that needs explicit-user proof, see
+        ``supersede``). Any invalid
+        step raises ConsolidationPlanRejected and rolls the whole plan back.
+        Merges and conflicts are reported, never applied.
+        """
+        if type(plan) is not ConsolidationPlan or not all(
+            type(part) is tuple
+            for part in (plan.events, plan.supersessions, plan.merges, plan.conflicts)
+        ):
+            raise ConsolidationPlanRejected("plan", "", "not a ConsolidationPlan")
+        if actor != CONSOLIDATION_ACTOR:
+            raise ConsolidationPlanRejected("actor", "", "unknown actor")
+        superseded_by: dict[str, str] = {}
+        for step in plan.supersessions:
+            if (
+                type(step) is not Supersession
+                or type(step.record_id) is not str
+                or type(step.superseded_by) is not str
+                or step.record_id in superseded_by
+            ):
+                raise ConsolidationPlanRejected(
+                    "supersession", getattr(step, "record_id", ""), "malformed or repeated"
+                )
+            superseded_by[step.record_id] = step.superseded_by
+        events: dict[str, ConsolidationEvent] = {}
+        for event in plan.events:
+            if (
+                type(event) is not ConsolidationEvent
+                or type(event.status) is not MemoryRecordStatus
+                or type(event.record_id) is not str
+                or event.record_id in events
+            ):
+                raise ConsolidationPlanRejected(
+                    "event", getattr(event, "record_id", ""), "malformed or repeated"
+                )
+            events[event.record_id] = event
+        paired = {
+            record_id for record_id, event in events.items()
+            if event.status is MemoryRecordStatus.SUPERSEDED
+        }
+        if paired != set(superseded_by) or any(
+            event.status not in (MemoryRecordStatus.SUPERSEDED, MemoryRecordStatus.EXPIRED)
+            for event in events.values()
+        ):
+            raise ConsolidationPlanRejected(
+                "event", "", "only EXPIRED, or SUPERSEDED paired with a supersession"
+            )
+        for start in superseded_by:
+            seen, cursor = {start}, superseded_by[start]
+            while cursor in superseded_by:
+                if cursor in seen:
+                    raise ConsolidationPlanRejected("supersession", start, "cycle")
+                seen.add(cursor)
+                cursor = superseded_by[cursor]
+        reason_cap = MEMORY_ORIGIN_DETAIL_CAP
+        with self._connection(write=True) as connection:
+            # Validate everything against the pre-plan state, then write.
+            rows: dict[str, sqlite3.Row] = {}
+            for record_id in (*events, *superseded_by.values()):
+                if record_id in rows:
+                    continue
+                try:
+                    validate_memory_record_id(record_id)
+                except ValueError:
+                    raise ConsolidationPlanRejected("record", "", "invalid record id") from None
+                row = connection.execute(
+                    f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ?", (record_id,)
+                ).fetchone()
+                if row is None:
+                    raise ConsolidationPlanRejected("record", record_id, "unknown record")
+                if self._record_view_from_row(row) is None:
+                    raise ConsolidationPlanRejected("record", record_id, "unreadable record")
+                rows[record_id] = row
+            if len({row["project_id"] for row in rows.values()}) > 1:
+                raise ConsolidationPlanRejected("plan", "", "plan spans projects")
+            approved = MemoryRecordStatus.APPROVED
+            for record_id, event in events.items():
+                row = rows[record_id]
+                current = MemoryRecordStatus(row["current_status"])
+                if event.status not in _RECORD_TRANSITIONS.get(current, frozenset()):
+                    raise ConsolidationPlanRejected(
+                        "event", record_id,
+                        f"refusing transition {current.value} -> {event.status.value}",
+                    )
+                if current is approved and needs_user_approval(MemoryRecordKind(row["kind"])):
+                    raise ConsolidationPlanRejected(
+                        "event", record_id, "approved decision/rule/preference needs the user"
+                    )
+            for old_id, new_id in superseded_by.items():
+                old, new = rows[old_id], rows[new_id]
+                if old_id == new_id or any(
+                    old[column] != new[column]
+                    for column in (
+                        "project_id", "conversation_id", "kind",
+                        "subject_key", "classification",
+                    )
+                ):
+                    raise ConsolidationPlanRejected(
+                        "supersession", old_id, "records do not share one subject scope"
+                    )
+                if new["current_status"] != approved.value:
+                    raise ConsolidationPlanRejected(
+                        "supersession", old_id, "superseding record is not APPROVED"
+                    )
+                if (
+                    old["kind"] == MemoryRecordKind.RULE.value
+                    or old["origin"] == MemoryRecordOrigin.EXPLICIT_USER.value
+                ):
+                    raise ConsolidationPlanRejected(
+                        "supersession", old_id, "rule or explicit-user record needs the user"
+                    )
+            at = utc_now()
+            for step in plan.supersessions:
+                try:
+                    connection.execute(
+                        "INSERT INTO memory_record_supersessions (old_record_id, "
+                        "new_record_id, actor, reason, at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            step.record_id, step.superseded_by, actor,
+                            sanitize_diagnostic_text(step.reason, reason_cap), at,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ConsolidationPlanRejected(
+                        "supersession", step.record_id, "already superseded"
+                    ) from None
+            for event in plan.events:
+                connection.execute(
+                    "INSERT INTO memory_record_events (record_id, status, actor, "
+                    "reason, at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        event.record_id, event.status.value, actor,
+                        sanitize_diagnostic_text(event.reason, reason_cap), at,
+                    ),
+                )
+        return {
+            "expired": len(events) - len(superseded_by),
+            "superseded": len(superseded_by),
+            "merged": len(plan.merges),
+            "conflicts": len(plan.conflicts),
+        }
+
+    def consolidate_scope(self, project_id: str, now: str) -> dict[str, int]:
+        """Load one project's V2.1 records, plan, apply; returns counts.
+
+        Idempotent: only live records are planned, so a second call over an
+        applied plan finds nothing to do. ``apply_consolidation_plan``
+        re-checks every step, so a concurrent change refuses the plan.
+        """
+        validate_project_id(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ? ORDER BY r.record_id",
+                (project_id,),
+            ).fetchall()
+        views = [self._record_view_from_row(row) for row in rows]
+        if any(view is None for view in views):
+            raise ConsolidationPlanRejected("record", "", "unreadable record")
+        plan = plan_consolidation(
+            ((view.record, view.status) for view in views), now=now
+        )
+        return self.apply_consolidation_plan(plan)
 
     def list_records(
         self,
