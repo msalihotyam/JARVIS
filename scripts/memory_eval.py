@@ -10,8 +10,13 @@ leak count per mode:
   then summed rank - shows how much of the gap a lexical OR fixes before
   embeddings.
 
+--extract scores recorded extraction model outputs (gold set) offline through
+memory_capture.parse_candidates: precision/recall per kind, false_fact and
+instruction_leak counts.  embeddings_gate() encodes the Q3 adoption rule.
+
 No network, no embeddings, stdlib only.  Usage:
     python scripts/memory_eval.py [--fixture PATH] [--json]
+    python scripts/memory_eval.py --extract [--gold PATH] [--json]
 """
 
 from __future__ import annotations
@@ -22,13 +27,14 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jarvis import memory  # noqa: E402
+from jarvis import memory, memory_capture  # noqa: E402
 from jarvis.contracts import (  # noqa: E402
     DataClassification,
     MemoryRecord,
@@ -40,7 +46,12 @@ from jarvis.contracts import (  # noqa: E402
 from jarvis.memory import SQLiteMemoryStore  # noqa: E402
 
 DEFAULT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_eval_v21.json"
+DEFAULT_GOLD = ROOT / "tests" / "fixtures" / "memory_extract_gold_v21.json"
 K = 5
+# Q3 (build/v21/SEC_PLAN.md): Recall@10 deltas in percentage points.
+GATE_OVERALL_GAIN = 5.0
+GATE_SUBSET_GAIN = 10.0
+GATE_MAX_LOSS = 2.0
 
 
 def _load_store(store: SQLiteMemoryStore, fixture: dict) -> tuple[dict, dict]:
@@ -128,11 +139,117 @@ def run_eval(fixture_path: Path = DEFAULT_FIXTURE) -> dict:
     return result
 
 
+def run_extract(gold_path: Path = DEFAULT_GOLD) -> dict:
+    """Score each case's recorded model output against its gold expectations.
+
+    A gold item matches one unused emitted candidate of the same kind whose
+    casefolded text contains ``text_contains``. false_fact counts FACT
+    candidates in cases whose gold has no FACT; instruction_leak counts
+    candidates containing one of the case's ``instruction_markers``."""
+    gold = json.loads(Path(gold_path).read_text(encoding="utf-8"))
+    kinds = [kind.value for kind in MemoryRecordKind]
+    tally = {kind: {"tp": 0, "emitted": 0, "expected": 0} for kind in kinds}
+    totals = {"false_fact": 0, "instruction_leak": 0, "refused": 0, "dropped": 0, "errors": 0}
+    cases = []
+    for case in gold["cases"]:
+        output = case["recorded_model_output"]
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        turns = [SimpleNamespace(id=turn["id"]) for turn in case["transcript"]]
+        parsed = memory_capture.parse_candidates(output, turns)
+        if isinstance(parsed, memory_capture.CaptureError):
+            totals["errors"] += 1
+            emitted = []
+        else:
+            totals["refused"] += parsed.refused
+            totals["dropped"] += len(parsed.dropped)
+            emitted = [(c.kind.value, c.text.casefold()) for c in parsed.candidates]
+        unused = list(emitted)
+        for item in case["expected"]:
+            tally[item["kind"]]["expected"] += 1
+            needle = item["text_contains"].casefold()
+            hit = next((e for e in unused if e[0] == item["kind"] and needle in e[1]), None)
+            if hit is not None:
+                unused.remove(hit)
+                tally[item["kind"]]["tp"] += 1
+        for kind, _ in emitted:
+            tally[kind]["emitted"] += 1
+        gold_kinds = {item["kind"] for item in case["expected"]}
+        false_fact = 0 if "fact" in gold_kinds else sum(k == "fact" for k, _ in emitted)
+        markers = [m.casefold() for m in case.get("instruction_markers", [])]
+        leaks = sum(any(m in text for m in markers) for _, text in emitted)
+        totals["false_fact"] += false_fact
+        totals["instruction_leak"] += leaks
+        cases.append({"id": case["id"], "lang": case["lang"], "emitted": len(emitted),
+                      "missed": len(case["expected"]) - (len(emitted) - len(unused)),
+                      "false_fact": false_fact, "instruction_leak": leaks})
+    by_kind = {
+        kind: {
+            "precision": round(t["tp"] / t["emitted"], 4) if t["emitted"] else None,
+            "recall": round(t["tp"] / t["expected"], 4) if t["expected"] else None,
+            **t,
+        }
+        for kind, t in tally.items()
+    }
+    return {"cases": len(cases), "by_kind": by_kind, **totals, "per_case": cases}
+
+
+def embeddings_gate(baseline: dict, candidate: dict) -> tuple[str, list[str]]:
+    """Q3: ADOPT iff (overall Recall@10 >= +5 points OR paraphrase or tr_en
+    >= +10) AND exact and update each lose <= 2 points; else REJECT.
+
+    Both dicts: {"recall_at_10": float, "recall_by_type": {type: float}} with
+    recall as a 0..1 fraction. A missing exact/update value fails closed."""
+
+    def delta(get):
+        try:
+            # Rounded so float noise cannot flip a threshold edge (0.48 - 0.50).
+            return round((float(get(candidate)) - float(get(baseline))) * 100, 6)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    reasons = []
+    overall = delta(lambda d: d["recall_at_10"])
+    gain = overall is not None and overall >= GATE_OVERALL_GAIN
+    reasons.append(f"overall {overall:+.1f}" if overall is not None else "overall missing")
+    for name in ("paraphrase", "tr_en"):
+        d = delta(lambda m, n=name: m["recall_by_type"][n])
+        reasons.append(f"{name} {d:+.1f}" if d is not None else f"{name} missing")
+        gain = gain or (d is not None and d >= GATE_SUBSET_GAIN)
+    safe = True
+    for name in ("exact", "update"):
+        d = delta(lambda m, n=name: m["recall_by_type"][n])
+        if d is None or d < -GATE_MAX_LOSS:
+            safe = False
+            reasons.append(f"{name} missing" if d is None else f"{name} loses {-d:.1f} > {GATE_MAX_LOSS}")
+        else:
+            reasons.append(f"{name} {d:+.1f}")
+    if not gain:
+        reasons.append(f"no gain: overall < +{GATE_OVERALL_GAIN} and paraphrase/tr_en < +{GATE_SUBSET_GAIN}")
+    return ("ADOPT" if gain and safe else "REJECT"), reasons
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument("--extract", action="store_true", help="score the extraction gold set")
+    parser.add_argument("--gold", type=Path, default=DEFAULT_GOLD)
     parser.add_argument("--json", action="store_true", help="print full JSON result")
     args = parser.parse_args(argv)
+    if args.extract:
+        result = run_extract(args.gold)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        print(f"cases={result['cases']} false_fact={result['false_fact']} "
+              f"instruction_leak={result['instruction_leak']} refused={result['refused']} "
+              f"dropped={result['dropped']} errors={result['errors']}")
+        for kind, row in result["by_kind"].items():
+            p = "-" if row["precision"] is None else f"{row['precision']:.3f}"
+            r = "-" if row["recall"] is None else f"{row['recall']:.3f}"
+            print(f"{kind:10} precision={p} recall={r} tp={row['tp']} "
+                  f"emitted={row['emitted']} expected={row['expected']}")
+        return 0
     result = run_eval(args.fixture)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
