@@ -629,6 +629,31 @@ class TileContentTests(TileContentCase):
             with self.subTest(size=(width, height)):
                 self.assertFalse(self.item(root, "railLineFocus").property("truncated"))
 
+    def test_o2_one_refresh_reads_the_instruction_and_the_active_files_once(self) -> None:
+        # D-4: the scope facts and the work panel share one read per refresh (it was two of each).
+        store, project, conversations, _ = self.scoped()
+        bridge = self.bridge()
+        self.files(bridge, project.id, ("a.md", "b.md"))
+        bridge.openConversation(conversations[0].id)
+        cls, counts = type(bridge._conversation_db()), {}
+
+        def counting(name):
+            real = getattr(cls, name)
+
+            def wrapper(this, *args, **kwargs):
+                counts[name] = counts.get(name, 0) + 1
+                return real(this, *args, **kwargs)
+            return wrapper
+
+        with mock.patch.object(cls, "load_project_instruction", counting("load_project_instruction")), \
+                mock.patch.object(cls, "list_project_files", counting("list_project_files")):
+            bridge._refresh_conversations()
+        self.assertEqual({"load_project_instruction": 1, "list_project_files": 1}, counts)
+        facts, panel = bridge.conversationProject, bridge.workPanel
+        self.assertEqual((True, 2), (facts["instruction"], facts["file_count"]))
+        self.assertEqual(("Yanıtları Türkçe ver.", 21, ["a.md", "b.md"]),
+                         (panel["instruction"], panel["instruction_chars"], panel["files"]))
+
     def test_p_plan_shows_the_next_job_in_genel_and_in_a_project(self) -> None:
         from datetime import datetime, timedelta
         store, project, conversations, global_one = self.scoped()

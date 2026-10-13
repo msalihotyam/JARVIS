@@ -926,8 +926,10 @@ class Bridge(QObject):
         self._open_title = "" if open_record is None else (open_record.title or (
             ("Bridge", QT_TRANSLATE_NOOP("Bridge", "Previous conversation"), ()) if open_record.origin == "legacy-import" else ""))
         self._conversation_owner = self._owner_of(store, open_id)
-        self._scope_facts = self._read_scope_facts(store, self._conversation_owner.get("id") or None)
-        self._work_panel = self._read_work_panel(store, self._conversation_owner.get("id") or "")
+        owner_id = self._conversation_owner.get("id") or ""
+        project = self._read_project_texts(store, owner_id)       # D-4: read once, used by both
+        self._scope_facts = self._read_scope_facts(store, owner_id or None, project)
+        self._work_panel = self._read_work_panel(store, owner_id, project)
         scope_owner = self._conversation_owner.get("id") or None
         scope = [r for r in everything if r.project_id == scope_owner and r.archived_at is None]
         self._scope_conversations = [
@@ -985,7 +987,25 @@ class Bridge(QObject):
         return {"id": project.id, "name": project.name, "active": bool(project.active)}
 
     @staticmethod
-    def _read_scope_facts(store: Any, project_id: str | None) -> dict[str, Any]:
+    def _read_project_texts(store: Any, project_id: str) -> dict[str, Any]:
+        """D-4, read only, once per refresh: the project's CURRENT instruction
+        text ("text") and its active file names ("files"), for the scope facts
+        and the work panel. A key is left out when its read failed (or the one
+        before it did); {} for no store or no project."""
+        read: dict[str, Any] = {}
+        if store is None or not project_id:
+            return read
+        try:
+            current = store.load_project_instruction(project_id)
+            read["text"] = current.text if current is not None else ""
+            read["files"] = [str(f["display_name"]) for f in store.list_project_files(project_id)
+                             if f.get("lifecycle") == project_files.ACTIVE]
+        except Exception:  # noqa: BLE001 - a label only: what was read stays
+            pass
+        return read
+
+    @staticmethod
+    def _read_scope_facts(store: Any, project_id: str | None, project: dict[str, Any]) -> dict[str, Any]:
         """Gate 6F (tiles T2, T4), read only: what the model sees in the scope -
         its current instruction and active files (a project) - and the scope's
         active memory records: their count and the newest write. Genel has no
@@ -995,9 +1015,10 @@ class Bridge(QObject):
             return facts
         try:
             if project_id:
-                current = store.load_project_instruction(project_id)
-                facts["instruction"] = current is not None and bool(current.text.strip())
-                facts["file_count"] = sum(1 for f in store.list_project_files(project_id) if f.get("lifecycle") == "active")
+                if "files" not in project:
+                    return facts
+                facts["instruction"] = bool(project["text"].strip())
+                facts["file_count"] = len(project["files"])
                 items = store.list_memory_items(project_id)
             else:
                 # ponytail: one listing per active project; a store-wide "newest item" query if projects grow many
@@ -1205,17 +1226,17 @@ class Bridge(QObject):
 
     workPanelChanged = Signal()
 
-    def _read_work_panel(self, store: Any, project_id: str) -> dict[str, Any]:
+    def _read_work_panel(self, store: Any, project_id: str, project: dict[str, Any]) -> dict[str, Any]:
         if store is None or not project_id:
             return {}
         panel: dict[str, Any] = {"instruction": "", "instruction_chars": 0, "files": [], "folder": ""}
+        text = project.get("text", "")
+        if text.strip():
+            panel["instruction"], panel["instruction_chars"] = " ".join(text.split())[:300], len(text)
+        if "files" not in project:
+            return panel
+        panel["files"] = list(project["files"])
         try:
-            current = store.load_project_instruction(project_id)
-            text = current.text if current is not None else ""
-            if text.strip():
-                panel["instruction"], panel["instruction_chars"] = " ".join(text.split())[:300], len(text)
-            panel["files"] = [str(f["display_name"]) for f in store.list_project_files(project_id)
-                              if f.get("lifecycle") == project_files.ACTIVE]
             link = self._folder_result("show", project_id).get("folder")
             panel["folder"] = Path(link["path"]).name if link else ""
         except Exception:  # noqa: BLE001 - a label only: what was read stays
