@@ -9,10 +9,10 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 from uuid import uuid4
 
 from jarvis.conditions import ConditionResult
@@ -83,6 +83,15 @@ from jarvis.contracts import (
     LoopCheckpoint,
     LoopStage,
     MemoryLifecycle,
+    MemoryRecord,
+    MemoryRecordActor,
+    MemoryRecordKind,
+    MemoryRecordOrigin,
+    MemoryRecordScope,
+    MemoryRecordScopeKind,
+    MemoryRecordStatus,
+    needs_user_approval,
+    validate_memory_record_id,
     MemoryRetrievalQuery,
     OutcomeStatus,
     MemoryOrigin,
@@ -158,6 +167,7 @@ from jarvis.contracts import (
     utc_now,
     validate_project_id,
 )
+from jarvis.memory_filter import classify_candidate_text
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.conversation import (
     CONVERSATION_ID,
@@ -978,6 +988,83 @@ def pre_v2_backup_path(database_path: Path) -> Path:
     return database_path.with_name(
         f"{database_path.stem}{PRE_V2_BACKUP_TAG}{database_path.suffix}"
     )
+
+
+class MemoryRecordRefused(ValueError):
+    """The never-stored filter refused a record; nothing was written.
+
+    Carries the filter category only - never the refused text.
+    """
+
+    def __init__(self, category: str | None) -> None:
+        self.category = category or "filter_error"
+        super().__init__(f"memory record refused: {self.category}")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecordApproval:
+    """Explicit-user proof for approving one PENDING record.
+
+    Built ONLY at a trusted local human command boundary (the app's
+    approve action, MEMAPPAPI), never from model, import or connector
+    output. The store re-establishes every eligibility condition from
+    current SQLite state; the proof names WHICH record the human approved,
+    it does not carry status.
+    """
+
+    project_id: str
+    record_id: str
+    detail: str = "user-approve"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecordView:
+    """One record together with its CURRENT status (latest event)."""
+
+    record: MemoryRecord
+    status: MemoryRecordStatus
+
+
+# Allowed status transitions; every state not listed is terminal.
+_RECORD_TRANSITIONS: dict[MemoryRecordStatus, frozenset[MemoryRecordStatus]] = {
+    MemoryRecordStatus.PENDING: frozenset({
+        MemoryRecordStatus.APPROVED,
+        MemoryRecordStatus.REJECTED,
+        MemoryRecordStatus.EXPIRED,
+    }),
+    MemoryRecordStatus.APPROVED: frozenset({
+        MemoryRecordStatus.RETRACTED,
+        MemoryRecordStatus.SUPERSEDED,
+        MemoryRecordStatus.EXPIRED,
+    }),
+}
+# Reachable only through their own audited paths, never record_event:
+# PENDING (insert), APPROVED (approve_record / auto-approve), SUPERSEDED
+# (supersede).
+_RESERVED_EVENT_STATUSES = frozenset({
+    MemoryRecordStatus.PENDING,
+    MemoryRecordStatus.APPROVED,
+    MemoryRecordStatus.SUPERSEDED,
+})
+_LEGACY_RECORD_KINDS = {
+    ProjectMemoryKind.FACT: MemoryRecordKind.FACT,
+    ProjectMemoryKind.DECISION: MemoryRecordKind.DECISION,
+    ProjectMemoryKind.RULE: MemoryRecordKind.RULE,
+}
+_RECORD_LIST_MAX_LIMIT = 500
+_RECORD_COLUMNS = (
+    "r.record_id, r.kind, r.text, r.subject_key, r.project_id, "
+    "r.conversation_id, r.origin, r.actor, r.tool, r.confidence, "
+    "r.classification, r.created_at, r.last_verified_at, r.expires_at, "
+    "r.supersedes, r.source_conversation_id, r.source_turn_ids"
+)
+# Current status = the newest event of the record.
+_RECORD_CURRENT_SQL = (
+    f"SELECT {_RECORD_COLUMNS}, e.status AS current_status "  # nosec B608 - constant SQL fragments only
+    "FROM memory_records r JOIN memory_record_events e ON e.event_id = "
+    "(SELECT MAX(event_id) FROM memory_record_events "
+    "WHERE record_id = r.record_id)"
+)
 
 
 class SQLiteMemoryStore:
@@ -6416,6 +6503,510 @@ class SQLiteMemoryStore:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                 }
+            )
+        except (TypeError, KeyError, ValueError):
+            return None
+
+    # --- V2.1 typed record store (insert-only, status events, undo) ---------
+    #
+    # memory_records rows are written once and never changed; status lives in
+    # the append-only memory_record_events log (current = newest event) and
+    # supersession in memory_record_supersessions. Nothing here issues an
+    # UPDATE or DELETE against those tables.
+
+    def insert_record(self, record: MemoryRecord) -> MemoryRecordView:
+        """Insert one model/tool/import record plus its initial status event.
+
+        Generic writers can never claim human provenance: an EXPLICIT_USER or
+        LEGACY_M1 origin, or the USER actor, is refused here - explicit human
+        records go through ``insert_explicit_user_record`` only. FACT/LESSON
+        start APPROVED (automatic, undoable); every other kind and every
+        IMPORT record starts PENDING until the user approves it.
+        """
+        if type(record) is not MemoryRecord:
+            raise ValueError("record must be a MemoryRecord")
+        if record.origin in (
+            MemoryRecordOrigin.EXPLICIT_USER,
+            MemoryRecordOrigin.LEGACY_M1,
+        ):
+            raise ValueError(
+                f"insert_record refuses origin {record.origin.value}"
+            )
+        if record.actor is MemoryRecordActor.USER:
+            raise ValueError("insert_record refuses the USER actor")
+        return self._persist_record(record)
+
+    def insert_explicit_user_record(
+        self,
+        project_id: str,
+        kind: str,
+        classification: str,
+        text: str,
+        subject_key: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> MemoryRecordView:
+        """THE trusted explicit-human write boundary for V2.1 records.
+
+        Mirrors ``save_explicit_user_memory_item``: the caller supplies RAW
+        command inputs and never a provenance value; ``EXPLICIT_USER`` and the
+        USER actor are established here. Audited production callers: none
+        yet - the app's local human "remember" command (MEMAPPAPI) is the
+        only sanctioned caller. No model, connector or import path may call
+        it. A DECISION/RULE/PREFERENCE still starts PENDING and needs
+        ``approve_record``; FACT/LESSON start APPROVED.
+        """
+        record = MemoryRecord(
+            kind=MemoryRecordKind(kind),
+            text=text,
+            subject_key=subject_key,
+            scope=MemoryRecordScope(
+                validate_project_id(project_id), conversation_id
+            ),
+            origin=MemoryRecordOrigin.EXPLICIT_USER,
+            actor=MemoryRecordActor.USER,
+            confidence=1.0,
+            classification=DataClassification(classification),
+        )
+        return self._persist_record(record)
+
+    def _persist_record(self, record: MemoryRecord) -> MemoryRecordView:
+        """The one INSERT-only record path; filter and hygiene re-run here."""
+        if type(record) is not MemoryRecord:
+            raise ValueError("record must be a MemoryRecord")
+        verdict = classify_candidate_text(record.text)
+        if not verdict.allowed:
+            raise MemoryRecordRefused(verdict.category)
+        text = normalize_retrieved_text(record.text)
+        if not text:
+            raise ValueError("memory text must be a non-blank string")
+        if len(text) > PROJECT_MEMORY_TEXT_CAP:
+            raise ValueError(
+                f"memory text is longer than {PROJECT_MEMORY_TEXT_CAP} characters"
+            )
+        text, _ = redact_credentials(text)
+        text = redact_local_paths(text)
+        stored = replace(record, text=text)
+        # The stored text is what retrieval delivers, so it is checked too.
+        verdict = classify_candidate_text(stored.text)
+        if not verdict.allowed:
+            raise MemoryRecordRefused(verdict.category)
+        status = (
+            MemoryRecordStatus.APPROVED
+            if not needs_user_approval(stored.kind)
+            and stored.origin is not MemoryRecordOrigin.IMPORT
+            else MemoryRecordStatus.PENDING
+        )
+        project_id = stored.scope.project_id
+        with self._connection(write=True) as connection:
+            project_row = connection.execute(
+                "SELECT active FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project_row is None or not project_row["active"]:
+                raise ValueError(f"Unknown or inactive project: {project_id}")
+            # list_records shows legacy M1 items under their own id; one id, one item.
+            if connection.execute(
+                "SELECT 1 FROM project_memory_items WHERE id = ?", (stored.record_id,)
+            ).fetchone():
+                raise ValueError(f"Memory record already exists: {stored.record_id}")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO memory_records
+                        (record_id, kind, text, subject_key, project_id,
+                         conversation_id, scope_kind, origin, actor, tool,
+                         confidence, classification, created_at,
+                         last_verified_at, expires_at, supersedes,
+                         source_conversation_id, source_turn_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, 'project', ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?)
+                    """,
+                    (
+                        stored.record_id,
+                        stored.kind.value,
+                        stored.text,
+                        stored.subject_key,
+                        project_id,
+                        stored.scope.conversation_id,
+                        stored.origin.value,
+                        stored.actor.value,
+                        stored.tool,
+                        stored.confidence,
+                        stored.classification.value,
+                        stored.created_at,
+                        stored.last_verified_at,
+                        stored.expires_at,
+                        stored.supersedes,
+                        stored.source_conversation_id,
+                        json.dumps(list(stored.source_turn_ids)),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"Memory record already exists or is invalid: "
+                    f"{stored.record_id}"
+                ) from exc
+            connection.execute(
+                "INSERT INTO memory_record_events (record_id, status, actor, "
+                "reason, at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    stored.record_id,
+                    status.value,
+                    stored.actor.value,
+                    "created",
+                    utc_now(),
+                ),
+            )
+        return MemoryRecordView(stored, status)
+
+    def approve_record(
+        self, record_id: str, proof: MemoryRecordApproval
+    ) -> MemoryRecordStatus:
+        """Approve one PENDING record with explicit-user proof.
+
+        The proof only names which record of which project the human
+        approved; eligibility (record exists in that project, project active,
+        record currently PENDING) is re-read from SQLite in the same write
+        transaction. Anything else is refused and nothing is written.
+        """
+        validate_memory_record_id(record_id)
+        if type(proof) is not MemoryRecordApproval:
+            raise ValueError("approve_record requires explicit-user proof")
+        if proof.record_id != record_id:
+            raise ValueError("approval proof names a different record")
+        reason = sanitize_diagnostic_text(proof.detail, MEMORY_ORIGIN_DETAIL_CAP)
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT project_id FROM memory_records WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            if row is None or row["project_id"] != proof.project_id:
+                raise ValueError(
+                    "approval must reference a record of exactly this project"
+                )
+            project_row = connection.execute(
+                "SELECT active FROM projects WHERE id = ?", (proof.project_id,)
+            ).fetchone()
+            if project_row is None or not project_row["active"]:
+                raise ValueError(
+                    f"Unknown or inactive project: {proof.project_id}"
+                )
+            self._append_record_event(
+                connection,
+                record_id,
+                MemoryRecordStatus.APPROVED,
+                MemoryRecordActor.USER,
+                reason,
+            )
+        return MemoryRecordStatus.APPROVED
+
+    def record_event(
+        self,
+        record_id: str,
+        status: MemoryRecordStatus,
+        actor: MemoryRecordActor,
+        reason: str = "",
+    ) -> MemoryRecordStatus:
+        """Append one REJECTED / RETRACTED / EXPIRED event.
+
+        PENDING, APPROVED and SUPERSEDED are reserved for their own audited
+        paths. The transition is checked against the current status read in
+        the same write transaction; a terminal record never moves again.
+        """
+        validate_memory_record_id(record_id)
+        if type(status) is not MemoryRecordStatus:
+            raise ValueError("status must be a MemoryRecordStatus")
+        if status in _RESERVED_EVENT_STATUSES:
+            raise ValueError(f"record_event refuses status {status.value}")
+        if type(actor) is not MemoryRecordActor:
+            raise ValueError("actor must be a MemoryRecordActor")
+        reason = sanitize_diagnostic_text(reason, MEMORY_ORIGIN_DETAIL_CAP)
+        with self._connection(write=True) as connection:
+            self._append_record_event(connection, record_id, status, actor, reason)
+        return status
+
+    def undo(
+        self, record_id: str, actor: MemoryRecordActor
+    ) -> MemoryRecordStatus:
+        """Undo an APPROVED record by appending a RETRACTED event."""
+        return self.record_event(
+            record_id, MemoryRecordStatus.RETRACTED, actor, "undo"
+        )
+
+    @staticmethod
+    def _append_record_event(
+        connection: sqlite3.Connection,
+        record_id: str,
+        status: MemoryRecordStatus,
+        actor: MemoryRecordActor,
+        reason: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT status FROM memory_record_events WHERE record_id = ? "
+            "ORDER BY event_id DESC LIMIT 1",
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown memory record: {record_id}")
+        try:
+            current = MemoryRecordStatus(row["status"])
+        except ValueError as exc:
+            raise ValueError("record has an unreadable status") from exc
+        if status not in _RECORD_TRANSITIONS.get(current, frozenset()):
+            raise ValueError(
+                f"refusing transition {current.value} -> {status.value}"
+            )
+        connection.execute(
+            "INSERT INTO memory_record_events (record_id, status, actor, "
+            "reason, at) VALUES (?, ?, ?, ?, ?)",
+            (record_id, status.value, actor.value, reason, utc_now()),
+        )
+
+    def current_status(self, record_id: str) -> MemoryRecordStatus | None:
+        """The record's newest event status, or None for an unknown record."""
+        validate_memory_record_id(record_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM memory_record_events WHERE record_id = ? "
+                "ORDER BY event_id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return MemoryRecordStatus(row["status"])
+        except ValueError:
+            return None
+
+    def supersede(
+        self,
+        old_record_id: str,
+        new_record_id: str,
+        actor: MemoryRecordActor,
+        reason: str = "",
+        *,
+        proof: MemoryRecordApproval | None = None,
+    ) -> MemoryRecordStatus:
+        """Mark ``old`` SUPERSEDED by ``new`` (both APPROVED, same subject).
+
+        ``new`` must already name ``old`` in ``supersedes`` with the same
+        project, conversation, kind and normalized subject key. An approved
+        RULE or explicit-user record is never superseded without
+        explicit-user proof for the OLD record.
+        """
+        validate_memory_record_id(old_record_id, "old_record_id")
+        validate_memory_record_id(new_record_id, "new_record_id")
+        if old_record_id == new_record_id:
+            raise ValueError("a record cannot supersede itself")
+        if type(actor) is not MemoryRecordActor:
+            raise ValueError("actor must be a MemoryRecordActor")
+        reason = sanitize_diagnostic_text(reason, MEMORY_ORIGIN_DETAIL_CAP)
+        with self._connection(write=True) as connection:
+            rows = {
+                row["record_id"]: row
+                for row in connection.execute(
+                    f"{_RECORD_CURRENT_SQL} WHERE r.record_id IN (?, ?)",
+                    (old_record_id, new_record_id),
+                ).fetchall()
+            }
+            old, new = rows.get(old_record_id), rows.get(new_record_id)
+            if (
+                old is None
+                or new is None
+                or new["project_id"] != old["project_id"]
+                or new["conversation_id"] != old["conversation_id"]
+                or new["kind"] != old["kind"]
+                or new["subject_key"] != old["subject_key"]
+                or new["supersedes"] != old_record_id
+            ):
+                raise ValueError(
+                    "supersede needs a new record naming the old one, with "
+                    "the same project, conversation, kind and subject"
+                )
+            approved = MemoryRecordStatus.APPROVED.value
+            if old["current_status"] != approved or new["current_status"] != approved:
+                raise ValueError("supersede needs two APPROVED records")
+            if (
+                old["kind"] == MemoryRecordKind.RULE.value
+                or old["origin"] == MemoryRecordOrigin.EXPLICIT_USER.value
+            ) and (
+                type(proof) is not MemoryRecordApproval
+                or proof.record_id != old_record_id
+                or proof.project_id != old["project_id"]
+            ):
+                raise ValueError(
+                    "superseding an approved RULE or explicit-user record "
+                    "requires explicit-user proof"
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO memory_record_supersessions (old_record_id, "
+                    "new_record_id, actor, reason, at) VALUES (?, ?, ?, ?, ?)",
+                    (old_record_id, new_record_id, actor.value, reason, utc_now()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"Memory record already superseded: {old_record_id}"
+                ) from exc
+            self._append_record_event(
+                connection,
+                old_record_id,
+                MemoryRecordStatus.SUPERSEDED,
+                actor,
+                reason,
+            )
+        return MemoryRecordStatus.SUPERSEDED
+
+    def list_records(
+        self,
+        scope: MemoryRecordScope,
+        statuses: Iterable[MemoryRecordStatus] | None = None,
+        kinds: Iterable[MemoryRecordKind] | None = None,
+        limit: int = 100,
+    ) -> list[MemoryRecordView]:
+        """List one project's records (V2.1 + legacy M1) with current status.
+
+        Only the scope's project is ever read; a conversation-scoped query
+        also sees project-wide records but never another conversation's.
+        GLOBAL_READONLY is refused here (the all-projects toggle is not this
+        store's surface). Legacy M1 ``project_memory_items`` are adapted
+        read-only as LEGACY_M1 records; nothing is migrated. Corrupt rows are
+        skipped, never normalized.
+        """
+        if type(scope) is not MemoryRecordScope:
+            raise ValueError("scope must be a MemoryRecordScope")
+        if scope.kind is not MemoryRecordScopeKind.PROJECT:
+            raise ValueError("list_records needs a PROJECT scope")
+        if type(limit) is not int or not 1 <= limit <= _RECORD_LIST_MAX_LIMIT:
+            raise ValueError(
+                f"limit must be an int between 1 and {_RECORD_LIST_MAX_LIMIT}"
+            )
+        status_set = None if statuses is None else frozenset(statuses)
+        kind_set = None if kinds is None else frozenset(kinds)
+        if status_set is not None and any(
+            type(s) is not MemoryRecordStatus for s in status_set
+        ):
+            raise ValueError("statuses must be MemoryRecordStatus members")
+        if kind_set is not None and any(
+            type(k) is not MemoryRecordKind for k in kind_set
+        ):
+            raise ValueError("kinds must be MemoryRecordKind members")
+        sql = f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ?"
+        params: list[object] = [scope.project_id]
+        if scope.conversation_id is not None:
+            sql += " AND (r.conversation_id IS NULL OR r.conversation_id = ?)"
+            params.append(scope.conversation_id)
+        else:
+            sql += " AND r.conversation_id IS NULL"
+        if status_set is not None:
+            sql += f" AND e.status IN ({', '.join('?' * len(status_set))})"
+            params.extend(sorted(s.value for s in status_set))
+        if kind_set is not None:
+            sql += f" AND r.kind IN ({', '.join('?' * len(kind_set))})"
+            params.extend(sorted(k.value for k in kind_set))
+        sql += " ORDER BY r.created_at, r.record_id"
+        with self._connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        views = [
+            view
+            for view in map(self._record_view_from_row, rows)
+            if view is not None
+        ]
+        views.extend(
+            view
+            for view in self._legacy_record_views(scope.project_id)
+            if (status_set is None or view.status in status_set)
+            and (kind_set is None or view.record.kind in kind_set)
+        )
+        views.sort(key=lambda v: (v.record.created_at, v.record.record_id))
+        return views[:limit]
+
+    def _legacy_record_views(self, project_id: str) -> list[MemoryRecordView]:
+        """Read-only adapter: M1 project_memory_items as LEGACY_M1 records.
+
+        THREAD has no V2.1 kind and is skipped. Only an ACTIVE explicit-user
+        M1 item reads as APPROVED; other ACTIVE items read as PENDING,
+        SUPERSEDED stays SUPERSEDED and RETIRED reads as RETRACTED. A SECRET
+        or corrupt item fails to build and is skipped.
+        """
+        # ponytail: reads every M1 row of the project per call; push the
+        # status/kind filters into SQL if M1 projects grow large.
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, project_id, kind, text, classification, origin, "
+                "origin_detail, active, superseded_by, created_at, updated_at "
+                "FROM project_memory_items WHERE project_id = ? "
+                "ORDER BY created_at, id",
+                (project_id,),
+            ).fetchall()
+        views: list[MemoryRecordView] = []
+        for row in rows:
+            item = self._memory_item_from_row(row)
+            if item is None or item.kind not in _LEGACY_RECORD_KINDS:
+                continue
+            explicit = item.origin is MemoryOrigin.EXPLICIT_USER
+            lifecycle = item.lifecycle
+            if lifecycle is MemoryLifecycle.ACTIVE:
+                status = (
+                    MemoryRecordStatus.APPROVED
+                    if explicit
+                    else MemoryRecordStatus.PENDING
+                )
+            elif lifecycle is MemoryLifecycle.SUPERSEDED:
+                status = MemoryRecordStatus.SUPERSEDED
+            else:
+                status = MemoryRecordStatus.RETRACTED
+            try:
+                record = MemoryRecord(
+                    kind=_LEGACY_RECORD_KINDS[item.kind],
+                    text=item.text,
+                    subject_key=f"legacy-{item.id}",
+                    scope=MemoryRecordScope(item.project_id),
+                    origin=MemoryRecordOrigin.LEGACY_M1,
+                    actor=(
+                        MemoryRecordActor.USER
+                        if explicit
+                        else MemoryRecordActor.MODEL
+                    ),
+                    confidence=1.0 if explicit else 0.5,
+                    classification=item.classification,
+                    record_id=item.id,
+                    created_at=item.created_at,
+                )
+            except (TypeError, ValueError):
+                continue
+            views.append(MemoryRecordView(record, status))
+        return views
+
+    @staticmethod
+    def _record_view_from_row(row: sqlite3.Row) -> MemoryRecordView | None:
+        """Rebuild one stored record with its current status, fail-closed."""
+        try:
+            turn_ids = json.loads(row["source_turn_ids"])
+            if type(turn_ids) is not list:
+                return None
+            record = MemoryRecord(
+                kind=MemoryRecordKind(row["kind"]),
+                text=row["text"],
+                subject_key=row["subject_key"],
+                scope=MemoryRecordScope(
+                    row["project_id"], row["conversation_id"]
+                ),
+                origin=MemoryRecordOrigin(row["origin"]),
+                actor=MemoryRecordActor(row["actor"]),
+                confidence=row["confidence"],
+                classification=DataClassification(row["classification"]),
+                record_id=row["record_id"],
+                tool=row["tool"],
+                created_at=row["created_at"],
+                last_verified_at=row["last_verified_at"],
+                expires_at=row["expires_at"],
+                supersedes=row["supersedes"],
+                source_conversation_id=row["source_conversation_id"],
+                source_turn_ids=tuple(turn_ids),
+            )
+            return MemoryRecordView(
+                record, MemoryRecordStatus(row["current_status"])
             )
         except (TypeError, KeyError, ValueError):
             return None
