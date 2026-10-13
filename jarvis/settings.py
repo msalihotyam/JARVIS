@@ -175,6 +175,13 @@ class Settings:
     #: one exact destination grant per enabled desktop capability; every
     #: other application is refused by Core's destination policy.
     desktop_apps: tuple[str, ...] = ()
+    #: V2.2 skills (PLAN D7): ONE switch for skill matching and use, save
+    #: offers, and experience capture and injection. Default False and False
+    #: in ``fail_closed_settings``: the capability stays off until the
+    #: operator turns it on. It is NOT authority: a skill is a procedure,
+    #: never a grant, so turning this on approves, pre-approves and relaxes
+    #: nothing - every step still passes Core policy and the approval gate.
+    skills_enabled: bool = False
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -221,6 +228,8 @@ class Settings:
             raise ValueError("permission_mode must be a PermissionMode member")
         if type(self.paid_api_enabled) is not bool:
             raise ValueError("paid_api_enabled must be exactly a bool")
+        if type(self.skills_enabled) is not bool:
+            raise ValueError("skills_enabled must be exactly a bool")
         # bool is an int subclass, so ``True`` would otherwise pass as 1 minute.
         if type(self.approval_ttl_minutes) is not int:
             raise ValueError("approval_ttl_minutes must be exactly an int")
@@ -380,7 +389,8 @@ CONFIG_MAX_BYTES = 16_384
 #: The closed key set. Exactly these, always all of them, in every document
 #: this code writes or accepts. "Unknown key" and "missing key" are the same
 #: verdict for the same reason: a document this build does not fully
-#: understand is one whose meaning it cannot promise the operator.
+#: understand is one whose meaning it cannot promise the operator. The one
+#: exception is the skills switch, written only when on (SKILLS_ENABLED_KEY).
 CONFIG_KEYS = (
     "config_version",
     "execution_enabled",
@@ -441,6 +451,20 @@ PRE_GITHUB_CONFIG_KEYS = PRE_GMAIL_CONFIG_KEYS - {
 #: pre-existing key - is refused whole: this is a second accepted CLOSED
 #: shape, never a general "optional keys" hole.
 LEGACY_CONFIG_KEYS = PRE_GITHUB_CONFIG_KEYS - {"claude_model", "claude_effort"}
+
+#: V2.2 skills switch (PLAN D7). Deliberately NOT in ``CONFIG_KEYS``: every
+#: older build refuses a document with a key it does not know (INVALID, then
+#: ``fail_closed_settings``), so a key written on every save would break
+#: rollback for every operator. It is therefore written ONLY when it differs
+#: from its default, i.e. only as ``true``; a document with skills off is
+#: byte-for-byte the shape the previous build wrote, and a document without
+#: the key loads with skills off.
+SKILLS_ENABLED_KEY = "skills_enabled"
+
+#: The current shape plus the skills switch: one more CLOSED shape, never an
+#: optional-keys hole. Only the current shape gains it, because only this
+#: build (which always writes the full current shape) ever writes it.
+SKILLS_CONFIG_KEYS = frozenset(CONFIG_KEYS) | {SKILLS_ENABLED_KEY}
 
 #: Raw provider tokens the canonical policy does not classify. It is
 #: syntax-aware - it reads labels and delimiters - and a raw token carries
@@ -745,8 +769,13 @@ def _exact_gmail_principal(value: object) -> str | None:
 
 
 def _document_from_settings(settings: Settings) -> dict[str, object]:
-    """The complete canonical document for a Settings. Always every key."""
-    return {
+    """The complete canonical document for a Settings.
+
+    Always every key of ``CONFIG_KEYS``; ``skills_enabled`` only when it is
+    on (see ``SKILLS_ENABLED_KEY``), so an off document stays readable by
+    an older build.
+    """
+    document: dict[str, object] = {
         "config_version": CONFIG_VERSION,
         "execution_enabled": settings.execution_enabled,
         "permission_mode": settings.permission_mode.value,
@@ -763,6 +792,9 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         "browser_origins": list(settings.browser_origins),
         "desktop_apps": list(settings.desktop_apps),
     }
+    if settings.skills_enabled:
+        document[SKILLS_ENABLED_KEY] = True
+    return document
 
 
 def _settings_from_document(document: dict[str, object]) -> Settings:
@@ -778,6 +810,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     keys = set(document)
     if keys not in (
         set(CONFIG_KEYS),
+        set(SKILLS_CONFIG_KEYS),
         set(PRE_DESKTOP_CONFIG_KEYS),
         set(PRE_BROWSER_CONFIG_KEYS),
         set(PRE_GMAIL_CONFIG_KEYS),
@@ -790,7 +823,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
         # complete pre-selection v1 key set (see LEGACY_CONFIG_KEYS).
         _fail(
             "The configuration document must contain exactly the current v1 "
-            "keys: " + ", ".join(CONFIG_KEYS) + "."
+            "keys: " + ", ".join(CONFIG_KEYS) + " (and optionally "
+            + SKILLS_ENABLED_KEY + ")."
         )
     if document["config_version"] != CONFIG_VERSION or type(
         document["config_version"]
@@ -800,6 +834,13 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     paid_enabled = _exact_bool(document["paid_api_enabled"], "paid_api_enabled")
     if paid_enabled and approval_id is None:
         _fail("'paid_api_enabled' requires a 'paid_api_approval_id'.")
+    # Absent means off (every older shape, and the current shape with skills
+    # off). A present value must be an exact JSON boolean, like the others.
+    skills_enabled = (
+        _exact_bool(document[SKILLS_ENABLED_KEY], SKILLS_ENABLED_KEY)
+        if SKILLS_ENABLED_KEY in document
+        else False
+    )
     try:
         return Settings(
             memory_database=_exact_database(document["memory_database"]),
@@ -839,6 +880,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             browser_origins=_exact_browser_origins(document.get("browser_origins")),
             # Absent means unset (a pre-Desktop document): no application.
             desktop_apps=_exact_desktop_apps(document.get("desktop_apps")),
+            skills_enabled=skills_enabled,
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already
@@ -858,6 +900,7 @@ def fail_closed_settings() -> Settings:
         execution_enabled=False,
         permission_mode=PermissionMode.STRICT,
         paid_api_enabled=False,
+        skills_enabled=False,
     )
 
 
