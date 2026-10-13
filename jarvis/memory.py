@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -856,6 +857,21 @@ def memory_records_fts_available(connection: sqlite3.Connection) -> bool:
     return row is not None
 
 
+_TURKISH_I_FOLD = {ord("I"): "i", ord("İ"): "i", ord("ı"): "i"}
+
+
+def _fold_search_text(text: str) -> str:
+    """Pure search folding: Turkish I/İ/ı -> i, lowercase, NFKD, no marks.
+
+    Used for the FTS index columns and every query token, never for the
+    stored record text. 'IŞIK', 'ışık', 'Işık' and 'isik' all fold to 'isik'.
+    """
+    decomposed = unicodedata.normalize(
+        "NFKD", text.translate(_TURKISH_I_FOLD).lower()
+    )
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def _create_compatibility_schema(connection: sqlite3.Connection) -> None:
     """Idempotent on every open. Statement by statement, NOT ``executescript``
     (which would commit the open transaction first), so the layer is created
@@ -1065,6 +1081,16 @@ _RECORD_CURRENT_SQL = (
     "(SELECT MAX(event_id) FROM memory_record_events "
     "WHERE record_id = r.record_id)"
 )
+#: Same columns as _RECORD_CURRENT_SQL plus the bm25 rank of an FTS match.
+_RECORD_SEARCH_FTS_SQL = (
+    f"SELECT {_RECORD_COLUMNS}, e.status AS current_status, "  # nosec B608 - constant SQL fragments only
+    f"bm25({MEMORY_RECORDS_FTS}) AS search_rank FROM {MEMORY_RECORDS_FTS} "
+    f"JOIN memory_records r ON r.record_id = {MEMORY_RECORDS_FTS}.record_id "
+    "JOIN memory_record_events e ON e.event_id = "
+    "(SELECT MAX(event_id) FROM memory_record_events "
+    "WHERE record_id = r.record_id)"
+)
+_RECORD_SEARCH_MAX_TOKENS = 32
 
 
 class SQLiteMemoryStore:
@@ -6657,6 +6683,17 @@ class SQLiteMemoryStore:
                     utc_now(),
                 ),
             )
+            # Same transaction: a refused or failed insert leaves no index row.
+            if memory_records_fts_available(connection):
+                connection.execute(
+                    f"INSERT INTO {MEMORY_RECORDS_FTS} "  # nosec B608 - constant table name
+                    "(record_id, text, subject_key) VALUES (?, ?, ?)",
+                    (
+                        stored.record_id,
+                        _fold_search_text(stored.text),
+                        _fold_search_text(stored.subject_key),
+                    ),
+                )
         return MemoryRecordView(stored, status)
 
     def approve_record(
@@ -6873,38 +6910,10 @@ class SQLiteMemoryStore:
         read-only as LEGACY_M1 records; nothing is migrated. Corrupt rows are
         skipped, never normalized.
         """
-        if type(scope) is not MemoryRecordScope:
-            raise ValueError("scope must be a MemoryRecordScope")
-        if scope.kind is not MemoryRecordScopeKind.PROJECT:
-            raise ValueError("list_records needs a PROJECT scope")
-        if type(limit) is not int or not 1 <= limit <= _RECORD_LIST_MAX_LIMIT:
-            raise ValueError(
-                f"limit must be an int between 1 and {_RECORD_LIST_MAX_LIMIT}"
-            )
-        status_set = None if statuses is None else frozenset(statuses)
-        kind_set = None if kinds is None else frozenset(kinds)
-        if status_set is not None and any(
-            type(s) is not MemoryRecordStatus for s in status_set
-        ):
-            raise ValueError("statuses must be MemoryRecordStatus members")
-        if kind_set is not None and any(
-            type(k) is not MemoryRecordKind for k in kind_set
-        ):
-            raise ValueError("kinds must be MemoryRecordKind members")
-        sql = f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ?"
-        params: list[object] = [scope.project_id]
-        if scope.conversation_id is not None:
-            sql += " AND (r.conversation_id IS NULL OR r.conversation_id = ?)"
-            params.append(scope.conversation_id)
-        else:
-            sql += " AND r.conversation_id IS NULL"
-        if status_set is not None:
-            sql += f" AND e.status IN ({', '.join('?' * len(status_set))})"
-            params.extend(sorted(s.value for s in status_set))
-        if kind_set is not None:
-            sql += f" AND r.kind IN ({', '.join('?' * len(kind_set))})"
-            params.extend(sorted(k.value for k in kind_set))
-        sql += " ORDER BY r.created_at, r.record_id"
+        where, params, status_set, kind_set = self._record_filter_sql(
+            "list_records", scope, statuses, kinds, limit
+        )
+        sql = f"{_RECORD_CURRENT_SQL} WHERE {where} ORDER BY r.created_at, r.record_id"
         with self._connection() as connection:
             rows = connection.execute(sql, params).fetchall()
         views = [
@@ -6920,6 +6929,124 @@ class SQLiteMemoryStore:
         )
         views.sort(key=lambda v: (v.record.created_at, v.record.record_id))
         return views[:limit]
+
+    @staticmethod
+    def _record_filter_sql(
+        caller: str,
+        scope: MemoryRecordScope,
+        statuses: Iterable[MemoryRecordStatus] | None,
+        kinds: Iterable[MemoryRecordKind] | None,
+        limit: int,
+    ) -> tuple[
+        str,
+        list[object],
+        frozenset[MemoryRecordStatus] | None,
+        frozenset[MemoryRecordKind] | None,
+    ]:
+        """Validate a record query and build its WHERE clause (no keyword).
+
+        The project scope is always an SQL predicate, never a post-filter.
+        """
+        if type(scope) is not MemoryRecordScope:
+            raise ValueError("scope must be a MemoryRecordScope")
+        if scope.kind is not MemoryRecordScopeKind.PROJECT:
+            raise ValueError(f"{caller} needs a PROJECT scope")
+        if type(limit) is not int or not 1 <= limit <= _RECORD_LIST_MAX_LIMIT:
+            raise ValueError(
+                f"limit must be an int between 1 and {_RECORD_LIST_MAX_LIMIT}"
+            )
+        status_set = None if statuses is None else frozenset(statuses)
+        kind_set = None if kinds is None else frozenset(kinds)
+        if status_set is not None and any(
+            type(s) is not MemoryRecordStatus for s in status_set
+        ):
+            raise ValueError("statuses must be MemoryRecordStatus members")
+        if kind_set is not None and any(
+            type(k) is not MemoryRecordKind for k in kind_set
+        ):
+            raise ValueError("kinds must be MemoryRecordKind members")
+        where = "r.project_id = ?"
+        params: list[object] = [scope.project_id]
+        if scope.conversation_id is not None:
+            where += " AND (r.conversation_id IS NULL OR r.conversation_id = ?)"
+            params.append(scope.conversation_id)
+        else:
+            where += " AND r.conversation_id IS NULL"
+        if status_set is not None:
+            where += f" AND e.status IN ({', '.join('?' * len(status_set))})"
+            params.extend(sorted(s.value for s in status_set))
+        if kind_set is not None:
+            where += f" AND r.kind IN ({', '.join('?' * len(kind_set))})"
+            params.extend(sorted(k.value for k in kind_set))
+        return where, params, status_set, kind_set
+
+    def search_records(
+        self,
+        query_text: str,
+        scope: MemoryRecordScope,
+        kinds: Iterable[MemoryRecordKind] | None = None,
+        statuses: Iterable[MemoryRecordStatus] | None = None,
+        limit: int = 20,
+    ) -> list[tuple[MemoryRecordView, float]]:
+        """Search one project's V2.1 records; returns (view, rank) pairs.
+
+        Every query token is folded (``_fold_search_text``) and passed as a
+        quoted FTS5 string, so user text is never FTS syntax ('OR', '*',
+        'NEAR', quotes are literal words). All tokens must match (AND).
+        Scope, status and kind filters are SQL predicates. FTS rank is bm25
+        (lower is better). Without the FTS index the same filters run as a
+        folded LIKE substring match with escaped wildcards and rank 0.0.
+        Legacy M1 items are not searched.
+        """
+        if type(query_text) is not str:
+            raise ValueError("query_text must be a string")
+        where, params, _, _ = self._record_filter_sql(
+            "search_records", scope, statuses, kinds, limit
+        )
+        tokens = re.findall(r"[^\W_]+", _fold_search_text(query_text))
+        if not tokens:
+            return []
+        if len(tokens) > _RECORD_SEARCH_MAX_TOKENS:
+            raise ValueError(
+                f"query_text has more than {_RECORD_SEARCH_MAX_TOKENS} words"
+            )
+        with self._connection() as connection:
+            if memory_records_fts_available(connection):
+                match = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+                rows = connection.execute(
+                    f"{_RECORD_SEARCH_FTS_SQL} WHERE {MEMORY_RECORDS_FTS} MATCH ? "  # nosec B608 - constant SQL fragments only
+                    f"AND {where} ORDER BY search_rank, r.created_at, r.record_id LIMIT ?",
+                    [match, *params, limit],
+                ).fetchall()
+                ranks = [float(row["search_rank"]) for row in rows]
+            else:
+                connection.create_function(
+                    "jarvis_fold",
+                    1,
+                    lambda v: None if v is None else _fold_search_text(str(v)),
+                    deterministic=True,
+                )
+                like = " AND ".join(
+                    "(jarvis_fold(r.text) LIKE ? ESCAPE '\\' "
+                    "OR jarvis_fold(r.subject_key) LIKE ? ESCAPE '\\')"
+                    for _ in tokens
+                )
+                patterns: list[object] = []
+                for token in tokens:
+                    escaped = re.sub(r"([\\%_])", r"\\\1", token)
+                    patterns += [f"%{escaped}%", f"%{escaped}%"]
+                rows = connection.execute(
+                    f"{_RECORD_CURRENT_SQL} WHERE {where} AND {like} "  # nosec B608 - constant SQL fragments only
+                    "ORDER BY r.created_at, r.record_id LIMIT ?",
+                    [*params, *patterns, limit],
+                ).fetchall()
+                ranks = [0.0] * len(rows)
+        results = []
+        for row, rank in zip(rows, ranks):
+            view = self._record_view_from_row(row)
+            if view is not None:
+                results.append((view, rank))
+        return results
 
     def _legacy_record_views(self, project_id: str) -> list[MemoryRecordView]:
         """Read-only adapter: M1 project_memory_items as LEGACY_M1 records.
