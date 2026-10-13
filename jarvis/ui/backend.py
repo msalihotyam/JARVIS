@@ -569,3 +569,12 @@ class Backend:
 
     def remember_message(self, conversation_id: str, message_id: str) -> dict:
         return self._plain("memory-remember", lambda app: app.remember_message(conversation_id, message_id))
+
+    def context_usage(self, conversation_id: str) -> dict:
+        return self._plain("context-usage", lambda app: app.context_usage_payload(conversation_id))
+
+    def global_memory_toggle(self, conversation_id: str) -> dict:
+        return self._plain("global-memory", lambda app: app.global_memory_toggle_payload(conversation_id))
+
+    def set_global_memory_toggle(self, conversation_id: str, enabled: bool) -> dict:
+        return self._plain("global-memory", lambda app: app.set_global_memory_toggle(conversation_id, enabled))

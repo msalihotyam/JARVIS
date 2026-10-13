@@ -282,6 +282,11 @@ def _waited(payload: Any, queued_ms: int | None) -> Any:
     return payload
 
 
+# V2.1a M4: the app's context-use labels as the UI's states; anything else is unknown.
+_USAGE_STATES = {"normal": "normal", "yuksek": "high", "dolu": "full"}
+_UNKNOWN_USAGE = {"used": None, "max": None, "ratio": None, "turnsUntilAutoCompact": None, "state": "unknown"}
+
+
 def _guarded(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
@@ -526,6 +531,13 @@ class Bridge(QObject):
         self._queue_timer.timeout.connect(self._drain_queue)
         self.stateChanged.connect(self.queueChanged)
         self.queueChanged.connect(self.attentionChanged)
+        # V2.1a M4: the open conversation's context use and all-projects memory
+        # toggle, re-read on every switch (and after each turn, ``_remember``).
+        self._context_usage: dict[str, Any] = dict(_UNKNOWN_USAGE)
+        self._global_memory = False
+        self._memory_read_id = ""
+        self.conversationChanged.connect(self._refresh_conversation_memory)
+        self._refresh_conversation_memory()
         # DFDRAFT: every conversation's own unsent draft - the open one's live
         # (its text as the composer reports it, its context above), the others
         # parked here by key; written to the preferences' drafts file shortly
@@ -711,6 +723,8 @@ class Bridge(QObject):
         if store.store is not None and store.diagnostic:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation could not be saved: %1"),
                         (store.diagnostic,)), "error")
+        if store is self._conversation_store and (kind == "result" or (kind == "jarvis" and entry.get("chat"))):
+            self._refresh_context_usage()   # never on the user's turn: it would queue ahead of its own run
 
     def _conversation(self) -> tuple:
         """The canonical conversation's raw turns as ``{role, text}``.
@@ -4838,6 +4852,93 @@ class Bridge(QObject):
                 self._say(entry["kind"], entry["text"])
             answer.update(ok=False, error=render(self._redacted(entries[0]["text"])))
         signal.emit(answer)
+
+    # -- V2.1a M4: context usage and the all-projects memory toggle (pass-through)
+    #
+    # Both are the app's answers for the open conversation, read on the worker.
+    # The bridge computes no window, ratio or default: anything but a clean
+    # answer for the open conversation reads as unknown usage and toggle off;
+    # a refused toggle change keeps the last confirmed value and says why.
+
+    contextUsageChanged = Signal()
+    globalMemoryChanged = Signal()
+
+    @Property("QVariantMap", notify=contextUsageChanged)
+    def contextUsage(self) -> dict:
+        return dict(self._context_usage)
+
+    @Property(bool, notify=globalMemoryChanged)
+    def globalMemoryEnabled(self) -> bool:
+        return self._global_memory
+
+    @Slot(bool)
+    def setGlobalMemoryEnabled(self, enabled: bool) -> None:
+        conversation_id, enabled = self._conversation_store.id or "", bool(enabled)
+        # Its own kind per click: a refusal is never dropped behind a later read.
+        self._run(f"global-memory-set:{uuid4().hex}",
+                  lambda: self.backend.set_global_memory_toggle(conversation_id, enabled),
+                  lambda payload: self._global_memory_answer(conversation_id, payload, says=True))
+
+    def _refresh_conversation_memory(self) -> None:
+        if self._shutting_down:
+            return
+        conversation_id = self._conversation_store.id or ""
+        if conversation_id != self._memory_read_id:   # a switch: the last one's values never show meanwhile
+            self._memory_read_id = conversation_id
+            self._context_usage_answer("", None)
+            self._global_memory_answer("", None)
+        self._refresh_context_usage()
+        if not conversation_id:
+            self._global_memory_answer("", None)
+            return
+        self._run("global-memory", lambda: self.backend.global_memory_toggle(conversation_id),
+                  lambda payload: self._global_memory_answer(conversation_id, payload))
+
+    def _refresh_context_usage(self) -> None:
+        if self._shutting_down:
+            return
+        conversation_id = self._conversation_store.id or ""
+        if not conversation_id:
+            self._context_usage_answer("", None)
+            return
+        self._run("context-usage", lambda: self.backend.context_usage(conversation_id),
+                  lambda payload: self._context_usage_answer(conversation_id, payload))
+
+    def _current(self, conversation_id: str, payload: Any) -> bool:
+        """A clean answer about the conversation that is still open."""
+        return (bool(conversation_id) and conversation_id == (self._conversation_store.id or "")
+                and isinstance(payload, dict) and payload.get("ok") is True
+                and payload.get("conversation_id") == conversation_id)
+
+    def _context_usage_answer(self, conversation_id: str, payload: Any) -> None:
+        usage = dict(_UNKNOWN_USAGE)
+        if self._current(conversation_id, payload) and isinstance(payload.get("max_tokens"), int):
+            usage.update(used=payload.get("used_tokens"), max=payload["max_tokens"], ratio=payload.get("ratio"),
+                         turnsUntilAutoCompact=payload.get("turns_until_autocompact"),
+                         state=_USAGE_STATES.get(str(payload.get("label_key")), "unknown"))
+        elif self._current(conversation_id, payload):
+            usage["used"] = payload.get("used_tokens")
+        if usage != self._context_usage:
+            self._context_usage = usage
+            self.contextUsageChanged.emit()
+
+    def _global_memory_answer(self, conversation_id: str, payload: Any, says: bool = False) -> None:
+        current = self._current(conversation_id, payload)
+        if says and not (isinstance(payload, dict) and payload.get("ok") is True):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if not isinstance(error, dict):   # the app's own refusal words (its plain-dict answers)
+                error = {"code": "invalid_task", "message": str(error or "refused")}
+            if conversation_id == (self._conversation_store.id or ""):   # never in another conversation's feed
+                for entry in error_entries(error):
+                    self._say(entry["kind"], entry["text"])
+            self.globalMemoryChanged.emit()   # a switch that moved on its own snaps back
+            return
+        if says and not current:
+            return   # it landed for a conversation no longer open; the switch re-read the open one
+        enabled = current and payload.get("enabled") is True
+        if enabled != self._global_memory:
+            self._global_memory = enabled
+            self.globalMemoryChanged.emit()
 
     # -- slots: configuration ------------------------------------------------
 
