@@ -4780,6 +4780,65 @@ class Bridge(QObject):
                 self._say(entry["kind"], entry["text"])
         self.dataChanged.emit()
 
+    # -- V2.1a M4: memory records, approvals and 'Hatırla' (pass-through) -----
+    #
+    # Each slot runs the app's method on the worker and delivers its answer
+    # whole, with the request's ids. The bridge decides nothing: ownership,
+    # status moves and the remember filter are the app's. A refusal is never
+    # swallowed: the answer keeps "ok": False with the rendered reason in
+    # "error", and the same words land in the feed.
+
+    memoryRecordsDone = Signal("QVariantMap")
+    memoryRecordActionDone = Signal("QVariantMap")
+
+    @Slot(str, "QVariantMap")
+    def memoryRecords(self, project_id: str, filters: Any) -> None:
+        request = {"project_id": str(project_id)}
+        self._run("memory-records", lambda: self.backend.memory_records(request["project_id"], filters),
+                  lambda payload: self._memory_answer(self.memoryRecordsDone, request, payload))
+
+    @Slot(str, str)
+    def approveMemoryRecord(self, project_id: str, record_id: str) -> None:
+        self._record_action("approve", self.backend.approve_memory_record, project_id, record_id)
+
+    @Slot(str, str)
+    def rejectMemoryRecord(self, project_id: str, record_id: str) -> None:
+        self._record_action("reject", self.backend.reject_memory_record, project_id, record_id)
+
+    @Slot(str, str)
+    def undoMemoryRecord(self, project_id: str, record_id: str) -> None:
+        self._record_action("undo", self.backend.undo_memory_record, project_id, record_id)
+
+    @Slot(str, str)
+    def rememberMessage(self, conversation_id: str, message_id: str) -> None:
+        request = {"action": "remember", "conversation_id": str(conversation_id), "message_id": str(message_id)}
+        self._run(f"memory-action:{uuid4().hex}",
+                  lambda: self.backend.remember_message(request["conversation_id"], request["message_id"]),
+                  lambda payload: self._memory_answer(self.memoryRecordActionDone, request, payload))
+
+    def _record_action(self, action: str, call: Callable[[str, str], dict], project_id: str, record_id: str) -> None:
+        request = {"action": action, "project_id": str(project_id), "record_id": str(record_id)}
+        # Every click's answer arrives (an approve that landed is never hidden behind a later refusal),
+        # so each click is its own kind. ponytail: one tiny _sequence entry per click, prune if it ever matters.
+        self._run(f"memory-action:{uuid4().hex}", lambda: call(request["project_id"], request["record_id"]),
+                  lambda payload: self._memory_answer(self.memoryRecordActionDone, request, payload))
+
+    def _memory_answer(self, signal: Any, request: dict, payload: Any) -> None:
+        answer = {**(payload if isinstance(payload, dict) else {}), **request}
+        answer["records"] = [{**item, "text": redact_text(str(item.get("text")))}
+                             for item in rows(answer, "records", "record_id")]
+        if isinstance(answer.get("record"), dict):
+            answer["record"] = {**answer["record"], "text": redact_text(str(answer["record"].get("text")))}
+        if answer.get("ok") is not True:
+            error = answer.get("error")
+            if not isinstance(error, dict):   # the app's own refusal words (its plain-dict answers)
+                error = {"code": "invalid_task", "message": str(error or answer.get("refused") or "refused")}
+            entries = error_entries(error)
+            for entry in entries:
+                self._say(entry["kind"], entry["text"])
+            answer.update(ok=False, error=render(self._redacted(entries[0]["text"])))
+        signal.emit(answer)
+
     # -- slots: configuration ------------------------------------------------
 
     def _apply_config(self, payload: dict) -> None:

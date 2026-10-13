@@ -15,6 +15,7 @@ names a capability and never interprets destination grammar.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -547,3 +548,24 @@ class Backend:
         return self._call("memory-list", lambda s: memory_list_result(
             self._memory(s), s, project_id, include_inactive
         ))
+
+    # -- V2.1a M4: memory records, pass-through (the app decides every refusal)
+
+    def _plain(self, command: str, action: Callable[[JarvisApp], dict]) -> dict:
+        """The app's V2.1 memory methods answer plain dicts ({"ok": ...})."""
+        return self._call(command, lambda s: SimpleNamespace(payload=action(self._app(s))))
+
+    def memory_records(self, project_id: str, filters: dict | None = None) -> dict:
+        return self._plain("memory-records", lambda app: app.memory_records_payload(project_id, filters))
+
+    def approve_memory_record(self, project_id: str, record_id: str) -> dict:
+        return self._plain("memory-approve", lambda app: app.approve_memory_record(project_id, record_id))
+
+    def reject_memory_record(self, project_id: str, record_id: str) -> dict:
+        return self._plain("memory-reject", lambda app: app.reject_memory_record(project_id, record_id))
+
+    def undo_memory_record(self, project_id: str, record_id: str) -> dict:
+        return self._plain("memory-undo", lambda app: app.undo_memory_record(project_id, record_id))
+
+    def remember_message(self, conversation_id: str, message_id: str) -> dict:
+        return self._plain("memory-remember", lambda app: app.remember_message(conversation_id, message_id))
