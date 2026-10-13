@@ -192,6 +192,12 @@ HEADER_KEYS = ("lane", "model", "effort", "base")
 JS_WS = "\t\n\v\f\r    -     　﻿"  # JS \s
 BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
 STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")
+# CONVINTERIM (Salih 2026-10-13): a report whose first STATUS line says "(interim)" is not a finish;
+# no final report within INTERIM_TIMEOUT_S of the first interim one seen -> a normal BLOCKED finish.
+STATUS_LINE_RE = re.compile(r"(?m)^\s*STATUS:.*$")
+INTERIM = "(INTERIM)"  # never a STATUS_RE word
+INTERIM_TIMEOUT_S = 45 * 60
+INTERIM_WHY = "interim report not finalized within 45 min"
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -538,9 +544,13 @@ def where_raised(e):
 
 def report_status(path):
     try:
-        m = STATUS_RE.search(Path(path).read_text(encoding="utf-8", errors="replace"))
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    line = STATUS_LINE_RE.search(text)
+    if line and "(interim)" in line.group(0).lower():
+        return INTERIM
+    m = STATUS_RE.search(text)
     return m.group(1).upper() if m else None
 
 
@@ -782,12 +792,12 @@ class Conveyor:
         except (KeyError, ValueError):
             return 0.0
 
-    def finish(self, name, ln, report, status):
+    def finish(self, name, ln, report, status, **why):
         quiet = ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
         ln["finished"] = True
         ln["status"] = status
         ln["report"] = str(self.collect(name, report))
-        self.event("finish", lane=name, id=ln["id"], status=status, report=ln["report"])
+        self.event("finish", lane=name, id=ln["id"], status=status, report=ln["report"], **why)
         if quiet:
             return
         ln["finished_ts"] = self.now()  # since of its attention item (bad STATUS, non-pass reading)
@@ -875,7 +885,20 @@ class Conveyor:
             if ln.get("finished") and ln.get("status") and ln["status"] != "DEAD":
                 continue  # DEAD: a report the rescued session writes later still finishes it
             found = self.find_report(name, ln.get("report_since") or self.started_ts(ln), a and a.get("cwd"))
+            interim = bool(found) and found[1] == INTERIM
+            if interim:  # not a finish: the lane runs on and its dependents wait (slice_done)
+                try:
+                    mt = found[0].stat().st_mtime
+                except OSError:
+                    mt = self.now()
+                since = ln.setdefault("interim_since", min(mt, self.now()))  # a rewrite never resets it
+                if self.now() - since >= INTERIM_TIMEOUT_S:
+                    ln["interim_timeout"] = INTERIM_WHY
+                    self.finish(name, ln, found[0], "BLOCKED", reason=INTERIM_WHY)
+                    continue
+                found = None
             if found:  # a report wins over any session state
+                ln.pop("interim_since", None)  # a later interim report starts a new clock
                 if found[1] == "BLOCKED" and self.resume_in_place(name, ln, found[0], a, lanes):
                     continue
                 self.finish(name, ln, *found)
@@ -888,6 +911,8 @@ class Conveyor:
                 self.event("finish", lane=name, id=ln["id"], status="DEAD", reason=dead)
                 continue
             if state in FINISHED:
+                if interim:  # ended its turn on an interim report: the final one or INTERIM_TIMEOUT_S decides
+                    continue
                 ln["finished"] = True
                 self.event("finish", lane=name, id=ln["id"], state=state)
                 continue
@@ -912,7 +937,7 @@ class Conveyor:
                 else:
                     self.redispatch(name, ln)
                 continue
-            if alive and self.watch_idle(name, ln, a):
+            if alive and not interim and self.watch_idle(name, ln, a):  # INTERIM_TIMEOUT_S owns it
                 continue
             self.unblock(name, ln, a)
 
@@ -1633,7 +1658,8 @@ class Conveyor:
                 why.append(f"prompt not delivered / session gone: {ln.get('dead')}")
             elif ln.get("status") in BAD or ln.get("status") == "STUCK":
                 why.append(f"STATUS {ln['status']}")
-                for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: ")):
+                for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: "),
+                                ("interim_timeout", "")):
                     if ln.get(k):
                         why.append(lead + ln[k])
             r = ln.get("reading") or {}

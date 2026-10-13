@@ -3558,6 +3558,101 @@ class TestResumeInPlace(Base):
         self.assertIn("F", self.attn())
 
 
+class TestInterimReport(AutopilotBase):
+    """CONVINTERIM: a STATUS line with "(interim)" is not a finish; 45 min without a final
+    report -> a normal BLOCKED finish (breaker count, attention item, backstop page)."""
+    def start(self):
+        self.backlog({"id": "A"}, {"id": "B", "depends_on": ["A"]})
+        self.c.pass_once()
+        self.t += 60
+        self.t0 = self.t
+        self.finish("A", "BLOCKED (interim)")
+
+    def bad(self):
+        return [x[0] for x in json.loads((self.base / "autopilot.json").read_text())["bad"]]
+
+    def test_interim_is_not_a_finish(self):
+        self.start()
+        self.t = self.t0 + conveyor.INTERIM_TIMEOUT_S - 60
+        self.c.pass_once()
+        self.assertFalse(self.lanes()["A"].get("finished"))
+        self.assertEqual(self.ev("finish"), [])
+        self.assertNotIn("A", self.attn())
+        self.assertEqual(self.view()["B"], "waiting_deps")
+        self.assertEqual(self.bad(), [])
+        self.assertEqual(self.pushes, [])
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("stop", "rm")])
+
+    def test_final_pass_within_45_min_is_recorded_as_today(self):
+        self.start()
+        self.t = self.t0 + conveyor.INTERIM_TIMEOUT_S - 60
+        self.finish("A", "PASS")
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "PASS"))
+        self.assertEqual([e["status"] for e in self.ev("finish")], ["PASS"])
+        self.assertNotIn("reason", self.ev("finish")[0])
+        self.assertNotIn("A", self.attn())
+        self.assertNotEqual(self.view()["B"], "waiting_deps")
+
+    def test_no_final_in_45_min_is_blocked_attention_breaker_page(self):
+        self.start()
+        self.t = self.t0 + 1800
+        self.finish("A", "BLOCKED (interim)")  # a rewritten interim report does not reset the clock
+        self.t = self.t0 + conveyor.INTERIM_TIMEOUT_S
+        self.c.pass_once()
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "BLOCKED"))
+        (ev,) = self.ev("finish")
+        self.assertEqual((ev["status"], ev["reason"]), ("BLOCKED", conveyor.INTERIM_WHY))
+        (item,) = [a for a in self.status()["attention"] if a["id"] == "A"]
+        self.assertEqual(item["reason"], f"STATUS BLOCKED; {conveyor.INTERIM_WHY}")
+        self.assertEqual(self.bad(), ["A"])
+        self.assertEqual(self.view()["B"], "waiting_deps")
+        self.assertEqual(self.pushes, [])
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn(f"A: STATUS BLOCKED; {conveyor.INTERIM_WHY}", self.pushes[0])
+
+    def test_session_done_on_an_interim_report_still_times_out(self):
+        self.start()
+        self.fake.agent("A").update(state="done", status="idle")
+        self.c.pass_once()
+        self.assertFalse(self.lanes()["A"].get("finished"))
+        self.assertEqual(self.ev("finish"), [])
+        self.t = self.t0 + conveyor.INTERIM_TIMEOUT_S
+        self.c.pass_once()
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "BLOCKED"))
+        self.assertEqual(self.bad(), ["A"])
+
+    def test_a_final_report_resets_the_interim_clock(self):
+        self.backlog({"id": "F", "files": ["jarvis/a.py"]})
+        self.c.pass_once()
+        self.t += 60
+        self.finish("F", "BLOCKED (interim)")
+        self.finish("F", "BLOCKED", extra="NEEDS FILES: jarvis/b.py\n")  # resumed in place (R3)
+        self.assertNotIn("interim_since", self.lanes()["F"])
+        self.t += conveyor.INTERIM_TIMEOUT_S
+        t1 = self.t
+        self.finish("F", "BLOCKED (interim)")  # a new clock starts here
+        self.t = t1 + conveyor.INTERIM_TIMEOUT_S - 60
+        self.c.pass_once()
+        ln = self.lanes()["F"]
+        self.assertFalse(ln.get("finished"))
+        self.assertEqual(ln["interim_since"], t1)
+
+    def test_final_blocked_without_marker_blocks_at_once(self):
+        self.backlog({"id": "A"}, {"id": "B", "depends_on": ["A"]})
+        self.c.pass_once()
+        self.t += 60
+        self.finish("A", "BLOCKED", extra="waiting for an interim CI result\n")
+        ln = self.lanes()["A"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "BLOCKED"))
+        self.assertIn("A", self.attn())
+        self.assertEqual(self.bad(), ["A"])
+
+
 class TestLock(Base):
     def test_live_lock_blocks(self):
         (self.base / "conveyor.lock").write_text(json.dumps({"pid": -5, "heartbeat": self.t - 60}))
