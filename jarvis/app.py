@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
@@ -47,6 +48,8 @@ from jarvis.connectors.project_folder import (
 from jarvis import project_files
 from jarvis import project_folders
 from jarvis.contracts import (
+    MemoryRecordOrigin,
+    utc_now,
     PROJECT_INSTRUCTION_KEY,
     project_instruction_block,
     project_instruction_delivery,
@@ -212,6 +215,7 @@ from jarvis.conversation import (
     context_fields,
     context_profile_of,
     json_text,
+    register_precompact_hook,
     rehydrate,
 )
 from jarvis.memory import _RECORD_CURRENT_SQL, MemoryRecordApproval, MemoryRecordRefused, SQLiteMemoryStore
@@ -3564,6 +3568,113 @@ def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     return timing
 
 
+class MemoryTriggers:
+    """Process-wide SessionEnd / PreCompact capture worker (V2.1a M2).
+
+    It only schedules: Core decides every record. Each conversation has at
+    most one draining thread; jobs that arrive meanwhile queue behind it. A
+    capture failure is swallowed here - it never reaches the chat or the
+    compaction that triggered it (I12). Process-wide because the UI backend
+    builds a fresh ``JarvisApp`` per call.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, list[tuple[Any, MemoryRecordOrigin, tuple[Any, ...] | None]]] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        # ponytail: process-local high-water mark of seqs handed to capture;
+        # a restart re-offers turns and Core's run-id ledger dedupes them.
+        self._captured: dict[str, int] = {}
+        self._closed = False
+
+    def schedule(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
+                 turns: Iterable[Any] | None = None) -> bool:
+        with self._lock:
+            if self._closed or not conversation_id:
+                return False
+            self._jobs.setdefault(conversation_id, []).append(
+                (app, trigger, None if turns is None else tuple(turns)))
+            if conversation_id in self._threads:
+                return True
+            thread = threading.Thread(target=self._drain, args=(conversation_id,),
+                                      name=f"jarvis-capture-{conversation_id}", daemon=True)
+            self._threads[conversation_id] = thread
+            thread.start()  # under the lock: shutdown never sees an unstarted thread
+        return True
+
+    def _drain(self, conversation_id: str) -> None:
+        while True:
+            with self._lock:
+                jobs = self._jobs.pop(conversation_id, [])
+                if not jobs:
+                    self._threads.pop(conversation_id, None)
+                    return
+            for app, trigger, turns in jobs:
+                try:
+                    self._run(app, conversation_id, trigger, turns)
+                except Exception:  # noqa: BLE001 - capture never blocks the chat (I12)
+                    pass
+
+    def _mark(self, conversation_id: str, turns: Iterable[Any], outcome: Any) -> None:
+        # Only a run Core finished (or already had) moves the mark; a
+        # provider/run-store refusal leaves the turns for the next leave.
+        if getattr(outcome, "outcome", None) not in ("ok", "duplicate"):
+            return
+        top = max((turn.seq for turn in turns), default=0)
+        with self._lock:
+            self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), top)
+
+    def _run(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
+             turns: tuple[Any, ...] | None) -> None:
+        model = app.intent_model
+        if model is None:
+            return
+        if trigger is MemoryRecordOrigin.CAPTURE_PRECOMPACT:
+            if turns:
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=turns)
+                self._mark(conversation_id, turns, outcome)
+            return
+        raw = app.memory.load_conversation_state(conversation_id).turns
+        with self._lock:
+            mark = self._captured.get(conversation_id, 0)
+        fresh = tuple(turn for turn in raw if turn.seq > mark)
+        if fresh:
+            if fresh == raw:
+                outcome = app.core.capture_memory(conversation_id, trigger, model)
+            else:
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=fresh)
+            self._mark(conversation_id, fresh, outcome)
+        record = app.memory.load_conversation(conversation_id)
+        if record is not None and record.project_id:
+            app.memory.consolidate_scope(record.project_id, utc_now())
+
+    def shutdown(self, app: Any, open_ids: Iterable[str] = (), timeout: float = 5.0) -> tuple[str, ...]:
+        """Session-end the open conversations, wait at most ``timeout`` seconds,
+        then have Core record every still-running conversation's run aborted.
+        Returns the conversations Core recorded as aborted."""
+        for conversation_id in open_ids:
+            self.schedule(app, conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END)
+        with self._lock:
+            self._closed = True
+            threads = dict(self._threads)
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in threads.values():
+            thread.join(max(0.0, deadline - time.monotonic()))
+        aborted: list[str] = []
+        for conversation_id, thread in threads.items():
+            if not thread.is_alive():
+                continue
+            try:
+                app.core.abort_capture_runs(conversation_id)
+            except Exception:  # noqa: BLE001 - shutdown proceeds regardless
+                continue
+            aborted.append(conversation_id)
+        return tuple(aborted)
+
+
+MEMORY_TRIGGERS = MemoryTriggers()
+
+
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
 
@@ -3585,6 +3696,19 @@ class JarvisApp:
         #: composed provider has no verified research route. Never registered.
         self.research_model = research_model
         self._cancelled_text: set[str] = set()
+        self.memory_triggers = MEMORY_TRIGGERS
+
+    def watch_conversations(self, store: Any) -> None:
+        """PreCompact: capture exactly the turns ``store`` is about to compact."""
+        register_precompact_hook(store, lambda cid, turns: self.memory_triggers.schedule(
+            self, cid, MemoryRecordOrigin.CAPTURE_PRECOMPACT, turns))
+
+    def conversation_left(self, conversation_id: str) -> bool:
+        """SessionEnd: switch, new conversation or archive. Delete never calls this."""
+        return self.memory_triggers.schedule(self, conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END)
+
+    def shutdown_memory_capture(self, open_ids: Iterable[str] = (), timeout: float = 5.0) -> tuple[str, ...]:
+        return self.memory_triggers.shutdown(self, open_ids, timeout)
 
     @property
     def permission_mode(self) -> PermissionMode:

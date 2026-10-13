@@ -53,8 +53,9 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 SCHEMA_VERSION = 1
 
@@ -407,11 +408,16 @@ def digest(text: str) -> str:
 
 def append_turn(state: ConversationState, *, role: str, kind: str, text: str, message: str = "",
                 capability: str = "", destination: str = "", refs: Iterable[Mapping[str, Any]] = (),
-                key: str = "", now: int | None = None, raw_turns_max: int = RAW_TURNS_MAX) -> tuple[ConversationState, Turn | None]:
+                key: str = "", now: int | None = None, raw_turns_max: int = RAW_TURNS_MAX,
+                on_compact: Callable[[tuple[Turn, ...]], None] | None = None) -> tuple[ConversationState, Turn | None]:
     """The state with one more turn, or the same state when ``key`` was seen.
 
     ``key`` is the turn's idempotency key: a retry, a re-delivered result or a
     reopen that replays a turn finds it and adds nothing.
+
+    ``on_compact`` (PreCompact) is called with exactly the raw turns about to
+    compact, BEFORE they do. It may only look; whatever it raises is dropped,
+    so a capture failure never blocks compaction.
     """
     if role not in ROLES or kind not in KINDS:
         raise ValueError(f"unknown role/kind {role}/{kind}")
@@ -427,6 +433,11 @@ def append_turn(state: ConversationState, *, role: str, kind: str, text: str, me
                 refs=tuple(dict(r) for r in refs), ts=int(now if now is not None else time.time()))
     turns = state.turns + (turn,)
     compacted, omitted = state.compacted, state.omitted
+    if on_compact is not None and len(turns) > raw_turns_max:
+        try:
+            on_compact(turns[: len(turns) - raw_turns_max])
+        except Exception:  # noqa: BLE001 - capture never blocks compaction (I12)
+            pass
     while len(turns) > raw_turns_max:
         # Older history compacts into the checkpoint; it does not disappear.
         old, turns = turns[0], turns[1:]
@@ -844,6 +855,25 @@ class ConversationStore:
         _retry_busy(lambda: os.replace(temporary, self.path))
 
 
+#: PreCompact hooks per Core store, set by the app (``register_precompact_hook``).
+#: Keyed by store so every ``PersistedConversation`` over it - the window makes
+#: many - gets the hook without being told; no entry means no hook (no-op).
+_PRECOMPACT_HOOKS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def register_precompact_hook(store: Any, hook: Callable[[str, tuple[Turn, ...]], None] | None) -> None:
+    """Install (``None``: remove) ``hook(conversation_id, turns)`` for ``store``.
+
+    It runs inside the store's write transaction, before compaction, with the
+    exact turns about to compact: it must only snapshot and hand off.
+    A transaction that then rolls back still fired the hook; Core's
+    run-id ledger dedupes the re-offer, so no pre-commit hook was added."""
+    if hook is None:
+        _PRECOMPACT_HOOKS.pop(store, None)
+    else:
+        _PRECOMPACT_HOOKS[store] = hook
+
+
 class PersistedConversation:
     """One conversation held in the Core store, with the surface the window
     uses: ``state``, ``append``, ``name_auto``, ``rename``, ``title``.
@@ -878,7 +908,16 @@ class PersistedConversation:
         if turn is None:
             return None
         fields = dict(fields, now=turn.ts)
-        return turn if self._change(lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, **fields)[0]) else None
+        # The hook fires on the stored apply only (it runs once, on the
+        # authoritative record), never on the local preview above.
+        try:
+            hook = _PRECOMPACT_HOOKS.get(self.store) if self.store is not None and self.id is not None else None
+        except TypeError:  # a store that cannot be weakly keyed has no hook
+            hook = None
+        on_compact = None if hook is None else (lambda turns, cid=self.id: hook(cid, turns))
+        return turn if self._change(
+            lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, on_compact=on_compact, **fields)[0]
+        ) else None
 
     def name_auto(self, ids: Iterable[str], auto: str) -> None:
         ids = tuple(ids)
