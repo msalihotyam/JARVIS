@@ -179,7 +179,8 @@ class PageTests(Case):
         self.assertEqual(["Mutfak teklifleri"], self.rows(root, "projectConversationRow"))
         self.assertEqual(["Eski notlar"], self.rows(root, "projectArchivedConversationRow"))
         self.assertEqual("No folder linked", self.item(root, "projectFolderRowBody").property("text"))   # G6H2: said, not hidden
-        self.assertEqual([], [n for n in ("projectMemoryRow", "projectScheduledRow", "projectJobsHeading", "projectTabs")
+        self.assertEqual("No memory yet", self.item(root, "projectMemoryRowBody").property("text"))   # V2.1a M4: released
+        self.assertEqual([], [n for n in ("projectScheduledRow", "projectJobsHeading", "projectTabs")
                               if self.visible(root, n)])                            # nothing before its release
         # A pinned row opens its conversation.
         self.press(root, self.visible(root, "projectPinnedRow")[0])

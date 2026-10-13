@@ -8,8 +8,9 @@ import "../components"
 // a "new conversation in this project" composer, its pinned and recent
 // conversations (and the archived ones, 6D-b); at the right, rows that open
 // the existing instruction editor and file panel as dialogs, and the 6H
-// folder link (G6H2: link an EXISTING folder, unlink). No Memory or
-// Scheduled row before their releases (V2.1 / V2.5): nothing fake or empty.
+// folder link (G6H2: link an EXISTING folder, unlink), and (V2.1a M4) the
+// project's typed memory: its approved + pending records in a dialog. No
+// Scheduled row before its release (V2.5): nothing fake or empty.
 // A project is context, never authority: every change goes through the
 // existing explicit-user paths and Core's answer is shown as returned.
 // Strings that moved here from the Projects page keep its catalog context.
@@ -18,7 +19,7 @@ Item {
     objectName: "projectDetail"
     property var project: ({})
     property var host: null                   // the Projects page: its one date formatter
-    // Which dialog is open: "conversations" (none), "instruction", "files" or "folder".
+    // Which dialog is open: "conversations" (none), "instruction", "files", "folder" or "memory".
     property string section: "conversations"
     readonly property bool live: project.active === true
     readonly property string shownId: project.id || ""
@@ -53,7 +54,7 @@ Item {
     // -- the open dialog follows `section` (the Projects page's card menu "Edit" sets it) --
     onSectionChanged: syncSection()
     // Leaving the page (another page loads) takes its dialogs with it: none outlives it open.
-    Component.onDestruction: { purgeDialog.close(); filesDialog.close(); instructionDialog.close(); folderDialog.close() }
+    Component.onDestruction: { purgeDialog.close(); filesDialog.close(); instructionDialog.close(); folderDialog.close(); memoryDialog.close() }
     function syncSection() {
         var open = shownId !== ""
         if (section === "instruction" && open) instructionDialog.open()
@@ -62,6 +63,8 @@ Item {
         else if (filesDialog.visible) filesDialog.close()
         if (section === "folder" && open) folderDialog.open()
         else if (folderDialog.visible) folderDialog.close()
+        if (section === "memory" && open && live) { memoryDialog.refresh(); memoryDialog.open() }
+        else if (memoryDialog.visible) memoryDialog.close()
     }
     // Gate 6E: the page fades in when another project opens; Q6: the rename
     // field shows only after "Rename" (Enter saves, Esc or Cancel puts it away).
@@ -294,6 +297,20 @@ Item {
             onOpened: projectPage.section = "folder"
             HoverTip { target: folderRow; text: folderRow.body; active: folderRow.visible && folderRow.linked }
         }
+        // V2.1a M4: approved + pending records; the app lists only an active project's memory.
+        SideRow {
+            objectName: "projectMemoryRow"
+            readonly property int count: memoryDialog.records.length
+            readonly property int pending: memoryDialog.pending
+            visible: projectPage.live
+            icon: "memory"; label: qsTr("Memory"); action: qsTr("Manage")
+            body: (count === 0 ? qsTr("No memory yet")
+                  : count >= memoryDialog.pageSize ? qsTr("%1+ records").arg(projectPage.number(count))
+                  : count === 1 ? qsTr("1 record") : qsTr("%1 records").arg(projectPage.number(count)))
+                  + (pending > 0 ? "  ·  " + qsTr("%1 pending").arg(projectPage.number(pending)) : "")
+            quiet: count === 0
+            onOpened: projectPage.section = "memory"
+        }
     }
 
     // -- the left column: the composer, then the conversations; one scroll -----
@@ -514,6 +531,15 @@ Item {
                            onClicked: bridge.unlinkProjectFolder(projectPage.project.id) },
             ActionButton { objectName: "folderDialogClose"; label: qsTr("Close"); height: 36; width: 110; onClicked: folderDialog.close() }
         ]
+    }
+    // V2.1a M4: the project's memory; it also feeds the row's count.
+    ProjectMemoryDialog {
+        id: memoryDialog
+        objectName: "projectMemoryDialog"
+        projectId: projectPage.live ? projectPage.shownId : ""
+        title: projectPage.project.name || ""
+        host: projectPage
+        onClosed: if (projectPage.section === "memory") projectPage.section = "conversations"
     }
     FolderDialog {
         id: folderPicker

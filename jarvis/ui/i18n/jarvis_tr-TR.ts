@@ -3311,6 +3311,93 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
+    <name>ProjectMemoryDialog</name>
+    <message>
+        <source>Memory</source>
+        <translation>Hafıza</translation>
+    </message>
+    <message>
+        <source>Rules</source>
+        <translation>Kurallar</translation>
+    </message>
+    <message>
+        <source>Decisions</source>
+        <translation>Kararlar</translation>
+    </message>
+    <message>
+        <source>Preferences</source>
+        <translation>Tercihler</translation>
+    </message>
+    <message>
+        <source>Facts</source>
+        <translation>Olgular</translation>
+    </message>
+    <message>
+        <source>Lessons</source>
+        <translation>Dersler</translation>
+    </message>
+    <message>
+        <source>You</source>
+        <translation>Siz</translation>
+    </message>
+    <message>
+        <source>Session capture</source>
+        <translation>Oturum yakalama</translation>
+    </message>
+    <message>
+        <source>Compaction capture</source>
+        <translation>Sıkıştırma yakalama</translation>
+    </message>
+    <message>
+        <source>Consolidation</source>
+        <translation>Birleştirme</translation>
+    </message>
+    <message>
+        <source>Import</source>
+        <translation>İçe aktarma</translation>
+    </message>
+    <message>
+        <source>Earlier project memory</source>
+        <translation>Önceki proje hafızası</translation>
+    </message>
+    <message>
+        <source>What JARVIS remembers for this project. Facts and lessons are kept at once and can be undone; decisions, rules and preferences wait for your approval.</source>
+        <translation>JARVIS&apos;in bu proje için hatırladıkları. Olgular ve dersler hemen saklanır ve geri alınabilir; kararlar, kurallar ve tercihler onayınızı bekler.</translation>
+    </message>
+    <message>
+        <source>No memory yet</source>
+        <translation>Henüz hafıza yok</translation>
+    </message>
+    <message>
+        <source>Pending</source>
+        <translation>Bekliyor</translation>
+    </message>
+    <message>
+        <source>Stale</source>
+        <translation>Eskimiş</translation>
+    </message>
+    <message>
+        <source>Conflict</source>
+        <translation>Çelişki</translation>
+    </message>
+    <message>
+        <source>Undo</source>
+        <translation>Geri Al</translation>
+    </message>
+    <message>
+        <source>Approve</source>
+        <translation>Onayla</translation>
+    </message>
+    <message>
+        <source>Reject</source>
+        <translation>Reddet</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Kapat</translation>
+    </message>
+</context>
+<context>
     <name>ProjectPage</name>
     <message>
         <source>Instructions</source>
@@ -3355,6 +3442,30 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>No folder linked</source>
         <translation>Bağlı klasör yok</translation>
+    </message>
+    <message>
+        <source>Memory</source>
+        <translation>Hafıza</translation>
+    </message>
+    <message>
+        <source>No memory yet</source>
+        <translation>Henüz hafıza yok</translation>
+    </message>
+    <message>
+        <source>%1+ records</source>
+        <translation>%1+ kayıt</translation>
+    </message>
+    <message>
+        <source>1 record</source>
+        <translation>1 kayıt</translation>
+    </message>
+    <message>
+        <source>%1 records</source>
+        <translation>%1 kayıt</translation>
+    </message>
+    <message>
+        <source>%1 pending</source>
+        <translation>%1 bekleyen</translation>
     </message>
     <message>
         <source>PINNED</source>
