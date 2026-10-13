@@ -174,6 +174,13 @@ from jarvis.memory_consolidation import (
     Supersession,
     plan_consolidation,
 )
+from jarvis.memory_doctor import (
+    DoctorRecordState,
+    LegacyM1Item,
+    MemoryDoctorSnapshot,
+    RepairAction,
+    RepairProposal,
+)
 from jarvis.memory_filter import classify_candidate_text
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.conversation import (
@@ -6963,6 +6970,154 @@ class SQLiteMemoryStore:
                 reason,
             )
         return MemoryRecordStatus.SUPERSEDED
+
+    def doctor_snapshot(self, project_id: str | None = None) -> MemoryDoctorSnapshot:
+        """Read-only Memory Doctor input for one project, or the whole store.
+
+        Unreadable record rows are left out (and their FTS rows with them,
+        so they do not look like drift). Without FTS5 the row count is the
+        record count: there is no index to drift.
+        """
+        scoped = project_id is not None
+        if scoped:
+            validate_project_id(project_id)
+        where, args = (" WHERE r.project_id = ?", (project_id,)) if scoped else ("", ())
+        with self._connection() as connection:
+            connection.execute("BEGIN")  # one read snapshot for every SELECT below
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL}{where} ORDER BY r.record_id", args
+            ).fetchall()
+            stored_ids = {row["record_id"] for row in connection.execute(
+                "SELECT record_id FROM memory_records WHERE project_id = ?" if scoped
+                else "SELECT record_id FROM memory_records",
+                args,
+            ).fetchall()}
+            projects = connection.execute("SELECT id FROM projects").fetchall()
+            conversations = connection.execute(
+                f"SELECT id FROM conversations WHERE {self._NOT_DELETED}"  # nosec B608 - constant fragment
+            ).fetchall()
+            legacy = connection.execute(
+                "SELECT id, project_id, kind FROM project_memory_items "
+                "WHERE project_id = ? ORDER BY id" if scoped
+                else "SELECT id, project_id, kind FROM project_memory_items ORDER BY id",
+                args,
+            ).fetchall()
+            fts_ids = None
+            if memory_records_fts_available(connection):
+                fts_ids = [row["record_id"] for row in connection.execute(
+                    f"SELECT record_id FROM {MEMORY_RECORDS_FTS}"  # nosec B608 - constant table name
+                    + (" WHERE record_id IN (SELECT record_id FROM memory_records "
+                       "WHERE project_id = ?)" if scoped else ""),
+                    args,
+                ).fetchall()]
+        states = []
+        for row in rows:
+            view = self._record_view_from_row(row)
+            if view is not None:
+                states.append(DoctorRecordState(view.record, view.status))
+        # Stored but unreadable (bad row or no event row): neither record nor drift.
+        unreadable = stored_ids - {state.record.record_id for state in states}
+        fts_row_count = (
+            len(states) if fts_ids is None
+            else sum(1 for record_id in fts_ids if record_id not in unreadable)
+        )
+        return MemoryDoctorSnapshot(
+            taken_at=utc_now(),
+            records=tuple(states),
+            known_project_ids=frozenset(row["id"] for row in projects),
+            known_conversation_ids=frozenset(row["id"] for row in conversations),
+            fts_row_count=fts_row_count,
+            legacy_items=tuple(
+                LegacyM1Item(row["id"], row["project_id"], row["kind"]) for row in legacy
+            ),
+        )
+
+    def rebuild_fts(self) -> int | None:
+        """Re-create the FTS index from memory_records; returns rows indexed.
+
+        Touches only ``memory_records_fts`` (the index, not a record table).
+        Returns None, writing nothing, when FTS5 is unavailable.
+        """
+        with self._connection(write=True) as connection:
+            if not memory_records_fts_available(connection):
+                return None
+            rows = connection.execute(
+                "SELECT record_id, text, subject_key FROM memory_records ORDER BY record_id"
+            ).fetchall()
+            connection.execute(f"DELETE FROM {MEMORY_RECORDS_FTS}")  # nosec B608 - constant table name
+            connection.executemany(
+                f"INSERT INTO {MEMORY_RECORDS_FTS} "  # nosec B608 - constant table name
+                "(record_id, text, subject_key) VALUES (?, ?, ?)",
+                [
+                    (row["record_id"], _fold_search_text(row["text"]),
+                     _fold_search_text(row["subject_key"]))
+                    for row in rows
+                ],
+            )
+        return len(rows)
+
+    def apply_doctor_repair(
+        self, proposal: RepairProposal, proof: MemoryRecordApproval
+    ) -> MemoryRecordStatus:
+        """Apply one Memory Doctor repair the human approved.
+
+        Only status-event repairs (RETRACT, EXPIRE) and SUPERSEDE are
+        accepted; the proof must name the record that changes status and
+        its project. RETRACT of a still-PENDING record is a REJECTED event
+        (a proposal is rejected, not retracted). Everything else, including
+        REBUILD_FTS, is refused; the transition table still applies.
+        """
+        if type(proof) is not MemoryRecordApproval:
+            raise ValueError("apply_doctor_repair requires explicit-user proof")
+        if (
+            type(proposal) is not RepairProposal
+            or type(proposal.action) is not RepairAction
+            or type(proposal.record_ids) is not tuple
+            or not all(type(rid) is str for rid in proposal.record_ids)
+        ):
+            raise ValueError("apply_doctor_repair needs a RepairProposal")
+        action, ids = proposal.action, proposal.record_ids
+        reason = sanitize_diagnostic_text(proof.detail, MEMORY_ORIGIN_DETAIL_CAP)
+        if action is RepairAction.SUPERSEDE:
+            if len(ids) != 2:
+                raise ValueError("a supersede repair names exactly (keep, old)")
+            keep, old = ids
+            validate_memory_record_id(old, "old_record_id")
+            if proof.record_id != old:
+                raise ValueError("repair proof must name the superseded record")
+            # project_id is immutable (insert-only), so this read cannot race.
+            with self._connection() as connection:
+                row = connection.execute(
+                    "SELECT project_id FROM memory_records WHERE record_id = ?", (old,)
+                ).fetchone()
+            if row is None or row["project_id"] != proof.project_id:
+                raise ValueError("repair proof must reference a record of exactly this project")
+            return self.supersede(old, keep, MemoryRecordActor.USER, reason, proof=proof)
+        if action not in (RepairAction.RETRACT, RepairAction.EXPIRE):
+            raise ValueError(f"apply_doctor_repair refuses action {action.value}")
+        if len(ids) != 1:
+            raise ValueError(f"a {action.value} repair names exactly one record")
+        (record_id,) = ids
+        validate_memory_record_id(record_id)
+        if proof.record_id != record_id:
+            raise ValueError("repair proof names a different record")
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ?", (record_id,)
+            ).fetchone()
+            if row is None or row["project_id"] != proof.project_id:
+                raise ValueError("repair proof must reference a record of exactly this project")
+            status = MemoryRecordStatus.EXPIRED
+            if action is RepairAction.RETRACT:
+                status = (
+                    MemoryRecordStatus.REJECTED
+                    if row["current_status"] == MemoryRecordStatus.PENDING.value
+                    else MemoryRecordStatus.RETRACTED
+                )
+            self._append_record_event(
+                connection, record_id, status, MemoryRecordActor.USER, reason
+            )
+        return status
 
     def apply_consolidation_plan(
         self, plan: ConsolidationPlan, actor: str = CONSOLIDATION_ACTOR
